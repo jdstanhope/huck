@@ -3,7 +3,6 @@
 //! 5.2.21's `print_cmd.c` output byte-for-byte (see `declare_f_diff_check.sh`
 //! and the `declf_*` tests); correctness is also round-trip idempotence (see
 //! the `rt_*` tests). Built across v146 Tasks 1-3; bash-faithful port in v218.
-#![allow(dead_code)] // entry points wired in Task 4; some helpers land in Tasks 2-3
 use crate::command::{
     Assignment, CaseClause, CaseItem, CaseTerminator, Command, Connector, ElifBranch, ExecCommand,
     ForClause, IfClause, Pipeline, Redirect, SelectClause, Sequence, SimpleCommand, TestBinaryOp,
@@ -870,24 +869,27 @@ fn modifier_suffix(modifier: &ParamModifier) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn live_parse(src: &str) -> crate::command::Sequence {
+        use crate::{lexer, parser};
+        parser::parse_sequence(&mut lexer::Lexer::new_live_atoms(
+            src,
+            &Default::default(),
+            lexer::LexerOptions::default(),
+        ))
+        .expect("parse")
+        .expect("non-empty")
+    }
     fn rt(src: &str) -> (String, String) {
-        use crate::{command, lexer};
-        let a = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(src).expect("lex")))
-            .expect("parse")
-            .expect("non-empty");
+        let a = live_parse(src);
         let s1 = sequence_to_source(&a, 0);
-        let b = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(&s1).expect("lex s1")))
-            .expect("parse s1")
-            .expect("non-empty s1");
+        let b = live_parse(&s1);
         let s2 = sequence_to_source(&b, 0);
         (s1, s2)
     }
     #[test]
     fn exported_function_value_form() {
-        use crate::{command, lexer};
-        let seq = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize("f(){ echo hi; }").unwrap()))
-            .unwrap()
-            .unwrap();
+        use crate::command;
+        let seq = live_parse("f(){ echo hi; }");
         let body = match seq.first {
             command::Command::FunctionDef { body, .. } => body,
             _ => panic!(),
@@ -896,9 +898,7 @@ mod tests {
         assert!(v.starts_with("() "), "{v}");
         assert!(v.contains("echo hi"), "{v}");
         // re-parseable when prefixed with a name:
-        let reparse = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(&format!("f {v}")).unwrap()))
-            .unwrap()
-            .unwrap();
+        let reparse = live_parse(&format!("f {v}"));
         assert!(matches!(reparse.first, command::Command::FunctionDef { .. }));
     }
 
@@ -908,11 +908,10 @@ mod tests {
         assert!(!s1.trim().is_empty(), "empty output for {src:?}");
     }
     fn assert_rt_ast_eq(src: &str) {
-        use crate::{command, lexer};
         assert_rt(src);
-        let a = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(src).unwrap())).unwrap().unwrap();
+        let a = live_parse(src);
         let s1 = sequence_to_source(&a, 0);
-        let b = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(&s1).unwrap())).unwrap().unwrap();
+        let b = live_parse(&s1);
         // Compare structure in canonical source form: generate->parse legitimately
         // reflows physical lines (`;`-joined commands onto separate lines), so AST
         // `line` metadata differs even when structure is identical. The source
@@ -1171,12 +1170,10 @@ mod tests {
 
     #[test]
     fn renders_process_substitution_both_directions() {
-        use crate::{command, lexer};
+        use crate::command;
 
         // input direction: <(...)
-        let seq_in = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize("f() { cat <(echo a); }").expect("lex")))
-            .expect("parse")
-            .expect("non-empty");
+        let seq_in = live_parse("f() { cat <(echo a); }");
         let body_in = match seq_in.first {
             command::Command::FunctionDef { body, .. } => body,
             _ => panic!("expected FunctionDef"),
@@ -1185,9 +1182,7 @@ mod tests {
         assert!(rendered_in.contains("<(echo a)"), "got: {rendered_in}");
 
         // output direction: >(...)
-        let seq_out = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize("g() { tee >(cat); }").expect("lex")))
-            .expect("parse")
-            .expect("non-empty");
+        let seq_out = live_parse("g() { tee >(cat); }");
         let body_out = match seq_out.first {
             command::Command::FunctionDef { body, .. } => body,
             _ => panic!("expected FunctionDef"),
@@ -1198,9 +1193,8 @@ mod tests {
 
     #[test]
     fn arith_command_renders_unquoted() {
-        use crate::{command, lexer};
-        let seq = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize("f(){ (( i < 3 )); }").unwrap()))
-            .unwrap().unwrap();
+        use crate::command;
+        let seq = live_parse("f(){ (( i < 3 )); }");
         let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
         let s = function_to_source(&name, &body);
         assert!(s.contains("(( i < 3 ))"), "got: {s:?}");
@@ -1209,9 +1203,8 @@ mod tests {
 
     #[test]
     fn arith_expansion_renders_unquoted() {
-        use crate::{command, lexer};
-        let seq = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize("f(){ i=$(( i + 1 )); }").unwrap()))
-            .unwrap().unwrap();
+        use crate::command;
+        let seq = live_parse("f(){ i=$(( i + 1 )); }");
         let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
         let s = function_to_source(&name, &body);
         assert!(s.contains("$(( i + 1 ))"), "got: {s:?}");
@@ -1220,9 +1213,8 @@ mod tests {
 
     #[test]
     fn arith_with_var_renders_unquoted() {
-        use crate::{command, lexer};
-        let seq = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize("f(){ (( x + $y )); }").unwrap()))
-            .unwrap().unwrap();
+        use crate::command;
+        let seq = live_parse("f(){ (( x + $y )); }");
         let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
         let s = function_to_source(&name, &body);
         assert!(s.contains("(( x + $y ))"), "got: {s:?}");
@@ -1230,8 +1222,8 @@ mod tests {
 
     // ── Task 2 (v218): bash print_cmd.c exact-match tests ──
     fn declf(src: &str) -> String {
-        use crate::{command, lexer};
-        let seq = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(src).unwrap())).unwrap().unwrap();
+        use crate::command;
+        let seq = live_parse(src);
         let command::Command::FunctionDef { name, body } = seq.first else {
             panic!("expected a function def")
         };
@@ -1429,9 +1421,9 @@ mod tests {
 
     // ── Task 2 (v219): end-to-end byte-exact reconstruction of quoted words ──
     fn declf_word(body_word_src: &str) -> String {
-        use crate::{command, lexer};
+        use crate::command;
         let src = format!("f(){{ echo {body_word_src}; }}");
-        let seq = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(&src).unwrap())).unwrap().unwrap();
+        let seq = live_parse(&src);
         let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
         function_to_source(&name, &body)
     }

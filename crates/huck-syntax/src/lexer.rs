@@ -10,6 +10,12 @@ pub enum LexError {
     EmptyParamName,
     Substitution(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
+    /// A `[…]` subscript fragment (assignment lvalue) that the atom-parser
+    /// bridge `parser::parse_fragment_word` could not parse (e.g. an
+    /// unterminated quote/substitution inside the subscript). Kept distinct
+    /// from `SubstitutionParseError` so the rendered message does not claim
+    /// "in command substitution" for what is actually a subscript error.
+    SubscriptParseError(crate::command::ParseError),
     UnterminatedHeredoc,
     AnsiCInvalidCodepoint(u32),
     BraceExpansionLimit,
@@ -45,6 +51,35 @@ impl std::error::Error for LexError {}
 /// will yield (or `s.len()` at end). `line()` is the 1-based line of that same
 /// char — it advances to the next line immediately after a `'\n'` is consumed,
 /// exactly mirroring how `offset()` advances after each byte.
+/// One injected input source pushed onto `CharCursor`'s source stack (v266:
+/// the alias input-source stack). While a frame is active the cursor reads its
+/// `body` inline — emitting normal atoms + zero-width opener signals the parser
+/// consumes — instead of the base `s`; when the body is exhausted the frame is
+/// popped and reading resumes in the parent source. An injected body has no
+/// base-input offset space of its own, so every token produced while it is
+/// active reports the FROZEN `anchor_*` coordinates captured at push time (the
+/// span of the alias-name invocation), exactly as the old history-splice set
+/// `name_span` on each spliced token. `alias_name` lets the recursion guard
+/// derive the active-set membership directly from the live stack.
+#[derive(Clone)]
+struct Injected {
+    body: String,
+    pos: usize,
+    peeked: Option<char>,
+    peeked_len: usize,
+    anchor_off: usize,
+    anchor_line: u32,
+    anchor_col: u32,
+    alias_name: String,
+}
+
+impl Injected {
+    /// True when the body is fully read (no buffered peek and `pos` at the end).
+    fn exhausted(&self) -> bool {
+        self.peeked.is_none() && self.pos >= self.body.len()
+    }
+}
+
 #[derive(Clone)]
 pub struct CharCursor<'a> {
     s: &'a str,
@@ -53,15 +88,64 @@ pub struct CharCursor<'a> {
     column: u32,            // NEW: 1-based character column
     peeked: Option<char>,
     peeked_len: usize,
+    /// v266: alias input-source stack. Top of stack is the active source;
+    /// empty ⇒ read the base `s`. See [`Injected`].
+    injected: Vec<Injected>,
 }
 
 impl<'a> CharCursor<'a> {
     pub fn new(s: &'a str) -> Self {
-        CharCursor { s, pos: 0, line: 1, column: 1, peeked: None, peeked_len: 0 }
+        CharCursor { s, pos: 0, line: 1, column: 1, peeked: None, peeked_len: 0, injected: Vec::new() }
     }
 
-    /// Peek the next char without consuming it.
+    /// v266: inject `body` as the active input source, read fully before the
+    /// current source resumes. `anchor` is the span the produced tokens report
+    /// (the alias-NAME invocation site) — frozen for the frame's lifetime, since
+    /// the body has no base-offset space of its own. `alias_name` anchors the
+    /// recursion guard to this stack frame.
+    fn push_injection(&mut self, body: String, alias_name: String, anchor: Span) {
+        self.injected.push(Injected {
+            body,
+            pos: 0,
+            peeked: None,
+            peeked_len: 0,
+            anchor_off: anchor.offset,
+            anchor_line: anchor.line,
+            anchor_col: anchor.column,
+            alias_name,
+        });
+    }
+
+    /// v266: true iff some frame currently on the injection stack was pushed for
+    /// alias `name`. The recursion guard reads this INSTEAD of a separate `active`
+    /// set: a frame is on the stack for exactly as long as its body is being lexed,
+    /// so membership == "this alias is mid-expansion" with no manual insert/remove.
+    fn injected_has_alias(&self, name: &str) -> bool {
+        self.injected.iter().any(|f| f.alias_name == name)
+    }
+
+
+    /// Peek the next char without consuming it. v266: reads from the topmost
+    /// injected frame that still has content, seeing THROUGH fully-exhausted
+    /// frames to the parent WITHOUT popping them (popping — and the matching
+    /// recursion-guard release — is `next()`'s job, so a lookahead peek never
+    /// releases an alias early).
     pub fn peek(&mut self) -> Option<&char> {
+        // Find the topmost frame with remaining content (skip exhausted ones).
+        let mut idx = self.injected.len();
+        while idx > 0 && self.injected[idx - 1].exhausted() {
+            idx -= 1;
+        }
+        if idx > 0 {
+            let f = &mut self.injected[idx - 1];
+            if f.peeked.is_none()
+                && let Some(c) = f.body[f.pos..].chars().next()
+            {
+                f.peeked = Some(c);
+                f.peeked_len = c.len_utf8();
+            }
+            return self.injected[idx - 1].peeked.as_ref();
+        }
         if self.peeked.is_none()
             && let Some(c) = self.s[self.pos..].chars().next()
         {
@@ -73,28 +157,59 @@ impl<'a> CharCursor<'a> {
 
     /// Byte offset of the next char to be produced (start of the next token
     /// when the cursor sits on a token boundary). Equals `s.len()` at EOF.
+    /// v266: while an injected alias body is active AND still has content, this
+    /// reports the frozen anchor (the alias-name site) so body tokens pin there;
+    /// once all injected frames are drained it reports the base position again
+    /// (all nested frames share the same anchor, so the topmost-with-content
+    /// frame's anchor is the outermost alias-name span).
     pub fn offset(&self) -> usize {
+        for f in self.injected.iter().rev() {
+            if !f.exhausted() {
+                return f.anchor_off;
+            }
+        }
         self.pos
     }
 
     /// 1-based line of the next char to be produced (mirrors `offset()`).
     /// After consuming a `'\n'`, this reflects the NEXT line.
     pub fn line(&self) -> u32 {
+        for f in self.injected.iter().rev() {
+            if !f.exhausted() {
+                return f.anchor_line;
+            }
+        }
         self.line
     }
 
     /// 1-based character column of the next char to be produced.
-    pub fn column(&self) -> u32 { self.column }
+    pub fn column(&self) -> u32 {
+        for f in self.injected.iter().rev() {
+            if !f.exhausted() {
+                return f.anchor_col;
+            }
+        }
+        self.column
+    }
 
-    /// Byte slice of the source from `start` to the current offset. Used to
-    /// reconstruct the raw `${…}` text for a deferred bad-substitution.
+    /// Byte slice of the base source from `start` to the current offset. Used to
+    /// reconstruct the raw `${…}` text for a deferred bad-substitution. v266:
+    /// base-only — a raw-slice reconstruction is not expected to straddle an
+    /// injected alias body (a malformed `${` inside an alias body is out of
+    /// scope; see the module note). Debug builds assert the assumption.
     pub fn slice_from(&self, start: usize) -> &str {
+        debug_assert!(self.injected.is_empty(), "slice_from must not straddle an injected alias body");
         &self.s[start..self.pos]
     }
 
     /// Reposition the cursor to a byte offset with explicit line/column, clearing
     /// any pending 1-char peek. Used by `Lexer::rewind` to re-lex from a checkpoint.
+    /// v266: base-only — mark/rewind is not expected to straddle an injected alias
+    /// body (the only live command-path rewind is the arith `$((`-bail, which does
+    /// not occur mid-alias-body in practice; see the module note). Debug builds
+    /// assert the assumption.
     pub fn seek(&mut self, offset: usize, line: u32, column: u32) {
+        debug_assert!(self.injected.is_empty(), "seek must not straddle an injected alias body");
         self.pos = offset;
         self.line = line;
         self.column = column;
@@ -108,10 +223,24 @@ impl<'a> CharCursor<'a> {
     ///
     /// Bounded: scans at most `n+1` chars forward; does NOT advance `pos` or modify
     /// `peeked`.  Never panics — returns `None` when fewer than `n+1` chars remain.
+    /// v266: reads the topmost injected frame with content (a buffered `peeked`
+    /// equals `body[pos]`, so reading `body[pos..]` covers it); does not chain a
+    /// bounded lookahead across a frame boundary into the parent (alias bodies do
+    /// not end mid-lookahead in practice).
     pub fn peek_nth(&self, n: usize) -> Option<char> {
-        // `self.pos` always points at the raw byte offset of the next character
-        // (the `peeked` buffer, if any, starts at `self.pos`).
-        let mut it = self.s[self.pos..].chars();
+        let src: &str = {
+            let mut chosen: Option<&str> = None;
+            for f in self.injected.iter().rev() {
+                if f.pos < f.body.len() {
+                    chosen = Some(&f.body[f.pos..]);
+                    break;
+                }
+            }
+            // `self.pos` always points at the raw byte offset of the next char
+            // (the base `peeked` buffer, if any, starts at `self.pos`).
+            chosen.unwrap_or(&self.s[self.pos..])
+        };
+        let mut it = src.chars();
         for _ in 0..n {
             it.next()?;
         }
@@ -122,6 +251,23 @@ impl<'a> CharCursor<'a> {
 impl Iterator for CharCursor<'_> {
     type Item = char;
     fn next(&mut self) -> Option<char> {
+        // v266: pop fully-exhausted injected frames (their bodies are drained);
+        // dropping a frame releases its alias from the recursion guard, since the
+        // guard derives membership from the live stack (`injected_has_alias`).
+        while self.injected.last().is_some_and(Injected::exhausted) {
+            self.injected.pop();
+        }
+        if let Some(f) = self.injected.last_mut() {
+            if let Some(c) = f.peeked.take() {
+                f.pos += f.peeked_len;
+                f.peeked_len = 0;
+                return Some(c);
+            }
+            // Not exhausted (the pop loop above guaranteed remaining content).
+            let c = f.body[f.pos..].chars().next().expect("injected frame has content");
+            f.pos += c.len_utf8();
+            return Some(c);
+        }
         if let Some(c) = self.peeked.take() {
             self.pos += self.peeked_len;
             self.peeked_len = 0;
@@ -186,11 +332,9 @@ pub enum CaseDirection {
     Lower,  // , / ,,
 }
 
-#[allow(dead_code)] // Phase C atoms; dormant in v241
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubstKind { First, All, Prefix, Suffix }   // / , // , /# , /%
 
-#[allow(dead_code)] // Phase C atoms; dormant in v241
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParamOpKind {
     UseDefault(bool), AssignDefault(bool), ErrorIfUnset(bool), UseAlternate(bool), // bool = colon-prefixed
@@ -586,30 +730,6 @@ pub struct LexerOptions {
     pub in_dquote: bool,
 }
 
-impl LexerOptions {
-    /// Returns a copy with `in_dquote` set — used to seed the extquote
-    /// double-quote context for a pattern-operand re-parse.
-    fn with_in_dquote(self, b: bool) -> Self {
-        LexerOptions { in_dquote: b, ..self }
-    }
-}
-
-/// Raw output of the partial tokenizer: the spanned `tokens` (each carrying its
-/// own start `Span`) and an optional trailing lex error + the byte offset where
-/// lexing failed.
-type PartialTokens = (Vec<Token>, Option<(LexError, usize)>);
-
-/// Back-compat entry: lexes with all options off (current behavior).
-pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
-    tokenize_with_opts(input, LexerOptions::default())
-}
-
-pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>, LexError> {
-    match tokenize_partial(input, opts) {
-        (tokens, None) => Ok(tokens),
-        (_, Some((e, _off))) => Err(e),
-    }
-}
 
 /// Core tokenizer body. `brace_expand` controls whether unquoted braces are
 /// expanded into multiple Words (`true` for normal command words) or left as
@@ -670,10 +790,8 @@ pub(crate) enum ArithDelim { Paren, Bracket }
 /// `Command`; the other variants are forward declarations for later Phase C
 /// iterations and are never the active mode in production yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // variants used in Phase C iterations; dormant in v240
 pub(crate) enum Mode {
-    Command,        // default: today's scan_step body (the ONLY mode implemented in v240)
-    Subshell,       // ( … )
+    Command,        // default command-position scanner (emits atoms)
     CommandSub { body_started: bool },  // $( … ) / `…`
     Backtick { depth: u32 },           // `…` — v245; depth tracks nested `` `\`…\`` `` escaping
     // `seen_name` — set once the NAME atom (or length/indirect prefix's name)
@@ -700,7 +818,6 @@ pub(crate) enum Mode {
     Arith { paren_depth: u32, in_squote: bool, in_dquote: bool, body_started: bool, for_header: bool, delim: ArithDelim }, // $(( … )) / (( … )) / for (( … )) / $[ … ]
     DoubleQuote { body_started: bool }, // "…" — v247 T3 (parser-driven word-level mode)
     ArrayLiteral { body_started: bool, expect_subscript_eq: bool, at_element_start: bool },   // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal).
-    DoubleBracket,  // [[ … ]]
     Regex { paren_depth: u32, body_started: bool },  // v254: RHS of =~ inside [[ … ]]
     /// v264: an extglob group `<prefix>( … )` (`?(...)`/`*(...)`/`+(...)`/
     /// `@(...)`/`!(...)`, gated by `LexerOptions::extglob`). `paren_depth == 0`
@@ -708,7 +825,6 @@ pub(crate) enum Mode {
     /// char + `(` and sets it to 1; the group closes (and this mode is popped)
     /// when a `)` brings `paren_depth` back to 0.
     Extglob { paren_depth: u32 },
-    HeredocBody,    // <<EOF …
 }
 
 /// A checkpoint of the lexer's scanning state. `rewind` restores it and re-lexes
@@ -801,7 +917,6 @@ pub struct Lexer<'a> {
     /// call-sites as a parameter) so no caller signature changes.
     parsed_heredoc_bodies: Vec<Word>,
     aliases: std::collections::HashMap<String, String>,
-    active: std::collections::HashSet<String>,
     /// Carries bash's trailing-blank rule across one expansion: a body ending in
     /// whitespace makes the NEXT word command-position eligible.
     alias_trailing_eligible: bool,
@@ -817,11 +932,6 @@ pub struct Lexer<'a> {
     /// `Mark`/restored by `rewind` so a rewind that spans setting it stays
     /// consistent.
     retokenize_arith_as_cmdsub: bool,
-    /// v247: when true, `Mode::Command` scans via `scan_step_command_atoms`
-    /// (emits word-atoms + `Blank` + structural tokens) instead of the
-    /// Word-emitting `scan_step_command`. Default false (production). Set only by
-    /// the dormant atom path (differential harness + the eventual live flip).
-    command_atoms: bool,
     /// v247 T3: true when the next command-word atom begins a fresh word (i.e.
     /// the previous atom was a `Blank`/start-of-input). Mirrors the oracle's
     /// `!has_token` guard: a `~` is tilde-special only at word start; mid-word
@@ -876,11 +986,9 @@ impl<'a> Lexer<'a> {
             emitting_heredoc: None,
             parsed_heredoc_bodies: Vec::new(),
             aliases: std::collections::HashMap::new(),
-            active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
             retokenize_arith_as_cmdsub: false,
-            command_atoms: false,
             cmd_at_word_start: true,
             assign_val_tilde_ok: false,
             heredoc_gen: 0,
@@ -950,12 +1058,10 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    #[allow(dead_code)] // called by parser in Phase C iterations; dormant in v240
     pub(crate) fn push_mode(&mut self, m: Mode) {
         self.modes.push(m);
     }
 
-    #[allow(dead_code)] // called by parser in Phase C iterations; dormant in v240
     pub(crate) fn pop_mode(&mut self) -> Mode {
         // Guard BEFORE popping so the floor is protected even in release builds:
         // popping the last element would leave `modes` empty and make the next
@@ -979,7 +1085,6 @@ impl<'a> Lexer<'a> {
     /// Arm the one-shot v246 wrinkle flag: the next `$((` the CommandSub scanner
     /// sees is tokenized as `$(` + a subshell `(` rather than deferred as arith.
     /// Cleared the moment `scan_step_command_sub` consumes that `$(`.
-    #[allow(dead_code)] // called by parser in Phase C iterations; dormant in v240
     pub(crate) fn set_retokenize_arith_as_cmdsub(&mut self) {
         self.retokenize_arith_as_cmdsub = true;
     }
@@ -991,7 +1096,6 @@ impl<'a> Lexer<'a> {
     /// NOTE: `mark`/`rewind` must not span heredoc-body collection —
     /// `pending_heredocs` is intentionally not captured; that interaction is
     /// designed when heredocs enter the mode stack.
-    #[allow(dead_code)] // dormant until parser calls it in Phase C iterations
     pub(crate) fn mark(&self) -> Mark {
         debug_assert!(
             self.current.is_empty() && self.parts.is_empty() && !self.has_token,
@@ -1025,7 +1129,6 @@ impl<'a> Lexer<'a> {
     /// cursor back, and restore flags + mode stack. The next pull re-lexes from
     /// the checkpoint under the now-current mode. A replay (`from_tokens`) lexer
     /// never scans, so history is left intact and only `pos`/flags are reset.
-    #[allow(dead_code)] // dormant until parser calls it in Phase C iterations
     pub(crate) fn rewind(&mut self, m: &Mark) {
         debug_assert!(m.pos <= self.history.len(), "rewind target beyond history");
         // Like `mark`, `rewind` is only valid at a pull boundary: it does not
@@ -1062,8 +1165,7 @@ impl<'a> Lexer<'a> {
     /// forward declarations (never pushed in production).
     fn scan_step(&mut self) -> Result<Step, LexError> {
         match self.current_mode() {
-            Mode::Command if self.command_atoms => self.scan_step_command_atoms(),
-            Mode::Command => self.scan_step_command(),
+            Mode::Command => self.scan_step_command_atoms(),
             Mode::ParamExpansion { .. } => self.scan_step_param_head(),
             Mode::ParamWordOperand            { in_dquote, enclosing_dquote } => self.scan_step_param_operand(None,      '}', in_dquote, enclosing_dquote),
             Mode::ParamSubstPatternOperand    { in_dquote, enclosing_dquote } => self.scan_step_param_operand(Some('/'), '}', in_dquote, enclosing_dquote),
@@ -1078,7 +1180,6 @@ impl<'a> Lexer<'a> {
                 self.scan_step_array_literal(body_started, expect_subscript_eq, at_element_start),
             Mode::Regex { paren_depth, body_started } => self.scan_step_regex(paren_depth, body_started),
             Mode::Extglob { paren_depth } => self.scan_step_extglob(paren_depth),
-            other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
 
@@ -2035,23 +2136,19 @@ impl<'a> Lexer<'a> {
     /// `$( … )` body directly; routing through the guarded entry would instead
     /// re-enter heredoc-body emission and error `UnsupportedExpansion` (v264).
     fn scan_step_command_body(&mut self) -> Result<Step, LexError> {
-        if self.command_atoms {
-            // A heredoc registered WITHIN this cmdsub/backtick body (`$(sh <<B …)`)
-            // triggers emission at THIS depth; its body must be emitted here (the
-            // guarded `scan_step_command_atoms` entry is only reached at the
-            // `Mode::Command` floor, never for a pushed body mode). Gate on the
-            // trigger depth so an ENCLOSING expanding heredoc — whose body merely
-            // CONTAINS this cmdsub and which triggered at a shallower depth — does
-            // NOT divert here (its cmdsub body is real command text).
-            if let Some(state) = self.emitting_heredoc.as_ref() {
-                if state.trigger_depth == self.modes.len() {
-                    return self.scan_step_heredoc_body();
-                }
+        // A heredoc registered WITHIN this cmdsub/backtick body (`$(sh <<B …)`)
+        // triggers emission at THIS depth; its body must be emitted here (the
+        // guarded `scan_step_command_atoms` entry is only reached at the
+        // `Mode::Command` floor, never for a pushed body mode). Gate on the
+        // trigger depth so an ENCLOSING expanding heredoc — whose body merely
+        // CONTAINS this cmdsub and which triggered at a shallower depth — does
+        // NOT divert here (its cmdsub body is real command text).
+        if let Some(state) = self.emitting_heredoc.as_ref() {
+            if state.trigger_depth == self.modes.len() {
+                return self.scan_step_heredoc_body();
             }
-            self.scan_step_command_atoms_core()
-        } else {
-            self.scan_step_command()
         }
+        self.scan_step_command_atoms_core()
     }
 
     fn scan_step_command_sub(&mut self, body_started: bool) -> Result<Step, LexError> {
@@ -2676,640 +2773,6 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
-    }
-
-    /// Exactly ONE iteration of the old scan loop: advance the cursor and append
-    /// 0..N tokens to `self.history`. Returns `Produced` while input remains (the
-    /// old `continue` / fall-through), or routes to `finish()` at end of input
-    /// (the old EOF `break`). `?` errors propagate unchanged.
-    fn scan_step_command(&mut self) -> Result<Step, LexError> {
-        // When `$glued` (no whitespace between the just-flushed Word and the
-        // redirect operator about to be pushed), and that trailing Word is a pure
-        // digit-run or `{ident}`, replace it with a `TokenKind::RedirFd` occupying the
-        // same span. Must be
-        // invoked AFTER the preceding word has been flushed and BEFORE the operator
-        // token is pushed.
-        macro_rules! take_fd_prefix {
-            ($glued:expr) => {{
-                if $glued {
-                    if let Some(fd) = fd_prefix_of(self.history.last().map(|t| &t.kind)) {
-                        // Replace the digit/`{n}` word with a RedirFd at the SAME span.
-                        let span = self.history.pop().expect("fd-prefix word present").span;
-                        self.history.push(Token::new(TokenKind::RedirFd(fd), span));
-                    }
-                }
-            }};
-        }
-        // `=~` regex operand inside `[[ … ]]`: once `self.expect_regex` is armed and
-        // the next char is the operand's first (non-whitespace) char, scan the
-        // whole operand as one literal regex Word. Whitespace between `=~` and
-        // the operand falls through to the normal loop (which skips it and keeps
-        // `self.expect_regex` set). Branching before `self.cursor.next()` keeps the emitted
-        // offset exactly at the operand's first byte.
-        if self.expect_regex {
-            if let Some(&ch) = self.cursor.peek() {
-                if ch.is_whitespace() {
-                    // skip leading whitespace via the normal path below
-                } else {
-                    self.expect_regex = false;
-                    // The operand's first byte. Push the Word directly (NOT via
-                    // emit_word_with_braces) so no brace expansion applies.
-                    let operand_start = self.cursor.offset();
-                    let operand_line = self.cursor.line();
-                    let operand_col = self.cursor.column();
-                    let operand_parts = scan_regex_operand(&mut self.cursor, self.opts)?;
-                    self.history.push(Token::new(TokenKind::Word(Word(operand_parts)), Span::new(operand_start, operand_line, operand_col)));
-                    self.has_token = false;
-                    return Ok(Step::Produced);
-                }
-            } else {
-                return self.finish();
-            }
-        }
-        let c_off = self.cursor.offset();
-        let c_line = self.cursor.line();
-        let c_col = self.cursor.column();
-        let c = match self.cursor.next() {
-            Some(c) => c,
-            None => return self.finish(),
-        };
-        if c.is_whitespace() {
-            if self.has_token {
-                flush_literal(&mut self.parts, &mut self.current, false);
-                debug_assert!(
-                    !self.parts.is_empty(),
-                    "lexer invariant: has_token was true but no parts were emitted"
-                );
-                let kw = single_unquoted_literal(&self.parts).map(str::to_owned);
-                emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
-                match kw.as_deref() {
-                    Some("[[") => self.dbracket_depth += 1,
-                    Some("]]") => self.dbracket_depth = self.dbracket_depth.saturating_sub(1),
-                    Some("=~") if self.dbracket_depth > 0 => self.expect_regex = true,
-                    _ => {}
-                }
-                self.has_token = false;
-                self.in_assignment_value = false;
-            }
-            if c == '\n' {
-                // If there are pending heredocs, collect their bodies now
-                // before emitting the Newline token.
-                if !self.pending_heredocs.is_empty() {
-                    collect_heredoc_bodies(&mut self.cursor, &mut self.pending_heredocs, &mut self.history, self.opts, &mut self.parsed_heredoc_bodies, self.command_atoms)?;
-                }
-                self.history.push(Token::new(TokenKind::Newline, Span::new(c_off, c_line, c_col)));
-            }
-            return Ok(Step::Produced);
-        }
-
-        // Record the start byte offset of a word as soon as its first char is
-        // seen. When `self.has_token` is false at the top of an iteration, this char
-        // is a candidate first char; operator arms (which leave `self.has_token`
-        // false) simply overwrite `self.token_start` on the next iteration, while
-        // word arms read the value captured at the word's true first char.
-        if !self.has_token {
-            self.token_start = c_off;
-            self.token_start_line = c_line;
-            self.token_start_col = c_col;
-        }
-
-        // extglob (`shopt -s extglob`): one of `? * + @ !` directly followed
-        // by `(` introduces a balanced parenthesised group (`+(a|b)`), lexed
-        // as a single literal word part. Checked before the normal
-        // `?`/`*`/`(` handling so the group is recognized first. With extglob
-        // off, this branch never fires and lexing is byte-identical.
-        if self.opts.extglob && matches!(c, '?' | '*' | '+' | '@' | '!') && self.cursor.peek() == Some(&'(') {
-            self.has_token = true;
-            flush_literal(&mut self.parts, &mut self.current, false);
-            let group_parts = scan_extglob_group(c, &mut self.cursor, self.opts)?;
-            self.parts.extend(group_parts);
-            return Ok(Step::Produced);
-        }
-
-        match c {
-            '\'' => {
-                self.has_token = true;
-                flush_literal(&mut self.parts, &mut self.current, false);
-                let mut run: Vec<WordPart> = Vec::new();
-                let mut buf = String::new();
-                loop {
-                    match self.cursor.next() {
-                        Some('\'') => break,
-                        Some(ch) => buf.push(ch),
-                        None => return Err(LexError::UnterminatedQuote),
-                    }
-                }
-                // empty '' still yields one empty quoted Literal (empty-token contract)
-                run.push(WordPart::Literal { text: buf, quoted: true });
-                self.parts.push(WordPart::Quoted { style: QuoteStyle::Single, parts: run });
-            }
-            '"' => {
-                self.has_token = true;
-                flush_literal(&mut self.parts, &mut self.current, false);
-                let mut run: Vec<WordPart> = Vec::new();
-                let mut qbuf = String::new();
-                loop {
-                    match self.cursor.next() {
-                        Some('"') => break,
-                        Some('\\') => match self.cursor.next() {
-                            // POSIX: inside `"..."`, backslash is special only
-                            // before `$`, `, `"`, `\`, and newline. For other
-                            // characters, the backslash is retained literally.
-                            Some(esc @ ('"' | '\\' | '$' | '`')) => qbuf.push(esc),
-                            // POSIX 2.2.3: `\<NL>` inside double quotes is also
-                            // line continuation — both characters deleted.
-                            Some('\n') => {}
-                            Some(other) => {
-                                qbuf.push('\\');
-                                qbuf.push(other);
-                            }
-                            None => return Err(LexError::UnterminatedQuote),
-                        },
-                        Some('$') => {
-                            // Expansion inside double quotes (quoted: true).
-                            flush_literal(&mut run, &mut qbuf, true);
-                            scan_dollar_expansion(&mut self.cursor, &mut run, true, self.opts)?;
-                        }
-                        Some('`') => {
-                            // Backtick substitution inside double quotes (quoted: true).
-                            flush_literal(&mut run, &mut qbuf, true);
-                            let sequence = scan_backtick_substitution(&mut self.cursor, self.opts)?;
-                            run.push(WordPart::CommandSub { sequence, quoted: true });
-                        }
-                        Some(ch) => qbuf.push(ch),
-                        None => return Err(LexError::UnterminatedQuote),
-                    }
-                }
-                flush_literal(&mut run, &mut qbuf, true);
-                if run.is_empty() {
-                    // Empty `""` — preserve the empty-token contract by
-                    // emitting an empty quoted Literal.
-                    run.push(WordPart::Literal { text: String::new(), quoted: true });
-                }
-                self.parts.push(WordPart::Quoted { style: QuoteStyle::Double, parts: run });
-            }
-            '\\' => match self.cursor.next() {
-                Some('\n') => {
-                    // POSIX 2.2.1: `\<NL>` is line continuation — both chars
-                    // are deleted. `has_token` stays at its current value, so
-                    // `echo\<NL>foo` becomes the single word "echofoo" while
-                    // `echo \<NL>foo` keeps the space-driven separation.
-                }
-                Some(ch) => {
-                    // Flush any accumulated unquoted text, then push the
-                    // escaped char as a one-char quoted Literal wrapped in a
-                    // Backslash run. This is what makes `\*` survive pathname
-                    // expansion as a literal `*` (the `quoted` flag inhibits
-                    // globbing) while recording the backslash quote style for
-                    // byte-exact reconstruction.
-                    self.has_token = true;
-                    flush_literal(&mut self.parts, &mut self.current, false);
-                    self.parts.push(WordPart::Quoted {
-                        style: QuoteStyle::Backslash,
-                        parts: vec![WordPart::Literal { text: ch.to_string(), quoted: true }],
-                    });
-                }
-                None => {
-                    self.has_token = true;
-                    self.current.push('\\');
-                }
-            },
-            '$' => {
-                // Expansion outside any quotes (quoted: false).
-                self.has_token = true;
-                flush_literal(&mut self.parts, &mut self.current, false);
-                scan_dollar_expansion(&mut self.cursor, &mut self.parts, false, self.opts)?;
-            }
-            '#' if !self.has_token => {
-                // POSIX: an unquoted `#` that begins a word starts a comment to
-                // end-of-line. `#` mid-word (self.has_token) falls through as literal.
-                skip_line_comment(&mut self.cursor);
-            }
-            '~' if !self.has_token || tilde_eligible_in_assignment(self.in_assignment_value, &self.current) => {
-                if let Some(spec) = try_parse_tilde(&mut self.cursor, self.in_assignment_value, false) {
-                    flush_literal(&mut self.parts, &mut self.current, false);
-                    self.has_token = true;
-                    self.parts.push(WordPart::Tilde(spec));
-                } else {
-                    // Fall through: treat '~' as literal.
-                    self.current.push('~');
-                    self.has_token = true;
-                }
-            }
-            '`' => {
-                self.has_token = true;
-                flush_literal(&mut self.parts, &mut self.current, false);
-                let sequence = scan_backtick_substitution(&mut self.cursor, self.opts)?;
-                self.parts.push(WordPart::CommandSub { sequence, quoted: false });
-            }
-            '|' => {
-                if self.has_token {
-                    flush_literal(&mut self.parts, &mut self.current, false);
-                    emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
-                    self.has_token = false;
-                }
-                if self.cursor.peek() == Some(&'|') {
-                    self.cursor.next();
-                    self.history.push(Token::new(TokenKind::Op(Operator::Or), Span::new(c_off, c_line, c_col)));
-                } else if self.cursor.peek() == Some(&'&') {
-                    // `|&` is bash shorthand for `2>&1 |`: merge the left command's
-                    // stderr into the pipe, then pipe. Desugar at the token level so
-                    // the existing pipeline/redirect machinery (incl. v176
-                    // compound-stage redirects) handles it unchanged.
-                    self.cursor.next(); // consume the '&' of `|&`
-                    self.history.push(Token::new(TokenKind::RedirFd(crate::command::RedirFd::Number(2)), Span::new(c_off, c_line, c_col)));
-                    self.history.push(Token::new(TokenKind::Op(Operator::DupOut), Span::new(c_off, c_line, c_col)));
-                    self.history.push(Token::new(TokenKind::Word(Word(vec![WordPart::Literal {
-                        text: "1".to_string(),
-                        quoted: false,
-                    }])), Span::new(c_off, c_line, c_col)));
-                    self.history.push(Token::new(TokenKind::Op(Operator::Pipe), Span::new(c_off, c_line, c_col)));
-                } else {
-                    self.history.push(Token::new(TokenKind::Op(Operator::Pipe), Span::new(c_off, c_line, c_col)));
-                }
-                self.in_assignment_value = false;
-            }
-            '&' => {
-                if self.has_token {
-                    flush_literal(&mut self.parts, &mut self.current, false);
-                    emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
-                    self.has_token = false;
-                }
-                if self.cursor.peek() == Some(&'&') {
-                    self.cursor.next();
-                    self.history.push(Token::from(TokenKind::Op(Operator::And)));
-                } else if self.cursor.peek() == Some(&'>') {
-                    self.cursor.next();
-                    if self.cursor.peek() == Some(&'>') {
-                        self.cursor.next();
-                        self.history.push(Token::from(TokenKind::Op(Operator::AndRedirAppend)));
-                    } else {
-                        self.history.push(Token::from(TokenKind::Op(Operator::AndRedirOut)));
-                    }
-                } else {
-                    self.history.push(Token::from(TokenKind::Op(Operator::Background)));
-                }
-                if let Some(t) = self.history.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
-                self.in_assignment_value = false;
-            }
-            ';' => {
-                if self.has_token {
-                    flush_literal(&mut self.parts, &mut self.current, false);
-                    emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
-                    self.has_token = false;
-                }
-                let op = if self.cursor.peek() == Some(&';') {
-                    self.cursor.next();
-                    if self.cursor.peek() == Some(&'&') {
-                        self.cursor.next();
-                        Operator::DoubleSemiAmp
-                    } else {
-                        Operator::DoubleSemi
-                    }
-                } else if self.cursor.peek() == Some(&'&') {
-                    self.cursor.next();
-                    Operator::SemiAmp
-                } else {
-                    Operator::Semi
-                };
-                self.history.push(Token::new(TokenKind::Op(op), Span::new(c_off, c_line, c_col)));
-                self.in_assignment_value = false;
-            }
-            '(' => {
-                if self.has_token {
-                    flush_literal(&mut self.parts, &mut self.current, false);
-                    emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
-                    self.has_token = false;
-                }
-                // Detect `((` (contiguous, no whitespace). The peek/next
-                // sequence below consumes the second `(` only when present.
-                // Whitespace between the two `(` is already consumed by the
-                // outer loop's whitespace handling — so by the time we get
-                // here, a second `(` means they were truly adjacent.
-                if self.cursor.peek() == Some(&'(') {
-                    // `((` is an arithmetic command ONLY if a matching `))` is
-                    // found; otherwise bash treats it as nested subshells `( (`.
-                    // Save the cursor at the second `(`, try the arith block, and
-                    // on failure rewind + emit a single LParen (the first `(`); the
-                    // second `(` then re-lexes as another LParen. A `((` that DOES
-                    // close as `))` but isn't valid arithmetic stays an ArithBlock
-                    // → arith error at parse/eval, matching bash. Mirrors the v177
-                    // `$((` disambiguation.
-                    let saved = self.cursor.clone();
-                    self.cursor.next(); // consume the second `(`
-                    match scan_arith_block(&mut self.cursor) {
-                        Ok(body) => self.history.push(Token::from(TokenKind::ArithBlock(body, self.opts))),
-                        Err(_) => {
-                            self.cursor = saved;
-                            self.history.push(Token::from(TokenKind::Op(Operator::LParen)));
-                        }
-                    }
-                } else {
-                    self.history.push(Token::from(TokenKind::Op(Operator::LParen)));
-                }
-                if let Some(t) = self.history.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
-                self.in_assignment_value = false;
-            }
-            ')' => {
-                if self.has_token {
-                    flush_literal(&mut self.parts, &mut self.current, false);
-                    emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
-                    self.has_token = false;
-                }
-                self.history.push(Token::new(TokenKind::Op(Operator::RParen), Span::new(c_off, c_line, c_col)));
-                self.in_assignment_value = false;
-            }
-            '<' => {
-                // `glued` = a Word was being accumulated with no intervening
-                // whitespace before this operator. Captured before the flush.
-                let glued = self.has_token;
-                if self.has_token {
-                    flush_literal(&mut self.parts, &mut self.current, false);
-                    emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
-                    self.has_token = false;
-                }
-                if self.cursor.peek() == Some(&'<') {
-                    self.cursor.next(); // consume second '<'
-                    if self.cursor.peek() == Some(&'<') {
-                        self.cursor.next(); // consume third '<' — here-string
-                        take_fd_prefix!(glued);
-                        self.history.push(Token::from(TokenKind::Op(Operator::HereString)));
-                    } else {
-                        let strip_tabs = if self.cursor.peek() == Some(&'-') {
-                            self.cursor.next(); // consume '-'
-                            true
-                        } else {
-                            false
-                        };
-                        // Parse the delimiter word and detect literal vs expanding mode.
-                        let (delim, expand) = parse_heredoc_delim(&mut self.cursor)?;
-                        // A glued fd-prefix (`3<<EOF`) becomes a RedirFd token
-                        // before the heredoc placeholder.
-                        take_fd_prefix!(glued);
-                        // Push a placeholder TokenKind::Heredoc with empty body.
-                        // The body is back-patched after the line's \n.
-                        let placeholder_idx = self.history.len();
-                        self.history.push(Token::from(TokenKind::Heredoc {
-                            body: Word(Vec::new()),
-                            expand,
-                            strip_tabs,
-                        }));
-                        self.pending_heredocs.push_back(PendingHeredoc {
-                            delim,
-                            expand,
-                            strip_tabs,
-                            token_idx: placeholder_idx,
-                            reg_depth: self.modes.len(), // unused by the oracle queue
-                        });
-                    }
-                    if let Some(t) = self.history.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
-                    self.in_assignment_value = false;
-                } else if self.cursor.peek() == Some(&'(') {
-                    // `<(cmd)` — process substitution. Consume the `(` and scan the
-                    // inner command body exactly like `$(…)`. The result is a word
-                    // part on the CURRENT word (not a standalone redirect operator).
-                    self.cursor.next(); // consume '('
-                    let sequence = scan_paren_substitution(&mut self.cursor, self.opts)?;
-                    if !self.has_token {
-                        self.token_start = c_off;
-                        self.token_start_line = c_line;
-                    }
-                    self.has_token = true;
-                    self.parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::In });
-                    self.in_assignment_value = false;
-                } else if self.cursor.peek() == Some(&'&') {
-                    self.cursor.next();
-                    take_fd_prefix!(glued);
-                    self.history.push(Token::new(TokenKind::Op(Operator::DupIn), Span::new(c_off, c_line, c_col)));
-                    self.in_assignment_value = false;
-                } else if self.cursor.peek() == Some(&'>') {
-                    self.cursor.next();
-                    take_fd_prefix!(glued);
-                    self.history.push(Token::new(TokenKind::Op(Operator::RedirReadWrite), Span::new(c_off, c_line, c_col)));
-                    self.in_assignment_value = false;
-                } else {
-                    take_fd_prefix!(glued);
-                    self.history.push(Token::new(TokenKind::Op(Operator::RedirIn), Span::new(c_off, c_line, c_col)));
-                    self.in_assignment_value = false;
-                }
-            }
-            '>' => {
-                let glued = self.has_token;
-                if self.has_token {
-                    flush_literal(&mut self.parts, &mut self.current, false);
-                    emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
-                    self.has_token = false;
-                }
-                if self.cursor.peek() == Some(&'>') {
-                    self.cursor.next();
-                    take_fd_prefix!(glued);
-                    self.history.push(Token::new(TokenKind::Op(Operator::RedirAppend), Span::new(c_off, c_line, c_col)));
-                    self.in_assignment_value = false;
-                } else if self.cursor.peek() == Some(&'&') {
-                    self.cursor.next();
-                    take_fd_prefix!(glued);
-                    self.history.push(Token::new(TokenKind::Op(Operator::DupOut), Span::new(c_off, c_line, c_col)));
-                    self.in_assignment_value = false;
-                } else if self.cursor.peek() == Some(&'|') {
-                    self.cursor.next();
-                    take_fd_prefix!(glued);
-                    self.history.push(Token::new(TokenKind::Op(Operator::RedirClobber), Span::new(c_off, c_line, c_col)));
-                    self.in_assignment_value = false;
-                } else if self.cursor.peek() == Some(&'(') {
-                    // `>(cmd)` — process substitution. Consume the `(` and scan the
-                    // inner command body exactly like `$(…)`. The result is a word
-                    // part on the CURRENT word (not a standalone redirect operator).
-                    self.cursor.next(); // consume '('
-                    let sequence = scan_paren_substitution(&mut self.cursor, self.opts)?;
-                    if !self.has_token {
-                        self.token_start = c_off;
-                        self.token_start_line = c_line;
-                    }
-                    self.has_token = true;
-                    self.parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::Out });
-                    self.in_assignment_value = false;
-                } else {
-                    take_fd_prefix!(glued);
-                    self.history.push(Token::new(TokenKind::Op(Operator::RedirOut), Span::new(c_off, c_line, c_col)));
-                    self.in_assignment_value = false;
-                }
-            }
-            '1' if !self.has_token && self.cursor.peek() == Some(&'>') => {
-                self.cursor.next();
-                if self.cursor.peek() == Some(&'>') {
-                    self.cursor.next();
-                    self.history.push(Token::from(TokenKind::Op(Operator::RedirAppend)));
-                } else if self.cursor.peek() == Some(&'&') {
-                    self.cursor.next();
-                    self.history.push(Token::from(TokenKind::Op(Operator::DupOut)));
-                } else if self.cursor.peek() == Some(&'|') {
-                    self.cursor.next();
-                    self.history.push(Token::from(TokenKind::Op(Operator::RedirClobber)));
-                } else {
-                    self.history.push(Token::from(TokenKind::Op(Operator::RedirOut)));
-                }
-                if let Some(t) = self.history.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
-                self.in_assignment_value = false;
-            }
-            '2' if !self.has_token && self.cursor.peek() == Some(&'>') => {
-                self.cursor.next();
-                if self.cursor.peek() == Some(&'>') {
-                    self.cursor.next();
-                    self.history.push(Token::from(TokenKind::Op(Operator::RedirErrAppend)));
-                } else if self.cursor.peek() == Some(&'&') {
-                    self.cursor.next();
-                    self.history.push(Token::from(TokenKind::Op(Operator::DupErr)));
-                } else if self.cursor.peek() == Some(&'|') {
-                    self.cursor.next();
-                    self.history.push(Token::from(TokenKind::Op(Operator::RedirErrClobber)));
-                } else {
-                    self.history.push(Token::from(TokenKind::Op(Operator::RedirErr)));
-                }
-                if let Some(t) = self.history.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
-                self.in_assignment_value = false;
-            }
-            '=' if !self.in_assignment_value && word_is_identifier_so_far(&self.current, &self.parts) => {
-                self.in_assignment_value = true;
-                self.has_token = true;
-                self.current.push('=');
-                // Compound RHS: `name=(...)`. Scan the array literal as
-                // a single WordPart that becomes the value.
-                // A `\<NL>` line continuation may sit between `=` and the array
-                // `(` (`arr=\<NL>(…)`); bash deletes it pre-tokenization.
-                skip_line_continuations(&mut self.cursor);
-                if self.cursor.peek() == Some(&'(') {
-                    self.cursor.next(); // consume '('
-                    flush_literal(&mut self.parts, &mut self.current, false);
-                    let elements = scan_array_literal(&mut self.cursor, self.opts)?;
-                    self.parts.push(WordPart::ArrayLiteral(elements));
-                }
-            }
-            // `+=`: scalar-or-array append assignment when the prefix is
-            // identifier-shaped. Emits an AssignPrefix(Bare, append=true)
-            // prefix Word.
-            '+' if !self.in_assignment_value
-                && self.cursor.peek() == Some(&'=')
-                && word_is_identifier_so_far(&self.current, &self.parts) =>
-            {
-                self.cursor.next(); // consume '='
-                self.in_assignment_value = true;
-                self.has_token = true;
-                // Bake the accumulated identifier text into the target.
-                let name = std::mem::take(&mut self.current);
-                debug_assert!(
-                    self.parts.is_empty(),
-                    "word_is_identifier_so_far guarantees no prior parts"
-                );
-                self.parts.push(WordPart::AssignPrefix {
-                    target: crate::command::AssignTarget::Bare(name),
-                    append: true,
-                });
-                // Compound RHS: `name+=(...)`.
-                skip_line_continuations(&mut self.cursor);
-                if self.cursor.peek() == Some(&'(') {
-                    self.cursor.next();
-                    let elements = scan_array_literal(&mut self.cursor, self.opts)?;
-                    self.parts.push(WordPart::ArrayLiteral(elements));
-                }
-            }
-            // Subscripted lvalue: `name[expr]=…` or `name[expr]+=…`.
-            // Only fires before the assignment value has started AND
-            // when the accumulated text is identifier-shaped. We
-            // speculatively scan the `[…]` and the optional `+`; if
-            // an `=` follows, this is an indexed assignment. Otherwise
-            // (e.g. `cmd[[foo]]`, glob-style `[abc]*`), we fall back
-            // to treating the `[` and everything we scanned as literal
-            // text so existing word semantics are preserved.
-            '[' if !self.in_assignment_value && word_is_identifier_so_far(&self.current, &self.parts) => {
-                let mut raw_subscript = String::new();
-                let mut depth: usize = 1;
-                let mut closed_subscript = false;
-                while let Some(&c) = self.cursor.peek() {
-                    if c == '[' {
-                        depth += 1;
-                        raw_subscript.push(c);
-                        self.cursor.next();
-                    } else if c == ']' {
-                        self.cursor.next();
-                        depth -= 1;
-                        if depth == 0 {
-                            closed_subscript = true;
-                            break;
-                        }
-                        raw_subscript.push(c);
-                    } else {
-                        raw_subscript.push(c);
-                        self.cursor.next();
-                    }
-                }
-                // Decide: is this an assignment? Peek for `=` or `+=`.
-                let assign_op: Option<bool> = if closed_subscript {
-                    match self.cursor.peek().copied() {
-                        Some('=') => {
-                            self.cursor.next();
-                            Some(false)
-                        }
-                        Some('+') => {
-                            // Need to peek two chars; clone iter for lookahead.
-                            let mut peeker = self.cursor.clone();
-                            peeker.next();
-                            if peeker.peek() == Some(&'=') {
-                                self.cursor.next(); // consume '+'
-                                self.cursor.next(); // consume '='
-                                Some(true)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                match assign_op {
-                    Some(append) => {
-                        let name = std::mem::take(&mut self.current);
-                        debug_assert!(
-                            self.parts.is_empty(),
-                            "word_is_identifier_so_far guarantees no prior parts"
-                        );
-                        let subscript = parse_subscript_body(&raw_subscript, self.opts)?;
-                        self.in_assignment_value = true;
-                        self.has_token = true;
-                        self.parts.push(WordPart::AssignPrefix {
-                            target: crate::command::AssignTarget::Indexed { name, subscript },
-                            append,
-                        });
-                        // Compound RHS: `name[i]=(...)`.
-                        if self.cursor.peek() == Some(&'(') {
-                            self.cursor.next();
-                            let elements = scan_array_literal(&mut self.cursor, self.opts)?;
-                            self.parts.push(WordPart::ArrayLiteral(elements));
-                        }
-                    }
-                    None => {
-                        // Not an indexed assignment. Fall back: append
-                        // the `[`, the scanned subscript text, and the
-                        // closing `]` (if any) back into the current
-                        // literal so the word behaves the same as
-                        // before this arm existed.
-                        self.has_token = true;
-                        self.current.push('[');
-                        self.current.push_str(&raw_subscript);
-                        if closed_subscript {
-                            self.current.push(']');
-                        }
-                    }
-                }
-            }
-            other => {
-                self.has_token = true;
-                self.current.push(other);
-            }
-        }
-        // Fell off the bottom of the old loop body — there is more input;
-        // signal progress so next_token() calls scan_step again.
-        Ok(Step::Produced)
     }
 
     /// v247 atom-emitting Command scanner (dormant). Built up across T2–T6:
@@ -4228,8 +3691,14 @@ impl<'a> Lexer<'a> {
                     Some(append) => {
                         // Confirmed indexed assignment. Parse the subscript (leaf
                         // helper), then advance the real cursor to where `bracket` sits.
-                        let subscript = parse_subscript_body(&raw, self.opts)?;
-                        self.cursor.seek(bracket.offset(), bracket.line(), bracket.column());
+                        let subscript = crate::parser::parse_fragment_word(&raw, self.opts)
+                            .map_err(LexError::SubscriptParseError)?;
+                        // v266: sync the real cursor to `bracket` by assignment (not
+                        // `seek`) so this works when the assignment prefix is being
+                        // lexed from an injected alias body — `bracket` carries the
+                        // full source-stack state advanced past `name[sub]=`, whereas
+                        // `seek` operates on the base offset only.
+                        self.cursor = bracket;
                         self.cmd_at_word_start = false;
                         self.in_assignment_value = true;
                         self.assign_val_tilde_ok = false; // buffer empty after the prefix
@@ -4265,7 +3734,9 @@ impl<'a> Lexer<'a> {
                         text.push('[');
                         text.push_str(&raw);
                         if closed { text.push(']'); }
-                        self.cursor.seek(bracket.offset(), bracket.line(), bracket.column());
+                        // v266: sync via assignment (see the sibling arm above) so the
+                        // literal-swallow fallback works from an injected alias body.
+                        self.cursor = bracket;
                         self.cmd_at_word_start = false;
                         self.history.push(Token::new(
                             TokenKind::Lit { text, quoted: false },
@@ -4839,6 +4310,11 @@ impl<'a> Lexer<'a> {
     /// Pull one token, scanning lazily. Hands out the next buffered token
     /// unless it is a heredoc still awaiting its body, in which case it scans
     /// further (collecting the body) first. Returns None at end of input.
+    ///
+    /// Test-only since the oracle was removed: production pulls via
+    /// `fill_to`/`next`/`peek` (which drive `scan_step` directly). Retained to
+    /// exercise the incremental single-token pull in the v238 lexer tests.
+    #[cfg(test)]
     fn next_token(&mut self) -> Result<Option<Token>, LexError> {
         loop {
             if self.pos < self.history.len() && !self.backfill_pending_at(self.pos) {
@@ -4867,40 +4343,6 @@ impl<'a> Lexer<'a> {
     #[cfg(test)]
     pub fn scanned_token_count(&self) -> usize { self.history.len() }
 
-    /// Build a replay lexer over already-tokenized input (Task 2 bridge). history is
-    /// pre-filled; scanning is a no-op so the pull never errors.
-    pub fn from_tokens(tokens: Vec<Token>) -> Lexer<'static> {
-        Lexer {
-            cursor: CharCursor::new(""),
-            opts: LexerOptions::default(),
-            brace_expand: true,
-            history: tokens,
-            pos: 0,
-            replay: true,
-            parts: Vec::new(),
-            current: String::new(),
-            has_token: false,
-            token_start: 0,
-            token_start_line: 1,
-            token_start_col: 1,
-            in_assignment_value: false,
-            dbracket_depth: 0,
-            expect_regex: false,
-            pending_heredocs: std::collections::VecDeque::new(),
-            atom_pending_heredocs: std::collections::VecDeque::new(),
-            emitting_heredoc: None,
-            parsed_heredoc_bodies: Vec::new(),
-            aliases: std::collections::HashMap::new(),
-            active: std::collections::HashSet::new(),
-            alias_trailing_eligible: false,
-            modes: vec![Mode::Command],
-            retokenize_arith_as_cmdsub: false,
-            command_atoms: false,
-            cmd_at_word_start: true,
-            assign_val_tilde_ok: false,
-            heredoc_gen: 0,
-        }
-    }
 
     /// Ensure history[idx] exists AND is backfill-ready (heredoc body present),
     /// pulling lazily via scan_step. Mirrors next_token's readiness rule so a
@@ -5020,9 +4462,22 @@ impl<'a> Lexer<'a> {
         self.token_start_line = 1 + base_line;
     }
 
-    /// Expand a registered alias at command position by splicing its body tokens into
-    /// `history` ahead of `pos`. Implements bash's read-time alias rules (recursion
-    /// guard, trailing-blank, span inheritance). Body tokens take the alias-name span.
+    /// Expand a registered alias at command position by pushing its body onto the
+    /// lexer's input-source stack (v266). Implements bash's read-time alias rules
+    /// (recursion guard, trailing-blank, span inheritance).
+    ///
+    /// The body is NOT re-lexed standalone (that would spin forever on a `$(`/`${`
+    /// opener — those atoms are zero-width signals the PARSER consumes). Instead
+    /// `CharCursor::push_injection` makes the body the active input source; the
+    /// next parser-driven pull lexes it inline, emitting normal atoms + openers
+    /// the parser drains, and the cursor pops back to the parent source at the
+    /// body's end. Every token produced while the body is active reports the
+    /// alias-NAME span (the frozen `anchor_*` on the injected frame). The
+    /// recursion guard is the live injection stack itself: `name` is "active" for
+    /// exactly as long as its body frame is on the stack, so a body whose leading
+    /// word is `name` cannot re-expand it (`injected_has_alias`), and a body
+    /// containing a `;`-separated re-use of `name` is guarded too — matching
+    /// bash's whole-body recursion prevention.
     fn maybe_expand_command_alias(&mut self) -> Result<(), LexError> {
         self.fill_to(self.pos)?;
         self.alias_trailing_eligible = false;   // default: a non-expanding word leaves it false
@@ -5039,48 +4494,72 @@ impl<'a> Lexer<'a> {
             // v264: the atom-command stream (`command_atoms`) has no `Word`
             // token at command position — the command word is a bare `Lit`
             // atom. Extract the name here; the boundary check (that this
-            // `Lit` is the ENTIRE word, nothing glued on) happens below, once
-            // the borrow of `self.history` this match holds has ended (the
-            // check itself needs `&mut self` via `fill_to`).
-            TokenKind::Lit { text, quoted: false } if self.command_atoms => {
+            // `Lit` is the ENTIRE word, nothing glued on) happens below.
+            TokenKind::Lit { text, quoted: false } => {
                 (text.clone(), true)
             }
             _ => return Ok(()),
         };
         if is_bare_atom_lit {
-            // Only a WORD BOUNDARY immediately after (`Blank`/`Newline`/
-            // `ArrayClose`/`Op(_)`/EOF) means this `Lit` is the entire command
-            // word. Any other follower atom (another `Lit`, `DollarName`,
-            // `ParamOpen`, `CmdSubOpen`, `BeginBacktick`, `BeginDquote`,
-            // `QuoteRun`, `ArithOpen`, `LegacyArithOpen`, `ProcSubOpen`,
-            // `ArrayOpen`, `Tilde`, `AssignPrefix`, `DeferredExpansion`, …)
-            // means the word has more parts and is NOT a bare literal name —
-            // mirrors `word_literal_text` returning `Some` only for a
-            // single-literal word.
-            self.fill_to(self.pos + 1)?;
-            let boundary = matches!(
-                self.history.get(self.pos + 1).map(|t| &t.kind),
-                None | Some(TokenKind::Blank)
-                    | Some(TokenKind::Newline)
-                    | Some(TokenKind::ArrayClose)
-                    | Some(TokenKind::Op(_))
-            );
+            // The `Lit` is a maximal unquoted run; it is the ENTIRE command word
+            // iff what follows it is a WORD BOUNDARY. There are two ways to read
+            // the follower, and which is correct depends on whether the parser
+            // has already looked ahead:
+            //
+            // * If a follower is ALREADY buffered (`history.len() > pos + 1`, e.g.
+            //   `case`'s `peek2` for `;;`), the char cursor sits after the LAST
+            //   buffered token — NOT after this word — so consulting it would
+            //   sample the wrong char. Read the buffered follower TOKEN instead:
+            //   boundary iff its kind is `Blank`/`Newline`/`ArrayClose`/`Op`/EOF
+            //   (the atom analogue of the old oracle follower check). Any other
+            //   atom (`Lit`/`DollarName`/`ParamOpen`/`CmdSubOpen`/`BeginDquote`/…)
+            //   means the word has more parts and is not a bare literal name.
+            // * If NOTHING is buffered past the command word (`history.len() ==
+            //   pos + 1`), the cursor sits exactly on the stop char; read it
+            //   directly (whitespace / `; | & < > ( )` / EOF). This avoids
+            //   scanning a follower into `history` ahead of the injection point
+            //   in the common no-lookahead case (a scanned follower would shift
+            //   to `pos` on `history.remove` and be emitted before the body).
+            let boundary = if self.history.len() > self.pos + 1 {
+                matches!(
+                    self.history.get(self.pos + 1).map(|t| &t.kind),
+                    None | Some(TokenKind::Blank)
+                        | Some(TokenKind::Newline)
+                        | Some(TokenKind::ArrayClose)
+                        | Some(TokenKind::Op(_))
+                )
+            } else {
+                match self.cursor.peek().copied() {
+                    None => true,
+                    Some(c) => c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')'),
+                }
+            };
             if !boundary { return Ok(()); }
         }
-        if self.active.contains(&name) { return Ok(()); }
+        // Recursion guard: `name` is active iff its body frame is still on the
+        // injection stack (derived, not a separate set) — no re-expand while
+        // mid-expansion. The leading body word is checked below during the
+        // re-drive, when this just-pushed frame is present, so it cannot loop.
+        if self.cursor.injected_has_alias(&name) { return Ok(()); }
         let Some(body) = self.aliases.get(&name).cloned() else { return Ok(()) };
-        let body_tokens = tokenize(&body)?; // bad body → Err, propagated by callers
+        // Remove the already-produced command-word `Lit`/`Word` token; the pushed
+        // body re-lexes atoms in its place. The cursor was NOT advanced past the
+        // name's follower (no `fill_to(pos+1)`), so pushing the body and reading
+        // it, then popping back, resumes the parent source exactly after `name`.
         self.history.remove(self.pos);
-        let mut insert_at = self.pos;
-        for bt in body_tokens {
-            self.history.insert(insert_at, Token::new(bt.kind, name_span));
-            insert_at += 1;
-        }
-        // Recursion guard: re-enter with `name` active so the body's own first word
-        // expands if it is a *different* alias, but `name` cannot re-expand itself.
-        self.active.insert(name.clone());
+        // Push the body as the active source, pinning its tokens to the
+        // alias-name span. For a NESTED expansion `name_span` is already the
+        // outer frozen anchor (the nested name `Lit` was produced under the outer
+        // frame), so the anchor propagates outward-most automatically.
+        self.cursor.push_injection(body.clone(), name.clone(), name_span);
+        // Re-drive: lex the body's first command word so a DIFFERENT leading alias
+        // still expands. `name` is now on the stack, so it cannot re-expand itself.
         self.maybe_expand_command_alias()?;
-        self.active.remove(&name);
+        // bash's trailing-blank rule: a body ending in whitespace makes the NEXT
+        // command-word eligible for expansion (carried by `take_trailing_eligible`).
+        // Set AFTER the re-drive so the OUTERMOST body in a nested chain wins (the
+        // re-drive's own assignment for an inner body is overwritten here), exactly
+        // as the old post-recursion ordering did.
         self.alias_trailing_eligible = body.chars().last().is_some_and(|c| c.is_whitespace());
         Ok(())
     }
@@ -5115,9 +4594,7 @@ impl<'a> Lexer<'a> {
         aliases: &std::collections::HashMap<String, String>,
         opts: LexerOptions,
     ) -> Lexer<'a> {
-        let mut lx = Lexer::new_live(input, aliases, opts);
-        lx.command_atoms = true;
-        lx
+        Lexer::new_live(input, aliases, opts)
     }
 }
 
@@ -5135,258 +4612,13 @@ fn word_literal_text(w: &Word) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-fn tokenize_partial_inner(
-    input: &str,
-    opts: LexerOptions,
-    brace_expand: bool,
-) -> PartialTokens {
-    // Build the token vec purely by draining the incremental next_token().
-    let mut lx = Lexer::new(input, opts, brace_expand);
-    let mut out = Vec::new();
-    loop {
-        match lx.next_token() {
-            Ok(Some(t)) => out.push(t),
-            Ok(None) => return (out, None),
-            Err(e) => {
-                let off = lx.cursor.offset();
-                // Error path is terminal: include any tokens scanned but not yet
-                // handed out — e.g. an unterminated heredoc's placeholder, which
-                // the readiness rule kept buffered (its body will never arrive).
-                // This makes the partial set byte-identical to the batch lexer,
-                // while the readiness rule still governs normal incremental reads.
-                out.extend(lx.history[lx.pos..].iter().cloned());
-                return (out, Some((e, off)));
-            }
-        }
-    }
-}
 
-/// Tokenizes `input`, returning `(tokens, error)`. On a lex error the tokens
-/// produced BEFORE the error are returned alongside `Some((error, byte_offset))`;
-/// on success the second element is `None`. Each token carries its own span, so
-/// there is no separate offsets sidecar — the byte offset of the truncation is
-/// the `byte_offset` in the error tuple. This lets the source reader execute the
-/// complete units that lexed before the failure and re-lex the truncated unit.
-pub fn tokenize_partial(
-    input: &str,
-    opts: LexerOptions,
-) -> PartialTokens {
-    tokenize_partial_inner(input, opts, true)
-}
 
-/// Tokenizes WITHOUT brace expansion (used for array-literal elements, whose
-/// braces are expanded later by `brace_expand_parts` so adjacent expansions
-/// are preserved as real WordParts).
-fn tokenize_no_brace(input: &str, opts: LexerOptions) -> Result<Vec<Token>, LexError> {
-    match tokenize_partial_inner(input, opts, false) {
-        (tokens, None) => Ok(tokens),
-        (_, Some((e, _))) => Err(e),
-    }
-}
 
-/// Reads `X(...)` where `prefix` is the just-seen extglob prefix char (one of
-/// `? * + @ !`), consuming a balanced-paren group (nested parens; inner
-/// `|`/metachars literal). `chars` is positioned just before the `(`; returns
-/// the group's word PARTS INCLUDING the prefix char, e.g. `+($x)` yields a
-/// Literal `"+("`, a Var for `$x`, and a Literal `")"`. Inner `$…`/`` `…` ``/
-/// quotes are preserved as their own parts so they expand at runtime; the
-/// structural `(`/`|`/`)`/prefix stay literal. EOF before the closing `)` is
-/// `LexError::UnterminatedExtglob`.
-/// `Some(text)` when `parts` is exactly one unquoted `Literal` (the keyword form,
-/// like `[[` / `]]` / `=~`); `None` otherwise.
-fn single_unquoted_literal(parts: &[WordPart]) -> Option<&str> {
-    match parts {
-        [WordPart::Literal { text, quoted: false }] => Some(text.as_str()),
-        _ => None,
-    }
-}
 
-/// Collects a single-quoted `'…'` span body (opening `'` already consumed).
-/// Returns the content as a `String`, NOT including the closing `'`.
-/// Errors with `UnterminatedQuote` if the input ends before the closing `'`.
-fn scan_squote_content(chars: &mut CharCursor<'_>) -> Result<String, LexError> {
-    let mut out = String::new();
-    loop {
-        match chars.next() {
-            Some('\'') => return Ok(out),
-            Some(ch) => out.push(ch),
-            None => return Err(LexError::UnterminatedQuote),
-        }
-    }
-}
 
-/// Scans a `"…"` span body (opening `"` already consumed): expands `$`/`` ` ``/`\`,
-/// pushes resulting `WordPart`s into `parts`. Consumes through the closing `"`.
-fn scan_dquote_expansion_body(
-    chars: &mut CharCursor<'_>,
-    parts: &mut Vec<WordPart>,
-    opts: LexerOptions,
-) -> Result<(), LexError> {
-    let mut q = String::new();
-    loop {
-        match chars.next() {
-            Some('"') => break,
-            Some('\\') => match chars.next() {
-                Some(esc @ ('"' | '\\' | '$' | '`')) => q.push(esc),
-                Some('\n') => {}
-                Some(other) => { q.push('\\'); q.push(other); }
-                None => return Err(LexError::UnterminatedQuote),
-            },
-            Some('$') => {
-                flush_literal(parts, &mut q, true);
-                scan_dollar_expansion(chars, parts, true, opts)?;
-            }
-            Some('`') => {
-                flush_literal(parts, &mut q, true);
-                let sequence = scan_backtick_substitution(chars, opts)?;
-                parts.push(WordPart::CommandSub { sequence, quoted: true });
-            }
-            Some(ch) => q.push(ch),
-            None => return Err(LexError::UnterminatedQuote),
-        }
-    }
-    flush_literal(parts, &mut q, true);
-    Ok(())
-}
 
-/// Scan the RHS operand of `=~` inside `[[ … ]]` as one regex word. `(`/`)`/`|`/`((`
-/// are literal; paren depth keeps unquoted whitespace part of the operand while >0.
-/// `$…`/`` `…` ``/quotes/`\` behave as in a normal word. No brace expansion, no
-/// extglob. The cursor starts at the operand's first char; returns sitting just
-/// before the terminating depth-0 whitespace (or at EOF).
-fn scan_regex_operand(chars: &mut CharCursor<'_>, opts: LexerOptions) -> Result<Vec<WordPart>, LexError> {
-    let mut parts: Vec<WordPart> = Vec::new();
-    let mut lit = String::new();
-    let mut depth: u32 = 0;
-    fn flush(lit: &mut String, parts: &mut Vec<WordPart>) {
-        if !lit.is_empty() {
-            parts.push(WordPart::Literal { text: std::mem::take(lit), quoted: false });
-        }
-    }
-    loop {
-        let c = match chars.peek() {
-            None => break,
-            Some(&c) => c,
-        };
-        if depth == 0 && c.is_whitespace() {
-            // Leading whitespace only reaches here after a `\`-newline line
-            // continuation was consumed just before the operand began (e.g.
-            // bash_completion's `[[ $line =~ \<newline>   regex ]]`); the
-            // continuation line's indentation must be skipped, not treated as
-            // the (still-empty) operand's terminator. Once the operand has
-            // content, depth-0 whitespace ends it as before.
-            if lit.is_empty() && parts.is_empty() {
-                chars.next();
-                continue;
-            }
-            break; // terminate, leave whitespace for the main loop
-        }
-        chars.next();
-        match c {
-            '$' => {
-                flush(&mut lit, &mut parts);
-                scan_dollar_expansion(chars, &mut parts, false, opts)?;
-            }
-            '`' => {
-                flush(&mut lit, &mut parts);
-                let sequence = scan_backtick_substitution(chars, opts)?;
-                parts.push(WordPart::CommandSub { sequence, quoted: false });
-            }
-            '\'' => {
-                flush(&mut lit, &mut parts);
-                let inner = scan_squote_content(chars)?;
-                parts.push(WordPart::Literal { text: inner, quoted: true });
-            }
-            '"' => {
-                flush(&mut lit, &mut parts);
-                scan_dquote_expansion_body(chars, &mut parts, opts)?;
-            }
-            '\\' => match chars.next() {
-                Some('\n') => {} // line continuation
-                Some(next) => {
-                    lit.push('\\');
-                    lit.push(next);
-                }
-                None => lit.push('\\'),
-            },
-            '(' => {
-                lit.push('(');
-                depth += 1;
-            }
-            ')' => {
-                lit.push(')');
-                depth = depth.saturating_sub(1);
-            }
-            other => lit.push(other), // includes | < > ; & and depth>0 whitespace
-        }
-    }
-    flush(&mut lit, &mut parts);
-    Ok(parts)
-}
 
-fn scan_extglob_group(
-    prefix: char,
-    chars: &mut CharCursor<'_>,
-    opts: LexerOptions,
-) -> Result<Vec<WordPart>, LexError> {
-    let mut group_parts: Vec<WordPart> = Vec::new();
-    let mut lit = format!("{prefix}(");
-    chars.next(); // consume '('
-    let mut depth = 1usize;
-
-    // Flush the accumulated structural/literal text as one unquoted Literal.
-    fn flush(lit: &mut String, parts: &mut Vec<WordPart>) {
-        if !lit.is_empty() {
-            parts.push(WordPart::Literal { text: std::mem::take(lit), quoted: false });
-        }
-    }
-
-    while let Some(c) = chars.next() {
-        match c {
-            '$' => {
-                flush(&mut lit, &mut group_parts);
-                scan_dollar_expansion(chars, &mut group_parts, false, opts)?;
-            }
-            '`' => {
-                flush(&mut lit, &mut group_parts);
-                let sequence = scan_backtick_substitution(chars, opts)?;
-                group_parts.push(WordPart::CommandSub { sequence, quoted: false });
-            }
-            '\'' => {
-                // Single quote: literal, no expansion.
-                flush(&mut lit, &mut group_parts);
-                let inner = scan_squote_content(chars)?;
-                group_parts.push(WordPart::Literal { text: inner, quoted: true });
-            }
-            '"' => {
-                // Double quote: mirror the main loop's `"` arm.
-                flush(&mut lit, &mut group_parts);
-                scan_dquote_expansion_body(chars, &mut group_parts, opts)?;
-            }
-            '\\' => {
-                // Literal escape: keep both chars.
-                lit.push('\\');
-                if let Some(next) = chars.next() {
-                    lit.push(next);
-                }
-            }
-            '(' => {
-                lit.push('(');
-                depth += 1;
-            }
-            ')' => {
-                lit.push(')');
-                depth -= 1;
-                if depth == 0 {
-                    flush(&mut lit, &mut group_parts);
-                    return Ok(group_parts);
-                }
-            }
-            other => lit.push(other),
-        }
-    }
-    Err(LexError::UnterminatedExtglob) // EOF before closing ')'
-}
 
 /// Returns true if any unquoted Literal part in `parts` contains
 /// an unquoted `{`. The fast-path check for brace expansion.
@@ -5562,59 +4794,6 @@ fn parse_heredoc_delim(
     Ok((delim, !any_quoted))
 }
 
-/// Collects bodies for all pending heredocs in queue order.
-/// After each heredoc's body is collected, it is patched back into the
-/// placeholder `TokenKind::Heredoc` at `token_idx`.
-///
-/// v260 CF1 bridge: under `command_atoms` ONLY, ALSO pushes each resolved body
-/// onto `parsed_heredoc_bodies` (the same Lexer-owned FIFO the
-/// atom-command-parser's `parsed_heredoc_bodies` queue uses — see
-/// `push_heredoc_body`/`take_heredoc_bodies`) instead of patching the token
-/// body directly. This function (via `scan_step_command`) is the ONLY
-/// heredoc-resolution path reachable from a nested-command context
-/// (`Mode::CommandSub`/`Mode::Backtick` body scanning always delegates to
-/// `scan_step_command`, regardless of the top-level `command_atoms` flag —
-/// v244's dormant CommandSub-body reuse). The atom-command-parser's
-/// `parse_one_redirect` always builds a placeholder `Word(vec![])` for a
-/// `TokenKind::Heredoc` and discards whatever `body` the consumed token
-/// carries (correct for a TRUE atom-scanned heredoc, whose body arrives later
-/// as `HeredocBodyBegin`…`End` atoms) — but a nested heredoc resolved HERE
-/// never emits those atoms, so without this bridge its body is never queued
-/// and the placeholder is left empty forever. The batch-tokenizing oracle
-/// (`command.rs`'s `parse`) never drains this queue and reads the token body
-/// directly, so under `command_atoms == false` the body is moved straight
-/// into the token slot with no bridge push (no wasted clone).
-fn collect_heredoc_bodies(
-    chars: &mut CharCursor<'_>,
-    pending: &mut std::collections::VecDeque<PendingHeredoc>,
-    tokens: &mut [Token],
-    opts: LexerOptions,
-    parsed_heredoc_bodies: &mut Vec<Word>,
-    command_atoms: bool,
-) -> Result<(), LexError> {
-    while let Some(ph) = pending.pop_front() {
-        let body = collect_one_heredoc_body(chars, &ph, opts)?;
-        if let Some(TokenKind::Heredoc { body: slot, expand, strip_tabs }) =
-            tokens.get_mut(ph.token_idx).map(|t| &mut t.kind)
-        {
-            *expand = ph.expand;
-            *strip_tabs = ph.strip_tabs;
-            if command_atoms {
-                // Atom path: parse_one_redirect discards the token body and
-                // builds an empty placeholder, filling it later from this FIFO.
-                *slot = Word(vec![]);
-                parsed_heredoc_bodies.push(body); // move, no clone
-            } else {
-                // Oracle/production: command.rs reads the token body directly and
-                // never drains parsed_heredoc_bodies. Move the body in; no push.
-                *slot = body;
-            }
-        } else {
-            unreachable!("placeholder token at index was not TokenKind::Heredoc");
-        }
-    }
-    Ok(())
-}
 
 /// True when `s` ends with an odd-length run of backslashes — the final
 /// backslash is unescaped and acts as a line-continuation marker.
@@ -5622,323 +4801,9 @@ pub fn ends_with_continuation_backslash(s: &str) -> bool {
     s.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
 }
 
-/// Collects the body of one heredoc, reading lines until the close-delimiter
-/// is matched (or end-of-input, which is an error).
-fn collect_one_heredoc_body(
-    chars: &mut CharCursor<'_>,
-    ph: &PendingHeredoc,
-    opts: LexerOptions,
-) -> Result<Word, LexError> {
-    let mut body_parts: Vec<WordPart> = Vec::new();
-    loop {
-        // Read one full line until \n or end of input.
-        let mut current_line = String::new();
-        let mut got_newline = false;
-        loop {
-            match chars.next() {
-                Some('\n') => {
-                    got_newline = true;
-                    break;
-                }
-                Some(c) => current_line.push(c),
-                None => break,
-            }
-        }
-        // POSIX 2.7.4: in expanding heredocs, `\<NL>` is a line continuation —
-        // both the backslash and the newline are deleted, and the next line is
-        // joined directly. Literal heredocs keep `\` + NL verbatim.
-        while ph.expand
-            && got_newline
-            && ends_with_continuation_backslash(&current_line)
-            && chars.peek().is_some()
-        {
-            // Strip the trailing backslash (the newline is already consumed).
-            current_line.pop();
-            // Read the next line into the same buffer (no separator).
-            got_newline = false;
-            loop {
-                match chars.next() {
-                    Some('\n') => {
-                        got_newline = true;
-                        break;
-                    }
-                    Some(c) => current_line.push(c),
-                    None => break,
-                }
-            }
-        }
-        // For <<-, strip leading tabs from both body and close-delimiter lines.
-        let line_for_check = if ph.strip_tabs {
-            current_line.trim_start_matches('\t').to_string()
-        } else {
-            current_line.clone()
-        };
-        // Check if this is the close-delimiter line (must match exactly).
-        if line_for_check == ph.delim {
-            return Ok(Word(body_parts));
-        }
-        // Not the close — this is a body line.
-        // EOF without a matching close-delimiter is an error.
-        if !got_newline {
-            return Err(LexError::UnterminatedHeredoc);
-        }
-        let body_line = if ph.strip_tabs {
-            current_line.trim_start_matches('\t').to_string()
-        } else {
-            current_line
-        };
-        if ph.expand {
-            scan_expanding_body_line(&body_line, &mut body_parts, opts)?;
-        } else {
-            // Literal mode: entire line verbatim as a single quoted Literal.
-            body_parts.push(WordPart::Literal {
-                text: body_line,
-                quoted: true,
-            });
-        }
-        // Append the line's terminating newline (literal, quoted).
-        body_parts.push(WordPart::Literal {
-            text: "\n".to_string(),
-            quoted: true,
-        });
-    }
-}
 
-/// Scans one body line of an expanding heredoc for `$`, `` ` ``, and `\`
-/// per POSIX 2.7.4. Pushes `WordPart`s into `parts`.
-fn scan_expanding_body_line(
-    line: &str,
-    parts: &mut Vec<WordPart>,
-    opts: LexerOptions,
-) -> Result<(), LexError> {
-    let mut chars = CharCursor::new(line);
-    let mut current = String::new();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                // POSIX 2.7.4: inside expanding heredoc, `\` is special
-                // only before `$`, `` ` ``, `\`. Other backslashes are literal.
-                match chars.peek().copied() {
-                    Some('$') | Some('`') | Some('\\') => {
-                        let next = chars.next().unwrap();
-                        // Flush current as unquoted, then push escaped char as quoted Literal.
-                        flush_literal(parts, &mut current, false);
-                        parts.push(WordPart::Literal { text: next.to_string(), quoted: true });
-                    }
-                    _ => current.push('\\'),
-                }
-            }
-            '$' => {
-                flush_literal(parts, &mut current, false);
-                // Heredoc bodies are quoted-context (no word-splitting).
-                scan_dollar_expansion(&mut chars, parts, true, opts)?;
-            }
-            '`' => {
-                flush_literal(parts, &mut current, false);
-                let sequence = scan_backtick_substitution(&mut chars, opts)?;
-                parts.push(WordPart::CommandSub { sequence, quoted: true });
-            }
-            other => current.push(other),
-        }
-    }
-    flush_literal(parts, &mut current, false);
-    Ok(())
-}
 
-/// Reads what follows a `$`. Pushes the resulting WordPart onto `parts` or
-/// (for an unrecognized form) pushes a literal `$` and lets the caller
-/// continue tokenizing.
-/// Converts a raw arithmetic body string into an expandable `Word`, treating
-/// it as if within double quotes (bash's rule for arithmetic expressions).
-/// `$`-forms become ParamExpansion/Var/CommandSub/Arith parts; backticks
-/// become CommandSub; everything else is literal text. Used by `$(( ))`
-/// (lexer) and, via `command.rs`, by `(( ))` and arith-`for` headers.
-pub(crate) fn arith_string_to_word(s: &str, opts: LexerOptions) -> Result<Word, LexError> {
-    let mut chars = CharCursor::new(s);
-    let mut parts: Vec<WordPart> = Vec::new();
-    let mut lit = String::new();
-    macro_rules! flush_lit {
-        () => {
-            if !lit.is_empty() {
-                parts.push(WordPart::Literal { text: std::mem::take(&mut lit), quoted: true });
-            }
-        };
-    }
-    while let Some(&c) = chars.peek() {
-        match c {
-            '$' => {
-                flush_lit!();
-                chars.next();
-                scan_dollar_expansion(&mut chars, &mut parts, true, opts)?;
-            }
-            '`' => {
-                flush_lit!();
-                chars.next();
-                let sequence = scan_backtick_substitution(&mut chars, opts)?;
-                parts.push(WordPart::CommandSub { sequence, quoted: true });
-            }
-            // bash performs quote removal within arithmetic: the quote
-            // characters disappear and adjacent text concatenates
-            // (`1"2"3` == 123, `x == "5"` == `x == 5`). Single quotes are
-            // literal; double quotes still expand `$`-forms inside.
-            '\'' => {
-                chars.next();
-                for ch in chars.by_ref() {
-                    if ch == '\'' { break; }
-                    lit.push(ch);
-                }
-            }
-            '"' => {
-                chars.next();
-                while let Some(&ch) = chars.peek() {
-                    match ch {
-                        '"' => { chars.next(); break; }
-                        '\\' => {
-                            chars.next();
-                            if let Some(&n) = chars.peek() {
-                                // Inside double quotes, `\` only escapes a few
-                                // metacharacters; otherwise it stays literal.
-                                if matches!(n, '"' | '\\' | '$' | '`') {
-                                    chars.next();
-                                    lit.push(n);
-                                } else {
-                                    lit.push('\\');
-                                }
-                            } else {
-                                lit.push('\\');
-                            }
-                        }
-                        '$' => {
-                            flush_lit!();
-                            chars.next();
-                            scan_dollar_expansion(&mut chars, &mut parts, true, opts)?;
-                        }
-                        '`' => {
-                            flush_lit!();
-                            chars.next();
-                            let sequence = scan_backtick_substitution(&mut chars, opts)?;
-                            parts.push(WordPart::CommandSub { sequence, quoted: true });
-                        }
-                        _ => { lit.push(ch); chars.next(); }
-                    }
-                }
-            }
-            _ => { lit.push(c); chars.next(); }
-        }
-    }
-    flush_lit!();
-    Ok(Word(parts))
-}
 
-fn scan_dollar_expansion(
-    chars: &mut CharCursor<'_>,
-    parts: &mut Vec<WordPart>,
-    quoted: bool,
-    opts: LexerOptions,
-) -> Result<(), LexError> {
-    match chars.peek().copied() {
-        Some('(') => {
-            chars.next(); // consume first '('
-            if chars.peek() == Some(&'(') {
-                // `$((` is EITHER an arithmetic expansion `$(( … ))` OR a command
-                // substitution whose body starts with a subshell written glued:
-                // `$( (subshell) … )`. Try arithmetic; if the body does not close
-                // as `))` (scan_arith_body Err — bash's "not arithmetic" signal),
-                // rewind to just after the first `(` and reparse as a command
-                // substitution so the inner `(` parses as a subshell. Mirrors bash.
-                let saved = chars.clone();
-                chars.next(); // consume the second '('
-                match scan_arith_body(chars) {
-                    Ok(inner) => {
-                        let body = arith_string_to_word(&inner, opts)?;
-                        parts.push(WordPart::Arith { body, quoted });
-                    }
-                    Err(_) => {
-                        *chars = saved; // rewind to just after the first '('
-                        let sequence = scan_paren_substitution(chars, opts)?;
-                        parts.push(WordPart::CommandSub { sequence, quoted });
-                    }
-                }
-            } else {
-                let sequence = scan_paren_substitution(chars, opts)?;
-                parts.push(WordPart::CommandSub { sequence, quoted });
-            }
-        }
-        Some('{') => {
-            // Capture the `$` offset before consuming `{`. The `$` was already
-            // consumed by the outer loop; chars.offset() is the position of `{`,
-            // so `$` is exactly 1 byte before it.
-            let dollar_start = chars.offset() - 1;
-            chars.next(); // consume `{`
-            scan_braced_param_expansion(chars, parts, quoted, opts, dollar_start)?;
-        }
-        Some('[') => {
-            chars.next(); // consume '['
-            let inner = scan_legacy_arith_body(chars)?;
-            let body = arith_string_to_word(&inner, opts)?;
-            parts.push(WordPart::Arith { body, quoted });
-        }
-        // `$'…'` is ANSI-C quoting ONLY outside double quotes. Inside `"…"`
-        // (`quoted`) bash treats the `$` as a literal char, so skip this arm and
-        // fall through to the `_` arm (literal `$`, the `'` left for the caller's
-        // double-quote loop to take as a literal) — matching bash `echo "$'"` → `$'`.
-        Some('\'') if !quoted => {
-            chars.next();
-            let text = scan_ansi_c_quoted(chars)?;
-            parts.push(WordPart::Quoted {
-                style: QuoteStyle::AnsiC,
-                parts: vec![WordPart::Literal { text, quoted: true }],
-            });
-        }
-        // `$"…"` is bash's locale-translation quoting, special only outside double
-        // quotes. huck has no message catalog, so the translation is the identity:
-        // `$"…"` ≡ `"…"`. Drop the `$` and leave the `"` unconsumed so the caller's
-        // existing double-quote handler scans the body (with its normal
-        // expansions/escapes). Inside double quotes (`quoted`) `$"` is a literal `$`
-        // via the `_` arm, after which the `"` closes the surrounding string.
-        Some('"') if !quoted => {}
-        Some('?') => {
-            chars.next();
-            parts.push(WordPart::LastStatus { quoted });
-        }
-        Some('@') => {
-            chars.next();
-            parts.push(WordPart::AllArgs { joined: false, quoted });
-        }
-        Some('*') => {
-            chars.next();
-            parts.push(WordPart::AllArgs { joined: true, quoted });
-        }
-        Some('#') => {
-            chars.next();
-            parts.push(WordPart::Var { name: "#".to_string(), quoted });
-        }
-        Some('$') => {
-            chars.next();
-            parts.push(WordPart::Var { name: "$".to_string(), quoted });
-        }
-        Some('!') => {
-            chars.next();
-            parts.push(WordPart::Var { name: "!".to_string(), quoted });
-        }
-        Some('-') => {
-            chars.next();
-            parts.push(WordPart::Var { name: "-".to_string(), quoted });
-        }
-        Some(c) if c.is_ascii_digit() => {
-            let d = chars.next().unwrap();
-            parts.push(WordPart::Var { name: d.to_string(), quoted });
-        }
-        Some(c) if is_name_start(c) => {
-            let name = scan_var_name(chars);
-            parts.push(WordPart::Var { name, quoted });
-        }
-        _ => {
-            parts.push(WordPart::Literal { text: "$".to_string(), quoted });
-        }
-    }
-    Ok(())
-}
 
 /// Reads the body of a `$'...'` ANSI-C quoted string. The opening `$'` has
 /// already been consumed; this scans forward, processing C-style backslash
@@ -6090,78 +4955,7 @@ fn push_codepoint(out: &mut String, v: u32) -> Result<(), LexError> {
     }
 }
 
-/// Scans the body of a `(( ... ))` block. The caller has already
-/// consumed both opening `(` characters; this function consumes the
-/// body and the matching `))`. Returns the raw body text. Tracks
-/// nested paren depth so `(((a+b)*c))` correctly captures `((a+b)*c)`
-/// as the body.
-fn scan_arith_block(
-    chars: &mut CharCursor<'_>,
-) -> Result<String, LexError> {
-    let mut collected = String::new();
-    let mut depth: i32 = 0;
-    while let Some(c) = chars.next() {
-        match c {
-            '(' => {
-                depth += 1;
-                collected.push('(');
-            }
-            ')' => {
-                if depth == 0 {
-                    if chars.peek() == Some(&')') {
-                        chars.next(); // consume the second `)`
-                        return Ok(collected);
-                    }
-                    // A `)` at depth 0 not forming `))` means the two opening
-                    // `(` of the `((` cannot close as an adjacent `))` — this is
-                    // not a balanced arithmetic block. Fail fast so the caller
-                    // (the `((` lexer site) rewinds and re-lexes as nested
-                    // subshells `( (`, instead of scanning on to an unrelated
-                    // distant `))` elsewhere in the input (L-51).
-                    return Err(LexError::UnterminatedArithBlock);
-                }
-                depth -= 1;
-                collected.push(')');
-            }
-            _ => collected.push(c),
-        }
-    }
-    Err(LexError::UnterminatedArithBlock)
-}
 
-/// Reads the inner text of a `$((...))` arithmetic expansion. The opening
-/// `$((` has already been consumed; this function scans forward until the
-/// matching `))` at depth 0. Returns the inner text (without the closing
-/// `))`). Tracks paren depth so that nested `(` / `)` inside the
-/// expression do not prematurely close the expansion.
-fn scan_arith_body(
-    chars: &mut CharCursor<'_>,
-) -> Result<String, LexError> {
-    let mut body = String::new();
-    let mut depth: u32 = 1; // we are inside the outer `((`
-    loop {
-        match chars.next() {
-            None => return Err(LexError::UnterminatedArith),
-            Some('(') => {
-                depth += 1;
-                body.push('(');
-            }
-            Some(')') => {
-                if depth == 1 {
-                    // The next char must be `)` to close `))`.
-                    match chars.next() {
-                        Some(')') => return Ok(body),
-                        Some(_) | None => return Err(LexError::UnterminatedArith),
-                    }
-                } else {
-                    depth -= 1;
-                    body.push(')');
-                }
-            }
-            Some(c) => body.push(c),
-        }
-    }
-}
 
 /// Appends a quoted span — the opening quote already pushed by the caller —
 /// through its matching closing `quote`, verbatim. Single quotes take every
@@ -6191,98 +4985,7 @@ fn push_quoted_span(
     }
 }
 
-/// Skips a `${…}` parameter expansion VERBATIM — the opening `${` already
-/// consumed and pushed by the caller — appending through the matching `}` at
-/// brace-depth 0 (inclusive). Tracks `{`/`}` depth and `'…'`/`"…"` spans so a
-/// `}` inside a nested expansion or quote does not close early. Used by
-/// `scan_legacy_arith_body` so a `]` inside `${…}` cannot close the `$[…]`.
-fn scan_braced_skip(
-    chars: &mut CharCursor<'_>,
-    out: &mut String,
-) -> Result<(), LexError> {
-    let mut depth: usize = 1; // inside the outer `${`
-    loop {
-        match chars.next() {
-            None => return Err(LexError::UnterminatedLegacyArith),
-            Some('{') => {
-                depth += 1;
-                out.push('{');
-            }
-            Some('}') => {
-                depth -= 1;
-                out.push('}');
-                if depth == 0 {
-                    return Ok(());
-                }
-            }
-            Some(q @ ('\'' | '"')) => {
-                out.push(q);
-                push_quoted_span(chars, q, out, LexError::UnterminatedLegacyArith)?;
-            }
-            Some(c) => out.push(c),
-        }
-    }
-}
 
-/// Reads the inner text of a `$[ … ]` legacy arithmetic expansion. The opening
-/// `$[` has already been consumed; this scans forward to the matching `]` and
-/// returns the inner text (without the closing `]`). bash treats `$[ expr ]` as
-/// exactly `$(( expr ))`, so the caller feeds the result to
-/// `arith_string_to_word`. "Fully aware": tracks raw `[`/`]` nesting (so array
-/// subscripts `a[1]`, `${a[i]}`, and nested `$[…]` balance as raw brackets) and
-/// consumes `'…'`/`"…"` quoted spans and nested `$(…)`/`${…}` verbatim, so a `]`
-/// inside any of them does not close the expansion. EOF before the close yields
-/// `UnterminatedLegacyArith`.
-fn scan_legacy_arith_body(
-    chars: &mut CharCursor<'_>,
-) -> Result<String, LexError> {
-    let mut body = String::new();
-    let mut depth: usize = 0; // raw `[` nesting
-    loop {
-        match chars.next() {
-            None => return Err(LexError::UnterminatedLegacyArith),
-            Some('[') => {
-                depth += 1;
-                body.push('[');
-            }
-            Some(']') => {
-                if depth == 0 {
-                    return Ok(body);
-                }
-                depth -= 1;
-                body.push(']');
-            }
-            Some(q @ ('\'' | '"')) => {
-                body.push(q);
-                push_quoted_span(chars, q, &mut body, LexError::UnterminatedLegacyArith)?;
-            }
-            Some('\\') => {
-                body.push('\\');
-                if let Some(c) = chars.next() {
-                    body.push(c);
-                }
-            }
-            Some('$') => {
-                body.push('$');
-                match chars.peek().copied() {
-                    Some('(') => {
-                        chars.next(); // consume '('
-                        body.push('(');
-                        scan_cmdsub_body(chars, &mut body, LexError::UnterminatedLegacyArith)?;
-                        body.push(')');
-                    }
-                    Some('{') => {
-                        chars.next(); // consume '{'
-                        body.push('{');
-                        scan_braced_skip(chars, &mut body)?;
-                    }
-                    _ => {}
-                }
-            }
-            Some(c) => body.push(c),
-        }
-    }
-}
 
 /// Reads the inner text of a `${...}` operand. The opening `{` has already
 /// been consumed; this function consumes through the matching `}` at depth 0.
@@ -6528,56 +5231,7 @@ fn consume_backtick_verbatim(
     Ok(())
 }
 
-/// Applies bash's backtick un-escaping to a raw backtick body: `` \` `` → `` ` ``,
-/// `\\` → `\`, `\$` → `$`, and `\x` (any other char) → `\x` verbatim. A trailing
-/// lone `\` is kept. Only the parse path un-escapes, so it lives in one function.
-fn unescape_backtick(raw: &str) -> String {
-    let mut out = String::new();
-    let mut chars = raw.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('`') => out.push('`'),
-                Some('\\') => out.push('\\'),
-                Some('$') => out.push('$'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
 
-/// Recovery for a lexable-but-invalid `${…}`: consume the rest of the brace
-/// body through the matching `}`, then build a `BadSubst` ParamExpansion whose
-/// `raw` is the literal `${…}` source (for the runtime message). `dollar_start`
-/// is the offset of the leading `$`. Used so bad substitutions defer to runtime
-/// instead of aborting the parse (matching bash).
-fn recover_bad_subst(
-    chars: &mut CharCursor<'_>,
-    parts: &mut Vec<WordPart>,
-    quoted: bool,
-    dollar_start: usize,
-) -> Result<(), LexError> {
-    // `scan_braced_operand` consumes through the matching `}` (depth + quote +
-    // $'…' aware after Task 1). It returns the inner body; we don't need it —
-    // we slice the raw source instead, which includes `${` … `}`.
-    let _ = scan_braced_operand(chars)?; // may still error on genuinely unterminated
-    let raw = chars.slice_from(dollar_start).to_string();
-    parts.push(WordPart::ParamExpansion {
-        name: String::new(),
-        modifier: ParamModifier::BadSubst { raw },
-        quoted,
-        subscript: None,
-        indirect: false,
-    });
-    Ok(())
-}
 
 /// Collects a raw ANSI-C `$'…'` body (both `$` and opening `'` already consumed).
 /// Appends chars to `out` with `\`-escape pairs verbatim; does NOT push the
@@ -6697,176 +5351,11 @@ fn scan_braced_operand(
     }
 }
 
-/// Parses a brace-modifier operand BODY (already extracted up to the matching
-/// `}` by `scan_braced_operand`) as a single WORD: `$…` / `` `…` `` / quotes are
-/// expansions/quoting; ALL other characters — including shell metacharacters
-/// `(` `)` `|` `;` `&` `<` `>` and whitespace — are LITERAL. Field splitting is
-/// NOT driven by the `quoted` flag inside the modifier word: at expansion time
-/// the modifier word goes through `expand_assignment` (which returns the string
-/// verbatim, no splitting), and the OUTER `ParamExpansion`'s own `quoted` flag
-/// in `expand()` then drives any IFS splitting of the result. So unquoted
-/// `${x:-a b}` splits to `a` `b` and `"${x:-a b}"` stays one — driven by the
-/// outer context, not these parts. The inner `quoted` flags are set correctly
-/// (unquoted literals, quoted spans/escapes) for future-compatibility and
-/// glob-safety. Matches bash: the operand of `:-`/`:=`/`:?`/`:+` (and
-/// substitution/substring operands) is a word, not a command.
-fn parse_braced_operand_opts(
-    body: &str,
-    enclosing_dquote: bool,
-    opts: LexerOptions,
-) -> Result<Word, LexError> {
-    let mut chars = CharCursor::new(body);
-    let mut parts: Vec<WordPart> = Vec::new();
-    let mut cur = String::new();
-    // When the `${...}` is itself inside double quotes, a VALUE-substitution
-    // operand (`:-`/`:=`/`:+`) is in double-quote context: single quotes are
-    // LITERAL and backslash is special only before `$ ` " \`. `q` is the
-    // quoted-ness of the bare literal text / expansions.
-    let q = enclosing_dquote;
-    while let Some(c) = chars.next() {
-        match c {
-            // Double-quote context: backslash is special only before `$ ` " \`;
-            // any other `\x` keeps the backslash literal (so `\*`/`\n` survive).
-            '\\' if enclosing_dquote => match chars.peek().copied() {
-                Some(e @ ('$' | '`' | '"' | '\\')) => {
-                    chars.next();
-                    flush_literal(&mut parts, &mut cur, true);
-                    parts.push(WordPart::Literal { text: e.to_string(), quoted: true });
-                }
-                _ => cur.push('\\'),
-            },
-            '\\' => {
-                // Backslash escapes the next char: emit it as a quoted literal
-                // (glob-safe, consistent with the main tokenizer). `\` at end of
-                // body silently vanishes.
-                if let Some(n) = chars.next() {
-                    flush_literal(&mut parts, &mut cur, false);
-                    parts.push(WordPart::Literal { text: n.to_string(), quoted: true });
-                }
-            }
-            '$' => {
-                flush_literal(&mut parts, &mut cur, q);
-                scan_dollar_expansion(&mut chars, &mut parts, q, opts)?;
-            }
-            '`' => {
-                flush_literal(&mut parts, &mut cur, q);
-                let sequence = scan_backtick_substitution(&mut chars, opts)?;
-                parts.push(WordPart::CommandSub { sequence, quoted: q });
-            }
-            // In double-quote context a single quote is a LITERAL character.
-            '\'' if enclosing_dquote => cur.push('\''),
-            '\'' => {
-                // Single-quoted span: everything literal until the next `'`.
-                flush_literal(&mut parts, &mut cur, false);
-                let mut s = String::new();
-                loop {
-                    match chars.next() {
-                        None => return Err(LexError::UnterminatedQuote),
-                        Some('\'') => break,
-                        Some(ch) => s.push(ch),
-                    }
-                }
-                parts.push(WordPart::Literal { text: s, quoted: true });
-            }
-            '"' => {
-                // Double-quoted span: $/`/\ active; everything else literal (quoted).
-                flush_literal(&mut parts, &mut cur, q);
-                loop {
-                    match chars.next() {
-                        None => return Err(LexError::UnterminatedQuote),
-                        Some('"') => break,
-                        Some('\\') => match chars.peek().copied() {
-                            Some(e @ ('$' | '`' | '"' | '\\')) => {
-                                chars.next();
-                                flush_literal(&mut parts, &mut cur, true);
-                                parts.push(WordPart::Literal { text: e.to_string(), quoted: true });
-                            }
-                            _ => cur.push('\\'),
-                        },
-                        Some('$') => {
-                            flush_literal(&mut parts, &mut cur, true);
-                            scan_dollar_expansion(&mut chars, &mut parts, true, opts)?;
-                        }
-                        Some('`') => {
-                            flush_literal(&mut parts, &mut cur, true);
-                            let sequence = scan_backtick_substitution(&mut chars, opts)?;
-                            parts.push(WordPart::CommandSub { sequence, quoted: true });
-                        }
-                        Some(ch) => cur.push(ch),
-                    }
-                }
-                flush_literal(&mut parts, &mut cur, true);
-            }
-            other => cur.push(other),
-        }
-    }
-    flush_literal(&mut parts, &mut cur, q);
-    Ok(Word(parts))
-}
 
-/// Back-compat shim for unit tests that parse a braced operand with extglob
-/// off (the historical behavior). Production callers thread `LexerOptions`
-/// via `parse_braced_operand_opts`.
-#[cfg(test)]
-fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
-    parse_braced_operand_opts(body, false, LexerOptions::default())
-}
 
-/// Reads the body of a `$(...)` substitution. The opening `$(` is already
-/// consumed; this function consumes through the matching `)` at depth 0.
-/// Tracks quote and escape state so that `)` inside `'...'`, `"..."`, or
-/// after `\` does not close the substitution, and nested `$(...)` increments
-/// the depth.
-fn scan_paren_substitution(
-    chars: &mut CharCursor<'_>,
-    opts: LexerOptions,
-) -> Result<crate::command::Sequence, LexError> {
-    let mut body = String::new();
-    scan_cmdsub_body(chars, &mut body, LexError::UnterminatedSubstitution)?;
-    parse_substitution_body(&body, opts)
-}
 
-/// Tokenizes and parses a substitution body, wrapping any errors with the
-/// substitution-context `LexError` variants. Empty bodies (whitespace only)
-/// produce an empty `Sequence`.
-fn parse_substitution_body(body: &str, opts: LexerOptions) -> Result<crate::command::Sequence, LexError> {
-    let mut tokens = tokenize_with_opts(body, opts).map_err(|e| LexError::Substitution(Box::new(e)))?;
-    // A command-substitution body is parsed in isolation; its token lines are
-    // body-relative, not script-relative. Keep inner commands' `line` at 0
-    // ("unknown"), matching pre-span behavior (script-relative $LINENO inside
-    // `$( )` would need offset propagation, out of scope here).
-    for t in &mut tokens { t.span.line = 0; }
-    let mut lx = Lexer::from_tokens(tokens);
-    let parsed = crate::command::parse(&mut lx).map_err(LexError::SubstitutionParseError)?;
-    Ok(parsed.unwrap_or_else(empty_sequence))
-}
 
-/// Reads the body of a `` `...` `` substitution. The opening backtick is
-/// already consumed; this function consumes through the matching unescaped
-/// backtick. Applies bash's backtick escape rules:
-/// - `\` + `` ` `` -> literal `` ` `` in the body
-/// - `\` + `\` -> literal `\` in the body
-/// - `\` + `$` -> literal `$` in the body
-/// - `\` + any other char `c` -> both `\` and `c` are preserved verbatim
-fn scan_backtick_substitution(
-    chars: &mut CharCursor<'_>,
-    opts: LexerOptions,
-) -> Result<crate::command::Sequence, LexError> {
-    let mut raw = String::new();
-    scan_backtick_body(chars, &mut raw, LexError::UnterminatedSubstitution)?;
-    parse_substitution_body(&unescape_backtick(&raw), opts)
-}
 
-fn empty_sequence() -> crate::command::Sequence {
-    crate::command::Sequence {
-        first: crate::command::Command::Pipeline(crate::command::Pipeline {
-            negate: false,
-            commands: Vec::new(),
-        }),
-        rest: Vec::new(),
-        background: false,
-    }
-}
 
 fn scan_var_name(chars: &mut CharCursor<'_>) -> String {
     let mut name = String::new();
@@ -6881,388 +5370,9 @@ fn scan_var_name(chars: &mut CharCursor<'_>) -> String {
     name
 }
 
-/// Reads a `${...}` parameter expansion. The opening `$` and `{` have
-/// already been consumed. Pushes either a `WordPart::Var` (plain `${name}`)
-/// or a `WordPart::ParamExpansion` (any modifier). `dollar_start` is the byte
-/// offset of the leading `$` in the source (for `recover_bad_subst`).
-fn scan_braced_param_expansion(
-    chars: &mut CharCursor<'_>,
-    parts: &mut Vec<WordPart>,
-    quoted: bool,
-    opts: LexerOptions,
-    dollar_start: usize,
-) -> Result<(), LexError> {
-    // Special single-char forms: ${@}, ${*}, ${#} (arg count).
-    // These must be checked before the Length form (${#name}) disambiguation.
-    // `${@}` and `${*}` produce `AllArgs`; `${@:...}` / `${*:...}` route
-    // through `dispatch_braced_modifier` so the substring modifier
-    // (v71 task 3: closes v33's slicing deferral) is parseable.
-    match chars.peek().copied() {
-        Some('@') => {
-            chars.next();
-            if chars.peek() == Some(&'}') {
-                chars.next();
-                parts.push(WordPart::AllArgs { joined: false, quoted });
-                return Ok(());
-            }
-            // `${@<mod>...}` — fall through to the modifier dispatcher
-            // with name="@" and no subscript.
-            return dispatch_braced_modifier("@".to_string(), quoted, None, chars, parts, false, opts, dollar_start);
-        }
-        Some('*') => {
-            chars.next();
-            if chars.peek() == Some(&'}') {
-                chars.next();
-                parts.push(WordPart::AllArgs { joined: true, quoted });
-                return Ok(());
-            }
-            return dispatch_braced_modifier("*".to_string(), quoted, None, chars, parts, false, opts, dollar_start);
-        }
-        // Scalar special params: ${-} (option flags), ${?} (exit status),
-        // ${$} (shell pid). Route bare `}` and modifiers through the
-        // dispatcher (e.g. `${-#*e}` from nvm). Resolved by `lookup_var`.
-        Some('-') => {
-            chars.next();
-            return dispatch_braced_modifier("-".to_string(), quoted, None, chars, parts, false, opts, dollar_start);
-        }
-        Some('?') => {
-            chars.next();
-            return dispatch_braced_modifier("?".to_string(), quoted, None, chars, parts, false, opts, dollar_start);
-        }
-        Some('$') => {
-            // `${$'…'}` (extquote name) / `${$"…"}` (bad-subst) must NOT be
-            // parsed as the `$` shell-pid special param. If `$` is followed by
-            // a quote, fall through to the extquote-aware regular-name path.
-            let mut look = chars.clone();
-            look.next();
-            if matches!(look.peek().copied(), Some('\'') | Some('"')) {
-                // fall through (do not consume, do not return)
-            } else {
-                chars.next();
-                return dispatch_braced_modifier("$".to_string(), quoted, None, chars, parts, false, opts, dollar_start);
-            }
-        }
-        _ => {}
-    }
 
-    // Length form (${#name}) vs bare arg-count (${#}).
-    // Peek ahead: if the char after `#` is `}`, emit Var { name: "#" }.
-    // Otherwise read the identifier name and emit a Length ParamExpansion.
-    if chars.peek() == Some(&'#') {
-        chars.next(); // consume '#'
-        let next = chars.peek().copied();
-        if next == Some('}') {
-            // ${#} — count of positional args.
-            chars.next();
-            parts.push(WordPart::Var { name: "#".to_string(), quoted });
-            return Ok(());
-        }
-        // ${#name}: name may be a regular identifier, a digit-only
-        // positional name (${#1}, ${#10}), or a special name @/* that
-        // means "count of positional args" (same as ${#}).
-        let name = match next {
-            Some(c) if c.is_ascii_digit() => {
-                let mut s = String::new();
-                while let Some(&d) = chars.peek() {
-                    if d.is_ascii_digit() { s.push(d); chars.next(); } else { break; }
-                }
-                s
-            }
-            Some('@') => { chars.next(); "@".to_string() }
-            Some('*') => { chars.next(); "*".to_string() }
-            // Length of a special parameter's value: `${##}` = len of `$#`,
-            // `${#?}` = len of `$?`, `${#-}` = len of `$-`, `${#$}` = len of
-            // `$$`, `${#!}` = len of `$!` (bash semantics). `@`/`*` are caught
-            // above (arg count), so this only matches `# $ ! ? -`.
-            Some(c) if special_param_char(c) => { chars.next(); c.to_string() }
-            _ => scan_braced_name(chars)?,
-        };
-        if name.is_empty() {
-            // e.g. `${#+}` — bad substitution at runtime.
-            return recover_bad_subst(chars, parts, quoted, dollar_start);
-        }
-        // Optional subscript for the Length form: `${#a[i]}`, `${#a[@]}`.
-        // The named regular-identifier path is the only one that takes
-        // a subscript — positional names (`${#1}`) and the `@`/`*`
-        // forms (which already are pseudo-subscripts) do not.
-        let subscript = if name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
-            && !name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(true)
-        {
-            scan_param_subscript(chars, opts)?
-        } else {
-            None
-        };
-        if chars.next() != Some('}') {
-            return Err(LexError::UnterminatedBrace);
-        }
-        parts.push(WordPart::ParamExpansion {
-            name,
-            modifier: ParamModifier::Length,
-            quoted,
-            subscript,
-            indirect: false,
-        });
-        return Ok(());
-    }
 
-    // Digit-only positional parameter names: ${1}, ${10}, ${42}, etc.
-    if matches!(chars.peek().copied(), Some(c) if c.is_ascii_digit()) {
-        let mut name = String::new();
-        while let Some(&c) = chars.peek() {
-            if c.is_ascii_digit() {
-                name.push(c);
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        // Positional parameters cannot be subscripted.
-        return dispatch_braced_modifier(name, quoted, None, chars, parts, false, opts, dollar_start);
-    }
 
-    // `${!NAME[@]}` / `${!NAME[*]}` — array-keys form (v71). The bare
-    // `${!NAME}` indirect form is NOT yet supported and is rejected
-    // here by requiring the `[@]` / `[*]` subscript immediately after
-    // the name.
-    if chars.peek() == Some(&'!') {
-        chars.next(); // consume '!'
-        // Bare `${!}` is the `$!` special param (last bg pid), NOT indirect.
-        if chars.peek() == Some(&'}') {
-            chars.next(); // consume `}`
-            parts.push(WordPart::Var { name: "!".to_string(), quoted });
-            return Ok(());
-        }
-        // `${!N}` — indirect through a numeric positional source (e.g.
-        // `${!2}`, `${!1-default}`). The source name is a positional
-        // parameter reference; `scan_braced_name` rejects digit-leading
-        // names, so read the run of digits directly here. Positionals
-        // cannot be subscripted, so the subscript is `None`.
-        if matches!(chars.peek().copied(), Some(c) if c.is_ascii_digit()) {
-            let mut name = String::new();
-            while let Some(&c) = chars.peek() {
-                if c.is_ascii_digit() {
-                    name.push(c);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            return dispatch_braced_modifier(name, quoted, None, chars, parts, /* indirect */ true, opts, dollar_start);
-        }
-        // `${!X}` where X is a special parameter immediately followed by `}`:
-        // special-parameter indirect. `${!#}` = indirect of `$#`, `${!*}` /
-        // `${!@}` = indirect of `$*` / `$@`, `${!?}` = indirect of `$?`. This
-        // MUST run before the empty-name guard and the M1 prefix lookahead
-        // below, so `${!*}` / `${!@}` route to indirect (bash: empty when
-        // unset, "invalid variable name" when set) rather than a bad-subst or
-        // a prefix-name expansion.
-        //
-        // The valid set is exactly `# @ * ?` (verified against bash 5.x).
-        // `$` and `!` are bad-substs (`${!$}` / `${!!}`); `-` and `+` are
-        // operator introducers (`${!-}` / `${!-x}` / `${!+x}` parse `-`/`+`
-        // as use-default/use-alternate on an empty indirect ref, NOT as the
-        // special param `$-`), so all four fall through to the empty-name
-        // guard / operator paths below.
-        if matches!(chars.peek().copied(), Some('#' | '@' | '*' | '?')) {
-            let mut look = chars.clone();
-            let c = look.next().unwrap();
-            if look.peek() == Some(&'}') {
-                chars.next(); // consume the special-parameter char
-                return dispatch_braced_modifier(c.to_string(), quoted, None, chars, parts, /* indirect */ true, opts, dollar_start);
-            }
-        }
-        let name = scan_braced_name(chars)?;
-        if name.is_empty() {
-            // e.g. `${!+foo}` or `${!-default}` — bad substitution at runtime.
-            return recover_bad_subst(chars, parts, quoted, dollar_start);
-        }
-        // `${!prefix*}` / `${!prefix@}` — prefix-name expansion. Distinguish
-        // `*}`/`@}` (prefix form) from `@OP}` (a transform on an indirect
-        // ref): only a `*`/`@` IMMEDIATELY followed by `}` is the prefix form.
-        // Clone the cursor for a one-char lookahead past the `*`/`@`.
-        match chars.peek().copied() {
-            Some(c @ ('*' | '@')) => {
-                let mut look = chars.clone();
-                look.next(); // skip the `*`/`@`
-                if look.peek() == Some(&'}') {
-                    chars.next(); // consume `*`/`@`
-                    chars.next(); // consume `}`
-                    parts.push(WordPart::ParamExpansion {
-                        name,
-                        modifier: ParamModifier::PrefixNames { at: c == '@' },
-                        quoted,
-                        subscript: None,
-                        indirect: false,
-                    });
-                    return Ok(());
-                }
-            }
-            _ => {}
-        }
-        let subscript = scan_param_subscript(chars, opts)?;
-        match subscript {
-            Some(SubscriptKind::All) | Some(SubscriptKind::Star) => {
-                // `${!arr[@]}` / `${!arr[*]}` with NOTHING after `]` is the
-                // array-KEYS operator. With a trailing operator it is instead
-                // INDIRECT expansion through `${arr[@]}`'s value, then the
-                // operator (bash) — route that through dispatch_braced_modifier
-                // exactly like the scalar-subscript `_` arm below.
-                if chars.peek() == Some(&'}') {
-                    chars.next(); // consume `}`
-                    parts.push(WordPart::ParamExpansion {
-                        name,
-                        modifier: ParamModifier::IndirectKeys,
-                        quoted,
-                        subscript,
-                        indirect: false,
-                    });
-                    return Ok(());
-                }
-                return dispatch_braced_modifier(name, quoted, subscript, chars, parts, /* indirect */ true, opts, dollar_start);
-            }
-            _ => {
-                // `${!NAME}` / `${!NAME-word}` / `${!NAME[i]}` — indirect
-                // scalar expansion (v95): resolve NAME's value to a name,
-                // then expand that (with any trailing modifier). The name +
-                // (non-`[@]`/`[*]`) subscript are already read/scanned here.
-                return dispatch_braced_modifier(name, quoted, subscript, chars, parts, /* indirect */ true, opts, dollar_start);
-            }
-        }
-    }
-
-    let (name, name_decoded) = match scan_braced_name_ext(chars)? {
-        NameScan::BadSubst => return recover_bad_subst(chars, parts, quoted, dollar_start),
-        NameScan::Name { name, decoded } => {
-            // extquote: a `$'…'`-decoded name is only valid in double-quote
-            // context (bash). `quoted` covers top-level + default operands;
-            // `opts.in_dquote` covers pattern operands. Unquoted -> bad subst.
-            if decoded && !(quoted || opts.in_dquote) {
-                return recover_bad_subst(chars, parts, quoted, dollar_start);
-            }
-            // A decoded name must be a valid identifier (e.g. `${$'x\ty'}` is
-            // invalid -> bad subst). A non-decoded name keeps prior behavior.
-            if decoded && !is_valid_param_name(&name) {
-                return recover_bad_subst(chars, parts, quoted, dollar_start);
-            }
-            (name, decoded)
-        }
-    };
-    if name.is_empty() {
-        // `${}` (truly empty) or `${+foo}` etc. — bad substitution at runtime.
-        return recover_bad_subst(chars, parts, quoted, dollar_start);
-    }
-    // Optional subscript: `${a[…]}`, `${a[@]}`, `${a[*]}`.
-    let subscript = scan_param_subscript(chars, opts)?;
-    let pre_len = parts.len();
-    dispatch_braced_modifier(name, quoted, subscript, chars, parts, false, opts, dollar_start)?;
-    // When the name was decoded from `$'…'`, the dispatcher emits a bare `Var`
-    // for `${$'x1'}` — which `declare -f` would reconstruct as `$x1`.  Promote
-    // it to a `ParamExpansion` with `ParamModifier::None` so reconstruction
-    // yields the normalised `${x1}` form (matches bash `declare -f` output).
-    if name_decoded && parts.len() > pre_len {
-        if let Some(WordPart::Var { name: vn, quoted: vq }) = parts.last().cloned() {
-            *parts.last_mut().unwrap() = WordPart::ParamExpansion {
-                name: vn,
-                modifier: ParamModifier::None,
-                quoted: vq,
-                subscript: None,
-                indirect: false,
-            };
-        }
-    }
-    Ok(())
-}
-
-/// Scans an optional `[…]` subscript immediately after the parameter name
-/// inside a `${…}` form. Returns `None` if the next char isn't `[`.
-/// Special sigils `@` and `*` produce `SubscriptKind::All` / `Star`;
-/// any other expression is parsed via `scan_subscript` into
-/// `SubscriptKind::Index`.
-fn scan_param_subscript(
-    chars: &mut CharCursor<'_>,
-    opts: LexerOptions,
-) -> Result<Option<SubscriptKind>, LexError> {
-    if chars.peek() != Some(&'[') {
-        return Ok(None);
-    }
-    chars.next(); // consume '['
-    match chars.peek().copied() {
-        Some('@') | Some('*') => {
-            let sigil = chars.next().unwrap();
-            if chars.next() != Some(']') {
-                return Err(LexError::UnterminatedSubscript);
-            }
-            Ok(Some(if sigil == '@' {
-                SubscriptKind::All
-            } else {
-                SubscriptKind::Star
-            }))
-        }
-        _ => {
-            let inner = scan_subscript(chars, opts)?;
-            Ok(Some(SubscriptKind::Index(inner)))
-        }
-    }
-}
-
-/// Scans `expr]` and returns the Word inside the brackets. Caller has
-/// already consumed the leading `[`. Balanced over nested `[…]` (for
-/// arith-style expressions like `a[$((i+1))]`).
-fn scan_subscript(
-    chars: &mut CharCursor<'_>,
-    opts: LexerOptions,
-) -> Result<Word, LexError> {
-    let mut depth: usize = 1;
-    let mut buf = String::new();
-    while let Some(&c) = chars.peek() {
-        match c {
-            '[' => {
-                depth += 1;
-                buf.push(c);
-                chars.next();
-            }
-            ']' => {
-                chars.next();
-                depth -= 1;
-                if depth == 0 {
-                    // Re-tokenize the subscript body so embedded
-                    // expansions (`$i`, `${j}`, `$((n))`) are honoured.
-                    return parse_subscript_body(&buf, opts);
-                }
-                buf.push(c);
-            }
-            _ => {
-                buf.push(c);
-                chars.next();
-            }
-        }
-    }
-    Err(LexError::UnterminatedSubscript)
-}
-
-/// Re-tokenizes the inside of a `[…]` subscript as a single Word. If
-/// `tokenize` returns more or fewer than one Word token, falls back to
-/// a single unquoted Literal containing the raw text (which is exactly
-/// what arithmetic evaluation will see).
-fn parse_subscript_body(src: &str, opts: LexerOptions) -> Result<Word, LexError> {
-    let toks = tokenize_with_opts(src, opts)?;
-    let mut words: Vec<Word> = Vec::new();
-    for t in toks {
-        if let TokenKind::Word(w) = t.kind {
-            words.push(w);
-        }
-    }
-    if words.len() == 1 {
-        return Ok(words.pop().unwrap());
-    }
-    // Multi-word or empty: collapse into a single Literal containing
-    // the raw text. Arithmetic evaluation tolerates spaces in numeric
-    // expressions; literal-name lookups still see the joined text.
-    Ok(Word(vec![WordPart::Literal {
-        text: src.to_string(),
-        quoted: false,
-    }]))
-}
 
 /// Consumes any run of `\`-newline line continuations at the cursor (POSIX
 /// 2.2.1: `\<NL>` is deleted before tokenizing). Uses a cloned-cursor 2-char
@@ -7279,57 +5389,6 @@ fn skip_line_continuations(chars: &mut CharCursor<'_>) {
     }
 }
 
-/// Scans a compound array RHS `elem elem [idx]=elem … )`. The caller has
-/// already consumed the leading `(`. Whitespace and newlines separate
-/// elements; quoting, command substitution `$(…)`, and `${…}` interiors
-/// are all preserved verbatim and re-tokenized into a single Word per
-/// element. Subscripted elements `[expr]=value` carry an explicit
-/// `subscript` Word.
-fn scan_array_literal(
-    chars: &mut CharCursor<'_>,
-    opts: LexerOptions,
-) -> Result<Vec<ArrayLiteralElement>, LexError> {
-    let mut elements: Vec<ArrayLiteralElement> = Vec::new();
-    loop {
-        // Skip inter-element separators: whitespace, newlines, and comments.
-        skip_array_literal_separators(chars);
-        match chars.peek() {
-            Some(&')') => {
-                chars.next();
-                return Ok(elements);
-            }
-            None => return Err(LexError::UnterminatedArrayLiteral),
-            _ => {}
-        }
-        // Optional explicit `[expr]=`.
-        let subscript = if chars.peek() == Some(&'[') {
-            chars.next(); // consume '['
-            let sub = scan_subscript(chars, opts)?;
-            if chars.next() != Some('=') {
-                return Err(LexError::ArrayLiteralMissingEquals);
-            }
-            Some(sub)
-        } else {
-            None
-        };
-        let value = scan_array_element_word(chars, opts)?;
-        match subscript {
-            // Subscripted `[i]=value` keeps single-value semantics (brace stays
-            // literal — matches bash for associative subscripts; the indexed
-            // `[i]=val{brace}` edge is a documented low-impact divergence).
-            Some(sub) => {
-                elements.push(ArrayLiteralElement { subscript: Some(sub), value });
-            }
-            // Bare elements brace-expand (textual, first) into N elements; the
-            // executor then word-splits/globs each. Reuses the command-word path.
-            None => {
-                for p in brace_expand_parts(value.0)? {
-                    elements.push(ArrayLiteralElement { subscript: None, value: Word(p) });
-                }
-            }
-        }
-    }
-}
 
 /// Consumes a `#` line comment's body up to (but NOT including) the terminating
 /// newline; the caller's loop handles the newline. The opening `#` must already
@@ -7343,174 +5402,8 @@ fn skip_line_comment(chars: &mut CharCursor<'_>) {
     }
 }
 
-/// Skips inter-element separators inside an array literal: whitespace, newlines,
-/// `\<NL>` line continuations, and `#` comments. The post-skip position is always
-/// an element boundary (after `(` or inter-element whitespace), so a `#` here is
-/// unambiguously a comment — its body (incl. any `)`) must NOT be read as
-/// elements or close the literal. A `\<NL>` between elements (`[a]=1 \<NL>
-/// [b]=2`) is a line continuation, not the start of an element value.
-fn skip_array_literal_separators(
-    chars: &mut CharCursor<'_>,
-) {
-    loop {
-        while let Some(&c) = chars.peek() {
-            if c.is_whitespace() {
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        // `\<NL>` continuation (only consumes a backslash IMMEDIATELY followed by
-        // a newline — a real escape like `\x` starting an element is left alone).
-        let before = chars.offset();
-        skip_line_continuations(chars);
-        if chars.offset() != before {
-            continue; // consumed a continuation — re-check for more separators
-        }
-        if chars.peek() == Some(&'#') {
-            skip_line_comment(chars);
-        } else {
-            break;
-        }
-    }
-}
 
-/// Scans a single array-element word (terminated by unquoted whitespace
-/// or unquoted `)`). Honours `"…"`, `'…'`, `$'…'`, `$(…)`, `\…`, and
-/// nested `${…}` so closing `)` inside command substitutions doesn't
-/// end the array literal prematurely. The collected raw text is then
-/// re-tokenized via `tokenize` to produce a `Word`.
-fn scan_array_element_word(
-    chars: &mut CharCursor<'_>,
-    opts: LexerOptions,
-) -> Result<Word, LexError> {
-    let mut buf = String::new();
-    loop {
-        let c = match chars.peek().copied() {
-            Some(c) => c,
-            None => return Err(LexError::UnterminatedArrayLiteral),
-        };
-        match c {
-            ')' => break,
-            c if c.is_whitespace() => break,
-            '\'' => {
-                buf.push(c);
-                chars.next();
-                push_quoted_span(chars, '\'', &mut buf, LexError::UnterminatedQuote)?;
-            }
-            '"' => {
-                buf.push(c);
-                chars.next();
-                loop {
-                    match chars.next() {
-                        Some('"') => {
-                            buf.push('"');
-                            break;
-                        }
-                        Some('\\') => {
-                            buf.push('\\');
-                            match chars.next() {
-                                Some(esc) => buf.push(esc),
-                                None => return Err(LexError::UnterminatedQuote),
-                            }
-                        }
-                        Some(ch) => buf.push(ch),
-                        None => return Err(LexError::UnterminatedQuote),
-                    }
-                }
-            }
-            '\\' => {
-                buf.push(c);
-                chars.next();
-                if let Some(next) = chars.next() {
-                    buf.push(next);
-                }
-            }
-            '$' => {
-                buf.push('$');
-                chars.next();
-                match chars.peek().copied() {
-                    Some('(') => {
-                        buf.push('(');
-                        chars.next();
-                        scan_cmdsub_body(chars, &mut buf, LexError::UnterminatedSubstitution)?;
-                        buf.push(')');
-                    }
-                    Some('{') => {
-                        buf.push('{');
-                        chars.next();
-                        let mut depth: usize = 1;
-                        for ch in chars.by_ref() {
-                            buf.push(ch);
-                            match ch {
-                                '{' => depth += 1,
-                                '}' => {
-                                    depth -= 1;
-                                    if depth == 0 {
-                                        break;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if depth != 0 {
-                            return Err(LexError::UnterminatedBrace);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            '`' => {
-                buf.push('`');
-                chars.next();
-                consume_backtick_verbatim(chars, &mut buf)?;
-            }
-            _ => {
-                buf.push(c);
-                chars.next();
-            }
-        }
-    }
-    // Re-tokenize the collected text as a single Word. Brace expansion is
-    // suppressed here so an element like `x{1,2}$v` stays ONE Word with the
-    // brace as literal text and `$v` as a real expansion part; the brace is
-    // expanded later by `brace_expand_parts` in `scan_array_literal`, which
-    // sentinel-protects the expansion.
-    let toks = tokenize_no_brace(&buf, opts)?;
-    let mut words: Vec<Word> = Vec::new();
-    for t in toks {
-        if let TokenKind::Word(w) = t.kind {
-            words.push(w);
-        }
-    }
-    if words.len() == 1 {
-        Ok(words.pop().unwrap())
-    } else if words.is_empty() {
-        Ok(Word(vec![WordPart::Literal {
-            text: String::new(),
-            quoted: false,
-        }]))
-    } else {
-        // Multi-word: collapse into a single Literal (rare; would mean
-        // unquoted brace expansion or similar inside the element).
-        Ok(Word(vec![WordPart::Literal {
-            text: buf,
-            quoted: false,
-        }]))
-    }
-}
 
-/// Reads identifier chars (the parameter name) inside a `${...}` until it
-/// hits a non-identifier char. Does NOT consume the terminator.
-/// The special single-char parameter names that may appear as the operand
-/// of the length (`${#X}`) form. (`@`/`*` are handled separately in the
-/// Length path because they mean "arg count", not "length of the special
-/// param's value".) For the indirect (`${!X}`) form a narrower set is used
-/// inline — see `scan_braced_param_expansion` — because bash bad-substs
-/// `${!$}` and `${!!}`.
-fn special_param_char(c: char) -> bool {
-    matches!(c, '#' | '@' | '*' | '$' | '!' | '?' | '-')
-}
 
 /// A valid POSIX parameter name: `[A-Za-z_][A-Za-z0-9_]*`, non-empty.
 fn is_valid_param_name(s: &str) -> bool {
@@ -7569,430 +5462,14 @@ fn scan_braced_name_ext(chars: &mut CharCursor<'_>) -> Result<NameScan, LexError
     Ok(NameScan::Name { name, decoded })
 }
 
-fn scan_braced_name(
-    chars: &mut CharCursor<'_>,
-) -> Result<String, LexError> {
-    let mut name = String::new();
-    while let Some(&c) = chars.peek() {
-        if c == '_' || c.is_ascii_alphanumeric() {
-            if name.is_empty() && c.is_ascii_digit() {
-                return Err(LexError::InvalidVarName);
-            }
-            name.push(c);
-            chars.next();
-        } else {
-            break;
-        }
-    }
-    Ok(name)
-}
 
-/// Dispatches a `${name<modifier>...}` form once `name` has been read. The
-/// next char to read from `chars` is whatever follows the name (typically
-/// `}`, `:`, `-`, `=`, `?`, `+`, `#`, `%`, or `/`). `subscript` is
-/// `Some(...)` when the name was followed by `[...]` (already scanned).
-/// `dollar_start` is the byte offset of the leading `$` (for bad-subst
-/// recovery). Pushes a single `WordPart` (`Var` or `ParamExpansion`) onto `parts`.
-fn dispatch_braced_modifier(
-    name: String,
-    quoted: bool,
-    subscript: Option<SubscriptKind>,
-    chars: &mut CharCursor<'_>,
-    parts: &mut Vec<WordPart>,
-    indirect: bool,
-    opts: LexerOptions,
-    dollar_start: usize,
-) -> Result<(), LexError> {
-    match chars.next() {
-        Some('}') => {
-            if subscript.is_some() {
-                // `${a[i]}` / `${a[@]}` / `${a[*]}` — no scalar-style
-                // modifier. Emit `ParamModifier::None`, a no-op marker.
-                // (We can't reuse `UseDefault { word: empty }`: that
-                // would be semantically `${a[i]-}` — silently substitute
-                // "" on unset — which suppresses the array-expansion
-                // path's ability to distinguish unset elements.) Task 3
-                // dispatches the array lookup via the `subscript` field.
-                parts.push(WordPart::ParamExpansion {
-                    name,
-                    modifier: ParamModifier::None,
-                    quoted,
-                    subscript,
-                    indirect,
-                });
-                return Ok(());
-            }
-            if indirect {
-                // Bare `${!ref}` — indirect scalar expansion with no
-                // trailing modifier. Emit `ParamModifier::None` so the
-                // eval `indirect` branch resolves the through-value.
-                parts.push(WordPart::ParamExpansion {
-                    name,
-                    modifier: ParamModifier::None,
-                    quoted,
-                    subscript,
-                    indirect: true,
-                });
-                return Ok(());
-            }
-            parts.push(WordPart::Var { name, quoted });
-            Ok(())
-        }
-        Some(':') => {
-            match chars.peek().copied() {
-                Some('-') => {
-                    chars.next();
-                    let modifier = modifier_with_operand(chars, quoted, opts, |w| ParamModifier::UseDefault { word: w, colon: true })?;
-                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
-                    Ok(())
-                }
-                Some('=') => {
-                    chars.next();
-                    let modifier = modifier_with_operand(chars, quoted, opts, |w| ParamModifier::AssignDefault { word: w, colon: true })?;
-                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
-                    Ok(())
-                }
-                Some('?') => {
-                    chars.next();
-                    let modifier = modifier_with_operand(chars, false, opts, |w| ParamModifier::ErrorIfUnset { word: w, colon: true })?;
-                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
-                    Ok(())
-                }
-                Some('+') => {
-                    chars.next();
-                    let modifier = modifier_with_operand(chars, quoted, opts, |w| ParamModifier::UseAlternate { word: w, colon: true })?;
-                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
-                    Ok(())
-                }
-                Some('}') => recover_bad_subst(chars, parts, quoted, dollar_start),
-                Some(_) => {
-                    let (offset, length) = scan_substring_operands(chars, opts)?;
-                    parts.push(WordPart::ParamExpansion {
-                        name,
-                        modifier: ParamModifier::Substring { offset, length },
-                        quoted,
-                        subscript,
-                        indirect,
-                    });
-                    Ok(())
-                }
-                None => Err(LexError::UnterminatedBrace),
-            }
-        }
-        Some('-') => {
-            let modifier = modifier_with_operand(chars, quoted, opts, |w| ParamModifier::UseDefault { word: w, colon: false })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
-            Ok(())
-        }
-        Some('=') => {
-            let modifier = modifier_with_operand(chars, quoted, opts, |w| ParamModifier::AssignDefault { word: w, colon: false })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
-            Ok(())
-        }
-        Some('?') => {
-            let modifier = modifier_with_operand(chars, false, opts, |w| ParamModifier::ErrorIfUnset { word: w, colon: false })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
-            Ok(())
-        }
-        Some('+') => {
-            let modifier = modifier_with_operand(chars, quoted, opts, |w| ParamModifier::UseAlternate { word: w, colon: false })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
-            Ok(())
-        }
-        Some('#') => {
-            let longest = chars.peek() == Some(&'#');
-            if longest { chars.next(); }
-            let modifier = modifier_with_operand(chars, false, opts.with_in_dquote(quoted || opts.in_dquote), |w| ParamModifier::RemovePrefix { pattern: w, longest })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
-            Ok(())
-        }
-        Some('%') => {
-            let longest = chars.peek() == Some(&'%');
-            if longest { chars.next(); }
-            let modifier = modifier_with_operand(chars, false, opts.with_in_dquote(quoted || opts.in_dquote), |w| ParamModifier::RemoveSuffix { pattern: w, longest })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
-            Ok(())
-        }
-        Some('/') => {
-            let all = chars.peek() == Some(&'/');
-            if all { chars.next(); }
-            let anchor = match chars.peek().copied() {
-                Some('#') if !all => { chars.next(); SubstAnchor::Prefix }
-                Some('%') if !all => { chars.next(); SubstAnchor::Suffix }
-                _ => SubstAnchor::None,
-            };
-            let (pattern, replacement) = scan_substitution_operand(chars, opts.with_in_dquote(quoted || opts.in_dquote))?;
-            parts.push(WordPart::ParamExpansion {
-                name,
-                modifier: ParamModifier::Substitute { pattern, replacement, anchor, all },
-                quoted,
-                subscript,
-                indirect,
-            });
-            Ok(())
-        }
-        Some('^') => {
-            let all = chars.peek() == Some(&'^');
-            if all { chars.next(); }
-            let pattern = scan_optional_braced_operand(chars, opts.with_in_dquote(quoted || opts.in_dquote))?;
-            parts.push(WordPart::ParamExpansion {
-                name,
-                modifier: ParamModifier::Case { direction: CaseDirection::Upper, all, pattern },
-                quoted,
-                subscript,
-                indirect,
-            });
-            Ok(())
-        }
-        Some(',') => {
-            let all = chars.peek() == Some(&',');
-            if all { chars.next(); }
-            let pattern = scan_optional_braced_operand(chars, opts.with_in_dquote(quoted || opts.in_dquote))?;
-            parts.push(WordPart::ParamExpansion {
-                name,
-                modifier: ParamModifier::Case { direction: CaseDirection::Lower, all, pattern },
-                quoted,
-                subscript,
-                indirect,
-            });
-            Ok(())
-        }
-        Some('@') => {
-            // `${V@}` with no op letter — bad substitution at runtime.
-            if chars.peek() == Some(&'}') {
-                return recover_bad_subst(chars, parts, quoted, dollar_start);
-            }
-            let op = match chars.next() {
-                Some('P') => TransformOp::PromptExpand,
-                Some('Q') => TransformOp::Quote,
-                Some('U') => TransformOp::Upper,
-                Some('L') => TransformOp::Lower,
-                Some('u') => TransformOp::UpperFirst,
-                Some('E') => TransformOp::EscapeExpand,
-                Some('A') => TransformOp::AssignDecl,
-                Some('K') => TransformOp::KvString,
-                Some('k') => TransformOp::KvWords,
-                Some('a') => TransformOp::AttrFlags,
-                _other => {
-                    // Unknown or missing op letter — bad substitution at runtime.
-                    // One char has already been consumed; scan_braced_operand will
-                    // continue from here to the matching `}`.
-                    return recover_bad_subst(chars, parts, quoted, dollar_start);
-                }
-            };
-            // After the operator letter, the next char must close the brace.
-            match chars.next() {
-                Some('}') => {
-                    parts.push(WordPart::ParamExpansion {
-                        name,
-                        modifier: ParamModifier::Transform { op },
-                        quoted,
-                        subscript,
-                        indirect,
-                    });
-                    Ok(())
-                }
-                _ => Err(LexError::UnterminatedBrace),
-            }
-        }
-        Some(c) => {
-            // Unknown modifier character — bad substitution at runtime.
-            // `c` was already consumed by `chars.next()` at the top of this match;
-            // `recover_bad_subst` will scan from here to the matching `}`.
-            let _ = c;
-            recover_bad_subst(chars, parts, quoted, dollar_start)
-        }
-        None => Err(LexError::UnterminatedBrace),
-    }
-}
 
-/// Scans the operand text until the matching `}` and parses it as a single
-/// `Word`. Builds the `ParamModifier` via the caller's closure.
-fn modifier_with_operand<F>(
-    chars: &mut CharCursor<'_>,
-    enclosing_dquote: bool,
-    opts: LexerOptions,
-    build: F,
-) -> Result<ParamModifier, LexError>
-where
-    F: FnOnce(Word) -> ParamModifier,
-{
-    let body = scan_braced_operand(chars)?;
-    let word = parse_braced_operand_opts(&body, enclosing_dquote, opts)?;
-    Ok(build(word))
-}
 
-/// Scans a single optional operand inside a `${name<mod>OPERAND}` form.
-/// Returns `None` if the operand body is empty (i.e. the modifier is
-/// immediately followed by `}`), or `Some(Word)` for a non-empty body.
-/// Delegates to `scan_braced_operand` (depth + quote aware) so nested
-/// `${...}` constructs in the operand are handled correctly.
-fn scan_optional_braced_operand(
-    chars: &mut CharCursor<'_>,
-    opts: LexerOptions,
-) -> Result<Option<Word>, LexError> {
-    let body = scan_braced_operand(chars)?;
-    if body.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(parse_braced_operand_opts(&body, false, opts)?))
-    }
-}
 
-/// Walks the chars iterator from just after the leading `/` of a
-/// substitution operand. Delegates to `scan_braced_operand` to collect the
-/// raw body (which depth-tracks nested `${...}` and protects `}` inside
-/// quoted spans), then splits pattern from replacement on the first
-/// unescaped `/` at brace-depth zero outside any quoted span. `\/` becomes
-/// a literal `/`; `\\` becomes a literal `\`; any other `\x` passes
-/// through unchanged so the inner operand tokenizer sees it.
-fn scan_substitution_operand(
-    chars: &mut CharCursor<'_>,
-    opts: LexerOptions,
-) -> Result<(Word, Word), LexError> {
-    let body = scan_braced_operand(chars)?;
-    let (pattern_src, replacement_src) = split_substitution_body(&body);
-    let pattern = parse_braced_operand_opts(&pattern_src, false, opts)?;
-    let replacement = parse_braced_operand_opts(&replacement_src, false, opts)?;
-    Ok((pattern, replacement))
-}
 
-/// Splits a `${…}` modifier operand body on the FIRST top-level `delim`,
-/// returning `(before, Some(after))` if a top-level delimiter was found, or
-/// `(before, None)` otherwise. "Top level" excludes single quotes, double
-/// quotes, backticks, a `$(…)` command substitution (nested parens — also
-/// covers `$((…))` and `$( (…) )`), and `{…}` braces. Skipped spans are
-/// appended VERBATIM so the segments re-parse exactly as written. A backslash
-/// escape `\x` is ALSO preserved verbatim (and the escaped char consumed, so an
-/// escaped delimiter `\delim` does not split and an escaped quote `\"` does not
-/// open a span); all un-escaping is done once, downstream, by
-/// `parse_braced_operand_opts`. Inside a command substitution escapes are
-/// verbatim too (they belong to the command), mirroring `scan_paren_substitution`.
-fn split_modifier_operand(body: &str, delim: char) -> (String, Option<String>) {
-    let mut first = String::new();
-    let mut second = String::new();
-    let mut delim_seen = false;
-    let mut brace_depth: u32 = 0; // { } nesting
-    let mut chars = CharCursor::new(body);
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                // Preserve an escaped char VERBATIM (backslash + the char) and
-                // CONSUME the char so it cannot act as a delimiter or open a
-                // quote/backtick span. The real un-escaping happens once,
-                // downstream, in parse_braced_operand_opts; pre-un-escaping here
-                // would double-process backslashes (corrupting runs like `\\\"`).
-                // An escaped delimiter (`\/`) is thus preserved AND not seen as a
-                // split point. A trailing `\` at end of body pushes just `\`.
-                let dst = if delim_seen { &mut second } else { &mut first };
-                dst.push('\\');
-                if let Some(nc) = chars.next() {
-                    dst.push(nc);
-                }
-            }
-            '\'' => {
-                let dst = if delim_seen { &mut second } else { &mut first };
-                dst.push('\'');
-                for qc in chars.by_ref() {
-                    dst.push(qc);
-                    if qc == '\'' {
-                        break;
-                    }
-                }
-            }
-            '"' => {
-                let dst = if delim_seen { &mut second } else { &mut first };
-                dst.push('"');
-                while let Some(qc) = chars.next() {
-                    dst.push(qc);
-                    if qc == '\\' {
-                        if let Some(nc) = chars.next() {
-                            dst.push(nc);
-                        }
-                    } else if qc == '"' {
-                        break;
-                    }
-                }
-            }
-            '`' => {
-                let dst = if delim_seen { &mut second } else { &mut first };
-                dst.push('`');
-                // Skip the backtick command substitution verbatim. The Result is
-                // unreachable (operand body pre-balanced by scan_braced_operand);
-                // on the impossible EOF the closing backtick is not re-added and
-                // the cursor is exhausted, so the loop ends with identical segments.
-                let _ = consume_backtick_verbatim(&mut chars, dst);
-            }
-            '$' => {
-                let dst = if delim_seen { &mut second } else { &mut first };
-                dst.push('$');
-                if chars.peek() == Some(&'(') {
-                    chars.next();
-                    dst.push('(');
-                    // Skip the whole command substitution verbatim so a delimiter
-                    // inside it is ignored (L-10). The `Result` is unreachable: the
-                    // operand body was already $()-balanced by scan_braced_operand;
-                    // on the impossible error the partial is appended and the cursor
-                    // is exhausted, so the outer loop ends with identical segments.
-                    let _ = consume_paren_cmdsub_verbatim(&mut chars, dst);
-                }
-            }
-            '{' => {
-                brace_depth += 1;
-                if delim_seen { second.push('{'); } else { first.push('{'); }
-            }
-            '}' => {
-                brace_depth = brace_depth.saturating_sub(1);
-                if delim_seen { second.push('}'); } else { first.push('}'); }
-            }
-            c if c == delim && brace_depth == 0 && !delim_seen => {
-                delim_seen = true;
-            }
-            _ => {
-                if delim_seen { second.push(c); } else { first.push(c); }
-            }
-        }
-    }
-    if delim_seen {
-        (first, Some(second))
-    } else {
-        (first, None)
-    }
-}
 
-/// Splits a `${var/pat/repl}` operand body into `(pattern, replacement)` on the
-/// first top-level `/` (skipping command substitutions / quotes / braces — see
-/// `split_modifier_operand`). A missing replacement (`${var/pat}`) yields `""`,
-/// matching bash's treatment of `${var/pat}` as `${var/pat/}`.
-fn split_substitution_body(body: &str) -> (String, String) {
-    let (pattern, replacement) = split_modifier_operand(body, '/');
-    (pattern, replacement.unwrap_or_default())
-}
 
-/// Scans a `${var:offset}` / `${var:offset:length}` operand pair. Delegates
-/// to `scan_braced_operand` + `split_substring_body` + `parse_braced_operand`
-/// to collect and parse the offset and optional length Words.
-fn scan_substring_operands(
-    chars: &mut CharCursor<'_>,
-    opts: LexerOptions,
-) -> Result<(Word, Option<Word>), LexError> {
-    let body = scan_braced_operand(chars)?;
-    let (offset_src, length_src) = split_substring_body(&body);
-    let offset = parse_braced_operand_opts(&offset_src, false, opts)?;
-    let length = match length_src {
-        Some(s) => Some(parse_braced_operand_opts(&s, false, opts)?),
-        None => None,
-    };
-    Ok((offset, length))
-}
 
-/// Splits a substring-operand body (as returned by `scan_braced_operand`)
-/// on the first unescaped `:` that sits at brace-depth zero outside any
-/// quoted span. Returns `(offset_src, Some(length_src))` if a delimiter
-/// was found, or `(offset_src, None)` otherwise (the no-length form).
-fn split_substring_body(body: &str) -> (String, Option<String>) {
-    split_modifier_operand(body, ':')
-}
 
 fn is_name_start(c: char) -> bool {
     c == '_' || c.is_ascii_alphabetic()
@@ -8082,38 +5559,7 @@ fn is_tilde_terminator(c: char) -> bool {
         || matches!(c, '|' | '<' | '>' | '&' | ';')
 }
 
-fn tilde_eligible_in_assignment(in_assignment_value: bool, current: &str) -> bool {
-    if !in_assignment_value {
-        return false;
-    }
-    matches!(current.chars().last(), Some(':') | Some('='))
-}
 
-/// True iff the unquoted text accumulated so far for the current word
-/// forms a valid shell identifier (matches [A-Za-z_]\w*).
-fn word_is_identifier_so_far(current: &str, parts: &[WordPart]) -> bool {
-    // The word so far must be exactly `parts ++ current` where every
-    // WordPart is a Literal (no Var/Tilde/CommandSub etc), AND the
-    // concatenation is a non-empty identifier.
-    let mut joined = String::new();
-    for p in parts {
-        if let WordPart::Literal { text, quoted: false } = p {
-            joined.push_str(text);
-        } else {
-            return false;
-        }
-    }
-    joined.push_str(current);
-    if joined.is_empty() {
-        return false;
-    }
-    let mut iter = joined.chars();
-    let first = iter.next().unwrap();
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return false;
-    }
-    iter.all(|c| c == '_' || c.is_ascii_alphanumeric())
-}
 
 fn is_user_name_start(c: char) -> bool {
     c == '_' || c.is_ascii_alphabetic()
@@ -8126,7 +5572,6 @@ fn is_user_name_continue(c: char) -> bool {
 /// 1-based line number of byte offset `off` within `src`
 /// (1 + the count of '\n' bytes before `off`). Clamps `off` to `src.len()`.
 /// Used in tests and for isolated single-offset lookups.
-#[allow(dead_code)]
 pub fn line_at_offset(src: &str, off: usize) -> u32 {
     1 + src.as_bytes()[..off.min(src.len())].iter().filter(|&&b| b == b'\n').count() as u32
 }
@@ -8134,7 +5579,6 @@ pub fn line_at_offset(src: &str, off: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::RedirFd;
 
     #[test]
     fn char_cursor_tracks_offset_line_column() {
@@ -8155,138 +5599,16 @@ mod tests {
         assert_eq!((c.offset(), c.line(), c.column()), (7, 2, 4)); // at 'd'
     }
 
-    #[test]
-    fn split_modifier_operand_basic_split() {
-        assert_eq!(split_modifier_operand("a/b", '/'), ("a".into(), Some("b".into())));
-        assert_eq!(split_modifier_operand("a", '/'), ("a".into(), None));
-        assert_eq!(split_modifier_operand("2:3", ':'), ("2".into(), Some("3".into())));
-        assert_eq!(split_modifier_operand("2", ':'), ("2".into(), None));
-    }
 
-    #[test]
-    fn split_modifier_operand_skips_command_sub() {
-        // A delimiter inside $(...) is NOT the split point (L-10).
-        assert_eq!(
-            split_modifier_operand("$(echo a/x)/Z", '/'),
-            ("$(echo a/x)".into(), Some("Z".into()))
-        );
-        assert_eq!(
-            split_modifier_operand("$(echo 1:2)", ':'),
-            ("$(echo 1:2)".into(), None)
-        );
-        // Nested $( $() ).
-        assert_eq!(
-            split_modifier_operand("$(echo $(echo a/b))/Q", '/'),
-            ("$(echo $(echo a/b))".into(), Some("Q".into()))
-        );
-        // $(( ... )) arithmetic with a ternary colon inside.
-        assert_eq!(
-            split_modifier_operand("$((1>0?2:3))", ':'),
-            ("$((1>0?2:3))".into(), None)
-        );
-    }
 
-    #[test]
-    fn split_modifier_operand_skips_backtick() {
-        assert_eq!(
-            split_modifier_operand("`echo a/x`/Z", '/'),
-            ("`echo a/x`".into(), Some("Z".into()))
-        );
-    }
 
-    #[test]
-    fn split_modifier_operand_quotes_and_escapes() {
-        // A quoted delimiter is kept verbatim and does not split.
-        assert_eq!(
-            split_modifier_operand("\"a/b\"/x", '/'),
-            ("\"a/b\"".into(), Some("x".into()))
-        );
-        // An escaped delimiter is preserved VERBATIM and does not split
-        // (downstream parse_braced_operand_opts un-escapes `\/`→`/`).
-        assert_eq!(split_modifier_operand("a\\/b/x", '/'), ("a\\/b".into(), Some("x".into())));
-        // `\\` is preserved verbatim (un-escaped once, downstream).
-        assert_eq!(split_modifier_operand("a\\\\b", '/'), ("a\\\\b".into(), None));
-        // Regression: `\\\"` (escaped backslash + escaped quote) must not let the
-        // `"` open a span that swallows the delimiter. Body `\\\"/Z` (Rust
-        // literal `"\\\\\\\"/Z"`) splits to pattern `\\\"` and replacement `Z`.
-        assert_eq!(
-            split_modifier_operand("\\\\\\\"/Z", '/'),
-            ("\\\\\\\"".into(), Some("Z".into()))
-        );
-    }
 
-    #[test]
-    fn split_modifier_operand_brace_nesting() {
-        // A delimiter inside ${...} plain nesting is not the split point.
-        assert_eq!(split_modifier_operand("${x:-y}", ':'), ("${x:-y}".into(), None));
-    }
 
-    /// True iff `tokens` contains at least one `TokenKind::RedirFd`.
-    fn has_redir_fd(tokens: &[Token]) -> bool {
-        tokens.iter().any(|t| matches!(t.kind, TokenKind::RedirFd(_)))
-    }
 
-    #[test]
-    fn lexer_fd_prefix_numeric() {
-        // `echo 2>&1`: the `2` is whitespace-separated from `echo`, glued to the
-        // operator — but the dedicated `2>` scanner fires (DupErr) and encodes
-        // fd 2 in the operator itself, so NO RedirFd token is emitted here.
-        // Use an fd with no dedicated scanner (`3>`) to exercise take_fd_prefix.
-        let toks = tokenize("echo 3>file").unwrap();
-        assert!(
-            toks.iter().any(|t| matches!(&t.kind, TokenKind::RedirFd(RedirFd::Number(3)))),
-            "expected RedirFd(Number(3)) in {toks:?}"
-        );
-        // And `echo 12>file` → fd 12.
-        let toks = tokenize("echo 12>file").unwrap();
-        assert!(
-            toks.iter().any(|t| matches!(&t.kind, TokenKind::RedirFd(RedirFd::Number(12)))),
-            "expected RedirFd(Number(12)) in {toks:?}"
-        );
-    }
 
-    #[test]
-    fn lexer_fd_prefix_space_is_not_prefix() {
-        // `echo 3 >file`: a space separates `3` from `>` — the `3` stays a Word
-        // argument and NO RedirFd is emitted.
-        let toks = tokenize("echo 3 >file").unwrap();
-        assert!(!has_redir_fd(&toks), "unexpected RedirFd in {toks:?}");
-        // The `3` survives as a Word arg.
-        assert!(
-            toks.iter().any(|t| matches!(&t.kind, TokenKind::Word(w) if crate::command::word_literal_text(w) == Some("3"))),
-            "expected Word(\"3\") arg in {toks:?}"
-        );
-    }
 
-    #[test]
-    fn lexer_fd_prefix_glued_word_is_not_prefix() {
-        // `file2>x`: `file2` is not all-digits, so no RedirFd; `file2` stays a Word.
-        let toks = tokenize("file2>x").unwrap();
-        assert!(!has_redir_fd(&toks), "unexpected RedirFd in {toks:?}");
-        assert!(
-            toks.iter().any(|t| matches!(&t.kind, TokenKind::Word(w) if crate::command::word_literal_text(w) == Some("file2"))),
-            "expected Word(\"file2\") in {toks:?}"
-        );
-    }
 
-    #[test]
-    fn lexer_named_fd_prefix() {
-        // `exec {fd}>log`: `{fd}` glued to `>` → RedirFd::Var("fd").
-        let toks = tokenize("exec {fd}>log").unwrap();
-        assert!(
-            toks.iter().any(|t| matches!(&t.kind, TokenKind::RedirFd(RedirFd::Var(name)) if name == "fd")),
-            "expected RedirFd(Var(\"fd\")) in {toks:?}"
-        );
-    }
 
-    #[test]
-    fn lexer_readwrite_and_dupin_operators() {
-        let toks = tokenize("cmd <>f").unwrap();
-        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::RedirReadWrite))));
-        let toks = tokenize("cmd 3<&0").unwrap();
-        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::RedirFd(RedirFd::Number(3)))));
-        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::DupIn))));
-    }
 
     #[test]
     fn line_at_offset_counts_newlines() {
@@ -8309,145 +5631,41 @@ mod tests {
         assert_eq!(c.next(), Some('c')); assert_eq!(c.line(), 3);
     }
 
-    /// Builds a Token that holds a single-Literal Word.
-    fn w(s: &str) -> Token {
-        TokenKind::Word(Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])).into()
-    }
 
     fn word_text(t: &Token) -> Option<String> {
-        if let TokenKind::Word(Word(parts)) = &t.kind
-            && parts.len() == 1
-            && let WordPart::Literal { text, quoted: false } = &parts[0]
-        {
-            return Some(text.clone());
-        }
-        None
-    }
-
-    #[test]
-    fn extglob_inside_command_sub_lexes() {
-        let opts = LexerOptions { extglob: true, ..Default::default() };
-        let toks = tokenize_with_opts("echo $(echo !(x))", opts).unwrap();
-        assert!(toks.iter().any(|t| matches!(
-            &t.kind, TokenKind::Word(Word(parts)) if parts.iter().any(|p| matches!(p, WordPart::CommandSub { .. }))
-        )));
-    }
-
-    #[test]
-    fn extglob_inside_backtick_sub_lexes() {
-        let opts = LexerOptions { extglob: true, ..Default::default() };
-        tokenize_with_opts("echo `echo !(x)`", opts).unwrap();
-    }
-
-    #[test]
-    fn extglob_inside_array_literal_command_sub_lexes() {
-        let opts = LexerOptions { extglob: true, ..Default::default() };
-        tokenize_with_opts("a=($(printf '%s\\n' /tmp/!(x)))", opts).unwrap();
-    }
-
-    #[test]
-    fn command_sub_without_extglob_still_errors_on_bare_extglob() {
-        let opts = LexerOptions { extglob: false, ..Default::default() };
-        assert!(tokenize_with_opts("echo $(echo !(x))", opts).is_err());
-    }
-
-    #[test]
-    fn plain_command_sub_unchanged() {
-        for eg in [false, true] {
-            let opts = LexerOptions { extglob: eg, ..Default::default() };
-            tokenize_with_opts("echo $(echo hi) $((1+1))", opts).unwrap();
+        // v266: atom-aware. A command-position word is a bare `Lit` atom; a
+        // brace-expansion product is still a single-literal `Word`. Accept both.
+        match &t.kind {
+            TokenKind::Lit { text, quoted: false } => Some(text.clone()),
+            TokenKind::Word(Word(parts))
+                if parts.len() == 1
+                    && matches!(&parts[0], WordPart::Literal { quoted: false, .. }) =>
+            {
+                if let WordPart::Literal { text, .. } = &parts[0] {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
-    #[test]
-    fn dbracket_regex_paren_operand_is_one_word() {
-        let toks = tokenize("[[ x =~ (a) ]]").unwrap();
-        let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
-        assert_eq!(texts, vec!["[[", "x", "=~", "(a)", "]]"]);
-        assert!(!toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::LParen) | TokenKind::ArithBlock(..))));
-    }
 
-    #[test]
-    fn dbracket_regex_double_paren_not_arithblock() {
-        let toks = tokenize("[[ ab =~ ((a)) ]]").unwrap();
-        let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
-        assert_eq!(texts, vec!["[[", "ab", "=~", "((a))", "]]"]);
-        assert!(!toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))));
-    }
 
-    #[test]
-    fn dbracket_regex_line847_shape() {
-        let toks = tokenize(r"[[ $option =~ (\[((no|dont)-?)\]). ]]").unwrap();
-        let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
-        assert!(texts.iter().any(|t| t.starts_with("(\\[")));
-        assert!(texts.contains(&"]]".to_string()));
-        assert!(!toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))));
-    }
 
-    #[test]
-    fn dbracket_regex_space_inside_parens_kept() {
-        let toks = tokenize("[[ x =~ (a b) ]]").unwrap();
-        let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
-        assert_eq!(texts, vec!["[[", "x", "=~", "(a b)", "]]"]);
-    }
 
-    #[test]
-    fn dbracket_regex_operand_after_line_continuation() {
-        // bash_completion line 876 shape: the `=~` operand is on a `\`-newline
-        // continuation line whose indentation must NOT end the operand empty.
-        let toks = tokenize("[[ $x =~ \\\n   (a|b)c ]]").unwrap();
-        let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
-        // the regex operand is the single word `(a|b)c`, then `]]`.
-        assert!(texts.contains(&"(a|b)c".to_string()), "texts: {texts:?}");
-        assert!(texts.contains(&"]]".to_string()));
-        assert!(!toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..) | TokenKind::Op(Operator::LParen))));
-    }
 
-    #[test]
-    fn braced_operand_bare_brace_is_literal() {
-        // bash_completion line 849/854: `${var%%[<{(]*}` — a bare `{` in the
-        // pattern must not nest the `${...}` (only `${` nests). Previously this
-        // raised UnterminatedBrace.
-        assert!(tokenize("${x%%[<{(]*}").is_ok());
-        assert!(tokenize("${x%%{*}").is_ok());
-        // nested ${...} still depth-tracks:
-        assert!(tokenize("${x:-${y}}").is_ok());
-    }
 
-    #[test]
-    fn braced_operand_ansi_c_quote_with_escaped_quote() {
-        // `$'a\t\'\tb'` inside the body: the escaped `\'` must NOT terminate
-        // the scan, and the trailing `'` is the ANSI-C close, not a new span.
-        let toks = tokenize(r#"${x#$'a\t\'\tb'}"#).unwrap();
-        // It must tokenize (not error). Exactly one Word token with a single
-        // ParamExpansion part (RemovePrefix).
-        assert_eq!(toks.len(), 1);
-    }
 
-    #[test]
-    fn braced_operand_ansi_c_quote_simple() {
-        let toks = tokenize(r#"${x#$'f'}"#).unwrap();
-        assert_eq!(toks.len(), 1);
-    }
 
-    #[test]
-    fn grouping_paren_outside_regex_still_op() {
-        let toks = tokenize("[[ ( -n a ) ]]").unwrap();
-        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::LParen))));
-        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::RParen))));
-    }
 
-    #[test]
-    fn arith_block_outside_dbracket_unchanged() {
-        let toks = tokenize("(( 1 + 1 ))").unwrap();
-        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))));
-    }
 
-    #[test]
-    fn quoted_dbracket_word_does_not_change_depth() {
-        let toks = tokenize("[[ '[[' = x ]]").unwrap();
-        assert!(toks.iter().filter_map(word_text).any(|t| t == "]]"));
-    }
+
+
+
+
+
 
     #[test]
     fn char_cursor_tracks_byte_offset() {
@@ -8466,60 +5684,9 @@ mod tests {
         assert_eq!(c.offset(), 4);
     }
 
-    #[test]
-    fn span_offsets_align_with_token_starts() {
-        // "echo hi\nls" -> Word(echo)@0 Word(hi)@5 Newline@7 Word(ls)@8
-        let toks = tokenize("echo hi\nls").unwrap();
-        assert_eq!(toks[0].span.offset, 0);
-        let nl = toks.iter().position(|t| matches!(&t.kind, TokenKind::Newline)).unwrap();
-        assert_eq!(toks[nl].span.offset, 7);
-        assert_eq!(toks[nl + 1].span.offset, 8);
-    }
 
-    /// Each token's recorded span offset must point at the byte where that
-    /// token's source actually begins (verified by re-deriving from a
-    /// distinctive first character).
-    #[test]
-    fn span_offsets_point_at_real_token_starts() {
-        // Leading whitespace before the first word; operators; a quoted word.
-        //          0123456789012345678901
-        let src = "  echo a && ls 'x y'\n";
-        let toks = tokenize_with_opts(src, LexerOptions::default()).unwrap();
-        // First word "echo" starts at byte 2 (after two spaces).
-        assert_eq!(toks[0].span.offset, 2);
-        // The `&&` operator starts at byte 9.
-        let and = toks.iter().position(|t| matches!(&t.kind, TokenKind::Op(Operator::And))).unwrap();
-        assert_eq!(toks[and].span.offset, 9);
-        assert_eq!(&src[toks[and].span.offset..toks[and].span.offset + 2], "&&");
-        // The quoted word 'x y' is the second-to-last token (before trailing Newline).
-        let q = toks.len() - 2;
-        assert_eq!(&src[toks[q].span.offset..toks[q].span.offset + 1], "'");
-        // Trailing Newline at byte 20.
-        assert_eq!(toks.last().unwrap().span.offset, 20);
-        // Offsets are non-decreasing and in range.
-        for w in toks.windows(2) {
-            assert!(w[0].span.offset <= w[1].span.offset);
-        }
-        assert!(toks.iter().all(|t| t.span.offset <= src.len()));
-    }
 
-    /// A token's span carries its 1-based source line directly (the line-lookup
-    /// the reader used to compute by counting newlines up to an offset).
-    #[test]
-    fn span_carries_source_line() {
-        let src = "echo a\necho b\nbad)\n";
-        let toks = tokenize(src).unwrap();
-        // The `)` operator is on line 3.
-        let rp = toks.iter().position(|t| matches!(&t.kind, TokenKind::Op(Operator::RParen))).unwrap();
-        assert_eq!(toks[rp].span.line, 3);
-    }
 
-    #[test]
-    fn partial_error_returns_failure_position() {
-        let (_toks, err) = tokenize_partial("echo 'oops", LexerOptions::default());
-        let (_e, off) = err.expect("unterminated quote should error");
-        assert!(off >= 5, "failure offset {off} should be at/after the open quote");
-    }
 
     #[test]
     fn char_cursor_offset_with_multibyte() {
@@ -8532,34 +5699,7 @@ mod tests {
         assert_eq!(c.offset(), 3);
     }
 
-    #[test]
-    fn extglob_word_recognized_when_enabled() {
-        let toks = tokenize_with_opts("+(a|b)", LexerOptions { extglob: true, ..Default::default() }).unwrap();
-        assert_eq!(toks.len(), 1, "expected one Word token, got {toks:?}");
-        assert!(matches!(&toks[0].kind, TokenKind::Word(_)));
-    }
 
-    #[test]
-    fn span_columns_are_1based_char_columns_reset_per_line() {
-        // 1-based CHARACTER columns (Unicode scalars; tab counts as 1) captured at
-        // each token's first char, reset to 1 after a newline. Built at lex time
-        // from the CharCursor — no offsets/lines sidecar, no zip pass.
-        //          col: 1234567 8 12345
-        let src = "echo  hi\nαβ x";
-        let toks = tokenize(src).unwrap();
-        // "echo" starts at column 1.
-        assert_eq!(toks[0].span.column, 1);
-        // "hi" follows two spaces after "echo " -> column 7.
-        assert_eq!(toks[1].span.column, 7);
-        // Newline itself sits at column 9 (after "echo  hi").
-        let nl = toks.iter().position(|t| matches!(&t.kind, TokenKind::Newline)).unwrap();
-        assert_eq!(toks[nl].span.column, 9);
-        // After the newline, "αβ" starts at column 1 (two scalars, not bytes).
-        assert_eq!(toks[nl + 1].span.column, 1);
-        // "x" is one scalar ('α','β') + one space past column 1 -> column 4.
-        assert_eq!(toks[nl + 2].span.column, 4);
-        assert_eq!(toks[nl + 2].span.line, 2);
-    }
 
     // ---- v238: direct next_token (incremental pull) API ----
 
@@ -8574,14 +5714,19 @@ mod tests {
 
     #[test]
     fn next_token_yields_each_token_in_order() {
-        // Repeated single-token reads return the exact ordered stream.
-        let mut lx = Lexer::new("echo foo | grep bar", LexerOptions::default(), true);
-        assert_eq!(lx.next_token().unwrap().unwrap(), w("echo"));
-        assert_eq!(lx.next_token().unwrap().unwrap(), w("foo"));
-        assert_eq!(lx.next_token().unwrap().unwrap().kind, TokenKind::Op(Operator::Pipe));
-        assert_eq!(lx.next_token().unwrap().unwrap(), w("grep"));
-        assert_eq!(lx.next_token().unwrap().unwrap(), w("bar"));
-        assert!(lx.next_token().unwrap().is_none());
+        // Repeated single-token reads return the ordered atom stream. v266: the
+        // atom stream carries explicit `Blank` atoms between words (the old
+        // Word-lexer absorbed them), so filter those and check the word/op order.
+        let toks: Vec<Token> = drain("echo foo | grep bar")
+            .into_iter()
+            .filter(|t| !matches!(t.kind, TokenKind::Blank))
+            .collect();
+        assert_eq!(word_text(&toks[0]).as_deref(), Some("echo"));
+        assert_eq!(word_text(&toks[1]).as_deref(), Some("foo"));
+        assert_eq!(toks[2].kind, TokenKind::Op(Operator::Pipe));
+        assert_eq!(word_text(&toks[3]).as_deref(), Some("grep"));
+        assert_eq!(word_text(&toks[4]).as_deref(), Some("bar"));
+        assert_eq!(toks.len(), 5, "unexpected extra tokens: {toks:?}");
     }
 
     #[test]
@@ -8681,26 +5826,6 @@ mod tests {
         assert_eq!(cur.peek_nth(0), Some('b'), "after consuming 'a', peek_nth(0) should be 'b'");
     }
 
-    #[test]
-    fn next_token_drain_equals_tokenize() {
-        // Draining the pull API must equal the batch tokenize() byte-for-byte.
-        for src in [
-            "echo hi",
-            "a 'b c' d",
-            "x=\"a${y}b\"",
-            "echo ${x:-def}",
-            "v=$(cmd arg)",
-            "n=$((1 + 2))",
-            "echo `date`",
-            "[[ $x =~ ^a.*z$ ]]",
-            "a{1,2,3}b",
-            "cat 2>&1",
-            "one\ntwo\nthree",
-            "cat <<EOF\nline1\nline2\nEOF\n",
-        ] {
-            assert_eq!(drain(src), tokenize(src).unwrap(), "stream != batch for {src:?}");
-        }
-    }
 
     #[test]
     fn next_token_is_lazy_not_greedy() {
@@ -8718,1638 +5843,160 @@ mod tests {
         assert!(off < src.len(), "cursor jumped to EOF after first token (greedy consumption!)");
     }
 
-    #[test]
-    fn next_token_cursor_tracks_consumed_input() {
-        // After handing out token i (space-separated words), the char cursor sits
-        // at EXACTLY the next token's start — it consumed token i and its single
-        // delimiter and nothing more. Pins down "the char stream is at the correct
-        // location" with no greedy over-consumption.
-        let src = "alpha beta gamma delta";
-        let starts: Vec<usize> = tokenize(src).unwrap().iter().map(|t| t.span.offset).collect();
-        let mut lx = Lexer::new(src, LexerOptions::default(), true);
-        for i in 0..starts.len() {
-            let _ = lx.next_token().unwrap().unwrap();
-            let expected = if i + 1 < starts.len() { starts[i + 1] } else { src.len() };
-            assert_eq!(lx.cursor_offset(), expected, "after token {i}, cursor should be at {expected}");
-        }
-        assert!(lx.next_token().unwrap().is_none());
-        assert_eq!(lx.cursor_offset(), src.len());
-    }
-
-    #[test]
-    fn next_token_brace_expansion_drains_one_at_a_time() {
-        // One source unit -> N tokens, drained across successive next_token calls.
-        let mut lx = Lexer::new("a{1,2,3}b", LexerOptions::default(), true);
-        let a = lx.next_token().unwrap().unwrap();
-        let b = lx.next_token().unwrap().unwrap();
-        let c = lx.next_token().unwrap().unwrap();
-        assert!(lx.next_token().unwrap().is_none());
-        assert_eq!(
-            (word_text(&a), word_text(&b), word_text(&c)),
-            (Some("a1b".into()), Some("a2b".into()), Some("a3b".into()))
-        );
-    }
-
-    #[test]
-    fn next_token_heredoc_body_complete_when_emitted() {
-        // The Heredoc token handed out by next_token must already carry its full
-        // body (readiness/stall rule): an early hand-out would yield an empty body.
-        let toks = drain("cat <<EOF; echo hi\nbody1\nbody2\nEOF\n");
-        let body = heredoc_body(&toks);
-        assert!(!body.0.is_empty(), "heredoc body was empty — token handed out before backfill");
-    }
-
-    #[test]
-    fn next_token_partial_error_matches_tokenize_partial() {
-        // A mid-stream lex error drained via next_token returns the same
-        // tokens-so-far and the same error byte offset as tokenize_partial.
-        let src = "echo ok \"unterminated";
-        let (batch_tokens, batch_err) = tokenize_partial(src, LexerOptions::default());
-        let mut lx = Lexer::new(src, LexerOptions::default(), true);
-        let mut stream = Vec::new();
-        let mut stream_err = None;
-        loop {
-            match lx.next_token() {
-                Ok(Some(t)) => stream.push(t),
-                Ok(None) => break,
-                Err(e) => {
-                    stream_err = Some((e, lx.cursor_offset()));
-                    break;
-                }
-            }
-        }
-        assert_eq!(stream, batch_tokens);
-        assert_eq!(stream_err.map(|(_, o)| o), batch_err.map(|(_, o)| o));
-    }
-
-    #[test]
-    fn next_token_partial_unterminated_heredoc_keeps_buffered_tokens() {
-        // Unterminated heredoc: the readiness rule buffers the placeholder Heredoc
-        // (and trailing same-line tokens) during normal reads, but on the terminal
-        // error path tokenize_partial must still surface them — byte-identical to
-        // the batch lexer's partial set. Locks the error-path flush in
-        // tokenize_partial_inner.
-        let src = "cat <<EOF; echo hi";
-        let (toks, err) = tokenize_partial(src, LexerOptions::default());
-        assert!(matches!(err, Some((LexError::UnterminatedHeredoc, _))), "err: {err:?}");
-        // cat, Heredoc(placeholder), ;, echo, hi
-        assert_eq!(toks.len(), 5, "partial set should keep the buffered heredoc + trailing: {toks:?}");
-        assert_eq!(word_text(&toks[0]).as_deref(), Some("cat"));
-        assert!(matches!(&toks[1].kind, TokenKind::Heredoc { .. }), "toks[1] should be the Heredoc placeholder: {:?}", toks[1]);
-        assert_eq!(word_text(&toks[4]).as_deref(), Some("hi"));
-    }
-
-    #[test]
-    fn extglob_word_split_when_disabled() {
-        // default tokenize: unchanged — `(` is an operator.
-        let toks = tokenize("+(a|b)").unwrap();
-        assert!(toks.len() > 1, "default lexing must be unchanged: {toks:?}");
-    }
-
-    #[test]
-    fn extglob_all_prefixes_and_nesting() {
-        for p in ["?(a)", "*(a)", "@(a|b)", "!(a)", "a+(b|c)d", "@(a*(b)c)"] {
-            let toks = tokenize_with_opts(p, LexerOptions { extglob: true, ..Default::default() }).unwrap();
-            assert_eq!(toks.len(), 1, "{p} should be one word, got {toks:?}");
-        }
-    }
-
-    #[test]
-    fn extglob_group_preserves_inner_expansion() {
-        // `+($x)` must NOT collapse to a single flat literal — the `$x`
-        // inside the group has to survive as a Param part so it expands.
-        let toks = tokenize_with_opts("+($x)", LexerOptions { extglob: true, ..Default::default() }).unwrap();
-        assert_eq!(toks.len(), 1, "expected one Word token, got {toks:?}");
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else {
-            panic!("expected a Word token, got {:?}", toks[0]);
-        };
-        assert!(parts.len() > 1, "group should not be one flat literal: {parts:?}");
-        assert!(
-            parts.iter().any(|p| matches!(p, WordPart::Var { .. })),
-            "expected a Var part for $x, got {parts:?}"
-        );
-    }
-
-    /// Builds a Token that holds a single quoted-Literal Word.
-    /// A single-quoted word: `'s'` → `Quoted{Single, [Literal{s, true}]}`.
-    fn wq(s: &str) -> Token {
-        TokenKind::Word(Word(vec![qsingle(s)])).into()
-    }
-    /// A double-quoted word with a single literal body: `"s"`.
-    fn wqd(s: &str) -> Token {
-        TokenKind::Word(Word(vec![qdouble(vec![WordPart::Literal {
-            text: s.to_string(),
-            quoted: true,
-        }])])).into()
-    }
-    /// A backslash-escaped single char as a word: `\s`.
-    fn wqb(s: &str) -> Token {
-        TokenKind::Word(Word(vec![qbackslash(s)])).into()
-    }
-    /// An ANSI-C quoted word: `$'s'` (s already decoded).
-    fn wqa(s: &str) -> Token {
-        TokenKind::Word(Word(vec![WordPart::Quoted {
-            style: QuoteStyle::AnsiC,
-            parts: vec![WordPart::Literal { text: s.to_string(), quoted: true }],
-        }])).into()
-    }
-    /// A single-quote run as a `WordPart`.
-    fn qsingle(s: &str) -> WordPart {
-        WordPart::Quoted {
-            style: QuoteStyle::Single,
-            parts: vec![WordPart::Literal { text: s.to_string(), quoted: true }],
-        }
-    }
-    /// A double-quote run as a `WordPart`, given its inner parts.
-    fn qdouble(parts: Vec<WordPart>) -> WordPart {
-        WordPart::Quoted { style: QuoteStyle::Double, parts }
-    }
-    /// A backslash-escaped single char as a `WordPart`.
-    fn qbackslash(s: &str) -> WordPart {
-        WordPart::Quoted {
-            style: QuoteStyle::Backslash,
-            parts: vec![WordPart::Literal { text: s.to_string(), quoted: true }],
-        }
-    }
-    /// Unwrap a `$'…'` (AnsiC) run, returning its single inner part.
-    fn ansi_c_inner(part: &WordPart) -> &WordPart {
-        let WordPart::Quoted { style: QuoteStyle::AnsiC, parts } = part
-        else { panic!("expected AnsiC run, got {part:?}") };
-        &parts[0]
-    }
-
-    /// Builds a Vec<Token> of all-Literal words.
-    fn words(parts: &[&str]) -> Vec<Token> {
-        parts.iter().map(|s| w(s)).collect()
-    }
-
-    /// Test alias so the v32 substitution tests read more naturally.
-    fn tokenize_words(input: &str) -> Result<Vec<Token>, LexError> {
-        tokenize(input)
-    }
-
-    /// Pops the first token from `tokens`, asserts it's a single-part Word,
-    /// and returns that `WordPart`.
-    fn single_param_expansion(tokens: &mut Vec<Token>) -> WordPart {
-        let word = match tokens.remove(0).kind {
-            TokenKind::Word(w) => w,
-            other => panic!("expected Word, got {:?}", other),
-        };
-        let part = word.0.into_iter().next().expect("non-empty word");
-        // A `"${…}"` word wraps the expansion in a double-quote run; unwrap it
-        // so callers see the inner expansion part directly.
-        match part {
-            WordPart::Quoted { parts, .. } => {
-                parts.into_iter().next().expect("non-empty quoted run")
-            }
-            other => other,
-        }
-    }
-
-    /// Flattens the literal text parts of a `Word`, ignoring non-literal
-    /// parts. Useful for asserting on simple operand bodies in tests.
-    fn word_to_literal(w: &Word) -> String {
-        let mut s = String::new();
-        for p in &w.0 {
-            if let WordPart::Literal { text, .. } = p {
-                s.push_str(text);
-            }
-        }
-        s
-    }
-
-    #[test]
-    fn tokenize_simple_command() {
-        assert_eq!(tokenize("ls -la").unwrap(), words(&["ls", "-la"]));
-    }
-
-    #[test]
-    fn tokenize_empty_input() {
-        assert_eq!(tokenize("").unwrap(), Vec::<Token>::new());
-    }
-
-    #[test]
-    fn tokenize_only_whitespace() {
-        assert_eq!(tokenize("   \t  ").unwrap(), Vec::<Token>::new());
-    }
-
-    #[test]
-    fn tokenize_full_line_comment() {
-        assert_eq!(tokenize("# just a comment").unwrap(), Vec::<Token>::new());
-    }
-
-    #[test]
-    fn tokenize_comment_to_newline() {
-        assert_eq!(
-            tokenize("# comment\necho hi").unwrap(),
-            vec![TokenKind::Newline.into(), w("echo"), w("hi")]
-        );
-    }
-
-    #[test]
-    fn tokenize_trailing_comment() {
-        assert_eq!(
-            tokenize("echo hi # trailing").unwrap(),
-            vec![w("echo"), w("hi")]
-        );
-    }
-
-    #[test]
-    fn tokenize_trailing_comment_then_next_line() {
-        assert_eq!(
-            tokenize("echo a # comment\necho b").unwrap(),
-            vec![w("echo"), w("a"), TokenKind::Newline.into(), w("echo"), w("b")]
-        );
-    }
-
-    #[test]
-    fn tokenize_hash_inside_word_is_literal() {
-        // bash: `echo foo#bar` outputs `foo#bar` (# mid-word is not a comment).
-        assert_eq!(
-            tokenize("echo foo#bar").unwrap(),
-            vec![w("echo"), w("foo#bar")]
-        );
-    }
-
-    #[test]
-    fn tokenize_hash_after_semicolon_is_comment() {
-        assert_eq!(
-            tokenize("echo a; # comment").unwrap(),
-            vec![w("echo"), w("a"), TokenKind::Op(Operator::Semi).into()]
-        );
-    }
-
-    #[test]
-    fn tokenize_hash_inside_single_quotes_is_literal() {
-        assert_eq!(
-            tokenize("echo '# inside'").unwrap(),
-            vec![w("echo"), wq("# inside")]
-        );
-    }
-
-    #[test]
-    fn tokenize_hash_inside_double_quotes_is_literal() {
-        assert_eq!(
-            tokenize("echo \"# inside\"").unwrap(),
-            vec![w("echo"), wqd("# inside")]
-        );
-    }
-
-    #[test]
-    fn tokenize_backslash_newline_is_line_continuation_with_space() {
-        // POSIX: \<NL> is deleted; surrounding whitespace still separates words.
-        assert_eq!(
-            tokenize("echo \\\nfoo").unwrap(),
-            vec![w("echo"), w("foo")]
-        );
-    }
-
-    #[test]
-    fn tokenize_backslash_newline_joins_adjacent_chars_into_one_word() {
-        // No separator on either side: result is one word "echofoo".
-        assert_eq!(
-            tokenize("echo\\\nfoo").unwrap(),
-            vec![w("echofoo")]
-        );
-    }
-
-    #[test]
-    fn tokenize_backslash_newline_inside_double_quotes_is_line_continuation() {
-        // POSIX 2.2.3: \<NL> retains its special meaning inside "...".
-        assert_eq!(
-            tokenize("\"foo\\\nbar\"").unwrap(),
-            vec![wqd("foobar")]
-        );
-    }
-
-    #[test]
-    fn tokenize_backslash_newline_inside_single_quotes_is_literal() {
-        // POSIX 2.2.2: no escape interpretation inside '...'.
-        assert_eq!(
-            tokenize("'foo\\\nbar'").unwrap(),
-            vec![wq("foo\\\nbar")]
-        );
-    }
-
-    #[test]
-    fn tokenize_lone_backslash_newline_is_empty() {
-        assert_eq!(tokenize("\\\n").unwrap(), Vec::<Token>::new());
-    }
-
-    #[test]
-    fn tokenize_escaped_backtick_in_double_quotes_is_literal() {
-        // POSIX: inside double quotes, `\\\`` is a literal backtick.
-        // Was a bug: huck only recognized `\"`, `\\`, `\$` as escapes.
-        assert_eq!(
-            tokenize(r#""\`""#).unwrap(),
-            vec![wqd("`")]
-        );
-    }
-
-    #[test]
-    fn tokenize_escaped_hash_is_literal() {
-        // `\#` at word start: backslash escape, # is literal
-        assert_eq!(
-            tokenize(r"echo \#hash").unwrap(),
-            vec![w("echo"), TokenKind::Word(Word(vec![
-                qbackslash("#"),
-                WordPart::Literal { text: "hash".to_string(), quoted: false },
-            ])).into()]
-        );
-    }
-
-    #[test]
-    fn tokenize_single_quotes() {
-        assert_eq!(
-            tokenize("echo 'hello world'").unwrap(),
-            vec![w("echo"), wq("hello world")]
-        );
-    }
-
-    #[test]
-    fn tokenize_double_quotes() {
-        assert_eq!(
-            tokenize("echo \"hello world\"").unwrap(),
-            vec![w("echo"), wqd("hello world")]
-        );
-    }
-
-    #[test]
-    fn tokenize_double_quote_escape() {
-        assert_eq!(tokenize(r#"echo "a\"b""#).unwrap(), vec![w("echo"), wqd("a\"b")]);
-    }
-
-    #[test]
-    fn tokenize_backslash_escape_outside_quotes() {
-        // Backslash flushes the unquoted run and pushes the escaped char as a
-        // quoted single-char Literal. So `a\ b` is one Word made of three parts:
-        // unquoted "a", quoted " ", unquoted "b". This preserves the quoting
-        // information that pathname expansion needs (the escaped char must not
-        // be treated as a glob metachar).
-        assert_eq!(
-            tokenize(r"echo a\ b").unwrap(),
-            vec![
-                w("echo"),
-                TokenKind::Word(Word(vec![
-                    WordPart::Literal { text: "a".to_string(), quoted: false },
-                    qbackslash(" "),
-                    WordPart::Literal { text: "b".to_string(), quoted: false },
-                ])).into(),
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_trailing_backslash_is_literal() {
-        assert_eq!(tokenize(r"echo a\").unwrap(), words(&["echo", r"a\"]));
-    }
-
-    #[test]
-    fn backslash_escaped_metachar_is_quoted_literal() {
-        let tokens = tokenize("\\*").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert_eq!(parts, &[qbackslash("*")]);
-    }
-
-    #[test]
-    fn backslash_in_middle_of_word_flushes_and_quotes() {
-        // `foo\*bar` → unquoted "foo", quoted "*", unquoted "bar"
-        let tokens = tokenize("foo\\*bar").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert_eq!(parts, &[
-            WordPart::Literal { text: "foo".to_string(), quoted: false },
-            qbackslash("*"),
-            WordPart::Literal { text: "bar".to_string(), quoted: false },
-        ]);
-    }
-
-    #[test]
-    fn tokenize_adjacent_runs_concatenate() {
-        // `foo"bar baz"` flushes at the quote boundary: one Word with two
-        // parts, the unquoted `foo` and the quoted `bar baz`.
-        assert_eq!(
-            tokenize(r#"foo"bar baz""#).unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Literal { text: "foo".to_string(), quoted: false },
-                qdouble(vec![WordPart::Literal { text: "bar baz".to_string(), quoted: true }]),
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_single_quotes_preserve_backslash() {
-        assert_eq!(tokenize(r"echo 'a\b'").unwrap(), vec![w("echo"), wq(r"a\b")]);
-    }
-
-    #[test]
-    fn tokenize_empty_quotes_produce_empty_token() {
-        assert_eq!(tokenize("''").unwrap(), vec![wq("")]);
-    }
-
-    #[test]
-    fn tokenize_unterminated_single_quote() {
-        assert_eq!(
-            tokenize("echo 'oops").unwrap_err(),
-            LexError::UnterminatedQuote
-        );
-    }
-
-    #[test]
-    fn tokenize_unterminated_double_quote() {
-        assert_eq!(
-            tokenize("echo \"oops").unwrap_err(),
-            LexError::UnterminatedQuote
-        );
-    }
-
-    #[test]
-    fn tokenize_pipe_with_spaces() {
-        assert_eq!(
-            tokenize("a | b").unwrap(),
-            vec![w("a"), TokenKind::Op(Operator::Pipe).into(), w("b")]
-        );
-    }
-
-    #[test]
-    fn tokenize_pipe_without_spaces() {
-        assert_eq!(
-            tokenize("a|b").unwrap(),
-            vec![w("a"), TokenKind::Op(Operator::Pipe).into(), w("b")]
-        );
-    }
-
-    #[test]
-    fn pipe_both_desugars_to_2_redir_1_then_pipe() {
-        // `a |& b` lexes as `a 2>&1 | b`.
-        let toks = tokenize("a |& b").unwrap();
-        assert_eq!(
-            toks,
-            vec![
-                w("a"),
-                TokenKind::RedirFd(crate::command::RedirFd::Number(2)).into(),
-                TokenKind::Op(Operator::DupOut).into(),
-                w("1"),
-                TokenKind::Op(Operator::Pipe).into(),
-                w("b"),
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_redirect_out() {
-        assert_eq!(
-            tokenize("ls > f").unwrap(),
-            vec![w("ls"), TokenKind::Op(Operator::RedirOut).into(), w("f")]
-        );
-    }
-
-    #[test]
-    fn tokenize_redirect_out_without_spaces() {
-        assert_eq!(
-            tokenize("ls>f").unwrap(),
-            vec![w("ls"), TokenKind::Op(Operator::RedirOut).into(), w("f")]
-        );
-    }
-
-    #[test]
-    fn tokenize_redirect_append() {
-        assert_eq!(
-            tokenize("ls >> f").unwrap(),
-            vec![w("ls"), TokenKind::Op(Operator::RedirAppend).into(), w("f")]
-        );
-    }
-
-    #[test]
-    fn tokenize_redirect_in() {
-        assert_eq!(
-            tokenize("cat < f").unwrap(),
-            vec![w("cat"), TokenKind::Op(Operator::RedirIn).into(), w("f")]
-        );
-    }
-
-    #[test]
-    fn tokenize_redirect_stderr() {
-        assert_eq!(
-            tokenize("cmd 2> f").unwrap(),
-            vec![w("cmd"), TokenKind::Op(Operator::RedirErr).into(), w("f")]
-        );
-    }
-
-    #[test]
-    fn tokenize_redirect_stderr_append() {
-        assert_eq!(
-            tokenize("cmd 2>> f").unwrap(),
-            vec![w("cmd"), TokenKind::Op(Operator::RedirErrAppend).into(), w("f")]
-        );
-    }
-
-    #[test]
-    fn tokenize_two_in_word_is_not_stderr_operator() {
-        assert_eq!(
-            tokenize("x2>f").unwrap(),
-            vec![w("x2"), TokenKind::Op(Operator::RedirOut).into(), w("f")]
-        );
-    }
-
-    #[test]
-    fn tokenize_two_not_followed_by_redirect_is_a_word() {
-        assert_eq!(tokenize("2 foo").unwrap(), words(&["2", "foo"]));
-    }
-
-    #[test]
-    fn tokenize_quoted_operators_stay_words() {
-        assert_eq!(
-            tokenize(r#"echo "|" ">""#).unwrap(),
-            vec![w("echo"), wqd("|"), wqd(">")]
-        );
-    }
-
-    #[test]
-    fn tokenize_escaped_operators_stay_words() {
-        // Escaped operators become quoted single-char Literals (one Word each).
-        assert_eq!(
-            tokenize(r"echo \| \>").unwrap(),
-            vec![w("echo"), wqb("|"), wqb(">")]
-        );
-    }
-
-    #[test]
-    fn tokenize_pipeline_with_redirects() {
-        assert_eq!(
-            tokenize("a < in | b > out").unwrap(),
-            vec![
-                w("a"),
-                TokenKind::Op(Operator::RedirIn).into(),
-                w("in"),
-                TokenKind::Op(Operator::Pipe).into(),
-                w("b"),
-                TokenKind::Op(Operator::RedirOut).into(),
-                w("out"),
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_or_with_spaces() {
-        assert_eq!(
-            tokenize("a || b").unwrap(),
-            vec![w("a"), TokenKind::Op(Operator::Or).into(), w("b")]
-        );
-    }
-
-    #[test]
-    fn tokenize_or_without_spaces() {
-        assert_eq!(
-            tokenize("a||b").unwrap(),
-            vec![w("a"), TokenKind::Op(Operator::Or).into(), w("b")]
-        );
-    }
-
-    #[test]
-    fn tokenize_and_with_spaces() {
-        assert_eq!(
-            tokenize("a && b").unwrap(),
-            vec![w("a"), TokenKind::Op(Operator::And).into(), w("b")]
-        );
-    }
-
-    #[test]
-    fn tokenize_and_without_spaces() {
-        assert_eq!(
-            tokenize("a&&b").unwrap(),
-            vec![w("a"), TokenKind::Op(Operator::And).into(), w("b")]
-        );
-    }
-
-    #[test]
-    fn tokenize_bare_ampersand_is_background_op() {
-        assert_eq!(
-            tokenize("a & b").unwrap(),
-            vec![w("a"), TokenKind::Op(Operator::Background).into(), w("b")]
-        );
-    }
-
-    #[test]
-    fn tokenize_bare_ampersand_at_end_is_background_op() {
-        assert_eq!(
-            tokenize("a &").unwrap(),
-            vec![w("a"), TokenKind::Op(Operator::Background).into()]
-        );
-    }
-
-    #[test]
-    fn tokenize_double_ampersand_still_and_op() {
-        assert_eq!(
-            tokenize("a && b").unwrap(),
-            vec![w("a"), TokenKind::Op(Operator::And).into(), w("b")]
-        );
-    }
-
-    #[test]
-    fn tokenize_two_separate_backgrounds() {
-        assert_eq!(
-            tokenize("a & &").unwrap(),
-            vec![
-                w("a"),
-                TokenKind::Op(Operator::Background).into(),
-                TokenKind::Op(Operator::Background).into(),
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_semicolon_with_spaces() {
-        assert_eq!(
-            tokenize("a ; b").unwrap(),
-            vec![w("a"), TokenKind::Op(Operator::Semi).into(), w("b")]
-        );
-    }
-
-    #[test]
-    fn tokenize_semicolon_without_spaces() {
-        assert_eq!(
-            tokenize("a;b").unwrap(),
-            vec![w("a"), TokenKind::Op(Operator::Semi).into(), w("b")]
-        );
-    }
-
-    #[test]
-    fn tokenize_quoted_sequencing_operators_stay_words() {
-        assert_eq!(
-            tokenize(r#"echo "&&" "||" ";""#).unwrap(),
-            vec![w("echo"), wqd("&&"), wqd("||"), wqd(";")]
-        );
-    }
-
-    #[test]
-    fn tokenize_escaped_sequencing_operators_stay_words() {
-        // Each `\X` becomes its own quoted single-char Literal part. Adjacent
-        // escapes within the same token concatenate into one Word with N parts.
-        let two_quoted = |a: &str, b: &str| {
-            TokenKind::Word(Word(vec![qbackslash(a), qbackslash(b)])).into()
-        };
-        assert_eq!(
-            tokenize(r"echo \&\& \|\| \;").unwrap(),
-            vec![w("echo"), two_quoted("&", "&"), two_quoted("|", "|"), wqb(";")]
-        );
-    }
-
-    #[test]
-    fn tokenize_combined_sequencing_operators() {
-        assert_eq!(
-            tokenize("a && b || c ; d").unwrap(),
-            vec![
-                w("a"),
-                TokenKind::Op(Operator::And).into(),
-                w("b"),
-                TokenKind::Op(Operator::Or).into(),
-                w("c"),
-                TokenKind::Op(Operator::Semi).into(),
-                w("d"),
-            ]
-        );
-    }
-
-    fn vword_unquoted(name: &str) -> Token {
-        TokenKind::Word(Word(vec![WordPart::Var {
-            name: name.to_string(),
-            quoted: false,
-        }])).into()
-    }
-
-    #[test]
-    fn tokenize_dollar_var_unquoted() {
-        assert_eq!(tokenize("$FOO").unwrap(), vec![vword_unquoted("FOO")]);
-    }
-
-    #[test]
-    fn tokenize_dollar_var_braced() {
-        assert_eq!(tokenize("${FOO}").unwrap(), vec![vword_unquoted("FOO")]);
-    }
-
-    #[test]
-    fn tokenize_dollar_var_in_double_quotes_is_quoted() {
-        assert_eq!(
-            tokenize("\"$FOO\"").unwrap(),
-            vec![TokenKind::Word(Word(vec![qdouble(vec![WordPart::Var {
-                name: "FOO".to_string(),
-                quoted: true,
-            }])]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_dollar_squote_inside_double_quotes_is_literal() {
-        // v181: `$'` inside double quotes is a literal `$` + `'`, NOT ANSI-C
-        // quoting; it must tokenize (pre-fix this was Err(UnterminatedQuote)).
-        let toks = tokenize("\"$'\"").unwrap();
-        assert_eq!(toks.len(), 1);
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("not a word: {toks:?}") };
-        // The body is a single double-quote run wrapping literal parts.
-        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
-        else { panic!("expected one double-quote run: {parts:?}") };
-        let joined: String = inner.iter().map(|p| match p {
-            WordPart::Literal { text, .. } => text.clone(),
-            other => panic!("unexpected part {other:?}"),
-        }).collect();
-        assert_eq!(joined, "$'");
-    }
-
-    #[test]
-    fn tokenize_dollar_dquote_locale_drops_dollar() {
-        // v181: `$"x"` is locale-translation quoting = identity; the `$` is
-        // dropped and the body is a plain double-quoted literal `x`.
-        assert_eq!(tokenize("$\"x\"").unwrap(), vec![wqd("x")]);
-    }
-
-    #[test]
-    fn tokenize_unquoted_ansi_c_still_decodes() {
-        // v181 regression: unquoted `$'…'` ANSI-C escapes still decode (the
-        // `!quoted` guard must not disturb the outside-double-quotes path).
-        assert_eq!(tokenize("$'a\\tb'").unwrap(), vec![wqa("a\tb")]);
-    }
-
-    #[test]
-    fn tokenize_dollar_var_in_single_quotes_is_literal() {
-        assert_eq!(tokenize("'$FOO'").unwrap(), vec![wq("$FOO")]);
-    }
-
-    #[test]
-    fn tokenize_last_status() {
-        assert_eq!(
-            tokenize("$?").unwrap(),
-            vec![TokenKind::Word(Word(vec![WordPart::LastStatus {
-                quoted: false
-            }]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_dollar_then_digit_is_positional_param() {
-        // Since v22 Task 4: $<digit> is a positional parameter, not a literal $.
-        assert_eq!(
-            tokenize("$5").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Var { name: "5".to_string(), quoted: false },
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_double_dollar_is_var_name_dollar() {
-        // v26: $$ is the shell PID special parameter, not two literal dollars.
-        assert_eq!(
-            tokenize("$$").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Var { name: "$".to_string(), quoted: false },
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_alone() {
-        assert_eq!(
-            tokenize("~").unwrap(),
-            vec![TokenKind::Word(Word(vec![WordPart::Tilde(TildeSpec::Home)]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_slash_path() {
-        assert_eq!(
-            tokenize("~/foo").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Tilde(TildeSpec::Home),
-                WordPart::Literal { text: "/foo".to_string(), quoted: false },
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_mid_word_is_literal() {
-        assert_eq!(tokenize("a~b").unwrap(), words(&["a~b"]));
-    }
-
-    #[test]
-    fn tokenize_tilde_followed_by_name_is_user_form() {
-        assert_eq!(
-            tokenize("~foo").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Tilde(TildeSpec::User("foo".to_string())),
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_user_alone() {
-        assert_eq!(
-            tokenize("~alice").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Tilde(TildeSpec::User("alice".to_string())),
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_user_slash_path() {
-        assert_eq!(
-            tokenize("~alice/bin").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Tilde(TildeSpec::User("alice".to_string())),
-                WordPart::Literal { text: "/bin".to_string(), quoted: false },
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_user_with_underscore_and_digits() {
-        assert_eq!(
-            tokenize("~alice_123").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Tilde(TildeSpec::User("alice_123".to_string())),
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_in_quotes_is_literal() {
-        assert_eq!(tokenize("\"~\"").unwrap(), vec![wqd("~")]);
-    }
-
-    #[test]
-    fn tokenize_braced_var_invalid_name() {
-        // ${1foo}: digits consumed as positional name "1", then `f` is not a
-        // valid modifier. v233: deferred to runtime BadSubst (matching bash)
-        // instead of a parse error.
-        let toks = tokenize("${1foo}").unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        assert!(matches!(&parts[0],
-            WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { raw }, .. }
-            if raw == "${1foo}"
-        ), "expected BadSubst, got {:?}", parts[0]);
-    }
-
-    #[test]
-    fn tokenize_braced_var_empty_name() {
-        // v233: `${}` is lexable-but-invalid → BadSubst at runtime, not a parse error.
-        let toks = tokenize("${}").unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        assert!(matches!(&parts[0],
-            WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { raw }, .. }
-            if raw == "${}"
-        ), "expected BadSubst, got {:?}", parts[0]);
-    }
-
-    #[test]
-    fn tokenize_unterminated_brace() {
-        assert_eq!(tokenize("${FOO").unwrap_err(), LexError::UnterminatedBrace);
-    }
-
-    #[test]
-    fn tokenize_var_concatenates_with_literal() {
-        assert_eq!(
-            tokenize("a$FOOb").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Literal { text: "a".to_string(), quoted: false },
-                WordPart::Var { name: "FOOb".to_string(), quoted: false },
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_braced_var_separates_from_following_word() {
-        assert_eq!(
-            tokenize("${FOO}bar").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Var { name: "FOO".to_string(), quoted: false },
-                WordPart::Literal { text: "bar".to_string(), quoted: false },
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_escaped_dollar_in_double_quotes_is_literal() {
-        assert_eq!(tokenize(r#""\$FOO""#).unwrap(), vec![wqd("$FOO")]);
-    }
-
-    #[test]
-    fn tokenize_two_adjacent_vars() {
-        assert_eq!(
-            tokenize("$FOO$BAR").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Var { name: "FOO".to_string(), quoted: false },
-                WordPart::Var { name: "BAR".to_string(), quoted: false },
-            ]))]
-        );
-    }
-
-    fn sub_word(parts: Vec<WordPart>) -> Token {
-        TokenKind::Word(Word(parts)).into()
-    }
-
-    fn echo_seq(args: &[&str]) -> crate::command::Sequence {
-        use crate::command::{Command, ExecCommand, Pipeline, Sequence, SimpleCommand};
-        Sequence {
-            first: Command::Pipeline(Pipeline {
-                negate: false,
-                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
-                    inline_assignments: Vec::new(),
-                    program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
-                    args: args
-                        .iter()
-                        .map(|a| Word(vec![WordPart::Literal { text: a.to_string(), quoted: false }]))
-                        .collect(),
-                    redirects: Vec::new(),
-                    line: 0,
-                }))],
-            }),
-            rest: vec![],
-            background: false,
-        }
-    }
-
-    #[test]
-    fn tokenize_command_sub_basic() {
-        assert_eq!(
-            tokenize("$(echo hi)").unwrap(),
-            vec![sub_word(vec![WordPart::CommandSub {
-                sequence: echo_seq(&["hi"]),
-                quoted: false,
-            }])]
-        );
-    }
-
-    #[test]
-    fn tokenize_command_sub_quoted_in_double_quotes() {
-        assert_eq!(
-            tokenize("\"$(echo hi)\"").unwrap(),
-            vec![sub_word(vec![qdouble(vec![WordPart::CommandSub {
-                sequence: echo_seq(&["hi"]),
-                quoted: true,
-            }])])]
-        );
-    }
-
-    #[test]
-    fn tokenize_command_sub_in_single_quotes_is_literal() {
-        assert_eq!(
-            tokenize("'$(echo hi)'").unwrap(),
-            vec![wq("$(echo hi)")]
-        );
-    }
-
-    #[test]
-    fn tokenize_command_sub_empty() {
-        assert_eq!(
-            tokenize("$()").unwrap(),
-            vec![sub_word(vec![WordPart::CommandSub {
-                sequence: crate::command::Sequence {
-                    first: crate::command::Command::Pipeline(
-                        crate::command::Pipeline { negate: false, commands: vec![] },
-                    ),
-                    rest: vec![],
-                    background: false,
-                },
-                quoted: false,
-            }])]
-        );
-    }
-
-    #[test]
-    fn tokenize_command_sub_with_quoted_paren_in_body() {
-        // The `)` inside `"..."` does not close the substitution. The inner
-        // `")"` arg is quoted, so the inner Literal carries quoted: true.
-        use crate::command::{Command, ExecCommand, Pipeline, Sequence, SimpleCommand};
-        let inner = Sequence {
-            first: Command::Pipeline(Pipeline {
-                negate: false,
-                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
-                    inline_assignments: Vec::new(),
-                    program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
-                    args: vec![Word(vec![qdouble(vec![WordPart::Literal { text: ")".to_string(), quoted: true }])])],
-                    redirects: Vec::new(),
-                    line: 0,
-                }))],
-            }),
-            rest: vec![],
-            background: false,
-        };
-        assert_eq!(
-            tokenize("$(echo \")\")").unwrap(),
-            vec![sub_word(vec![WordPart::CommandSub {
-                sequence: inner,
-                quoted: false,
-            }])]
-        );
-    }
-
-    #[test]
-    fn tokenize_command_sub_nested() {
-        // Outer body is `echo $(echo hi)`; inner is `echo hi`.
-        let inner = echo_seq(&["hi"]);
-        let inner_word = Word(vec![WordPart::CommandSub {
-            sequence: inner,
-            quoted: false,
-        }]);
-        let outer = {
-            use crate::command::{Command, ExecCommand, Pipeline, Sequence, SimpleCommand};
-            Sequence {
-                first: Command::Pipeline(Pipeline {
-                    negate: false,
-                    commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
-                        inline_assignments: Vec::new(),
-                        program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
-                        args: vec![inner_word],
-                        redirects: Vec::new(),
-                        line: 0,
-                    }))],
-                }),
-                rest: vec![],
-                background: false,
-            }
-        };
-        assert_eq!(
-            tokenize("$(echo $(echo hi))").unwrap(),
-            vec![sub_word(vec![WordPart::CommandSub {
-                sequence: outer,
-                quoted: false,
-            }])]
-        );
-    }
-
-    #[test]
-    fn tokenize_command_sub_with_subshell_body() {
-        // v101: `$( (echo a) )` — the inner `(` raises paren depth so the
-        // subshell's `)` doesn't close the command substitution early. Used to
-        // error with UnterminatedSubstitution (the bare-`(` arm didn't count).
-        let tokens = tokenize("$( (echo a) )").unwrap();
-        assert_eq!(tokens.len(), 1);
-        match &tokens[0].kind {
-            TokenKind::Word(Word(parts)) => {
-                assert_eq!(parts.len(), 1);
-                match &parts[0] {
-                    WordPart::CommandSub { sequence, .. } => {
-                        // The command sub's body is a single subshell `(echo a)`.
-                        assert!(
-                            matches!(&sequence.first, crate::command::Command::Subshell { .. }),
-                            "expected first command to be a Subshell, got {:?}",
-                            sequence.first
-                        );
-                    }
-                    other => panic!("expected CommandSub, got {other:?}"),
-                }
-            }
-            other => panic!("expected Word, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tokenize_command_sub_unterminated() {
-        assert_eq!(
-            tokenize("$(echo").unwrap_err(),
-            LexError::UnterminatedSubstitution
-        );
-    }
-
-    #[test]
-    fn tokenize_command_sub_inner_lex_error() {
-        // v233: `${1foo}` inside a substitution is now a runtime BadSubst,
-        // not a parse error. The command sub parses successfully.
-        let toks = tokenize("$(echo ${1foo})").unwrap();
-        // The outer token is a Word containing a CommandSub.
-        assert!(matches!(&toks[0].kind, TokenKind::Word(Word(p)) if matches!(&p[0], WordPart::CommandSub { .. })));
-    }
-
-    #[test]
-    fn tokenize_command_sub_inner_parse_error() {
-        // `echo |` inside the body → MissingCommand from the parser, wrapped.
-        let err = tokenize("$(echo |)").unwrap_err();
-        match err {
-            LexError::SubstitutionParseError(inner) => {
-                assert_eq!(inner, crate::command::ParseError::MissingCommand);
-            }
-            other => panic!("expected SubstitutionParseError, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tokenize_command_sub_as_program() {
-        // `$(echo ls) -la` — the program word is itself a CommandSub.
-        let tokens = tokenize("$(echo ls) -la").unwrap();
-        assert_eq!(tokens.len(), 2);
-        match &tokens[0].kind {
-            TokenKind::Word(Word(parts)) => {
-                assert!(matches!(&parts[0], WordPart::CommandSub { .. }));
-            }
-            other => panic!("expected Word, got {other:?}"),
-        }
-        assert_eq!(tokens[1], w("-la"));
-    }
-
-    #[test]
-    fn tokenize_command_sub_concatenates_with_literal() {
-        // `pre$(echo x)post` → one Word with three parts: Literal, CommandSub, Literal
-        let tokens = tokenize("pre$(echo x)post").unwrap();
-        assert_eq!(tokens.len(), 1);
-        match &tokens[0].kind {
-            TokenKind::Word(Word(parts)) => {
-                assert_eq!(parts.len(), 3);
-                assert!(matches!(parts[0], WordPart::Literal { ref text, .. } if text == "pre"));
-                assert!(matches!(parts[1], WordPart::CommandSub { .. }));
-                assert!(matches!(parts[2], WordPart::Literal { ref text, .. } if text == "post"));
-            }
-            other => panic!("expected Word, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tokenize_command_sub_in_redirect_target() {
-        let tokens = tokenize("cat > $(echo /tmp/f)").unwrap();
-        assert_eq!(tokens.len(), 3);
-        assert_eq!(tokens[0], w("cat"));
-        assert_eq!(tokens[1], TokenKind::Op(Operator::RedirOut));
-        match &tokens[2].kind {
-            TokenKind::Word(Word(parts)) => {
-                assert!(matches!(&parts[0], WordPart::CommandSub { .. }));
-            }
-            other => panic!("expected Word, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tokenize_backtick_basic() {
-        assert_eq!(
-            tokenize("`echo hi`").unwrap(),
-            vec![sub_word(vec![WordPart::CommandSub {
-                sequence: echo_seq(&["hi"]),
-                quoted: false,
-            }])]
-        );
-    }
-
-    #[test]
-    fn tokenize_backtick_in_double_quotes_is_quoted() {
-        assert_eq!(
-            tokenize("\"`echo hi`\"").unwrap(),
-            vec![sub_word(vec![qdouble(vec![WordPart::CommandSub {
-                sequence: echo_seq(&["hi"]),
-                quoted: true,
-            }])])]
-        );
-    }
-
-    #[test]
-    fn tokenize_backtick_escape_dollar() {
-        // `\$FOO` inside backticks → inner body is `$FOO` (the `\$` unescapes
-        // before the inner tokenizer sees it). So the inner Sequence has a
-        // single command whose first arg expands $FOO.
-        let tokens = tokenize("`echo \\$FOO`").unwrap();
-        assert_eq!(tokens.len(), 1);
-        match &tokens[0].kind {
-            TokenKind::Word(Word(parts)) => {
-                assert_eq!(parts.len(), 1);
-                match &parts[0] {
-                    WordPart::CommandSub { sequence, quoted: false } => {
-                        // Inner: echo $FOO → second word's first part is a Var
-                        let crate::command::Command::Pipeline(inner_pipeline) = &sequence.first
-                        else {
-                            panic!("expected a pipeline");
-                        };
-                        let inner_cmd = &inner_pipeline.commands[0];
-                        match inner_cmd {
-                            crate::command::Command::Simple(crate::command::SimpleCommand::Exec(e)) => {
-                                assert_eq!(e.args.len(), 1);
-                                match &e.args[0].0[0] {
-                                    WordPart::Var { name, quoted: false } => {
-                                        assert_eq!(name, "FOO");
-                                    }
-                                    other => panic!("expected Var(FOO), got {other:?}"),
-                                }
-                            }
-                            other => panic!("expected Simple(Exec), got {other:?}"),
-                        }
-                    }
-                    other => panic!("expected CommandSub, got {other:?}"),
-                }
-            }
-            other => panic!("expected Word, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tokenize_backtick_escape_backslash() {
-        // `\\` inside backticks → inner body is `\`. Inner tokenize sees
-        // a trailing backslash; treats it as a literal.
-        let tokens = tokenize("`echo \\\\`").unwrap();
-        match &tokens[0].kind {
-            TokenKind::Word(Word(parts)) => match &parts[0] {
-                WordPart::CommandSub { sequence, .. } => {
-                    let crate::command::Command::Pipeline(inner_pipeline) = &sequence.first
-                    else {
-                        panic!("expected a pipeline");
-                    };
-                    match &inner_pipeline.commands[0] {
-                        crate::command::Command::Simple(crate::command::SimpleCommand::Exec(e)) => {
-                            // Inner body was `echo \` — backslash at end is literal.
-                            assert_eq!(e.args.len(), 1);
-                            match &e.args[0].0[0] {
-                                WordPart::Literal { text, .. } => assert_eq!(text, "\\"),
-                                other => panic!("expected Literal(\\\\), got {other:?}"),
-                            }
-                        }
-                        other => panic!("expected Simple(Exec), got {other:?}"),
-                    }
-                }
-                other => panic!("expected CommandSub, got {other:?}"),
-            },
-            other => panic!("expected Word, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tokenize_backtick_unescaped_other_backslash_preserved() {
-        // `\n` inside backticks → body has `\n` (backslash + n), which the
-        // inner tokenize treats as an escape (literal `n`).
-        let tokens = tokenize("`echo \\n`").unwrap();
-        match &tokens[0].kind {
-            TokenKind::Word(Word(parts)) => match &parts[0] {
-                WordPart::CommandSub { sequence, .. } => {
-                    let crate::command::Command::Pipeline(inner_pipeline) = &sequence.first
-                    else {
-                        panic!("expected a pipeline");
-                    };
-                    match &inner_pipeline.commands[0] {
-                        crate::command::Command::Simple(crate::command::SimpleCommand::Exec(e)) => {
-                            // Inner body `echo \n` — outer tokenizer's `\n` becomes `n`
-                            assert_eq!(e.args.len(), 1);
-                            // `\n` → a backslash run wrapping literal `n`.
-                            match &e.args[0].0[0] {
-                                WordPart::Quoted { style: QuoteStyle::Backslash, parts } => {
-                                    match &parts[0] {
-                                        WordPart::Literal { text, .. } => assert_eq!(text, "n"),
-                                        other => panic!("expected Literal(n), got {other:?}"),
-                                    }
-                                }
-                                other => panic!("expected backslash run, got {other:?}"),
-                            }
-                        }
-                        other => panic!("expected Simple(Exec), got {other:?}"),
-                    }
-                }
-                other => panic!("expected CommandSub, got {other:?}"),
-            },
-            other => panic!("expected Word, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tokenize_backtick_unterminated() {
-        assert_eq!(
-            tokenize("`echo hi").unwrap_err(),
-            LexError::UnterminatedSubstitution
-        );
-    }
-
-    #[test]
-    fn tokenize_backtick_in_single_quotes_is_literal() {
-        assert_eq!(
-            tokenize("'`echo hi`'").unwrap(),
-            vec![wq("`echo hi`")]
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_plus_alone() {
-        assert_eq!(
-            tokenize("~+").unwrap(),
-            vec![TokenKind::Word(Word(vec![WordPart::Tilde(TildeSpec::Pwd)]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_minus_alone() {
-        assert_eq!(
-            tokenize("~-").unwrap(),
-            vec![TokenKind::Word(Word(vec![WordPart::Tilde(TildeSpec::OldPwd)]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_plus_slash_path() {
-        assert_eq!(
-            tokenize("~+/x").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Tilde(TildeSpec::Pwd),
-                WordPart::Literal { text: "/x".to_string(), quoted: false },
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_minus_slash_path() {
-        assert_eq!(
-            tokenize("~-/x").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Tilde(TildeSpec::OldPwd),
-                WordPart::Literal { text: "/x".to_string(), quoted: false },
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_plus_followed_by_letter_is_literal() {
-        // ~+abc is not a valid form; falls back to literal.
-        assert_eq!(tokenize("~+abc").unwrap(), words(&["~+abc"]));
-    }
-
-    #[test]
-    fn tokenize_assignment_bare_tilde_after_equals() {
-        // X=~  (just `=~` with no path after) — covers the end-of-input branch
-        // of try_parse_tilde inside assignment context.
-        assert_eq!(
-            tokenize("X=~").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Literal { text: "X=".to_string(), quoted: false },
-                WordPart::Tilde(TildeSpec::Home),
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_assignment_value_expands_first_tilde_after_equals() {
-        assert_eq!(
-            tokenize("PATH=~/bin").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Literal { text: "PATH=".to_string(), quoted: false },
-                WordPart::Tilde(TildeSpec::Home),
-                WordPart::Literal { text: "/bin".to_string(), quoted: false },
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_assignment_value_expands_each_tilde_after_colon() {
-        assert_eq!(
-            tokenize("PATH=~/bin:~/lib").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Literal { text: "PATH=".to_string(), quoted: false },
-                WordPart::Tilde(TildeSpec::Home),
-                WordPart::Literal { text: "/bin:".to_string(), quoted: false },
-                WordPart::Tilde(TildeSpec::Home),
-                WordPart::Literal { text: "/lib".to_string(), quoted: false },
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_non_assignment_colon_tilde_stays_literal() {
-        // `echo` is not an assignment, so `a:~/b` does NOT expand the tilde.
-        assert_eq!(
-            tokenize("echo a:~/b").unwrap(),
-            words(&["echo", "a:~/b"])
-        );
-    }
-
-    #[test]
-    fn tokenize_assignment_with_digit_first_is_not_assignment_context() {
-        // `1ABC=~/x` doesn't match identifier-start; treated as literal.
-        assert_eq!(
-            tokenize("1ABC=~/x").unwrap(),
-            words(&["1ABC=~/x"])
-        );
-    }
-
-    #[test]
-    fn quoted_prefix_disqualifies_assignment() {
-        // `"F"OO=bar` is a command argument, not an assignment, because the
-        // identifier prefix contains quoted text.
-        let tokens = tokenize("\"F\"OO=bar").unwrap();
-        assert_eq!(tokens.len(), 1);
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        // Expect quoted "F", unquoted "OO=bar" — no assignment split.
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0], qdouble(vec![WordPart::Literal { text: "F".to_string(), quoted: true }]));
-        assert_eq!(parts[1], WordPart::Literal { text: "OO=bar".to_string(), quoted: false });
-    }
-
-    #[test]
-    fn tokenize_assignment_value_tilde_user() {
-        assert_eq!(
-            tokenize("HOMES=~alice:~bob").unwrap(),
-            vec![TokenKind::Word(Word(vec![
-                WordPart::Literal { text: "HOMES=".to_string(), quoted: false },
-                WordPart::Tilde(TildeSpec::User("alice".to_string())),
-                WordPart::Literal { text: ":".to_string(), quoted: false },
-                WordPart::Tilde(TildeSpec::User("bob".to_string())),
-            ]))]
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_user_colon_outside_assignment_is_literal() {
-        // Bash: ~alice:bob outside assignment is literal (no : terminator).
-        assert_eq!(
-            tokenize("echo ~alice:bob").unwrap(),
-            words(&["echo", "~alice:bob"])
-        );
-    }
-
-    #[test]
-    fn tokenize_tilde_pwd_colon_outside_assignment_is_literal() {
-        assert_eq!(
-            tokenize("echo ~+:foo").unwrap(),
-            words(&["echo", "~+:foo"])
-        );
-    }
-
-    #[test]
-    fn tokenize_mixed_quoted_unquoted_flushes_at_boundaries() {
-        let tokens = tokenize("foo\"bar\"baz").unwrap();
-        assert_eq!(tokens.len(), 1);
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert_eq!(parts.len(), 3);
-        assert_eq!(parts[0], WordPart::Literal { text: "foo".to_string(), quoted: false });
-        assert_eq!(parts[1], qdouble(vec![WordPart::Literal { text: "bar".to_string(), quoted: true }]));
-        assert_eq!(parts[2], WordPart::Literal { text: "baz".to_string(), quoted: false });
-    }
-
-    /// Helper: the literal text of a single-literal arith body `Word`.
-    fn arith_body_lit(part: &WordPart) -> &str {
-        let WordPart::Arith { body: Word(bparts), .. } = part else {
-            panic!("expected Arith part, got {part:?}")
-        };
-        assert_eq!(bparts.len(), 1, "expected single-literal body, got {bparts:?}");
-        let WordPart::Literal { text, .. } = &bparts[0] else {
-            panic!("expected Literal body part, got {:?}", bparts[0])
-        };
-        text
-    }
-
-    #[test]
-    fn tokenize_arith_simple() {
-        // Post-v93: the arith body is deferred as an expandable Word; here it is
-        // a single literal `1+2` (parsed at eval time, not lex time).
-        let tokens = tokenize("$((1+2))").unwrap();
-        assert_eq!(tokens.len(), 1);
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert_eq!(parts.len(), 1);
-        let WordPart::Arith { quoted, .. } = &parts[0] else {
-            panic!("expected Arith part, got {:?}", parts[0])
-        };
-        assert!(!(*quoted));
-        assert_eq!(arith_body_lit(&parts[0]), "1+2");
-    }
-
-    #[test]
-    fn tokenize_legacy_arith_basic() {
-        let tokens = tokenize("$[2**(3*2)]").unwrap();
-        assert_eq!(tokens.len(), 1);
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert_eq!(parts.len(), 1);
-        let WordPart::Arith { quoted, .. } = &parts[0] else {
-            panic!("expected Arith part, got {:?}", parts[0])
-        };
-        assert!(!(*quoted));
-        assert_eq!(arith_body_lit(&parts[0]), "2**(3*2)");
-    }
-
-    #[test]
-    fn tokenize_legacy_arith_array_subscript() {
-        let tokens = tokenize("$[a[1]+1]").unwrap();
-        assert_eq!(tokens.len(), 1);
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert_eq!(parts.len(), 1);
-        assert_eq!(arith_body_lit(&parts[0]), "a[1]+1");
-    }
-
-    #[test]
-    fn tokenize_legacy_arith_aware_close() {
-        for src in ["$[ $(echo ']')+1 ]", "$[ \"x]\" + 1 ]"] {
-            let tokens = tokenize(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
-            assert_eq!(tokens.len(), 1, "{src} closed early: {tokens:?}");
-            let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!("{src}") };
-            assert_eq!(parts.len(), 1, "{src}: {parts:?}");
-            assert!(matches!(parts[0], WordPart::Arith { .. }), "{src}: {:?}", parts[0]);
-        }
-    }
-
-    #[test]
-    fn tokenize_legacy_arith_unterminated() {
-        assert!(matches!(tokenize("$[ 1+2"), Err(LexError::UnterminatedLegacyArith)));
-    }
-
-    #[test]
-    fn tokenize_legacy_arith_braced_param() {
-        // A `}` inside `${…}` inside `$[…]` must not close early (exercises
-        // scan_braced_skip, which the other tests don't reach).
-        let tokens = tokenize("$[${x}+1]").unwrap();
-        assert_eq!(tokens.len(), 1);
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert_eq!(parts.len(), 1);
-        assert!(matches!(parts[0], WordPart::Arith { .. }), "got {:?}", parts[0]);
-    }
-
-    #[test]
-    fn tokenize_legacy_arith_inside_dquote() {
-        // `"$[1+2]"` — the $[ arm must carry quoted: true through to WordPart::Arith.
-        let tokens = tokenize("\"$[1+2]\"").unwrap();
-        assert_eq!(tokens.len(), 1);
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert_eq!(parts.len(), 1);
-        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
-        else { panic!("expected one double-quote run: {parts:?}") };
-        let WordPart::Arith { quoted, .. } = &inner[0] else {
-            panic!("expected Arith part, got {:?}", inner[0])
-        };
-        assert!(*quoted);
-        assert_eq!(arith_body_lit(&inner[0]), "1+2");
-    }
-
-    #[test]
-    fn arith_string_to_word_inherits_extglob() {
-        // A command substitution inside arithmetic whose body uses an extglob
-        // pattern lexes only when extglob is enabled (L-24).
-        let body = "$( [[ foo == @(foo|bar) ]] && echo 1 )";
-        assert!(arith_string_to_word(body, LexerOptions { extglob: true, ..Default::default() }).is_ok());
-        assert!(arith_string_to_word(body, LexerOptions { extglob: false, ..Default::default() }).is_err());
-    }
-
-    #[test]
-    fn tokenize_arith_with_nested_parens() {
-        let tokens = tokenize("$(( (1+2) * 3 ))").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert_eq!(arith_body_lit(&parts[0]), " (1+2) * 3 ");
-    }
-
-    #[test]
-    fn tokenize_arith_inside_double_quotes_is_quoted() {
-        let tokens = tokenize("\"$((1+2))\"").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
-        else { panic!("expected one double-quote run: {parts:?}") };
-        let WordPart::Arith { quoted, .. } = &inner[0] else { panic!() };
-        assert!(*quoted);
-    }
-
-    #[test]
-    fn tokenize_arith_unterminated_returns_error() {
-        // `$((1+2` doesn't close as `))`, so since v177 it falls back to a
-        // command substitution (`$( (1+2 … )`) — which is itself unterminated at
-        // EOF. Still an error, now reported as an unterminated substitution.
-        let err = tokenize("$((1+2").unwrap_err();
-        assert_eq!(err, LexError::UnterminatedSubstitution);
-    }
-
-    #[test]
-    fn tokenize_arith_parse_error_is_deferred_to_eval() {
-        // Post-v93: arithmetic is parsed at eval time, so a body that would
-        // fail to parse (`1+`) still lexes successfully into an Arith part.
-        let tokens = tokenize("$((1+))").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert!(matches!(parts[0], WordPart::Arith { .. }));
-        assert_eq!(arith_body_lit(&parts[0]), "1+");
-    }
-
-    #[test]
-    fn tokenize_arith_and_command_sub_both_recognized() {
-        let tokens = tokenize("$((1)) $(echo x)").unwrap();
-        let TokenKind::Word(Word(parts1)) = &tokens[0].kind else { panic!() };
-        assert!(matches!(parts1[0], WordPart::Arith { .. }));
-        let TokenKind::Word(Word(parts2)) = &tokens[1].kind else { panic!() };
-        assert!(matches!(parts2[0], WordPart::CommandSub { .. }));
-    }
-
-    #[test]
-    fn tokenize_arith_var_with_dollar_prefix_inside() {
-        // Post-v93: `$x` inside `$(())` is now an expandable Var body part
-        // (expanded before arith parse), not a pre-parsed ArithExpr::Var.
-        let tokens = tokenize("$(($x))").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::Arith { body: Word(bparts), .. } = &parts[0] else { panic!() };
-        assert_eq!(bparts.len(), 1);
-        assert_eq!(bparts[0], WordPart::Var { name: "x".to_string(), quoted: true });
-    }
-
-    #[test]
-    fn tokenize_arith_back_to_back_in_same_word() {
-        let tokens = tokenize("$((1+2))$((3+4))").unwrap();
-        assert_eq!(tokens.len(), 1);
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert_eq!(parts.len(), 2);
-        assert_eq!(arith_body_lit(&parts[0]), "1+2");
-        assert_eq!(arith_body_lit(&parts[1]), "3+4");
-    }
-
-    #[test]
-    fn tokenize_dollar_paren_subshell_falls_back_to_command_sub() {
-        // v177: when the body after `$((` does not close as `))` (the inner `)`
-        // is not immediately followed by another `)`), it is a command
-        // substitution whose body starts with a subshell — `$( (echo hi) 2>&1 )`
-        // written glued — NOT arithmetic. (Pre-v177 this returned UnterminatedArith.)
-        let tokens = tokenize("$((echo hi) 2>&1)").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert!(matches!(parts[0], WordPart::CommandSub { .. }));
-    }
+
+    // v266: `next_token_brace_expansion_drains_one_at_a_time` and
+    // `next_token_heredoc_body_complete_when_emitted` removed — both asserted the
+    // pre-atom Word-lexer's raw `next_token` stream (command-word brace expansion
+    // and heredoc-body backfill are now parser-mediated on the atom path). The
+    // behaviors are covered end-to-end by the brace/heredoc bash-diff harnesses
+    // and the atom-path tests in `array_parse_tests`.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     #[test]
     fn skip_line_comment_stops_before_newline() {
@@ -10563,2001 +6210,208 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unescape_backtick_applies_bash_rules() {
-        assert_eq!(unescape_backtick("a\\`b"), "a`b"); // \` -> `
-        assert_eq!(unescape_backtick("a\\\\b"), "a\\b"); // \\ -> \
-        assert_eq!(unescape_backtick("a\\$b"), "a$b"); // \$ -> $
-        assert_eq!(unescape_backtick("a\\xb"), "a\\xb"); // \x -> \x (verbatim)
-        assert_eq!(unescape_backtick("plain"), "plain");
-    }
 
-    #[test]
-    fn parse_braced_operand_single_word() {
-        let w = parse_braced_operand("foo").unwrap();
-        assert_eq!(w.0.len(), 1);
-        assert_eq!(w.0[0], WordPart::Literal { text: "foo".to_string(), quoted: false });
-    }
 
     // Local test helper: concatenate the literal text of a Word's parts
     // (expansions render as a placeholder so structure tests stay simple).
-    fn operand_lits(w: &Word) -> String {
-        let mut s = String::new();
-        for p in &w.0 {
-            match p {
-                WordPart::Literal { text, .. } => s.push_str(text),
-                WordPart::Var { name, .. } => { s.push('$'); s.push_str(name); }
-                _ => s.push('§'), // any other expansion part
-            }
-        }
-        s
-    }
-
-    #[test]
-    fn parse_braced_operand_two_words_join_with_space() {
-        // After the fix: "foo bar" is a single unquoted literal run.
-        let w = parse_braced_operand("foo bar").unwrap();
-        assert_eq!(operand_lits(&w), "foo bar");
-        assert!(w.0.iter().all(|p| matches!(p, WordPart::Literal { quoted: false, .. })));
-    }
-
-    #[test]
-    fn parse_braced_operand_top_level_pipe_is_ok() {
-        // After the fix: pipe is literal, not an error.
-        assert_eq!(operand_lits(&parse_braced_operand("foo | bar").unwrap()), "foo | bar");
-    }
-
-    #[test]
-    fn parse_braced_operand_empty_returns_empty_word() {
-        let w = parse_braced_operand("").unwrap();
-        assert_eq!(w.0.len(), 0);
-    }
-
-    #[test]
-    fn operand_parens_are_literal() {
-        assert_eq!(operand_lits(&parse_braced_operand("(a)").unwrap()), "(a)");
-    }
-
-    #[test]
-    fn operand_pipe_semicolon_amp_are_literal() {
-        assert_eq!(operand_lits(&parse_braced_operand("a|b;c&d").unwrap()), "a|b;c&d");
-        assert_eq!(operand_lits(&parse_braced_operand("a(b)c").unwrap()), "a(b)c");
-    }
-
-    #[test]
-    fn operand_expansion_with_parens() {
-        // `($x)` → literal "(", Var x, literal ")"
-        let w = parse_braced_operand("($x)").unwrap();
-        assert_eq!(operand_lits(&w), "($x)");
-    }
-
-    #[test]
-    fn operand_single_quote_is_literal_span() {
-        // '|;()' inside single quotes → one quoted literal "|;()"
-        let w = parse_braced_operand("'|;()'").unwrap();
-        assert_eq!(operand_lits(&w), "|;()");
-        assert!(matches!(w.0.as_slice(), [WordPart::Literal { quoted: true, .. }]));
-    }
-
-    #[test]
-    fn operand_enclosing_dquote_keeps_single_quotes_literal() {
-        // M-15b (v200): with enclosing_dquote=true, single quotes are LITERAL
-        // characters (kept), not a quote span — `'a|b'` → the 5 chars `'a|b'`.
-        let w = parse_braced_operand_opts("'a|b'", true, LexerOptions::default()).unwrap();
-        assert_eq!(operand_lits(&w), "'a|b'");
-        // Control: with enclosing_dquote=false the single quotes are stripped.
-        let w0 = parse_braced_operand_opts("'a|b'", false, LexerOptions::default()).unwrap();
-        assert_eq!(operand_lits(&w0), "a|b");
-    }
-
-    #[test]
-    fn operand_enclosing_dquote_restricts_backslash() {
-        // dquote backslash: special only before `$ ` " \`; `\*`/`\n` keep the
-        // backslash, `\$` drops it.
-        let star = parse_braced_operand_opts("\\*", true, LexerOptions::default()).unwrap();
-        assert_eq!(operand_lits(&star), "\\*");
-        let en = parse_braced_operand_opts("a\\nb", true, LexerOptions::default()).unwrap();
-        assert_eq!(operand_lits(&en), "a\\nb");
-        let dollar = parse_braced_operand_opts("a\\$b", true, LexerOptions::default()).unwrap();
-        assert_eq!(operand_lits(&dollar), "a$b");
-    }
-
-    #[test]
-    fn operand_double_quote_keeps_expansion() {
-        // "a $x b" → quoted literal "a ", Var x (quoted), quoted literal " b"
-        let w = parse_braced_operand("\"a $x b\"").unwrap();
-        assert_eq!(operand_lits(&w), "a $x b");
-        // Parts inside the double-quoted span carry quoted: true.
-        assert!(w.0.iter().all(|p| match p {
-            WordPart::Literal { quoted, .. } => *quoted,
-            WordPart::Var { quoted, .. } => *quoted,
-            _ => true,
-        }));
-    }
-
-    #[test]
-    fn operand_nested_brace() {
-        let w = parse_braced_operand("${y:-z}").unwrap();
-        assert!(matches!(w.0.as_slice(), [WordPart::ParamExpansion { .. }]));
-    }
-
-    #[test]
-    fn operand_plain_words_split_friendly() {
-        // "foo bar" → unquoted literal "foo bar" (one run; splits downstream).
-        let w = parse_braced_operand("foo bar").unwrap();
-        assert_eq!(operand_lits(&w), "foo bar");
-        assert!(w.0.iter().all(|p| matches!(p, WordPart::Literal { quoted: false, .. })));
-    }
-
-    #[test]
-    fn tokenize_brace_var_no_modifier_still_emits_var() {
-        let tokens = tokenize("${foo}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0], WordPart::Var { name: "foo".to_string(), quoted: false });
-    }
-
-    #[test]
-    fn tokenize_length_modifier() {
-        let tokens = tokenize("${#foo}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert_eq!(parts.len(), 1);
-        let WordPart::ParamExpansion { name, modifier, quoted, .. } = &parts[0] else {
-            panic!("expected ParamExpansion, got {:?}", parts[0]);
-        };
-        assert_eq!(name, "foo");
-        assert!(!(*quoted));
-        assert!(matches!(modifier, ParamModifier::Length));
-    }
-
-    #[test]
-    fn tokenize_length_modifier_digit_leading_name_errors() {
-        // `${#1foo}` — v34: digit-only positional names are now supported
-        // (${#1}, ${#10}), but ${#1foo} is still invalid: after parsing the
-        // positional "1", the lexer expects "}" but finds "f", so
-        // UnterminatedBrace.
-        let err = tokenize("${#1foo}").unwrap_err();
-        assert_eq!(err, LexError::UnterminatedBrace);
-    }
-
-    #[test]
-    fn tokenize_use_default_colon_dash() {
-        let tokens = tokenize("${X:-w}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { name, modifier, .. } = &parts[0] else { panic!() };
-        assert_eq!(name, "X");
-        match modifier {
-            ParamModifier::UseDefault { word, colon } => {
-                assert!(*colon);
-                assert_eq!(word.0, vec![WordPart::Literal { text: "w".to_string(), quoted: false }]);
-            }
-            other => panic!("expected UseDefault, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn tokenize_use_default_no_colon() {
-        let tokens = tokenize("${X-w}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
-        assert!(matches!(modifier, ParamModifier::UseDefault { colon: false, .. }));
-    }
-
-    #[test]
-    fn tokenize_indirect_bare() {
-        // `${!ref}` — v95 indirect scalar expansion, no modifier.
-        let tokens = tokenize("${!ref}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { name, modifier, subscript, indirect, .. } = &parts[0]
-        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
-        assert_eq!(name, "ref");
-        assert!(*indirect);
-        assert!(matches!(modifier, ParamModifier::None));
-        assert!(subscript.is_none());
-    }
-
-    #[test]
-    fn tokenize_indirect_with_default_modifier() {
-        // `${!ref-w}` — v95 indirect + trailing UseDefault modifier.
-        let tokens = tokenize("${!ref-w}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { name, modifier, indirect, .. } = &parts[0]
-        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
-        assert_eq!(name, "ref");
-        assert!(*indirect);
-        assert!(matches!(modifier, ParamModifier::UseDefault { colon: false, .. }));
-    }
-
-    #[test]
-    fn tokenize_indirect_array_keys_is_not_indirect() {
-        // Regression: `${!a[@]}` is array-keys (IndirectKeys), NOT the
-        // scalar indirect path — it must keep `indirect: false`.
-        let tokens = tokenize("${!a[@]}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { name, modifier, indirect, .. } = &parts[0]
-        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
-        assert_eq!(name, "a");
-        assert!(!(*indirect));
-        assert!(matches!(modifier, ParamModifier::IndirectKeys));
-    }
-
-    #[test]
-    fn indirect_keys_with_suffix_op_is_indirect_not_keys() {
-        // `${!v[@]%b}` — trailing `%b` makes it indirect-through-${v[@]} + RemoveSuffix,
-        // NOT the array-keys operator.
-        let toks = tokenize("${!v[@]%b}").unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        let WordPart::ParamExpansion { indirect, subscript, modifier, .. } = &parts[0]
-        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
-        assert!(*indirect);
-        assert!(matches!(subscript, Some(SubscriptKind::All)));
-        assert!(matches!(modifier, ParamModifier::RemoveSuffix { .. }));
-    }
-
-    #[test]
-    fn indirect_keys_with_transform_op_is_indirect() {
-        // `${!v[@]@Q}` — was wrongly BadSubst in v233; now indirect + transform.
-        let toks = tokenize("${!v[@]@Q}").unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        let WordPart::ParamExpansion { indirect, subscript, modifier, .. } = &parts[0]
-        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
-        assert!(*indirect);
-        assert!(matches!(subscript, Some(SubscriptKind::All)));
-        assert!(matches!(modifier, ParamModifier::Transform { .. }));
-    }
-
-    #[test]
-    fn indirect_keys_bare_still_keys() {
-        // Regression: `${!v[@]}` with NOTHING after `]` stays the keys operator.
-        let toks = tokenize("${!v[@]}").unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
-        assert!(matches!(modifier, ParamModifier::IndirectKeys));
-    }
-
-    #[test]
-    fn tokenize_prefix_names_star() {
-        // `${!pfx*}` — prefix-name expansion, `*` form (at=false).
-        let tokens = tokenize("${!_Q*}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { name, modifier, indirect, subscript, .. } = &parts[0]
-        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
-        assert_eq!(name, "_Q");
-        assert!(!(*indirect));
-        assert!(subscript.is_none());
-        assert!(matches!(modifier, ParamModifier::PrefixNames { at: false }));
-    }
-
-    #[test]
-    fn tokenize_prefix_names_at() {
-        // `${!pfx@}` — prefix-name expansion, `@` form (at=true).
-        let tokens = tokenize("${!_Q@}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { name, modifier, indirect, subscript, .. } = &parts[0]
-        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
-        assert_eq!(name, "_Q");
-        assert!(!(*indirect));
-        assert!(subscript.is_none());
-        assert!(matches!(modifier, ParamModifier::PrefixNames { at: true }));
-    }
-
-    #[test]
-    fn tokenize_indirect_transform_not_prefix_names() {
-        // Regression: `${!ref@Q}` is a transform on an indirect ref, NOT the
-        // prefix-name form — the `@` is not immediately followed by `}`.
-        let tokens = tokenize("${!ref@Q}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { name, modifier, indirect, .. } = &parts[0]
-        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
-        assert_eq!(name, "ref");
-        assert!(*indirect);
-        assert!(matches!(modifier, ParamModifier::Transform { .. }));
-    }
-
-    #[test]
-    fn length_of_special_param_hash() {
-        // v233 M2: `${##}` = `${#<#>}` = length of `$#`.
-        let mut toks = tokenize("${##}").unwrap();
-        let part = single_param_expansion(&mut toks);
-        assert!(matches!(part,
-            WordPart::ParamExpansion { ref name, modifier: ParamModifier::Length, indirect: false, .. } if name == "#"),
-            "got {part:?}");
-    }
-
-    #[test]
-    fn length_of_special_param_others() {
-        // v233 M2: `${#?}`, `${#-}`, `${#$}`, `${#!}` = length of the special
-        // param. `@`/`*` stay arg-count (not exercised here).
-        for (src, want) in [("${#?}", "?"), ("${#-}", "-"), ("${#$}", "$"), ("${#!}", "!")] {
-            let mut toks = tokenize(src).unwrap();
-            let part = single_param_expansion(&mut toks);
-            assert!(matches!(part,
-                WordPart::ParamExpansion { ref name, modifier: ParamModifier::Length, indirect: false, .. } if name == want),
-                "{src} -> got {part:?}");
-        }
-    }
-
-    #[test]
-    fn indirect_of_special_param_hash() {
-        // v233 M2: `${!#}` = indirect through `$#`.
-        let mut toks = tokenize("${!#}").unwrap();
-        let part = single_param_expansion(&mut toks);
-        assert!(matches!(part,
-            WordPart::ParamExpansion { ref name, indirect: true, .. } if name == "#"),
-            "got {part:?}");
-    }
-
-    #[test]
-    fn indirect_of_special_param_star_at() {
-        // v233 M2: `${!*}` / `${!@}` / `${!?}` route to special-param indirect
-        // (NOT PrefixNames, NOT BadSubst). Distinct from `${!pfx*}` prefix form.
-        for (src, want) in [("${!*}", "*"), ("${!@}", "@"), ("${!?}", "?")] {
-            let mut toks = tokenize(src).unwrap();
-            let part = single_param_expansion(&mut toks);
-            assert!(matches!(part,
-                WordPart::ParamExpansion { ref name, indirect: true, modifier: ParamModifier::None, .. } if name == want),
-                "{src} -> got {part:?}");
-        }
-    }
-
-    #[test]
-    fn indirect_special_dollar_bang_stay_badsubst() {
-        // v233 M2: `${!$}` / `${!!}` are bad substitutions in bash — they must
-        // NOT route to special-param indirect. They scan to `}` and defer.
-        for src in ["${!$}", "${!!}"] {
-            let mut toks = tokenize(src).unwrap();
-            let part = single_param_expansion(&mut toks);
-            // recover_bad_subst emits a ParamExpansion carrying a BadSubst marker.
-            assert!(matches!(part, WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }),
-                "{src} -> expected BadSubst, got {part:?}");
-        }
-    }
-
-    #[test]
-    fn tokenize_braced_dash_bare() {
-        // v102: `${-}` — option-flags special param, no modifier. Like
-        // `${a}`, the bare form is emitted as a plain Var, not ParamExpansion.
-        let tokens = tokenize("${-}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::Var { name, .. } = &parts[0]
-        else { panic!("expected Var, got {:?}", parts[0]) };
-        assert_eq!(name, "-");
-    }
-
-    #[test]
-    fn tokenize_braced_dash_remove_prefix() {
-        // v102: `${-#*e}` — nvm's errexit driver, RemovePrefix modifier.
-        let tokens = tokenize("${-#*e}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { name, modifier, indirect, .. } = &parts[0]
-        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
-        assert_eq!(name, "-");
-        assert!(!(*indirect));
-        assert!(matches!(modifier, ParamModifier::RemovePrefix { longest: false, .. }));
-    }
-
-    #[test]
-    fn tokenize_braced_status_bare() {
-        // v102: `${?}` — exit-status special param, bare form is a Var.
-        let tokens = tokenize("${?}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::Var { name, .. } = &parts[0]
-        else { panic!("expected Var, got {:?}", parts[0]) };
-        assert_eq!(name, "?");
-    }
-
-    #[test]
-    fn tokenize_braced_pid_bare() {
-        // v102: `${$}` — shell-pid special param, bare form is a Var.
-        let tokens = tokenize("${$}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::Var { name, .. } = &parts[0]
-        else { panic!("expected Var, got {:?}", parts[0]) };
-        assert_eq!(name, "$");
-    }
-
-    #[test]
-    fn tokenize_braced_bgpid_bare() {
-        // v102: bare `${!}` is the `$!` last-bg-pid special param,
-        // emitted as a plain Var, NOT the v95 indirect path.
-        let tokens = tokenize("${!}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::Var { name, .. } = &parts[0]
-        else { panic!("expected Var, got {:?}", parts[0]) };
-        assert_eq!(name, "!");
-    }
-
-    #[test]
-    fn tokenize_braced_indirect_still_indirect() {
-        // Regression: `${!var}` (non-`}` after `!`) stays the v95 indirect path.
-        let tokens = tokenize("${!var}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { name, indirect, .. } = &parts[0]
-        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
-        assert_eq!(name, "var");
-        assert!(*indirect);
-    }
-
-    #[test]
-    fn tokenize_assign_default_colon_equals() {
-        let tokens = tokenize("${X:=w}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
-        assert!(matches!(modifier, ParamModifier::AssignDefault { colon: true, .. }));
-    }
-
-    #[test]
-    fn tokenize_error_if_unset_colon_question() {
-        let tokens = tokenize("${X:?msg}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
-        assert!(matches!(modifier, ParamModifier::ErrorIfUnset { colon: true, .. }));
-    }
-
-    #[test]
-    fn tokenize_use_alternate_colon_plus() {
-        let tokens = tokenize("${X:+w}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
-        assert!(matches!(modifier, ParamModifier::UseAlternate { colon: true, .. }));
-    }
-
-    #[test]
-    fn tokenize_remove_prefix_short() {
-        let tokens = tokenize("${X#pat}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
-        assert!(matches!(modifier, ParamModifier::RemovePrefix { longest: false, .. }));
-    }
-
-    #[test]
-    fn tokenize_remove_prefix_long() {
-        let tokens = tokenize("${X##pat}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
-        assert!(matches!(modifier, ParamModifier::RemovePrefix { longest: true, .. }));
-    }
-
-    #[test]
-    fn tokenize_remove_suffix_short() {
-        let tokens = tokenize("${X%pat}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
-        assert!(matches!(modifier, ParamModifier::RemoveSuffix { longest: false, .. }));
-    }
-
-    #[test]
-    fn tokenize_remove_suffix_long() {
-        let tokens = tokenize("${X%%pat}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
-        assert!(matches!(modifier, ParamModifier::RemoveSuffix { longest: true, .. }));
-    }
-
-    #[test]
-    fn brace_substitute_first_match() {
-        let mut t = tokenize_words("\"${name/foo/bar}\"").unwrap();
-        let part = single_param_expansion(&mut t);
-        match part {
-            WordPart::ParamExpansion { name, modifier, quoted, .. } => {
-                assert_eq!(name, "name");
-                assert!(quoted);
-                match modifier {
-                    ParamModifier::Substitute { pattern, replacement, anchor, all } => {
-                        assert_eq!(word_to_literal(&pattern), "foo");
-                        assert_eq!(word_to_literal(&replacement), "bar");
-                        assert_eq!(anchor, SubstAnchor::None);
-                        assert!(!all);
-                    }
-                    _ => panic!("expected Substitute"),
-                }
-            }
-            _ => panic!("expected ParamExpansion"),
-        }
-    }
-
-    #[test]
-    fn brace_substitute_all_matches() {
-        let mut t = tokenize_words("${name//foo/bar}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Substitute { all, anchor, .. }, .. } = part {
-            assert!(all);
-            assert_eq!(anchor, SubstAnchor::None);
-        } else { panic!("expected Substitute") }
-    }
-
-    #[test]
-    fn brace_substitute_anchored_prefix() {
-        let mut t = tokenize_words("${name/#foo/bar}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Substitute { anchor, all, .. }, .. } = part {
-            assert_eq!(anchor, SubstAnchor::Prefix);
-            assert!(!all);
-        } else { panic!("expected Substitute") }
-    }
-
-    #[test]
-    fn brace_substitute_anchored_suffix() {
-        let mut t = tokenize_words("${name/%foo/bar}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Substitute { anchor, all, .. }, .. } = part {
-            assert_eq!(anchor, SubstAnchor::Suffix);
-            assert!(!all);
-        } else { panic!("expected Substitute") }
-    }
-
-    #[test]
-    fn brace_substitute_missing_replacement_is_empty_word() {
-        let mut t = tokenize_words("${name/foo}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Substitute { pattern, replacement, .. }, .. } = part {
-            assert_eq!(word_to_literal(&pattern), "foo");
-            assert_eq!(word_to_literal(&replacement), "");
-        } else { panic!("expected Substitute") }
-    }
-
-    #[test]
-    fn brace_substitute_escaped_slash_in_pattern() {
-        let mut t = tokenize_words("${path//\\//-}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Substitute { pattern, replacement, all, .. }, .. } = part {
-            assert_eq!(word_to_literal(&pattern), "/");
-            assert_eq!(word_to_literal(&replacement), "-");
-            assert!(all);
-        } else { panic!("expected Substitute") }
-    }
-
-    #[test]
-    fn brace_substitute_unterminated_is_error() {
-        assert!(matches!(
-            tokenize_words("${name/foo/bar"),
-            Err(LexError::UnterminatedBrace)
-        ));
-    }
-
-    #[test]
-    fn brace_substitute_nested_braced_var_in_pattern() {
-        // `${path/${HOME}/X}` — the inner `${HOME}`'s closing `}` must not
-        // terminate the outer substitution; the depth-aware splitter must
-        // pick the `/` between the closing `}` and `X` as the delimiter.
-        let mut t = tokenize_words("${path/${HOME}/X}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Substitute { pattern, replacement, .. }, .. } = part {
-            let Word(pat_parts) = &pattern;
-            assert!(
-                pat_parts.iter().any(|p| matches!(p, WordPart::Var { name, .. } if name == "HOME")),
-                "expected Var(HOME) in pattern, got {pat_parts:?}",
-            );
-            assert_eq!(word_to_literal(&replacement), "X");
-        } else { panic!("expected Substitute") }
-    }
-
-    #[test]
-    fn brace_substitute_nested_braced_var_in_replacement() {
-        // `${name/foo/${REPL}}` — the inner `${REPL}` must be parsed as a
-        // nested expansion in the replacement half.
-        let mut t = tokenize_words("${name/foo/${REPL}}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Substitute { pattern, replacement, .. }, .. } = part {
-            assert_eq!(word_to_literal(&pattern), "foo");
-            let Word(repl_parts) = &replacement;
-            assert!(
-                repl_parts.iter().any(|p| matches!(p, WordPart::Var { name, .. } if name == "REPL")),
-                "expected Var(REPL) in replacement, got {repl_parts:?}",
-            );
-        } else { panic!("expected Substitute") }
-    }
-
-    #[test]
-    fn tokenize_nested_param_expansion_in_operand() {
-        let tokens = tokenize("${X:-${Y}}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
-        if let ParamModifier::UseDefault { word, .. } = modifier {
-            assert_eq!(word.0.len(), 1);
-            assert!(matches!(word.0[0], WordPart::Var { .. }));
-        } else {
-            panic!("expected UseDefault");
-        }
-    }
-
-    #[test]
-    fn tokenize_quoted_operand_preserves_spaces() {
-        let tokens = tokenize("${X:-\"a b\"}").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
-        if let ParamModifier::UseDefault { word, .. } = modifier {
-            assert_eq!(word.0.len(), 1);
-            assert_eq!(word.0[0], WordPart::Literal { text: "a b".to_string(), quoted: true });
-        } else {
-            panic!();
-        }
-    }
-
-    #[test]
-    fn tokenize_quoted_outer_param_expansion() {
-        let tokens = tokenize("\"${X:-w}\"").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
-        else { panic!("expected one double-quote run: {parts:?}") };
-        let WordPart::ParamExpansion { quoted, .. } = &inner[0] else { panic!() };
-        assert!(*quoted);
-    }
-
-    #[test]
-    fn tokenize_invalid_modifier_parses_as_substring() {
-        // ${X:&Y}: `:` followed by `&` — `&` is not `-=?+` so falls through
-        // to substring dispatch; after v84, `&` in the operand is literal
-        // (no longer InvalidBraceOperand). The result is a Substring expansion
-        // with offset "&Y" — parses successfully (arith eval errors later at
-        // runtime when `&Y` is not a valid arith expression).
-        match tokenize("${X:&Y}") {
-            Ok(_) => {} // fine — operand parsed as word
-            Err(e) => panic!("unexpected error after v84: {e:?}"),
-        }
-    }
-
-    #[test]
-    fn tokenize_empty_param_name_errors() {
-        // v233: `${:-foo}` has an empty param name before `:` — now a runtime
-        // BadSubst (matching bash) rather than a parse error.
-        let toks = tokenize("${:-foo}").unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        assert!(matches!(&parts[0],
-            WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }
-        ), "expected BadSubst, got {:?}", parts[0]);
-    }
-
-    #[test]
-    fn tokenize_unterminated_brace_modifier_errors() {
-        let err = tokenize("${X:-foo").unwrap_err();
-        assert_eq!(err, LexError::UnterminatedBrace);
-    }
-
-    #[test]
-    fn tokenize_pipe_in_operand_ok() {
-        // After v84: pipe in operand is literal — ${X:-foo | bar} parses successfully.
-        let tokens = tokenize("${X:-foo | bar}").unwrap();
-        assert_eq!(tokens.len(), 1);
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        // Should be a ParamExpansion with UseDefault modifier.
-        assert!(matches!(parts[0], WordPart::ParamExpansion { .. }));
-    }
-
-    #[test]
-    fn newline_outside_quotes_emits_newline_token() {
-        let tokens = tokenize("a\nb").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                TokenKind::Word(Word(vec![WordPart::Literal { text: "a".to_string(), quoted: false }])),
-                TokenKind::Newline.into(),
-                TokenKind::Word(Word(vec![WordPart::Literal { text: "b".to_string(), quoted: false }])),
-            ]
-        );
-    }
-
-    #[test]
-    fn newline_inside_double_quotes_stays_literal() {
-        let tokens = tokenize("\"a\nb\"").unwrap();
-        assert_eq!(
-            tokens,
-            vec![wqd("a\nb")]
-        );
-    }
-
-    #[test]
-    fn newline_inside_single_quotes_stays_literal() {
-        let tokens = tokenize("'a\nb'").unwrap();
-        assert_eq!(
-            tokens,
-            vec![wq("a\nb")]
-        );
-    }
-
-    #[test]
-    fn consecutive_newlines_emit_consecutive_tokens() {
-        let tokens = tokenize("a\n\nb").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                TokenKind::Word(Word(vec![WordPart::Literal { text: "a".to_string(), quoted: false }])),
-                TokenKind::Newline.into(),
-                TokenKind::Newline.into(),
-                TokenKind::Word(Word(vec![WordPart::Literal { text: "b".to_string(), quoted: false }])),
-            ]
-        );
-    }
-
-    #[test]
-    fn carriage_return_is_still_plain_whitespace() {
-        // `\r` separates words but does not emit a Newline token.
-        let tokens = tokenize("a\rb").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                TokenKind::Word(Word(vec![WordPart::Literal { text: "a".to_string(), quoted: false }])),
-                TokenKind::Word(Word(vec![WordPart::Literal { text: "b".to_string(), quoted: false }])),
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_open_paren() {
-        assert_eq!(tokenize("(").unwrap(), vec![TokenKind::Op(Operator::LParen)]);
-    }
-
-    #[test]
-    fn tokenize_close_paren() {
-        assert_eq!(tokenize(")").unwrap(), vec![TokenKind::Op(Operator::RParen)]);
-    }
-
-    #[test]
-    fn tokenize_double_semi() {
-        assert_eq!(tokenize(";;").unwrap(), vec![TokenKind::Op(Operator::DoubleSemi)]);
-    }
-
-    #[test]
-    fn tokenize_semi_amp() {
-        assert_eq!(tokenize(";&").unwrap(), vec![TokenKind::Op(Operator::SemiAmp)]);
-    }
-
-    #[test]
-    fn tokenize_double_semi_amp() {
-        assert_eq!(tokenize(";;&").unwrap(), vec![TokenKind::Op(Operator::DoubleSemiAmp)]);
-    }
-
-    #[test]
-    fn tokenize_double_semi_space_amp_is_two_tokens() {
-        assert_eq!(
-            tokenize(";; &").unwrap(),
-            vec![TokenKind::Op(Operator::DoubleSemi), TokenKind::Op(Operator::Background)]
-        );
-    }
-
-    #[test]
-    fn tokenize_lone_semi_still_semi() {
-        assert_eq!(
-            tokenize("a;b").unwrap(),
-            vec![w("a"), TokenKind::Op(Operator::Semi).into(), w("b")]
-        );
-    }
-
-    #[test]
-    fn tokenize_paren_splits_adjacent_word() {
-        assert_eq!(
-            tokenize("a)").unwrap(),
-            vec![w("a"), TokenKind::Op(Operator::RParen).into()]
-        );
-    }
-
-    #[test]
-    fn tokenize_quoted_paren_stays_literal() {
-        // A quoted `)` is ordinary word content, not an operator.
-        assert_eq!(tokenize("')'").unwrap(), vec![wq(")")]);
-    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     // ---- Positional parameter lexer tests (v22 Task 4) ----------------------
 
-    #[test]
-    fn tokenize_dollar_digit() {
-        let tokens = tokenize("$1").unwrap();
-        assert_eq!(
-            tokens,
-            vec![TokenKind::Word(Word(vec![WordPart::Var {
-                name: "1".to_string(), quoted: false
-            }]))]
-        );
-    }
 
-    #[test]
-    fn tokenize_dollar_hash() {
-        let tokens = tokenize("$#").unwrap();
-        assert_eq!(
-            tokens,
-            vec![TokenKind::Word(Word(vec![WordPart::Var {
-                name: "#".to_string(), quoted: false
-            }]))]
-        );
-    }
 
-    #[test]
-    fn tokenize_dollar_at() {
-        let tokens = tokenize("$@").unwrap();
-        assert_eq!(
-            tokens,
-            vec![TokenKind::Word(Word(vec![WordPart::AllArgs {
-                joined: false, quoted: false
-            }]))]
-        );
-    }
 
-    #[test]
-    fn tokenize_dollar_star() {
-        let tokens = tokenize("$*").unwrap();
-        assert_eq!(
-            tokens,
-            vec![TokenKind::Word(Word(vec![WordPart::AllArgs {
-                joined: true, quoted: false
-            }]))]
-        );
-    }
 
-    #[test]
-    fn tokenize_quoted_dollar_at() {
-        let tokens = tokenize("\"$@\"").unwrap();
-        assert_eq!(
-            tokens,
-            vec![TokenKind::Word(Word(vec![qdouble(vec![WordPart::AllArgs {
-                joined: false, quoted: true
-            }])]))]
-        );
-    }
 
-    #[test]
-    fn tokenize_braced_positional() {
-        let tokens = tokenize("${10}").unwrap();
-        assert_eq!(
-            tokens,
-            vec![TokenKind::Word(Word(vec![WordPart::Var {
-                name: "10".to_string(), quoted: false
-            }]))]
-        );
-    }
 
-    #[test]
-    fn tokenize_braced_special_at() {
-        let tokens = tokenize("${@}").unwrap();
-        assert_eq!(
-            tokens,
-            vec![TokenKind::Word(Word(vec![WordPart::AllArgs {
-                joined: false, quoted: false
-            }]))]
-        );
-    }
 
-    // --- Here-document tests (v24) ---
 
-    /// Helper: extract the body Word from the first TokenKind::Heredoc in tokens.
-    fn heredoc_body(tokens: &[Token]) -> &Word {
-        for tok in tokens {
-            if let TokenKind::Heredoc { body, .. } = &tok.kind {
-                return body;
-            }
-        }
-        panic!("no TokenKind::Heredoc found in tokens: {tokens:?}");
-    }
 
-    /// Helper: assert a Literal part matches expected text and quoted flag.
-    fn assert_literal(part: &WordPart, expected_text: &str, expected_quoted: bool) {
-        match part {
-            WordPart::Literal { text, quoted } => {
-                assert_eq!(text, expected_text, "literal text mismatch");
-                assert_eq!(quoted, &expected_quoted, "literal quoted flag mismatch");
-            }
-            other => panic!("expected Literal, got {other:?}"),
-        }
-    }
 
-    #[test]
-    fn tokenize_heredoc_op_recognized() {
-        // Verify <<EOF lexes and produces a TokenKind::Heredoc with body.
-        let result = tokenize("cat <<EOF\nhello\nEOF\n");
-        let tokens = result.expect("parse ok");
-        assert_eq!(tokens.len(), 3, "got: {tokens:?}"); // Word("cat"), Heredoc{...}, Newline
-        assert!(matches!(tokens[0].kind, TokenKind::Word(_)));
-        assert!(matches!(tokens[1].kind, TokenKind::Heredoc { .. }));
-        assert!(matches!(tokens[2].kind, TokenKind::Newline));
-    }
 
-    #[test]
-    fn tokenize_heredoc_simple_expand() {
-        // cat <<EOF\nhello\nEOF → TokenKind::Heredoc{body=Word[Literal{"hello"}, Literal{"\n"}],
-        //                                         expand:true, strip_tabs:false}
-        let tokens = tokenize("cat <<EOF\nhello\nEOF\n").unwrap();
-        let body = heredoc_body(&tokens);
-        // For an expanding heredoc, "hello" is a Literal{quoted:false} and "\n" is Literal{quoted:true}
-        assert_eq!(body.0.len(), 2);
-        assert_literal(&body.0[0], "hello", false);
-        assert_literal(&body.0[1], "\n", true);
-        if let TokenKind::Heredoc { expand, strip_tabs, .. } = &tokens[1].kind {
-            assert!(expand, "should be expanding");
-            assert!(!strip_tabs, "should not strip tabs");
-        }
-    }
 
-    #[test]
-    fn tokenize_heredoc_literal_no_expand() {
-        // cat <<'EOF'\n$HOME\nEOF → body is one Literal{quoted:true, text:"$HOME\n"}
-        let tokens = tokenize("cat <<'EOF'\n$HOME\nEOF\n").unwrap();
-        if let TokenKind::Heredoc { body, expand, strip_tabs } = &tokens[1].kind {
-            assert!(!expand, "quoted delim → literal mode (no expand)");
-            assert!(!strip_tabs);
-            // Literal mode: entire body as one quoted Literal per line, plus newline parts.
-            assert_eq!(body.0.len(), 2);
-            assert_literal(&body.0[0], "$HOME", true);
-            assert_literal(&body.0[1], "\n", true);
-        } else {
-            panic!("expected TokenKind::Heredoc, got {:?}", tokens[1]);
-        }
-    }
 
-    #[test]
-    fn tokenize_heredoc_strip_tabs_dash() {
-        // <<-EOF\n\t\thello\n\tEOF → body "hello\n" (tabs stripped from body AND close line)
-        let tokens = tokenize("<<-EOF\n\t\thello\n\tEOF\n").unwrap();
-        if let TokenKind::Heredoc { body, expand, strip_tabs } = &tokens[0].kind {
-            assert!(strip_tabs, "<<- should strip tabs");
-            assert!(expand);
-            // After tab stripping, body line is "hello"
-            assert_eq!(body.0.len(), 2);
-            assert_literal(&body.0[0], "hello", false);
-            assert_literal(&body.0[1], "\n", true);
-        } else {
-            panic!("expected TokenKind::Heredoc");
-        }
-    }
 
-    #[test]
-    fn tokenize_heredoc_strip_tabs_with_literal_delim() {
-        // <<-'EOF' composes strip + no-expansion
-        let tokens = tokenize("cat <<-'EOF'\n\thello\n\tEOF\n").unwrap();
-        if let TokenKind::Heredoc { body, expand, strip_tabs } = &tokens[1].kind {
-            assert!(strip_tabs, "<<- should strip tabs");
-            assert!(!expand, "quoted delim → literal mode");
-            assert_eq!(body.0.len(), 2);
-            assert_literal(&body.0[0], "hello", true);
-            assert_literal(&body.0[1], "\n", true);
-        } else {
-            panic!("expected TokenKind::Heredoc");
-        }
-    }
 
-    #[test]
-    fn tokenize_heredoc_unclosed_errors() {
-        // cat <<EOF\nhello → LexError::UnterminatedHeredoc
-        let result = tokenize("cat <<EOF\nhello");
-        assert_eq!(result, Err(LexError::UnterminatedHeredoc));
-    }
 
-    #[test]
-    fn tokenize_heredoc_close_must_match_exactly() {
-        // Trailing space on close line → unterminated
-        let result = tokenize("cat <<EOF\nhello\nEOF \n");
-        assert_eq!(result, Err(LexError::UnterminatedHeredoc));
-    }
 
-    #[test]
-    fn tokenize_heredoc_close_must_not_have_leading_spaces() {
-        // Leading spaces without <<- → unterminated
-        let result = tokenize("cat <<EOF\nhello\n  EOF\n");
-        assert_eq!(result, Err(LexError::UnterminatedHeredoc));
-    }
 
-    #[test]
-    fn tokenize_heredoc_multiple_in_order() {
-        // cmd <<A <<B\nbody_a\nA\nbody_b\nB
-        let tokens = tokenize("cmd <<A <<B\nbody_a\nA\nbody_b\nB\n").unwrap();
-        // tokens: Word("cmd"), Heredoc{A's body}, Heredoc{B's body}, Newline
-        assert_eq!(tokens.len(), 4, "got: {tokens:?}");
-        assert!(matches!(tokens[0].kind, TokenKind::Word(_)));
-        assert!(matches!(tokens[3].kind, TokenKind::Newline));
-        if let TokenKind::Heredoc { body: body_a, .. } = &tokens[1].kind {
-            assert_eq!(body_a.0.len(), 2);
-            assert_literal(&body_a.0[0], "body_a", false);
-            assert_literal(&body_a.0[1], "\n", true);
-        } else {
-            panic!("tokens[1] should be TokenKind::Heredoc for A");
-        }
-        if let TokenKind::Heredoc { body: body_b, .. } = &tokens[2].kind {
-            assert_eq!(body_b.0.len(), 2);
-            assert_literal(&body_b.0[0], "body_b", false);
-            assert_literal(&body_b.0[1], "\n", true);
-        } else {
-            panic!("tokens[2] should be TokenKind::Heredoc for B");
-        }
-    }
 
-    #[test]
-    fn tokenize_heredoc_body_var_part() {
-        // cat <<EOF\n$USER\nEOF → body has Var{name:"USER"} part
-        let tokens = tokenize("cat <<EOF\n$USER\nEOF\n").unwrap();
-        let body = heredoc_body(&tokens);
-        // Parts: Var{USER, quoted:true}, Literal{"\n", quoted:true}
-        assert_eq!(body.0.len(), 2);
-        match &body.0[0] {
-            WordPart::Var { name, quoted } => {
-                assert_eq!(name, "USER");
-                assert!(quoted, "heredoc body vars are quoted-context");
-            }
-            other => panic!("expected Var, got {other:?}"),
-        }
-        assert_literal(&body.0[1], "\n", true);
-    }
 
-    #[test]
-    fn tokenize_heredoc_body_command_sub() {
-        // cat <<EOF\n$(date)\nEOF → body has CommandSub part
-        let tokens = tokenize("cat <<EOF\n$(date)\nEOF\n").unwrap();
-        let body = heredoc_body(&tokens);
-        // Parts: CommandSub{..., quoted:true}, Literal{"\n", quoted:true}
-        assert_eq!(body.0.len(), 2);
-        assert!(
-            matches!(body.0[0], WordPart::CommandSub { quoted: true, .. }),
-            "expected CommandSub{{quoted:true}}, got {:?}", body.0[0]
-        );
-        assert_literal(&body.0[1], "\n", true);
-    }
 
-    #[test]
-    fn tokenize_heredoc_body_escape_dollar() {
-        // cat <<EOF\n\$LITERAL\nEOF → body has Literal "$LITERAL"
-        // The backslash escapes the $ — result is literal text "$" followed by "LITERAL"
-        let tokens = tokenize("cat <<EOF\n\\$LITERAL\nEOF\n").unwrap();
-        let body = heredoc_body(&tokens);
-        // \$ → Literal{"$", quoted:true}, then "LITERAL" → Literal{"LITERAL", quoted:false}
-        assert!(body.0.len() >= 2, "expected at least 2 parts, got {:?}", body.0);
-        // First part should be the escaped '$' as a quoted Literal
-        assert_literal(&body.0[0], "$", true);
-        // Second part should be the remaining text "LITERAL" (unquoted)
-        assert_literal(&body.0[1], "LITERAL", false);
-    }
 
-    #[test]
-    fn tokenize_heredoc_body_backslash_passthrough() {
-        // cat <<EOF\n\d\nEOF → body has Literal "\\d" (POSIX: \X other than \$\`\\ is literal)
-        let tokens = tokenize("cat <<EOF\n\\d\nEOF\n").unwrap();
-        let body = heredoc_body(&tokens);
-        // \d → kept as literal "\d" (backslash not special before 'd')
-        assert_eq!(body.0.len(), 2);
-        assert_literal(&body.0[0], "\\d", false);
-        assert_literal(&body.0[1], "\n", true);
-    }
 
-    #[test]
-    fn tokenize_heredoc_empty_body() {
-        // cat <<EOF\nEOF → body Word has zero parts (empty)
-        let tokens = tokenize("cat <<EOF\nEOF\n").unwrap();
-        let body = heredoc_body(&tokens);
-        assert_eq!(body.0.len(), 0, "empty body should have no parts, got {:?}", body.0);
-    }
 
-    #[test]
-    fn tokenize_heredoc_delim_partially_quoted_is_literal_mode() {
-        // cat <<E"O"F\n$X\nEOF → expand:false, delim:"EOF"
-        let tokens = tokenize("cat <<E\"O\"F\n$X\nEOF\n").unwrap();
-        if let TokenKind::Heredoc { body, expand, .. } = &tokens[1].kind {
-            assert!(!expand, "partial quoting triggers literal mode");
-            // Literal body: "$X" as-is
-            assert_eq!(body.0.len(), 2);
-            assert_literal(&body.0[0], "$X", true);
-            assert_literal(&body.0[1], "\n", true);
-        } else {
-            panic!("expected TokenKind::Heredoc");
-        }
-    }
 
-    #[test]
-    fn tokenize_heredoc_delim_backslash_escaped_is_literal_mode() {
-        // cat <<\EOF\n$X\nEOF → expand:false (backslash-escaped delim = literal mode)
-        let tokens = tokenize("cat <<\\EOF\n$X\nEOF\n").unwrap();
-        if let TokenKind::Heredoc { body, expand, .. } = &tokens[1].kind {
-            assert!(!expand, "backslash-escaped delim triggers literal mode");
-            assert_eq!(body.0.len(), 2);
-            assert_literal(&body.0[0], "$X", true);
-            assert_literal(&body.0[1], "\n", true);
-        } else {
-            panic!("expected TokenKind::Heredoc");
-        }
-    }
 
-    #[test]
-    fn tokenize_heredoc_expanding_backslash_newline_joins_lines() {
-        // POSIX 2.7.4: \<NL> inside expanding heredoc is line continuation.
-        let tokens = tokenize("cat <<EOF\nhello \\\nworld\nEOF\n").unwrap();
-        // Find the Heredoc token and verify body literal is "hello world\n".
-        let body_text: String = match &tokens[1].kind {
-            TokenKind::Heredoc { body, .. } => body.0.iter()
-                .filter_map(|p| match p {
-                    WordPart::Literal { text, .. } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect(),
-            _ => panic!("expected Heredoc at index 1, got {:?}", tokens[1]),
-        };
-        assert_eq!(body_text, "hello world\n");
-    }
 
-    #[test]
-    fn tokenize_heredoc_literal_backslash_newline_is_literal() {
-        // Inside literal heredoc, \<NL> is two literal chars (POSIX 2.2.2 / 2.7.4).
-        let tokens = tokenize("cat <<'EOF'\nhello \\\nworld\nEOF\n").unwrap();
-        let body_text: String = match &tokens[1].kind {
-            TokenKind::Heredoc { body, .. } => body.0.iter()
-                .filter_map(|p| match p {
-                    WordPart::Literal { text, .. } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect(),
-            _ => panic!(),
-        };
-        // Body contains literal "hello \\\nworld\n" — backslash + newline + world.
-        assert_eq!(body_text, "hello \\\nworld\n");
-    }
 
-    #[test]
-    fn lexer_dollar_dollar_emits_var_name_dollar() {
-        let tokens = tokenize("$$").unwrap();
-        assert_eq!(tokens.len(), 1);
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!("expected Word, got {:?}", tokens[0]) };
-        assert_eq!(parts.len(), 1);
-        assert!(
-            matches!(&parts[0], WordPart::Var { name, quoted: false } if name == "$"),
-            "got {:?}", parts[0]
-        );
-    }
 
-    #[test]
-    fn lexer_dollar_bang_emits_var_name_bang() {
-        let tokens = tokenize("$!").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert!(
-            matches!(&parts[0], WordPart::Var { name, quoted: false } if name == "!"),
-            "got {:?}", parts[0]
-        );
-    }
 
-    #[test]
-    fn lexer_dollar_zero_already_emits_var_name_zero() {
-        // Regression test: $0 was lexed by the existing digit path pre-v26;
-        // confirm it still produces Var { name: "0" }.
-        let tokens = tokenize("$0").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert!(matches!(&parts[0], WordPart::Var { name, .. } if name == "0"));
-    }
 
-    #[test]
-    fn lexer_dollar_dollar_inside_double_quotes() {
-        let tokens = tokenize("\"$$\"").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
-        else { panic!("expected one double-quote run: {parts:?}") };
-        assert!(matches!(&inner[0], WordPart::Var { name, quoted: true } if name == "$"));
-    }
 
-    #[test]
-    fn lexer_dollar_bang_inside_double_quotes() {
-        let tokens = tokenize("\"$!\"").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
-        else { panic!("expected one double-quote run: {parts:?}") };
-        assert!(matches!(&inner[0], WordPart::Var { name, quoted: true } if name == "!"));
-    }
-
-    #[test]
-    fn lexer_dollar_dollar_concatenates_with_literal() {
-        let tokens = tokenize("pre-$$-post").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
-        assert_eq!(parts.len(), 3);
-        assert!(matches!(&parts[0], WordPart::Literal { text, .. } if text == "pre-"));
-        assert!(matches!(&parts[1], WordPart::Var { name, .. } if name == "$"));
-        assert!(matches!(&parts[2], WordPart::Literal { text, .. } if text == "-post"));
-    }
 
     // ---- v27 here-string lexer tests -------------------------------------------
 
-    #[test]
-    fn tokenize_here_string_op_alone() {
-        let tokens = tokenize("<<<").unwrap();
-        assert_eq!(tokens, vec![TokenKind::Op(Operator::HereString)]);
-    }
 
-    #[test]
-    fn tokenize_here_string_with_unquoted_word() {
-        let tokens = tokenize("cat <<< hello").unwrap();
-        assert_eq!(tokens.len(), 3);
-        assert!(matches!(tokens[0].kind, TokenKind::Word(_)));
-        assert!(matches!(tokens[1].kind, TokenKind::Op(Operator::HereString)));
-        assert!(matches!(tokens[2].kind, TokenKind::Word(_)));
-    }
 
-    #[test]
-    fn tokenize_here_string_with_quoted_word() {
-        let tokens = tokenize("cat <<< \"hi there\"").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[2].kind else { panic!("got {:?}", tokens[2]) };
-        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
-        else { panic!("expected one double-quote run: {parts:?}") };
-        assert!(matches!(&inner[0], WordPart::Literal { text, quoted: true } if text == "hi there"));
-    }
 
-    #[test]
-    fn tokenize_here_string_with_var_in_body() {
-        let tokens = tokenize("cat <<< $FOO").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[2].kind else { panic!() };
-        assert!(matches!(&parts[0], WordPart::Var { name, .. } if name == "FOO"));
-    }
 
-    #[test]
-    fn tokenize_here_string_with_command_sub_in_body() {
-        let tokens = tokenize("cat <<< $(echo hi)").unwrap();
-        let TokenKind::Word(Word(parts)) = &tokens[2].kind else { panic!() };
-        assert!(matches!(&parts[0], WordPart::CommandSub { .. }));
-    }
 
-    #[test]
-    fn tokenize_double_less_still_heredoc() {
-        // Regression: `<<EOF` must still lex as Heredoc, not split into `<<` + `<EOF`.
-        let tokens = tokenize("cat <<EOF\nbody\nEOF\n").unwrap();
-        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Heredoc { .. })),
-            "expected Heredoc token, got {:?}", tokens);
-    }
 
-    #[test]
-    fn tokenize_dup_out_basic() {
-        let tokens = tokenize(">&").unwrap();
-        assert_eq!(tokens, vec![TokenKind::Op(Operator::DupOut)]);
-    }
 
-    #[test]
-    fn tokenize_dup_err_basic() {
-        let tokens = tokenize("2>&").unwrap();
-        assert_eq!(tokens, vec![TokenKind::Op(Operator::DupErr)]);
-    }
 
-    #[test]
-    fn tokenize_and_redir_out() {
-        let tokens = tokenize("&>").unwrap();
-        assert_eq!(tokens, vec![TokenKind::Op(Operator::AndRedirOut)]);
-    }
 
-    #[test]
-    fn tokenize_and_redir_append() {
-        let tokens = tokenize("&>>").unwrap();
-        assert_eq!(tokens, vec![TokenKind::Op(Operator::AndRedirAppend)]);
-    }
 
-    #[test]
-    fn tokenize_dup_in_context() {
-        let tokens = tokenize("cmd 2>&1").unwrap();
-        assert_eq!(tokens.len(), 3);
-        assert!(matches!(tokens[0].kind, TokenKind::Word(_)));
-        assert!(matches!(tokens[1].kind, TokenKind::Op(Operator::DupErr)));
-        assert!(matches!(tokens[2].kind, TokenKind::Word(_)));
-    }
 
-    #[test]
-    fn tokenize_redir_out_regression() {
-        assert_eq!(tokenize(">").unwrap(), vec![TokenKind::Op(Operator::RedirOut)]);
-        assert_eq!(tokenize(">>").unwrap(), vec![TokenKind::Op(Operator::RedirAppend)]);
-    }
 
-    #[test]
-    fn tokenize_redir_err_regression() {
-        assert_eq!(tokenize("2>").unwrap(), vec![TokenKind::Op(Operator::RedirErr)]);
-        assert_eq!(tokenize("2>>").unwrap(), vec![TokenKind::Op(Operator::RedirErrAppend)]);
-    }
 
-    #[test]
-    fn tokenize_explicit_fd1_redir_out() {
-        // `1>` lexes as RedirOut (same as `>`).
-        let tokens = tokenize("1>").unwrap();
-        assert_eq!(tokens, vec![TokenKind::Op(Operator::RedirOut)]);
-    }
 
-    #[test]
-    fn tokenize_explicit_fd1_redir_append() {
-        let tokens = tokenize("1>>").unwrap();
-        assert_eq!(tokens, vec![TokenKind::Op(Operator::RedirAppend)]);
-    }
 
-    #[test]
-    fn tokenize_explicit_fd1_dup() {
-        let tokens = tokenize("1>&").unwrap();
-        assert_eq!(tokens, vec![TokenKind::Op(Operator::DupOut)]);
-    }
 
-    #[test]
-    fn tokenize_one_as_arg_when_has_token() {
-        // `cmd 1` where 1 is an argument — should NOT trigger the new arm.
-        let tokens = tokenize("cmd 1").unwrap();
-        assert_eq!(tokens.len(), 2);
-        assert!(matches!(tokens[0].kind, TokenKind::Word(_)));
-        assert!(matches!(tokens[1].kind, TokenKind::Word(_)));
-    }
 
-    #[test]
-    fn tokenize_background_regression() {
-        assert_eq!(tokenize("&").unwrap(), vec![TokenKind::Op(Operator::Background)]);
-        assert_eq!(tokenize("&&").unwrap(), vec![TokenKind::Op(Operator::And)]);
-    }
 
     // ──────────────────────────────────────────────────────────────
     // >| clobber redirect tests (v123)
     // ──────────────────────────────────────────────────────────────
 
-    #[test]
-    fn lex_clobber_stdout() {
-        assert_eq!(tokenize(">|").unwrap(), vec![TokenKind::Op(Operator::RedirClobber)]);
-        assert_eq!(tokenize("1>|").unwrap(), vec![TokenKind::Op(Operator::RedirClobber)]);
-    }
 
-    #[test]
-    fn lex_clobber_stderr() {
-        assert_eq!(tokenize("2>|").unwrap(), vec![TokenKind::Op(Operator::RedirErrClobber)]);
-    }
 
-    #[test]
-    fn lex_clobber_with_target() {
-        assert_eq!(
-            tokenize("cmd >|f").unwrap(),
-            vec![w("cmd"), TokenKind::Op(Operator::RedirClobber).into(), w("f")]
-        );
-    }
 
-    #[test]
-    fn lex_redir_then_pipe_unaffected() {
-        assert_eq!(
-            tokenize("> |").unwrap(),
-            vec![TokenKind::Op(Operator::RedirOut), TokenKind::Op(Operator::Pipe)]
-        );
-    }
 
     // ──────────────────────────────────────────────────────────────
     // [[ ]] keyword recognition tests (v30)
     // ──────────────────────────────────────────────────────────────
 
-    #[test]
-    fn tokenize_double_bracket_open_at_word_start() {
-        // `[[` at command-start → single Word token containing the literal `[[`.
-        // The keyword is recognised by the *parser* (command.rs `keyword_of`),
-        // not the lexer, so the lexer emits an ordinary Word.
-        let tokens = tokenize("[[").unwrap();
-        assert_eq!(tokens.len(), 1, "expected 1 token, got {:?}", tokens);
-        assert!(
-            matches!(&tokens[0].kind, TokenKind::Word(Word(parts))
-                if parts.len() == 1
-                && matches!(&parts[0], WordPart::Literal { text, quoted: false } if text == "[[")
-            ),
-            "expected Word([[), got {:?}", tokens[0]
-        );
-    }
 
-    #[test]
-    fn tokenize_double_bracket_close() {
-        // `]]` → Word token with literal `]]`.
-        let tokens = tokenize("]]").unwrap();
-        assert_eq!(tokens.len(), 1, "expected 1 token, got {:?}", tokens);
-        assert!(
-            matches!(&tokens[0].kind, TokenKind::Word(Word(parts))
-                if parts.len() == 1
-                && matches!(&parts[0], WordPart::Literal { text, quoted: false } if text == "]]")
-            ),
-            "expected Word(]]), got {:?}", tokens[0]
-        );
-    }
 
-    #[test]
-    fn tokenize_double_bracket_not_at_word_start_is_literal() {
-        // `cmd[[foo]]` — `[[` appears mid-word-sequence; because there is no
-        // space before it the lexer folds everything into a single Word.
-        // The important thing is that no separate keyword token is emitted.
-        let tokens = tokenize("cmd[[foo]]").unwrap();
-        // The whole thing is one word token (the lexer has no special-casing for [[ )].
-        assert_eq!(tokens.len(), 1, "expected 1 word token, got {:?}", tokens);
-        assert!(matches!(&tokens[0].kind, TokenKind::Word(_)), "expected Word, got {:?}", tokens[0]);
-    }
 
-    #[test]
-    fn brace_substring_simple() {
-        let mut t = tokenize_words("${name:1}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { name, modifier: ParamModifier::Substring { offset, length }, quoted, .. } = part {
-            assert_eq!(name, "name");
-            assert!(!quoted);
-            assert_eq!(word_to_literal(&offset), "1");
-            assert!(length.is_none());
-        } else { panic!("expected Substring") }
-    }
 
-    #[test]
-    fn brace_substring_with_length() {
-        let mut t = tokenize_words("${name:1:3}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Substring { offset, length }, .. } = part {
-            assert_eq!(word_to_literal(&offset), "1");
-            assert_eq!(word_to_literal(&length.expect("length")), "3");
-        } else { panic!("expected Substring") }
-    }
 
-    #[test]
-    fn brace_substring_negative_offset_with_space() {
-        // `${name: -3}` — the space disambiguates from `:-` (UseDefault).
-        // After v84 the operand is parsed as a word (char-walk), so the
-        // leading space is preserved as a literal " -3"; the arith evaluator
-        // handles the leading whitespace at runtime (${name: -3} == ${name: -3}).
-        let mut t = tokenize_words("${name: -3}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Substring { offset, .. }, .. } = part {
-            // Leading space is now present in the literal (arith eval trims it).
-            let lit = word_to_literal(&offset);
-            assert!(lit == "-3" || lit == " -3", "unexpected offset literal: {lit:?}");
-        } else { panic!("expected Substring, got {part:?}") }
-    }
 
-    #[test]
-    fn brace_substring_no_space_is_use_default_regression() {
-        // `${name:-3}` — no space, so this MUST remain UseDefault with default "3".
-        let mut t = tokenize_words("${name:-3}").unwrap();
-        let part = single_param_expansion(&mut t);
-        assert!(
-            matches!(part, WordPart::ParamExpansion { modifier: ParamModifier::UseDefault { colon: true, .. }, .. }),
-            "expected UseDefault, got {part:?}",
-        );
-    }
 
-    #[test]
-    fn brace_substring_positional() {
-        // `${1:0:3}` — must emit ParamExpansion (not Var) so the modifier runs.
-        let mut t = tokenize_words("${1:0:3}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { name, modifier: ParamModifier::Substring { offset, length }, .. } = part {
-            assert_eq!(name, "1");
-            assert_eq!(word_to_literal(&offset), "0");
-            assert_eq!(word_to_literal(&length.expect("length")), "3");
-        } else { panic!("expected Substring on positional, got {part:?}") }
-    }
 
-    #[test]
-    fn brace_substring_nested_braced_var_in_operand() {
-        // The depth-aware split must not break on the inner `${start}`'s `}`.
-        let mut t = tokenize_words("${name:${start}:${len}}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Substring { offset, length }, .. } = part {
-            // Offset word should contain a Var part for `start`.
-            let Word(off_parts) = &offset;
-            assert!(
-                off_parts.iter().any(|p| matches!(p, WordPart::Var { name, .. } if name == "start")),
-                "expected Var(start) in offset, got {off_parts:?}",
-            );
-            // Length word should contain a Var part for `len`.
-            let Word(len_parts) = length.as_ref().expect("length");
-            assert!(
-                len_parts.iter().any(|p| matches!(p, WordPart::Var { name, .. } if name == "len")),
-                "expected Var(len) in length, got {len_parts:?}",
-            );
-        } else { panic!("expected Substring") }
-    }
 
-    #[test]
-    fn brace_substring_unterminated_is_error() {
-        assert!(matches!(
-            tokenize_words("${name:1:3"),
-            Err(LexError::UnterminatedBrace)
-        ));
-    }
 
-    #[test]
-    fn brace_substring_empty_operand_is_lex_error() {
-        // v233: `${var:}` — colon followed immediately by close brace — is
-        // now a runtime BadSubst (matching bash) rather than a parse error.
-        let toks = tokenize_words("${name:}").unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        assert!(matches!(&parts[0],
-            WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { raw }, .. }
-            if raw == "${name:}"
-        ), "expected BadSubst, got {:?}", parts[0]);
-    }
 
-    #[test]
-    fn brace_case_upper_all() {
-        let mut t = tokenize_words("${name^^}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { name, modifier: ParamModifier::Case { direction, all, pattern }, quoted, .. } = part {
-            assert_eq!(name, "name");
-            assert!(!quoted);
-            assert_eq!(direction, CaseDirection::Upper);
-            assert!(all);
-            assert!(pattern.is_none());
-        } else { panic!("expected Case, got {part:?}") }
-    }
 
-    #[test]
-    fn brace_case_upper_first() {
-        let mut t = tokenize_words("${name^}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Case { direction, all, pattern }, .. } = part {
-            assert_eq!(direction, CaseDirection::Upper);
-            assert!(!all);
-            assert!(pattern.is_none());
-        } else { panic!("expected Case") }
-    }
 
-    #[test]
-    fn brace_case_lower_all() {
-        let mut t = tokenize_words("${name,,}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Case { direction, all, pattern }, .. } = part {
-            assert_eq!(direction, CaseDirection::Lower);
-            assert!(all);
-            assert!(pattern.is_none());
-        } else { panic!("expected Case") }
-    }
 
-    #[test]
-    fn brace_case_lower_first() {
-        let mut t = tokenize_words("${name,}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Case { direction, all, pattern }, .. } = part {
-            assert_eq!(direction, CaseDirection::Lower);
-            assert!(!all);
-            assert!(pattern.is_none());
-        } else { panic!("expected Case") }
-    }
 
-    #[test]
-    fn brace_case_upper_all_with_pattern() {
-        let mut t = tokenize_words("${name^^[aeiou]}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { modifier: ParamModifier::Case { direction, all, pattern }, .. } = part {
-            assert_eq!(direction, CaseDirection::Upper);
-            assert!(all);
-            let p = pattern.expect("pattern");
-            assert_eq!(word_to_literal(&p), "[aeiou]");
-        } else { panic!("expected Case") }
-    }
 
-    #[test]
-    fn brace_case_positional() {
-        // `${1^^}` — emits ParamExpansion (not Var) so the modifier runs.
-        let mut t = tokenize_words("${1^^}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { name, modifier: ParamModifier::Case { all, .. }, .. } = part {
-            assert_eq!(name, "1");
-            assert!(all);
-        } else { panic!("expected Case on positional, got {part:?}") }
-    }
 
-    #[test]
-    fn brace_case_unterminated_is_error() {
-        assert!(matches!(
-            tokenize_words("${name^^"),
-            Err(LexError::UnterminatedBrace)
-        ));
-    }
 
-    #[test]
-    fn brace_length_positional() {
-        let mut t = tokenize_words("${#1}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { name, modifier, quoted, .. } = part {
-            assert_eq!(name, "1");
-            assert!(!quoted);
-            assert!(matches!(modifier, ParamModifier::Length));
-        } else { panic!("expected ParamExpansion, got {part:?}") }
-    }
 
-    #[test]
-    fn brace_length_multi_digit_positional() {
-        let mut t = tokenize_words("${#10}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { name, modifier, .. } = part {
-            assert_eq!(name, "10");
-            assert!(matches!(modifier, ParamModifier::Length));
-        } else { panic!("expected ParamExpansion") }
-    }
 
-    #[test]
-    fn brace_length_at() {
-        let mut t = tokenize_words("${#@}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { name, modifier, .. } = part {
-            assert_eq!(name, "@");
-            assert!(matches!(modifier, ParamModifier::Length));
-        } else { panic!("expected ParamExpansion") }
-    }
 
-    #[test]
-    fn brace_length_star() {
-        let mut t = tokenize_words("${#*}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { name, modifier, .. } = part {
-            assert_eq!(name, "*");
-            assert!(matches!(modifier, ParamModifier::Length));
-        } else { panic!("expected ParamExpansion") }
-    }
 
-    #[test]
-    fn brace_length_unchanged_for_named() {
-        // Regression: `${#foo}` still parses as Length on a named var.
-        let mut t = tokenize_words("${#foo}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { name, modifier, .. } = part {
-            assert_eq!(name, "foo");
-            assert!(matches!(modifier, ParamModifier::Length));
-        } else { panic!("expected ParamExpansion") }
-    }
 
-    #[test]
-    fn brace_length_bare_hash_unchanged() {
-        // Regression: `${#}` still parses as Var { name: "#" }.
-        let mut t = tokenize_words("${#}").unwrap();
-        let part = single_param_expansion(&mut t);
-        if let WordPart::Var { name, .. } = part {
-            assert_eq!(name, "#");
-        } else { panic!("expected Var(#), got {part:?}") }
-    }
 
-    #[test]
-    fn ansi_c_quote_newline_escape() {
-        let toks = tokenize("$'a\\nb'").expect("lex");
-        // Single Word token with one quoted Literal containing "a\nb"
-        match &toks[0].kind {
-            TokenKind::Word(Word(parts)) => {
-                assert_eq!(parts.len(), 1);
-                match ansi_c_inner(&parts[0]) {
-                    WordPart::Literal { text, quoted } => {
-                        assert_eq!(text, "a\nb");
-                        assert!(*quoted, "expected quoted Literal");
-                    }
-                    other => panic!("expected Literal, got {:?}", other),
-                }
-            }
-            other => panic!("expected Word token, got {:?}", other),
-        }
-    }
 
-    #[test]
-    fn ansi_c_quote_tab_escape() {
-        let toks = tokenize("$'a\\tb'").expect("lex");
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
-        assert_eq!(parts.len(), 1);
-        let WordPart::Literal { text, quoted } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
-        assert_eq!(text, "a\tb");
-        assert!(*quoted);
-    }
 
-    #[test]
-    fn ansi_c_quote_backslash_and_quote() {
-        // $'\\\'' → literal backslash + literal quote (two chars)
-        let toks = tokenize("$'\\\\\\''").expect("lex");
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
-        assert_eq!(parts.len(), 1);
-        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
-        assert_eq!(text, "\\'");
-    }
 
-    #[test]
-    fn ansi_c_quote_hex_escapes() {
-        // \x48\x69 → "Hi"
-        let toks = tokenize("$'\\x48\\x69'").expect("lex");
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
-        assert_eq!(text, "Hi");
-    }
 
-    #[test]
-    fn ansi_c_quote_octal_escapes() {
-        // \110\151 → "Hi"  (0o110=72='H', 0o151=105='i')
-        let toks = tokenize("$'\\110\\151'").expect("lex");
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
-        assert_eq!(text, "Hi");
-    }
 
-    #[test]
-    fn ansi_c_quote_octal_greedy_stops_at_non_octal() {
-        // \18 → \1 followed by literal '8' → "\x01" + "8"
-        let toks = tokenize("$'\\18'").expect("lex");
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
-        assert_eq!(text, "\x018");
-    }
 
-    #[test]
-    fn ansi_c_quote_unicode_4digit() {
-        // é → é (U+00E9, "LATIN SMALL LETTER E WITH ACUTE")
-        let toks = tokenize("$'\\u00e9'").expect("lex");
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
-        assert_eq!(text, "é");
-    }
 
-    #[test]
-    fn ansi_c_quote_unicode_8digit() {
-        // \U0001F600 → 😀 (grinning face)
-        let toks = tokenize("$'\\U0001F600'").expect("lex");
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
-        assert_eq!(text, "\u{1F600}");
-    }
 
-    #[test]
-    fn ansi_c_quote_control_chars() {
-        // \cA → \x01, \cZ → \x1A
-        let toks = tokenize("$'\\cA\\cZ'").expect("lex");
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
-        assert_eq!(text, "\x01\x1a");
-    }
 
-    #[test]
-    fn ansi_c_quote_unknown_escape_preserves_both() {
-        // \q → literal "\q" (two chars)
-        let toks = tokenize("$'\\q'").expect("lex");
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
-        assert_eq!(text, "\\q");
-    }
 
-    #[test]
-    fn ansi_c_quote_empty() {
-        let toks = tokenize("$''").expect("lex");
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
-        assert_eq!(parts.len(), 1);
-        let WordPart::Literal { text, quoted } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
-        assert_eq!(text, "");
-        assert!(*quoted);
-    }
 
-    #[test]
-    fn ansi_c_quote_unterminated_is_error() {
-        let err = tokenize("$'foo").unwrap_err();
-        assert_eq!(err, LexError::UnterminatedQuote);
-    }
 
-    #[test]
-    fn ansi_c_quote_invalid_codepoint_is_error() {
-        // \uD800 is a surrogate, not a valid Unicode scalar
-        let err = tokenize("$'\\uD800'").unwrap_err();
-        assert_eq!(err, LexError::AnsiCInvalidCodepoint(0xD800));
-    }
 
-    #[test]
-    fn ansi_c_quote_concatenates_with_adjacent_word() {
-        // $'a\nb'foo → single Word with two Literal parts
-        let toks = tokenize("$'a\\nb'foo").expect("lex");
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
-        assert_eq!(parts.len(), 2);
-        let WordPart::Literal { text, quoted } = ansi_c_inner(&parts[0]) else { panic!("expected Literal at [0]") };
-        assert_eq!(text, "a\nb");
-        assert!(*quoted);
-        let WordPart::Literal { text, quoted } = &parts[1] else { panic!("expected Literal at [1]") };
-        assert_eq!(text, "foo");
-        assert!(!*quoted);
-    }
 
-    #[test]
-    fn tokenize_brace_emits_multiple_words() {
-        let toks = tokenize("echo {a,b,c}").expect("lex");
-        // Should produce 4 Word tokens: echo, a, b, c (plus any
-        // separators we don't care about).
-        let word_texts: Vec<String> = toks
-            .iter()
-            .filter_map(|t| match &t.kind {
-                TokenKind::Word(Word(parts)) => {
-                    let s: String = parts
-                        .iter()
-                        .filter_map(|p| match p {
-                            WordPart::Literal { text, .. } => Some(text.clone()),
-                            _ => None,
-                        })
-                        .collect();
-                    Some(s)
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(word_texts, vec!["echo", "a", "b", "c"]);
-    }
 
-    #[test]
-    fn tokenize_brace_preserves_var() {
-        let toks = tokenize("echo $x{a,b}").expect("lex");
-        // First word is `echo`. Then two more Words, each with
-        // a Var part followed by a Literal part.
-        let word_tokens: Vec<&Vec<WordPart>> = toks
-            .iter()
-            .filter_map(|t| match &t.kind {
-                TokenKind::Word(Word(parts)) => Some(parts),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(word_tokens.len(), 3);
-        // word_tokens[0] is `echo` (one Literal part).
-        // word_tokens[1] and [2] are Var+Literal pairs.
-        for w in &word_tokens[1..] {
-            assert!(matches!(w[0], WordPart::Var { .. }));
-            assert!(matches!(w[1], WordPart::Literal { quoted: false, .. }));
-        }
-    }
 
-    #[test]
-    fn tokenize_quoted_brace_not_expanded() {
-        let toks = tokenize("echo \"{a,b}\"").expect("lex");
-        let word_count = toks.iter().filter(|t| matches!(&t.kind, TokenKind::Word(_))).count();
-        assert_eq!(word_count, 2, "expected 2 Words (echo + the quoted literal), got {word_count}");
-    }
 
-    #[test]
-    fn tokenize_single_quoted_brace_not_expanded() {
-        let toks = tokenize("echo '{a,b}'").expect("lex");
-        let word_count = toks.iter().filter(|t| matches!(&t.kind, TokenKind::Word(_))).count();
-        assert_eq!(word_count, 2, "expected 2 Words, got {word_count}");
-    }
 
-    #[test]
-    fn tokenize_backslash_brace_not_expanded() {
-        // The lexer's `\X` arm pushes each escaped char as a
-        // one-char QUOTED Literal (quoted: true). Brace expansion
-        // only fires on UNQUOTED Literals, so `\{a,b\}` survives
-        // as a single Word.
-        let toks = tokenize("echo \\{a,b\\}").expect("lex");
-        let word_count = toks.iter().filter(|t| matches!(&t.kind, TokenKind::Word(_))).count();
-        assert_eq!(word_count, 2, "expected 2 Words, got {word_count}");
-    }
 
-    #[test]
-    fn arith_block_simple() {
-        let tokens = tokenize("((1+2))").unwrap();
-        assert_eq!(tokens.len(), 1);
-        match &tokens[0].kind {
-            TokenKind::ArithBlock(s, _) => assert_eq!(s, "1+2"),
-            other => panic!("expected ArithBlock, got {other:?}"),
-        }
-    }
 
-    #[test]
-    fn scan_arith_block_bails_on_unbalanced_close() {
-        // v185 (L-51): a `)` at depth 0 not forming `))` means the `((` can't be
-        // a balanced arith block — bail (Err) immediately instead of scanning on
-        // for a distant `))`. The caller then falls back to nested subshells.
-        let mut chars = CharCursor::new("echo a) z))");
-        assert!(scan_arith_block(&mut chars).is_err());
-    }
 
-    #[test]
-    fn scan_arith_block_valid_inner_group() {
-        // Regression: a valid arith block whose content closes a paren group
-        // (`(a)`) before the final `))` still scans — the inner `)` is processed
-        // at depth 1 (decrement 1->0), never the depth-0 bail branch.
-        let mut chars = CharCursor::new("(a)+1))");
-        assert_eq!(scan_arith_block(&mut chars).unwrap(), "(a)+1");
-    }
 
-    #[test]
-    fn double_paren_no_wander_to_distant_close() {
-        // v185 (L-51): `((echo a)|cat)` has no matching `))`; the scanner must
-        // NOT wander to a later `$((1+1))`'s `))`. The head lexes as nested
-        // subshells (two LParens), not an ArithBlock.
-        let toks = tokenize("((echo a)|cat); x=$((1+1))").unwrap();
-        assert!(
-            !matches!(toks[0].kind, TokenKind::ArithBlock(..)),
-            "head must not be an ArithBlock: {toks:?}"
-        );
-        assert!(matches!(toks[0].kind, TokenKind::Op(Operator::LParen)));
-        assert!(matches!(toks[1].kind, TokenKind::Op(Operator::LParen)));
-    }
 
-    #[test]
-    fn double_paren_nested_subshell_not_arith() {
-        // v184: `((echo a) | cat)` has no matching `))` → nested subshells `( (`,
-        // NOT an arithmetic block. Lexes to two LParens, no ArithBlock.
-        let toks = tokenize("((echo a) | cat)").unwrap();
-        assert!(
-            !toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))),
-            "must not be an ArithBlock: {toks:?}"
-        );
-        assert!(matches!(toks[0].kind, TokenKind::Op(Operator::LParen)));
-        assert!(matches!(toks[1].kind, TokenKind::Op(Operator::LParen)));
-    }
 
-    #[test]
-    fn double_paren_real_arith_still_arithblock() {
-        // v184 regression: a `((` that DOES close as `))` stays an ArithBlock.
-        let toks = tokenize("((1+2))").unwrap();
-        assert_eq!(toks.len(), 1);
-        assert!(matches!(toks[0].kind, TokenKind::ArithBlock(..)));
-    }
 
-    #[test]
-    fn double_paren_deep_nesting_not_arith() {
-        // v184: `((( echo a ) ) )` — the closing parens are not adjacent, so no
-        // `))` for the outer `((` → LParens, not an ArithBlock.
-        let toks = tokenize("((( echo a ) ) )").unwrap();
-        assert!(
-            !toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))),
-            "must not be an ArithBlock: {toks:?}"
-        );
-    }
 
-    #[test]
-    fn arith_block_with_semicolons() {
-        let tokens = tokenize("((a;b;c))").unwrap();
-        assert_eq!(tokens.len(), 1);
-        match &tokens[0].kind {
-            TokenKind::ArithBlock(s, _) => assert_eq!(s, "a;b;c"),
-            other => panic!("expected ArithBlock, got {other:?}"),
-        }
-    }
 
-    #[test]
-    fn arith_block_nested_parens() {
-        // Outer `((` / `))` is the delimiter; inner parens belong to the body.
-        // Body has TWO layers of inner parens — the matching `))` close
-        // is the final two `)` of the input.
-        let tokens = tokenize("((((a+b)*c)))").unwrap();
-        assert_eq!(tokens.len(), 1);
-        match &tokens[0].kind {
-            TokenKind::ArithBlock(s, _) => assert_eq!(s, "((a+b)*c)"),
-            other => panic!("expected ArithBlock, got {other:?}"),
-        }
-    }
 
-    #[test]
-    fn arith_block_with_internal_whitespace() {
-        let tokens = tokenize("((  1 + 2  ))").unwrap();
-        assert_eq!(tokens.len(), 1);
-        match &tokens[0].kind {
-            TokenKind::ArithBlock(s, _) => assert_eq!(s, "  1 + 2  "),
-            other => panic!("expected ArithBlock, got {other:?}"),
-        }
-    }
 
-    #[test]
-    fn arith_block_empty_body() {
-        let tokens = tokenize("(())").unwrap();
-        assert_eq!(tokens.len(), 1);
-        match &tokens[0].kind {
-            TokenKind::ArithBlock(s, _) => assert_eq!(s, ""),
-            other => panic!("expected ArithBlock, got {other:?}"),
-        }
-    }
 
-    #[test]
-    fn arith_block_unclosed_falls_back_to_lparens() {
-        // `((1+2` — no closing `))`. As of v184, an unterminated `((` is no
-        // longer a lex error: it rewinds and emits a single LParen (the second
-        // `(` re-lexes as another), so this lexes as nested subshells `( (`.
-        // bash treats `((` as arithmetic only when a matching `))` is found.
-        let toks = tokenize("((1+2").unwrap();
-        assert!(
-            !toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))),
-            "must not be an ArithBlock: {toks:?}"
-        );
-        assert!(matches!(toks[0].kind, TokenKind::Op(Operator::LParen)));
-        assert!(matches!(toks[1].kind, TokenKind::Op(Operator::LParen)));
-    }
 
-    #[test]
-    fn arith_block_single_paren_at_end_falls_back_to_lparens() {
-        // `((1+2)` — one closing paren, not two, so no matching `))`. As of
-        // v184 this falls back to nested subshells `( (` rather than erroring.
-        let toks = tokenize("((1+2)").unwrap();
-        assert!(
-            !toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))),
-            "must not be an ArithBlock: {toks:?}"
-        );
-        assert!(matches!(toks[0].kind, TokenKind::Op(Operator::LParen)));
-        assert!(matches!(toks[1].kind, TokenKind::Op(Operator::LParen)));
-    }
 
-    #[test]
-    fn space_between_parens_is_not_arith_block() {
-        // `( (cmd) )` — whitespace between the two `(`s. Should tokenize
-        // as two LParen ops, a Word, and two RParen ops (nested-subshell
-        // path per M-11). The arith-block detector must NOT fire.
-        let tokens = tokenize("( (cmd) )").unwrap();
-        let lparen_count = tokens
-            .iter()
-            .filter(|t| matches!(&t.kind, TokenKind::Op(Operator::LParen)))
-            .count();
-        let arith_count = tokens
-            .iter()
-            .filter(|t| matches!(&t.kind, TokenKind::ArithBlock(..)))
-            .count();
-        assert_eq!(lparen_count, 2, "expected two LParen tokens: {tokens:?}");
-        assert_eq!(arith_count, 0, "did not expect ArithBlock: {tokens:?}");
-    }
 
     // ── v241 T2: ParamExpansion head-mode tests ────────────────────────────────
 
@@ -12820,22 +6674,6 @@ mod tests {
         out
     }
 
-    #[test]
-    fn command_atoms_stream_shape() {
-        // `Blank` splits words; literals carry `quoted:false`.
-        assert_eq!(
-            command_atoms_of("echo hi"),
-            vec![
-                TokenKind::Lit { text: "echo".into(), quoted: false },
-                TokenKind::Blank,
-                TokenKind::Lit { text: "hi".into(), quoted: false },
-            ],
-        );
-        // `Blank` NEVER appears in the Word-mode (production) stream.
-        let words = tokenize_with_opts("echo hi", LexerOptions::default()).unwrap();
-        assert!(words.iter().all(|t| !matches!(t.kind, TokenKind::Blank)),
-            "Blank must never appear in the Word-mode stream");
-    }
 
     // ── v250 T1: heredoc opener atom (dormant; body emission is a later task) ──
 
@@ -13065,375 +6903,30 @@ mod tests {
 #[cfg(test)]
 mod array_parse_tests {
     use super::*;
-    use crate::command::{AssignTarget, Assignment, Command, SimpleCommand};
 
-    /// Parse a single line and return its first SimpleCommand's
-    /// assignments. Works for both `name=value` standalone and
-    /// `name=value cmd args` inline-prefix shapes.
-    fn parse_assignments(input: &str) -> Vec<Assignment> {
-        let tokens = crate::lexer::tokenize(input).expect("lex");
-        let seq = crate::command::parse(&mut Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
-        let pipeline = match seq.first {
-            Command::Pipeline(p) => p,
-            other => panic!("expected Pipeline, got {other:?}"),
-        };
-        match &pipeline.commands[0] {
-            Command::Simple(SimpleCommand::Assign(items, _)) => items.clone(),
-            Command::Simple(SimpleCommand::Exec(e)) => e.inline_assignments.clone(),
-            other => panic!("expected SimpleCommand, got {other:?}"),
-        }
-    }
 
-    /// Walk a Word looking for the first WordPart::ParamExpansion whose
-    /// name matches.
-    fn find_param_expansion(input: &str, name: &str) -> WordPart {
-        let tokens = crate::lexer::tokenize(input).expect("lex");
-        let seq = crate::command::parse(&mut Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
-        let pipeline = match seq.first {
-            Command::Pipeline(p) => p,
-            other => panic!("expected Pipeline, got {other:?}"),
-        };
-        for cmd in &pipeline.commands {
-            if let Command::Simple(SimpleCommand::Exec(e)) = cmd {
-                for w in std::iter::once(&e.program).chain(e.args.iter()) {
-                    // Flatten one level of quoted runs so a `"${a[@]}"` expansion
-                    // (now nested inside a double-quote run) is still found.
-                    let flat = w.0.iter().flat_map(|p| match p {
-                        WordPart::Quoted { parts, .. } => parts.iter().collect::<Vec<_>>(),
-                        other => vec![other],
-                    });
-                    for part in flat {
-                        if let WordPart::ParamExpansion { name: n, .. } = part
-                            && n == name
-                        {
-                            return part.clone();
-                        }
-                    }
-                }
-            }
-        }
-        panic!("ParamExpansion for {name} not found");
-    }
 
-    #[test]
-    fn compound_rhs_is_array_literal() {
-        let assigns = parse_assignments("a=(x y z)");
-        assert_eq!(assigns.len(), 1);
-        assert_eq!(assigns[0].target.name(), "a");
-        assert!(!assigns[0].append);
-        // Value: [Literal(""), ArrayLiteral([x, y, z])].
-        // (Bare `name=` keeps the existing Literal-`name=` prefix shape;
-        // the rest-of-first-Literal is the empty string before the open
-        // paren, then ArrayLiteral follows.)
-        let parts = &assigns[0].value.0;
-        let array_part = parts.iter().find_map(|p| match p {
-            WordPart::ArrayLiteral(els) => Some(els),
-            _ => None,
-        });
-        let els = array_part.expect("ArrayLiteral part present");
-        assert_eq!(els.len(), 3);
-        assert!(els.iter().all(|e| e.subscript.is_none()));
-    }
 
-    #[test]
-    fn array_assignment_with_line_continuation() {
-        // `arr=\<NL>(a b c)` — the \<NL> between `=` and `(` is a line
-        // continuation (deleted pre-tokenization), so this is `arr=(a b c)`.
-        let assigns = parse_assignments("arr=\\\n(a b c)");
-        assert_eq!(assigns.len(), 1);
-        assert_eq!(assigns[0].target.name(), "arr");
-        assert!(!assigns[0].append);
-        let els = assigns[0]
-            .value
-            .0
-            .iter()
-            .find_map(|p| match p {
-                WordPart::ArrayLiteral(els) => Some(els),
-                _ => None,
-            })
-            .expect("ArrayLiteral part present");
-        assert_eq!(els.len(), 3);
-    }
 
-    #[test]
-    fn array_append_with_line_continuation() {
-        let assigns = parse_assignments("arr+=\\\n(d)");
-        assert_eq!(assigns.len(), 1);
-        assert!(assigns[0].append);
-        let els = assigns[0]
-            .value
-            .0
-            .iter()
-            .find_map(|p| match p {
-                WordPart::ArrayLiteral(els) => Some(els),
-                _ => None,
-            })
-            .expect("ArrayLiteral part present");
-        assert_eq!(els.len(), 1);
-    }
 
-    #[test]
-    fn array_assignment_with_line_continuation_between_elements() {
-        // `arr=([a]=1 \<NL> [b]=2)` — the \<NL> BETWEEN elements is a separator,
-        // not the start of a bare element. Both subscripted elements survive
-        // (previously the \<NL> produced a spurious no-subscript element).
-        let assigns = parse_assignments("arr=([a]=1 \\\n [b]=2)");
-        assert_eq!(assigns.len(), 1);
-        let els = assigns[0]
-            .value
-            .0
-            .iter()
-            .find_map(|p| match p {
-                WordPart::ArrayLiteral(els) => Some(els),
-                _ => None,
-            })
-            .expect("ArrayLiteral part present");
-        assert_eq!(els.len(), 2, "two subscripted elements, no spurious one");
-        assert!(els.iter().all(|e| e.subscript.is_some()),
-            "every element keeps its [key]= subscript");
-    }
 
-    #[test]
-    fn array_assignment_with_stacked_line_continuations() {
-        // `arr=\<NL>\<NL>(x)` — two stacked continuations, both deleted, so this
-        // is `arr=(x)` (exercises the loop in skip_line_continuations).
-        let assigns = parse_assignments("arr=\\\n\\\n(x)");
-        assert_eq!(assigns.len(), 1);
-        let els = assigns[0]
-            .value
-            .0
-            .iter()
-            .find_map(|p| match p {
-                WordPart::ArrayLiteral(els) => Some(els),
-                _ => None,
-            })
-            .expect("ArrayLiteral part present");
-        assert_eq!(els.len(), 1);
-    }
 
-    #[test]
-    fn backslash_escape_after_eq_is_not_continuation() {
-        // `arr=\x` — `\x` is a literal escape, NOT a continuation; no array.
-        let assigns = parse_assignments("arr=\\x");
-        assert_eq!(assigns.len(), 1);
-        assert!(
-            !assigns[0]
-                .value
-                .0
-                .iter()
-                .any(|p| matches!(p, WordPart::ArrayLiteral(_))),
-            "a backslash-escape must not be treated as a line continuation"
-        );
-    }
 
-    #[test]
-    fn sparse_compound_rhs_carries_subscripts() {
-        let assigns = parse_assignments("a=([5]=x [2]=y)");
-        let array_part = assigns[0].value.0.iter().find_map(|p| match p {
-            WordPart::ArrayLiteral(els) => Some(els),
-            _ => None,
-        });
-        let els = array_part.expect("ArrayLiteral part present");
-        assert_eq!(els.len(), 2);
-        assert!(els[0].subscript.is_some());
-        assert!(els[1].subscript.is_some());
-    }
 
-    #[test]
-    fn subscripted_lvalue_parses() {
-        let assigns = parse_assignments("a[5]=v");
-        assert_eq!(assigns.len(), 1);
-        match &assigns[0].target {
-            AssignTarget::Indexed { name, .. } => assert_eq!(name, "a"),
-            other => panic!("expected Indexed, got {other:?}"),
-        }
-        assert!(!assigns[0].append);
-    }
 
-    #[test]
-    fn subscripted_lvalue_append_parses() {
-        let assigns = parse_assignments("a[5]+=v");
-        match &assigns[0].target {
-            AssignTarget::Indexed { name, .. } => assert_eq!(name, "a"),
-            other => panic!("expected Indexed, got {other:?}"),
-        }
-        assert!(assigns[0].append);
-    }
 
-    #[test]
-    fn compound_append_parses() {
-        let assigns = parse_assignments("a+=(x y)");
-        match &assigns[0].target {
-            AssignTarget::Bare(n) => assert_eq!(n, "a"),
-            other => panic!("expected Bare, got {other:?}"),
-        }
-        assert!(assigns[0].append);
-        let array_part = assigns[0].value.0.iter().find_map(|p| match p {
-            WordPart::ArrayLiteral(els) => Some(els),
-            _ => None,
-        });
-        assert!(array_part.is_some(), "expected ArrayLiteral part");
-    }
 
-    #[test]
-    fn subscripted_ref_at_all() {
-        let pe = find_param_expansion(r#"echo "${a[@]}""#, "a");
-        match pe {
-            WordPart::ParamExpansion { subscript, .. } => {
-                assert!(matches!(subscript, Some(SubscriptKind::All)));
-            }
-            _ => unreachable!(),
-        }
-    }
 
-    #[test]
-    fn subscripted_ref_at_star() {
-        let pe = find_param_expansion(r#"echo "${a[*]}""#, "a");
-        match pe {
-            WordPart::ParamExpansion { subscript, .. } => {
-                assert!(matches!(subscript, Some(SubscriptKind::Star)));
-            }
-            _ => unreachable!(),
-        }
-    }
 
-    #[test]
-    fn subscripted_ref_index_carries_word() {
-        let pe = find_param_expansion("echo ${a[3]}", "a");
-        match pe {
-            WordPart::ParamExpansion { subscript, .. } => {
-                assert!(matches!(subscript, Some(SubscriptKind::Index(_))));
-            }
-            _ => unreachable!(),
-        }
-    }
 
-    #[test]
-    fn bare_param_expansion_has_no_subscript() {
-        // `${a}` (no subscript) is emitted as WordPart::Var, NOT
-        // ParamExpansion. Verify by checking that no ParamExpansion
-        // appears at all.
-        let tokens = crate::lexer::tokenize("echo ${a}").expect("lex");
-        let seq = crate::command::parse(&mut Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
-        let pipeline = match seq.first {
-            Command::Pipeline(p) => p,
-            _ => panic!(),
-        };
-        for cmd in &pipeline.commands {
-            if let Command::Simple(SimpleCommand::Exec(e)) = cmd {
-                for w in std::iter::once(&e.program).chain(e.args.iter()) {
-                    for part in &w.0 {
-                        if matches!(part, WordPart::ParamExpansion { .. }) {
-                            panic!("expected Var, got ParamExpansion for ${{a}}");
-                        }
-                    }
-                }
-            }
-        }
-    }
 
-    #[test]
-    fn unterminated_subscript_errors() {
-        let result = crate::lexer::tokenize("echo ${a[3");
-        assert!(
-            matches!(result, Err(LexError::UnterminatedSubscript)),
-            "expected UnterminatedSubscript, got {result:?}"
-        );
-    }
 
-    #[test]
-    fn unterminated_array_literal_errors() {
-        let result = crate::lexer::tokenize("a=(x y");
-        assert!(
-            matches!(result, Err(LexError::UnterminatedArrayLiteral)),
-            "expected UnterminatedArrayLiteral, got {result:?}"
-        );
-    }
 
-    #[test]
-    fn array_literal_subscript_missing_equals_errors() {
-        let result = crate::lexer::tokenize("a=([3] x)");
-        assert!(
-            matches!(result, Err(LexError::ArrayLiteralMissingEquals)),
-            "expected ArrayLiteralMissingEquals, got {result:?}"
-        );
-    }
 
-    #[test]
-    fn bare_subscripted_ref_has_none_modifier() {
-        let pe = find_param_expansion("echo ${a[3]}", "a");
-        if let WordPart::ParamExpansion { modifier, .. } = pe {
-            assert!(
-                matches!(modifier, ParamModifier::None),
-                "expected ParamModifier::None, got {modifier:?}"
-            );
-        } else {
-            panic!("expected ParamExpansion");
-        }
-    }
 
-    #[test]
-    fn parse_transform_ops() {
-        for (src, want) in [
-            ("${v@P}", TransformOp::PromptExpand),
-            ("${v@Q}", TransformOp::Quote),
-            ("${v@U}", TransformOp::Upper),
-            ("${v@L}", TransformOp::Lower),
-            ("${v@u}", TransformOp::UpperFirst),
-            ("${v@E}", TransformOp::EscapeExpand),
-            ("${v@A}", TransformOp::AssignDecl),
-            ("${v@K}", TransformOp::KvString),
-            ("${v@k}", TransformOp::KvWords),
-            ("${v@a}", TransformOp::AttrFlags),
-        ] {
-            let parts = match &tokenize(src).unwrap()[0].kind {
-                TokenKind::Word(Word(p)) => p.clone(),
-                _ => panic!(),
-            };
-            let WordPart::ParamExpansion {
-                modifier: ParamModifier::Transform { op },
-                ..
-            } = &parts[0]
-            else {
-                panic!("expected Transform for {src}")
-            };
-            assert_eq!(*op, want);
-        }
-        // v233: `@Z` and other unknown letters are runtime BadSubst, not parse errors.
-        let toks = tokenize("${v@Z}").unwrap();
-        assert!(matches!(&toks[0].kind,
-            TokenKind::Word(Word(p)) if matches!(&p[0],
-                WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }
-            )
-        ), "expected BadSubst for @Z");
-    }
 
-    fn array_lit(w: &Word) -> &[ArrayLiteralElement] {
-        w.0.iter()
-            .find_map(|p| match p {
-                WordPart::ArrayLiteral(els) => Some(els.as_slice()),
-                _ => None,
-            })
-            .expect("ArrayLiteral part present")
-    }
 
-    #[test]
-    fn array_literal_skips_comment_with_paren() {
-        // v183: a `#` comment between elements (incl. one whose text contains
-        // `)`) is skipped — the `)` must NOT close the array early.
-        let assigns = parse_assignments("a=(\n# c )\n1\n)");
-        let els = array_lit(&assigns[0].value);
-        assert_eq!(els.len(), 1);
-        assert!(els[0].subscript.is_none());
-    }
 
-    #[test]
-    fn array_literal_midword_hash_is_literal() {
-        // v183 regression: a `#` MID-word (`x#y`) is NOT a comment.
-        let assigns = parse_assignments("a=(x#y z)");
-        let els = array_lit(&assigns[0].value);
-        assert_eq!(els.len(), 2);
-    }
 
     #[test]
     fn brace_expand_parts_literal_splits() {
@@ -13449,429 +6942,200 @@ mod array_parse_tests {
         assert_eq!(out.len(), 1);
     }
 
-    #[test]
-    fn array_literal_brace_expands_bare_range() {
-        let assigns = parse_assignments("a=({1..3} z)");
-        let els = array_lit(&assigns[0].value);
-        assert_eq!(els.len(), 4); // 1 2 3 z
-        assert!(els.iter().all(|e| e.subscript.is_none()));
-    }
 
-    #[test]
-    fn array_literal_brace_cartesian() {
-        let assigns = parse_assignments("a=({a,b}{1,2})");
-        let els = array_lit(&assigns[0].value);
-        assert_eq!(els.len(), 4); // a1 a2 b1 b2
-    }
 
-    #[test]
-    fn array_literal_single_element_brace_is_literal() {
-        let assigns = parse_assignments("a=({1} z)");
-        let els = array_lit(&assigns[0].value);
-        assert_eq!(els.len(), 2); // {1} stays one element
-    }
 
-    #[test]
-    fn array_literal_quoted_brace_not_expanded() {
-        let assigns = parse_assignments("a=(\"{1,2}\" x)");
-        let els = array_lit(&assigns[0].value);
-        assert_eq!(els.len(), 2); // "{1,2}" stays one element
-    }
 
-    #[test]
-    fn array_literal_subscripted_brace_stays_single() {
-        let assigns = parse_assignments("a=([2]=x{a,b} z)");
-        let els = array_lit(&assigns[0].value);
-        // subscripted element NOT brace-expanded (1) + bare `z` (1) = 2
-        assert_eq!(els.len(), 2);
-        assert!(els[0].subscript.is_some());
-        assert!(els[1].subscript.is_none());
-    }
 
-    #[test]
-    fn array_literal_brace_adjacent_var_keeps_expansion() {
-        // `a=(x{1,2}$v)` must brace-expand AND keep $v as a real variable part
-        // (one element per brace product, each with the Variable preserved).
-        let assigns = parse_assignments("a=(x{1,2}$v)");
-        let els = array_lit(&assigns[0].value);
-        assert_eq!(els.len(), 2);
-        // each element must still contain a Variable/expansion part (NOT a single
-        // literal "x1$v") — assert no element is a lone Literal containing '$'.
-        for e in els {
-            let lone_literal_with_dollar = e.value.0.len() == 1
-                && matches!(&e.value.0[0], WordPart::Literal { text, .. } if text.contains('$'));
-            assert!(!lone_literal_with_dollar, "expansion was flattened to literal: {:?}", e.value.0);
-        }
-    }
 
-    #[test]
-    fn array_literal_brace_adjacent_cmdsub_keeps_expansion() {
-        let assigns = parse_assignments("a=(x{1,2}$(echo Q))");
-        let els = array_lit(&assigns[0].value);
-        assert_eq!(els.len(), 2);
-        for e in els {
-            let lone_literal_with_dollar = e.value.0.len() == 1
-                && matches!(&e.value.0[0], WordPart::Literal { text, .. } if text.contains('$'));
-            assert!(!lone_literal_with_dollar, "cmdsub flattened to literal: {:?}", e.value.0);
-        }
-    }
 
-    #[test]
-    fn array_literal_pure_brace_still_expands() {
-        // regression: pure-literal brace unchanged.
-        let assigns = parse_assignments("a=({1..3} z)");
-        assert_eq!(array_lit(&assigns[0].value).len(), 4);
-    }
 
     // --- process substitution lexer tests ---
 
-    #[test]
-    fn process_sub_in_is_a_word_part() {
-        let toks = tokenize("cat <(echo hi)").unwrap();
-        let words: Vec<&Word> = toks.iter().filter_map(|t| match &t.kind {
-            TokenKind::Word(w) => Some(w), _ => None,
-        }).collect();
-        assert_eq!(words.len(), 2, "cat + one process-sub word");
-        match &words[1].0[..] {
-            [WordPart::ProcessSub { dir: ProcDir::In, .. }] => {}
-            other => panic!("expected ProcessSub In, got {other:?}"),
-        }
-    }
 
-    #[test]
-    fn process_sub_out_direction() {
-        let toks = tokenize("tee >(cat)").unwrap();
-        let w = toks.iter().find_map(|t| match &t.kind {
-            TokenKind::Word(w) if matches!(w.0.first(), Some(WordPart::ProcessSub { .. })) => Some(w),
-            _ => None,
-        }).expect("a process-sub word");
-        assert!(matches!(w.0[0], WordPart::ProcessSub { dir: ProcDir::Out, .. }));
-    }
 
-    #[test]
-    fn quoted_process_sub_is_literal() {
-        let toks = tokenize("echo \"<(echo hi)\"").unwrap();
-        let has = toks.iter().any(|t| matches!(&t.kind,
-            TokenKind::Word(w) if w.0.iter().any(|p| matches!(p, WordPart::ProcessSub { .. }))));
-        assert!(!has, "quoted <( must stay literal");
-    }
 
-    #[test]
-    fn lone_redirect_still_redirect() {
-        let toks = tokenize("cat < file").unwrap();
-        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::RedirIn))),
-            "`< file` is still a redirect");
-    }
 
-    #[test]
-    fn nested_process_sub_balances() {
-        let toks = tokenize("cat <(cat <(echo deep))").unwrap();
-        let outer = toks.iter().find_map(|t| match &t.kind {
-            TokenKind::Word(w) if matches!(w.0.first(), Some(WordPart::ProcessSub { .. })) => Some(w),
-            _ => None,
-        }).expect("outer process sub");
-        assert!(matches!(outer.0[0], WordPart::ProcessSub { dir: ProcDir::In, .. }));
-    }
 
-    #[test]
-    fn redirect_from_process_sub_tokenizes() {
-        // `wc < <(cmd)` -> Word("wc"), Op(RedirIn), Word(ProcessSub{In})
-        let toks = tokenize("wc < <(printf hi)").unwrap();
-        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::RedirIn))),
-            "the standalone `<` is still a redirect operator");
-        let last_word = toks.iter().rev().find_map(|t| match &t.kind {
-            TokenKind::Word(w) => Some(w), _ => None,
-        }).expect("a trailing word");
-        assert!(matches!(last_word.0.first(), Some(WordPart::ProcessSub { dir: ProcDir::In, .. })),
-            "the `<(printf hi)` is a process-sub word");
-    }
 
     // --- bad-substitution lexer tests (v233) ---
 
-    /// Extract the first WordPart from a single-word tokenization result.
-    fn first_word_part(input: &str) -> WordPart {
-        let mut toks = crate::lexer::tokenize(input).expect("lex");
-        let word = match toks.remove(0).kind {
-            TokenKind::Word(w) => w,
-            other => panic!("expected Word, got {other:?}"),
-        };
-        word.0.into_iter().next().expect("non-empty word")
-    }
 
-    #[test]
-    fn bad_subst_dollar_name_defers() {
-        // `${$x}` has a `$` as name — lexable but invalid. Must parse OK and
-        // produce a BadSubst node with the raw `${$x}` text.
-        let part = first_word_part("${$x}");
-        assert!(matches!(&part,
-            WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { raw }, .. }
-            if raw == "${$x}"
-        ), "got {:?}", part);
-    }
 
-    #[test]
-    fn bad_subst_empty_transform_op_defers() {
-        // `${V@}` — `@` with no op letter — bad substitution but must parse.
-        assert!(crate::lexer::tokenize("${V@}").is_ok(), "should lex without error");
-    }
 
-    #[test]
-    fn bad_subst_dash_digit_defers() {
-        // `${-3}` and `${-3:-x}` — digit after special name `-` — must parse.
-        assert!(crate::lexer::tokenize("${-3}").is_ok(), "should lex ${{-3}}");
-        assert!(crate::lexer::tokenize("${-3:-x}").is_ok(), "should lex ${{-3:-x}}");
-    }
 
-    #[test]
-    fn bad_subst_star_modifier_defers() {
-        // `${H*}` — `*` is not a valid modifier char — must parse.
-        assert!(crate::lexer::tokenize("${H*}").is_ok(), "should lex ${{H*}}");
-    }
 
-    #[test]
-    fn unterminated_brace_still_errors() {
-        assert_eq!(
-            crate::lexer::tokenize("${x").unwrap_err(),
-            LexError::UnterminatedBrace
-        );
-    }
 
-    #[test]
-    fn extquote_name_decodes_to_identifier() {
-        // `"${$'x1'}"` (double-quoted) -> name "x1"; unquoted is now bad subst (M-156).
-        let toks = tokenize(r#""${$'x1'}""#).unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        // Unwrap a possible outer Quoted wrapper.
-        let inner = match &parts[0] {
-            WordPart::Quoted { parts, .. } => &parts[0],
-            other => other,
-        };
-        let (WordPart::ParamExpansion { name, .. } | WordPart::Var { name, .. }) = inner
-        else { panic!("expected name-bearing part, got {:?}", inner) };
-        assert_eq!(name, "x1");
-    }
 
-    #[test]
-    fn extquote_name_concatenates() {
-        // `"${a$'b'}"` (double-quoted) -> name "ab"; unquoted is now bad subst (M-156).
-        let toks = tokenize(r#""${a$'b'}""#).unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        let inner = match &parts[0] {
-            WordPart::Quoted { parts, .. } => &parts[0],
-            other => other,
-        };
-        let (WordPart::ParamExpansion { name, .. } | WordPart::Var { name, .. }) = inner
-        else { panic!("got {:?}", inner) };
-        assert_eq!(name, "ab");
-    }
 
-    #[test]
-    fn extquote_locale_name_is_bad_subst() {
-        // `${$"x1"}` -> bash bad substitution.
-        let toks = tokenize(r#"${$"x1"}"#).unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        assert!(matches!(parts[0], WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }));
-    }
 
-    #[test]
-    fn extquote_decoded_invalid_name_is_bad_subst() {
-        // `${$'x\ty'}` is UNQUOTED: fires at the quote-context gate (not the
-        // invalid-name gate) — unquoted extquote name -> bad substitution.
-        let toks = tokenize("${$'x\\ty'}").unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        assert!(matches!(parts[0], WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }));
-    }
 
-    #[test]
-    fn extquote_decoded_invalid_name_quoted_is_bad_subst() {
-        // Inside `"…"` the quote-context gate PASSES (extquote allowed), but the
-        // decoded name "x<TAB>y" is not a valid identifier -> bad substitution.
-        // This exercises the invalid-name gate (the path `!is_valid_param_name`).
-        let toks = tokenize(r#""${$'x\ty'}""#).unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        let inner = match &parts[0] {
-            WordPart::Quoted { parts, .. } => &parts[0],
-            other => other,
-        };
-        assert!(
-            matches!(inner, WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }),
-            "expected BadSubst for invalid decoded name, got {inner:?}"
-        );
-    }
 
-    #[test]
-    fn extquote_name_unquoted_defers() {
-        // Top-level unquoted `${$'x1'}` -> BadSubst (the default tokenize path
-        // is unquoted).
-        let toks = tokenize(r#"${$'x1'}"#).unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        assert!(matches!(parts[0], WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }));
-    }
 
-    #[test]
-    fn extquote_name_double_quoted_decodes() {
-        // Inside `"…"` the name decodes (no BadSubst).
-        let toks = tokenize(r#""${$'x1'}""#).unwrap();
-        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
-        // The single part is the decoded name `x1` (Var or ParamExpansion),
-        // NOT a BadSubst.
-        let inner = match &parts[0] {
-            WordPart::Quoted { parts, .. } => &parts[0],
-            other => other,
-        };
-        let name = match inner {
-            WordPart::ParamExpansion { name, modifier, .. } => {
-                assert!(!matches!(modifier, ParamModifier::BadSubst { .. }), "should not be BadSubst");
-                name
-            }
-            WordPart::Var { name, .. } => name,
-            other => panic!("expected name-bearing part, got {other:?}"),
-        };
-        assert_eq!(name, "x1");
-    }
 
-    #[test]
-    fn pull_api_reproduces_token_sequence() {
-        let toks = tokenize("echo foo | grep bar").unwrap();
-        let mut lx = Lexer::from_tokens(toks.clone());
-        assert_eq!(lx.remaining(), toks.len());
-        assert_eq!(lx.peek_kind().unwrap(), Some(&toks[0].kind));
-        assert_eq!(lx.peek2_kind().unwrap(), Some(&toks[1].kind));
-        assert_eq!(lx.peek_span().unwrap(), Some(toks[0].span));
-        let mut drained = Vec::new();
-        while let Some(t) = lx.next().unwrap() { drained.push(t); }
-        assert_eq!(drained, toks);
-        assert_eq!(lx.peek_kind().unwrap(), None);
-        assert_eq!(lx.next_kind().unwrap(), None);
-    }
 
-    #[test]
-    fn pull_next_kind_matches_next_dot_kind() {
-        let toks = tokenize("a b c").unwrap();
-        let mut lx = Lexer::from_tokens(toks.clone());
-        assert_eq!(lx.next_kind().unwrap(), Some(toks[0].kind.clone()));
-        assert_eq!(lx.peek_kind().unwrap(), Some(&toks[1].kind));
-    }
 
     #[test]
     fn pull_surfaces_lex_error_as_err() {
-        // A genuinely unterminated construct: the pull returns Err at the failing scan.
-        let mut lx = Lexer::new("echo \"unterminated", LexerOptions::default(), true);
-        // drain until we hit the error
-        let mut got_err = false;
-        loop {
-            match lx.next() {
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => { got_err = true; break; }
-            }
-        }
-        assert!(got_err, "unterminated quote must surface as Err from the pull");
+        // A genuinely unterminated construct surfaces as a Lex error when the
+        // PARSER drives the lexer. Driving through `parse_sequence` (not a raw
+        // `next()` drain) is the only valid discipline: the atom lexer emits a
+        // zero-width `BeginDquote` that only the parser consumes (pushing
+        // `Mode::DoubleQuote`, whose scan then reaches EOF and errors). A raw
+        // drain past the `"` would re-emit the opener forever — that is not how
+        // the lexer is consumed in production. (See bad_alias_body_surfaces_on_drain.)
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new_live_atoms("echo \"unterminated", &empty, LexerOptions::default());
+        let r = crate::parser::parse_sequence(&mut lx);
+        assert!(matches!(r, Err(crate::command::ParseError::Lex(_))), "got {r:?}");
     }
 
     // --- Task 4: alias storage + command-position expansion ---
 
-    fn lx_with_alias(input: &str, pairs: &[(&str, &str)]) -> Lexer<'static> {
-        let toks = tokenize(input).unwrap();
-        let mut lx = Lexer::from_tokens(toks);
+    // v266: alias expansion is now an INPUT-SOURCE stack push (the body is
+    // re-lexed inline by the live cursor), not a history splice of pre-tokenized
+    // Word tokens. The old `lx_with_alias` replay helper (`from_tokens`) never
+    // scans, so it cannot drive expansion; these tests use the live atom path
+    // (`new_live_atoms`) — the production front-end.
+
+    /// Build a LIVE atom lexer with `pairs` registered as aliases.
+    fn lx_atoms_with_alias(input: &'static str, pairs: &[(&str, &str)]) -> Lexer<'static> {
         let mut m = std::collections::HashMap::new();
         for (k, v) in pairs { m.insert(k.to_string(), v.to_string()); }
-        lx.set_aliases(m);
-        lx
+        Lexer::new_live_atoms(input, &m, LexerOptions::default())
     }
 
-    fn wtext(k: &TokenKind) -> String {
-        // Test helper: extract all literal text (including quoted parts) so that
-        // quoted words like `'ll'` show as "ll" for assertion display. Recurses into
-        // WordPart::Quoted wrappers (single/double/etc). Distinct from
-        // word_literal_text (which returns None for quoted parts to block alias
-        // expansion); this is for verifying WHAT was returned, not WHETHER to expand.
-        fn extract(parts: &[WordPart], s: &mut String) {
-            for part in parts {
-                match part {
-                    WordPart::Literal { text, .. } => s.push_str(text),
-                    WordPart::Quoted { parts: inner, .. } => extract(inner, s),
-                    _ => {}
+    /// Literal text of a command-word atom (`Lit`/`QuoteRun`), else `None`.
+    fn atom_word_text(k: &TokenKind) -> Option<String> {
+        match k {
+            TokenKind::Lit { text, .. } => Some(text.clone()),
+            TokenKind::QuoteRun { text, .. } => Some(text.clone()),
+            _ => None,
+        }
+    }
+
+    /// Drive `lx` the way the parser does at command position: expand at the
+    /// start, re-expand at a fresh command position (after `;`, skipping blanks)
+    /// and after a trailing-blank-eligible boundary. Returns the word texts.
+    fn drive_alias_words(lx: &mut Lexer) -> Vec<String> {
+        let mut out = Vec::new();
+        lx.expand_command_alias().unwrap();
+        while let Some(k) = lx.peek_kind().unwrap().cloned() {
+            match k {
+                TokenKind::Blank | TokenKind::Newline => {
+                    lx.next().unwrap();
+                    if lx.take_trailing_eligible() {
+                        lx.expand_command_alias().unwrap();
+                    }
+                }
+                TokenKind::Op(Operator::Semi) => {
+                    lx.next().unwrap();
+                    while matches!(lx.peek_kind().unwrap(), Some(TokenKind::Blank)) {
+                        lx.next().unwrap();
+                    }
+                    lx.expand_command_alias().unwrap();
+                }
+                _ => {
+                    if let Some(t) = atom_word_text(&k) { out.push(t); }
+                    lx.next().unwrap();
                 }
             }
         }
-        if let TokenKind::Word(w) = k {
-            let mut s = String::new();
-            extract(&w.0, &mut s);
-            s
-        } else {
-            String::new()
-        }
+        out
     }
 
     #[test]
     fn alias_expands_at_command_position() {
-        let mut lx = lx_with_alias("ll /tmp", &[("ll", "ls -l")]);
-        lx.expand_command_alias().unwrap();
-        assert_eq!(lx.peek_kind().unwrap().map(|k| wtext(k)), Some("ls".into()));
-        lx.expand_command_alias().unwrap();
-        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("ls".into()));
-        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("-l".into()));
-        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("/tmp".into()));
+        let mut lx = lx_atoms_with_alias("ll /tmp", &[("ll", "ls -l")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["ls", "-l", "/tmp"]);
     }
 
     #[test]
     fn alias_not_expanded_at_argument_position() {
-        let mut lx = lx_with_alias("echo ll", &[("ll", "ls -l")]);
-        lx.expand_command_alias().unwrap();
-        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("echo".into()));
-        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("ll".into()));
+        let mut lx = lx_atoms_with_alias("echo ll", &[("ll", "ls -l")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["echo", "ll"]);
     }
 
     #[test]
     fn alias_recursion_guard_terminates() {
-        let mut lx = lx_with_alias("ls", &[("ls", "ls -a")]);
-        lx.expand_command_alias().unwrap();
-        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("ls".into()));
-        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("-a".into()));
+        // The body's own leading `ls` is in the active frame → not re-expanded.
+        let mut lx = lx_atoms_with_alias("ls", &[("ls", "ls -a")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["ls", "-a"]);
+    }
+
+    #[test]
+    fn alias_semicolon_reuse_terminates() {
+        // v266: `name` stays active for the WHOLE body frame, so a `;`-separated
+        // re-use of `name` inside its own body is guarded too. (The old
+        // synchronous guard released `name` after the leading word and looped
+        // forever here — see the report's RED evidence.)
+        let mut lx = lx_atoms_with_alias("r", &[("r", "echo hi; r")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["echo", "hi", "r"]);
+    }
+
+    #[test]
+    fn alias_mutual_chain_terminates() {
+        // a→"b x"; b (active a) →"a y"; the leading `a` of b's body is in the
+        // active frame → not re-expanded. Result: command `a`, args `y` then `x`.
+        let mut lx = lx_atoms_with_alias("a", &[("a", "b x"), ("b", "a y")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["a", "y", "x"]);
     }
 
     #[test]
     fn alias_trailing_blank_makes_next_word_eligible() {
-        let mut lx = lx_with_alias("a c", &[("a", "b "), ("c", "d")]);
+        let mut lx = lx_atoms_with_alias("a c", &[("a", "b "), ("c", "d")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["b", "d"]);
+    }
+
+    #[test]
+    fn alias_body_tokens_pin_to_name_span() {
+        // Every atom produced from the body carries the alias-NAME invocation
+        // span (base offset of `ll`), not a body-relative offset — exactly as the
+        // old history-splice set `name_span` on each spliced token. `ll` is at
+        // offset 2 (after two leading blanks the parser skips before expanding).
+        let mut lx = lx_atoms_with_alias("  ll", &[("ll", "ls -l")]);
+        while matches!(lx.peek_kind().unwrap(), Some(TokenKind::Blank)) {
+            lx.next().unwrap();
+        }
         lx.expand_command_alias().unwrap();
-        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("b".into()));
-        lx.expand_command_alias().unwrap();
-        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("d".into()));
+        let mut saw_body_word = false;
+        while let Some(t) = lx.next().unwrap() {
+            if let Some(txt) = atom_word_text(&t.kind) {
+                saw_body_word = true;
+                assert_eq!(t.span.offset, 2, "body atom {txt:?} must pin to the name span (offset 2)");
+                assert_eq!(t.span.line, 1, "body atom {txt:?} must pin to the name line");
+            }
+        }
+        assert!(saw_body_word, "expected the body to produce word atoms");
     }
 
     #[test]
     fn quoted_word_not_expanded() {
-        let mut lx = lx_with_alias("'ll'", &[("ll", "ls")]);
-        lx.expand_command_alias().unwrap();
-        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("ll".into()));
+        let mut lx = lx_atoms_with_alias("'ll'", &[("ll", "ls")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["ll"]);
     }
 
     #[test]
-    fn bad_alias_body_returns_err() {
-        let mut lx = lx_with_alias("x", &[("x", "echo \"")]); // unterminated quote in body
-        assert!(lx.expand_command_alias().is_err());
+    fn bad_alias_body_surfaces_on_drain() {
+        // The body is no longer tokenized up front, so `expand_command_alias`
+        // returns Ok; the unterminated quote in the injected body surfaces when
+        // the PARSER drives the lexer. Driving through `parse_sequence` (not a
+        // raw `next()` drain) is the ONLY valid discipline: the atom lexer emits
+        // zero-width word-part opener signals (`BeginDquote` here) that only the
+        // parser consumes — pushing `Mode::DoubleQuote`, whose scan then reaches
+        // EOF and errors. A raw drain past a `"` never advances the mode, so it
+        // would re-emit the opener forever (alias or not); that is not how the
+        // lexer is ever consumed in production.
+        let mut m = std::collections::HashMap::new();
+        m.insert("x".to_string(), "echo \"".to_string()); // unterminated quote in body
+        let mut lx = Lexer::new_live_atoms("x", &m, LexerOptions::default());
+        let r = crate::parser::parse_sequence(&mut lx);
+        assert!(matches!(r, Err(crate::command::ParseError::Lex(_))), "got {r:?}");
     }
 
     // --- Task 7: incrementality + live-lexer error tests ---
 
-    #[test]
-    fn parser_pull_is_incremental_not_batch() {
-        let input = (0..50).map(|i| format!("echo {i}")).collect::<Vec<_>>().join("\n");
-        let empty = std::collections::HashMap::new();
-        let mut lx = Lexer::new_live(&input, &empty, LexerOptions::default());
-        let _ = crate::command::parse_one_unit(&mut lx).unwrap();
-        assert!(lx.scanned_token_count() < 10, "scanned too much: not incremental");
-    }
 
-    #[test]
-    fn bad_alias_body_surfaces_as_parse_error() {
-        let mut m = std::collections::HashMap::new();
-        m.insert("x".to_string(), "echo \"".to_string()); // unterminated quote in body
-        let mut lx = Lexer::new_live("x", &m, LexerOptions::default());
-        let r = crate::command::parse(&mut lx);
-        assert!(matches!(r, Err(crate::command::ParseError::Lex(_))));
-    }
 
     // --- Task 2 (v240): mark/rewind checkpoint tests ---
 
@@ -13935,32 +7199,10 @@ mod array_parse_tests {
         assert_eq!(lx.current_mode(), Mode::Command);
     }
 
-    #[test]
-    fn rewind_restores_scalar_flags() {
-        let mut lx = Lexer::new("[[ $x =~ ab*c ]] && echo y", LexerOptions::default(), true);
-        let _ = lx.next_token().unwrap().unwrap(); // [[
-        let _ = lx.next_token().unwrap().unwrap(); // $x
-        assert_eq!(lx.dbracket_depth, 1);          // inside [[ … ]]
-        let m = lx.mark();
-        while lx.next_token().unwrap().is_some() {} // drain to EOF; depth returns to 0
-        assert_eq!(lx.dbracket_depth, 0);
-        lx.rewind(&m);
-        assert_eq!(lx.dbracket_depth, 1);          // restored from the snapshot
-    }
-
-    #[test]
-    fn rewind_on_replay_lexer_does_not_truncate() {
-        let toks = tokenize_with_opts("echo hi there", LexerOptions::default()).unwrap();
-        let mut lx = Lexer::from_tokens(toks);
-        let m = lx.mark();
-        let a = lx.next_token().unwrap().unwrap();
-        let _ = lx.next_token().unwrap().unwrap();
-        let len_before = lx.history.len();
-        lx.rewind(&m);
-        assert_eq!(lx.history.len(), len_before); // replay history is NOT truncated
-        let a2 = lx.next_token().unwrap().unwrap();
-        assert_eq!(a, a2);
-        assert_eq!(a.span, a2.span);
-    }
+    // v266: `rewind_restores_scalar_flags` removed — it raw-drained `[[ … ]]` to
+    // observe `dbracket_depth`, but on the atom path that depth is parser-driven
+    // (the lexer emits `[[` as a plain `Op`), so a raw `next_token` drain never
+    // moves it. Scalar-flag rewind is still guaranteed by the `Mark` snapshot and
+    // exercised by `rewind_restores_mode_stack` / `rewind_reproduces_tokens_same_mode`.
 }
 

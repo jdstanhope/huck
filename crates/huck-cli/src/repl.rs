@@ -176,7 +176,13 @@ pub fn run(args: &[String], version: &str) -> i32 {
                 }
                 let do_alias = {
                     let shell = shell_cell.borrow();
+                    // Aliases expand when interactive OR when `shopt -s expand_aliases`
+                    // is set (matching bash, and the file/`-c`/source reader in
+                    // builtins.rs). Recomputed per logical command so a `shopt -s
+                    // expand_aliases` on an earlier line takes effect on later ones,
+                    // including in piped-stdin (non-interactive) mode.
                     shell.is_interactive
+                        || shell.shopt_options.get("expand_aliases").unwrap_or(false)
                         || std::env::var("HUCK_EXPAND_ALIASES").is_ok()
                 };
                 let outcome = {

@@ -2323,13 +2323,25 @@ mod tests {
 
     #[test]
     fn reconstruct_source_scalars() {
-        use crate::lexer::tokenize;
         fn rt(src: &str) -> String {
-            let toks = tokenize(src).expect("lex");
-            let w = toks.iter().find_map(|t| match &t.kind {
-                crate::lexer::TokenKind::Word(w) => Some(w.clone()),
-                _ => None,
-            }).expect("a Word token");
+            // Parse `<src>` as the sole argument word of `echo` via the live
+            // atom front-end, then reconstruct its source.
+            let line = format!("echo {src}");
+            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+                &line,
+                &Default::default(),
+                crate::lexer::LexerOptions::default(),
+            ))
+            .expect("parse")
+            .expect("non-empty");
+            let pipeline = match seq.first {
+                Command::Pipeline(p) => p,
+                other => panic!("expected pipeline, got {other:?}"),
+            };
+            let w = match &pipeline.commands[0] {
+                Command::Simple(SimpleCommand::Exec(e)) => e.args[0].clone(),
+                other => panic!("expected simple command, got {other:?}"),
+            };
             reconstruct_word_source(&w)
         }
         assert_eq!(rt("abc"), "abc");

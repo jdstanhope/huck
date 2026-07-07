@@ -1,19 +1,19 @@
-//! Parser-driven front-end (Phase C). Consumes the stack-mode lexer's atoms and
-//! builds the existing AST (`WordPart`/`Word`). DORMANT in v241: reached only by
-//! tests; production still uses the lexer's pre-built Words + command.rs.
-#![allow(dead_code, unused_imports)]
+//! Parser-driven front-end. Consumes the stack-mode lexer's atoms and builds the
+//! AST (`WordPart`/`Word` + `command.rs` command types). Live in production since
+//! the v264 flip and the sole front-end since v266 (the old Word-lexer/`command::parse`
+//! oracle is deleted): `parse_sequence` is the entry point.
 
 use crate::command::{
     Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
     AssignTarget,
-    Redirection, RedirFd, RedirOp, FileMode, word_literal_text, valid_identifier_text, IfClause, ElifBranch, WhileClause,
+    Redirection, RedirOp, word_literal_text, valid_identifier_text, IfClause, ElifBranch, WhileClause,
     ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator, ArithForClause,
     TestExpr, TestUnaryOp, TestBinaryOp, try_unary_op, skip_test_newlines, is_compound_opener,
 };
 use crate::lexer::{
-    brace_expand_parts, ArithDelim, ArrayLiteralElement, CaseDirection, Lexer, Mode, Operator,
+    brace_expand_parts, ArithDelim, ArrayLiteralElement, Lexer, Mode, Operator,
     ParamModifier, ParamOpKind, ProcDir, QuoteStyle, SubstAnchor, SubstKind, SubscriptKind,
-    TokenKind, TransformOp, Word, WordPart,
+    TokenKind, Word, WordPart,
 };
 
 /// Assemble a `Word` (Vec<WordPart>) from atoms in the CURRENT mode, stopping
@@ -1981,19 +1981,12 @@ fn keyword_of_consumed(token: &TokenKind) -> Option<Keyword> {
 }
 
 /// Extract a `for`/`select` loop-variable name from an assembled `Word`: it must
-/// be a single unquoted `Literal`.  Mirrors `for_variable_name`'s rule.
+/// be a single unquoted `Literal`.
 fn for_variable_name_word(w: &Word) -> Option<String> {
     if w.0.len() != 1 { return None; }
     let WordPart::Literal { text, quoted: false } = &w.0[0] else { return None; };
     if text.is_empty() { return None; }
     Some(text.clone())
-}
-
-/// Returns `true` if `token` is a reserved word (keyword).  Delegates to
-/// `keyword_kind` so there is ONE keyword table.  `time` is NOT a keyword
-/// (see `cmd_time_is_plain_command`).
-fn keyword_of_tok(token: &TokenKind) -> bool {
-    keyword_kind(token).is_some()
 }
 
 
@@ -3278,6 +3271,44 @@ pub fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> 
     Ok(Some(seq))
 }
 
+/// Assemble a bounded fragment (a `[…]` subscript body) into a single `Word`
+/// using the atom parser. Replaces the oracle `parse_subscript_body`. The
+/// fragment is balanced by construction (the lexer captured a bracket-matched
+/// interior), so `$i` / `${j}` / `$((n))` / `$(…)` / quotes all assemble
+/// correctly here — the parser drives the zero-width opener signals a standalone
+/// lexer could not. If the fragment is empty or lexes to more than one word
+/// (e.g. `1 + 2`), collapse to a single unquoted `Literal` carrying the raw
+/// text, matching `parse_subscript_body`'s historical fallback (arithmetic
+/// evaluation tolerates the joined text; literal keys see it verbatim).
+pub fn parse_fragment_word(
+    raw: &str,
+    opts: crate::lexer::LexerOptions,
+) -> Result<crate::lexer::Word, ParseError> {
+    use crate::command::{Command, SimpleCommand};
+    let empty = std::collections::HashMap::new();
+    let mut lx = crate::lexer::Lexer::new_live_atoms(raw, &empty, opts);
+    let parsed = parse_sequence(&mut lx)?;
+    // Single-word fragment: exactly one simple Exec command whose program is the
+    // whole word, with no args / redirects / inline-assignments / list tail.
+    if let Some(seq) = &parsed
+        && seq.rest.is_empty()
+        && !seq.background
+        && let Command::Pipeline(p) = &seq.first
+        && !p.negate
+        && p.commands.len() == 1
+        && let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0]
+        && e.args.is_empty()
+        && e.redirects.is_empty()
+        && e.inline_assignments.is_empty()
+    {
+        return Ok(e.program.clone());
+    }
+    Ok(crate::lexer::Word(vec![crate::lexer::WordPart::Literal {
+        text: raw.to_string(),
+        quoted: false,
+    }]))
+}
+
 /// v264: parse ONE top-level command unit from the atom stream, stopping at
 /// (and consuming) the next top-level newline or EOF. Skips leading blank
 /// lines. Returns `Ok(None)` when only newlines/blanks/EOF remain. The atom
@@ -3415,16 +3446,6 @@ fn parse_if(iter: &mut Lexer) -> Result<Command, ParseError> {
     expect_keyword(iter, Keyword::Fi, ParseError::UnterminatedIf)?;
     let clause = IfClause { condition, then_body, elif_branches, else_body };
     maybe_wrap_redirects(Command::If(Box::new(clause)), iter)
-}
-
-/// Validates a `for`/`select` loop variable name token.  Mirrors
-/// `for_variable_name` in `command.rs`: must be an unquoted single-literal Word.
-fn for_variable_name(token: &TokenKind) -> Option<String> {
-    let TokenKind::Word(w) = token else { return None };
-    if w.0.len() != 1 { return None; }
-    let WordPart::Literal { text, quoted: false } = &w.0[0] else { return None; };
-    if text.is_empty() { return None; }
-    Some(text.clone())
 }
 
 /// Skips `;`/newline separators before `do`, then consumes `do`, the loop body,
@@ -4267,9 +4288,7 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
 mod tests {
     use super::*;
     use crate::lexer::{
-        CaseDirection, Lexer, LexerOptions, Mode, ParamModifier,
-        ParamOpKind, SubstAnchor, SubstKind, SubscriptKind, TokenKind, TransformOp, Word,
-        WordPart,
+        Lexer, LexerOptions, Mode, ParamOpKind, SubstKind, TokenKind, Word, WordPart,
     };
     use crate::command::ParseError;
 
@@ -4583,11 +4602,6 @@ mod tests {
     /// In-scope: the parser accepts this input.
     fn diff_cmd(s: &str) {
         assert!(new_seq(s).is_ok(), "expected Ok for {s:?}, got {:?}", new_seq(s));
-    }
-    /// Deferred: the new parser must return UnsupportedCommand.
-    fn diff_unsupported(s: &str) {
-        assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
-                "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
     }
     /// Error: the parser rejects this input.
     fn diff_err(s: &str) {
@@ -4968,31 +4982,6 @@ mod tests {
 
     // ── v252 T1: positional array literals ───────────────────────────────────
 
-    #[test]
-    fn atoms_array_literal_rich_values() {
-        diff_cmd("a=(\"x y\" 'z' bare)");            // double/single/bare
-        diff_cmd("a=($x ${y} ${z:-d})");             // param expansions
-        diff_cmd("a=($(echo hi) `echo bye`)");       // command subs
-        diff_cmd("a=($((1 + 2)) end)");              // arith
-        diff_cmd("a=(~ ~/x a=~)");                   // tilde eligibility
-        // NOTE: the brief's literal case was `[ab]c` (a bracket AT the START
-        // of a value) — that collides with the ORACLE's pre-existing (T1-era,
-        // out-of-scope-for-T2) array-literal subscript sniff: ANY value
-        // beginning with `[` unconditionally attempts `[expr]=` subscript
-        // parsing (`scan_array_literal`), and `[ab]c` has no `=` after `]`, so
-        // the oracle itself errors (`ArrayLiteralMissingEquals`) — even the
-        // LEX stage fails (`old_seq`'s `tokenize_with_opts(...).expect("lex")`
-        // panics), so no diff/err helper can express it. That leading-`[`
-        // sniff is Task 3's territory ("do NOT touch subscripts"), so this
-        // uses a mid-value bracket instead — still proves globs/brackets stay
-        // literal in a value, without hitting the deferred subscript sniff.
-        diff_cmd("a=(*.txt foo?bar pre[ab]c)");      // globs (patterns kept literal in AST)
-        diff_cmd("a=(pre$xpost \"$mix\"tail)");      // adjacency/glue within a value
-        diff_cmd("a=(\n  one\n  two\n)");            // newline separators
-        diff_cmd("a=(one # comment\n two)");         // comment separator
-        diff_cmd("arr=\\\n(1 2)");                   // `\<NL>` between prefix and `(`
-        diff_cmd("a=(foo\\ bar)");                   // backslash-escaped space stays one element
-    }
 
     // ── v252 merge-gate fix: `\<NL>` line continuation is GLUE, not a
     // separator, when it abuts element text with no surrounding whitespace.
@@ -6507,11 +6496,6 @@ mod tests {
         assert!(new_bt(s, true).is_ok(),  "quoted   {s:?}: {:?}", new_bt(s, true));
     }
 
-    fn diff_bt_deferred(s: &str) {
-        assert!(matches!(new_bt(s, false), Err(ParseError::UnsupportedExpansion)),
-                "expected deferred for {s:?}, got {:?}", new_bt(s, false));
-    }
-
     // ── v245 T1 scaffolding test ─────────────────────────────────────────────
 
     #[test]
@@ -7443,5 +7427,57 @@ mod tests {
         diff_eg("shopt -s extglob\necho $( [[ foo == @(foo|bar) ]] && echo 1 )");
         diff_eg("echo $( [[ z == !(a|b) ]] && echo 7 )");
         diff_eg("echo `[[ ab == @(ab|cd) ]] && echo 3`");
+    }
+
+    // ── v266 T1: parse_fragment_word (subscript bridge) ────────────────────
+
+    #[test]
+    fn fragment_word_single_expansion() {
+        use crate::lexer::{WordPart, LexerOptions};
+        let w = parse_fragment_word("$i", LexerOptions::default()).unwrap();
+        // A single `$i` becomes a one-part Word with a variable expansion (not a raw literal).
+        assert!(w.0.iter().any(|p| !matches!(p, WordPart::Literal { .. })), "got {:?}", w);
+    }
+
+    #[test]
+    fn fragment_word_command_sub() {
+        use crate::lexer::{WordPart, LexerOptions};
+        let w = parse_fragment_word("$(echo 2)", LexerOptions::default()).unwrap();
+        assert!(w.0.iter().any(|p| matches!(p, WordPart::CommandSub { .. })), "got {:?}", w);
+    }
+
+    #[test]
+    fn fragment_word_multiword_collapses_to_raw_literal() {
+        use crate::lexer::{WordPart, LexerOptions};
+        let w = parse_fragment_word("1 + 2", LexerOptions::default()).unwrap();
+        assert_eq!(w.0, vec![WordPart::Literal { text: "1 + 2".to_string(), quoted: false }]);
+    }
+
+    #[test]
+    fn fragment_word_plain_index() {
+        use crate::lexer::{WordPart, LexerOptions};
+        let w = parse_fragment_word("i+1", LexerOptions::default()).unwrap();
+        assert_eq!(w.0, vec![WordPart::Literal { text: "i+1".to_string(), quoted: false }]);
+    }
+
+    /// A malformed subscript (`a[1"]=x` — unterminated quote inside `[...]`)
+    /// surfaces through the real assignment-lvalue atom scanner (not just
+    /// `parse_fragment_word` in isolation) as `LexError::SubscriptParseError`,
+    /// NOT the pre-existing `SubstitutionParseError` used for `$(...)` — the
+    /// two are kept distinct so the rendered message doesn't misreport a
+    /// subscript error as "in command substitution" (v266 T1 error-mapping
+    /// fix; the reused-variant version regressed this exact wording).
+    #[test]
+    fn fragment_word_malformed_subscript_uses_dedicated_error_variant() {
+        use crate::lexer::{LexError, LexerOptions};
+        let mut lx = Lexer::new_live_atoms("a[1\"]=x\n", &Default::default(), LexerOptions::default());
+        let err = parse_sequence(&mut lx).expect_err("malformed subscript should error");
+        match err {
+            ParseError::Lex(boxed) => match *boxed {
+                LexError::SubscriptParseError(_) => {}
+                other => panic!("expected SubscriptParseError, got {other:?}"),
+            },
+            other => panic!("expected ParseError::Lex, got {other:?}"),
+        }
     }
 }

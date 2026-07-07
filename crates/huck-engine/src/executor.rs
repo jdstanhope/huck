@@ -9220,6 +9220,46 @@ mod array_assign_tests {
         let m = s.get_indexed("a").expect("a should still exist");
         assert_eq!(m.len(), 3);
     }
+
+    // v266 T1: the subscript-assignment lvalue (`a[i]=v`) is now assembled by
+    // the atom-parser's `parse_fragment_word` instead of the oracle
+    // `parse_subscript_body`. These exercise the full production path
+    // (parse_sequence + execute, same as the CLI) for every subscript shape
+    // the bridge must preserve: command-sub, `$var`, arithmetic, a quoted
+    // associative key, and append-assign on an already-set element.
+    #[test]
+    fn subscript_bridge_atom_path_regressions() {
+        // `a[$(echo 2)]=hi` — command substitution inside the subscript.
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(); a[$(echo 2)]=hi");
+        let m = s.get_indexed("a").expect("a should be an array");
+        assert_eq!(m.get(&2).map(String::as_str), Some("hi"));
+
+        // `a[$i]=x` — a plain variable subscript.
+        let mut s = Shell::new();
+        run_line(&mut s, "i=3; a[$i]=x");
+        let m = s.get_indexed("a").expect("a should be an array");
+        assert_eq!(m.get(&3).map(String::as_str), Some("x"));
+
+        // `a[1+1]=y` — arithmetic subscript (multi-word fragment, joined-text
+        // fallback path in `parse_fragment_word`).
+        let mut s = Shell::new();
+        run_line(&mut s, "a[1+1]=y");
+        let m = s.get_indexed("a").expect("a should be an array");
+        assert_eq!(m.get(&2).map(String::as_str), Some("y"));
+
+        // `declare -A m; m["a b"]=z` — a quoted, space-containing associative
+        // key, driven through the real `declare` builtin.
+        let mut s = Shell::new();
+        run_line(&mut s, "declare -A m; m[\"a b\"]=z");
+        assert_eq!(s.lookup_associative_element("m", "a b"), Some("z".into()));
+
+        // `a[2]=p; a[2]+=q` — append-assign re-resolves the same subscript.
+        let mut s = Shell::new();
+        run_line(&mut s, "a[2]=p; a[2]+=q");
+        let m = s.get_indexed("a").expect("a should be an array");
+        assert_eq!(m.get(&2).map(String::as_str), Some("pq"));
+    }
 }
 
 #[cfg(test)]
