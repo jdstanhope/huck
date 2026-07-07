@@ -91,11 +91,15 @@ pub struct CharCursor<'a> {
     /// v266: alias input-source stack. Top of stack is the active source;
     /// empty ⇒ read the base `s`. See [`Injected`].
     injected: Vec<Injected>,
+    /// Monotonic count of chars yielded by `next()` — main string AND injected
+    /// (alias-body) chars. Progress metric for the forward-progress guard; never
+    /// decremented (rewind/seek reposition, they do not consume).
+    consumed: u64,
 }
 
 impl<'a> CharCursor<'a> {
     pub fn new(s: &'a str) -> Self {
-        CharCursor { s, pos: 0, line: 1, column: 1, peeked: None, peeked_len: 0, injected: Vec::new() }
+        CharCursor { s, pos: 0, line: 1, column: 1, peeked: None, peeked_len: 0, injected: Vec::new(), consumed: 0 }
     }
 
     /// v266: inject `body` as the active input source, read fully before the
@@ -257,18 +261,18 @@ impl Iterator for CharCursor<'_> {
         while self.injected.last().is_some_and(Injected::exhausted) {
             self.injected.pop();
         }
-        if let Some(f) = self.injected.last_mut() {
+        let c = if let Some(f) = self.injected.last_mut() {
             if let Some(c) = f.peeked.take() {
                 f.pos += f.peeked_len;
                 f.peeked_len = 0;
-                return Some(c);
+                Some(c)
+            } else {
+                // Not exhausted (the pop loop above guaranteed remaining content).
+                let c = f.body[f.pos..].chars().next().expect("injected frame has content");
+                f.pos += c.len_utf8();
+                Some(c)
             }
-            // Not exhausted (the pop loop above guaranteed remaining content).
-            let c = f.body[f.pos..].chars().next().expect("injected frame has content");
-            f.pos += c.len_utf8();
-            return Some(c);
-        }
-        if let Some(c) = self.peeked.take() {
+        } else if let Some(c) = self.peeked.take() {
             self.pos += self.peeked_len;
             self.peeked_len = 0;
             if c == '\n' { self.line += 1; self.column = 1; } else { self.column += 1; }
@@ -279,7 +283,11 @@ impl Iterator for CharCursor<'_> {
             Some(c)
         } else {
             None
+        };
+        if c.is_some() {
+            self.consumed += 1;
         }
+        c
     }
 }
 
@@ -5597,6 +5605,19 @@ mod tests {
         assert_eq!((c.offset(), c.line(), c.column()), (6, 2, 3)); // at '\t'
         c.next();                       // consume tab -> one column
         assert_eq!((c.offset(), c.line(), c.column()), (7, 2, 4)); // at 'd'
+    }
+
+    #[test]
+    fn char_cursor_consumed_counts_yielded_chars() {
+        let mut c = CharCursor::new("abc");
+        assert_eq!(c.consumed, 0);
+        c.next();
+        c.next();
+        assert_eq!(c.consumed, 2);
+        c.next(); // "c"
+        assert_eq!(c.consumed, 3);
+        assert_eq!(c.next(), None); // EOF must NOT bump
+        assert_eq!(c.consumed, 3);
     }
 
 
