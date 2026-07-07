@@ -58,13 +58,15 @@ category flip** — see Non-goals and Success criteria.
    `io::stderr()` when no sink is installed. Call sites never name a stream, so
    they cannot write a diagnostic to the wrong one.
 4. **Kill the three defects** that fall out of unification: no double prefix,
-   no sink-bypassing `eprintln!`, and add the `-c:` segment.
+   no sink-bypassing `eprintln!`, and the **complete** prologue matrix including
+   the `-c:` segment — the full bash attribution rules of §3, with nothing
+   deferred.
 5. **Enforce it.** A production invariant (a test in the v268 `include_str!`
-   style) asserts that no literal `"huck: "` string survives in engine emission
-   code outside `error_prefix` and a small allowlist.
+   style) asserts that no literal `"huck: "` / invocation-name text survives in
+   emission code outside `error_prefix` and the emitter family (§1).
 6. **Prove parity.** A `tests/scripts/error_message_diff_check.sh` harness runs
-   representative error-producing fragments through bash and huck and asserts
-   byte-identical stderr for the message forms this iteration covers.
+   an error-producing fragment for **every cell of the §3 matrix** through bash
+   and huck and asserts byte-identical stderr.
 
 ## Non-goals
 
@@ -73,31 +75,34 @@ category flip** — see Non-goals and Success criteria.
   format). Those are separate iterations. The PASS count is expected to stay 10.
 - **No message-body changes.** Body composition (the text after the prologue,
   and helpers like `bash_io_error`) is unchanged — only the prologue and the
-  emission path are unified.
-- **No new prologue semantics beyond the `-c:` segment.** The exact bash matrix
-  of *which* error classes get `-c:` is harness-verified; any residual
-  attribution edge case that proves deep is captured as a `[deferred]`
-  divergence rather than expanded here.
+  emission path are unified. (The `<name>: -c: line N:` *prologue* on a syntax
+  error is in scope; the message *body* — e.g. `syntax error near unexpected
+  token` vs huck's wording — is not.)
+
+There is **no deferral** of the prefix itself: every prologue form in §3,
+including `-c:` attribution and the pre-shell CLI form, is implemented this
+iteration.
 
 ## Design
 
-### 1. The emitter
+### 1. The emitter family
 
-Add to huck-engine one function and one macro. The macro is `eprintln!`-shaped:
-first the shell (for the prologue), then the context, then a format string +
-args.
+Three entry points cover every diagnostic huck emits; they are the *only* code
+that writes the invocation-name/prologue text. All three live in huck-engine
+(new `error_emit.rs`), route through the thread-local sink, and share one
+prologue builder (`error_prefix`, now taking a `Diag` kind — §3).
+
+**(a) Runtime errors — the common case (`sh_error!`).** `eprintln!`-shaped:
+shell, context, format string + args.
 
 ```rust
-// crates/huck-engine/src/macros.rs (or a new error_emit.rs)
-
-/// Emit one bash-compatible diagnostic line to the current error sink.
-/// `cmd` is the builtin/context name (`Some("cd")`) or `None`. The prologue
-/// (`<name>: [line N: ][cmd: ]`) is prepended; the body is the caller's message.
+/// Emit one bash diagnostic to the current error sink for a RUNTIME error.
+/// Prologue: `<name>: [line N: ][cmd: ]`. `cmd` = builtin/context (Some("cd")) or None.
 pub fn emit_error(shell: &Shell, cmd: Option<&str>, body: std::fmt::Arguments) {
     with_err(|err| {
-        let _ = ::std::io::Write::write_fmt(err, format_args!("{}", shell.error_prefix(cmd)));
-        let _ = ::std::io::Write::write_fmt(err, body);
-        let _ = ::std::io::Write::write_all(err, b"\n");
+        let _ = write!(err, "{}", shell.error_prefix(Diag::Runtime(cmd)));
+        let _ = err.write_fmt(body);
+        let _ = err.write_all(b"\n");
     });
 }
 
@@ -109,9 +114,43 @@ macro_rules! sh_error {
 }
 ```
 
-`sh_error!` is `#[macro_export]`ed and `emit_error` is `pub` so huck-cli's
-central-printer sites (`repl.rs`) can use them; `$crate` resolves to huck-engine
-regardless of the invoking crate. In-engine sites use it directly.
+**(b) Syntax/parser errors (`emit_syntax_error`).** Prologue is
+`<name>: [-c: ]line N:` — the `-c:` segment present iff the shell was invoked
+with `-c` (`is_command_string`), and **no `cmd` segment**. The line comes from
+the `ParseError`'s own location, not the runtime line counter.
+
+```rust
+/// Emit a SYNTAX/parser diagnostic. Prologue: `<name>: [-c: ]line N:`.
+pub fn emit_syntax_error(shell: &Shell, line: u32, body: std::fmt::Arguments) {
+    with_err(|err| {
+        let _ = write!(err, "{}", shell.error_prefix(Diag::Syntax { line }));
+        let _ = err.write_fmt(body);
+        let _ = err.write_all(b"\n");
+    });
+}
+```
+
+**(c) Pre-shell CLI errors (`emit_cli_error`).** For failures that occur before
+a `Shell` exists (bad CLI option, line-editor init) — bash prints
+`<basename>: <msg>` with **no line, no `-c:`**. `prog` is `basename(argv[0])`
+(the CLI's `args[0]`), matching bash's use of the invocation basename.
+
+```rust
+/// Emit a diagnostic with no shell state: `<prog>: <msg>`.
+pub fn emit_cli_error(prog: &str, body: std::fmt::Arguments) {
+    with_err(|err| {
+        let _ = write!(err, "{prog}: ");
+        let _ = err.write_fmt(body);
+        let _ = err.write_all(b"\n");
+    });
+}
+```
+
+`sh_error!` is `#[macro_export]`ed and all three functions are `pub` so
+huck-cli's central printers (`repl.rs`) can use them; `$crate` resolves to
+huck-engine regardless of the invoking crate. In-engine sites use them directly.
+Together they are the "group of functions" through which all emission flows —
+there is no fourth path.
 
 Call sites transform mechanically:
 
@@ -146,38 +185,59 @@ caller outside the emitter remains. The existing `error_prefix` unit tests
 (`shell_state.rs:3963+`) stay (in-crate). Any current external caller is
 rewritten to `sh_error!`.
 
-### 3. Prologue completeness — the `-c:` segment
+### 3. The prologue matrix (complete)
 
-bash attributes syntax/parser diagnostics in command-string mode to
-`<name>: -c: line N:`. Add an `is_command_string: bool` flag to `Shell`, set
-when huck is invoked with `-c`, and extend `error_prefix` to insert the `-c:`
-segment for the invocation-context class:
+Empirically characterized against bash 5.2.21 across every mode × error class.
+`<name>` is `$0` **verbatim** (never basenamed): the `-c` NAME arg, else the
+script path, else `bash`→`huck` for stdin/default.
+
+| Error class | `-c` mode | script-file mode | stdin (non-interactive) | interactive |
+|---|---|---|---|---|
+| **Runtime** (builtin, cd, cmd-not-found, arith, `set -o`) | `<name>: line N: <cmd>: <msg>` | `<name>: line N: <cmd>: <msg>` | `<name>: line N: <cmd>: <msg>` | `<name>: <cmd>: <msg>` (no line) |
+| **Syntax/parser** | `<name>: -c: line N: <msg>` | `<name>: line N: <msg>` | `<name>: line N: <msg>` | `<name>: line N: <msg>` |
+| **Pre-shell CLI** (bad option, editor init) | `<basename>: <msg>` (no line) | — | — | — |
+
+Rules distilled:
+- **`-c:` segment** ⟺ **syntax error AND `-c` mode**. Never for runtime errors;
+  never in script/stdin mode. (Verified: `bash -c 'if'` → `bash: -c: line 1:`;
+  `bash -c 'readonly x=1;x=2'` → `bash: line 1:` (no `-c:`); `bash s.sh` syntax
+  error → `s.sh: line N:`.)
+- **`cmd:` segment** only on runtime errors (never syntax; the parser has no
+  builtin context).
+- **`line N:`** on every non-interactive diagnostic; **absent** interactively
+  and for pre-shell CLI errors. Syntax errors take the line from the
+  `ParseError` location; runtime errors from `current_lineno`.
+- `<name>` carries embedded slashes unchanged (`bash -c '…' /a/b/prog` →
+  `/a/b/prog: …`); pre-shell errors use the invocation **basename**.
+
+This maps onto `error_prefix` taking a `Diag` kind that selects the segments:
 
 ```rust
-// inside error_prefix, after the `<name>: ` and before `line N: `
-if !self.is_interactive && self.is_command_string && /* invocation-context class */ {
-    out.push_str("-c: ");
+enum Diag<'a> {
+    Runtime(Option<&'a str>), // <name>: [line N: ][cmd: ]
+    Syntax { line: u32 },     // <name>: [-c: (iff is_command_string)]line N:
 }
+pub(crate) fn error_prefix(&self, kind: Diag) -> String { … }
 ```
 
-The class distinction (bash uses `-c:` for parser/startup diagnostics but not
-for every runtime builtin error) is verified by the harness. If matching bash's
-exact attribution matrix proves to require per-error-class plumbing beyond a
-single flag, this iteration covers the common syntax-error forms and records the
-residual as an `L-*` `[deferred]` divergence — the emitter unification (Goals
-1–5) does not depend on it.
+Requires one new `Shell` field, `is_command_string: bool`, set when huck is
+invoked with `-c`. The pre-shell form has no `Shell` and is produced by
+`emit_cli_error` (§1c), not `error_prefix`.
 
 ### 4. Eliminate the double prefix
 
 Parser/lexer errors originate in huck-syntax, which has no `Shell` and must not
 carry a prologue. Guarantee that `ParseError`/`LexError` `Display`
 (`command.rs:676`, `lexer.rs:36`, via `errors::parse_error_message_impl`)
-renders **body only** — no `<name>:`/`line N:`/`huck:` text. The central
+renders **body only** — no `<name>:`/`line N:`/`-c:`/`huck:` text. The central
 runners (`repl.rs:47/229/…` and the script/`-c` entry path) stop using
-`eprintln!("huck: {e}")` and instead emit through `sh_error!(shell, None,
-"{e}")`, so the prologue is applied exactly once, by the one emitter. Audit the
-paths that currently inject `<name>: line N:` into a syntax-error body and remove
-that injection (it moves into `error_prefix`).
+`eprintln!("huck: {e}")` and instead emit through `emit_syntax_error(shell,
+line, format_args!("{e}"))`, passing the line from the `ParseError` location.
+The prologue (including the `-c:` segment when `is_command_string`) is then
+applied exactly once, by `emit_syntax_error`. Audit every path that currently
+injects `<name>: line N:` into a syntax-error body — that today produces the
+`huck: bash5: line 1:` double prefix — and remove the injection; it now lives
+solely in `error_prefix(Diag::Syntax{..})`.
 
 ### 5. Sink routing
 
@@ -194,43 +254,61 @@ A few `shell_state.rs` methods (e.g. lines 189/192) *return* a `"huck: {cmd}:
 translating caller emits with `sh_error!`. This keeps the invariant (no literal
 `"huck: "`) true and centralizes the prologue.
 
-### 7. Pre-shell CLI diagnostics (allowlist)
+### 7. Pre-shell CLI diagnostics
 
-`repl.rs:47` emits `huck: {e}` for a `parse_cli` failure that happens **before a
-`Shell` exists**, so there is no `error_prefix` state (`$0`/argv0 unset). bash
-still prefixes with its name here, but huck has nothing to resolve. These few
-pre-shell sites are an **explicit, enumerated allowlist**: they keep a literal
-`"huck: "` and are exempt from the invariant. The allowlist is small (CLI
-argument parsing and line-editor init) and listed in the invariant test so it
-cannot silently grow.
+`repl.rs:47/129` emit `huck: {e}` for a `parse_cli` / line-editor-init failure
+that happens **before a `Shell` exists**. bash prints `<basename>: <msg>` with
+no line here. These route through `emit_cli_error(prog, format_args!("{e}"))`
+(§1c), where `prog = basename(args[0])` — so they match bash's basename-only
+form and are **not** a literal-`"huck: "` exception: the invocation name lives
+inside `emit_cli_error`, the sole place besides `error_prefix` that renders it.
+No scattered allowlist; the invariant permits the name text only inside the
+emitter family.
 
 ## Enforcement invariant
 
 Add a production test in the v268 `lexer_has_no_production_parser_dependency`
-style: read the engine emission sources with `include_str!`, strip
-`#[cfg(test)]` modules, and assert zero literal `"huck: "` occurrences outside
-(a) `error_prefix`'s definition and (b) the enumerated pre-shell allowlist.
-This is the durable guard that "all sites use the one emitter" — a new hand-baked
-`"huck: "` fails the test.
+style: read the emission sources with `include_str!`, strip `#[cfg(test)]`
+modules, and assert zero literal invocation-name text (`"huck: "`) outside the
+**emitter family** (`error_prefix`, `emit_error`, `emit_syntax_error`,
+`emit_cli_error`). This is the durable guard that "all sites use the emitter" —
+a new hand-baked `"huck: "` fails the test.
 
 ## Testing
 
-- **`tests/scripts/error_message_diff_check.sh`** — bash↔huck byte-comparator
-  (the standard `checkf`/`checkd` harness shape) over representative
-  error-producing fragments in each mode:
-  - script-file mode (`<name>: line N: <msg>`): readonly assignment, unknown
-    builtin option, a redirect failure, a `cd` failure.
-  - `-c` mode (`<name>: -c: line N: <msg>`): a syntax error, a runtime error.
-  - the double-prefix regression (a syntax error must produce exactly one
-    prologue).
-  - a `2>&1`-captured error (proves sink routing: the diagnostic lands on stdout
-    when redirected).
-  Guard the sweep with `ulimit -v` + `timeout` per the repo convention.
-- **Unit tests** for `emit_error`: prologue composition for
-  interactive/non-interactive, with/without `cmd`, with/without `line N`, and
-  the `-c:` segment — asserting against a capture sink.
-- **Full existing suites green**: `huck-syntax` (~408) and `huck-engine`
-  (~1740), run per-crate single-threaded per the repo memory.
+**Primary driver — the bash test suite, iteratively.** The exact set of error
+messages to match is discovered and validated by running the prefix-touched
+bash-test categories and reading the diffs, not by enumerating cases a priori.
+The loop: run each of `parser`, `execscript`, `type`, `dirstack`, `alias`,
+`printf`, `errors`, `comsub` via the runner
+(`HUCK_BASH_TEST_CATEGORY=<cat> bash tests/bash-test-suite/runner.sh`), read the
+per-category `.diff`, and for each line that is a *prologue* mismatch, fix the
+emitter/matrix and re-run. A prologue diff line that persists means the matrix
+(§3) is wrong for that case — the suite is the oracle. (Diff lines that are
+*body* mismatches — wording, source-line echo, `-o` gaps — are out of scope and
+expected to remain; the PASS status of these categories will not necessarily
+flip.) These runs stay local (GPL: never copy bash test bytes into committed
+files).
+
+**Regression harness — `tests/scripts/error_message_diff_check.sh`.** A
+bash↔huck byte-comparator (standard `checkf`/`checkd` shape) with one fragment
+per **cell of the §3 matrix**:
+- runtime × {`-c`, script-file, stdin}: readonly assignment, unknown builtin
+  option, a `cd` failure (each `<name>: line N: <cmd>: <msg>`, no `-c:`).
+- syntax × `-c`: `<name>: -c: line N: <msg>`; syntax × script-file:
+  `<name>: line N: <msg>` — same fragment, asserting `-c:` appears iff `-c`.
+- custom `$0` (`huck -c '…' myprog`) → `myprog:` prefix.
+- the double-prefix regression: a `-c` syntax error yields exactly one prologue.
+- a `2>&1`-captured runtime error lands on stdout (proves sink routing).
+- pre-shell: `huck --badoption` → `huck: <msg>` (basename, no line).
+Guard the sweep with `ulimit -v` + `timeout` per the repo convention.
+
+**Unit tests** for the prologue builder: `error_prefix(Diag::Runtime/Syntax)`
+composition for interactive/non-interactive, with/without `cmd`, with/without
+`is_command_string`, asserting against a capture sink; plus `emit_cli_error`.
+
+**Full existing suites green**: `huck-syntax` (~408) and `huck-engine` (~1740),
+run per-crate single-threaded per the repo memory.
 
 ## Site inventory (for task decomposition)
 
@@ -261,29 +339,36 @@ the first task and the double-prefix/`-c:`/central-printer work as its own task.
 
 - **`&Shell` availability.** A minority of free functions emit without a `Shell`
   in scope. Each is resolved by threading `&Shell` (usually already available on
-  an adjacent parameter) or, if genuinely shell-less and pre-shell, added to the
-  §7 allowlist. The plan flags any site that needs a signature change.
+  an adjacent parameter) or, if genuinely pre-shell, routed through
+  `emit_cli_error` (§1c/§7). The plan flags any site that needs a signature
+  change.
 - **Borrow conflicts.** Sites inside `&mut self` methods calling
   `emit_error(self, …)` take a shared reborrow; a few may need a small scope
   adjustment. Mechanical, caught by the compiler.
 - **Warnings that are really notices.** `warning:`-class lines that bash routes
   without the error prologue must NOT be forced through `sh_error!`. The plan
   classifies each `warning:` site (bash parity is the arbiter).
-- **`-c:` attribution depth** (see §3) — the one place with real bash nuance;
-  bounded by the deferral clause.
+- **Syntax-error line source.** `emit_syntax_error` needs the line from the
+  `ParseError` location (v237 spanned tokens; AST `line: u32`). The plan
+  confirms the exact accessor; huck already emits *a* line for `-c` syntax
+  errors today, so the source exists — this iteration routes it correctly and
+  adds `-c:`.
 
 ## Success criteria
 
-1. `sh_error!`/`emit_error` exist and are the sole error-emission path in engine
-   production code.
-2. `error_prefix` is `pub(crate)` with no non-emitter caller.
-3. The invariant test passes (zero literal `"huck: "` outside `error_prefix` +
-   the enumerated allowlist).
-4. No double prefix; syntax errors carry exactly one prologue.
-5. Raw-`eprintln!` error sites route through the sink (a `2>&1` test proves it).
-6. `error_message_diff_check.sh` passes for the covered forms.
-7. `huck-syntax` and `huck-engine` suites green.
-8. bash-test PASS count unchanged (10) — this is expected and correct; the win
-   is architectural uniformity, which turns the prefix from "1 of N blockers"
-   into "0 blockers" for every affected category, enabling future single-fix
-   category flips.
+1. The emitter family (`sh_error!`/`emit_error`, `emit_syntax_error`,
+   `emit_cli_error`) exists and is the sole error-emission path in production.
+2. `error_prefix` is `pub(crate)`, takes `Diag`, and has no non-emitter caller.
+3. The invariant test passes (zero literal invocation-name text outside the
+   emitter family).
+4. **The full §3 matrix is implemented** — `-c:` appears iff syntax-error-in-`-c`;
+   runtime/script/stdin/pre-shell forms all match bash. Nothing deferred.
+5. No double prefix; syntax errors carry exactly one prologue.
+6. Raw-`eprintln!` error sites route through the sink (a `2>&1` test proves it).
+7. `error_message_diff_check.sh` passes for **every matrix cell**, and the
+   prefix-touched bash-test categories show **no remaining *prologue* diff
+   lines** (body-only diffs may remain — see Testing).
+8. `huck-syntax` and `huck-engine` suites green.
+9. bash-test PASS count unchanged (10) — expected and correct; the win is
+   architectural uniformity, turning the prefix from "1 of N blockers" into "0
+   blockers" for every affected category, enabling future single-fix flips.
