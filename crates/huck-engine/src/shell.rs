@@ -386,7 +386,18 @@ pub fn process_line_in_sinks(
         Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink, err_sink),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {
-            { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error: {}", crate::parse_error_message(&e)); }
+            // No AST-carried position for an immediate (non-EOF) parse error on
+            // a single logical command: derive the line from the live lexer's
+            // cursor, counting newlines within THIS command's own text. Matches
+            // bash for the common (first/only command) case; a longer piped-
+            // stdin session with cumulative line tracking is a separate gap
+            // (bash counts lines across the whole non-interactive input, which
+            // huck's per-command REPL loop does not track today).
+            let off = lx.cursor_pos().min(line.len());
+            let ln = 1 + line.as_bytes()[..off].iter().filter(|&&b| b == b'\n').count() as u32;
+            crate::err_thread_local::install_err_sinks(sink, err_sink, || {
+                crate::emit_syntax_error(shell, ln, format_args!("syntax error: {}", crate::parse_error_message(&e)));
+            });
             ExecOutcome::Continue(2)
         }
     }

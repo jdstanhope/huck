@@ -72,9 +72,9 @@ pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
 
 /// Renders a `LexError` into a message that includes its own leading
 /// separator. Most variants start with `": "` so the caller's
-/// `"huck: syntax error"` prefix reads naturally. Substitution-wrapper
+/// `"syntax error"` body prefix reads naturally. Substitution-wrapper
 /// variants start with `" in command substitution"` (no colon) so the
-/// rendered line reads `"huck: syntax error in command substitution: ..."`.
+/// rendered line reads `"syntax error in command substitution: ..."`.
 pub(crate) fn lex_error_message_impl(error: &LexError) -> String {
     match error {
         LexError::UnterminatedQuote => ": unterminated quote".to_string(),
@@ -140,7 +140,7 @@ mod tests {
     fn parse_error_lex_strips_leading_colon_space() {
         // LexError::UnterminatedQuote renders as ": unterminated quote" via
         // lex_error_message. When wrapped in ParseError::Lex, parse_error_message
-        // must strip the leading ": " so callers using "huck: syntax error: {}"
+        // must strip the leading ": " so callers using "syntax error: {}"
         // produce a single separator, not a double one.
         let err = ParseError::Lex(Box::new(LexError::UnterminatedQuote));
         let msg = parse_error_message(&err);

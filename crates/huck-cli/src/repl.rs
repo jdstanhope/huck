@@ -17,6 +17,7 @@ use huck_engine::shell::{
     install_sigint_handler, maybe_source_rc_file, parse_cli, process_line, RunMode,
 };
 use huck_engine::shell_state::Shell;
+use huck_engine::{emit_cli_error, emit_syntax_error};
 
 use crate::completion_helper::HuckHelper;
 use crate::readline_apply::{function_to_cmd, parse_keyseq};
@@ -33,18 +34,35 @@ enum ReadResult {
     Interrupted,
     /// Ctrl-D at an empty first-line prompt — exit the shell cleanly.
     Eof,
-    /// EOF while a partial command was pending — a truncated command.
-    EofMidCommand,
+    /// EOF while a partial command was pending — a truncated command. Carries
+    /// the accumulated buffer so the caller can derive a `line N:` (bash
+    /// counts the line the next, never-arriving, line would have been).
+    EofMidCommand(String),
     /// A rustyline read error — exit the shell.
     ReadError(String),
 }
 
+/// The invocation basename bash uses for pre-shell (no-`Shell`-yet)
+/// diagnostics: `get_name_for_error`'s basename form, not the raw path.
+/// `argv[0]` here is the REAL process argv[0] (unlike `args`, which is
+/// `argv[1..]` — see `src/main.rs`), with a `"huck"` fallback.
+fn cli_prog_name() -> String {
+    std::env::args()
+        .next()
+        .as_deref()
+        .and_then(|a0| std::path::Path::new(a0).file_name())
+        .and_then(|f| f.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "huck".to_string())
+}
+
 /// Runs the interactive shell loop. Returns the process exit code.
 pub fn run(args: &[String], version: &str) -> i32 {
+    let prog = cli_prog_name();
     let opts = match parse_cli(args) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("huck: {e}");
+            emit_cli_error(&prog, format_args!("{e}"));
             return 2;
         }
     };
@@ -107,7 +125,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
                     } else {
                         (e.to_string(), 126)
                     };
-                    eprintln!("huck: {}: {msg}", path.display());
+                    emit_cli_error(&prog, format_args!("{}: {msg}", path.display()));
                     return code;
                 }
             };
@@ -127,7 +145,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
     let mut editor: Editor<HuckHelper, FileHistory> = match Editor::with_config(config) {
         Ok(editor) => editor,
         Err(e) => {
-            eprintln!("huck: failed to initialize line editor: {e}");
+            emit_cli_error(&prog, format_args!("failed to initialize line editor: {e}"));
             return 1;
         }
     };
@@ -226,9 +244,13 @@ pub fn run(args: &[String], version: &str) -> i32 {
                 let code = shell.last_status();
                 return shell_exit(&mut shell, code);
             }
-            ReadResult::EofMidCommand => {
-                eprintln!("huck: syntax error: unexpected end of input");
+            ReadResult::EofMidCommand(buffer) => {
+                // bash's line count for an EOF-truncated command is the line
+                // the next (never-arriving) physical line would have been:
+                // 1 (first line) + newlines already read + 1 (the missing one).
+                let line = buffer.matches('\n').count() as u32 + 2;
                 let mut shell = shell_cell.borrow_mut();
+                emit_syntax_error(&shell, line, format_args!("syntax error: unexpected end of input"));
                 return shell_exit(&mut shell, 2);
             }
             ReadResult::ReadError(msg) => {
@@ -416,7 +438,7 @@ fn read_logical_command(
                 return if buffer.is_empty() {
                     ReadResult::Eof
                 } else {
-                    ReadResult::EofMidCommand
+                    ReadResult::EofMidCommand(buffer)
                 };
             }
             Err(e) => return ReadResult::ReadError(e.to_string()),

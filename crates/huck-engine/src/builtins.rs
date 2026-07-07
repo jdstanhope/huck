@@ -6279,7 +6279,7 @@ fn resolve_source_path(
 
 pub(crate) fn run_sourced_contents_in_sinks(
     contents: &str,
-    path: &std::path::Path,
+    _path: &std::path::Path,
     shell: &mut crate::shell_state::Shell,
     sink: &mut crate::executor::StdoutSink,
     err_sink: &mut crate::executor::StderrSink,
@@ -6343,17 +6343,13 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     }
                     Ok(_) => break,
                     Err(le) => {
-                        {
-                            let mut err = crate::executor::err_writer(err_sink, sink);
-                            e!(&mut *err,
-                                "huck: {}: line {}: syntax error: {}",
-                                path.display(),
-                                line_of(start + tok_off),
-                                crate::parse_error_message(
-                                    &crate::command::ParseError::Lex(Box::new(le))
-                                )
-                            );
-                        }
+                        let line = line_of(start + tok_off) as u32;
+                        let msg = crate::parse_error_message(
+                            &crate::command::ParseError::Lex(Box::new(le)),
+                        );
+                        crate::err_thread_local::install_err_sinks(sink, err_sink, || {
+                            crate::emit_syntax_error(shell, line, format_args!("syntax error: {msg}"));
+                        });
                         last_status = 2;
                         start = next_line_start(start + tok_off);
                         prev_end = start;
@@ -6466,17 +6462,13 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     if let Some((le, tok_off)) = pending_lex_err {
                         // Report at the failing token's START line (not the cursor's
                         // post-scan EOF position), and restart just past that line.
-                        {
-                            let mut err = crate::executor::err_writer(err_sink, sink);
-                            e!(&mut *err,
-                                "huck: {}: line {}: syntax error: {}",
-                                path.display(),
-                                line_of(start + tok_off),
-                                crate::parse_error_message(
-                                    &crate::command::ParseError::Lex(Box::new(le))
-                                )
-                            );
-                        }
+                        let line = line_of(start + tok_off) as u32;
+                        let msg = crate::parse_error_message(
+                            &crate::command::ParseError::Lex(Box::new(le)),
+                        );
+                        crate::err_thread_local::install_err_sinks(sink, err_sink, || {
+                            crate::emit_syntax_error(shell, line, format_args!("syntax error: {msg}"));
+                        });
                         last_status = 2;
                         start = next_line_start(start + tok_off);
                         prev_end = start;
@@ -6490,15 +6482,11 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     // the old tokenize_partial foff path.
                     let is_lex = matches!(e, crate::command::ParseError::Lex(_));
                     let foff = if is_lex { iter.cursor_pos() } else { unit_start_off };
-                    {
-                        let mut err = crate::executor::err_writer(err_sink, sink);
-                        e!(&mut *err,
-                            "huck: {}: line {}: syntax error: {}",
-                            path.display(),
-                            line_of(start + foff),
-                            crate::parse_error_message(&e)
-                        );
-                    }
+                    let line = line_of(start + foff) as u32;
+                    let msg = crate::parse_error_message(&e);
+                    crate::err_thread_local::install_err_sinks(sink, err_sink, || {
+                        crate::emit_syntax_error(shell, line, format_args!("syntax error: {msg}"));
+                    });
                     last_status = 2;
                     if is_lex {
                         start = next_line_start(start + foff);
