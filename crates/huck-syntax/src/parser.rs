@@ -388,6 +388,14 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                         // Never validly closed: rewind to right after `[` and let
                         // the outer loop's ordinary dispatch re-scan from there.
                         iter.rewind(&mark);
+                        // v268 fix: `mark` was taken AFTER the lexer set
+                        // `pending_lvalue_subscript = true` for this `name[`, so the
+                        // rewind above just restored the flag to `true`. We've
+                        // decided this is NOT an assignment (never validly closed),
+                        // so clear it — otherwise the very next command-scan step
+                        // would misread a bare `=`/`+=` right after `[` as a
+                        // spurious AssignEq the parser can't place (e.g. `a[=x`).
+                        iter.clear_pending_lvalue_subscript();
                         push_lit(&mut acc, &mut parts, name, quoted);
                         push_lit(&mut acc, &mut parts, "[".to_string(), quoted);
                     }
@@ -7760,5 +7768,51 @@ mod tests {
         let AssignTarget::Indexed { .. } = &items[0].target else { panic!("indexed") };
         assert!(matches!(items[0].value.0.first(), Some(WordPart::Tilde(_))),
             "D2: leading ~ must be a Tilde part, got {:?}", items[0].value.0);
+    }
+
+    #[test]
+    fn cmdword_unclosed_bracket_eq_leaks_no_stale_flag() {
+        // v268 T2 CRITICAL fix: the LBracket arm's rewind-on-error path took
+        // `mark` AFTER the lexer set `pending_lvalue_subscript = true` (for
+        // `name[`), so `iter.rewind(&mark)` restored the flag to `true`. The
+        // very next command-scan step then misread a bare `=`/`+=` right
+        // after `[` as a spurious AssignEq the parser can't place, aborting
+        // the whole line with a parse error. Bash treats all of these as
+        // ordinary (glob) words with no assignment — `a[=x` etc. never close
+        // the bracket, so it's never an indexed lvalue.
+        use crate::command::{Command, SimpleCommand};
+        use crate::lexer::WordPart;
+        let empty = std::collections::HashMap::new();
+
+        fn part_text(p: &WordPart) -> String {
+            match p {
+                WordPart::Literal { text, .. } => text.clone(),
+                WordPart::Quoted { parts, .. } => parts.iter().map(part_text).collect(),
+                other => format!("<{other:?}>"),
+            }
+        }
+        fn word_text(w: &crate::lexer::Word) -> String {
+            w.0.iter().map(part_text).collect()
+        }
+
+        for (src, prog, args) in [
+            ("echo a[=x", "echo", vec!["a[=x"]),
+            ("echo x[+=y", "echo", vec!["x[+=y"]),
+            ("printf '%s\\n' a[=1", "printf", vec!["%s\\n", "a[=1"]),
+            ("echo one a[=x two", "echo", vec!["one", "a[=x", "two"]),
+        ] {
+            let mut lx = crate::lexer::Lexer::new_live_atoms(src, &empty, crate::lexer::LexerOptions::default());
+            let result = parse_sequence(&mut lx);
+            assert!(result.is_ok(), "{src:?} must parse without error, got {result:?}");
+            let seq = result.unwrap().expect("non-empty sequence");
+            let Command::Pipeline(p) = &seq.first else { panic!("{src:?}: not a pipeline") };
+            let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else {
+                panic!("{src:?}: not a plain Exec (got {:?}) — must NOT be an assignment", p.commands[0])
+            };
+            assert!(e.inline_assignments.is_empty(), "{src:?}: must NOT be an assignment");
+            assert_eq!(word_text(&e.program), prog, "{src:?}: program mismatch");
+            let got_args: Vec<String> = e.args.iter().map(word_text).collect();
+            assert_eq!(got_args, args, "{src:?}: args mismatch");
+        }
     }
 }

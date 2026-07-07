@@ -1201,6 +1201,21 @@ impl<'a> Lexer<'a> {
         );
     }
 
+    /// v268 fix: clear `pending_lvalue_subscript` after a rewind on the
+    /// "never validly closed" path in the parser's `LBracket` arm
+    /// (`parse_word_command`). The mark there is taken AFTER the lexer sets
+    /// the flag `true` (emitting the zero-width `LBracket` for `name[`), so a
+    /// plain `rewind(&mark)` restores it to `true` — and the flag-check hook
+    /// in `scan_step_command_atoms` then re-fires on the very next scan,
+    /// misreading a bare `=`/`+=` right after `[` as a spurious `AssignEq`
+    /// even though the parser has just decided this is NOT an assignment.
+    /// Call this right after `rewind` on that path only; the success
+    /// (assignment) and glob-fold-back paths never take this route and don't
+    /// need it.
+    pub(crate) fn clear_pending_lvalue_subscript(&mut self) {
+        self.pending_lvalue_subscript = false;
+    }
+
     /// Drop the consumed prefix `history[0..pos]` and reset `pos` to 0, bounding
     /// the buffer to the live (unconsumed) tail. Acts only once `pos` crosses
     /// `HISTORY_PRUNE_THRESHOLD`, to avoid churn.
