@@ -17,7 +17,7 @@ use huck_engine::shell::{
     install_sigint_handler, maybe_source_rc_file, parse_cli, process_line, RunMode,
 };
 use huck_engine::shell_state::Shell;
-use huck_engine::{emit_cli_error, emit_syntax_error};
+use huck_engine::{emit_cli_error, emit_error, emit_syntax_error};
 
 use crate::completion_helper::HuckHelper;
 use crate::readline_apply::{function_to_cmd, parse_keyseq};
@@ -254,8 +254,8 @@ pub fn run(args: &[String], version: &str) -> i32 {
                 return shell_exit(&mut shell, 2);
             }
             ReadResult::ReadError(msg) => {
-                eprintln!("huck: input error: {msg}");
                 let mut shell = shell_cell.borrow_mut();
+                emit_error(&shell, None, format_args!("input error: {msg}"));
                 return shell_exit(&mut shell, 1);
             }
         }
@@ -387,7 +387,7 @@ fn read_logical_command(
                             expanded
                         }
                         Err(e) => {
-                            eprintln!("huck: {e}");
+                            emit_error(&shell, None, format_args!("{e}"));
                             shell.set_last_status(1);
                             return ReadResult::Interrupted;
                         }

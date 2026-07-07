@@ -920,7 +920,7 @@ impl Shell {
             }
             Diag::Syntax { line } => {
                 if !self.is_interactive {
-                    if self.is_command_string {
+                    if self.source_depth == 0 && self.is_command_string {
                         out.push_str("-c: ");
                     }
                     out.push_str(&format!("line {line}: "));
@@ -4047,5 +4047,21 @@ mod shopt_tests {
         sh.is_interactive = true;
         sh.is_command_string = true;
         assert_eq!(sh.error_prefix(Diag::Syntax { line: 9 }), "huck: ");
+    }
+
+    #[test]
+    fn error_prefix_syntax_no_c_segment_when_sourced_under_dash_c() {
+        // `-c:` must not leak into a file sourced under `-c` — bash:
+        // `bash -c 'source /tmp/bad.sh'` → `/tmp/bad.sh: line 2: ...` (no `-c:`).
+        // `is_command_string` stays true for the whole `-c` invocation, so the
+        // gate must additionally require top-level source depth (0).
+        let mut sh = Shell::new();
+        sh.is_interactive = false;
+        sh.is_command_string = true;
+        sh.shell_argv0 = "badfile".into();
+        sh.source_depth = 1;
+        assert_eq!(sh.error_prefix(Diag::Syntax { line: 2 }), "badfile: line 2: ");
+        sh.source_depth = 0;
+        assert_eq!(sh.error_prefix(Diag::Syntax { line: 2 }), "badfile: -c: line 2: ");
     }
 }

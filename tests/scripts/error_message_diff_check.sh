@@ -100,6 +100,23 @@ checknotshape "syntax stdin 'if': -c: absent" "$h" '^[^:]+: -c: '
 checknotshape "syntax stdin 'if': bash oracle has no -c: either" "$b" '-c: '
 
 # ---------------------------------------------------------------------------
+# 2b. Source-under-`-c`: a file with a syntax error sourced from a `-c`
+#    command string must NOT leak the `-c:` segment onto the sourced file's
+#    own prologue (bash: `<file>: line N: ...`, no `-c:`) — `is_command_string`
+#    stays true for the whole `-c` invocation, so the gate additionally
+#    requires top-level source depth. Body wording is out of scope (non-goal,
+#    same as the rest of §2) — only the prologue shape is asserted.
+# ---------------------------------------------------------------------------
+tmp=$(mktemp "${TMPDIR:-/tmp}/huck-errmsg.XXXXXX")
+printf 'if\n' > "$tmp"
+b=$("$BASH_BIN" -c "source $tmp" 2>&1)
+h=$("$HUCK_BIN" -c "source $tmp" 2>&1)
+rm -f "$tmp"
+checkshape "syntax source-under-c: line N: present" "$h" '^[^:]+: line [0-9]+: '
+checknotshape "syntax source-under-c: -c: absent" "$h" '-c: '
+checknotshape "syntax source-under-c: bash oracle has no -c: either" "$b" '-c: '
+
+# ---------------------------------------------------------------------------
 # 3. Custom $0 (`myprog`) with a runtime error: body already bash-parity, and
 #    both sides are forced to the SAME literal name, so a full byte match
 #    needs no normalization.
