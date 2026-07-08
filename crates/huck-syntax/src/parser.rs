@@ -4231,6 +4231,21 @@ fn next_test_word_atom(iter: &mut Lexer) -> Result<Word, ParseError> {
     parse_word_command(iter, false)
 }
 
+/// G3: parse the `[[ … ]]` `==`/`!=`/`=` pattern RHS operand with force-extglob
+/// armed on the lexer, so an extglob-shaped group (`@(a|b)`, `!(x)`, …) is
+/// recognized even when `shopt extglob` is OFF — bash ALWAYS treats that RHS as
+/// an extended pattern. The lexer emits the same zero-width `ExtglobOpen` signal
+/// the `shopt`-on path uses; `parse_word_command` assembles the `Mode::Extglob`
+/// group. The flag is disarmed afterward (INCLUDING on error) so it never leaks
+/// into later scanning; the lexer's depth guard already confines it to this
+/// operand's own mode level (nested `$(…)` etc. do not inherit the force).
+fn parse_pattern_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
+    iter.set_force_extglob(true);
+    let r = next_test_word_atom(iter);
+    iter.set_force_extglob(false);
+    r
+}
+
 /// True if the next atom is a `[[ ]]` binary operator. `<`/`>` arrive as
 /// `Op(RedirIn)`/`Op(RedirOut)`; every other operator is a single unquoted
 /// `Lit` atom (the lexer has no dedicated token for it). KEEP IN SYNC with
@@ -4339,8 +4354,8 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
                 None => return Err(ParseError::TestExprBadOperator(format!("{op_word:?}"))),
             };
             match op_text.as_str() {
-                "==" | "=" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringEq, lhs, rhs }) }
-                "!=" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringNe, lhs, rhs }) }
+                "==" | "=" => { let rhs = parse_pattern_operand(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringEq, lhs, rhs }) }
+                "!=" => { let rhs = parse_pattern_operand(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringNe, lhs, rhs }) }
                 "=~" => {
                     let pattern = parse_regex_operand(iter)?;
                     // The oracle lexes the regex operand EAGERLY as one Word, then
@@ -7612,6 +7627,77 @@ mod tests {
         diff_eg("shopt -s extglob\necho $( [[ foo == @(foo|bar) ]] && echo 1 )");
         diff_eg("echo $( [[ z == !(a|b) ]] && echo 7 )");
         diff_eg("echo `[[ ab == @(ab|cd) ]] && echo 3`");
+    }
+
+    // ── G3: the `==`/`!=`/`=` RHS pattern inside `[[ … ]]` is force-parsed as an
+    // extended (extglob) pattern with DEFAULT (extglob-OFF) LexerOptions. ────────
+    #[test]
+    fn g3_dbracket_eq_extglob_parses_without_shopt() {
+        // Helper: the DoubleBracket's rhs pattern literal text, parsed under
+        // extglob-OFF defaults (new_seq / t6_first use LexerOptions::default()).
+        fn rhs_lit(s: &str) -> String {
+            // Concatenate all Literal parts (an extglob group glued to literal
+            // prefix/suffix, e.g. `a*(b)c`, assembles as several `Literal` parts).
+            fn concat(w: &Word) -> String {
+                w.0.iter().map(|p| match p {
+                    WordPart::Literal { text, .. } => text.clone(),
+                    o => panic!("rhs part not a plain literal: {o:?}"),
+                }).collect()
+            }
+            match t6_first(s) {
+                Command::DoubleBracket { expr, .. } => match *expr {
+                    TestExpr::Binary { rhs, .. } => concat(&rhs),
+                    o => panic!("expected Binary, got {o:?}"),
+                },
+                o => panic!("expected DoubleBracket, got {o:?}"),
+            }
+        }
+        // All 5 prefixes + `==`/`!=`/`=` assemble the extglob group into the RHS
+        // literal even though extglob is OFF (the parser force-arms it).
+        assert_eq!(rhs_lit("[[ record == @(record|top) ]]"), "@(record|top)");
+        assert_eq!(rhs_lit("[[ x != @(a|b) ]]"), "@(a|b)");
+        assert_eq!(rhs_lit("[[ ab = @(ab|cd) ]]"), "@(ab|cd)");
+        assert_eq!(rhs_lit("[[ foo == !(bar) ]]"), "!(bar)");
+        assert_eq!(rhs_lit("[[ aab == +(a|b) ]]"), "+(a|b)");
+        assert_eq!(rhs_lit("[[ ac == a*(b)c ]]"), "a*(b)c"); // glued prefix/suffix
+        assert_eq!(rhs_lit("[[ a == a?(b) ]]"), "a?(b)");
+        // Nested (bash-valid: prefixed inner group).
+        assert_eq!(rhs_lit("[[ abbbc == @(a*(b)c) ]]"), "@(a*(b)c)");
+    }
+
+    #[test]
+    fn g3_dbracket_grouping_and_literal_paren_still_parse() {
+        // `[[ (expr) ]]` grouping must still parse (bare `(`, no `?*+@!` prefix,
+        // does NOT trigger the extglob gate).
+        assert!(matches!(t6_first("[[ (a == a) ]]"), Command::DoubleBracket { .. }));
+        // A quoted paren RHS is a quoted literal, NOT an extglob group (no
+        // `ExtglobOpen` fires for `"("` — the `(` is inside a `"…"` span). It
+        // parses as a Binary whose rhs is a single Quoted part.
+        match t6_first("[[ $x == \"(\" ]]") {
+            Command::DoubleBracket { expr, .. } => match *expr {
+                TestExpr::Binary { rhs, .. } => {
+                    assert_eq!(rhs.0.len(), 1);
+                    assert!(matches!(rhs.0[0], WordPart::Quoted { .. }), "got {:?}", rhs.0[0]);
+                }
+                o => panic!("{o:?}"),
+            },
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn g3_force_extglob_does_not_leak() {
+        // The force flag is confined to the `[[ == ]]` operand: a bare command
+        // `echo @(a)` with extglob OFF is still a parse error (unchanged), and a
+        // `@(a)` inside a `$(…)` nested in the operand is NOT force-recognized
+        // (extglob stays off inside the command substitution, matching bash).
+        assert!(new_seq("echo @(a)").is_err(), "bare @( must still error with extglob off");
+        assert!(
+            new_seq("[[ x == $(echo @(a)) ]]").is_err(),
+            "@( inside a nested cmdsub must NOT inherit force-extglob"
+        );
+        // A following command on the same logical unit is unaffected.
+        assert!(new_seq("[[ a == @(a) ]] && echo hi").is_ok());
     }
 
     #[test]
