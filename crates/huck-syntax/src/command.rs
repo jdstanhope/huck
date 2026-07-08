@@ -729,34 +729,6 @@ pub(crate) fn is_function_body_shape(body: &Command) -> bool {
 
 
 
-/// Returns the text of `word` if it is a single, unquoted `Literal` whose
-/// text is a valid identifier (`[A-Za-z_][A-Za-z0-9_]*`) and is not a
-/// reserved keyword. Used by `for`-loop variable names and function names.
-pub(crate) fn valid_identifier_text(word: &Word) -> Option<String> {
-    if word.0.len() != 1 {
-        return None;
-    }
-    let WordPart::Literal { text, quoted: false } = &word.0[0] else {
-        return None;
-    };
-    // Reject reserved keywords. Build a single-Word token to reuse keyword_of.
-    let tok = TokenKind::Word(Word(vec![WordPart::Literal {
-        text: text.clone(),
-        quoted: false,
-    }]));
-    if keyword_of(&tok).is_some() {
-        return None;
-    }
-    let mut chars = text.chars();
-    let first = chars.next()?;
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return None;
-    }
-    if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
-        return None;
-    }
-    Some(text.clone())
-}
 
 /// Returns the function name if `word` is a single, unquoted, non-empty
 /// `Literal` that is not a reserved keyword. Unlike `valid_identifier_text`, this

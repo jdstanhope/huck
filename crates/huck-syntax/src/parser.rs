@@ -6,7 +6,7 @@
 use crate::command::{
     Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
     AssignTarget,
-    Redirection, RedirOp, word_literal_text, valid_identifier_text, IfClause, ElifBranch, WhileClause,
+    Redirection, RedirOp, word_literal_text, IfClause, ElifBranch, WhileClause,
     ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator, ArithForClause,
     TestExpr, TestUnaryOp, TestBinaryOp, try_unary_op, skip_test_newlines, is_compound_opener,
 };
@@ -2644,10 +2644,13 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
         // oracle's fallthrough arm (`command.rs` `parse_command_inner`,
         // `Some(other) => Err(UnexpectedKeyword(other.name()))`) raises the
         // SAME error for all of them, not a generic deferral. v257 T3 found
-        // this returning `UnsupportedCommand` instead (discovered via
-        // `coproc 123 { :; }`: `123` fails `valid_identifier_text` so the
-        // body is anonymous, `parse_command` reads the stray `123 {` as a
-        // simple command up to `;`, then hits the unmatched `}`).
+        // this returning `UnsupportedCommand` instead (originally discovered via
+        // `coproc 123 { :; }` when a non-identifier coproc name forced the
+        // anonymous body path and `parse_command` read the stray `123 {` as a
+        // simple command up to `;`, then hit the unmatched `}`; the coproc name
+        // rule now accepts any single non-keyword word, so `coproc 123 { :; }`
+        // parses as named and no longer reaches here — but the arm's behaviour
+        // is unchanged and still correct for genuine terminator keywords).
         Some(other) => return Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {}
     }
@@ -2798,7 +2801,12 @@ fn peek_coproc_named(iter: &mut Lexer) -> Result<bool, ParseError> {
         // with no `Blank` before the opener. Mirror the oracle's
         // `parse_coproc_command` exactly.
         Some(TokenKind::Word(w)) => {
-            let named = valid_identifier_text(w).is_some();
+            // bash parses `coproc WORD compound-command` for ANY word as the
+            // name and defers the valid-identifier check to RUNTIME. The NAME is
+            // any single, non-keyword word (`valid_function_name_text`, NOT the
+            // stricter `valid_identifier_text`) — a keyword like `{`/`if`/`while`
+            // is instead the anonymous compound command (`coproc <compound>`).
+            let named = crate::command::valid_function_name_text(w).is_some();
             if !named {
                 return Ok(false);
             }
@@ -2807,7 +2815,10 @@ fn peek_coproc_named(iter: &mut Lexer) -> Result<bool, ParseError> {
         Some(TokenKind::Lit { text, quoted: false }) => text.clone(),
         _ => return Ok(false),
     };
-    if valid_identifier_text(&single_lit_word(&text)).is_none() {
+    // Any single non-keyword word is a NAME candidate (identifier validity is a
+    // RUNTIME check in bash, e.g. `coproc @ { :; }` parses); a keyword word is the
+    // anonymous form's compound opener and must fall through to `Ok(false)`.
+    if crate::command::valid_function_name_text(&single_lit_word(&text)).is_none() {
         return Ok(false);
     }
     // Examine the token AFTER word1.
@@ -2861,8 +2872,12 @@ fn parse_coproc(iter: &mut Lexer) -> Result<Command, ParseError> {
     skip_test_blanks(iter)?; // blanks only — a NEWLINE after `coproc` makes it anonymous
     if peek_coproc_named(iter)? {
         let name_word = consume_command_word(iter)?;
-        let name = valid_identifier_text(&name_word)
-            .expect("peek_coproc_named verified a valid identifier");
+        // `valid_function_name_text` (not `valid_identifier_text`): the NAME may
+        // be any single non-keyword word (`@`, `1x`, …); bash validates it as an
+        // identifier at RUNTIME, not at parse time. `run_coproc` performs that
+        // check and mirrors bash's `` `NAME': not a valid identifier `` error.
+        let name = crate::command::valid_function_name_text(&name_word)
+            .expect("peek_coproc_named verified a single non-keyword word");
         skip_test_blanks(iter)?;
         let body = parse_coproc_body(iter)?;
         Ok(Command::Coproc { name, body: Box::new(body) })
@@ -6611,10 +6626,26 @@ mod tests {
 
     #[test]
     fn atoms_coproc_errors() {
-        diff_err("coproc 123 { :; }");     // 123 invalid ident → anonymous → UnexpectedKeyword("}")
         diff_err("coproc");                // MissingCommand
         diff_err("coproc |cat");           // MissingCommand
         diff_err("coproc a | coproc b");   // 2nd-stage coproc → UnexpectedKeyword("coproc")
+    }
+
+    #[test]
+    fn atoms_coproc_nonidentifier_name_parses() {
+        // bash parses `coproc WORD compound-command` for ANY word as the NAME and
+        // defers the valid-identifier check to RUNTIME (nameref11.sub line 47:
+        // `coproc @ { :; }` parses; runtime prints `` `@': not a valid identifier ``).
+        diff_cmd("coproc @ { :; }");            // non-identifier name + brace group
+        diff_cmd("coproc @ ( : )");             // non-identifier name + subshell
+        diff_cmd("coproc 123 { :; }");          // digit-leading name (was wrongly rejected)
+        diff_cmd("coproc 1x { :; }");
+        diff_cmd("coproc foo-bar { :; }");      // hyphen — not a valid identifier
+        diff_cmd("coproc @ if x; then y; fi");  // non-identifier name + if-compound
+        // Valid-name and anonymous forms are unchanged.
+        diff_cmd("coproc MYCO { :; }");         // valid name (control)
+        diff_cmd("coproc { :; }");              // anonymous brace group
+        diff_cmd("coproc cat");                 // anonymous simple command
     }
 
     #[test]
