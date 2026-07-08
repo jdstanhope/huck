@@ -85,8 +85,26 @@ pub fn expand_modifier_with_value(
     // Scalar lookup it consults `shell.lookup_var(name)` (so positional
     // and special params resolve too); for Element it uses the
     // caller-supplied value verbatim (Some=set, None=unset).
+    // `$*` / `$@` are "set" (for the non-colon `-`/`+`/`=`/`?` tests) iff there
+    // is at least one positional parameter — NOT iff their joined string is
+    // non-empty. `lookup_var` has no `*`/`@` case (returns None), which made
+    // every `${*-word}` / `${@-word}` modifier see them as unset and wrongly
+    // substitute the default even when positionals were present. Resolve them
+    // here to the IFS-joined positionals, mapping "$#==0" to None (unset) so
+    // `condition_is_null` gets the right verdict. (The scalar Value returned
+    // for a set `$@` is IFS-joined like `$*`; field-splitting a quoted set
+    // `"${@-word}"` into separate fields is a deeper pre-existing gap — L-88.)
+    let star_at_raw = |sh: &Shell| -> Option<String> {
+        if sh.positional_args.is_empty() {
+            None
+        } else {
+            Some(sh.positional_args.join(&crate::expand::ifs_join_sep(&sh.ifs())))
+        }
+    };
+    let is_star_at = matches!(source, ParamLookup::Scalar) && (name == "*" || name == "@");
     let get_raw = |sh: &Shell| -> Option<String> {
         match source {
+            _ if is_star_at => star_at_raw(sh),
             // `lookup_var` (not `get`) so positional (`$1`) and special
             // params resolve here too — `get` consults only named vars,
             // which silently dropped e.g. `${1#-a}` to empty (v93 fix).
@@ -97,6 +115,7 @@ pub fn expand_modifier_with_value(
     };
     let lookup_v = |sh: &Shell| -> String {
         match source {
+            _ if is_star_at => star_at_raw(sh).unwrap_or_default(),
             ParamLookup::Scalar => sh.lookup_var(name).unwrap_or_default(),
             ParamLookup::Element(Some(s)) => s.to_string(),
             ParamLookup::Element(None) => String::new(),
@@ -137,6 +156,13 @@ pub fn expand_modifier_with_value(
         ParamModifier::AssignDefault { word, colon } => {
             let raw = get_raw(shell);
             if condition_is_null(raw.as_deref(), *colon) {
+                if is_star_at {
+                    // `${*=word}` / `${@=word}` cannot assign to `$*`/`$@`
+                    // (bash: `$*: cannot assign in this way`, rc 1). Error
+                    // before evaluating the word, like bash.
+                    crate::sh_error!(shell, None, "${}: cannot assign in this way", name);
+                    return ExpansionResult::Fatal { status: 1 };
+                }
                 let v = expand_word_to_string(word, shell);
                 // When operating on an array element, we do NOT mutate
                 // the array via `try_set` (that would write the scalar
@@ -770,6 +796,49 @@ mod tests {
         let m = ParamModifier::Length;
         let r = expand_modifier("*", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("2".to_string()));
+    }
+
+    #[test]
+    fn use_default_on_star_is_set_when_positionals_present() {
+        // `${*-x}` with positionals set: `$*` is set (regardless of whether the
+        // joined value is empty), so the default is NOT substituted — the value
+        // is the IFS-joined positionals.
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "b".to_string()];
+        let m = ParamModifier::UseDefault { word: lit("x"), colon: false };
+        assert_eq!(expand_modifier("*", &m, &mut shell), ExpansionResult::Value("a b".to_string()));
+        // A single EMPTY positional still counts as set ($#==1) → no default.
+        shell.positional_args = vec!["".to_string()];
+        assert_eq!(expand_modifier("*", &m, &mut shell), ExpansionResult::Value(String::new()));
+    }
+
+    #[test]
+    fn use_default_on_star_substitutes_when_no_positionals() {
+        // `${*-x}` with NO positionals: `$*` is unset ($#==0) → default.
+        let mut shell = Shell::new();
+        shell.positional_args = vec![];
+        let m = ParamModifier::UseDefault { word: lit("x"), colon: false };
+        assert_eq!(expand_modifier("*", &m, &mut shell), fields("x"));
+    }
+
+    #[test]
+    fn assign_default_on_star_at_errors_cannot_assign() {
+        // `${*=x}` / `${@=x}` cannot assign to `$*`/`$@` — bash errors
+        // `$*: cannot assign in this way` (rc 1) when the assign fires.
+        for name in ["*", "@"] {
+            let mut shell = Shell::new();
+            shell.positional_args = vec![];
+            let m = ParamModifier::AssignDefault { word: lit("x"), colon: false };
+            assert_eq!(
+                expand_modifier(name, &m, &mut shell),
+                ExpansionResult::Fatal { status: 1 },
+            );
+        }
+        // With positionals present, `$*` is set → no assign, no error.
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "b".to_string()];
+        let m = ParamModifier::AssignDefault { word: lit("x"), colon: false };
+        assert_eq!(expand_modifier("*", &m, &mut shell), ExpansionResult::Value("a b".to_string()));
     }
 
     #[test]
