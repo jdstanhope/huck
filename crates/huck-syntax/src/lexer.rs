@@ -3115,8 +3115,23 @@ impl<'a> Lexer<'a> {
     /// PARSER (`push_heredoc_literal_lines`) splits that merged text back into the
     /// oracle's per-line `(content, "\n")` `Literal` pairs. No expansions.
     fn scan_step_heredoc_body_literal(&mut self, ph: &PendingHeredoc) -> Result<Step, LexError> {
+        let trigger_depth = self.emitting_heredoc.as_ref().map(|s| s.trigger_depth).unwrap_or(self.modes.len());
         let mut body = String::new();
         loop {
+            // Heredoc-inside-comsub/backtick: a prefix delimiter match at the line
+            // start terminates the body, consuming ONLY the delimiter chars (and
+            // any `<<-` tabs) and leaving the rest of the line for the enclosing
+            // `)` / `` ` `` scanner. Checked BEFORE reading the line so the tail
+            // (`)` / `` ` `` / trailing text) is not swallowed into the body.
+            if let Some(consume) = self.heredoc_comsub_prefix_terminates(ph, trigger_depth) {
+                for _ in 0..consume { self.cursor.next(); }
+                let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                if !body.is_empty() {
+                    self.history.push(Token::new(TokenKind::Lit { text: body, quoted: true }, Span::new(off, l, c)));
+                }
+                self.emit_heredoc_body_end();
+                return Ok(Step::Produced);
+            }
             let mut line = String::new();
             let mut got_nl = false;
             while let Some(ch) = self.cursor.next() {
@@ -3169,6 +3184,15 @@ impl<'a> Lexer<'a> {
                 for _ in 0..consume {
                     self.cursor.next();
                 }
+                self.emit_heredoc_body_end();
+                return Ok(Step::Produced);
+            }
+            // Heredoc-inside-comsub/backtick: a prefix delimiter match terminates
+            // the body, consuming ONLY the delimiter chars and leaving the rest of
+            // the line (`)` / `` ` `` / trailing text) for the enclosing scanner.
+            let trigger_depth = self.emitting_heredoc.as_ref().expect("emitting").trigger_depth;
+            if let Some(consume) = self.heredoc_comsub_prefix_terminates(ph, trigger_depth) {
+                for _ in 0..consume { self.cursor.next(); }
                 self.emit_heredoc_body_end();
                 return Ok(Step::Produced);
             }
@@ -3266,6 +3290,40 @@ impl<'a> Lexer<'a> {
         } else {
             None
         };
+    }
+
+    /// Heredoc-inside-command-substitution termination (`$( … <<D … )` / `` `…<<D…` ``).
+    ///
+    /// bash's command-substitution here-document scanner uses a PREFIX delimiter
+    /// compare (unlike the top-level scanner, which requires an exact full-line
+    /// match): a body line whose content STARTS WITH the delimiter terminates the
+    /// heredoc, consuming ONLY the delimiter characters and leaving the remainder
+    /// of the line as command-substitution/backtick input — so the enclosing `)` /
+    /// `` ` `` can close normally. This reproduces the `comsub-eof*` corpus:
+    ///   `EOF )` / `EOF)` / `` EOF` `` all prefix-match `EOF` → body ends, cursor
+    /// left on ` )` / `)` / `` ` ``. Gated to an enclosing `CommandSub`/`Backtick`
+    /// mode (top-level heredocs keep the strict exact-match rule).
+    ///
+    /// Bounded, non-consuming line-oriented probe (like `heredoc_at_delim_line`),
+    /// NOT a forward scan for a matching delimiter: it only compares the delimiter
+    /// against the chars at the current line start. Returns `Some(n)` — the number
+    /// of chars to advance the real cursor (leading `<<-` tabs + the delimiter) —
+    /// on a prefix match, else `None`.
+    fn heredoc_comsub_prefix_terminates(&self, ph: &PendingHeredoc, trigger_depth: usize) -> Option<usize> {
+        match trigger_depth.checked_sub(1).and_then(|i| self.modes.get(i)) {
+            Some(Mode::CommandSub { .. }) | Some(Mode::Backtick { .. }) => {}
+            _ => return None,
+        }
+        let mut probe = self.cursor.clone();
+        let mut consumed = 0usize;
+        if ph.strip_tabs {
+            while probe.peek() == Some(&'\t') { probe.next(); consumed += 1; }
+        }
+        for dch in ph.delim.chars() {
+            if probe.next() != Some(dch) { return None; }
+            consumed += 1;
+        }
+        Some(consumed)
     }
 
     /// v250 T4: does the logical body line the cursor sits at (leading `<<-` tabs

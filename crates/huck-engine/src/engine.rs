@@ -322,6 +322,21 @@ mod tests {
     }
 
     #[test]
+    fn heredoc_in_comsub_eof_adjacency_expands() {
+        // Heredoc STARTED inside a command substitution whose close delimiter is
+        // adjacent to the heredoc close-delimiter text. bash prefix-matches the
+        // heredoc delimiter, so the body terminates and the `$()`/`` ` `` closes.
+        // `$()`/`` `…` `` strip the trailing newline, so the body `hi\n` → `hi`.
+        let mut e = Engine::new();
+        // comsub-eof0: `EOF )` (delimiter, space, `)`).
+        assert_eq!(e.capture("foo=$(cat <<EOF\nhi\nEOF )\necho $foo").stdout, "hi\n");
+        // comsub-eof1: heredoc inside a BACKTICK (the former panic case).
+        assert_eq!(e.capture("foo=`cat <<EOF\nhi\nEOF`\necho $foo").stdout, "hi\n");
+        // comsub-eof4: `EOF)` (no space before the `)`).
+        assert_eq!(e.capture("e=$(cat <<EOF\ncontents\nEOF)\necho $e").stdout, "contents\n");
+    }
+
+    #[test]
     fn capture_collects_stdout_and_code() {
         let mut e = Engine::new();
         let out = e.capture("echo hi; echo bye; exit 4");

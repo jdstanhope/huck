@@ -1914,7 +1914,11 @@ fn parse_heredoc_body_expanding(iter: &mut Lexer) -> Result<Word, ParseError> {
             // `LegacyArithOpen` arm above, not this catch-all. Other still-deferred
             // constructs inside an expanding heredoc body fall through here.
             Some(TokenKind::DeferredExpansion) => return Err(ParseError::UnsupportedExpansion),
-            _ => unreachable!("lexer emits only body-part atoms between HeredocBodyBegin and HeredocBodyEnd"),
+            // Defense-in-depth: the lexer is expected to emit only body-part atoms
+            // between `HeredocBodyBegin` and `HeredocBodyEnd`, but a malformed
+            // heredoc-in-comsub/backtick construct must NEVER panic. Surface a clean
+            // parse error instead of `unreachable!`.
+            _ => return Err(ParseError::Lex(Box::new(crate::lexer::LexError::UnterminatedHeredoc))),
         }
     }
     flush_lit(&mut acc, &mut parts);
@@ -5684,6 +5688,28 @@ mod tests {
         // heredoc is byte-identical (fill_command fills args before redirects,
         // matching source order here).
         diff_cmd("echo $(a <<X\nxx\nX\n) >$(f <<Y\nyy\nY\n)");
+    }
+
+    #[test]
+    fn atoms_heredoc_in_comsub_eof_adjacency() {
+        // A heredoc STARTED inside a `$(…)`/`` `…` `` whose close delimiter sits
+        // adjacent to (or shares the line with) the heredoc close-delimiter text.
+        // bash uses a PREFIX delimiter match in the comsub here-doc scanner, so
+        // the body terminates and the enclosing `)`/`` ` `` closes normally. These
+        // MUST parse (they errored — or, for the backtick case, PANICKED with an
+        // `unreachable!` — before the heredoc-in-comsub prefix-termination fix).
+
+        // comsub-eof1: heredoc inside a BACKTICK — the crash case. `EOF` is on the
+        // same line as the closing `` ` ``. Must parse, never panic.
+        diff_cmd("foo=`cat <<EOF\nhi\nEOF`\necho $foo");
+        // comsub-eof0: `$()` with `EOF )` (delimiter, space, then `)`).
+        diff_cmd("foo=$(cat <<EOF\nhi\nEOF )\necho $foo");
+        // comsub-eof4: `$()` with `EOF)` (no space before the `)`).
+        diff_cmd("e=$(cat <<EOF\ncontents\nEOF)\necho $e");
+        // A LITERAL (`<<'EOF'`) heredoc inside `$()` with an adjacent `)`.
+        diff_cmd("e=$(cat <<'EOF'\nliteral\nEOF)\necho $e");
+        // Proper delimiter line then a separate `)` line still parses (exact match).
+        diff_cmd("e=$(cat <<EOF\nx\nEOF\n)\necho $e");
     }
 
     #[test]
