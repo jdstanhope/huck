@@ -1262,11 +1262,19 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
         }
     }
 
-    // 2. Dispatch: empty body or non-empty body.
+    // 2. Dispatch: empty body or non-empty body. Skip a leading run of
+    // Blank/Newline atoms first — bash treats a command-substitution body
+    // that is only whitespace/newlines (`$( )`, `$(\n\t)`) as empty, unlike
+    // an explicit subshell (`( )`/`(\n)` are syntax errors there; see the
+    // `parse_subshell` caller above, which only skips `Blank`, not
+    // `Newline`, before its own empty check).
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank) | Some(TokenKind::Newline)) {
+        iter.next_kind()?;
+    }
     let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
-        // Empty body `$()` — consume `)` and construct the same Sequence the
-        // production oracle yields via `parse_substitution_body("")` →
-        // `unwrap_or_else(empty_sequence)`.
+        // Empty (or whitespace/newline-only) body `$()`/`$( )`/`$(\n)` —
+        // consume `)` and construct the same Sequence the production oracle
+        // yields via `parse_substitution_body("")` → `unwrap_or_else(empty_sequence)`.
         iter.next_kind()?; // consume `)`
         Sequence {
             first: Command::Pipeline(Pipeline { negate: false, commands: Vec::new() }),
@@ -1314,6 +1322,13 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
     match iter.next_kind()? {
         Some(TokenKind::CmdSubOpen) => {} // the real opener, scanned under CommandSub mode
         _ => { iter.pop_mode(); return Err(ParseError::UnsupportedExpansion); }
+    }
+    // Skip a leading run of Blank/Newline atoms before checking for an empty
+    // body — same whitespace/newline-only-body rule as `parse_command_sub`
+    // (`<( )`/`<(\n)` are empty process substitutions in bash, unlike an
+    // explicit subshell).
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank) | Some(TokenKind::Newline)) {
+        iter.next_kind()?;
     }
     let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
         iter.next_kind()?; // consume `)`
@@ -5057,6 +5072,9 @@ mod tests {
         // empty body
         diff_cmd("cat <()");
         diff_cmd("tee >()");
+        // G2: whitespace/newline-only body — same empty-body rule as `$( )`.
+        diff_cmd("cat <( )");
+        diff_cmd("tee >(\n\t)");
     }
 
     #[test]
@@ -5862,6 +5880,18 @@ mod tests {
         diff_err("( a");                   // unterminated parity
     }
 
+    /// G2 regression guard: the whitespace/newline-only-body fix is scoped to
+    /// `parse_command_sub`/`parse_process_sub` (via an explicit `Blank`/`Newline`
+    /// skip before the empty-body check). An explicit subshell must still
+    /// reject a whitespace/newline-only body exactly as before — bash treats
+    /// `( )` and `(\n)` both as syntax errors, unlike `$( )`/`$(\n)`.
+    #[test]
+    fn cmd_subshell_whitespace_only_still_errors() {
+        for s in ["( )", "(  )", "(\n)", "(\t)"] {
+            assert!(new_seq(s).is_err(), "subshell {s:?} must still error, got {:?}", new_seq(s));
+        }
+    }
+
     // v243 T3 tests
 
     #[test]
@@ -6533,6 +6563,37 @@ mod tests {
         diff_cs("$(echo hi there)");
         diff_cs("$(true)");
         diff_cs("$()");            // empty -> empty Sequence (NOT EmptySubshell)
+    }
+
+    /// G2: a command-substitution body that is only whitespace/newlines
+    /// (no actual command) must parse the SAME empty `Sequence` a truly-empty
+    /// `$()` body does — bash treats `$( )`/`$(\n\t)` as an empty command
+    /// substitution, unlike an explicit subshell (`( )`/`(\n)` are syntax
+    /// errors there — see `cmd_subshell`'s `diff_err("()")` case and
+    /// `cmd_subshell_whitespace_only_still_errors` below, unaffected by
+    /// this change).
+    #[test]
+    fn cs_whitespace_only_body_is_empty() {
+        fn empty_sequence() -> Sequence {
+            Sequence {
+                first: Command::Pipeline(Pipeline { negate: false, commands: Vec::new() }),
+                rest: Vec::new(),
+                background: false,
+            }
+        }
+        for s in ["$()", "$( )", "$(  )", "$(\t)", "$(\n)", "$(\n\t\n)", "$( \n \t \n )"] {
+            match new_cs(s, false) {
+                Ok(WordPart::CommandSub { sequence, quoted: false }) => {
+                    assert_eq!(sequence, empty_sequence(), "body {s:?} must yield the empty Sequence");
+                }
+                other => panic!("expected empty CommandSub for {s:?}, got {other:?}"),
+            }
+        }
+        // Leading/trailing whitespace around a REAL command still runs it
+        // (this is not a special case — parse_subshell_sequence already
+        // skips blanks before the first command).
+        diff_cs("$( echo hi )");
+        diff_cs("$(\n echo hi \n)");
     }
 
     #[test]
