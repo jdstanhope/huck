@@ -11,7 +11,6 @@ pub enum LexError {
     Substitution(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
     UnterminatedHeredoc,
-    AnsiCInvalidCodepoint(u32),
     BraceExpansionLimit,
     /// `${a[3` or `a[3=v` — missing `]` closing a subscript.
     UnterminatedSubscript,
@@ -5081,12 +5080,12 @@ fn decode_ansi_c_escape(
                     _ => break,
                 }
             }
-            push_codepoint(out, v)?;
+            push_codepoint(out, v);
         }
         Some('x') => {
             if chars.peek().copied().is_some_and(|c| c.is_ascii_hexdigit()) {
                 let v = scan_hex_digits(chars, 2);
-                push_codepoint(out, v)?;
+                push_codepoint(out, v);
             } else {
                 out.push('\\');
                 out.push('x');
@@ -5095,7 +5094,7 @@ fn decode_ansi_c_escape(
         Some('u') => {
             if chars.peek().copied().is_some_and(|c| c.is_ascii_hexdigit()) {
                 let v = scan_hex_digits(chars, 4);
-                push_codepoint(out, v)?;
+                push_codepoint(out, v);
             } else {
                 out.push('\\');
                 out.push('u');
@@ -5104,7 +5103,7 @@ fn decode_ansi_c_escape(
         Some('U') => {
             if chars.peek().copied().is_some_and(|c| c.is_ascii_hexdigit()) {
                 let v = scan_hex_digits(chars, 8);
-                push_codepoint(out, v)?;
+                push_codepoint(out, v);
             } else {
                 out.push('\\');
                 out.push('U');
@@ -5119,7 +5118,7 @@ fn decode_ansi_c_escape(
             Some('@') => out.push('\0'),
             Some(c) => {
                 let v = (c.to_ascii_uppercase() as u32) & 0x1F;
-                push_codepoint(out, v)?;
+                push_codepoint(out, v);
             }
         },
         Some(other) => {
@@ -5150,15 +5149,81 @@ fn scan_hex_digits(
     v
 }
 
-/// Appends a codepoint to `out`, or errors if the value is not a valid
-/// Unicode scalar (surrogate range or > U+10FFFF).
-fn push_codepoint(out: &mut String, v: u32) -> Result<(), LexError> {
-    match char::from_u32(v) {
-        Some(c) => {
-            out.push(c);
-            Ok(())
-        }
-        None => Err(LexError::AnsiCInvalidCodepoint(v)),
+/// Appends a `\u`/`\U`/`\nnn`/`\xhh`/`\cX` codepoint to `out`. Never errors:
+/// bash accepts out-of-range `\u`/`\U` values (surrogates, > U+10FFFF) at parse
+/// time and emits bytes, so huck must not raise a syntax error either.
+///
+/// Encoding (matches bash 5.2's `\u`/`\U`, verified byte-for-byte where huck's
+/// architecture permits — see the residual note below):
+///   * a valid Unicode scalar (<= U+10FFFF, non-surrogate) is pushed as a
+///     `char` → standard UTF-8, the fast path shared with the octal/hex forms.
+///     This is byte-identical to bash for every representable value.
+///   * a value > 0x7FFFFFFF encodes to nothing (empty) — byte-identical to bash
+///     (`\Ufffffffe`, `\Uffffffff` emit no bytes).
+///   * a surrogate (0xD800..=0xDFFF) or 0x110000..=0x7FFFFFFF value: bash emits
+///     the classic *extended* UTF-8 byte sequence (e.g. `\Ud800` → `ed a0 80`,
+///     `\U110000` → `f4 90 80 80`), which is NOT valid UTF-8. huck stores every
+///     word as a Rust `String` (a valid-UTF-8 invariant the whole expand path
+///     relies on; the same reason `\xff` yields `c3 bf` rather than the raw
+///     byte `ff`), so these bytes cannot be represented. We substitute the
+///     Unicode replacement char via `from_utf8_lossy` — a bounded, documented
+///     residual divergence for these extreme values (see
+///     `ansic_unicode_escape_diff_check.sh`). The parse gap (no syntax error)
+///     is fully closed regardless.
+fn push_codepoint(out: &mut String, v: u32) {
+    if let Some(c) = char::from_u32(v) {
+        out.push(c);
+        return;
+    }
+    let bytes = extended_utf8_bytes(v);
+    // `from_utf8_lossy` keeps the empty (> 0x7FFFFFFF) case empty and maps the
+    // invalid surrogate / > U+10FFFF sequences to U+FFFD, preserving the
+    // String's valid-UTF-8 invariant.
+    out.push_str(&String::from_utf8_lossy(&bytes));
+}
+
+/// Encodes `v` with the classic *extended* UTF-8 scheme (1–6 bytes for values
+/// up to 0x7FFFFFFF; empty above that). For a valid Unicode scalar this equals
+/// standard UTF-8; the surrogate / > U+10FFFF ranges produce the (invalid-UTF-8)
+/// byte sequences bash emits for `\u`/`\U`.
+fn extended_utf8_bytes(v: u32) -> Vec<u8> {
+    const CONT: u8 = 0x80;
+    if v < 0x80 {
+        vec![v as u8]
+    } else if v < 0x800 {
+        vec![0xC0 | (v >> 6) as u8, CONT | (v & 0x3F) as u8]
+    } else if v < 0x10000 {
+        vec![
+            0xE0 | (v >> 12) as u8,
+            CONT | ((v >> 6) & 0x3F) as u8,
+            CONT | (v & 0x3F) as u8,
+        ]
+    } else if v < 0x20_0000 {
+        vec![
+            0xF0 | (v >> 18) as u8,
+            CONT | ((v >> 12) & 0x3F) as u8,
+            CONT | ((v >> 6) & 0x3F) as u8,
+            CONT | (v & 0x3F) as u8,
+        ]
+    } else if v < 0x400_0000 {
+        vec![
+            0xF8 | (v >> 24) as u8,
+            CONT | ((v >> 18) & 0x3F) as u8,
+            CONT | ((v >> 12) & 0x3F) as u8,
+            CONT | ((v >> 6) & 0x3F) as u8,
+            CONT | (v & 0x3F) as u8,
+        ]
+    } else if v < 0x8000_0000 {
+        vec![
+            0xFC | (v >> 30) as u8,
+            CONT | ((v >> 24) & 0x3F) as u8,
+            CONT | ((v >> 18) & 0x3F) as u8,
+            CONT | ((v >> 12) & 0x3F) as u8,
+            CONT | ((v >> 6) & 0x3F) as u8,
+            CONT | (v & 0x3F) as u8,
+        ]
+    } else {
+        Vec::new()
     }
 }
 
@@ -7561,6 +7626,78 @@ mod array_parse_tests {
         lx.maybe_prune_history(); // pos < threshold → no-op
         assert_eq!(lx.pos, pos);
         assert_eq!(lx.scanned_token_count(), len);
+    }
+
+    // --- $'\u'/$'\U' codepoint encoding (extended UTF-8) ---
+
+    #[test]
+    fn extended_utf8_matches_bash_across_ranges() {
+        // (value, bash's exact bytes). Valid scalars and the > 0x7FFFFFFF
+        // (empty) range are byte-identical to bash 5.2.
+        let cases: &[(u32, &[u8])] = &[
+            (0x0041, &[0x41]),                                     // 'A'
+            (0x00E9, &[0xC3, 0xA9]),                               // 'é'  2-byte
+            (0x0800, &[0xE0, 0xA0, 0x80]),                         // 3-byte
+            (0x10FFFF, &[0xF4, 0x8F, 0xBF, 0xBF]),                 // max scalar, 4-byte
+            (0x110000, &[0xF4, 0x90, 0x80, 0x80]),                 // just over max, 4-byte
+            (0x0020_0000, &[0xF8, 0x88, 0x80, 0x80, 0x80]),        // 5-byte
+            (0x03FF_FFFF, &[0xFB, 0xBF, 0xBF, 0xBF, 0xBF]),        // 5-byte max
+            (0x0400_0000, &[0xFC, 0x84, 0x80, 0x80, 0x80, 0x80]),  // 6-byte
+            (0x7FFF_FFFF, &[0xFD, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]),  // 6-byte max
+            (0xD800, &[0xED, 0xA0, 0x80]),                         // surrogate
+            (0xDFFF, &[0xED, 0xBF, 0xBF]),                         // surrogate
+        ];
+        for (v, want) in cases {
+            assert_eq!(extended_utf8_bytes(*v), *want, "value {:#x}", v);
+        }
+        // Above 0x7FFFFFFF → empty (bash emits nothing).
+        assert!(extended_utf8_bytes(0xFFFF_FFFE).is_empty());
+        assert!(extended_utf8_bytes(0xFFFF_FFFF).is_empty());
+        assert!(extended_utf8_bytes(0x8000_0000).is_empty());
+    }
+
+    #[test]
+    fn push_codepoint_valid_scalars_are_byte_exact() {
+        let mut s = String::new();
+        push_codepoint(&mut s, 0x0041);
+        push_codepoint(&mut s, 0x00E9);
+        push_codepoint(&mut s, 0x0800);
+        push_codepoint(&mut s, 0x10FFFF);
+        assert_eq!(s.as_bytes(), &[0x41, 0xC3, 0xA9, 0xE0, 0xA0, 0x80, 0xF4, 0x8F, 0xBF, 0xBF]);
+    }
+
+    #[test]
+    fn push_codepoint_over_max_yields_empty_like_bash() {
+        // > 0x7FFFFFFF: bash emits nothing, and so does huck (byte-exact).
+        let mut s = String::from("x");
+        push_codepoint(&mut s, 0xFFFF_FFFE);
+        push_codepoint(&mut s, 0xFFFF_FFFF);
+        assert_eq!(s, "x");
+    }
+
+    #[test]
+    fn push_codepoint_surrogate_and_over_10ffff_never_error_and_stay_valid_utf8() {
+        // Documented residual: bash emits raw (invalid-UTF-8) bytes here; huck
+        // keeps its valid-UTF-8 String invariant by substituting U+FFFD. The
+        // point of the fix is that these NEVER raise a parse error / panic.
+        for v in [0xD800u32, 0xDFFF, 0x110000, 0x0020_0000, 0x7FFF_FFFF] {
+            let mut s = String::new();
+            push_codepoint(&mut s, v); // must not panic
+            assert!(std::str::from_utf8(s.as_bytes()).is_ok(), "valid utf8 for {:#x}", v);
+            assert!(!s.is_empty(), "non-empty replacement for {:#x}", v);
+        }
+    }
+
+    #[test]
+    fn decode_ansi_c_escapes_out_of_range_u_does_not_error() {
+        // The end-to-end $'...' decoder must accept out-of-range \u/\U without
+        // raising (previously LexError::AnsiCInvalidCodepoint) and stay valid.
+        assert_eq!(decode_ansi_c_escapes(r"AéB"), "Aé B".replace(' ', ""));
+        assert_eq!(decode_ansi_c_escapes(r"\Ufffffffe"), ""); // > 0x7FFFFFFF → empty
+        for esc in [r"\U110000", r"\ud800", r"\U7fffffff"] {
+            let s = decode_ansi_c_escapes(esc); // must not panic
+            assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+        }
     }
 }
 
