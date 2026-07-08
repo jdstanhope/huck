@@ -1396,8 +1396,9 @@ pub(crate) fn reconstruct_array_literal(
     for e in elems {
         match &e.subscript {
             Some(sub) => parts.push(format!(
-                "[{}]={}",
+                "[{}]{}={}",
                 expand_assignment(sub, shell),
+                if e.append { "+" } else { "" },
                 render_elem_value(&e.value, shell)
             )),
             None => parts.push(render_elem_value(&e.value, shell)),

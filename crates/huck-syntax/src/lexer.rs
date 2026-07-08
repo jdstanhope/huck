@@ -11,7 +11,6 @@ pub enum LexError {
     Substitution(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
     UnterminatedHeredoc,
-    AnsiCInvalidCodepoint(u32),
     BraceExpansionLimit,
     /// `${a[3` or `a[3=v` — missing `]` closing a subscript.
     UnterminatedSubscript,
@@ -448,6 +447,11 @@ pub struct ArrayLiteralElement {
     /// `Some(word)` for explicit `[expr]=value`; `None` for positional.
     pub subscript: Option<Word>,
     pub value: Word,
+    /// `true` for the append spelling `[expr]+=value` (only meaningful when
+    /// `subscript` is `Some`). At runtime the element appends to the current
+    /// value of that subscript (string concat, or arithmetic `+=` for an
+    /// integer-flagged array) exactly like a standalone `a[i]+=v`.
+    pub append: bool,
 }
 
 /// Direction of a process substitution: `<(cmd)` reads from the process,
@@ -748,6 +752,20 @@ pub struct LexerOptions {
     /// Read ONLY by the extquote `$'…'`-name gate (M-156); it does NOT affect
     /// glob-literalness, word-splitting, or quoting of operands.
     pub in_dquote: bool,
+    /// True for a top-level BATCH program parse (a whole file / `-c` string /
+    /// piped-stdin-as-a-complete-program / `eval` / `source`) where end-of-input
+    /// TERMINATES an open here-document — bash delimits a here-doc by EOF when the
+    /// input runs out (it warns on stderr but PARSES the body collected so far).
+    ///
+    /// DEFAULT `false`: every other caller — including the REPL continuation
+    /// `classify` (which must keep returning `Incomplete(Heredoc)` so the prompt
+    /// stays up) — keeps erroring `UnterminatedHeredoc` on an open here-doc at
+    /// genuine end-of-input. Read ONLY by the heredoc-body collectors
+    /// (`scan_step_heredoc_body_literal` / `_expanding`); it does NOT affect any
+    /// other tokenization rule. NOT captured in `Mark` — a heredoc body is never
+    /// mark/rewound (see the `Mark` doc-comment), and the flag is immutable for a
+    /// lexer's lifetime.
+    pub eof_closes_heredoc: bool,
 }
 
 
@@ -837,7 +855,7 @@ pub(crate) enum Mode {
     // to this frame by `sync_quotes!` on every `'`/`"` toggle in `scan_step_arith`.
     Arith { paren_depth: u32, in_squote: bool, in_dquote: bool, body_started: bool, for_header: bool, delim: ArithDelim }, // $(( … )) / (( … )) / for (( … )) / $[ … ]
     DoubleQuote { body_started: bool }, // "…" — v247 T3 (parser-driven word-level mode)
-    ArrayLiteral { body_started: bool, expect_subscript_eq: bool, at_element_start: bool },   // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal).
+    ArrayLiteral { body_started: bool, expect_subscript_eq: bool, at_element_start: bool, subscript_append: bool },   // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=`/`+=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal). subscript_append: the operator the lexer just consumed for the CURRENT subscripted element was `+=` (not `=`); the parser reads it via current_mode() after scanning the value.
     Regex { paren_depth: u32, body_started: bool },  // v254: RHS of =~ inside [[ … ]]
     /// v264: an extglob group `<prefix>( … )` (`?(...)`/`*(...)`/`+(...)`/
     /// `@(...)`/`!(...)`, gated by `LexerOptions::extglob`). `paren_depth == 0`
@@ -1143,7 +1161,32 @@ impl<'a> Lexer<'a> {
         // popping the last element would leave `modes` empty and make the next
         // `current_mode()` panic with a confusing message.
         debug_assert!(self.modes.len() > 1, "Command is the floor and must never be popped");
-        self.modes.pop().expect("pop_mode on an empty mode stack")
+        let popped_depth = self.modes.len();
+        let popped = self.modes.pop().expect("pop_mode on an empty mode stack");
+        // Delayed heredoc across a comsub/backtick boundary: a `cat <<D` opened
+        // INSIDE a command substitution whose `)`/`` ` `` closes before D's body
+        // was collected (`echo $(cat <<D)\n…body…\nD`). bash collects such a
+        // heredoc's body from the lines following the ENCLOSING command line — so
+        // re-tag any still-pending heredoc registered at the depth we just left to
+        // the enclosing depth, letting the enclosing line's newline trigger its
+        // body emission (`atom_heredoc_idx_at_depth`). A heredoc whose body WAS
+        // collected within the comsub was already removed from the queue, so this
+        // only re-homes genuinely-orphaned entries. Not a forward scan: no cursor
+        // movement, just a depth re-tag on the existing FIFO.
+        if matches!(popped, Mode::CommandSub { .. } | Mode::Backtick { .. }) {
+            let new_depth = self.modes.len();
+            let mut changed = false;
+            for ph in self.atom_pending_heredocs.iter_mut() {
+                if ph.reg_depth == popped_depth {
+                    ph.reg_depth = new_depth;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.heredoc_gen += 1; // atom_pending_heredocs mutated
+            }
+        }
+        popped
     }
 
     /// v254 T1 fix: set the current `Mode::Regex { body_started }` flag from the
@@ -1312,7 +1355,7 @@ impl<'a> Lexer<'a> {
             Mode::Arith { paren_depth, in_squote, in_dquote, body_started, for_header, delim } =>
                 self.scan_step_arith(paren_depth, in_squote, in_dquote, body_started, for_header, delim),
             Mode::DoubleQuote { body_started } => self.scan_step_dquote(body_started),
-            Mode::ArrayLiteral { body_started, expect_subscript_eq, at_element_start } =>
+            Mode::ArrayLiteral { body_started, expect_subscript_eq, at_element_start, .. } =>
                 self.scan_step_array_literal(body_started, expect_subscript_eq, at_element_start),
             Mode::Regex { paren_depth, body_started } => self.scan_step_regex(paren_depth, body_started),
             Mode::Extglob { paren_depth } => self.scan_step_extglob(paren_depth),
@@ -3138,8 +3181,13 @@ impl<'a> Lexer<'a> {
                 if ch == '\n' { got_nl = true; break; }
                 line.push(ch);
             }
+            // `<<-` matches a close line by its tab-stripped form OR its raw form
+            // against the raw delimiter word: `<<-$'\tEND'` (a quoted tab-indented
+            // delimiter) matches a `\tEND` close line raw, but does NOT match a
+            // bare `END` close line (bash strips the close line's tabs but keeps
+            // the delimiter's — see heredoc3.sub + heredoc_dash_tab_delim harness).
             let check = if ph.strip_tabs { line.trim_start_matches('\t') } else { &line[..] };
-            if check == ph.delim {
+            if check == ph.delim || line == ph.delim {
                 // Close delimiter reached — emit the accumulated Lit + End, pop.
                 let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
                 if !body.is_empty() {
@@ -3149,6 +3197,24 @@ impl<'a> Lexer<'a> {
                 return Ok(Step::Produced);
             }
             if !got_nl {
+                // End-of-input with no close-delimiter line. In a top-level BATCH
+                // parse (`eof_closes_heredoc`), bash delimits the here-doc by EOF:
+                // fold the partial final line (if any) into the body — bash appends
+                // the line separator to it exactly as for a newline-terminated line —
+                // and finish the body normally instead of erroring.
+                if self.opts.eof_closes_heredoc {
+                    if !line.is_empty() {
+                        let body_line = if ph.strip_tabs { line.trim_start_matches('\t').to_string() } else { line };
+                        body.push_str(&body_line);
+                        body.push('\n');
+                    }
+                    let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                    if !body.is_empty() {
+                        self.history.push(Token::new(TokenKind::Lit { text: body, quoted: true }, Span::new(off, l, c)));
+                    }
+                    self.emit_heredoc_body_end();
+                    return Ok(Step::Produced);
+                }
                 return Err(LexError::UnterminatedHeredoc);
             }
             let body_line = if ph.strip_tabs { line.trim_start_matches('\t').to_string() } else { line };
@@ -3196,6 +3262,17 @@ impl<'a> Lexer<'a> {
                 self.emit_heredoc_body_end();
                 return Ok(Step::Produced);
             }
+            // End-of-input at a logical line start (input ran out after a
+            // newline-terminated body line, or with an entirely empty body). In a
+            // top-level BATCH parse, bash delimits the here-doc by EOF: finish the
+            // body as-is — the trailing `\n` of the previous line was already
+            // emitted, so no separator is added here. Checked BEFORE clearing
+            // `at_line_start` so the mid-line `None` branch below (which DOES append
+            // a separator) fires only for a genuinely unterminated final line.
+            if self.opts.eof_closes_heredoc && self.cursor.peek().is_none() {
+                self.emit_heredoc_body_end();
+                return Ok(Step::Produced);
+            }
             self.emitting_heredoc.as_mut().expect("emitting").at_line_start = false;
             self.heredoc_gen += 1; // v250 T6 fix: emitting_heredoc.at_line_start flip is a state change
             // Fall through to emit the first atom of this body line.
@@ -3205,7 +3282,16 @@ impl<'a> Lexer<'a> {
         let c = self.cursor.column();
         match self.cursor.peek().copied() {
             // EOF mid-body without a matching close-delimiter line — error (matches
-            // the oracle's `!got_newline` guard).
+            // the oracle's `!got_newline` guard). In a top-level BATCH parse
+            // (`eof_closes_heredoc`), bash instead delimits the here-doc by EOF: the
+            // partial final line's atoms were already emitted incrementally, so
+            // append the missing line separator (bash terminates the final line with
+            // a `\n` even without a trailing newline in the source) and finish.
+            None if self.opts.eof_closes_heredoc => {
+                self.history.push(Token::new(TokenKind::Lit { text: "\n".into(), quoted: true }, Span::new(off, l, c)));
+                self.emit_heredoc_body_end();
+                Ok(Step::Produced)
+            }
             None => Err(LexError::UnterminatedHeredoc),
             // End of a body line: emit the `\n` separator (quoted:true) and re-arm
             // the line-start delimiter check for the next line.
@@ -3366,8 +3452,10 @@ impl<'a> Lexer<'a> {
         }
         // Leading `<<-` tabs are already stripped on the real cursor; `trim` here is
         // a harmless no-op that also matches the oracle's whole-line strip.
+        // See `scan_step_heredoc_body_literal`: `<<-` matches on the tab-stripped
+        // OR the raw close line against the raw delimiter word.
         let check = if ph.strip_tabs { line.trim_start_matches('\t') } else { &line[..] };
-        if check == ph.delim { Some(consumed) } else { None }
+        if check == ph.delim || line == ph.delim { Some(consumed) } else { None }
     }
 
     /// v250 T4: emit ONE atom for a `$`-expansion in a QUOTED operand context —
@@ -4401,13 +4489,29 @@ impl<'a> Lexer<'a> {
         // even a `[` — is treated as literal, not another subscript. If `=` is
         // absent → ArrayLiteralMissingEquals.
         if expect_subscript_eq {
-            if let Some(Mode::ArrayLiteral { expect_subscript_eq: e, .. }) = self.modes.last_mut() {
-                *e = false;
-            }
+            // The subscript's assignment operator: `=` (set) or `+=` (append).
+            // Record which for the parser (read via current_mode() after it
+            // scans the value). `[expr]` followed by neither is the same error
+            // the set-only path always raised.
+            let mut append = false;
             if self.cursor.peek() == Some(&'=') {
                 self.cursor.next(); // consume the required '='
+            } else if self.cursor.peek() == Some(&'+') {
+                let mut p = self.cursor.clone();
+                p.next();
+                if p.peek() == Some(&'=') {
+                    self.cursor.next(); // consume '+'
+                    self.cursor.next(); // consume '='
+                    append = true;
+                } else {
+                    return Err(LexError::ArrayLiteralMissingEquals);
+                }
             } else {
                 return Err(LexError::ArrayLiteralMissingEquals);
+            }
+            if let Some(Mode::ArrayLiteral { expect_subscript_eq: e, subscript_append: sa, .. }) = self.modes.last_mut() {
+                *e = false;
+                *sa = append;
             }
         }
         let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
@@ -4961,7 +5065,7 @@ fn parse_heredoc_delim(
     let mut any_quoted = false;
     while let Some(&c) = chars.peek() {
         match c {
-            '\n' | ' ' | '\t' | ';' | '&' | '|' | '<' | '>' => break,
+            '\n' | ' ' | '\t' | ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
             '\'' => {
                 chars.next();
                 any_quoted = true;
@@ -4983,10 +5087,15 @@ fn parse_heredoc_delim(
             }
             '\\' => {
                 chars.next();
-                any_quoted = true;
-                if let Some(&next) = chars.peek() {
-                    chars.next();
-                    delim.push(next);
+                match chars.peek() {
+                    // `\<newline>` inside the delimiter word is a line
+                    // continuation: both the backslash and the newline are
+                    // deleted and scanning continues on the next line (bash
+                    // strips continuations before reading the delimiter word).
+                    // It is NOT quoting, so `any_quoted` stays untouched.
+                    Some(&'\n') => { chars.next(); }
+                    Some(&next) => { chars.next(); any_quoted = true; delim.push(next); }
+                    None => { any_quoted = true; }
                 }
             }
             _ => {
@@ -5081,12 +5190,12 @@ fn decode_ansi_c_escape(
                     _ => break,
                 }
             }
-            push_codepoint(out, v)?;
+            push_codepoint(out, v);
         }
         Some('x') => {
             if chars.peek().copied().is_some_and(|c| c.is_ascii_hexdigit()) {
                 let v = scan_hex_digits(chars, 2);
-                push_codepoint(out, v)?;
+                push_codepoint(out, v);
             } else {
                 out.push('\\');
                 out.push('x');
@@ -5095,7 +5204,7 @@ fn decode_ansi_c_escape(
         Some('u') => {
             if chars.peek().copied().is_some_and(|c| c.is_ascii_hexdigit()) {
                 let v = scan_hex_digits(chars, 4);
-                push_codepoint(out, v)?;
+                push_codepoint(out, v);
             } else {
                 out.push('\\');
                 out.push('u');
@@ -5104,7 +5213,7 @@ fn decode_ansi_c_escape(
         Some('U') => {
             if chars.peek().copied().is_some_and(|c| c.is_ascii_hexdigit()) {
                 let v = scan_hex_digits(chars, 8);
-                push_codepoint(out, v)?;
+                push_codepoint(out, v);
             } else {
                 out.push('\\');
                 out.push('U');
@@ -5119,7 +5228,7 @@ fn decode_ansi_c_escape(
             Some('@') => out.push('\0'),
             Some(c) => {
                 let v = (c.to_ascii_uppercase() as u32) & 0x1F;
-                push_codepoint(out, v)?;
+                push_codepoint(out, v);
             }
         },
         Some(other) => {
@@ -5150,15 +5259,81 @@ fn scan_hex_digits(
     v
 }
 
-/// Appends a codepoint to `out`, or errors if the value is not a valid
-/// Unicode scalar (surrogate range or > U+10FFFF).
-fn push_codepoint(out: &mut String, v: u32) -> Result<(), LexError> {
-    match char::from_u32(v) {
-        Some(c) => {
-            out.push(c);
-            Ok(())
-        }
-        None => Err(LexError::AnsiCInvalidCodepoint(v)),
+/// Appends a `\u`/`\U`/`\nnn`/`\xhh`/`\cX` codepoint to `out`. Never errors:
+/// bash accepts out-of-range `\u`/`\U` values (surrogates, > U+10FFFF) at parse
+/// time and emits bytes, so huck must not raise a syntax error either.
+///
+/// Encoding (matches bash 5.2's `\u`/`\U`, verified byte-for-byte where huck's
+/// architecture permits — see the residual note below):
+///   * a valid Unicode scalar (<= U+10FFFF, non-surrogate) is pushed as a
+///     `char` → standard UTF-8, the fast path shared with the octal/hex forms.
+///     This is byte-identical to bash for every representable value.
+///   * a value > 0x7FFFFFFF encodes to nothing (empty) — byte-identical to bash
+///     (`\Ufffffffe`, `\Uffffffff` emit no bytes).
+///   * a surrogate (0xD800..=0xDFFF) or 0x110000..=0x7FFFFFFF value: bash emits
+///     the classic *extended* UTF-8 byte sequence (e.g. `\Ud800` → `ed a0 80`,
+///     `\U110000` → `f4 90 80 80`), which is NOT valid UTF-8. huck stores every
+///     word as a Rust `String` (a valid-UTF-8 invariant the whole expand path
+///     relies on; the same reason `\xff` yields `c3 bf` rather than the raw
+///     byte `ff`), so these bytes cannot be represented. We substitute the
+///     Unicode replacement char via `from_utf8_lossy` — a bounded, documented
+///     residual divergence for these extreme values (see
+///     `ansic_unicode_escape_diff_check.sh`). The parse gap (no syntax error)
+///     is fully closed regardless.
+fn push_codepoint(out: &mut String, v: u32) {
+    if let Some(c) = char::from_u32(v) {
+        out.push(c);
+        return;
+    }
+    let bytes = extended_utf8_bytes(v);
+    // `from_utf8_lossy` keeps the empty (> 0x7FFFFFFF) case empty and maps the
+    // invalid surrogate / > U+10FFFF sequences to U+FFFD, preserving the
+    // String's valid-UTF-8 invariant.
+    out.push_str(&String::from_utf8_lossy(&bytes));
+}
+
+/// Encodes `v` with the classic *extended* UTF-8 scheme (1–6 bytes for values
+/// up to 0x7FFFFFFF; empty above that). For a valid Unicode scalar this equals
+/// standard UTF-8; the surrogate / > U+10FFFF ranges produce the (invalid-UTF-8)
+/// byte sequences bash emits for `\u`/`\U`.
+fn extended_utf8_bytes(v: u32) -> Vec<u8> {
+    const CONT: u8 = 0x80;
+    if v < 0x80 {
+        vec![v as u8]
+    } else if v < 0x800 {
+        vec![0xC0 | (v >> 6) as u8, CONT | (v & 0x3F) as u8]
+    } else if v < 0x10000 {
+        vec![
+            0xE0 | (v >> 12) as u8,
+            CONT | ((v >> 6) & 0x3F) as u8,
+            CONT | (v & 0x3F) as u8,
+        ]
+    } else if v < 0x20_0000 {
+        vec![
+            0xF0 | (v >> 18) as u8,
+            CONT | ((v >> 12) & 0x3F) as u8,
+            CONT | ((v >> 6) & 0x3F) as u8,
+            CONT | (v & 0x3F) as u8,
+        ]
+    } else if v < 0x400_0000 {
+        vec![
+            0xF8 | (v >> 24) as u8,
+            CONT | ((v >> 18) & 0x3F) as u8,
+            CONT | ((v >> 12) & 0x3F) as u8,
+            CONT | ((v >> 6) & 0x3F) as u8,
+            CONT | (v & 0x3F) as u8,
+        ]
+    } else if v < 0x8000_0000 {
+        vec![
+            0xFC | (v >> 30) as u8,
+            CONT | ((v >> 24) & 0x3F) as u8,
+            CONT | ((v >> 18) & 0x3F) as u8,
+            CONT | ((v >> 12) & 0x3F) as u8,
+            CONT | ((v >> 6) & 0x3F) as u8,
+            CONT | (v & 0x3F) as u8,
+        ]
+    } else {
+        Vec::new()
     }
 }
 
@@ -7525,6 +7700,50 @@ mod array_parse_tests {
     }
 
     #[test]
+    fn heredoc_comsub_interleave_parses() {
+        // parse-gaps-round2: heredoc<->comsub interleaving that used to reject.
+        let empty = std::collections::HashMap::new();
+        let cases = [
+            // comsub4.sub block 2: delimiter across a `\<newline>` continuation.
+            "x=$( cat <<\\EOT\\\n4\nd \\\ng\nEOT4\n)\necho \"$x\"\n",
+            // comsub4.sub block 3: quoted-delim heredoc in comsub, literal `\`.
+            "x=$( cat <<\\EOT\nd \\\ng\nEOT\n)\necho \"$x\"\n",
+            // heredoc7.sub: `)` terminates the delimiter word; body after close.
+            "echo $(cat <<EOF)\nfoo\nbar\nEOF\nafter\n",
+            // `)` closes a subshell after a heredoc delimiter.
+            "(cat <<EOF)\nhi\nEOF\n",
+        ];
+        for src in cases {
+            let mut lx = Lexer::new_live_atoms(src, &empty, LexerOptions::default());
+            assert!(
+                crate::parser::parse_sequence(&mut lx).is_ok(),
+                "expected clean parse for {src:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn heredoc_delim_stops_at_paren() {
+        // `<<EOF)` — `)` is a metacharacter, so the delimiter is `EOF` (not
+        // `EOF)`); the delimiter word ends and `)` is a separate token.
+        let mut c = CharCursor::new("EOF)\nhi\nEOF");
+        let (delim, expand) = parse_heredoc_delim(&mut c).unwrap();
+        assert_eq!(delim, "EOF");
+        assert!(expand);
+        assert_eq!(c.peek(), Some(&')'));
+    }
+
+    #[test]
+    fn heredoc_delim_line_continuation_joins() {
+        // `\EOT\<newline>4` — the `\<newline>` is a line continuation (both
+        // deleted); the quoted delimiter word is `EOT4` (any_quoted → no expand).
+        let mut c = CharCursor::new("\\EOT\\\n4\nbody");
+        let (delim, expand) = parse_heredoc_delim(&mut c).unwrap();
+        assert_eq!(delim, "EOT4");
+        assert!(!expand, "backslash-quoted delimiter disables expansion");
+    }
+
+    #[test]
     fn scan_stall_guard_counts_injected_alias_body() {
         // An alias whose body is far longer than SCAN_STALL_CAP tokens. Each injected
         // char advances `consumed`, so the guard never fires — proving the metric is
@@ -7561,6 +7780,78 @@ mod array_parse_tests {
         lx.maybe_prune_history(); // pos < threshold → no-op
         assert_eq!(lx.pos, pos);
         assert_eq!(lx.scanned_token_count(), len);
+    }
+
+    // --- $'\u'/$'\U' codepoint encoding (extended UTF-8) ---
+
+    #[test]
+    fn extended_utf8_matches_bash_across_ranges() {
+        // (value, bash's exact bytes). Valid scalars and the > 0x7FFFFFFF
+        // (empty) range are byte-identical to bash 5.2.
+        let cases: &[(u32, &[u8])] = &[
+            (0x0041, &[0x41]),                                     // 'A'
+            (0x00E9, &[0xC3, 0xA9]),                               // 'é'  2-byte
+            (0x0800, &[0xE0, 0xA0, 0x80]),                         // 3-byte
+            (0x10FFFF, &[0xF4, 0x8F, 0xBF, 0xBF]),                 // max scalar, 4-byte
+            (0x110000, &[0xF4, 0x90, 0x80, 0x80]),                 // just over max, 4-byte
+            (0x0020_0000, &[0xF8, 0x88, 0x80, 0x80, 0x80]),        // 5-byte
+            (0x03FF_FFFF, &[0xFB, 0xBF, 0xBF, 0xBF, 0xBF]),        // 5-byte max
+            (0x0400_0000, &[0xFC, 0x84, 0x80, 0x80, 0x80, 0x80]),  // 6-byte
+            (0x7FFF_FFFF, &[0xFD, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]),  // 6-byte max
+            (0xD800, &[0xED, 0xA0, 0x80]),                         // surrogate
+            (0xDFFF, &[0xED, 0xBF, 0xBF]),                         // surrogate
+        ];
+        for (v, want) in cases {
+            assert_eq!(extended_utf8_bytes(*v), *want, "value {:#x}", v);
+        }
+        // Above 0x7FFFFFFF → empty (bash emits nothing).
+        assert!(extended_utf8_bytes(0xFFFF_FFFE).is_empty());
+        assert!(extended_utf8_bytes(0xFFFF_FFFF).is_empty());
+        assert!(extended_utf8_bytes(0x8000_0000).is_empty());
+    }
+
+    #[test]
+    fn push_codepoint_valid_scalars_are_byte_exact() {
+        let mut s = String::new();
+        push_codepoint(&mut s, 0x0041);
+        push_codepoint(&mut s, 0x00E9);
+        push_codepoint(&mut s, 0x0800);
+        push_codepoint(&mut s, 0x10FFFF);
+        assert_eq!(s.as_bytes(), &[0x41, 0xC3, 0xA9, 0xE0, 0xA0, 0x80, 0xF4, 0x8F, 0xBF, 0xBF]);
+    }
+
+    #[test]
+    fn push_codepoint_over_max_yields_empty_like_bash() {
+        // > 0x7FFFFFFF: bash emits nothing, and so does huck (byte-exact).
+        let mut s = String::from("x");
+        push_codepoint(&mut s, 0xFFFF_FFFE);
+        push_codepoint(&mut s, 0xFFFF_FFFF);
+        assert_eq!(s, "x");
+    }
+
+    #[test]
+    fn push_codepoint_surrogate_and_over_10ffff_never_error_and_stay_valid_utf8() {
+        // Documented residual: bash emits raw (invalid-UTF-8) bytes here; huck
+        // keeps its valid-UTF-8 String invariant by substituting U+FFFD. The
+        // point of the fix is that these NEVER raise a parse error / panic.
+        for v in [0xD800u32, 0xDFFF, 0x110000, 0x0020_0000, 0x7FFF_FFFF] {
+            let mut s = String::new();
+            push_codepoint(&mut s, v); // must not panic
+            assert!(std::str::from_utf8(s.as_bytes()).is_ok(), "valid utf8 for {:#x}", v);
+            assert!(!s.is_empty(), "non-empty replacement for {:#x}", v);
+        }
+    }
+
+    #[test]
+    fn decode_ansi_c_escapes_out_of_range_u_does_not_error() {
+        // The end-to-end $'...' decoder must accept out-of-range \u/\U without
+        // raising (previously LexError::AnsiCInvalidCodepoint) and stay valid.
+        assert_eq!(decode_ansi_c_escapes(r"AéB"), "Aé B".replace(' ', ""));
+        assert_eq!(decode_ansi_c_escapes(r"\Ufffffffe"), ""); // > 0x7FFFFFFF → empty
+        for esc in [r"\U110000", r"\ud800", r"\U7fffffff"] {
+            let s = decode_ansi_c_escapes(esc); // must not panic
+            assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+        }
     }
 }
 

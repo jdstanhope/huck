@@ -5385,6 +5385,18 @@ fn run_coproc(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
+    // The parser accepts ANY single non-keyword word as the coproc NAME (bash's
+    // grammar `coproc WORD compound-command`) and defers the valid-identifier
+    // check to here (RUNTIME), matching bash: `coproc @ { :; }` parses, then at
+    // runtime prints `` `@': not a valid identifier `` and does NOT start the
+    // coprocess (exit status 1, body not run).
+    if !crate::builtins::is_valid_name(name) {
+        {
+            let mut err = err_writer(err_sink, sink);
+            crate::sh_error_to!(shell, &mut *err, None, "`{}': not a valid identifier", name);
+        }
+        return ExecOutcome::Continue(1);
+    }
     // v157 single-active: warn (but proceed) if a coproc is already live.
     if let Some(existing) = shell.coprocs.first() {
         {
@@ -6646,14 +6658,25 @@ pub(crate) fn apply_one_assignment(
                         return Err(());
                     }
                     let new_pairs = build_associative_map(elements, shell, err)?;
-                    for (k, v) in new_pairs {
-                        shell
-                            .set_associative_element(name, k, v)
-                            .map_err(|_| ())?;
+                    for (k, v, append) in new_pairs {
+                        if append {
+                            // `a+=([k]+=v)`: concatenate onto the existing
+                            // element (bash: `[k]=base` + `[k]+=y` → `basey`).
+                            shell
+                                .append_associative_element(name, &k, &v)
+                                .map_err(|_| ())?;
+                        } else {
+                            shell
+                                .set_associative_element(name, k, v)
+                                .map_err(|_| ())?;
+                        }
                     }
                     return Ok(());
                 } else {
-                    let pairs = build_associative_map(elements, shell, err)?;
+                    let pairs = build_associative_map(elements, shell, err)?
+                        .into_iter()
+                        .map(|(k, v, _)| (k, v))
+                        .collect();
                     return shell.replace_associative(name, pairs).map_err(|_| ());
                 }
             }
@@ -6716,7 +6739,7 @@ pub(crate) fn apply_one_assignment(
                 } else {
                     0
                 };
-                let map = expand_array_elements(elements, name, shell, start, err)?;
+                let map = expand_array_elements(elements, name, shell, start, true, err)?;
                 shell.extend_indexed(name, map).map_err(|_| ())
             } else {
                 // a=(elements): replace whole array.
@@ -6800,12 +6823,18 @@ pub(crate) fn apply_one_assignment(
 /// Builds an associative-array initializer from the compound literal's
 /// elements. Each element MUST have an explicit subscript ([key]=value);
 /// positional elements (no subscript) are an error.
+/// Each returned triple is `(key, value, append)`. `append` is `true` for a
+/// `[key]+=value` element and is honored ONLY by the `a+=(…)` append context
+/// (append to the pre-existing element). In a fresh `declare -A a=(…)` replace,
+/// bash treats `[k]+=v` like `[k]=v` — no concat with an earlier same-key
+/// element in the literal (e.g. `([k]=x [k]+=y)` → `y`, not `xy`) — which the
+/// key-dedup below already reproduces.
 fn build_associative_map(
     elements: &[crate::lexer::ArrayLiteralElement],
     shell: &mut Shell,
     err: &mut dyn std::io::Write,
-) -> Result<Vec<(String, String)>, ()> {
-    let mut out: Vec<(String, String)> = Vec::new();
+) -> Result<Vec<(String, String, bool)>, ()> {
+    let mut out: Vec<(String, String, bool)> = Vec::new();
     for elem in elements {
         let key = match &elem.subscript {
             Some(sw) => crate::expand::eval_subscript_key(sw, shell),
@@ -6815,10 +6844,11 @@ fn build_associative_map(
             }
         };
         let val = crate::param_expansion::expand_word_to_string(&elem.value, shell);
-        if let Some(slot) = out.iter_mut().find(|(k, _)| k == &key) {
+        if let Some(slot) = out.iter_mut().find(|(k, _, _)| k == &key) {
             slot.1 = val;
+            slot.2 = elem.append;
         } else {
-            out.push((key, val));
+            out.push((key, val, elem.append));
         }
     }
     Ok(out)
@@ -6843,6 +6873,7 @@ fn expand_array_elements(
     name: &str,
     shell: &mut Shell,
     start: usize,
+    consult_existing: bool,
     err: &mut dyn std::io::Write,
 ) -> Result<std::collections::BTreeMap<usize, String>, ()> {
     let mut map: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
@@ -6857,7 +6888,36 @@ fn expand_array_elements(
                         return Err(());
                     }
                 };
-                map.insert(idx, expand_assignment(&elem.value, shell));
+                let add = expand_assignment(&elem.value, shell);
+                let value = if elem.append {
+                    // `[i]+=v`: append to the current value of element `i` —
+                    // whatever an earlier element in THIS literal set (map),
+                    // or (only for `a+=(…)` append context) the pre-existing
+                    // array element. A plain `a=(…)` replace discards the old
+                    // array, so it never consults it. Integer-flagged arrays
+                    // use arithmetic `+=`, matching a standalone `a[i]+=v`.
+                    let base = map
+                        .get(&idx)
+                        .cloned()
+                        .or_else(|| {
+                            if consult_existing {
+                                shell.lookup_indexed_element(name, idx)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    if shell.is_integer(name) {
+                        let cur = arith_eval_operand(&base, shell).unwrap_or(0);
+                        let addv = arith_eval_operand(&add, shell).unwrap_or(0);
+                        (cur + addv).to_string()
+                    } else {
+                        base + &add
+                    }
+                } else {
+                    add
+                };
+                map.insert(idx, value);
                 implicit = idx + 1;
                 if shell.pending_fatal_status.is_some() {
                     return Err(());
@@ -6883,7 +6943,7 @@ fn build_array_map(
     shell: &mut Shell,
     err: &mut dyn std::io::Write,
 ) -> Result<std::collections::BTreeMap<usize, String>, ()> {
-    expand_array_elements(elements, name, shell, 0, err)
+    expand_array_elements(elements, name, shell, 0, false, err)
 }
 
 // ----- job-control helpers -------------------------------------------------
@@ -9348,6 +9408,55 @@ mod array_assign_tests {
         let m = s.get_indexed("a").expect("a should be an array");
         assert_eq!(m.get(&2).map(String::as_str), Some("pq"));
     }
+
+    #[test]
+    fn array_literal_append_element_unset_takes_value() {
+        // `x=(1 2 [2]+=7 4)`: element 2 is unset in the fresh literal, so
+        // `[2]+=7` yields "7" (base empty). Matches bash `1 2 7 4`.
+        let mut s = Shell::new();
+        run_line(&mut s, "x=(1 2 [2]+=7 4)");
+        let m = s.get_indexed("x").expect("x is an array");
+        assert_eq!(m.get(&0).map(String::as_str), Some("1"));
+        assert_eq!(m.get(&1).map(String::as_str), Some("2"));
+        assert_eq!(m.get(&2).map(String::as_str), Some("7"));
+        assert_eq!(m.get(&3).map(String::as_str), Some("4"));
+    }
+
+    #[test]
+    fn array_literal_append_element_concats_earlier_in_literal() {
+        // `[0]=a [0]+=b [0]+=c` → "abc" (append against the map-so-far).
+        let mut s = Shell::new();
+        run_line(&mut s, "x=([0]=a [0]+=b [0]+=c)");
+        assert_eq!(s.lookup_indexed_element("x", 0), Some("abc".into()));
+    }
+
+    #[test]
+    fn array_literal_append_replace_ignores_old_array() {
+        // A plain `x=(…)` replace discards the old array: `[0]+=B` on the
+        // discarded x[0]=9 → "B" (base empty), matching bash.
+        let mut s = Shell::new();
+        run_line(&mut s, "x=(9 9 9); x=([0]+=B)");
+        assert_eq!(s.lookup_indexed_element("x", 0), Some("B".into()));
+    }
+
+    #[test]
+    fn array_literal_append_context_consults_existing_element() {
+        // `x+=(…)` append keeps the old array: `[1]+=Z` on existing x[1]=b → "bZ".
+        let mut s = Shell::new();
+        run_line(&mut s, "x=(a b c); x+=([1]+=Z)");
+        let m = s.get_indexed("x").expect("x is an array");
+        assert_eq!(m.get(&1).map(String::as_str), Some("bZ"));
+        assert_eq!(m.get(&0).map(String::as_str), Some("a"));
+        assert_eq!(m.get(&2).map(String::as_str), Some("c"));
+    }
+
+    #[test]
+    fn array_literal_append_element_integer_arithmetic() {
+        // Integer-flagged array: `[0]+=3` on n[0]=5 is arithmetic → 8.
+        let mut s = Shell::new();
+        run_line(&mut s, "declare -ia n=(5 [0]+=3)");
+        assert_eq!(s.lookup_indexed_element("n", 0), Some("8".into()));
+    }
 }
 
 #[cfg(test)]
@@ -9374,6 +9483,23 @@ mod assoc_assign_tests {
         assert!(s.get_indexed("m").is_some());
         assert!(s.get_associative("m").is_none());
         assert_eq!(s.lookup_indexed_element("m", 0), Some("bar".into()));
+    }
+
+    #[test]
+    fn compound_append_literal_on_associative_appends_to_existing() {
+        // `a+=([one]+=more)` on existing [one]=one → "onemore".
+        let mut s = Shell::new();
+        run(&mut s, "declare -A a=([one]=one); a+=([one]+=more)");
+        assert_eq!(s.lookup_associative_element("a", "one"), Some("onemore".into()));
+    }
+
+    #[test]
+    fn compound_replace_literal_on_associative_append_is_plain_set() {
+        // bash quirk: in a fresh `declare -A a=(…)` replace, `[k]+=y` does NOT
+        // concat with an earlier `[k]=x` in the same literal — result is "y".
+        let mut s = Shell::new();
+        run(&mut s, "declare -A a=([k]=x [k]+=y)");
+        assert_eq!(s.lookup_associative_element("a", "k"), Some("y".into()));
     }
 
     #[test]
@@ -9487,6 +9613,40 @@ mod assoc_assign_tests {
         );
         // foo should be unaffected.
         assert_eq!(s.lookup_associative_element("foo", "k"), Some("v".into()));
+    }
+}
+
+#[cfg(test)]
+mod coproc_name_tests {
+    use crate::shell_state::Shell;
+
+    fn run(shell: &mut Shell, line: &str) {
+        crate::shell::process_line(line, shell, false);
+    }
+
+    #[test]
+    fn invalid_coproc_name_rejected_at_runtime() {
+        // `coproc @ { :; }` PARSES (bash grammar `coproc WORD compound`), then at
+        // runtime the invalid identifier is rejected: no coproc is created, no
+        // `@`/`@_PID` variables are set, and `$?` is 1 — matching bash.
+        let mut s = Shell::new();
+        run(&mut s, "coproc @ { :; }");
+        assert_eq!(s.last_status(), 1, "invalid coproc name → exit status 1");
+        assert!(s.coprocs.is_empty(), "no coproc should be created");
+        assert!(s.get("@_PID").is_none(), "no NAME_PID for a rejected coproc");
+    }
+
+    #[test]
+    fn valid_coproc_name_still_starts() {
+        // Regression guard: a valid name is unaffected — the coprocess starts and
+        // its record is published (status 0).
+        let mut s = Shell::new();
+        run(&mut s, "coproc MYCO { :; }");
+        assert_eq!(s.last_status(), 0, "valid coproc name → exit status 0");
+        assert_eq!(s.coprocs.len(), 1, "one coproc should be live");
+        assert_eq!(s.coprocs[0].name, "MYCO");
+        // Reap the child to avoid leaking it into other tests.
+        run(&mut s, "wait 2>/dev/null");
     }
 }
 

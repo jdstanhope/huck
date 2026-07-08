@@ -440,6 +440,19 @@ mod tests {
     }
 
     #[test]
+    fn classify_heredoc_open_at_eof_still_incomplete() {
+        // Invariant (b) of the EOF-closes-heredoc work: `classify` builds its
+        // lexer with `eof_closes_heredoc=false` (the default), so an open
+        // here-document at end-of-input STILL reports Incomplete(Heredoc) — the
+        // interactive REPL must keep prompting (PS2), never terminate the body at
+        // a line boundary. Only the top-level BATCH parse closes it at EOF.
+        assert_eq!(
+            classify("cat <<EOF\nhi", false),
+            Completeness::Incomplete(ContinuationReason::Heredoc)
+        );
+    }
+
+    #[test]
     fn classify_heredoc_bare_first_line_is_incomplete() {
         // The REPL feeds one physical line at a time, so the FIRST classify call
         // for `cat <<EOF\n…\nEOF` is on the bare redirect line `cat <<EOF` — no

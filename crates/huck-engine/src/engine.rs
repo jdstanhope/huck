@@ -337,6 +337,29 @@ mod tests {
     }
 
     #[test]
+    fn heredoc_delim_line_continuation_in_comsub() {
+        // comsub4.sub block 2: a heredoc delimiter word that spans a `\<newline>`
+        // line continuation — `<<\EOT\` + newline + `4` forms delimiter `EOT4`
+        // (quoted → literal body, trailing backslash kept verbatim). Inside `$()`.
+        let mut e = Engine::new();
+        let out = e.capture("x=$( cat <<\\EOT\\\n4\nd \\\ng\nEOT4\n)\necho \"$x\"");
+        assert_eq!(out.stdout, "d \\\ng\n");
+    }
+
+    #[test]
+    fn heredoc_in_comsub_body_after_close() {
+        // heredoc7.sub: a heredoc opened INSIDE `$( … )` whose `)` closes on the
+        // opener line — `)` terminates the (unquoted) delimiter word, and the body
+        // is taken from the lines following the ENCLOSING command line (delayed
+        // heredoc across the comsub boundary). bash: `echo $(cat <<EOF)…` → body.
+        let mut e = Engine::new();
+        let out = e.capture("echo $(cat <<EOF)\nfoo\nbar\nEOF\n");
+        assert_eq!(out.stdout, "foo bar\n");
+        let out2 = e.capture("x=$(cat <<EOF)\none\ntwo\nEOF\necho \"[$x]\"");
+        assert_eq!(out2.stdout, "[one\ntwo]\n");
+    }
+
+    #[test]
     fn capture_collects_stdout_and_code() {
         let mut e = Engine::new();
         let out = e.capture("echo hi; echo bye; exit 4");

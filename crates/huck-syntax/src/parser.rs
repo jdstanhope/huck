@@ -6,7 +6,7 @@
 use crate::command::{
     Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
     AssignTarget,
-    Redirection, RedirOp, word_literal_text, valid_identifier_text, IfClause, ElifBranch, WhileClause,
+    Redirection, RedirOp, word_literal_text, IfClause, ElifBranch, WhileClause,
     ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator, ArithForClause,
     TestExpr, TestUnaryOp, TestBinaryOp, try_unary_op, skip_test_newlines, is_compound_opener,
 };
@@ -1361,8 +1361,25 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
 /// `brace_expand_parts`) and — v252 T3 — explicit `[expr]=value` subscripted
 /// elements (single value, NO brace expansion). Owns the full push/pop
 /// lifecycle of its `ArrayLiteral` frame; pops on every exit path.
+/// True when a command word (its leading `name=(…)` compound assignment) may
+/// appear in ARGUMENT position — bash's `ASSIGNMENT_BUILTIN` set plus the
+/// hard-coded `eval`/`let` (see parse.y `read_token_word`, `PST_ASSIGNOK`).
+fn is_compound_assignment_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "declare" | "typeset" | "local" | "export" | "readonly" | "alias" | "eval" | "let"
+    )
+}
+
+/// True when a word carries a `name=(…)` compound array-literal assignment (an
+/// `ArrayLiteral` part). Used to gate its position: valid only as a leading
+/// assignment or as an argument to a declaration builtin.
+fn word_has_array_literal(w: &Word) -> bool {
+    w.0.iter().any(|p| matches!(p, WordPart::ArrayLiteral(_)))
+}
+
 pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseError> {
-    iter.push_mode(Mode::ArrayLiteral { body_started: false, expect_subscript_eq: false, at_element_start: true });
+    iter.push_mode(Mode::ArrayLiteral { body_started: false, expect_subscript_eq: false, at_element_start: true, subscript_append: false });
     let mut elements: Vec<ArrayLiteralElement> = Vec::new();
     loop {
         match iter.peek_kind()? {
@@ -1388,12 +1405,20 @@ pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseErr
                     Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(ParseError::Lex(Box::new(e))); }
                 }
                 iter.pop_mode(); // ParamSubscriptOperand
-                // The lexer consumes the required `=` (or errors
+                // The lexer consumes the required `=` / `+=` (or errors
                 // ArrayLiteralMissingEquals) as `parse_word_command` scans on.
                 let value = match parse_word_command(iter, false) {
                     Ok(v) => v,
                     Err(e) => { iter.pop_mode(); return Err(e); }
                 };
+                // The lexer recorded whether the operator was `+=` (append) on
+                // the ArrayLiteral mode; read it now, before the next element's
+                // scan can overwrite it. Nothing between the operator scan and
+                // here touches this flag.
+                let append = matches!(
+                    iter.current_mode(),
+                    Mode::ArrayLiteral { subscript_append: true, .. }
+                );
                 // An empty value (`[i]= ` / `[i]=)`) re-tokenizes to a single
                 // empty literal in the oracle (`scan_array_element_word`'s
                 // `words.is_empty()` fallback), NOT an empty Word.
@@ -1402,7 +1427,7 @@ pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseErr
                 } else {
                     value
                 };
-                elements.push(ArrayLiteralElement { subscript: Some(sub_word), value });
+                elements.push(ArrayLiteralElement { subscript: Some(sub_word), value, append });
             }
             Some(_) => {
                 // A positional value: parse_word_command stops at the next
@@ -1416,7 +1441,7 @@ pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseErr
                 match brace_expand_parts(value.0) {
                     Ok(expansions) => {
                         for p in expansions {
-                            elements.push(ArrayLiteralElement { subscript: None, value: Word(p) });
+                            elements.push(ArrayLiteralElement { subscript: None, value: Word(p), append: false });
                         }
                     }
                     Err(e) => { iter.pop_mode(); return Err(ParseError::Lex(Box::new(e))); }
@@ -2459,6 +2484,32 @@ fn parse_simple_with_leading_word(
         return Err(ParseError::MissingCommand);
     }
 
+    // A `name=(…)` array-literal (compound assignment) is only valid in an
+    // assignment-acceptable position, matching bash's parser: as a LEADING
+    // assignment (every preceding word is assignment-shaped, i.e. still in the
+    // command-word prefix), or as an argument to a declaration builtin — bash's
+    // `ASSIGNMENT_BUILTIN` set (declare/typeset/local/export/readonly/alias)
+    // plus the hard-coded `eval`/`let` (parse.y `read_token_word`,
+    // `PST_ASSIGNOK`). Anywhere else bash rejects the unexpected `(` with a
+    // syntax error (`printf … a=(a b)` → rc 2). The lexer emits `ArrayOpen`
+    // wherever it sees `name=(` at a word start regardless of position, so this
+    // is the parser's job (delimiter/position ownership stays with the parser).
+    let command_word_is_decl_builtin = all_words
+        .iter()
+        .find(|w| !crate::command::is_assignment_word(w))
+        .and_then(|w| crate::command::word_literal_text(w))
+        .is_some_and(is_compound_assignment_builtin);
+    for (i, w) in all_words.iter().enumerate() {
+        if !word_has_array_literal(w) {
+            continue;
+        }
+        let in_leading_prefix =
+            all_words[..i].iter().all(crate::command::is_assignment_word);
+        if !in_leading_prefix && !command_word_is_decl_builtin {
+            return Err(ParseError::UnexpectedToken);
+        }
+    }
+
     // Peel leading assignments from the front — mirrors `finalize_stage`.
     // Uses `is_assignment_word` (cheap peek) then `try_split_assignment`
     // (consuming move) to match the oracle's assignment-detection exactly.
@@ -2593,10 +2644,13 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
         // oracle's fallthrough arm (`command.rs` `parse_command_inner`,
         // `Some(other) => Err(UnexpectedKeyword(other.name()))`) raises the
         // SAME error for all of them, not a generic deferral. v257 T3 found
-        // this returning `UnsupportedCommand` instead (discovered via
-        // `coproc 123 { :; }`: `123` fails `valid_identifier_text` so the
-        // body is anonymous, `parse_command` reads the stray `123 {` as a
-        // simple command up to `;`, then hits the unmatched `}`).
+        // this returning `UnsupportedCommand` instead (originally discovered via
+        // `coproc 123 { :; }` when a non-identifier coproc name forced the
+        // anonymous body path and `parse_command` read the stray `123 {` as a
+        // simple command up to `;`, then hit the unmatched `}`; the coproc name
+        // rule now accepts any single non-keyword word, so `coproc 123 { :; }`
+        // parses as named and no longer reaches here — but the arm's behaviour
+        // is unchanged and still correct for genuine terminator keywords).
         Some(other) => return Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {}
     }
@@ -2747,7 +2801,12 @@ fn peek_coproc_named(iter: &mut Lexer) -> Result<bool, ParseError> {
         // with no `Blank` before the opener. Mirror the oracle's
         // `parse_coproc_command` exactly.
         Some(TokenKind::Word(w)) => {
-            let named = valid_identifier_text(w).is_some();
+            // bash parses `coproc WORD compound-command` for ANY word as the
+            // name and defers the valid-identifier check to RUNTIME. The NAME is
+            // any single, non-keyword word (`valid_function_name_text`, NOT the
+            // stricter `valid_identifier_text`) — a keyword like `{`/`if`/`while`
+            // is instead the anonymous compound command (`coproc <compound>`).
+            let named = crate::command::valid_function_name_text(w).is_some();
             if !named {
                 return Ok(false);
             }
@@ -2756,7 +2815,10 @@ fn peek_coproc_named(iter: &mut Lexer) -> Result<bool, ParseError> {
         Some(TokenKind::Lit { text, quoted: false }) => text.clone(),
         _ => return Ok(false),
     };
-    if valid_identifier_text(&single_lit_word(&text)).is_none() {
+    // Any single non-keyword word is a NAME candidate (identifier validity is a
+    // RUNTIME check in bash, e.g. `coproc @ { :; }` parses); a keyword word is the
+    // anonymous form's compound opener and must fall through to `Ok(false)`.
+    if crate::command::valid_function_name_text(&single_lit_word(&text)).is_none() {
         return Ok(false);
     }
     // Examine the token AFTER word1.
@@ -2810,8 +2872,12 @@ fn parse_coproc(iter: &mut Lexer) -> Result<Command, ParseError> {
     skip_test_blanks(iter)?; // blanks only — a NEWLINE after `coproc` makes it anonymous
     if peek_coproc_named(iter)? {
         let name_word = consume_command_word(iter)?;
-        let name = valid_identifier_text(&name_word)
-            .expect("peek_coproc_named verified a valid identifier");
+        // `valid_function_name_text` (not `valid_identifier_text`): the NAME may
+        // be any single non-keyword word (`@`, `1x`, …); bash validates it as an
+        // identifier at RUNTIME, not at parse time. `run_coproc` performs that
+        // check and mirrors bash's `` `NAME': not a valid identifier `` error.
+        let name = crate::command::valid_function_name_text(&name_word)
+            .expect("peek_coproc_named verified a single non-keyword word");
         skip_test_blanks(iter)?;
         let body = parse_coproc_body(iter)?;
         Ok(Command::Coproc { name, body: Box::new(body) })
@@ -5245,7 +5311,37 @@ mod tests {
         diff_cmd("a=(a|b c;d e<f)");      // |;&<> literal inside values
         diff_cmd("a=({1..3})");           // brace-expanded bare element -> 1 2 3
         diff_cmd("a=(x{a,b}y)");          // brace expansion with prefix/suffix
-        diff_cmd("pre a=(1 2) post");     // assignment mid-command still one word
+        diff_err("pre a=(1 2) post");     // array literal in ARG position → bash rejects (rc 2)
+    }
+
+    #[test]
+    fn atoms_array_literal_arg_position_rejected() {
+        // A `name=(…)` compound array assignment is valid ONLY as a leading
+        // assignment or as an argument to a declaration builtin; elsewhere bash
+        // rejects the unexpected `(` (rc 2). Mirror that.
+        diff_err("printf \"%s\\n\" -a a=(a b)"); // array1.sub line 1
+        diff_err("echo a=(x)");                  // plain command arg
+        diff_err("echo a+=(3)");                 // append form as arg
+        diff_err("foo a=(1) b=(2)");             // non-decl command, two array args
+        diff_err("command declare a=(1 2)");     // `command` is not a decl builtin
+        // Valid positions still parse:
+        diff_cmd("a=(1 2)");                     // sole leading assignment
+        diff_cmd("a=(1) b=(2)");                 // consecutive leading assignments
+        diff_cmd("x=1 a=(1 2)");                 // scalar + array leading prefix
+        diff_cmd("declare -a a=(1 2)");          // declaration builtin argument
+        diff_cmd("declare a=(1 2) b=(3 4)");     // two array args to declare
+        diff_cmd("local a=(1 2)");
+        diff_cmd("export a=(1 2)");
+        diff_cmd("readonly a=(1 2)");
+        diff_cmd("typeset a=(1 2)");
+        diff_cmd("alias a=(1 2)");
+        diff_cmd("eval a=(1 2)");
+        diff_cmd("let a=(1 2)");
+        diff_cmd("x=1 declare a=(1 2)");          // decl builtin after leading assign
+        // Unaffected shapes: element assign, append scalar, quoted `=(`.
+        diff_cmd("a[0]=x");
+        diff_cmd("a+=(3)");                       // leading append array
+        diff_cmd("echo \"a=(x)\"");               // quoted, not an array literal
     }
 
     #[test]
@@ -5273,6 +5369,44 @@ mod tests {
         // not an UnexpectedToken error.
         diff_cmd("a=([0]=)");                    // sole empty subscripted value
         diff_cmd("a=([2]=two [0]=)");            // empty value as the LAST element
+    }
+
+    #[test]
+    fn atoms_array_literal_append_element_sets_flag() {
+        // `[expr]+=value` inside an array literal parses and carries append=true;
+        // `[expr]=value` and positional elements carry append=false.
+        let elems = match t6_first("a=([2]+=7 [0]=x 9)") {
+            Command::Pipeline(p) => match &p.commands[0] {
+                Command::Simple(SimpleCommand::Assign(assigns, _)) => assigns[0]
+                    .value
+                    .0
+                    .iter()
+                    .find_map(|wp| match wp {
+                        WordPart::ArrayLiteral(e) => Some(e.clone()),
+                        _ => None,
+                    })
+                    .expect("ArrayLiteral WordPart"),
+                o => panic!("{o:?}"),
+            },
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(elems.len(), 3);
+        // [2]+=7 — subscripted, append.
+        assert!(elems[0].subscript.is_some() && elems[0].append, "[2]+=7 append: {:?}", elems[0]);
+        // [0]=x — subscripted, NOT append.
+        assert!(elems[1].subscript.is_some() && !elems[1].append, "[0]=x set: {:?}", elems[1]);
+        // 9 — positional, never append.
+        assert!(elems[2].subscript.is_none() && !elems[2].append, "positional: {:?}", elems[2]);
+    }
+
+    #[test]
+    fn atoms_array_literal_append_element_parses() {
+        diff_cmd("x=(1 2 [2]+=7 4)");        // the appendop.tests spelling
+        diff_cmd("a=([one]+=more)");          // assoc-style append element
+        diff_cmd("n=(5 [0]+=3)");             // numeric-append element
+        diff_cmd("a=([i+1]+=v)");             // arithmetic subscript + append
+        // `[i]` followed by `+` that is NOT `+=` is still the missing-`=` error.
+        diff_err("a=([2]+7)");
     }
 
     #[test]
@@ -5358,7 +5492,7 @@ mod tests {
         // falls through to the SAME `FunctionName` error as the oracle.
         assert!(new_seq("a=(one)(two)").is_err(), "error parity for \"a=(one)(two)\"");
         diff_cmd("a=(a)b");                          // text glued after the close paren
-        diff_cmd("cmd a=(1 2) b=(3 4)");             // two array assignments in one command
+        diff_err("cmd a=(1 2) b=(3 4)");             // array literals in ARG position (cmd not a decl builtin) → bash rejects (rc 2)
         diff_cmd("a=(   )");                         // whitespace-only body == empty
         diff_cmd("a=(\n)");                          // newline-only body == empty
         // "nots a =(1 2)" — space before `=` means `a` and `=(1` are SEPARATE
@@ -5904,6 +6038,78 @@ mod tests {
         diff_cmd("cat 3<<EOF\nx\nEOF\n");
     }
 
+    // EOF-closes-heredoc: a top-level BATCH parse (`eof_closes_heredoc=true`)
+    // delimits an open here-document by end-of-input (bash behavior), instead of
+    // erroring `UnterminatedHeredoc`.
+
+    fn new_seq_eof(s: &str) -> Result<Option<Sequence>, ParseError> {
+        let opts = LexerOptions { eof_closes_heredoc: true, ..Default::default() };
+        let mut lx = Lexer::new_live_atoms(s, &Default::default(), opts);
+        parse_sequence(&mut lx)
+    }
+
+    /// Pull the first redirect's heredoc body Word out of a parsed program.
+    fn heredoc_body_text(s: &str) -> String {
+        let cmd = new_seq_eof(s).expect("parse ok").expect("non-empty").first;
+        let e = t6_exec(&cmd);
+        match &e.redirects[0].op {
+            crate::command::RedirOp::Heredoc { body, .. } => body
+                .0
+                .iter()
+                .map(|p| match p {
+                    WordPart::Literal { text, .. } => text.clone(),
+                    o => panic!("unexpected body part {o:?}"),
+                })
+                .collect(),
+            o => panic!("expected Heredoc redirect, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn atoms_heredoc_eof_closes_expanding() {
+        // Requirement (a): with the flag set, `cat <<EOF\nhi` (no close-delimiter
+        // line, EOF ends input) parses to a heredoc whose body is `hi\n` — bash
+        // appends the line separator to the final line even without a trailing
+        // newline in the source.
+        assert_eq!(heredoc_body_text("cat <<EOF\nhi"), "hi\n");
+        // Trailing newline present, still no close delimiter → same body.
+        assert_eq!(heredoc_body_text("cat <<EOF\nhi\n"), "hi\n");
+        // Multi-line body.
+        assert_eq!(heredoc_body_text("cat <<EOF\nhi\nthere"), "hi\nthere\n");
+        // Empty body (bare newline then EOF).
+        assert_eq!(heredoc_body_text("cat <<EOF\n"), "");
+    }
+
+    #[test]
+    fn atoms_heredoc_eof_closes_literal() {
+        // Quoted delimiter → literal body collector; EOF closes it too.
+        assert_eq!(heredoc_body_text("cat <<'EOF'\nhi"), "hi\n");
+        // `<<-` strips leading tabs, EOF-closed.
+        assert_eq!(heredoc_body_text("cat <<-'EOF'\n\thi\n\tthere"), "hi\nthere\n");
+    }
+
+    #[test]
+    fn atoms_heredoc_eof_default_still_errors() {
+        // WITHOUT the flag (the default — used by `classify` and all internal
+        // parses), an open here-document at EOF is still a parse error.
+        assert!(
+            matches!(new_seq("cat <<EOF\nhi"), Err(ParseError::Lex(ref e)) if matches!(**e, crate::lexer::LexError::UnterminatedHeredoc)),
+            "default opts must still error UnterminatedHeredoc: {:?}",
+            new_seq("cat <<EOF\nhi")
+        );
+        assert!(
+            matches!(new_seq("cat <<'EOF'\nhi"), Err(ParseError::Lex(ref e)) if matches!(**e, crate::lexer::LexError::UnterminatedHeredoc)),
+            "default opts (literal) must still error: {:?}",
+            new_seq("cat <<'EOF'\nhi")
+        );
+    }
+
+    #[test]
+    fn atoms_heredoc_eof_closes_properly_closed_unchanged() {
+        // A here-document that IS properly closed is byte-identical with the flag on.
+        assert_eq!(heredoc_body_text("cat <<EOF\nhi\nEOF\n"), "hi\n");
+    }
+
     // v250 T6: mark/rewind heredoc-state generation guard + error parity + adversarial corpus
 
     #[test]
@@ -6420,10 +6626,26 @@ mod tests {
 
     #[test]
     fn atoms_coproc_errors() {
-        diff_err("coproc 123 { :; }");     // 123 invalid ident → anonymous → UnexpectedKeyword("}")
         diff_err("coproc");                // MissingCommand
         diff_err("coproc |cat");           // MissingCommand
         diff_err("coproc a | coproc b");   // 2nd-stage coproc → UnexpectedKeyword("coproc")
+    }
+
+    #[test]
+    fn atoms_coproc_nonidentifier_name_parses() {
+        // bash parses `coproc WORD compound-command` for ANY word as the NAME and
+        // defers the valid-identifier check to RUNTIME (nameref11.sub line 47:
+        // `coproc @ { :; }` parses; runtime prints `` `@': not a valid identifier ``).
+        diff_cmd("coproc @ { :; }");            // non-identifier name + brace group
+        diff_cmd("coproc @ ( : )");             // non-identifier name + subshell
+        diff_cmd("coproc 123 { :; }");          // digit-leading name (was wrongly rejected)
+        diff_cmd("coproc 1x { :; }");
+        diff_cmd("coproc foo-bar { :; }");      // hyphen — not a valid identifier
+        diff_cmd("coproc @ if x; then y; fi");  // non-identifier name + if-compound
+        // Valid-name and anonymous forms are unchanged.
+        diff_cmd("coproc MYCO { :; }");         // valid name (control)
+        diff_cmd("coproc { :; }");              // anonymous brace group
+        diff_cmd("coproc cat");                 // anonymous simple command
     }
 
     #[test]

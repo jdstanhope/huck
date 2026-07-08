@@ -722,8 +722,9 @@ fn array_literal_to_source(elems: &[crate::lexer::ArrayLiteralElement]) -> Strin
     for e in elems {
         match &e.subscript {
             Some(sub) => parts.push(format!(
-                "[{}]={}",
+                "[{}]{}={}",
                 word_to_source(sub),
+                if e.append { "+" } else { "" },
                 word_to_source(&e.value)
             )),
             None => parts.push(word_to_source(&e.value)),
