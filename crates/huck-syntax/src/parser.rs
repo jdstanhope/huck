@@ -1362,7 +1362,7 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
 /// elements (single value, NO brace expansion). Owns the full push/pop
 /// lifecycle of its `ArrayLiteral` frame; pops on every exit path.
 pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseError> {
-    iter.push_mode(Mode::ArrayLiteral { body_started: false, expect_subscript_eq: false, at_element_start: true });
+    iter.push_mode(Mode::ArrayLiteral { body_started: false, expect_subscript_eq: false, at_element_start: true, subscript_append: false });
     let mut elements: Vec<ArrayLiteralElement> = Vec::new();
     loop {
         match iter.peek_kind()? {
@@ -1388,12 +1388,20 @@ pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseErr
                     Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(ParseError::Lex(Box::new(e))); }
                 }
                 iter.pop_mode(); // ParamSubscriptOperand
-                // The lexer consumes the required `=` (or errors
+                // The lexer consumes the required `=` / `+=` (or errors
                 // ArrayLiteralMissingEquals) as `parse_word_command` scans on.
                 let value = match parse_word_command(iter, false) {
                     Ok(v) => v,
                     Err(e) => { iter.pop_mode(); return Err(e); }
                 };
+                // The lexer recorded whether the operator was `+=` (append) on
+                // the ArrayLiteral mode; read it now, before the next element's
+                // scan can overwrite it. Nothing between the operator scan and
+                // here touches this flag.
+                let append = matches!(
+                    iter.current_mode(),
+                    Mode::ArrayLiteral { subscript_append: true, .. }
+                );
                 // An empty value (`[i]= ` / `[i]=)`) re-tokenizes to a single
                 // empty literal in the oracle (`scan_array_element_word`'s
                 // `words.is_empty()` fallback), NOT an empty Word.
@@ -1402,7 +1410,7 @@ pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseErr
                 } else {
                     value
                 };
-                elements.push(ArrayLiteralElement { subscript: Some(sub_word), value });
+                elements.push(ArrayLiteralElement { subscript: Some(sub_word), value, append });
             }
             Some(_) => {
                 // A positional value: parse_word_command stops at the next
@@ -1416,7 +1424,7 @@ pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseErr
                 match brace_expand_parts(value.0) {
                     Ok(expansions) => {
                         for p in expansions {
-                            elements.push(ArrayLiteralElement { subscript: None, value: Word(p) });
+                            elements.push(ArrayLiteralElement { subscript: None, value: Word(p), append: false });
                         }
                     }
                     Err(e) => { iter.pop_mode(); return Err(ParseError::Lex(Box::new(e))); }
@@ -5273,6 +5281,44 @@ mod tests {
         // not an UnexpectedToken error.
         diff_cmd("a=([0]=)");                    // sole empty subscripted value
         diff_cmd("a=([2]=two [0]=)");            // empty value as the LAST element
+    }
+
+    #[test]
+    fn atoms_array_literal_append_element_sets_flag() {
+        // `[expr]+=value` inside an array literal parses and carries append=true;
+        // `[expr]=value` and positional elements carry append=false.
+        let elems = match t6_first("a=([2]+=7 [0]=x 9)") {
+            Command::Pipeline(p) => match &p.commands[0] {
+                Command::Simple(SimpleCommand::Assign(assigns, _)) => assigns[0]
+                    .value
+                    .0
+                    .iter()
+                    .find_map(|wp| match wp {
+                        WordPart::ArrayLiteral(e) => Some(e.clone()),
+                        _ => None,
+                    })
+                    .expect("ArrayLiteral WordPart"),
+                o => panic!("{o:?}"),
+            },
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(elems.len(), 3);
+        // [2]+=7 — subscripted, append.
+        assert!(elems[0].subscript.is_some() && elems[0].append, "[2]+=7 append: {:?}", elems[0]);
+        // [0]=x — subscripted, NOT append.
+        assert!(elems[1].subscript.is_some() && !elems[1].append, "[0]=x set: {:?}", elems[1]);
+        // 9 — positional, never append.
+        assert!(elems[2].subscript.is_none() && !elems[2].append, "positional: {:?}", elems[2]);
+    }
+
+    #[test]
+    fn atoms_array_literal_append_element_parses() {
+        diff_cmd("x=(1 2 [2]+=7 4)");        // the appendop.tests spelling
+        diff_cmd("a=([one]+=more)");          // assoc-style append element
+        diff_cmd("n=(5 [0]+=3)");             // numeric-append element
+        diff_cmd("a=([i+1]+=v)");             // arithmetic subscript + append
+        // `[i]` followed by `+` that is NOT `+=` is still the missing-`=` error.
+        diff_err("a=([2]+7)");
     }
 
     #[test]

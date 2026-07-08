@@ -447,6 +447,11 @@ pub struct ArrayLiteralElement {
     /// `Some(word)` for explicit `[expr]=value`; `None` for positional.
     pub subscript: Option<Word>,
     pub value: Word,
+    /// `true` for the append spelling `[expr]+=value` (only meaningful when
+    /// `subscript` is `Some`). At runtime the element appends to the current
+    /// value of that subscript (string concat, or arithmetic `+=` for an
+    /// integer-flagged array) exactly like a standalone `a[i]+=v`.
+    pub append: bool,
 }
 
 /// Direction of a process substitution: `<(cmd)` reads from the process,
@@ -836,7 +841,7 @@ pub(crate) enum Mode {
     // to this frame by `sync_quotes!` on every `'`/`"` toggle in `scan_step_arith`.
     Arith { paren_depth: u32, in_squote: bool, in_dquote: bool, body_started: bool, for_header: bool, delim: ArithDelim }, // $(( … )) / (( … )) / for (( … )) / $[ … ]
     DoubleQuote { body_started: bool }, // "…" — v247 T3 (parser-driven word-level mode)
-    ArrayLiteral { body_started: bool, expect_subscript_eq: bool, at_element_start: bool },   // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal).
+    ArrayLiteral { body_started: bool, expect_subscript_eq: bool, at_element_start: bool, subscript_append: bool },   // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=`/`+=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal). subscript_append: the operator the lexer just consumed for the CURRENT subscripted element was `+=` (not `=`); the parser reads it via current_mode() after scanning the value.
     Regex { paren_depth: u32, body_started: bool },  // v254: RHS of =~ inside [[ … ]]
     /// v264: an extglob group `<prefix>( … )` (`?(...)`/`*(...)`/`+(...)`/
     /// `@(...)`/`!(...)`, gated by `LexerOptions::extglob`). `paren_depth == 0`
@@ -1311,7 +1316,7 @@ impl<'a> Lexer<'a> {
             Mode::Arith { paren_depth, in_squote, in_dquote, body_started, for_header, delim } =>
                 self.scan_step_arith(paren_depth, in_squote, in_dquote, body_started, for_header, delim),
             Mode::DoubleQuote { body_started } => self.scan_step_dquote(body_started),
-            Mode::ArrayLiteral { body_started, expect_subscript_eq, at_element_start } =>
+            Mode::ArrayLiteral { body_started, expect_subscript_eq, at_element_start, .. } =>
                 self.scan_step_array_literal(body_started, expect_subscript_eq, at_element_start),
             Mode::Regex { paren_depth, body_started } => self.scan_step_regex(paren_depth, body_started),
             Mode::Extglob { paren_depth } => self.scan_step_extglob(paren_depth),
@@ -4400,13 +4405,29 @@ impl<'a> Lexer<'a> {
         // even a `[` — is treated as literal, not another subscript. If `=` is
         // absent → ArrayLiteralMissingEquals.
         if expect_subscript_eq {
-            if let Some(Mode::ArrayLiteral { expect_subscript_eq: e, .. }) = self.modes.last_mut() {
-                *e = false;
-            }
+            // The subscript's assignment operator: `=` (set) or `+=` (append).
+            // Record which for the parser (read via current_mode() after it
+            // scans the value). `[expr]` followed by neither is the same error
+            // the set-only path always raised.
+            let mut append = false;
             if self.cursor.peek() == Some(&'=') {
                 self.cursor.next(); // consume the required '='
+            } else if self.cursor.peek() == Some(&'+') {
+                let mut p = self.cursor.clone();
+                p.next();
+                if p.peek() == Some(&'=') {
+                    self.cursor.next(); // consume '+'
+                    self.cursor.next(); // consume '='
+                    append = true;
+                } else {
+                    return Err(LexError::ArrayLiteralMissingEquals);
+                }
             } else {
                 return Err(LexError::ArrayLiteralMissingEquals);
+            }
+            if let Some(Mode::ArrayLiteral { expect_subscript_eq: e, subscript_append: sa, .. }) = self.modes.last_mut() {
+                *e = false;
+                *sa = append;
             }
         }
         let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
