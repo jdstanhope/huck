@@ -595,7 +595,7 @@ pub enum TokenKind {
     ParamOp(ParamOpKind),
     Lit { text: String, quoted: bool },
     DollarName { name: String, quoted: bool },
-    DeferredExpansion,   // $(...) inside a nested "..." operand span (both the continuing-dquote site and the first-char-of-a-newly-opened-dquote site) — still deferred: unquoted-operand $(cmd) handled by CmdSubOpen in v244; unquoted+continuing-dquote-operand backtick handled by BeginBacktick in v245 T6; unquoted-operand $(( handled by ArithOpen in v246 T6 (the in-dquote sites for $(cmd)/$(( stay deferred — see the ArithOpen wiring note at the continuing-dquote `$(` site)
+    DeferredExpansion,   // defensive fallback emitted ONLY by scan_step_command_sub when the cursor is not on a real `$(`/`(`/backtick opener (test-drive robustness). G1/v270 WIRED the operand-in-dquote sites: `$(cmd)`/`$((expr))`/backtick inside a `"…"` span within a `${…}` operand now emit real opener signals (CmdSubOpen/ArithOpen/BeginBacktick), quoted:true carried to the parser via Lexer::operand_in_dquote().
     CmdSubOpen,          // $( opener atom — dual role: signal in an operand mode (v244 wiring), real opener in CommandSub mode
     ProcSubOpen { dir: ProcDir },  // v251: `<(`/`>(` word-part signal (unquoted); parser assembles WordPart::ProcessSub via Mode::CommandSub. Cursor is left on `(`.
     ArrayOpen,   // v252: zero-width signal that a compound array RHS `(…)` follows an assignment prefix; cursor left on `(`. Parser pushes Mode::ArrayLiteral.
@@ -1030,6 +1030,35 @@ impl<'a> Lexer<'a> {
 
     pub(crate) fn current_mode(&self) -> Mode {
         *self.modes.last().expect("mode stack is never empty (Command is the floor)")
+    }
+
+    /// True when the top-of-stack mode is a `${…}` operand scanner currently
+    /// INSIDE its inline `"…"` span (`in_dquote == true`). The parser queries
+    /// this at the exact moment it dispatches an operand-position opener signal
+    /// (`CmdSubOpen`/`ArithOpen`/`BeginBacktick`) to decide the resulting
+    /// `WordPart`'s `quoted` bit: a `$(…)`/`$((…))`/`` `…` `` inside a quoted
+    /// operand span must NOT be word-split (`quoted: true`), matching bash
+    /// (`${y:-"$(printf "a b")"}` → one field). An UNQUOTED-operand opener
+    /// reads `false` here and stays word-splittable.
+    ///
+    /// TIMING (why reading live lexer state is sound): the lexer is pull-based
+    /// with single-token lookahead. When the parser peeks/consumes the opener
+    /// signal, `fill_to` produced exactly that token and stopped, so
+    /// `modes.last()` still reflects the operand frame at the signal's position
+    /// — the frame's `in_dquote` was set by the SAME scan step that emitted the
+    /// signal (the operand sites here call `set_operand_in_dquote(true)`), and
+    /// the parser has not yet pushed the sub-parse mode nor run a later scan.
+    /// Query it INSIDE the dispatch arm, before `parse_command_sub` et al. push.
+    pub(crate) fn operand_in_dquote(&self) -> bool {
+        matches!(
+            self.modes.last(),
+            Some(
+                Mode::ParamWordOperand            { in_dquote: true, .. }
+                | Mode::ParamSubstPatternOperand    { in_dquote: true, .. }
+                | Mode::ParamSubstringOffsetOperand { in_dquote: true, .. }
+                | Mode::ParamSubscriptOperand       { in_dquote: true, .. },
+            )
+        )
     }
 
     /// v264 flip-fix (Finding 1): read the brace-expand flag (`set +B` clears it).
@@ -1756,19 +1785,22 @@ impl<'a> Lexer<'a> {
                             self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(off, l, c)));
                         }
                         Some('(') => {
-                            // NOTE (v246 T6): unlike the unquoted operand site below,
-                            // this continuing-nested-dquote site is NOT wired to
-                            // ArithOpen. `CmdSubOpen` was likewise never wired here for
-                            // `$(cmd)` (still deferred) — see the `DeferredExpansion`
-                            // TokenKind doc comment. Signal atoms (ArithOpen/CmdSubOpen/
-                            // BeginBacktick) carry no `quoted` bit of their own, so
-                            // wiring this site would silently drop the "inside a nested
-                            // `"…"`" quoted-context onto the resulting WordPart (verified:
-                            // produces `quoted:false` where the oracle emits `true`).
-                            // Both `$((` and `$(cmd)` remain deferred here.
-                            self.cursor.next(); // `$`
-                            self.cursor.next(); // `(`
-                            self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                            // `$(cmd)` / `$((expr))` inside a CONTINUING `"…"` operand
+                            // span. Emit the ZERO-WIDTH opener signal (cursor stays on
+                            // `$`) exactly like the unquoted-operand site below; the
+                            // parser pushes Mode::CommandSub/Arith whose first scan
+                            // consumes `$(`/`$((`. `probe` is past `$`, so `probe.peek()`
+                            // is the first `(`; probe one more to distinguish `$((`.
+                            // The quoted context (we are inside `"…"`) reaches the parser
+                            // via `Lexer::operand_in_dquote()`, which reads this frame's
+                            // `in_dquote` at dispatch time (see G1 / v270).
+                            let mut probe2 = probe.clone();
+                            probe2.next(); // skip the first `(`
+                            if probe2.peek() == Some(&'(') {
+                                self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
+                            } else {
+                                self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
+                            }
                         }
                         Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
                             self.cursor.next(); // `$`
@@ -2029,9 +2061,13 @@ impl<'a> Lexer<'a> {
 
                         // Backtick as the first char inside `"…"`.
                         Some('`') => {
-                            self.cursor.next();
+                            // Emit the BeginBacktick SIGNAL without consuming `` ` ``
+                            // (mirrors the continuing-span backtick site); the parser
+                            // pushes Mode::Backtick which consumes the opening `` ` ``.
+                            // Mark the span open so the rest scans in-dquote; the quoted
+                            // context reaches the parser via `operand_in_dquote()`.
                             self.history.push(Token::new(
-                                TokenKind::DeferredExpansion,
+                                TokenKind::BeginBacktick,
                                 Span::new(in_off, in_l, in_c),
                             ));
                             self.set_operand_in_dquote(true);
@@ -2052,9 +2088,19 @@ impl<'a> Lexer<'a> {
                                     self.set_operand_in_dquote(true);
                                 }
                                 Some('(') => {
-                                    self.cursor.next(); // `$`
-                                    self.cursor.next(); // `(`
-                                    self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(in_off, in_l, in_c)));
+                                    // `$(cmd)` / `$((expr))` as the FIRST char inside a
+                                    // `"…"` operand span. Zero-width opener signal
+                                    // (cursor stays on `$`); the parser's pushed
+                                    // Mode::CommandSub/Arith consumes `$(`/`$((`. `probe`
+                                    // is past `$`, so `probe.peek()` is the first `(`.
+                                    // Quoted context via `operand_in_dquote()`.
+                                    let mut probe2 = probe.clone();
+                                    probe2.next(); // skip the first `(`
+                                    if probe2.peek() == Some(&'(') {
+                                        self.history.push(Token::new(TokenKind::ArithOpen, Span::new(in_off, in_l, in_c)));
+                                    } else {
+                                        self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(in_off, in_l, in_c)));
+                                    }
                                     self.set_operand_in_dquote(true);
                                 }
                                 Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
@@ -6762,6 +6808,46 @@ mod tests {
         // v246 T6: `$((` in an unquoted operand emits ArithOpen (zero-width signal).
         let a = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
         assert_eq!(a[0], TokenKind::ArithOpen, "$(( must emit ArithOpen signal");
+    }
+
+    /// G1/v270: a `$(…)`/`$((…))`/`` `…` `` inside a `"…"` span within a `${…}`
+    /// operand emits the REAL opener signal (not the old `DeferredExpansion`),
+    /// and `operand_in_dquote()` reads `true` at the moment the signal is pulled
+    /// (both the FIRST-char-of-span and the CONTINUING-span sites).
+    #[test]
+    fn operand_dquote_expansion_signals() {
+        // Drive an operand mode and return (first signal kind, operand_in_dquote()
+        // observed right after that signal was pulled). Stops at the first opener
+        // signal (parser would push the sub-mode there).
+        fn signal_and_quoted(s: &str) -> (TokenKind, bool) {
+            let mut lx = Lexer::new(s, LexerOptions::default(), true);
+            lx.push_mode(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
+            while let Some(t) = lx.next_token().unwrap() {
+                if matches!(t.kind, TokenKind::CmdSubOpen | TokenKind::ArithOpen | TokenKind::BeginBacktick) {
+                    let q = lx.operand_in_dquote();
+                    return (t.kind, q);
+                }
+                assert!(
+                    !matches!(t.kind, TokenKind::DeferredExpansion),
+                    "operand-in-dquote expansion must NOT emit DeferredExpansion"
+                );
+            }
+            panic!("no opener signal emitted for {s:?}");
+        }
+
+        // FIRST char of the `"…"` span.
+        assert_eq!(signal_and_quoted("\"$(x)\"}"),      (TokenKind::CmdSubOpen,    true));
+        assert_eq!(signal_and_quoted("\"$((1+1))\"}"),  (TokenKind::ArithOpen,     true));
+        assert_eq!(signal_and_quoted("\"`x`\"}"),       (TokenKind::BeginBacktick, true));
+        // CONTINUING the span (a literal precedes the expansion).
+        assert_eq!(signal_and_quoted("\"a$(x)\"}"),     (TokenKind::CmdSubOpen,    true));
+        assert_eq!(signal_and_quoted("\"a$((1+1))\"}"), (TokenKind::ArithOpen,     true));
+        assert_eq!(signal_and_quoted("\"a`x`\"}"),      (TokenKind::BeginBacktick, true));
+
+        // Regression: an UNQUOTED-operand opener reads `false` (still splittable).
+        assert_eq!(signal_and_quoted("$(x)}"),          (TokenKind::CmdSubOpen,    false));
+        assert_eq!(signal_and_quoted("$((1+1))}"),      (TokenKind::ArithOpen,     false));
+        assert_eq!(signal_and_quoted("`x`}"),           (TokenKind::BeginBacktick, false));
     }
 
     // ── v247 T7: Command-mode atom-stream shape ──────────────────────────────
