@@ -47,6 +47,33 @@ checkf "assign colon named" 'HOME=/h; x=~/a:~root; echo "$x"'
 checkf "mid-word tilde"    'HOME=/h; echo a~b'
 checkf "unknown ~prefix"   'HOME=/h; echo ~+abc'
 
+# ---- A bare `~` immediately before `)` is a tilde (the `)` terminates the
+# tilde-prefix): case patterns, command subs, subshells. Previously huck kept
+# `~` literal because `is_tilde_terminator` lacked `)`.
+checkf "case ~ in ~)"      'HOME=/h; case ~ in ~) echo "ok 2";; \~) echo bad2a;; *) echo "bad 2b";; esac'
+checkf "case subj+pat ~)"  'HOME=/h; case ~ in ~) echo M;; *) echo N;; esac'
+checkf "cmdsub bare ~)"    'HOME=/h; echo $(echo ~)'
+checkf "cmdsub ~+ )"       'cd /tmp; echo $(echo ~+)'
+checkf "cmdsub ~root )"    'echo $(echo ~root)'
+# `(~)`: the `~` is the subshell's command word, glued to `)`. Both shells
+# tilde-expand it to /h then fail to exec it; the exec error TEXT differs
+# (unrelated pre-existing divergence), so assert only that /h was produced.
+checkf "subshell (~)"      'HOME=/h; (~) 2>&1 | grep -o "/h" | head -1'
+checkf "case ~/bin) ok"    'HOME=/h; case /h/bin in ~/bin) echo M;; *) echo N;; esac'
+checkf "case ~|x) alt"     'HOME=/h; case /h in ~|x) echo M;; *) echo N;; esac'
+
+# ---- POSIX restricts ASSIGNMENT-CONTEXT tilde (`~` after `=`/`:` in a
+# name=value word) to real assignment statements. In posix mode an assign-ctx
+# tilde in a plain command ARGUMENT stays literal; leading assignments,
+# declaration-builtin args, and word-start tildes still expand.
+checkf "arg :~ non-posix"  'HOME=/h; echo foo=bar:~'
+checkf "arg :~ POSIX"      'HOME=/h; set -o posix; echo foo=bar:~'
+checkf "arg =~ POSIX"      'HOME=/h; set -o posix; echo foo=~'
+checkf "arg =~/x POSIX"    'HOME=/h; set -o posix; echo v=~/x'
+checkf "leading :~ POSIX"  'HOME=/h; set -o posix; foo=bar:~ env | grep "^foo="'
+checkf "export :~ POSIX"   'HOME=/h; set -o posix; export foo=bar:~; echo "$foo"'
+checkf "word-start ~ POSIX" 'HOME=/h; set -o posix; echo ~/x ~'
+
 # DIVERGENCE (reported): echo ~root:~root
 #   bash=[/root:~root]  huck=[~root:~root]
 # huck fails to expand a NAMED-user tilde (~root) at word start when the tilde
