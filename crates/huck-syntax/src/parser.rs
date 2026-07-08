@@ -1361,6 +1361,23 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
 /// `brace_expand_parts`) and — v252 T3 — explicit `[expr]=value` subscripted
 /// elements (single value, NO brace expansion). Owns the full push/pop
 /// lifecycle of its `ArrayLiteral` frame; pops on every exit path.
+/// True when a command word (its leading `name=(…)` compound assignment) may
+/// appear in ARGUMENT position — bash's `ASSIGNMENT_BUILTIN` set plus the
+/// hard-coded `eval`/`let` (see parse.y `read_token_word`, `PST_ASSIGNOK`).
+fn is_compound_assignment_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "declare" | "typeset" | "local" | "export" | "readonly" | "alias" | "eval" | "let"
+    )
+}
+
+/// True when a word carries a `name=(…)` compound array-literal assignment (an
+/// `ArrayLiteral` part). Used to gate its position: valid only as a leading
+/// assignment or as an argument to a declaration builtin.
+fn word_has_array_literal(w: &Word) -> bool {
+    w.0.iter().any(|p| matches!(p, WordPart::ArrayLiteral(_)))
+}
+
 pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseError> {
     iter.push_mode(Mode::ArrayLiteral { body_started: false, expect_subscript_eq: false, at_element_start: true, subscript_append: false });
     let mut elements: Vec<ArrayLiteralElement> = Vec::new();
@@ -2465,6 +2482,32 @@ fn parse_simple_with_leading_word(
 
     if all_words.is_empty() && redirects.is_empty() {
         return Err(ParseError::MissingCommand);
+    }
+
+    // A `name=(…)` array-literal (compound assignment) is only valid in an
+    // assignment-acceptable position, matching bash's parser: as a LEADING
+    // assignment (every preceding word is assignment-shaped, i.e. still in the
+    // command-word prefix), or as an argument to a declaration builtin — bash's
+    // `ASSIGNMENT_BUILTIN` set (declare/typeset/local/export/readonly/alias)
+    // plus the hard-coded `eval`/`let` (parse.y `read_token_word`,
+    // `PST_ASSIGNOK`). Anywhere else bash rejects the unexpected `(` with a
+    // syntax error (`printf … a=(a b)` → rc 2). The lexer emits `ArrayOpen`
+    // wherever it sees `name=(` at a word start regardless of position, so this
+    // is the parser's job (delimiter/position ownership stays with the parser).
+    let command_word_is_decl_builtin = all_words
+        .iter()
+        .find(|w| !crate::command::is_assignment_word(w))
+        .and_then(|w| crate::command::word_literal_text(w))
+        .is_some_and(is_compound_assignment_builtin);
+    for (i, w) in all_words.iter().enumerate() {
+        if !word_has_array_literal(w) {
+            continue;
+        }
+        let in_leading_prefix =
+            all_words[..i].iter().all(crate::command::is_assignment_word);
+        if !in_leading_prefix && !command_word_is_decl_builtin {
+            return Err(ParseError::UnexpectedToken);
+        }
     }
 
     // Peel leading assignments from the front — mirrors `finalize_stage`.
@@ -5253,7 +5296,37 @@ mod tests {
         diff_cmd("a=(a|b c;d e<f)");      // |;&<> literal inside values
         diff_cmd("a=({1..3})");           // brace-expanded bare element -> 1 2 3
         diff_cmd("a=(x{a,b}y)");          // brace expansion with prefix/suffix
-        diff_cmd("pre a=(1 2) post");     // assignment mid-command still one word
+        diff_err("pre a=(1 2) post");     // array literal in ARG position → bash rejects (rc 2)
+    }
+
+    #[test]
+    fn atoms_array_literal_arg_position_rejected() {
+        // A `name=(…)` compound array assignment is valid ONLY as a leading
+        // assignment or as an argument to a declaration builtin; elsewhere bash
+        // rejects the unexpected `(` (rc 2). Mirror that.
+        diff_err("printf \"%s\\n\" -a a=(a b)"); // array1.sub line 1
+        diff_err("echo a=(x)");                  // plain command arg
+        diff_err("echo a+=(3)");                 // append form as arg
+        diff_err("foo a=(1) b=(2)");             // non-decl command, two array args
+        diff_err("command declare a=(1 2)");     // `command` is not a decl builtin
+        // Valid positions still parse:
+        diff_cmd("a=(1 2)");                     // sole leading assignment
+        diff_cmd("a=(1) b=(2)");                 // consecutive leading assignments
+        diff_cmd("x=1 a=(1 2)");                 // scalar + array leading prefix
+        diff_cmd("declare -a a=(1 2)");          // declaration builtin argument
+        diff_cmd("declare a=(1 2) b=(3 4)");     // two array args to declare
+        diff_cmd("local a=(1 2)");
+        diff_cmd("export a=(1 2)");
+        diff_cmd("readonly a=(1 2)");
+        diff_cmd("typeset a=(1 2)");
+        diff_cmd("alias a=(1 2)");
+        diff_cmd("eval a=(1 2)");
+        diff_cmd("let a=(1 2)");
+        diff_cmd("x=1 declare a=(1 2)");          // decl builtin after leading assign
+        // Unaffected shapes: element assign, append scalar, quoted `=(`.
+        diff_cmd("a[0]=x");
+        diff_cmd("a+=(3)");                       // leading append array
+        diff_cmd("echo \"a=(x)\"");               // quoted, not an array literal
     }
 
     #[test]
@@ -5404,7 +5477,7 @@ mod tests {
         // falls through to the SAME `FunctionName` error as the oracle.
         assert!(new_seq("a=(one)(two)").is_err(), "error parity for \"a=(one)(two)\"");
         diff_cmd("a=(a)b");                          // text glued after the close paren
-        diff_cmd("cmd a=(1 2) b=(3 4)");             // two array assignments in one command
+        diff_err("cmd a=(1 2) b=(3 4)");             // array literals in ARG position (cmd not a decl builtin) → bash rejects (rc 2)
         diff_cmd("a=(   )");                         // whitespace-only body == empty
         diff_cmd("a=(\n)");                          // newline-only body == empty
         // "nots a =(1 2)" — space before `=` means `a` and `=(1` are SEPARATE
