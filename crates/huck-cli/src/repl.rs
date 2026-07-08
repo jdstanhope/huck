@@ -3,6 +3,7 @@
 //! terminal-free `huck_engine`.
 
 use std::cell::RefCell;
+use std::io::IsTerminal;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -338,6 +339,43 @@ fn apply_readline_settings(
 
 /// Reads one logical command, gathering continuation lines until the
 /// accumulated buffer classifies as `Complete` or a genuine `Error`.
+/// Reads one physical line from STDIN_FILENO one byte at a time via `libc::read`,
+/// stopping after a consumed (but excluded) `\n` or at EOF. Returns `None` only at
+/// EOF with no bytes read; a final line without a trailing newline is returned as
+/// `Some`. Byte-at-a-time is REQUIRED for a non-seekable / shared script stream: a
+/// child process or the `read` builtin that inherits fd 0 must see the correct
+/// stream position, so the reader must not consume past the current line. (bash
+/// reads non-interactive command input from a pipe one character at a time for the
+/// same reason; rustyline's `readline_direct` uses a read-ahead BufReader that
+/// would swallow the rest of the script.)
+fn read_stdin_line_raw() -> Option<String> {
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        let mut b = [0u8; 1];
+        let n = unsafe {
+            libc::read(libc::STDIN_FILENO, b.as_mut_ptr() as *mut libc::c_void, 1)
+        };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break; // hard read error → treat as EOF for this line
+        }
+        if n == 0 {
+            break; // EOF
+        }
+        if b[0] == b'\n' {
+            return Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.push(b[0]);
+    }
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
 fn read_logical_command(
     editor: &mut Editor<HuckHelper, FileHistory>,
     cell: &RefCell<Shell>,
@@ -349,6 +387,11 @@ fn read_logical_command(
     // The reason the buffer-so-far is incomplete, and the line that
     // caused it — together they pick the joiner for the next line.
     let mut pending: Option<(huck_engine::continuation::ContinuationReason, String)> = None;
+
+    // Non-tty stdin (a piped or redirected script): read the script byte-at-a-time
+    // from fd 0 rather than through rustyline, so a child process / `read` builtin
+    // sharing fd 0 sees the correct stream position (see `read_stdin_line_raw`).
+    let non_tty = !std::io::stdin().is_terminal();
 
     loop {
         let expanded = {
@@ -378,7 +421,13 @@ fn read_logical_command(
         // measurement and the full styled string for display (B-01). For a marker-free
         // prompt the two are identical, so plain prompts are unaffected.
         let measured = huck_engine::prompt::prompt_raw(&expanded);
-        match editor.readline(&(measured, expanded)) {
+        let read = if non_tty {
+            // No prompt for non-tty; read one line straight from fd 0.
+            read_stdin_line_raw().ok_or(ReadlineError::Eof)
+        } else {
+            editor.readline(&(measured, expanded))
+        };
+        match read {
             Ok(raw) => {
                 // History expansion runs per physical line, as before.
                 let line = {
