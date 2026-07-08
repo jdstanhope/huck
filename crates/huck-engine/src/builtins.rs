@@ -2385,9 +2385,7 @@ fn split_read_fields(line: &str, ifs: &str) -> Vec<String> {
 }
 
 #[cfg(unix)]
-unsafe fn silent_disable_echo() -> Option<libc::termios> {
-    use std::os::unix::io::AsRawFd;
-    let fd = std::io::stdin().as_raw_fd();
+unsafe fn silent_disable_echo(fd: std::os::unix::io::RawFd) -> Option<libc::termios> {
     if unsafe { libc::isatty(fd) } == 0 {
         return None;
     }
@@ -2402,31 +2400,38 @@ unsafe fn silent_disable_echo() -> Option<libc::termios> {
 }
 
 #[cfg(unix)]
-unsafe fn silent_restore_echo(saved: libc::termios) {
-    use std::os::unix::io::AsRawFd;
-    let fd = std::io::stdin().as_raw_fd();
+unsafe fn silent_restore_echo(fd: std::os::unix::io::RawFd, saved: libc::termios) {
     let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
 }
 
-/// Reads one byte at a time from STDIN_FILENO via `libc::read`,
-/// bypassing Rust's shared `std::io::stdin()` BufReader. Necessary
-/// because rustyline's non-tty `readline_direct` path fills that same
+/// Reads one byte at a time from a raw OS file descriptor via `libc::read`,
+/// bypassing Rust's shared `std::io::stdin()` BufReader. For fd 0 this is
+/// necessary because rustyline's non-tty `readline_direct` path fills that same
 /// BufReader with script-ahead bytes; using it here would return
-/// cached script bytes instead of the redirected fd 0.
-struct RawStdinReader;
+/// cached script bytes instead of the redirected fd 0. For `read -u FD` it
+/// reads directly from the caller-chosen fd.
+struct RawFdReader {
+    fd: std::os::unix::io::RawFd,
+}
 
-impl RawStdinReader {
+impl RawFdReader {
+    /// Default reader over fd 0 (stdin).
     fn new() -> Self {
-        RawStdinReader
+        RawFdReader { fd: libc::STDIN_FILENO }
+    }
+
+    /// Reader over an arbitrary already-open fd (`read -u FD`).
+    fn from_fd(fd: std::os::unix::io::RawFd) -> Self {
+        RawFdReader { fd }
     }
 }
 
-impl std::io::Read for RawStdinReader {
+impl std::io::Read for RawFdReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             let n = unsafe {
                 libc::read(
-                    libc::STDIN_FILENO,
+                    self.fd,
                     buf.as_mut_ptr() as *mut libc::c_void,
                     buf.len(),
                 )
@@ -2556,7 +2561,7 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
         return ExecOutcome::Continue(1);
     }
 
-    let mut handle = RawStdinReader::new();
+    let mut handle = RawFdReader::new();
     // Skip the first `skip` records.
     for _ in 0..skip {
         match read_one_record(&mut handle, delim) {
@@ -2629,6 +2634,8 @@ fn builtin_read(
     let mut prompt: Option<String> = None;
     let mut delim: u8 = b'\n';
     let mut array_name: Option<String> = None;
+    // `-u FD`: read from this file descriptor instead of stdin. `None` = stdin.
+    let mut read_fd: Option<std::os::unix::io::RawFd> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -2678,6 +2685,22 @@ fn builtin_read(
                     array_name = Some(v);
                     break;
                 }
+                b'u' => {
+                    let v = match take_opt_value(args, &mut i, bytes, j, "read", 'u', err, shell) {
+                        Ok(v) => v,
+                        Err(rc) => return ExecOutcome::Continue(rc),
+                    };
+                    // A non-numeric fd spec is rejected up front (bash:
+                    // "read: <val>: invalid file descriptor specification").
+                    match v.trim().parse::<std::os::unix::io::RawFd>() {
+                        Ok(fd) if fd >= 0 => read_fd = Some(fd),
+                        _ => {
+                            crate::sh_error_to!(shell, err, None, "read: {v}: invalid file descriptor specification");
+                            return ExecOutcome::Continue(1);
+                        }
+                    }
+                    break;
+                }
                 c => {
                     crate::sh_error_to!(shell, err, None, "read: -{}: invalid option", c as char);
                     return ExecOutcome::Continue(2);
@@ -2703,6 +2726,16 @@ fn builtin_read(
         return ExecOutcome::Continue(1);
     }
 
+    // `-u FD`: validate the fd is actually open BEFORE reading (bash checks
+    // immediately via fcntl(fd, F_GETFD) == -1 && errno == EBADF), so an
+    // unopened fd errors without consuming any input.
+    if let Some(fd) = read_fd
+        && unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1
+    {
+        crate::sh_error_to!(shell, err, None, "read: {fd}: invalid file descriptor: Bad file descriptor");
+        return ExecOutcome::Continue(1);
+    }
+
     // Prompt — only when stdin is a tty (matches bash).
     if let Some(p) = &prompt {
         use std::io::IsTerminal;
@@ -2712,11 +2745,13 @@ fn builtin_read(
         }
     }
 
-    // -s silent: toggle ECHO off on stdin's tty for the duration of
-    // the read, then restore.
+    // -s silent: toggle ECHO off on the read fd's tty (stdin unless `-u FD`)
+    // for the duration of the read, then restore.
+    #[cfg(unix)]
+    let tty_fd = read_fd.unwrap_or(libc::STDIN_FILENO);
     #[cfg(unix)]
     let saved_term = if silent {
-        unsafe { silent_disable_echo() }
+        unsafe { silent_disable_echo(tty_fd) }
     } else {
         None
     };
@@ -2727,7 +2762,10 @@ fn builtin_read(
     // with subsequent script lines on a single underlying read; using
     // BufReader here would return cached script bytes instead of the
     // redirected fd 0 (e.g. our `<<<` here-string pipe).
-    let mut handle = RawStdinReader::new();
+    let mut handle = match read_fd {
+        Some(fd) => RawFdReader::from_fd(fd),
+        None => RawFdReader::new(),
+    };
     let line_opt = match read_one_line(&mut handle, raw, delim) {
         Ok(opt) => opt,
         Err(e) => {
@@ -2735,7 +2773,7 @@ fn builtin_read(
             #[cfg(unix)]
             if let Some(s) = saved_term {
                 unsafe {
-                    silent_restore_echo(s);
+                    silent_restore_echo(tty_fd, s);
                 }
             }
             return ExecOutcome::Continue(1);
@@ -2754,7 +2792,7 @@ fn builtin_read(
     #[cfg(unix)]
     if let Some(s) = saved_term {
         unsafe {
-            silent_restore_echo(s);
+            silent_restore_echo(tty_fd, s);
         }
     }
     if was_silenced {
@@ -10842,6 +10880,74 @@ mod read_tests {
         let mut c = Cursor::new(b"foo\0bar".as_slice());
         let r = read_one_line(&mut c, false, 0u8).unwrap();
         assert_eq!(r.as_deref(), Some("foo"));
+    }
+
+    // ── read -u FD ──────────────────────────────────────────────
+
+    fn run_read(args: &[&str], shell: &mut crate::shell_state::Shell) -> (i32, String) {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let rc = match builtin_read(&argv, &mut out, &mut err, shell) {
+            ExecOutcome::Continue(c) => c,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        (rc, String::from_utf8_lossy(&err).into_owned())
+    }
+
+    #[test]
+    fn read_u_nonnumeric_fd_is_spec_error() {
+        let mut shell = crate::shell_state::Shell::new();
+        let (rc, err) = run_read(&["-u", "xyz", "v"], &mut shell);
+        assert_eq!(rc, 1);
+        assert!(
+            err.contains("xyz: invalid file descriptor specification"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_u_separate_and_bundled_read_from_pipe() {
+        // Create a real OS pipe, write a line into it, and read it back via
+        // `read -u FD` in both the separate (`-u N`) and bundled (`-uN`) forms.
+        for bundled in [false, true] {
+            let mut fds = [0 as std::os::unix::io::RawFd; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            let (rfd, wfd) = (fds[0], fds[1]);
+            let payload = b"hello world extra\n";
+            let n = unsafe {
+                libc::write(wfd, payload.as_ptr() as *const libc::c_void, payload.len())
+            };
+            assert_eq!(n, payload.len() as isize);
+            unsafe { libc::close(wfd) };
+
+            let mut shell = crate::shell_state::Shell::new();
+            let fd_str = rfd.to_string();
+            let (rc, err) = if bundled {
+                run_read(&[&format!("-u{fd_str}"), "a", "b"], &mut shell)
+            } else {
+                run_read(&["-u", &fd_str, "a", "b"], &mut shell)
+            };
+            unsafe { libc::close(rfd) };
+            assert_eq!(rc, 0, "err: {err}");
+            assert_eq!(shell.get("a"), Some("hello"));
+            // Remaining fields collapse into the last name (IFS join preserved).
+            assert_eq!(shell.get("b"), Some("world extra"));
+        }
+    }
+
+    #[test]
+    fn read_u_unopened_fd_is_bad_file_descriptor() {
+        // Pick an fd that is (almost certainly) not open, verify up-front.
+        let fd: std::os::unix::io::RawFd = 90;
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        let mut shell = crate::shell_state::Shell::new();
+        let (rc, err) = run_read(&["-u", "90", "v"], &mut shell);
+        assert_eq!(rc, 1);
+        assert!(
+            err.contains("90: invalid file descriptor: Bad file descriptor"),
+            "got: {err}"
+        );
     }
 
     // ── read_one_record ────────────────────────────────────────
