@@ -3181,8 +3181,13 @@ impl<'a> Lexer<'a> {
                 if ch == '\n' { got_nl = true; break; }
                 line.push(ch);
             }
+            // `<<-` matches a close line by its tab-stripped form OR its raw form
+            // against the raw delimiter word: `<<-$'\tEND'` (a quoted tab-indented
+            // delimiter) matches a `\tEND` close line raw, but does NOT match a
+            // bare `END` close line (bash strips the close line's tabs but keeps
+            // the delimiter's — see heredoc3.sub + heredoc_dash_tab_delim harness).
             let check = if ph.strip_tabs { line.trim_start_matches('\t') } else { &line[..] };
-            if check == ph.delim {
+            if check == ph.delim || line == ph.delim {
                 // Close delimiter reached — emit the accumulated Lit + End, pop.
                 let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
                 if !body.is_empty() {
@@ -3447,8 +3452,10 @@ impl<'a> Lexer<'a> {
         }
         // Leading `<<-` tabs are already stripped on the real cursor; `trim` here is
         // a harmless no-op that also matches the oracle's whole-line strip.
+        // See `scan_step_heredoc_body_literal`: `<<-` matches on the tab-stripped
+        // OR the raw close line against the raw delimiter word.
         let check = if ph.strip_tabs { line.trim_start_matches('\t') } else { &line[..] };
-        if check == ph.delim { Some(consumed) } else { None }
+        if check == ph.delim || line == ph.delim { Some(consumed) } else { None }
     }
 
     /// v250 T4: emit ONE atom for a `$`-expansion in a QUOTED operand context —
