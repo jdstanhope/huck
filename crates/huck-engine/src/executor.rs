@@ -8468,6 +8468,37 @@ mod tests {
         );
     }
 
+    /// A `for`/`select` loop may use a `{ … }` brace group in place of
+    /// `do … done` (ksh-derived, accepted by bash). The loop must actually
+    /// iterate, and `break`/`continue` must work inside the brace body.
+    #[test]
+    #[cfg(unix)]
+    fn for_brace_body_iterates_with_break_continue() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let run = |src: &str| -> String {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut shell = Shell::new();
+            {
+                let mut out = StdoutSink::Capture(&mut buf);
+                let mut err = StderrSink::Capture(&mut Vec::new());
+                let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(src, &Default::default(), crate::lexer::LexerOptions::default())).expect("parse").expect("seq");
+                execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        // Word-list brace body iterates.
+        assert_eq!(run("for x in a b c; { echo $x; }"), "a\nb\nc\n");
+        // C-style brace body iterates.
+        assert_eq!(run("for ((i=0;i<3;i++)) { echo $i; }"), "0\n1\n2\n");
+        // break/continue inside the brace body.
+        assert_eq!(
+            run("for x in 1 2 3 4; { [ $x = 3 ] && break; [ $x = 1 ] && continue; echo $x; }"),
+            "2\n"
+        );
+        // Nested brace-body loops.
+        assert_eq!(run("for x in 1 2; { for y in a b; { echo $x$y; } }"), "1a\n1b\n2a\n2b\n");
+    }
+
     // ----- external-process stderr capture / Merged --------------------------
 
     /// `/bin/sh -c 'echo out; echo err >&2'` with split capture sinks:

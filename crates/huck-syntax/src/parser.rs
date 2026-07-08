@@ -3546,6 +3546,11 @@ fn parse_if(iter: &mut Lexer) -> Result<Command, ParseError> {
 fn parse_do_body_done(iter: &mut Lexer) -> Result<Sequence, ParseError> {
     loop {
         match iter.peek_kind()? {
+            // Skip inter-token blanks so a spaced separator before `do`/`{`
+            // (`)) ; do`, `for ((…)) ; do …`) reaches the keyword — the atom
+            // scanner emits a `Blank` between the `))`/word and the `;`, and a
+            // bare `Blank` here would otherwise stop the skip early.
+            Some(TokenKind::Blank) => { iter.next_kind()?; }
             Some(TokenKind::Op(Operator::Semi)) => { iter.next_kind()?; }
             // v250 T3: a `Newline` consumed here may be immediately followed
             // by a heredoc-body atom group the lexer emitted for the line —
@@ -3557,6 +3562,21 @@ fn parse_do_body_done(iter: &mut Lexer) -> Result<Sequence, ParseError> {
             }
             _ => break,
         }
+    }
+    // bash (ksh-derived) accepts a `{ list; }` brace group in place of
+    // `do … done` for `for`/`select` loops (but NOT `while`/`until`, which
+    // inline their own do/done and never reach here). The AST is unchanged:
+    // the loop body is the compound-list between `{` and `}`. Reuse the exact
+    // `{`-reserved-word rules of `parse_brace_group` so recognition stays
+    // identical (leading blanks/newlines already skipped above; a redirect on
+    // the loop — `for … { … } > f` — is left for the caller's
+    // `maybe_wrap_redirects`, exactly as with the `done` form).
+    if peek_leading_keyword(iter)? == Some(Keyword::LBrace) {
+        expect_keyword(iter, Keyword::LBrace, ParseError::UnterminatedBrace)?;
+        let body =
+            parse_compound_section(iter, &[Keyword::RBrace], ParseError::UnterminatedBrace)?;
+        expect_keyword(iter, Keyword::RBrace, ParseError::UnterminatedBrace)?;
+        return Ok(body);
     }
     expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
     let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
@@ -4658,6 +4678,60 @@ mod tests {
         assert!(matches!(t6_first("case x in a) y;; esac"), Command::Case(_)));
         assert!(matches!(t6_first("for ((i=0;i<3;i++)); do :; done"), Command::ArithFor(_)));
         assert!(matches!(t6_first("(( 1+2 ))"), Command::Arith(_)));
+    }
+
+    #[test]
+    fn t6_for_brace_body_parses_like_do_done() {
+        // ksh-derived `{ … }` body in place of `do … done` for word-list `for`.
+        let brace = t6_first("for x in a b; { echo $x; }");
+        let dodone = t6_first("for x in a b; do echo $x; done");
+        match (brace, dodone) {
+            (Command::For(b), Command::For(d)) => {
+                assert_eq!(b.var, d.var);
+                assert_eq!(b.words, d.words);
+                assert_eq!(b.has_in, d.has_in);
+                assert_eq!(format!("{:?}", b.body), format!("{:?}", d.body));
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn t6_arith_for_brace_body_parses_like_do_done() {
+        // C-style `for ((…)) { … }` — only a Blank before `{`, no `;`.
+        let brace = t6_first("for ((i=0;i<3;i++)) { echo $i; }");
+        let dodone = t6_first("for ((i=0;i<3;i++)) do echo $i; done");
+        match (brace, dodone) {
+            (Command::ArithFor(b), Command::ArithFor(d)) => {
+                assert_eq!(format!("{:?}", b.init), format!("{:?}", d.init));
+                assert_eq!(format!("{:?}", b.cond), format!("{:?}", d.cond));
+                assert_eq!(format!("{:?}", b.step), format!("{:?}", d.step));
+                assert_eq!(format!("{:?}", b.body), format!("{:?}", d.body));
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn t6_select_brace_body_parses_like_do_done() {
+        let brace = t6_first("select x in a b; { echo $x; }");
+        let dodone = t6_first("select x in a b; do echo $x; done");
+        match (brace, dodone) {
+            (Command::Select(b), Command::Select(d)) => {
+                assert_eq!(format!("{:?}", b.body), format!("{:?}", d.body));
+                assert_eq!(format!("{:?}", b.words), format!("{:?}", d.words));
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn t6_while_brace_body_still_rejected() {
+        // bash does NOT allow a brace body on while/until — huck must keep
+        // rejecting it (parse_while inlines its own do/done, never reaches
+        // parse_do_body_done's brace path).
+        assert!(new_seq("while false; { echo hi; }").is_err());
+        assert!(new_seq("until true; { echo hi; }").is_err());
     }
 
     #[test]
