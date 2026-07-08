@@ -974,6 +974,19 @@ pub struct Lexer<'a> {
     /// subscript and consumes `RBracket`, to emit `AssignEq` (→ indexed assignment)
     /// or clear (→ ordinary glob word).
     pending_lvalue_subscript: bool,
+    /// G3: parser→lexer signal that the operand currently being scanned is a
+    /// `[[ … ]]` `==`/`!=`/`=` pattern RHS, whose `?*+@!(` extglob triggers must
+    /// fire UNCONDITIONALLY (bash treats that RHS as an extended pattern even with
+    /// `shopt -u extglob`). Stores `Some(modes.len())` captured when the parser
+    /// enabled it, so the force applies ONLY at that mode depth — descending into a
+    /// nested `$(…)`/`` `…` ``/`$((…))`/`${…}` within the operand (which grows the
+    /// mode stack) does NOT inherit the force, matching bash (extglob stays off
+    /// inside a command substitution). The zero-width `ExtglobOpen` signal + the
+    /// parser-owned `Mode::Extglob` still own the `(…)` balancing — this flag only
+    /// gates the trigger; it never forward-scans. Not captured in `Mark` (the only
+    /// mark/rewind reachable mid-operand is the arith `$((`-bail at a DEEPER depth,
+    /// which the depth guard already excludes, so the flag is invariant across it).
+    force_extglob_depth: Option<usize>,
     /// Consecutive `Produced` scan steps that consumed no input (see
     /// `scan_step_guarded` / `SCAN_STALL_CAP`).
     stall_steps: u32,
@@ -1023,6 +1036,7 @@ impl<'a> Lexer<'a> {
             cmd_at_word_start: true,
             assign_val_tilde_ok: false,
             pending_lvalue_subscript: false,
+            force_extglob_depth: None,
             stall_steps: 0,
             heredoc_gen: 0,
         }
@@ -1142,6 +1156,21 @@ impl<'a> Lexer<'a> {
         if let Some(Mode::Regex { body_started, .. }) = self.modes.last_mut() {
             *body_started = v;
         }
+    }
+
+    /// G3: arm/disarm force-extglob for the `[[ … ]]` `==`/`!=`/`=` pattern
+    /// operand about to be scanned. Called by the parser around
+    /// `next_test_word_atom`. When `on`, captures the CURRENT mode depth so the
+    /// force applies only to atoms scanned at that depth (see `force_extglob_depth`).
+    pub(crate) fn set_force_extglob(&mut self, on: bool) {
+        self.force_extglob_depth = if on { Some(self.modes.len()) } else { None };
+    }
+
+    /// True when the extglob trigger must fire regardless of `opts.extglob`: the
+    /// parser armed force-extglob AND we are scanning at the exact mode depth it
+    /// was armed for (not inside a nested expansion pushed since).
+    fn extglob_forced_here(&self) -> bool {
+        self.force_extglob_depth == Some(self.modes.len())
     }
 
     /// Arm the one-shot v246 wrinkle flag: the next `$((` the CommandSub scanner
@@ -3612,7 +3641,7 @@ impl<'a> Lexer<'a> {
             // scan, pushed by the parser's `parse_extglob_group`). Checked before
             // the literal-run catch-all so the group is recognized first; with
             // extglob off this arm never matches and lexing is unchanged.
-            Some(pc) if self.opts.extglob
+            Some(pc) if (self.opts.extglob || self.extglob_forced_here())
                 && matches!(pc, '?' | '*' | '+' | '@' | '!')
                 && self.cursor.peek_nth(1) == Some('(') =>
             {
@@ -3682,7 +3711,7 @@ impl<'a> Lexer<'a> {
                     // (mirrors `zzz+(q)` glued-prefix — the oracle's own
                     // per-char loop checks this same condition every iteration,
                     // not only at word start).
-                    if self.opts.extglob
+                    if (self.opts.extglob || self.extglob_forced_here())
                         && matches!(ch, '?' | '*' | '+' | '@' | '!')
                         && self.cursor.peek_nth(1) == Some('(')
                     { break; }
