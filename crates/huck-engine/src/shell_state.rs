@@ -2138,6 +2138,22 @@ impl Shell {
             true,
         );
         self.install_var("HUCK_VERSION", env!("CARGO_PKG_VERSION").to_string(), false);
+        // getopts index: bash seeds OPTIND=1 at startup (POSIX: `$OPTIND` reads
+        // as 1 before any `getopts` runs) and marks it integer (`declare -i`).
+        // Not exported, not readonly. getopts itself already defaults an
+        // unset/invalid OPTIND to 1, so this only makes the value visible to
+        // scripts that read `$OPTIND` cold.
+        // Preserve an inherited export flag: bash resets an env-inherited
+        // OPTIND's value to 1 but keeps its `-x` attribute (`declare -ix`).
+        let optind_exported = self.vars.get("OPTIND").map(|v| v.exported).unwrap_or(false);
+        self.vars.insert("OPTIND".to_string(), Variable {
+            value: VarValue::Scalar("1".to_string()),
+            exported: optind_exported,
+            readonly: false,
+            integer: true,
+            case_fold: None,
+            nameref: false,
+        });
         // SHLVL: read inherited value (already in vars from env-load), add 1.
         let lvl = self.vars
             .get("SHLVL")

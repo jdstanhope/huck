@@ -854,6 +854,13 @@ pub(crate) fn declare_scalar_quote(v: &str) -> String {
         return crate::param_expansion::ansi_c_quote(v);
     }
     if crate::param_expansion::contains_shell_metas(v) {
+        // bash's `sh_single_quote` special-cases a value that is exactly one
+        // single-quote character: it backslash-escapes it (`\'`) instead of
+        // emitting the degenerate `''\'''` wrap. Only the lone `'` — two or
+        // more quotes still use the normal `'\''` wrapping.
+        if v == "'" {
+            return r"\'".to_string();
+        }
         return format!("'{}'", escape_alias_value(v));
     }
     v.to_string()
@@ -5582,7 +5589,11 @@ fn shopt_o_bridge(
 }
 
 fn set_escape_value(v: &str) -> String {
-    format!("'{}'", v.replace('\'', r#"'\''"#))
+    // `set` (no args) lists variables in bash's POSIX `name=value` form, whose
+    // value quoting is identical to the bare-`declare` form: bare when nothing
+    // needs quoting, single-quoted (`'\''`-escaped) for shell metacharacters,
+    // ANSI-C `$'…'` for control chars, and the lone-`'` → `\'` special case.
+    declare_scalar_quote(v)
 }
 
 /// POSIX `eval`: joins args with spaces, re-parses the result,
@@ -10161,8 +10172,28 @@ mod set_tests {
         let c_idx = out.find("ZZTEST_C=").expect("missing C");
         assert!(a_idx < b_idx, "A should come before B");
         assert!(b_idx < c_idx, "B should come before C");
-        // Format check: value should be single-quoted.
-        assert!(out.contains("ZZTEST_A='one'"), "expected single-quoted value: {out:?}");
+        // Format check: a plain alphanumeric value is printed BARE (no quotes),
+        // matching bash's `set` listing (only metacharacter values get quoted).
+        assert!(out.contains("ZZTEST_A=one\n"), "expected bare value: {out:?}");
+    }
+
+    #[test]
+    fn set_escape_value_matches_bash_listing_quoting() {
+        // bash `set` (no args) value quoting — verified against bash 5.2.
+        assert_eq!(set_escape_value("abc"), "abc"); // plain → bare
+        assert_eq!(set_escape_value("123"), "123"); // digits → bare
+        assert_eq!(set_escape_value("ab#cd"), "ab#cd"); // # not leading → bare
+        assert_eq!(set_escape_value("#abc"), "'#abc'"); // # leading → quoted
+        assert_eq!(set_escape_value("a~b"), "a~b"); // ~ not leading → bare
+        assert_eq!(set_escape_value("~"), "'~'"); // ~ leading → quoted
+        assert_eq!(set_escape_value("x=~"), "'x=~'"); // ~ after = → quoted
+        assert_eq!(set_escape_value("a b"), "'a b'"); // space → quoted
+        assert_eq!(set_escape_value("a*b"), "'a*b'"); // glob → quoted
+        assert_eq!(set_escape_value(""), ""); // empty → bare (name=)
+        assert_eq!(set_escape_value("'"), r"\'"); // lone quote → \'
+        assert_eq!(set_escape_value("a'b"), r"'a'\''b'"); // embedded quote
+        assert_eq!(set_escape_value("''"), r"''\'''\'''"); // two quotes → wrap
+        assert_eq!(set_escape_value("\t"), "$'\\t'"); // control → ANSI-C
     }
 
     #[test]
