@@ -480,7 +480,15 @@ pub enum QuoteStyle {
 #[non_exhaustive]
 pub enum WordPart {
     Literal { text: String, quoted: bool },
-    Tilde(TildeSpec),
+    /// `assign_ctx` is true when this tilde was recognized in ASSIGNMENT-VALUE
+    /// position (right after an unquoted `=`/`:` in a `name=value`-shaped word,
+    /// e.g. the `~` in `foo=bar:~`), false for a word-start tilde (`~`, `~/x`).
+    /// Used by the argument-expansion path to honor bash's POSIX rule: in posix
+    /// mode, assignment-context tilde expansion is restricted to real assignment
+    /// statements, so an assign-ctx tilde in a plain command ARGUMENT stays
+    /// literal (the assignment path — leading assignments + declaration builtins
+    /// — always resolves it regardless).
+    Tilde { spec: TildeSpec, assign_ctx: bool },
     Var { name: String, quoted: bool },
     LastStatus { quoted: bool },
     CommandSub { sequence: crate::command::Sequence, quoted: bool },
@@ -632,8 +640,10 @@ pub enum TokenKind {
     /// v247 T3: a command-position tilde construct (`~`, `~user`, `~+`, `~-`,
     /// `~/…`). Emitted by `scan_command_word_atom` ONLY at word start (mirrors
     /// the oracle's `!has_token` guard); the parser turns it into
-    /// `WordPart::Tilde(spec)`.
-    Tilde(TildeSpec),
+    /// `WordPart::Tilde { spec, assign_ctx }`. `assign_ctx` is set when the
+    /// tilde was recognized in assignment-value position (after an unquoted
+    /// `=`/`:` in a `name=value` word) rather than at word start.
+    Tilde { spec: TildeSpec, assign_ctx: bool },
     /// v247 T3: zero-width opener signal for a `"…"` double-quoted span in
     /// command-word context. The lexer does NOT consume the `"`; the parser
     /// (`parse_dquote`) pushes `Mode::DoubleQuote`, whose first scan consumes the
@@ -3818,9 +3828,15 @@ impl<'a> Lexer<'a> {
             Some('~') if at_word_start || (self.in_assignment_value && tilde_ok) => {
                 self.cmd_at_word_start = false;
                 self.cursor.next(); // consume `~`
-                match try_parse_tilde(&mut self.cursor, self.in_assignment_value, in_array_value) {
+                match try_parse_tilde(&mut self.cursor, self.in_assignment_value) {
                     Some(spec) => {
-                        self.history.push(Token::new(TokenKind::Tilde(spec), Span::new(off, l, c)));
+                        // The `~` arm fires for `at_word_start` OR the
+                        // assignment-value branch; `!at_word_start` here means it
+                        // came from the latter (after an unquoted `=`/`:`).
+                        self.history.push(Token::new(
+                            TokenKind::Tilde { spec, assign_ctx: !at_word_start },
+                            Span::new(off, l, c),
+                        ));
                     }
                     None => {
                         // Not a tilde construct — `~` is a literal (coalesced with
@@ -5873,20 +5889,14 @@ fn is_name_cont(c: char) -> bool {
 /// the `+` in `~+`). On failure, leaves the iterator untouched and
 /// returns `None` (the caller treats `~` as a literal).
 ///
-/// `in_array_value` (v252 T2): true when scanning an ATOM-path array-literal
-/// value. The oracle (`scan_array_element_word`) collects each element into a
-/// bounded raw buffer that never includes the element's closing `)`, then
-/// re-tokenizes that buffer standalone — so a trailing `~` there sees EOF, not
-/// `)`. Our atom scanner runs directly against the live source cursor (no
-/// bounded buffer), so it must be told to treat the array's closing `)` as an
-/// end-of-word terminator too, or a value-final `~` (`a=(a=~)`) would see the
-/// real `)` and wrongly fail to recognize the tilde.
+/// `)` terminates a tilde-prefix via `is_tilde_terminator` (it closes an
+/// array-literal element `a=(a=~)`, a `case` pattern, a subshell, and a
+/// `$(…)`/backtick body — a value-final `~` before it must still be a tilde).
 fn try_parse_tilde(
     chars: &mut CharCursor<'_>,
     in_assignment_value: bool,
-    in_array_value: bool,
 ) -> Option<TildeSpec> {
-    let term = |c: char| is_tilde_terminator(c) || (in_assignment_value && c == ':') || (in_array_value && c == ')');
+    let term = |c: char| is_tilde_terminator(c) || (in_assignment_value && c == ':');
     match chars.peek().copied() {
         // Bare ~ at end of word.
         None => Some(TildeSpec::Home),
@@ -5945,7 +5955,13 @@ fn try_parse_tilde(
 fn is_tilde_terminator(c: char) -> bool {
     c == '/'
         || c.is_whitespace()
-        || matches!(c, '|' | '<' | '>' | '&' | ';')
+        // Unquoted shell metacharacters end the word, so they end a
+        // tilde-prefix too. `)` matters most: it closes a `$(…)`/backtick
+        // command-sub body (`echo $(echo ~)` → home), a subshell (`(~)`),
+        // and a `case` pattern (`case ~ in ~)`), where a bare trailing `~`
+        // must still tilde-expand (matches bash). (`(` never legally follows
+        // a word-start `~`, so it is deliberately omitted.)
+        || matches!(c, '|' | '<' | '>' | '&' | ';' | ')')
 }
 
 

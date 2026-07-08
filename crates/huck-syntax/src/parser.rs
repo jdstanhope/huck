@@ -298,10 +298,10 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                     });
                 }
             }
-            Some(TokenKind::Tilde(_)) => {
-                if let Some(TokenKind::Tilde(spec)) = iter.next_kind()? {
+            Some(TokenKind::Tilde { .. }) => {
+                if let Some(TokenKind::Tilde { spec, assign_ctx }) = iter.next_kind()? {
                     flush_lit(&mut acc, &mut parts);
-                    parts.push(WordPart::Tilde(spec));
+                    parts.push(WordPart::Tilde { spec, assign_ctx });
                 }
             }
             // v247 T4: a bare scalar-append assignment-prefix atom (`name+=`).
@@ -2426,7 +2426,7 @@ fn parse_simple_with_leading_word(
                     | TokenKind::BeginBacktick
                     | TokenKind::ArithOpen
                     | TokenKind::LegacyArithOpen
-                    | TokenKind::Tilde(_)
+                    | TokenKind::Tilde { .. }
                     | TokenKind::BeginDquote
                     | TokenKind::AssignPrefix { .. }
                     | TokenKind::ExtglobOpen { .. }
@@ -3228,7 +3228,7 @@ fn fill_word_parts(parts: &mut [WordPart], bodies: &mut impl Iterator<Item = Wor
             }
             // No nested Word — nothing to fill.
             WordPart::Literal { .. }
-            | WordPart::Tilde(_)
+            | WordPart::Tilde { .. }
             | WordPart::Var { .. }
             | WordPart::LastStatus { .. }
             | WordPart::AllArgs { .. }
@@ -8200,7 +8200,7 @@ mod tests {
         let Command::Pipeline(p) = &seq.first else { panic!() };
         let Command::Simple(SimpleCommand::Assign(items, _)) = &p.commands[0] else { panic!() };
         let AssignTarget::Indexed { .. } = &items[0].target else { panic!("indexed") };
-        assert!(matches!(items[0].value.0.first(), Some(WordPart::Tilde(_))),
+        assert!(matches!(items[0].value.0.first(), Some(WordPart::Tilde { .. })),
             "D2: leading ~ must be a Tilde part, got {:?}", items[0].value.0);
     }
 

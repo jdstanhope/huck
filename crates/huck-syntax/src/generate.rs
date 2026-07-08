@@ -618,7 +618,7 @@ fn part_to_source(part: &WordPart) -> String {
         WordPart::Arith { body, quoted } => {
             quote_if(*quoted, format!("$(({}))", arith_body_to_source(body)))
         }
-        WordPart::Tilde(t) => match t {
+        WordPart::Tilde { spec: t, .. } => match t {
             TildeSpec::Home => "~".to_string(),
             TildeSpec::User(u) => format!("~{u}"),
             TildeSpec::Pwd => "~+".to_string(),

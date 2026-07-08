@@ -1066,11 +1066,20 @@ fn expand_part(
             current.push_str(text, *quoted);
             *has_emitted = true;
         }
-        WordPart::Tilde(spec) => {
-            // Tilde expansion result is always unquoted — pathname
-            // expansion treats the expanded path as if the user typed it.
-            let text = resolve_tilde(spec, shell)
-                .unwrap_or_else(|| render_tilde_literal(spec));
+        WordPart::Tilde { spec, assign_ctx } => {
+            // POSIX rule: in posix mode, assignment-context tilde expansion
+            // (`~` right after `=`/`:` in a `name=value` word) is restricted to
+            // real assignment statements. A plain command ARGUMENT reaches this
+            // arg-expansion path, so an assign-ctx tilde stays LITERAL here.
+            // (Leading assignments + declaration builtins expand via
+            // `expand_assignment`, which always resolves — no regression.)
+            // Word-start tildes (`~`, `~/x`) always resolve.
+            let text = if *assign_ctx && shell.shell_options.posix {
+                render_tilde_literal(spec)
+            } else {
+                resolve_tilde(spec, shell)
+                    .unwrap_or_else(|| render_tilde_literal(spec))
+            };
             current.push_str(&text, false);
             *has_emitted = true;
         }
@@ -1498,7 +1507,7 @@ fn reconstruct_part(part: &WordPart, out: &mut String) {
             out.push_str(&reconstruct_word_source_inner(body));
             out.push_str("))");
         }
-        P::Tilde(spec) => out.push_str(&render_tilde_literal(spec)),
+        P::Tilde { spec, .. } => out.push_str(&render_tilde_literal(spec)),
         P::CommandSub { sequence, .. } => {
             out.push_str("$(");
             out.push_str(&reconstruct_sequence_source(sequence));
@@ -1693,7 +1702,11 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
     for part in &word.0 {
         match part {
             WordPart::Literal { text, .. } => result.push_str(text),
-            WordPart::Tilde(spec) => {
+            WordPart::Tilde { spec, .. } => {
+                // Assignment path (leading assignments, declaration-builtin args,
+                // `case`/`[[` patterns): always resolve — posix does NOT restrict
+                // tilde here. The `assign_ctx` tag is only consulted by the
+                // argument-expansion path (`expand_part`).
                 let text = resolve_tilde(spec, shell)
                     .unwrap_or_else(|| render_tilde_literal(spec));
                 result.push_str(&text);
@@ -1821,7 +1834,7 @@ fn word_part_is_quoted(part: &WordPart) -> bool {
         WordPart::Arith { quoted, .. } => *quoted,
         WordPart::ParamExpansion { quoted, .. } => *quoted,
         WordPart::AllArgs { quoted, .. } => *quoted,
-        WordPart::Tilde(_) => false,
+        WordPart::Tilde { .. } => false,
         WordPart::AssignPrefix { .. } | WordPart::ArrayLiteral(_) => false,
         // ProcessSub expands to a single /dev/fd/N path — treated as quoted
         // (no IFS-splitting, no glob expansion of the realized path).
@@ -2506,7 +2519,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("HOME", "/tmp/huck_test".to_string());
         let word = Word(vec![
-            WordPart::Tilde(TildeSpec::Home),
+            WordPart::Tilde { spec: TildeSpec::Home, assign_ctx: false },
             WordPart::Literal { text: "/foo".to_string(), quoted: false },
         ]);
         assert_eq!(
@@ -2706,15 +2719,43 @@ mod tests {
     fn expand_tilde_home_unset_falls_back_to_literal() {
         let mut shell = Shell::new();
         shell.unset("HOME");
-        let word = Word(vec![WordPart::Tilde(TildeSpec::Home)]);
+        let word = Word(vec![WordPart::Tilde { spec: TildeSpec::Home, assign_ctx: false }]);
         assert_eq!(expand_strings(&word, &mut shell), vec!["~"]);
+    }
+
+    #[test]
+    fn expand_assign_ctx_tilde_literal_under_posix_in_arg() {
+        // POSIX: an assignment-context tilde (`~` after `=`/`:` in a name=value
+        // word) in a plain command ARGUMENT stays literal. `expand()` is the
+        // argument path.
+        let mut shell = Shell::new();
+        shell.export_set("HOME", "/usr/xyz".to_string());
+        shell.shell_options.posix = true;
+        let word = Word(vec![
+            WordPart::Literal { text: "foo=bar:".to_string(), quoted: false },
+            WordPart::Tilde { spec: TildeSpec::Home, assign_ctx: true },
+        ]);
+        assert_eq!(expand_strings(&word, &mut shell), vec!["foo=bar:~"]);
+        // Non-posix: the same word DOES expand.
+        shell.shell_options.posix = false;
+        assert_eq!(expand_strings(&word, &mut shell), vec!["foo=bar:/usr/xyz"]);
+        // POSIX word-start tilde (assign_ctx=false) still expands even in an arg.
+        shell.shell_options.posix = true;
+        let ws = Word(vec![WordPart::Tilde { spec: TildeSpec::Home, assign_ctx: false }]);
+        assert_eq!(expand_strings(&ws, &mut shell), vec!["/usr/xyz"]);
+        // POSIX assignment PATH (expand_assignment) always resolves an
+        // assign-ctx tilde — leading assignments / declaration builtins.
+        assert_eq!(
+            expand_assignment(&word, &mut shell),
+            "foo=bar:/usr/xyz".to_string()
+        );
     }
 
     #[test]
     fn expand_tilde_pwd_resolves_when_pwd_set() {
         let mut shell = Shell::new();
         shell.export_set("PWD", "/var/tmp".to_string());
-        let word = Word(vec![WordPart::Tilde(TildeSpec::Pwd)]);
+        let word = Word(vec![WordPart::Tilde { spec: TildeSpec::Pwd, assign_ctx: false }]);
         assert_eq!(expand_strings(&word, &mut shell), vec!["/var/tmp"]);
     }
 
@@ -2722,7 +2763,7 @@ mod tests {
     fn expand_tilde_pwd_unset_falls_back_to_literal_plus() {
         let mut shell = Shell::new();
         shell.unset("PWD");
-        let word = Word(vec![WordPart::Tilde(TildeSpec::Pwd)]);
+        let word = Word(vec![WordPart::Tilde { spec: TildeSpec::Pwd, assign_ctx: false }]);
         assert_eq!(expand_strings(&word, &mut shell), vec!["~+"]);
     }
 
@@ -2730,7 +2771,7 @@ mod tests {
     fn expand_tilde_oldpwd_unset_falls_back_to_literal_minus() {
         let mut shell = Shell::new();
         shell.unset("OLDPWD");
-        let word = Word(vec![WordPart::Tilde(TildeSpec::OldPwd)]);
+        let word = Word(vec![WordPart::Tilde { spec: TildeSpec::OldPwd, assign_ctx: false }]);
         assert_eq!(expand_strings(&word, &mut shell), vec!["~-"]);
     }
 
@@ -2738,7 +2779,7 @@ mod tests {
     fn expand_tilde_unknown_user_falls_back_to_literal() {
         let mut shell = Shell::new();
         let word = Word(vec![
-            WordPart::Tilde(TildeSpec::User("definitely_not_a_real_user_xyz_42".to_string())),
+            WordPart::Tilde { spec: TildeSpec::User("definitely_not_a_real_user_xyz_42".to_string()), assign_ctx: false },
             WordPart::Literal { text: "/x".to_string(), quoted: false },
         ]);
         assert_eq!(
@@ -2753,7 +2794,7 @@ mod tests {
         shell.export_set("HOME", "/h".to_string());
         let word = Word(vec![
             WordPart::Literal { text: "PATH=".to_string(), quoted: false },
-            WordPart::Tilde(TildeSpec::Home),
+            WordPart::Tilde { spec: TildeSpec::Home, assign_ctx: false },
             WordPart::Literal { text: "/bin".to_string(), quoted: false },
         ]);
         assert_eq!(expand_assignment(&word, &mut shell), "PATH=/h/bin");
@@ -2847,7 +2888,7 @@ mod tests {
     fn expand_tilde_marks_chars_unquoted() {
         let mut shell = Shell::new();
         shell.export_set("HOME", "/h".to_string());
-        let word = Word(vec![WordPart::Tilde(TildeSpec::Home)]);
+        let word = Word(vec![WordPart::Tilde { spec: TildeSpec::Home, assign_ctx: false }]);
         let fields = expand(&word, &mut shell);
         assert_eq!(fields[0].chars, "/h");
         assert_eq!(fields[0].quoted, vec![false, false]);
