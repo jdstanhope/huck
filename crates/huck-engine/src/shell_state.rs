@@ -42,17 +42,22 @@ pub enum VarValue {
 }
 
 impl VarValue {
-    /// Returns the "scalar view" of this value: the string itself
-    /// for `Scalar`, or the element at subscript 0 (or "" if no such
-    /// element) for `Indexed`. This is the bash rule that `$a` and
-    /// `${a}` on an indexed array mean `${a[0]}`. For `Associative`
-    /// returns "" (bash: `$m` on an associative array is empty,
-    /// not the first value).
+    /// Returns the "scalar view" of this value: the string itself for
+    /// `Scalar`, the element at subscript 0 for `Indexed`, or the element
+    /// whose KEY is `"0"` for `Associative` (or "" if no such element).
+    /// This is the bash rule that `$a` / `${a}` on an array means `${a[0]}`
+    /// — for an associative array `[0]` is the string key `"0"` (e.g.
+    /// `declare -A m; m[0]=x; echo $m` prints `x`), so it is empty only when
+    /// there is no `"0"` key, NOT unconditionally.
     pub fn scalar_view(&self) -> &str {
         match self {
             VarValue::Scalar(s) => s.as_str(),
             VarValue::Indexed(m) => m.get(&0).map(String::as_str).unwrap_or(""),
-            VarValue::Associative(_) => "",
+            VarValue::Associative(pairs) => pairs
+                .iter()
+                .find(|(k, _)| k == "0")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or(""),
         }
     }
 }
