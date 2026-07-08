@@ -3544,6 +3544,10 @@ fn parse_if(iter: &mut Lexer) -> Result<Command, ParseError> {
 /// and `done`.  Returns the parsed body `Sequence`.  Shared by `parse_for` and
 /// `parse_select`.  Mirrors `parse_do_body_done` (~1522) in `command.rs`.
 fn parse_do_body_done(iter: &mut Lexer) -> Result<Sequence, ParseError> {
+    // bash accepts at most ONE `;` before `do`/`{` (an optional list terminator);
+    // a second `;` (`for … ; ; do`) is a syntax error. Track it so the Blank-skip
+    // below can't bridge across to a second `;` and wrongly accept `; ;`.
+    let mut saw_semi = false;
     loop {
         match iter.peek_kind()? {
             // Skip inter-token blanks so a spaced separator before `do`/`{`
@@ -3551,7 +3555,7 @@ fn parse_do_body_done(iter: &mut Lexer) -> Result<Sequence, ParseError> {
             // scanner emits a `Blank` between the `))`/word and the `;`, and a
             // bare `Blank` here would otherwise stop the skip early.
             Some(TokenKind::Blank) => { iter.next_kind()?; }
-            Some(TokenKind::Op(Operator::Semi)) => { iter.next_kind()?; }
+            Some(TokenKind::Op(Operator::Semi)) if !saw_semi => { iter.next_kind()?; saw_semi = true; }
             // v250 T3: a `Newline` consumed here may be immediately followed
             // by a heredoc-body atom group the lexer emitted for the line —
             // drain it before continuing, or the next `peek_kind` would see a
