@@ -12756,12 +12756,16 @@ mod set_options_tests {
         assert!(out.is_empty(), "error goes to stderr, not the captured stdout: {out:?}");
     }
 
+    // `set -a` enabling the flag is tested here; the auto-export *behavior*
+    // it gates (assignments become exported) lives in the executor and is
+    // covered byte-for-byte against bash by set_o_options_diff_check.sh.
     #[test]
-    fn set_allexport_auto_exports_assignments() {
+    fn set_dash_a_enables_allexport() {
         let mut shell = Shell::new();
         let (oc, _) = run(&["-a"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert!(shell.shell_options.allexport);
+        assert_eq!(option_get(&shell, "allexport"), Some(true));
     }
 
     #[test]
