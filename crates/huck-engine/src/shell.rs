@@ -399,6 +399,8 @@ pub fn process_line_in_sinks(
     let empty = std::collections::HashMap::new();
     let aliases = if expand_aliases { &shell.aliases } else { &empty };
     let mut lx = lexer::Lexer::new_live_atoms(line, aliases, opts);
+    // `set +o braceexpand` / `set +B` disables `{a,b}` brace expansion.
+    lx.set_brace_expand(shell.shell_options.braceexpand);
     match parser::parse_sequence(&mut lx) {
         Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink, err_sink),
         Ok(None) => ExecOutcome::Continue(0),

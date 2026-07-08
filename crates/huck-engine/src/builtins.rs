@@ -5100,10 +5100,11 @@ pub fn signal_names() -> Vec<String> {
         .collect()
 }
 
-/// bash 5.2's full `set -o` option table, in bash's display order.
-/// `errexit`/`nounset`/`pipefail` are implemented (real state via
-/// `Shell.shell_options`); the rest are recognized for listing + querying
-/// only (their `default` is reported) and cannot be enabled.
+/// bash 5.2's full `set -o` option table, in bash's display order. Every name
+/// is backed by real state in `Shell.shell_options` and is settable (v270);
+/// only some options carry deeper behavior (see the `ShellOptions` doc). The
+/// `default` here mirrors each field's non-interactive default and is only a
+/// fallback for `option_get`.
 const SETO_TABLE: &[OptionInfo] = &[
     OptionInfo { name: "allexport", default: false },
     OptionInfo { name: "braceexpand", default: true },
@@ -5134,12 +5135,10 @@ const SETO_TABLE: &[OptionInfo] = &[
     OptionInfo { name: "xtrace", default: false },
 ];
 
-/// Error from `option_set` for a non-settable `set -o` name.
+/// Error from `option_set` for an unrecognized `set -o` name.
 /// `Debug` is required because an existing test calls `option_set(...).unwrap()`.
 #[derive(Debug)]
 enum OptSetErr {
-    /// Known bash option huck does not implement (e.g. `xtrace`, `posix`).
-    Unimplemented,
     /// Not a recognized `set -o` option name at all.
     Unknown,
 }
@@ -5158,32 +5157,63 @@ pub(crate) fn option_get(shell: &Shell, name: &str) -> Option<bool> {
         "noexec" => Some(shell.shell_options.noexec),
         "physical" => Some(shell.shell_options.physical),
         "posix" => Some(shell.shell_options.posix),
-        other => SETO_TABLE.iter().find(|o| o.name == other).map(|o| o.default),
+        "allexport" => Some(shell.shell_options.allexport),
+        "braceexpand" => Some(shell.shell_options.braceexpand),
+        "hashall" => Some(shell.shell_options.hashall),
+        "histexpand" => Some(shell.shell_options.histexpand),
+        "history" => Some(shell.shell_options.history),
+        "ignoreeof" => Some(shell.shell_options.ignoreeof),
+        "interactive-comments" => Some(shell.shell_options.interactive_comments),
+        "keyword" => Some(shell.shell_options.keyword),
+        "monitor" => Some(shell.shell_options.monitor),
+        "notify" => Some(shell.shell_options.notify),
+        "onecmd" => Some(shell.shell_options.onecmd),
+        "functrace" => Some(shell.shell_options.functrace),
+        "errtrace" => Some(shell.shell_options.errtrace),
+        "emacs" => Some(shell.shell_options.emacs),
+        "vi" => Some(shell.shell_options.vi),
+        "nolog" => Some(shell.shell_options.nolog),
+        "privileged" => Some(shell.shell_options.privileged),
+        _ => None,
     }
 }
 
-/// Writes a `set -o` option. Only the behaviorally-implemented options are
-/// settable; the rest of `SETO_TABLE` is inert (`Unimplemented`).
+/// Writes a `set -o` option. Every valid bash 5.2 option name is settable;
+/// only `braceexpand`/`allexport` (and the pre-existing behavioral options)
+/// carry semantics — the rest are faithful accept-and-store toggles (see the
+/// `ShellOptions` doc-comment). An unrecognized name yields `OptSetErr::Unknown`.
 fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetErr> {
     match name {
-        "errexit" => { shell.shell_options.errexit = value; Ok(()) }
-        "nounset" => { shell.shell_options.nounset = value; Ok(()) }
-        "pipefail" => { shell.shell_options.pipefail = value; Ok(()) }
-        "verbose" => { shell.shell_options.verbose = value; Ok(()) }
-        "xtrace" => { shell.shell_options.xtrace = value; Ok(()) }
-        "noglob" => { shell.shell_options.noglob = value; Ok(()) }
-        "noclobber" => { shell.shell_options.noclobber = value; Ok(()) }
-        "noexec" => { shell.shell_options.noexec = value; Ok(()) }
-        "physical" => { shell.shell_options.physical = value; Ok(()) }
-        "posix" => { shell.shell_options.posix = value; Ok(()) }
-        other => {
-            if SETO_TABLE.iter().any(|o| o.name == other) {
-                Err(OptSetErr::Unimplemented)
-            } else {
-                Err(OptSetErr::Unknown)
-            }
-        }
+        "errexit" => shell.shell_options.errexit = value,
+        "nounset" => shell.shell_options.nounset = value,
+        "pipefail" => shell.shell_options.pipefail = value,
+        "verbose" => shell.shell_options.verbose = value,
+        "xtrace" => shell.shell_options.xtrace = value,
+        "noglob" => shell.shell_options.noglob = value,
+        "noclobber" => shell.shell_options.noclobber = value,
+        "noexec" => shell.shell_options.noexec = value,
+        "physical" => shell.shell_options.physical = value,
+        "posix" => shell.shell_options.posix = value,
+        "allexport" => shell.shell_options.allexport = value,
+        "braceexpand" => shell.shell_options.braceexpand = value,
+        "hashall" => shell.shell_options.hashall = value,
+        "histexpand" => shell.shell_options.histexpand = value,
+        "history" => shell.shell_options.history = value,
+        "ignoreeof" => shell.shell_options.ignoreeof = value,
+        "interactive-comments" => shell.shell_options.interactive_comments = value,
+        "keyword" => shell.shell_options.keyword = value,
+        "monitor" => shell.shell_options.monitor = value,
+        "notify" => shell.shell_options.notify = value,
+        "onecmd" => shell.shell_options.onecmd = value,
+        "functrace" => shell.shell_options.functrace = value,
+        "errtrace" => shell.shell_options.errtrace = value,
+        "emacs" => shell.shell_options.emacs = value,
+        "vi" => shell.shell_options.vi = value,
+        "nolog" => shell.shell_options.nolog = value,
+        "privileged" => shell.shell_options.privileged = value,
+        _ => return Err(OptSetErr::Unknown),
     }
+    Ok(())
 }
 
 fn print_options_table(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
@@ -5252,12 +5282,8 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
             }
             match option_set(shell, &args[i], true) {
                 Ok(()) => {}
-                Err(OptSetErr::Unimplemented) => {
-                    crate::sh_error_to!(shell, err, None, "set: {}: not yet supported in this version", args[i]);
-                    return ExecOutcome::Continue(2);
-                }
                 Err(OptSetErr::Unknown) => {
-                    crate::sh_error_to!(shell, err, None, "set: -o: invalid option name: {}", args[i]);
+                    crate::sh_error_to!(shell, err, None, "set: {}: invalid option name", args[i]);
                     shell.builtin_usage_error = Some(2);
                     return ExecOutcome::Continue(2);
                 }
@@ -5272,12 +5298,8 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
             }
             match option_set(shell, &args[i], false) {
                 Ok(()) => {}
-                Err(OptSetErr::Unimplemented) => {
-                    crate::sh_error_to!(shell, err, None, "set: {}: not yet supported in this version", args[i]);
-                    return ExecOutcome::Continue(2);
-                }
                 Err(OptSetErr::Unknown) => {
-                    crate::sh_error_to!(shell, err, None, "set: +o: invalid option name: {}", args[i]);
+                    crate::sh_error_to!(shell, err, None, "set: {}: invalid option name", args[i]);
                     shell.builtin_usage_error = Some(2);
                     return ExecOutcome::Continue(2);
                 }
@@ -5298,6 +5320,19 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                     b'v' => shell.shell_options.verbose = true,
                     b'x' => shell.shell_options.xtrace = true,
                     b'n' => shell.shell_options.noexec = true,
+                    // bash 5.2 single-char aliases for long-form options.
+                    b'a' => shell.shell_options.allexport = true,
+                    b'b' => shell.shell_options.notify = true,
+                    b'h' => shell.shell_options.hashall = true,
+                    b'k' => shell.shell_options.keyword = true,
+                    b'm' => shell.shell_options.monitor = true,
+                    b't' => shell.shell_options.onecmd = true,
+                    b'B' => shell.shell_options.braceexpand = true,
+                    b'E' => shell.shell_options.errtrace = true,
+                    b'H' => shell.shell_options.histexpand = true,
+                    b'P' => shell.shell_options.physical = true,
+                    b'T' => shell.shell_options.functrace = true,
+                    b'p' => shell.shell_options.privileged = true,
                     b'o' => {
                         i += 1;
                         if i >= args.len() {
@@ -5305,14 +5340,8 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                         }
                         match option_set(shell, &args[i], true) {
                             Ok(()) => {}
-                            Err(OptSetErr::Unimplemented) => {
-                                crate::sh_error_to!(shell, err, None, "set: {}: not yet supported in this version",
-                                    args[i]
-                                );
-                                return ExecOutcome::Continue(2);
-                            }
                             Err(OptSetErr::Unknown) => {
-                                crate::sh_error_to!(shell, err, None, "set: -o: invalid option name: {}",
+                                crate::sh_error_to!(shell, err, None, "set: {}: invalid option name",
                                     args[i]
                                 );
                                 shell.builtin_usage_error = Some(2);
@@ -5341,6 +5370,18 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                     b'v' => shell.shell_options.verbose = false,
                     b'x' => shell.shell_options.xtrace = false,
                     b'n' => shell.shell_options.noexec = false,
+                    b'a' => shell.shell_options.allexport = false,
+                    b'b' => shell.shell_options.notify = false,
+                    b'h' => shell.shell_options.hashall = false,
+                    b'k' => shell.shell_options.keyword = false,
+                    b'm' => shell.shell_options.monitor = false,
+                    b't' => shell.shell_options.onecmd = false,
+                    b'B' => shell.shell_options.braceexpand = false,
+                    b'E' => shell.shell_options.errtrace = false,
+                    b'H' => shell.shell_options.histexpand = false,
+                    b'P' => shell.shell_options.physical = false,
+                    b'T' => shell.shell_options.functrace = false,
+                    b'p' => shell.shell_options.privileged = false,
                     b'o' => {
                         i += 1;
                         if i >= args.len() {
@@ -5348,14 +5389,8 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                         }
                         match option_set(shell, &args[i], false) {
                             Ok(()) => {}
-                            Err(OptSetErr::Unimplemented) => {
-                                crate::sh_error_to!(shell, err, None, "set: {}: not yet supported in this version",
-                                    args[i]
-                                );
-                                return ExecOutcome::Continue(2);
-                            }
                             Err(OptSetErr::Unknown) => {
-                                crate::sh_error_to!(shell, err, None, "set: +o: invalid option name: {}",
+                                crate::sh_error_to!(shell, err, None, "set: {}: invalid option name",
                                     args[i]
                                 );
                                 shell.builtin_usage_error = Some(2);
@@ -5514,10 +5549,6 @@ fn shopt_o_bridge(
         for name in names {
             match option_set(shell, name, set_f) {
                 Ok(()) => {}
-                Err(OptSetErr::Unimplemented) => {
-                    crate::sh_error_to!(shell, err, None, "shopt: {name}: not yet supported in this version");
-                    rc = 1;
-                }
                 Err(OptSetErr::Unknown) => {
                     crate::sh_error_to!(shell, err, None, "shopt: {name}: invalid shell option name");
                     rc = 1;
@@ -12668,17 +12699,69 @@ mod set_options_tests {
     }
 
     #[test]
-    fn set_o_enable_unimplemented_says_not_supported() {
-        let mut shell = Shell::new();
-        let (oc, _) = run(&["-o", "allexport"], &mut shell);
-        assert!(matches!(oc, ExecOutcome::Continue(2)));
+    fn set_o_accepts_all_bash_options() {
+        // v270: bash accepts every valid `set -o` name in a script (most are
+        // interactive-only toggles that are inert non-interactively). huck now
+        // accepts + stores them all (rc 0), replacing the old "not yet supported".
+        for name in [
+            "allexport", "braceexpand", "hashall", "histexpand", "history",
+            "ignoreeof", "interactive-comments", "keyword", "monitor", "notify",
+            "onecmd", "functrace", "errtrace", "emacs", "vi", "nolog", "privileged",
+        ] {
+            let mut shell = Shell::new();
+            let (oc, _) = run(&["-o", name], &mut shell);
+            assert!(matches!(oc, ExecOutcome::Continue(0)), "-o {name} should be accepted");
+            assert_eq!(option_get(&shell, name), Some(true), "-o {name} should be stored on");
+        }
+    }
+
+    #[test]
+    fn set_single_char_flags_accepted() {
+        // bash single-char aliases: -a allexport, -b notify, -h hashall,
+        // -k keyword, -m monitor, -t onecmd, -B braceexpand, -E errtrace,
+        // -H histexpand, -P physical, -T functrace, -p privileged.
+        let cases = [
+            ("-a", "allexport"), ("-b", "notify"), ("-t", "onecmd"),
+            ("-k", "keyword"), ("-m", "monitor"), ("-E", "errtrace"),
+            ("-H", "histexpand"), ("-P", "physical"), ("-T", "functrace"),
+            ("-p", "privileged"),
+        ];
+        for (flag, name) in cases {
+            let mut shell = Shell::new();
+            let (oc, _) = run(&[flag], &mut shell);
+            assert!(matches!(oc, ExecOutcome::Continue(0)), "{flag} should be accepted");
+            assert_eq!(option_get(&shell, name), Some(true), "{flag} should turn {name} on");
+            let (oc2, _) = run(&[&flag.replace('-', "+")], &mut shell);
+            assert!(matches!(oc2, ExecOutcome::Continue(0)), "+{} should be accepted", &flag[1..]);
+            assert_eq!(option_get(&shell, name), Some(false), "+{} should turn {name} off", &flag[1..]);
+        }
+        // -h hashall / -B braceexpand default ON: verify +h/+B turn them off then -h/-B on.
+        for (flag, name) in [("h", "hashall"), ("B", "braceexpand")] {
+            let mut shell = Shell::new();
+            let (oc, _) = run(&[&format!("+{flag}")], &mut shell);
+            assert!(matches!(oc, ExecOutcome::Continue(0)));
+            assert_eq!(option_get(&shell, name), Some(false));
+            let (oc, _) = run(&[&format!("-{flag}")], &mut shell);
+            assert!(matches!(oc, ExecOutcome::Continue(0)));
+            assert_eq!(option_get(&shell, name), Some(true));
+        }
     }
 
     #[test]
     fn set_o_enable_unknown_name_is_invalid() {
         let mut shell = Shell::new();
-        let (oc, _) = run(&["-o", "nope_no_such_opt"], &mut shell);
+        let (oc, out) = run(&["-o", "nope_no_such_opt"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(2)));
+        // bash wording: `set: <name>: invalid option name`.
+        assert!(out.is_empty(), "error goes to stderr, not the captured stdout: {out:?}");
+    }
+
+    #[test]
+    fn set_allexport_auto_exports_assignments() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-a"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.shell_options.allexport);
     }
 
     #[test]

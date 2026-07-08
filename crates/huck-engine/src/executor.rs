@@ -3901,6 +3901,10 @@ fn run_assignment_list(
             st = 1;
             break;
         }
+        // `set -a` / `-o allexport`: a variable assigned here is auto-exported.
+        if shell.shell_options.allexport {
+            shell.export(name);
+        }
         if shell.shell_options.xtrace {
             let val = shell.lookup_var(name).unwrap_or_default();
             let p4 = ps4(shell);

@@ -1100,6 +1100,13 @@ impl<'a> Lexer<'a> {
         self.brace_expand
     }
 
+    /// Set the brace-expansion flag (`set +o braceexpand` / `set +B` clears it).
+    /// Must be called before the first token is pulled — the mode stack captures
+    /// this value when a mode is pushed. The default (`new_live`) is `true`.
+    pub fn set_brace_expand(&mut self, on: bool) {
+        self.brace_expand = on;
+    }
+
     /// v264 flip-fix (Finding 2): force mid-word state after a `$( )`/`<( )`/`>( )`
     /// close when the surrounding word CONTINUES. The `)` that ends a command/
     /// process substitution runs `boundary_reset()` (→ `cmd_at_word_start = true`),
