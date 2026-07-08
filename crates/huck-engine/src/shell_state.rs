@@ -197,7 +197,7 @@ pub fn declare_err_message(cmd: &str, name: &str, err: &DeclareErr) -> String {
 /// Persistent shell-option state controlled by `set -X` / `set -o NAME`.
 /// Extend the struct AND the option-name table in `src/builtins.rs`
 /// together when adding a new option.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ShellOptions {
     pub errexit: bool,
     pub nounset: bool,
@@ -219,6 +219,84 @@ pub struct ShellOptions {
     /// strict POSIX semantics. Currently gates special-builtin prefix-assignment
     /// persistence (executor.rs); more posix-mode behaviors hang off this later.
     pub posix: bool,
+
+    // --- bash 5.2 completeness options (v270) ---
+    // Every valid bash `set -o` name is now modeled so `set` accepts them
+    // (matching bash, which silently accepts these in a script) and `set -o` /
+    // `set +o` list + round-trip byte-identically. Only `braceexpand` and
+    // `allexport` carry behavior (gated at the tokenizer / assignment path);
+    // the rest are faithful accept-and-store toggles whose deeper per-option
+    // semantics (job control, trap inheritance, hashing, history) are deferred.
+    /// `set -a` / `-o allexport`: auto-export every subsequently-assigned var.
+    pub allexport: bool,
+    /// `set -B` / `-o braceexpand`: perform `{a,b}` brace expansion (default ON).
+    pub braceexpand: bool,
+    /// `set -h` / `-o hashall`: remember command locations (default ON; inert).
+    pub hashall: bool,
+    /// `set -H` / `-o histexpand`: `!`-style history expansion (inert non-interactively).
+    pub histexpand: bool,
+    /// `-o history`: command history (inert non-interactively).
+    pub history: bool,
+    /// `-o ignoreeof`: don't exit on EOF (interactive-only; inert).
+    pub ignoreeof: bool,
+    /// `-o interactive-comments`: treat `#` as a comment (default ON; already huck behavior).
+    pub interactive_comments: bool,
+    /// `set -k` / `-o keyword`: place assignment args in the environment (inert).
+    pub keyword: bool,
+    /// `set -m` / `-o monitor`: job control (inert non-interactively).
+    pub monitor: bool,
+    /// `set -b` / `-o notify`: report terminated background jobs immediately (inert).
+    pub notify: bool,
+    /// `set -t` / `-o onecmd`: exit after reading one command (inert).
+    pub onecmd: bool,
+    /// `set -T` / `-o functrace`: DEBUG/RETURN traps inherited by functions (inert).
+    pub functrace: bool,
+    /// `set -E` / `-o errtrace`: ERR trap inherited by functions (inert).
+    pub errtrace: bool,
+    /// `-o emacs`: emacs line-editing (interactive-only; inert).
+    pub emacs: bool,
+    /// `-o vi`: vi line-editing (interactive-only; inert).
+    pub vi: bool,
+    /// `-o nolog`: don't record function definitions in history (inert).
+    pub nolog: bool,
+    /// `set -p` / `-o privileged`: privileged mode (inert).
+    pub privileged: bool,
+}
+
+impl Default for ShellOptions {
+    fn default() -> Self {
+        ShellOptions {
+            errexit: false,
+            nounset: false,
+            pipefail: false,
+            verbose: false,
+            xtrace: false,
+            noglob: false,
+            noclobber: false,
+            noexec: false,
+            physical: false,
+            posix: false,
+            // bash non-interactive defaults (oracle: `bash -c 'set -o'`):
+            // braceexpand / hashall / interactive_comments are ON, rest OFF.
+            allexport: false,
+            braceexpand: true,
+            hashall: true,
+            histexpand: false,
+            history: false,
+            ignoreeof: false,
+            interactive_comments: true,
+            keyword: false,
+            monitor: false,
+            notify: false,
+            onecmd: false,
+            functrace: false,
+            errtrace: false,
+            emacs: false,
+            vi: false,
+            nolog: false,
+            privileged: false,
+        }
+    }
 }
 
 /// One row of the bash `shopt` option table.

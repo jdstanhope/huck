@@ -2385,9 +2385,7 @@ fn split_read_fields(line: &str, ifs: &str) -> Vec<String> {
 }
 
 #[cfg(unix)]
-unsafe fn silent_disable_echo() -> Option<libc::termios> {
-    use std::os::unix::io::AsRawFd;
-    let fd = std::io::stdin().as_raw_fd();
+unsafe fn silent_disable_echo(fd: std::os::unix::io::RawFd) -> Option<libc::termios> {
     if unsafe { libc::isatty(fd) } == 0 {
         return None;
     }
@@ -2402,31 +2400,38 @@ unsafe fn silent_disable_echo() -> Option<libc::termios> {
 }
 
 #[cfg(unix)]
-unsafe fn silent_restore_echo(saved: libc::termios) {
-    use std::os::unix::io::AsRawFd;
-    let fd = std::io::stdin().as_raw_fd();
+unsafe fn silent_restore_echo(fd: std::os::unix::io::RawFd, saved: libc::termios) {
     let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
 }
 
-/// Reads one byte at a time from STDIN_FILENO via `libc::read`,
-/// bypassing Rust's shared `std::io::stdin()` BufReader. Necessary
-/// because rustyline's non-tty `readline_direct` path fills that same
+/// Reads one byte at a time from a raw OS file descriptor via `libc::read`,
+/// bypassing Rust's shared `std::io::stdin()` BufReader. For fd 0 this is
+/// necessary because rustyline's non-tty `readline_direct` path fills that same
 /// BufReader with script-ahead bytes; using it here would return
-/// cached script bytes instead of the redirected fd 0.
-struct RawStdinReader;
+/// cached script bytes instead of the redirected fd 0. For `read -u FD` it
+/// reads directly from the caller-chosen fd.
+struct RawFdReader {
+    fd: std::os::unix::io::RawFd,
+}
 
-impl RawStdinReader {
+impl RawFdReader {
+    /// Default reader over fd 0 (stdin).
     fn new() -> Self {
-        RawStdinReader
+        RawFdReader { fd: libc::STDIN_FILENO }
+    }
+
+    /// Reader over an arbitrary already-open fd (`read -u FD`).
+    fn from_fd(fd: std::os::unix::io::RawFd) -> Self {
+        RawFdReader { fd }
     }
 }
 
-impl std::io::Read for RawStdinReader {
+impl std::io::Read for RawFdReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             let n = unsafe {
                 libc::read(
-                    libc::STDIN_FILENO,
+                    self.fd,
                     buf.as_mut_ptr() as *mut libc::c_void,
                     buf.len(),
                 )
@@ -2556,7 +2561,7 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
         return ExecOutcome::Continue(1);
     }
 
-    let mut handle = RawStdinReader::new();
+    let mut handle = RawFdReader::new();
     // Skip the first `skip` records.
     for _ in 0..skip {
         match read_one_record(&mut handle, delim) {
@@ -2629,6 +2634,8 @@ fn builtin_read(
     let mut prompt: Option<String> = None;
     let mut delim: u8 = b'\n';
     let mut array_name: Option<String> = None;
+    // `-u FD`: read from this file descriptor instead of stdin. `None` = stdin.
+    let mut read_fd: Option<std::os::unix::io::RawFd> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -2678,6 +2685,22 @@ fn builtin_read(
                     array_name = Some(v);
                     break;
                 }
+                b'u' => {
+                    let v = match take_opt_value(args, &mut i, bytes, j, "read", 'u', err, shell) {
+                        Ok(v) => v,
+                        Err(rc) => return ExecOutcome::Continue(rc),
+                    };
+                    // A non-numeric fd spec is rejected up front (bash:
+                    // "read: <val>: invalid file descriptor specification").
+                    match v.trim().parse::<std::os::unix::io::RawFd>() {
+                        Ok(fd) if fd >= 0 => read_fd = Some(fd),
+                        _ => {
+                            crate::sh_error_to!(shell, err, None, "read: {v}: invalid file descriptor specification");
+                            return ExecOutcome::Continue(1);
+                        }
+                    }
+                    break;
+                }
                 c => {
                     crate::sh_error_to!(shell, err, None, "read: -{}: invalid option", c as char);
                     return ExecOutcome::Continue(2);
@@ -2703,6 +2726,16 @@ fn builtin_read(
         return ExecOutcome::Continue(1);
     }
 
+    // `-u FD`: validate the fd is actually open BEFORE reading (bash checks
+    // immediately via fcntl(fd, F_GETFD) == -1 && errno == EBADF), so an
+    // unopened fd errors without consuming any input.
+    if let Some(fd) = read_fd
+        && unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1
+    {
+        crate::sh_error_to!(shell, err, None, "read: {fd}: invalid file descriptor: Bad file descriptor");
+        return ExecOutcome::Continue(1);
+    }
+
     // Prompt — only when stdin is a tty (matches bash).
     if let Some(p) = &prompt {
         use std::io::IsTerminal;
@@ -2712,11 +2745,13 @@ fn builtin_read(
         }
     }
 
-    // -s silent: toggle ECHO off on stdin's tty for the duration of
-    // the read, then restore.
+    // -s silent: toggle ECHO off on the read fd's tty (stdin unless `-u FD`)
+    // for the duration of the read, then restore.
+    #[cfg(unix)]
+    let tty_fd = read_fd.unwrap_or(libc::STDIN_FILENO);
     #[cfg(unix)]
     let saved_term = if silent {
-        unsafe { silent_disable_echo() }
+        unsafe { silent_disable_echo(tty_fd) }
     } else {
         None
     };
@@ -2727,7 +2762,10 @@ fn builtin_read(
     // with subsequent script lines on a single underlying read; using
     // BufReader here would return cached script bytes instead of the
     // redirected fd 0 (e.g. our `<<<` here-string pipe).
-    let mut handle = RawStdinReader::new();
+    let mut handle = match read_fd {
+        Some(fd) => RawFdReader::from_fd(fd),
+        None => RawFdReader::new(),
+    };
     let line_opt = match read_one_line(&mut handle, raw, delim) {
         Ok(opt) => opt,
         Err(e) => {
@@ -2735,7 +2773,7 @@ fn builtin_read(
             #[cfg(unix)]
             if let Some(s) = saved_term {
                 unsafe {
-                    silent_restore_echo(s);
+                    silent_restore_echo(tty_fd, s);
                 }
             }
             return ExecOutcome::Continue(1);
@@ -2754,7 +2792,7 @@ fn builtin_read(
     #[cfg(unix)]
     if let Some(s) = saved_term {
         unsafe {
-            silent_restore_echo(s);
+            silent_restore_echo(tty_fd, s);
         }
     }
     if was_silenced {
@@ -5062,10 +5100,11 @@ pub fn signal_names() -> Vec<String> {
         .collect()
 }
 
-/// bash 5.2's full `set -o` option table, in bash's display order.
-/// `errexit`/`nounset`/`pipefail` are implemented (real state via
-/// `Shell.shell_options`); the rest are recognized for listing + querying
-/// only (their `default` is reported) and cannot be enabled.
+/// bash 5.2's full `set -o` option table, in bash's display order. Every name
+/// is backed by real state in `Shell.shell_options` and is settable (v270);
+/// only some options carry deeper behavior (see the `ShellOptions` doc). The
+/// `default` here mirrors each field's non-interactive default and is only a
+/// fallback for `option_get`.
 const SETO_TABLE: &[OptionInfo] = &[
     OptionInfo { name: "allexport", default: false },
     OptionInfo { name: "braceexpand", default: true },
@@ -5096,12 +5135,10 @@ const SETO_TABLE: &[OptionInfo] = &[
     OptionInfo { name: "xtrace", default: false },
 ];
 
-/// Error from `option_set` for a non-settable `set -o` name.
+/// Error from `option_set` for an unrecognized `set -o` name.
 /// `Debug` is required because an existing test calls `option_set(...).unwrap()`.
 #[derive(Debug)]
 enum OptSetErr {
-    /// Known bash option huck does not implement (e.g. `xtrace`, `posix`).
-    Unimplemented,
     /// Not a recognized `set -o` option name at all.
     Unknown,
 }
@@ -5120,32 +5157,63 @@ pub(crate) fn option_get(shell: &Shell, name: &str) -> Option<bool> {
         "noexec" => Some(shell.shell_options.noexec),
         "physical" => Some(shell.shell_options.physical),
         "posix" => Some(shell.shell_options.posix),
-        other => SETO_TABLE.iter().find(|o| o.name == other).map(|o| o.default),
+        "allexport" => Some(shell.shell_options.allexport),
+        "braceexpand" => Some(shell.shell_options.braceexpand),
+        "hashall" => Some(shell.shell_options.hashall),
+        "histexpand" => Some(shell.shell_options.histexpand),
+        "history" => Some(shell.shell_options.history),
+        "ignoreeof" => Some(shell.shell_options.ignoreeof),
+        "interactive-comments" => Some(shell.shell_options.interactive_comments),
+        "keyword" => Some(shell.shell_options.keyword),
+        "monitor" => Some(shell.shell_options.monitor),
+        "notify" => Some(shell.shell_options.notify),
+        "onecmd" => Some(shell.shell_options.onecmd),
+        "functrace" => Some(shell.shell_options.functrace),
+        "errtrace" => Some(shell.shell_options.errtrace),
+        "emacs" => Some(shell.shell_options.emacs),
+        "vi" => Some(shell.shell_options.vi),
+        "nolog" => Some(shell.shell_options.nolog),
+        "privileged" => Some(shell.shell_options.privileged),
+        _ => None,
     }
 }
 
-/// Writes a `set -o` option. Only the behaviorally-implemented options are
-/// settable; the rest of `SETO_TABLE` is inert (`Unimplemented`).
+/// Writes a `set -o` option. Every valid bash 5.2 option name is settable;
+/// only `braceexpand`/`allexport` (and the pre-existing behavioral options)
+/// carry semantics — the rest are faithful accept-and-store toggles (see the
+/// `ShellOptions` doc-comment). An unrecognized name yields `OptSetErr::Unknown`.
 fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetErr> {
     match name {
-        "errexit" => { shell.shell_options.errexit = value; Ok(()) }
-        "nounset" => { shell.shell_options.nounset = value; Ok(()) }
-        "pipefail" => { shell.shell_options.pipefail = value; Ok(()) }
-        "verbose" => { shell.shell_options.verbose = value; Ok(()) }
-        "xtrace" => { shell.shell_options.xtrace = value; Ok(()) }
-        "noglob" => { shell.shell_options.noglob = value; Ok(()) }
-        "noclobber" => { shell.shell_options.noclobber = value; Ok(()) }
-        "noexec" => { shell.shell_options.noexec = value; Ok(()) }
-        "physical" => { shell.shell_options.physical = value; Ok(()) }
-        "posix" => { shell.shell_options.posix = value; Ok(()) }
-        other => {
-            if SETO_TABLE.iter().any(|o| o.name == other) {
-                Err(OptSetErr::Unimplemented)
-            } else {
-                Err(OptSetErr::Unknown)
-            }
-        }
+        "errexit" => shell.shell_options.errexit = value,
+        "nounset" => shell.shell_options.nounset = value,
+        "pipefail" => shell.shell_options.pipefail = value,
+        "verbose" => shell.shell_options.verbose = value,
+        "xtrace" => shell.shell_options.xtrace = value,
+        "noglob" => shell.shell_options.noglob = value,
+        "noclobber" => shell.shell_options.noclobber = value,
+        "noexec" => shell.shell_options.noexec = value,
+        "physical" => shell.shell_options.physical = value,
+        "posix" => shell.shell_options.posix = value,
+        "allexport" => shell.shell_options.allexport = value,
+        "braceexpand" => shell.shell_options.braceexpand = value,
+        "hashall" => shell.shell_options.hashall = value,
+        "histexpand" => shell.shell_options.histexpand = value,
+        "history" => shell.shell_options.history = value,
+        "ignoreeof" => shell.shell_options.ignoreeof = value,
+        "interactive-comments" => shell.shell_options.interactive_comments = value,
+        "keyword" => shell.shell_options.keyword = value,
+        "monitor" => shell.shell_options.monitor = value,
+        "notify" => shell.shell_options.notify = value,
+        "onecmd" => shell.shell_options.onecmd = value,
+        "functrace" => shell.shell_options.functrace = value,
+        "errtrace" => shell.shell_options.errtrace = value,
+        "emacs" => shell.shell_options.emacs = value,
+        "vi" => shell.shell_options.vi = value,
+        "nolog" => shell.shell_options.nolog = value,
+        "privileged" => shell.shell_options.privileged = value,
+        _ => return Err(OptSetErr::Unknown),
     }
+    Ok(())
 }
 
 fn print_options_table(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
@@ -5214,12 +5282,8 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
             }
             match option_set(shell, &args[i], true) {
                 Ok(()) => {}
-                Err(OptSetErr::Unimplemented) => {
-                    crate::sh_error_to!(shell, err, None, "set: {}: not yet supported in this version", args[i]);
-                    return ExecOutcome::Continue(2);
-                }
                 Err(OptSetErr::Unknown) => {
-                    crate::sh_error_to!(shell, err, None, "set: -o: invalid option name: {}", args[i]);
+                    crate::sh_error_to!(shell, err, None, "set: {}: invalid option name", args[i]);
                     shell.builtin_usage_error = Some(2);
                     return ExecOutcome::Continue(2);
                 }
@@ -5234,12 +5298,8 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
             }
             match option_set(shell, &args[i], false) {
                 Ok(()) => {}
-                Err(OptSetErr::Unimplemented) => {
-                    crate::sh_error_to!(shell, err, None, "set: {}: not yet supported in this version", args[i]);
-                    return ExecOutcome::Continue(2);
-                }
                 Err(OptSetErr::Unknown) => {
-                    crate::sh_error_to!(shell, err, None, "set: +o: invalid option name: {}", args[i]);
+                    crate::sh_error_to!(shell, err, None, "set: {}: invalid option name", args[i]);
                     shell.builtin_usage_error = Some(2);
                     return ExecOutcome::Continue(2);
                 }
@@ -5260,6 +5320,19 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                     b'v' => shell.shell_options.verbose = true,
                     b'x' => shell.shell_options.xtrace = true,
                     b'n' => shell.shell_options.noexec = true,
+                    // bash 5.2 single-char aliases for long-form options.
+                    b'a' => shell.shell_options.allexport = true,
+                    b'b' => shell.shell_options.notify = true,
+                    b'h' => shell.shell_options.hashall = true,
+                    b'k' => shell.shell_options.keyword = true,
+                    b'm' => shell.shell_options.monitor = true,
+                    b't' => shell.shell_options.onecmd = true,
+                    b'B' => shell.shell_options.braceexpand = true,
+                    b'E' => shell.shell_options.errtrace = true,
+                    b'H' => shell.shell_options.histexpand = true,
+                    b'P' => shell.shell_options.physical = true,
+                    b'T' => shell.shell_options.functrace = true,
+                    b'p' => shell.shell_options.privileged = true,
                     b'o' => {
                         i += 1;
                         if i >= args.len() {
@@ -5267,14 +5340,8 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                         }
                         match option_set(shell, &args[i], true) {
                             Ok(()) => {}
-                            Err(OptSetErr::Unimplemented) => {
-                                crate::sh_error_to!(shell, err, None, "set: {}: not yet supported in this version",
-                                    args[i]
-                                );
-                                return ExecOutcome::Continue(2);
-                            }
                             Err(OptSetErr::Unknown) => {
-                                crate::sh_error_to!(shell, err, None, "set: -o: invalid option name: {}",
+                                crate::sh_error_to!(shell, err, None, "set: {}: invalid option name",
                                     args[i]
                                 );
                                 shell.builtin_usage_error = Some(2);
@@ -5303,6 +5370,18 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                     b'v' => shell.shell_options.verbose = false,
                     b'x' => shell.shell_options.xtrace = false,
                     b'n' => shell.shell_options.noexec = false,
+                    b'a' => shell.shell_options.allexport = false,
+                    b'b' => shell.shell_options.notify = false,
+                    b'h' => shell.shell_options.hashall = false,
+                    b'k' => shell.shell_options.keyword = false,
+                    b'm' => shell.shell_options.monitor = false,
+                    b't' => shell.shell_options.onecmd = false,
+                    b'B' => shell.shell_options.braceexpand = false,
+                    b'E' => shell.shell_options.errtrace = false,
+                    b'H' => shell.shell_options.histexpand = false,
+                    b'P' => shell.shell_options.physical = false,
+                    b'T' => shell.shell_options.functrace = false,
+                    b'p' => shell.shell_options.privileged = false,
                     b'o' => {
                         i += 1;
                         if i >= args.len() {
@@ -5310,14 +5389,8 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                         }
                         match option_set(shell, &args[i], false) {
                             Ok(()) => {}
-                            Err(OptSetErr::Unimplemented) => {
-                                crate::sh_error_to!(shell, err, None, "set: {}: not yet supported in this version",
-                                    args[i]
-                                );
-                                return ExecOutcome::Continue(2);
-                            }
                             Err(OptSetErr::Unknown) => {
-                                crate::sh_error_to!(shell, err, None, "set: +o: invalid option name: {}",
+                                crate::sh_error_to!(shell, err, None, "set: {}: invalid option name",
                                     args[i]
                                 );
                                 shell.builtin_usage_error = Some(2);
@@ -5476,10 +5549,6 @@ fn shopt_o_bridge(
         for name in names {
             match option_set(shell, name, set_f) {
                 Ok(()) => {}
-                Err(OptSetErr::Unimplemented) => {
-                    crate::sh_error_to!(shell, err, None, "shopt: {name}: not yet supported in this version");
-                    rc = 1;
-                }
                 Err(OptSetErr::Unknown) => {
                     crate::sh_error_to!(shell, err, None, "shopt: {name}: invalid shell option name");
                     rc = 1;
@@ -10844,6 +10913,74 @@ mod read_tests {
         assert_eq!(r.as_deref(), Some("foo"));
     }
 
+    // ── read -u FD ──────────────────────────────────────────────
+
+    fn run_read(args: &[&str], shell: &mut crate::shell_state::Shell) -> (i32, String) {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let rc = match builtin_read(&argv, &mut out, &mut err, shell) {
+            ExecOutcome::Continue(c) => c,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        (rc, String::from_utf8_lossy(&err).into_owned())
+    }
+
+    #[test]
+    fn read_u_nonnumeric_fd_is_spec_error() {
+        let mut shell = crate::shell_state::Shell::new();
+        let (rc, err) = run_read(&["-u", "xyz", "v"], &mut shell);
+        assert_eq!(rc, 1);
+        assert!(
+            err.contains("xyz: invalid file descriptor specification"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_u_separate_and_bundled_read_from_pipe() {
+        // Create a real OS pipe, write a line into it, and read it back via
+        // `read -u FD` in both the separate (`-u N`) and bundled (`-uN`) forms.
+        for bundled in [false, true] {
+            let mut fds = [0 as std::os::unix::io::RawFd; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            let (rfd, wfd) = (fds[0], fds[1]);
+            let payload = b"hello world extra\n";
+            let n = unsafe {
+                libc::write(wfd, payload.as_ptr() as *const libc::c_void, payload.len())
+            };
+            assert_eq!(n, payload.len() as isize);
+            unsafe { libc::close(wfd) };
+
+            let mut shell = crate::shell_state::Shell::new();
+            let fd_str = rfd.to_string();
+            let (rc, err) = if bundled {
+                run_read(&[&format!("-u{fd_str}"), "a", "b"], &mut shell)
+            } else {
+                run_read(&["-u", &fd_str, "a", "b"], &mut shell)
+            };
+            unsafe { libc::close(rfd) };
+            assert_eq!(rc, 0, "err: {err}");
+            assert_eq!(shell.get("a"), Some("hello"));
+            // Remaining fields collapse into the last name (IFS join preserved).
+            assert_eq!(shell.get("b"), Some("world extra"));
+        }
+    }
+
+    #[test]
+    fn read_u_unopened_fd_is_bad_file_descriptor() {
+        // Pick an fd that is (almost certainly) not open, verify up-front.
+        let fd: std::os::unix::io::RawFd = 90;
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        let mut shell = crate::shell_state::Shell::new();
+        let (rc, err) = run_read(&["-u", "90", "v"], &mut shell);
+        assert_eq!(rc, 1);
+        assert!(
+            err.contains("90: invalid file descriptor: Bad file descriptor"),
+            "got: {err}"
+        );
+    }
+
     // ── read_one_record ────────────────────────────────────────
 
     #[test]
@@ -12562,17 +12699,73 @@ mod set_options_tests {
     }
 
     #[test]
-    fn set_o_enable_unimplemented_says_not_supported() {
-        let mut shell = Shell::new();
-        let (oc, _) = run(&["-o", "allexport"], &mut shell);
-        assert!(matches!(oc, ExecOutcome::Continue(2)));
+    fn set_o_accepts_all_bash_options() {
+        // v270: bash accepts every valid `set -o` name in a script (most are
+        // interactive-only toggles that are inert non-interactively). huck now
+        // accepts + stores them all (rc 0), replacing the old "not yet supported".
+        for name in [
+            "allexport", "braceexpand", "hashall", "histexpand", "history",
+            "ignoreeof", "interactive-comments", "keyword", "monitor", "notify",
+            "onecmd", "functrace", "errtrace", "emacs", "vi", "nolog", "privileged",
+        ] {
+            let mut shell = Shell::new();
+            let (oc, _) = run(&["-o", name], &mut shell);
+            assert!(matches!(oc, ExecOutcome::Continue(0)), "-o {name} should be accepted");
+            assert_eq!(option_get(&shell, name), Some(true), "-o {name} should be stored on");
+        }
+    }
+
+    #[test]
+    fn set_single_char_flags_accepted() {
+        // bash single-char aliases: -a allexport, -b notify, -h hashall,
+        // -k keyword, -m monitor, -t onecmd, -B braceexpand, -E errtrace,
+        // -H histexpand, -P physical, -T functrace, -p privileged.
+        let cases = [
+            ("-a", "allexport"), ("-b", "notify"), ("-t", "onecmd"),
+            ("-k", "keyword"), ("-m", "monitor"), ("-E", "errtrace"),
+            ("-H", "histexpand"), ("-P", "physical"), ("-T", "functrace"),
+            ("-p", "privileged"),
+        ];
+        for (flag, name) in cases {
+            let mut shell = Shell::new();
+            let (oc, _) = run(&[flag], &mut shell);
+            assert!(matches!(oc, ExecOutcome::Continue(0)), "{flag} should be accepted");
+            assert_eq!(option_get(&shell, name), Some(true), "{flag} should turn {name} on");
+            let (oc2, _) = run(&[&flag.replace('-', "+")], &mut shell);
+            assert!(matches!(oc2, ExecOutcome::Continue(0)), "+{} should be accepted", &flag[1..]);
+            assert_eq!(option_get(&shell, name), Some(false), "+{} should turn {name} off", &flag[1..]);
+        }
+        // -h hashall / -B braceexpand default ON: verify +h/+B turn them off then -h/-B on.
+        for (flag, name) in [("h", "hashall"), ("B", "braceexpand")] {
+            let mut shell = Shell::new();
+            let (oc, _) = run(&[&format!("+{flag}")], &mut shell);
+            assert!(matches!(oc, ExecOutcome::Continue(0)));
+            assert_eq!(option_get(&shell, name), Some(false));
+            let (oc, _) = run(&[&format!("-{flag}")], &mut shell);
+            assert!(matches!(oc, ExecOutcome::Continue(0)));
+            assert_eq!(option_get(&shell, name), Some(true));
+        }
     }
 
     #[test]
     fn set_o_enable_unknown_name_is_invalid() {
         let mut shell = Shell::new();
-        let (oc, _) = run(&["-o", "nope_no_such_opt"], &mut shell);
+        let (oc, out) = run(&["-o", "nope_no_such_opt"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(2)));
+        // bash wording: `set: <name>: invalid option name`.
+        assert!(out.is_empty(), "error goes to stderr, not the captured stdout: {out:?}");
+    }
+
+    // `set -a` enabling the flag is tested here; the auto-export *behavior*
+    // it gates (assignments become exported) lives in the executor and is
+    // covered byte-for-byte against bash by set_o_options_diff_check.sh.
+    #[test]
+    fn set_dash_a_enables_allexport() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-a"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.shell_options.allexport);
+        assert_eq!(option_get(&shell, "allexport"), Some(true));
     }
 
     #[test]
