@@ -1161,7 +1161,32 @@ impl<'a> Lexer<'a> {
         // popping the last element would leave `modes` empty and make the next
         // `current_mode()` panic with a confusing message.
         debug_assert!(self.modes.len() > 1, "Command is the floor and must never be popped");
-        self.modes.pop().expect("pop_mode on an empty mode stack")
+        let popped_depth = self.modes.len();
+        let popped = self.modes.pop().expect("pop_mode on an empty mode stack");
+        // Delayed heredoc across a comsub/backtick boundary: a `cat <<D` opened
+        // INSIDE a command substitution whose `)`/`` ` `` closes before D's body
+        // was collected (`echo $(cat <<D)\n…body…\nD`). bash collects such a
+        // heredoc's body from the lines following the ENCLOSING command line — so
+        // re-tag any still-pending heredoc registered at the depth we just left to
+        // the enclosing depth, letting the enclosing line's newline trigger its
+        // body emission (`atom_heredoc_idx_at_depth`). A heredoc whose body WAS
+        // collected within the comsub was already removed from the queue, so this
+        // only re-homes genuinely-orphaned entries. Not a forward scan: no cursor
+        // movement, just a depth re-tag on the existing FIFO.
+        if matches!(popped, Mode::CommandSub { .. } | Mode::Backtick { .. }) {
+            let new_depth = self.modes.len();
+            let mut changed = false;
+            for ph in self.atom_pending_heredocs.iter_mut() {
+                if ph.reg_depth == popped_depth {
+                    ph.reg_depth = new_depth;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.heredoc_gen += 1; // atom_pending_heredocs mutated
+            }
+        }
+        popped
     }
 
     /// v254 T1 fix: set the current `Mode::Regex { body_started }` flag from the
@@ -5033,7 +5058,7 @@ fn parse_heredoc_delim(
     let mut any_quoted = false;
     while let Some(&c) = chars.peek() {
         match c {
-            '\n' | ' ' | '\t' | ';' | '&' | '|' | '<' | '>' => break,
+            '\n' | ' ' | '\t' | ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
             '\'' => {
                 chars.next();
                 any_quoted = true;
@@ -5055,10 +5080,15 @@ fn parse_heredoc_delim(
             }
             '\\' => {
                 chars.next();
-                any_quoted = true;
-                if let Some(&next) = chars.peek() {
-                    chars.next();
-                    delim.push(next);
+                match chars.peek() {
+                    // `\<newline>` inside the delimiter word is a line
+                    // continuation: both the backslash and the newline are
+                    // deleted and scanning continues on the next line (bash
+                    // strips continuations before reading the delimiter word).
+                    // It is NOT quoting, so `any_quoted` stays untouched.
+                    Some(&'\n') => { chars.next(); }
+                    Some(&next) => { chars.next(); any_quoted = true; delim.push(next); }
+                    None => { any_quoted = true; }
                 }
             }
             _ => {
@@ -7660,6 +7690,50 @@ mod array_parse_tests {
             let mut lx = Lexer::new_live_atoms(src, &empty, LexerOptions::default());
             assert!(crate::parser::parse_sequence(&mut lx).is_ok(), "false NoProgress on {src:?}");
         }
+    }
+
+    #[test]
+    fn heredoc_comsub_interleave_parses() {
+        // parse-gaps-round2: heredoc<->comsub interleaving that used to reject.
+        let empty = std::collections::HashMap::new();
+        let cases = [
+            // comsub4.sub block 2: delimiter across a `\<newline>` continuation.
+            "x=$( cat <<\\EOT\\\n4\nd \\\ng\nEOT4\n)\necho \"$x\"\n",
+            // comsub4.sub block 3: quoted-delim heredoc in comsub, literal `\`.
+            "x=$( cat <<\\EOT\nd \\\ng\nEOT\n)\necho \"$x\"\n",
+            // heredoc7.sub: `)` terminates the delimiter word; body after close.
+            "echo $(cat <<EOF)\nfoo\nbar\nEOF\nafter\n",
+            // `)` closes a subshell after a heredoc delimiter.
+            "(cat <<EOF)\nhi\nEOF\n",
+        ];
+        for src in cases {
+            let mut lx = Lexer::new_live_atoms(src, &empty, LexerOptions::default());
+            assert!(
+                crate::parser::parse_sequence(&mut lx).is_ok(),
+                "expected clean parse for {src:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn heredoc_delim_stops_at_paren() {
+        // `<<EOF)` — `)` is a metacharacter, so the delimiter is `EOF` (not
+        // `EOF)`); the delimiter word ends and `)` is a separate token.
+        let mut c = CharCursor::new("EOF)\nhi\nEOF");
+        let (delim, expand) = parse_heredoc_delim(&mut c).unwrap();
+        assert_eq!(delim, "EOF");
+        assert!(expand);
+        assert_eq!(c.peek(), Some(&')'));
+    }
+
+    #[test]
+    fn heredoc_delim_line_continuation_joins() {
+        // `\EOT\<newline>4` — the `\<newline>` is a line continuation (both
+        // deleted); the quoted delimiter word is `EOT4` (any_quoted → no expand).
+        let mut c = CharCursor::new("\\EOT\\\n4\nbody");
+        let (delim, expand) = parse_heredoc_delim(&mut c).unwrap();
+        assert_eq!(delim, "EOT4");
+        assert!(!expand, "backslash-quoted delimiter disables expansion");
     }
 
     #[test]
