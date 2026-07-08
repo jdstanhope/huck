@@ -102,6 +102,19 @@ if [ -n "$HELPER_DIR" ]; then
     export PATH
 fi
 
+# ---- TMPDIR ---------------------------------------------------------
+# bash's own tests/run-all does `: ${TMPDIR:=/tmp}; export TMPDIR` (lines
+# 17-18) before running any category, and its shipped .right files were
+# generated under that condition. 64 of the test .sub files use a BARE
+# $TMPDIR (e.g. extglob6.sub's `DIR=$TMPDIR/extglob-$$; mkdir $DIR; cd
+# $DIR; touch a`). With TMPDIR unset those `mkdir`/`cd` fail and the test
+# leaks files into the shared scratch dir for ANY shell (verified: real
+# bash leaks the same stray `a`), which then pollutes later categories
+# (a stray `a` makes getopts's unquoted `[-a]` glob expand). Match bash's
+# harness precondition so our run replicates the .right conditions.
+: "${TMPDIR:=/tmp}"
+export TMPDIR
+
 # ---- Scratch dir ---------------------------------------------------
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
