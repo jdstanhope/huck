@@ -381,7 +381,18 @@ pub fn process_line_in_sinks(
     sink: &mut crate::executor::StdoutSink,
     err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
-    let opts = lexer::LexerOptions { extglob: shell.extglob(), ..Default::default() };
+    // This is a top-level BATCH parse of a COMPLETE program string (piped-stdin
+    // logical command, `eval`, a trap/PROMPT_COMMAND action). Like bash, an open
+    // here-document is delimited by end-of-input rather than erroring. The
+    // interactive REPL continuation check runs earlier in `classify` (its own
+    // lexer keeps `eof_closes_heredoc=false`, so it still returns
+    // `Incomplete(Heredoc)` and prompts) — by the time a buffer reaches here it is
+    // a complete logical command, so closing at EOF matches bash.
+    let opts = lexer::LexerOptions {
+        extglob: shell.extglob(),
+        eof_closes_heredoc: true,
+        ..Default::default()
+    };
     // Build a live lexer that expands aliases at command position as the parser
     // reads tokens. For non-interactive / non-alias paths, use an empty alias map
     // so the live lexer is alias-free (byte-identical to the old token pre-pass).

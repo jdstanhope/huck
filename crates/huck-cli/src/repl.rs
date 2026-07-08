@@ -440,6 +440,17 @@ fn read_logical_command(
             Err(ReadlineError::Eof) => {
                 return if buffer.is_empty() {
                     ReadResult::Eof
+                } else if matches!(
+                    pending.as_ref().map(|(r, _)| r),
+                    Some(huck_engine::continuation::ContinuationReason::Heredoc)
+                ) {
+                    // Real EOF with an OPEN here-document: bash delimits the
+                    // here-doc by end-of-input and RUNS the buffer (it does not
+                    // error). `process_line` closes the heredoc at EOF
+                    // (`eof_closes_heredoc`), so hand the buffer off as Ready.
+                    // Other incompleteness (unclosed quote/`$(`/compound) still
+                    // reports "unexpected end of input" via EofMidCommand.
+                    ReadResult::Ready { buffer, history }
                 } else {
                     ReadResult::EofMidCommand(buffer)
                 };

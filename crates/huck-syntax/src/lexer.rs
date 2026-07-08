@@ -752,6 +752,20 @@ pub struct LexerOptions {
     /// Read ONLY by the extquote `$'…'`-name gate (M-156); it does NOT affect
     /// glob-literalness, word-splitting, or quoting of operands.
     pub in_dquote: bool,
+    /// True for a top-level BATCH program parse (a whole file / `-c` string /
+    /// piped-stdin-as-a-complete-program / `eval` / `source`) where end-of-input
+    /// TERMINATES an open here-document — bash delimits a here-doc by EOF when the
+    /// input runs out (it warns on stderr but PARSES the body collected so far).
+    ///
+    /// DEFAULT `false`: every other caller — including the REPL continuation
+    /// `classify` (which must keep returning `Incomplete(Heredoc)` so the prompt
+    /// stays up) — keeps erroring `UnterminatedHeredoc` on an open here-doc at
+    /// genuine end-of-input. Read ONLY by the heredoc-body collectors
+    /// (`scan_step_heredoc_body_literal` / `_expanding`); it does NOT affect any
+    /// other tokenization rule. NOT captured in `Mark` — a heredoc body is never
+    /// mark/rewound (see the `Mark` doc-comment), and the flag is immutable for a
+    /// lexer's lifetime.
+    pub eof_closes_heredoc: bool,
 }
 
 
@@ -3153,6 +3167,24 @@ impl<'a> Lexer<'a> {
                 return Ok(Step::Produced);
             }
             if !got_nl {
+                // End-of-input with no close-delimiter line. In a top-level BATCH
+                // parse (`eof_closes_heredoc`), bash delimits the here-doc by EOF:
+                // fold the partial final line (if any) into the body — bash appends
+                // the line separator to it exactly as for a newline-terminated line —
+                // and finish the body normally instead of erroring.
+                if self.opts.eof_closes_heredoc {
+                    if !line.is_empty() {
+                        let body_line = if ph.strip_tabs { line.trim_start_matches('\t').to_string() } else { line };
+                        body.push_str(&body_line);
+                        body.push('\n');
+                    }
+                    let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                    if !body.is_empty() {
+                        self.history.push(Token::new(TokenKind::Lit { text: body, quoted: true }, Span::new(off, l, c)));
+                    }
+                    self.emit_heredoc_body_end();
+                    return Ok(Step::Produced);
+                }
                 return Err(LexError::UnterminatedHeredoc);
             }
             let body_line = if ph.strip_tabs { line.trim_start_matches('\t').to_string() } else { line };
@@ -3200,6 +3232,17 @@ impl<'a> Lexer<'a> {
                 self.emit_heredoc_body_end();
                 return Ok(Step::Produced);
             }
+            // End-of-input at a logical line start (input ran out after a
+            // newline-terminated body line, or with an entirely empty body). In a
+            // top-level BATCH parse, bash delimits the here-doc by EOF: finish the
+            // body as-is — the trailing `\n` of the previous line was already
+            // emitted, so no separator is added here. Checked BEFORE clearing
+            // `at_line_start` so the mid-line `None` branch below (which DOES append
+            // a separator) fires only for a genuinely unterminated final line.
+            if self.opts.eof_closes_heredoc && self.cursor.peek().is_none() {
+                self.emit_heredoc_body_end();
+                return Ok(Step::Produced);
+            }
             self.emitting_heredoc.as_mut().expect("emitting").at_line_start = false;
             self.heredoc_gen += 1; // v250 T6 fix: emitting_heredoc.at_line_start flip is a state change
             // Fall through to emit the first atom of this body line.
@@ -3209,7 +3252,16 @@ impl<'a> Lexer<'a> {
         let c = self.cursor.column();
         match self.cursor.peek().copied() {
             // EOF mid-body without a matching close-delimiter line — error (matches
-            // the oracle's `!got_newline` guard).
+            // the oracle's `!got_newline` guard). In a top-level BATCH parse
+            // (`eof_closes_heredoc`), bash instead delimits the here-doc by EOF: the
+            // partial final line's atoms were already emitted incrementally, so
+            // append the missing line separator (bash terminates the final line with
+            // a `\n` even without a trailing newline in the source) and finish.
+            None if self.opts.eof_closes_heredoc => {
+                self.history.push(Token::new(TokenKind::Lit { text: "\n".into(), quoted: true }, Span::new(off, l, c)));
+                self.emit_heredoc_body_end();
+                Ok(Step::Produced)
+            }
             None => Err(LexError::UnterminatedHeredoc),
             // End of a body line: emit the `\n` separator (quoted:true) and re-arm
             // the line-start delimiter check for the next line.

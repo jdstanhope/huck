@@ -5950,6 +5950,78 @@ mod tests {
         diff_cmd("cat 3<<EOF\nx\nEOF\n");
     }
 
+    // EOF-closes-heredoc: a top-level BATCH parse (`eof_closes_heredoc=true`)
+    // delimits an open here-document by end-of-input (bash behavior), instead of
+    // erroring `UnterminatedHeredoc`.
+
+    fn new_seq_eof(s: &str) -> Result<Option<Sequence>, ParseError> {
+        let opts = LexerOptions { eof_closes_heredoc: true, ..Default::default() };
+        let mut lx = Lexer::new_live_atoms(s, &Default::default(), opts);
+        parse_sequence(&mut lx)
+    }
+
+    /// Pull the first redirect's heredoc body Word out of a parsed program.
+    fn heredoc_body_text(s: &str) -> String {
+        let cmd = new_seq_eof(s).expect("parse ok").expect("non-empty").first;
+        let e = t6_exec(&cmd);
+        match &e.redirects[0].op {
+            crate::command::RedirOp::Heredoc { body, .. } => body
+                .0
+                .iter()
+                .map(|p| match p {
+                    WordPart::Literal { text, .. } => text.clone(),
+                    o => panic!("unexpected body part {o:?}"),
+                })
+                .collect(),
+            o => panic!("expected Heredoc redirect, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn atoms_heredoc_eof_closes_expanding() {
+        // Requirement (a): with the flag set, `cat <<EOF\nhi` (no close-delimiter
+        // line, EOF ends input) parses to a heredoc whose body is `hi\n` — bash
+        // appends the line separator to the final line even without a trailing
+        // newline in the source.
+        assert_eq!(heredoc_body_text("cat <<EOF\nhi"), "hi\n");
+        // Trailing newline present, still no close delimiter → same body.
+        assert_eq!(heredoc_body_text("cat <<EOF\nhi\n"), "hi\n");
+        // Multi-line body.
+        assert_eq!(heredoc_body_text("cat <<EOF\nhi\nthere"), "hi\nthere\n");
+        // Empty body (bare newline then EOF).
+        assert_eq!(heredoc_body_text("cat <<EOF\n"), "");
+    }
+
+    #[test]
+    fn atoms_heredoc_eof_closes_literal() {
+        // Quoted delimiter → literal body collector; EOF closes it too.
+        assert_eq!(heredoc_body_text("cat <<'EOF'\nhi"), "hi\n");
+        // `<<-` strips leading tabs, EOF-closed.
+        assert_eq!(heredoc_body_text("cat <<-'EOF'\n\thi\n\tthere"), "hi\nthere\n");
+    }
+
+    #[test]
+    fn atoms_heredoc_eof_default_still_errors() {
+        // WITHOUT the flag (the default — used by `classify` and all internal
+        // parses), an open here-document at EOF is still a parse error.
+        assert!(
+            matches!(new_seq("cat <<EOF\nhi"), Err(ParseError::Lex(ref e)) if matches!(**e, crate::lexer::LexError::UnterminatedHeredoc)),
+            "default opts must still error UnterminatedHeredoc: {:?}",
+            new_seq("cat <<EOF\nhi")
+        );
+        assert!(
+            matches!(new_seq("cat <<'EOF'\nhi"), Err(ParseError::Lex(ref e)) if matches!(**e, crate::lexer::LexError::UnterminatedHeredoc)),
+            "default opts (literal) must still error: {:?}",
+            new_seq("cat <<'EOF'\nhi")
+        );
+    }
+
+    #[test]
+    fn atoms_heredoc_eof_closes_properly_closed_unchanged() {
+        // A here-document that IS properly closed is byte-identical with the flag on.
+        assert_eq!(heredoc_body_text("cat <<EOF\nhi\nEOF\n"), "hi\n");
+    }
+
     // v250 T6: mark/rewind heredoc-state generation guard + error parity + adversarial corpus
 
     #[test]

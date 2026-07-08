@@ -6319,7 +6319,15 @@ pub(crate) fn run_sourced_contents_in_sinks(
         // map is refreshed (`set_aliases`) so cross-unit def-then-use works.
         let expand = shell.is_interactive
             || shell.shopt_options.get("expand_aliases").unwrap_or(false);
-        let opts = crate::lexer::LexerOptions { extglob, ..Default::default() };
+        // Top-level BATCH parse of a whole file / `-c` string / `source`d file:
+        // an open here-document at end-of-input is delimited by EOF (bash warns but
+        // parses the body collected so far), rather than erroring
+        // `UnterminatedHeredoc`. bash applies the same EOF-closes rule to `source`.
+        let opts = crate::lexer::LexerOptions {
+            extglob,
+            eof_closes_heredoc: true,
+            ..Default::default()
+        };
         let empty = std::collections::HashMap::new();
         let aliases_now = if expand { shell.aliases.clone() } else { empty };
         let mut iter = crate::lexer::Lexer::new_live_atoms(&contents[start..], &aliases_now, opts);
