@@ -2724,6 +2724,7 @@ fn builtin_read(
     let mut read_fd: Option<std::os::unix::io::RawFd> = None;
     let mut max_chars: Option<usize> = None;
     let mut nchars_active_delim = true;
+    let mut timeout: Option<f64> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -2804,6 +2805,20 @@ fn builtin_read(
                     }
                     break;
                 }
+                b't' => {
+                    let v = match take_opt_value(args, &mut i, bytes, j, "read", 't', err, shell) {
+                        Ok(v) => v,
+                        Err(rc) => return ExecOutcome::Continue(rc),
+                    };
+                    match v.trim().parse::<f64>() {
+                        Ok(t) if t >= 0.0 && t.is_finite() => timeout = Some(t),
+                        _ => {
+                            crate::sh_error_to!(shell, err, None, "read: {v}: invalid timeout specification");
+                            return ExecOutcome::Continue(1);
+                        }
+                    }
+                    break;
+                }
                 c => {
                     crate::sh_error_to!(shell, err, None, "read: -{}: invalid option", c as char);
                     return ExecOutcome::Continue(2);
@@ -2869,8 +2884,28 @@ fn builtin_read(
         Some(fd) => RawFdReader::from_fd(fd),
         None => RawFdReader::new(),
     };
+    // `-t 0`: availability probe — poll once with 0 timeout, read nothing.
+    #[cfg(unix)]
+    if timeout == Some(0.0) {
+        let fd = handle.raw_fd();
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let pr = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if let Some(s) = saved_term {
+            unsafe {
+                silent_restore_echo(tty_fd, s);
+            }
+        }
+        return ExecOutcome::Continue(if pr > 0 { 0 } else { 1 });
+    }
+    let deadline = timeout.and_then(|t| {
+        if t > 0.0 {
+            Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(t))
+        } else {
+            None
+        }
+    });
     let poll_fd = Some(handle.raw_fd());
-    let cfg = ReadCfg { raw, delim, delim_active: nchars_active_delim, max_chars, deadline: None };
+    let cfg = ReadCfg { raw, delim, delim_active: nchars_active_delim, max_chars, deadline };
     let (line, stop, _any_read) = match read_record(&mut handle, &cfg, poll_fd) {
         Ok(t) => t,
         Err(e) => {

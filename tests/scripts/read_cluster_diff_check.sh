@@ -59,5 +59,25 @@ check "n3 utf8"      'printf "h\xc3\xa9llo" | { read -n 3 x; echo "[$x]"; }'    
 check "rn3 backslash" 'printf "a\\\\bc" | { read -rn 3 x; echo "[$x]"; }'         # [a\b]
 check_err "bad-n"    'printf "x\n" | { read -n abc y; echo "rc=$?"; }'             # rc1 + "read: abc: invalid number"
 
+# --- M-163: -t TIMEOUT timed reads ---
+check "t-data"        'printf "line\n" | { read -t 5 x; echo "rc=$? [$x]"; }'    # rc0 [line]
+check "t0-file-ready" 'read -t 0 x < /etc/hostname; echo "rc=$?"'                # rc0 (regular file always ready)
+check_err "bad-t"     'printf "x\n" | { read -t abc y; echo "rc=$?"; }'          # rc1 + "read: abc: invalid timeout specification"
+check "t-frac-data"   'printf "z\n" | { read -t 0.5 x; echo "rc=$? [$x]"; }'     # rc0 [z]
+
+# Timeout-expiry cases run a slow producer; `check`'s stdin-piped-script
+# form can't express that cleanly, so these compare via `bash -c`/`huck -c`
+# directly (rc-only — huck's error stream on SIGALRM-style timeout doesn't
+# need byte-identical matching, just the exit code + any partial data).
+check_rc_only() { local l="$1" f="$2" b h
+  b=$(bash -c "$f" 2>/dev/null; echo "EXIT:$?")
+  h=$("$HUCK_BIN" -c "$f" 2>/dev/null; echo "EXIT:$?")
+  if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$l"; PASS=$((PASS+1))
+  else printf 'FAIL: %s\n' "$l"; diff <(echo "$b") <(echo "$h")|sed 's/^/  /'; FAIL=$((FAIL+1)); fi; }
+
+check_rc_only "t-timeout"   '( sleep 2; echo late ) | { read -t 1 x; echo "rc=$? [$x]"; }'   # rc142 []
+check_rc_only "t-partial"   '( printf par; sleep 2 ) | { read -t 1 x; echo "rc=$? [$x]"; }'   # rc142 [par]
+check_rc_only "t-frac-to"   '( sleep 1; echo l ) | { read -t 0.3 x; echo "rc=$?"; }'          # rc142
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
