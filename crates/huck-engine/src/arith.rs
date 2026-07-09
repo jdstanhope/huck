@@ -603,13 +603,23 @@ pub enum ArithErrorKind {
     ExpressionExpected,      // "expression expected"
     ColonExpected,           // "`:' expected for conditional expression"
     SyntaxErrorInExpression, // "syntax error in expression"
-    BadArraySubscript,       // "bad array subscript"
+    // Reserved bash-compat error kind: the "bad array subscript" string is
+    // wired into the Display impl but no code path constructs this variant yet.
+    // (Surfaced once `arith` became `pub(crate)` — `pub mod` had exempted it
+    // from dead-code analysis. Kept for the pending arith-subscript work.)
+    #[allow(dead_code)]
+    BadArraySubscript, // "bad array subscript"
     // Eval-time:
     DivisionByZero,
     ModuloByZero,
-    NotAnInteger { var: String, value: String },
+    NotAnInteger {
+        var: String,
+        value: String,
+    },
     NegativeExponent,
-    ShiftCountOutOfRange { count: i64 },
+    ShiftCountOutOfRange {
+        count: i64,
+    },
     ReadonlyVar(String),
 }
 
