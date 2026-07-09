@@ -1369,6 +1369,15 @@ impl<'a> Lexer<'a> {
         std::mem::take(&mut self.parsed_heredoc_bodies)
     }
 
+    /// True while one or more heredoc bodies are still pending collection (the
+    /// atom-path queue or the legacy queue is non-empty). Lets a caller that has
+    /// just consumed a unit-terminating newline decide whether it must peek for a
+    /// `HeredocBodyBegin` — avoiding an over-scan into the *next* unit's first
+    /// token when no heredoc is pending (issue #86).
+    pub(crate) fn has_pending_heredoc_body(&self) -> bool {
+        !self.pending_heredocs.is_empty() || !self.atom_pending_heredocs.is_empty()
+    }
+
     /// v264: set the M-156 extquote double-quote context flag (`opts.in_dquote`),
     /// returning the previous value so the caller can restore it. The braced-param
     /// head scanner reads this flag to decide whether a `$'…'`-decoded NAME is

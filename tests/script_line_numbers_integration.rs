@@ -81,7 +81,6 @@ fn lex_error_as_only_unit_is_reported_line_one() {
 }
 
 #[test]
-#[ignore = "known regression, tracked in #86: huck aborts earlier units and reports the EOF line, not the token's line"]
 fn lex_error_as_first_token_of_second_unit_reports_its_line() {
     // A clean unit, then a unit beginning with an unterminated quote. The error
     // surfaces via the post-unit boundary peek; it must report line 2 (the token's
@@ -102,4 +101,48 @@ fn lex_error_after_blank_line_counts_the_blank() {
     let (_o, se, _c) = run_script("echo a\n\n'bad\n");
     assert!(se.contains("syntax error"), "stderr: {se:?}");
     assert!(se.contains("line 3:"), "expected 'line 3:', got: {se:?}");
+}
+
+#[test]
+fn earlier_units_run_before_a_later_parse_error() {
+    // Two clean units, then a unit with an unterminated quote. Both clean units
+    // must execute (side effects survive) and the error is reported at the
+    // offending token's line (3), matching bash.
+    let (so, se, c) = run_script("echo a\necho b\n'unterminated\n");
+    assert!(
+        so.contains("a") && so.contains("b"),
+        "both units should run: {so:?}"
+    );
+    assert!(
+        se.contains("syntax error"),
+        "lex error must be reported: {se:?}"
+    );
+    assert!(se.contains("line 3:"), "expected 'line 3:', got: {se:?}");
+    assert_eq!(c, 2, "exit code should be 2, got {c}");
+}
+
+#[test]
+fn heredoc_unit_then_good_unit_still_runs() {
+    // A heredoc unit followed by a normal unit: the post-newline heredoc-body
+    // collection must still fire (queue non-empty) so the body attaches and the
+    // following unit runs — guards against the #86 gate over-suppressing it.
+    let (so, _se, c) = run_script("cat <<EOF\nhello\nEOF\necho after\n");
+    assert!(so.contains("hello"), "heredoc body should print: {so:?}");
+    assert!(so.contains("after"), "following unit should run: {so:?}");
+    assert_eq!(c, 0, "exit code should be 0, got {c}");
+}
+
+#[test]
+fn heredoc_unit_immediately_before_a_parse_error() {
+    // The heredoc unit's body is collected and the queue drains, so the loop
+    // stops before peeking the next unit's bad token. The heredoc unit runs and
+    // the error is reported at the bad token's line (4), not the EOF line.
+    let (so, se, c) = run_script("cat <<EOF\nhi\nEOF\n'unterminated\n");
+    assert!(so.contains("hi"), "heredoc unit should run: {so:?}");
+    assert!(
+        se.contains("syntax error"),
+        "lex error must be reported: {se:?}"
+    );
+    assert!(se.contains("line 4:"), "expected 'line 4:', got: {se:?}");
+    assert_eq!(c, 2, "exit code should be 2, got {c}");
 }
