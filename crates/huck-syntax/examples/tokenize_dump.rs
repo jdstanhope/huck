@@ -3,7 +3,7 @@
 //! Run: `cargo run --example tokenize_dump -p huck-syntax -- 'echo hi | wc -l'`
 //! (falls back to a built-in sample if no argument is given).
 
-use huck_syntax::lexer::{Lexer, LexerOptions};
+use huck_syntax::{Lexer, LexerOptions};
 
 fn main() {
     let src = std::env::args()
