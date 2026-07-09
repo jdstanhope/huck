@@ -31,11 +31,11 @@ for k in "\${!colors[@]}"; do
 done`;
 
 const jobControlLines = [
-  { prompt: "huck$", text: "sleep 30 &" },
+  { prompt: "huck>", text: "sleep 30 &" },
   { text: "[1] 20481" },
-  { prompt: "huck$", text: "jobs" },
+  { prompt: "huck>", text: "jobs" },
   { text: "[1]+ Running                 sleep 30 &" },
-  { prompt: "huck$", text: "fg %1" },
+  { prompt: "huck>", text: "fg %1" },
   { text: "sleep 30" },
 ];
 
@@ -45,12 +45,14 @@ kill "$job_pid"
 wait "$job_pid" 2>/dev/null
 echo "job $job_pid stopped"`;
 
-const historyExample = `huck$ echo building the site
+const historyExample = `huck> echo building the site
 building the site
-huck$ !!
+huck> !!
 echo building the site
 building the site
-huck$ !echo:s/building/deploying/
+huck> ehco deploying the site
+huck: ehco: command not found
+huck> ^ehco^echo^
 echo deploying the site
 deploying the site`;
 

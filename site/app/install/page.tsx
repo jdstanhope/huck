@@ -21,9 +21,9 @@ cargo run                # interactive REPL`;
 
 const firstRunLines = [
   { prompt: "$", text: "huck" },
-  { prompt: "huck$", text: "echo hello from huck" },
+  { prompt: "huck>", text: "echo hello from huck" },
   { text: "hello from huck" },
-  { prompt: "huck$", text: "exit" },
+  { prompt: "huck>", text: "exit" },
 ];
 
 function Method({

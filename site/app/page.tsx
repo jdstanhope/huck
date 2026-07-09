@@ -6,11 +6,11 @@ import { site } from "@/lib/site";
 
 const demoLines = [
   { prompt: "$", text: "huck" },
-  { prompt: "huck$", text: 'for f in *.rs; do echo "${f%.rs}"; done' },
-  { prompt: "huck$", text: "name=(alice bob); echo \"${name[@]^}\"" },
+  { prompt: "huck>", text: 'for f in *.rs; do echo "${f%.rs}"; done' },
+  { prompt: "huck>", text: "name=(alice bob); echo \"${name[@]^}\"" },
   { text: "Alice Bob" },
   {
-    prompt: "huck$",
+    prompt: "huck>",
     text: "diff <(huck -c 'echo ${x:-hi}') <(bash -c 'echo ${x:-hi}') && echo identical",
   },
   { text: "identical" },
