@@ -1,0 +1,45 @@
+---
+title: "Hello, huck"
+date: 2026-07-09
+summary: "Why build a bash-compatible shell in Rust — and build it as a long-running experiment in working with Claude."
+tags: ["intro", "process"]
+version: null
+draft: false
+---
+
+huck is a bash-compatible shell written in Rust. That one sentence hides three
+separate reasons the project exists — and this blog is where I'll track how it
+goes.
+
+## Understanding a shell, in detail
+
+Everyone uses a shell. Almost no one knows what it actually does. Word
+splitting, the order expansions happen in, how `$IFS` interacts with globbing,
+what job control really requires from the terminal, how programmable completion
+is wired — these are the parts you never see until you try to reproduce them
+exactly. The surest way to understand a system is to rebuild it and diff your
+output against the original, byte for byte. That's the bar huck holds itself to:
+every feature ships with a spec, a plan, tests, and a harness that runs the same
+fragment through huck and real bash and asserts identical output.
+
+<CodeBlock lang="bash" code={`diff <(huck -c 'echo \${x:-hi}') <(bash -c 'echo \${x:-hi}') && echo identical`} />
+
+## Learning Rust by building something demanding
+
+A shell is a great forcing function for a language. It touches parsing, process
+management, signals, file descriptors, terminals, and performance all at once.
+huck is where I'm learning Rust in the deep end — ownership across a
+copy-on-write shell state, careful `unsafe` at the OS boundary, and a
+parser/lexer architecture that had to be rebuilt more than once.
+
+## Watching how Claude handles long-term development
+
+The third reason is the most interesting to me. huck is built almost entirely
+with Claude, one numbered iteration at a time: brainstorm a design, write a
+spec, write an implementation plan, execute it with a fresh agent per task,
+review, and merge. It's now more than 270 iterations deep. The open question
+isn't "can an AI write a function" — it's whether that workflow holds up across
+months of real, cumulative software development: regressions, architecture
+changes, tech debt, and all. This blog is partly a logbook of that experiment.
+
+More soon.

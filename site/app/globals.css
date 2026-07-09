@@ -1,0 +1,26 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@theme {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, "SFMono-Regular", monospace;
+  --color-accent: #7ee787;      /* terminal green */
+  --color-accent-dim: #3fb950;
+}
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root { color-scheme: light dark; }
+
+html { scroll-behavior: smooth; }
+body { @apply bg-white text-zinc-900 antialiased; }
+.dark body { @apply bg-zinc-950 text-zinc-100; }
+
+.shiki, .shiki span {
+  color: var(--shiki-light) !important;
+  background-color: var(--shiki-light-bg) !important;
+}
+.dark .shiki, .dark .shiki span {
+  color: var(--shiki-dark) !important;
+  background-color: var(--shiki-dark-bg) !important;
+}
