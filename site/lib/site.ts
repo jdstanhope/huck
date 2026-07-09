@@ -8,6 +8,7 @@ export const site = {
   nav: [
     { href: "/", label: "Home" },
     { href: "/features", label: "Features" },
+    { href: "/library", label: "Library" },
     { href: "/install", label: "Install" },
     { href: "/blog", label: "Blog" },
   ],
