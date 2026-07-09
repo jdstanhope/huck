@@ -40,9 +40,11 @@ fn cd_missing_has_no_os_error_suffix_and_prologue() {
 
 #[test]
 fn cd_into_file_reports_not_a_directory() {
-    let (_o, e, _c) = run_file("cd /etc/hostname\n");
+    // `/etc/hosts` is a regular file on both Linux and macOS (unlike
+    // `/etc/hostname`, which is absent on macOS → "No such file or directory").
+    let (_o, e, _c) = run_file("cd /etc/hosts\n");
     assert!(
-        e.contains(": line 1: cd: /etc/hostname: Not a directory\n"),
+        e.contains(": line 1: cd: /etc/hosts: Not a directory\n"),
         "stderr: {e:?}"
     );
     assert!(!e.contains("os error"), "leaked Rust suffix: {e:?}");
@@ -95,10 +97,12 @@ fn source_a_directory_is_a_directory() {
 
 #[test]
 fn source_a_binary_cannot_execute() {
-    let (_o, e, _c) = run_file(". /bin/true\n");
-    // bash: `<src>: line 1: .: /bin/true: cannot execute binary file` (WITH `.:`).
+    // `/usr/bin/true` is an executable binary on both Linux and macOS (macOS has
+    // no `/bin/true` → sourcing it would be "No such file or directory").
+    let (_o, e, _c) = run_file(". /usr/bin/true\n");
+    // bash: `<src>: line 1: .: /usr/bin/true: cannot execute binary file` (WITH `.:`).
     assert!(
-        e.contains(": line 1: .: /bin/true: cannot execute binary file\n"),
+        e.contains(": line 1: .: /usr/bin/true: cannot execute binary file\n"),
         "stderr: {e:?}"
     );
     assert!(!e.contains("valid UTF-8"), "leaked Rust UTF-8 error: {e:?}");

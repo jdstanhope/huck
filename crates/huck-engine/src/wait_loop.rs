@@ -314,7 +314,18 @@ mod tests {
 
     fn make_pipe() -> (RawFd, RawFd) {
         let mut fds = [0; 2];
+        // `pipe2` is Linux-only; fall back to `pipe` + `fcntl(FD_CLOEXEC)` elsewhere.
+        #[cfg(target_os = "linux")]
         let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        #[cfg(not(target_os = "linux"))]
+        let ret = unsafe {
+            let r = libc::pipe(fds.as_mut_ptr());
+            if r == 0 {
+                libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+                libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            r
+        };
         assert_eq!(ret, 0);
         (fds[0], fds[1])
     }

@@ -15677,9 +15677,17 @@ mod umask_tests {
 
 // ─── ulimit ──────────────────────────────────────────────────────────────────
 
+// `getrlimit`/`setrlimit` take a Linux-glibc-specific `__rlimit_resource_t` on
+// Linux but a plain `c_int` on macOS/BSD. Alias so `RlimitResource` matches the
+// type of the `RLIMIT_*` constants (and the syscall signature) on each platform.
+#[cfg(target_os = "linux")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(not(target_os = "linux"))]
+type RlimitResource = libc::c_int;
+
 struct UlimitRes {
     letter: char,
-    resource: libc::__rlimit_resource_t,
+    resource: RlimitResource,
     mult: u64,           // value units per limit byte/raw; 1 = unscaled
     label: &'static str, // for `-a`
 }
@@ -15697,6 +15705,9 @@ const ULIMIT_TABLE: &[UlimitRes] = &[
         mult: 1024,
         label: "data seg size           (kbytes, -d)",
     },
+    // RLIMIT_NICE/SIGPENDING/MSGQUEUE/RTPRIO/LOCKS are Linux-only; macOS bash
+    // likewise does not offer -e/-i/-q/-r/-x, so gate them out off-Linux.
+    #[cfg(target_os = "linux")]
     UlimitRes {
         letter: 'e',
         resource: libc::RLIMIT_NICE,
@@ -15709,6 +15720,7 @@ const ULIMIT_TABLE: &[UlimitRes] = &[
         mult: 1024,
         label: "file size               (blocks, -f)",
     },
+    #[cfg(target_os = "linux")]
     UlimitRes {
         letter: 'i',
         resource: libc::RLIMIT_SIGPENDING,
@@ -15733,12 +15745,14 @@ const ULIMIT_TABLE: &[UlimitRes] = &[
         mult: 1,
         label: "open files                      (-n)",
     },
+    #[cfg(target_os = "linux")]
     UlimitRes {
         letter: 'q',
         resource: libc::RLIMIT_MSGQUEUE,
         mult: 1,
         label: "POSIX message queues     (bytes, -q)",
     },
+    #[cfg(target_os = "linux")]
     UlimitRes {
         letter: 'r',
         resource: libc::RLIMIT_RTPRIO,
@@ -15769,6 +15783,7 @@ const ULIMIT_TABLE: &[UlimitRes] = &[
         mult: 1024,
         label: "virtual memory          (kbytes, -v)",
     },
+    #[cfg(target_os = "linux")]
     UlimitRes {
         letter: 'x',
         resource: libc::RLIMIT_LOCKS,
