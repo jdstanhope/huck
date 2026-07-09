@@ -2168,7 +2168,14 @@ fn skip_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
 /// immediately afterward, which already drains via the loop above; this
 /// exists for the couple of sites that don't.)
 fn collect_heredoc_bodies_after_newline(iter: &mut Lexer) -> Result<(), ParseError> {
-    while matches!(iter.peek_kind()?, Some(TokenKind::HeredocBodyBegin { .. })) {
+    // #86: only peek for a heredoc body when one is actually pending. `&&`
+    // short-circuits, so with no pending heredoc `peek_kind()` is never called
+    // and the next unit's first token is not scanned — a unit-terminating
+    // newline ends the unit cleanly instead of over-scanning into (and failing
+    // on) a following unit that begins with a lex error.
+    while iter.has_pending_heredoc_body()
+        && matches!(iter.peek_kind()?, Some(TokenKind::HeredocBodyBegin { .. }))
+    {
         let body = parse_heredoc_body(iter)?;
         iter.push_heredoc_body(body);
     }
