@@ -615,6 +615,11 @@ pub enum TokenKind {
     // --- Phase C v245: backtick command-substitution atoms (dormant until Task 2). ---
     BeginBacktick,       // opening ` — dual role: signal in an operand mode (v245 T6 wiring), real opener in Backtick mode
     EndBacktick,         // closing ` — emitted by scan_step_backtick when depth unwinds
+    /// v274: a verbatim run of raw backtick-body bytes captured by the dumb
+    /// `Mode::BacktickRaw` mode (phase 1 of capture→unescape→re-parse). Quote-blind
+    /// and `$()`-blind — backslashes and their escaped char survive unchanged so the
+    /// parser's phase-2 `unescape_backtick_body` can apply bash's one-level rule.
+    BacktickRawText(String),
     // --- Phase C v246: arithmetic-expansion atoms (dormant). ---
     ArithOpen,   // opening `$((` — dual role: zero-width signal in an operand mode, real opener in Arith mode
     ArithClose,  // closing `))` — emitted by scan_step_arith at paren_depth 0
@@ -842,6 +847,11 @@ pub(crate) enum Mode {
     Command,        // default command-position scanner (emits atoms)
     CommandSub { body_started: bool },  // $( … ) / `…`
     Backtick { depth: u32 },           // `…` — v245; depth tracks nested `` `\`…\`` `` escaping
+    /// v274: dumb quote-blind/`$()`-blind raw-capture backtick mode (phase 1 of
+    /// capture→unescape→re-parse). Streams the body verbatim as `BacktickRawText`
+    /// atoms framed by `BeginBacktick`…`EndBacktick`; entry is tracked by the
+    /// lexer's `backtick_raw_started` flag (reset in `push_mode`), NOT a field.
+    BacktickRaw,
     // `seen_name` — set once the NAME atom (or length/indirect prefix's name)
     // has been emitted. `indirect` — set when the `${!…}` indirect prefix was
     // emitted (needed by Phase 2 to route `*}`/`@}` to the prefix-name form).
@@ -1018,6 +1028,12 @@ pub struct Lexer<'a> {
     /// Consecutive `Produced` scan steps that consumed no input (see
     /// `scan_step_guarded` / `SCAN_STALL_CAP`).
     stall_steps: u32,
+    /// v274: false until `scan_step_backtick_raw`'s first (entry) call has consumed
+    /// the opening `` ` `` and emitted `BeginBacktick`. Reset to false whenever a
+    /// `Mode::BacktickRaw` frame is pushed (see `push_mode`), so sequential/re-entered
+    /// backticks in one lexer each re-run the entry handshake. The raw mode never
+    /// pushes a nested mode, so a single flag suffices (nesting uses a fresh Lexer).
+    backtick_raw_started: bool,
     /// v250 T6 (+ fix pass): monotonic counter bumped on EVERY mutation of
     /// `atom_pending_heredocs`/`emitting_heredoc`: the push at the atom `<<`
     /// opener site, `emitting_heredoc` set at the newline trigger, the
@@ -1067,6 +1083,7 @@ impl<'a> Lexer<'a> {
             force_extglob_depth: None,
             stall_steps: 0,
             heredoc_gen: 0,
+            backtick_raw_started: false,
         }
     }
 
@@ -1170,6 +1187,11 @@ impl<'a> Lexer<'a> {
     }
 
     pub(crate) fn push_mode(&mut self, m: Mode) {
+        // v274: a fresh BacktickRaw frame must re-run the entry handshake (consume
+        // the opening `` ` ``, emit BeginBacktick), so clear the started flag here.
+        if matches!(m, Mode::BacktickRaw) {
+            self.backtick_raw_started = false;
+        }
         self.modes.push(m);
     }
 
@@ -1369,6 +1391,7 @@ impl<'a> Lexer<'a> {
             Mode::ParamSubscriptOperand       { in_dquote, enclosing_dquote } => self.scan_step_param_operand(None,      ']', in_dquote, enclosing_dquote),
             Mode::CommandSub { body_started } => self.scan_step_command_sub(body_started),
             Mode::Backtick { depth } => self.scan_step_backtick(depth),
+            Mode::BacktickRaw => self.scan_step_backtick_raw(),
             Mode::Arith { paren_depth, in_squote, in_dquote, body_started, for_header, delim } =>
                 self.scan_step_arith(paren_depth, in_squote, in_dquote, body_started, for_header, delim),
             Mode::DoubleQuote { body_started } => self.scan_step_dquote(body_started),
@@ -2643,6 +2666,76 @@ impl<'a> Lexer<'a> {
         let kind = if open { TokenKind::BeginBacktick } else { TokenKind::EndBacktick };
         self.history.push(Token::new(kind, Span::new(off, l, c)));
         Ok(())
+    }
+
+    /// v274: dumb raw-capture scanner for `Mode::BacktickRaw` (phase 1 of
+    /// capture→unescape→re-parse). QUOTE-BLIND and `$()`-BLIND: `'`, `"`, `(`, `#`
+    /// are ordinary body bytes. Per step:
+    ///
+    /// - FIRST call (cursor parked on the opening `` ` ``, `backtick_raw_started`
+    ///   still false) → consume it, emit `BeginBacktick` (mirrors
+    ///   `scan_step_backtick`'s depth==0 entry handshake so `parse_backtick_sub`'s
+    ///   opening pull is unchanged).
+    /// - EOF before the close → `finish()` (unterminated; parser maps to an error).
+    /// - a bare unescaped `` ` `` → consume it, emit `EndBacktick`.
+    /// - `\` → consume the `\` AND the next char (if any), emit both bytes verbatim
+    ///   as `BacktickRawText` (so a `` \` `` never closes and the backslashes survive
+    ///   for phase-2 unescape). A trailing lone `\` at EOF is emitted alone.
+    /// - otherwise → consume the maximal run of chars that are neither `\` nor
+    ///   `` ` `` and emit it as one `BacktickRawText`.
+    fn scan_step_backtick_raw(&mut self) -> Result<Step, LexError> {
+        if !self.backtick_raw_started {
+            // ENTRY: consume the opening backtick and emit BeginBacktick.
+            let off = self.cursor.offset();
+            let l   = self.cursor.line();
+            let c   = self.cursor.column();
+            debug_assert_eq!(self.cursor.peek(), Some(&'`'), "scan_step_backtick_raw entry: expected opening `");
+            self.cursor.next(); // consume the opening '`'
+            self.backtick_raw_started = true;
+            self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+            return Ok(Step::Produced);
+        }
+        let off = self.cursor.offset();
+        let l   = self.cursor.line();
+        let c   = self.cursor.column();
+        match self.cursor.peek().copied() {
+            None => {
+                // EOF before the close — unterminated; parser surfaces the error.
+                self.finish()
+            }
+            Some('`') => {
+                // Bare unescaped backtick closes the body.
+                self.cursor.next(); // consume the closing '`'
+                self.history.push(Token::new(TokenKind::EndBacktick, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+            Some('\\') => {
+                // Escape: emit the `\` and the following char (if any) VERBATIM, so a
+                // `` \` `` never closes and backslash runs survive for phase 2.
+                let mut text = String::new();
+                self.cursor.next(); // consume the '\'
+                text.push('\\');
+                if let Some(&ch) = self.cursor.peek() {
+                    self.cursor.next(); // consume the escaped char
+                    text.push(ch);
+                }
+                self.history.push(Token::new(TokenKind::BacktickRawText(text), Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+            Some(_) => {
+                // Maximal run of ordinary body chars (neither `\` nor `` ` ``).
+                let mut text = String::new();
+                while let Some(&ch) = self.cursor.peek() {
+                    if ch == '\\' || ch == '`' {
+                        break;
+                    }
+                    self.cursor.next();
+                    text.push(ch);
+                }
+                self.history.push(Token::new(TokenKind::BacktickRawText(text), Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+        }
     }
 
     /// `Mode::Arith { paren_depth, in_squote, in_dquote, body_started, for_header, delim }` scanner — v246.
@@ -6690,6 +6783,66 @@ mod tests {
             scan_backtick_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap_err(),
             LexError::UnterminatedBrace
         );
+    }
+
+    #[test]
+    fn backtick_raw_streams_verbatim_atoms() {
+        // v274 phase 1: Mode::BacktickRaw streams the body VERBATIM (quote-blind,
+        // $()-blind) as BacktickRawText atoms framed by BeginBacktick…EndBacktick.
+        // Body source (between the outer backticks):  a\`b\\c
+        //   (an escaped backtick + an escaped backslash are raw body content).
+        let mut lx = Lexer::new_live_atoms("`a\\`b\\\\c`", &Default::default(), LexerOptions::default());
+        lx.push_mode(Mode::BacktickRaw);
+        let mut kinds: Vec<String> = Vec::new();
+        loop {
+            match lx.next_kind().expect("lex") {
+                Some(TokenKind::EndBacktick) => { kinds.push("END".to_string()); break; }
+                Some(TokenKind::BeginBacktick) => kinds.push("BEGIN".to_string()),
+                Some(TokenKind::BacktickRawText(s)) => kinds.push(s),
+                Some(other) => panic!("unexpected atom: {other:?}"),
+                None => panic!("EOF before EndBacktick"),
+            }
+        }
+        // The raw chunks reassemble the body VERBATIM (backslashes preserved).
+        let joined: String = kinds
+            .iter()
+            .filter(|k| !matches!(k.as_str(), "BEGIN" | "END"))
+            .cloned()
+            .collect();
+        assert_eq!(joined, "a\\`b\\\\c");
+        assert_eq!(kinds.first().unwrap(), "BEGIN");
+        assert_eq!(kinds.last().unwrap(), "END");
+
+        // Quote-blind: a `'`/`"`/`(`/`#` inside the body is ordinary run text.
+        let mut lx2 = Lexer::new_live_atoms("`echo '(' \"#\"`", &Default::default(), LexerOptions::default());
+        lx2.push_mode(Mode::BacktickRaw);
+        let mut body = String::new();
+        loop {
+            match lx2.next_kind().expect("lex") {
+                Some(TokenKind::EndBacktick) => break,
+                Some(TokenKind::BeginBacktick) => {}
+                Some(TokenKind::BacktickRawText(s)) => body.push_str(&s),
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert_eq!(body, "echo '(' \"#\"");
+
+        // A trailing lone `\` at EOF is emitted raw, then EOF → finish (no close).
+        let mut lx3 = Lexer::new_live_atoms("`ab\\", &Default::default(), LexerOptions::default());
+        lx3.push_mode(Mode::BacktickRaw);
+        let mut body3 = String::new();
+        let mut saw_end = false;
+        loop {
+            match lx3.next_kind().expect("lex") {
+                Some(TokenKind::EndBacktick) => { saw_end = true; break; }
+                Some(TokenKind::BeginBacktick) => {}
+                Some(TokenKind::BacktickRawText(s)) => body3.push_str(&s),
+                Some(other) => panic!("unexpected: {other:?}"),
+                None => break,
+            }
+        }
+        assert_eq!(body3, "ab\\");
+        assert!(!saw_end, "unterminated body must not emit EndBacktick");
     }
 
 
