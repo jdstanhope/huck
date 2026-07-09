@@ -59,6 +59,12 @@ check "n3 utf8"      'printf "h\xc3\xa9llo" | { read -n 3 x; echo "[$x]"; }'    
 check "rn3 backslash" 'printf "a\\\\bc" | { read -rn 3 x; echo "[$x]"; }'         # [a\b]
 check_err "bad-n"    'printf "x\n" | { read -n abc y; echo "rc=$?"; }'             # rc1 + "read: abc: invalid number"
 
+# --- Final-review Finding 1: -N assigns RAW (no IFS split/trim), -n still splits ---
+check "N5 raw 2v"     'printf "a b c" | { read -N 5 x y; echo "rc=$? [$x][$y]"; }'      # rc0 [a b c][]
+check "N5 raw trim"   'printf "  a  " | { read -N 5 x; echo "rc=$? [$x]"; }'            # rc0 [  a  ]
+check "N3 raw array"  'printf "a b" | { read -N 3 -a arr; echo "rc=$? n=${#arr[@]} [${arr[0]}]"; }' # rc0 n=1 [a b]
+check "N9 raw eof"    'printf "a b" | { read -N 9 x y; echo "rc=$? [$x][$y]"; }'        # rc1 [a b][]
+
 # --- M-163: -t TIMEOUT timed reads ---
 check "t-data"        'printf "line\n" | { read -t 5 x; echo "rc=$? [$x]"; }'    # rc0 [line]
 check "t0-file-ready" 'read -t 0 x < /etc/hostname; echo "rc=$?"'                # rc0 (regular file always ready)

@@ -85,8 +85,8 @@ Status mapping from `(string, stop, any)`:
 | stop | exit | assignment |
 |---|---|---|
 | `Delim` | 0 | assign split fields |
-| `Count` | 0 | assign split fields |
-| `Eof` (any=true) | 1 | assign split fields (B-02a) |
+| `Count` | 0 | assign split fields (EXCEPT `-N`: raw, no split/trim — whole string to the first named var / a single `-a` element; remaining names empty; `REPLY` path already assigned raw) |
+| `Eof` (any=true) | 1 | assign split fields (B-02a) (same `-N` raw exception as `Count`) |
 | `Eof` (any=false) | 1 | assign EMPTY to each named var (B-02b); `REPLY=""` if no names |
 | `Timeout` | 142 (`128 + libc::SIGALRM`) | assign split fields of partial data |
 

@@ -2226,7 +2226,13 @@ fn read_record<R: std::io::Read>(
             if pr == 0 {
                 return Ok((String::from_utf8_lossy(&out).into_owned(), ReadStop::Timeout, any));
             }
-            // pr < 0 (EINTR) or > 0: fall through and attempt the read.
+            if pr < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue; // EINTR: re-check the deadline and re-poll
+                }
+                // Other poll errors: fall through and attempt the read, as before.
+            }
+            // pr > 0: fall through and attempt the read.
         }
         let mut byte = [0u8; 1];
         let n = r.read(&mut byte)?;
@@ -2248,10 +2254,12 @@ fn read_record<R: std::io::Read>(
             if nxt[0] == b'\n' {
                 continue; // line continuation — no char committed
             }
-            out.push(nxt[0]); // \X -> X, one char committed
-            chars += 1;
-            if cfg.max_chars == Some(chars) {
-                return Ok((String::from_utf8_lossy(&out).into_owned(), ReadStop::Count, any));
+            out.push(nxt[0]); // \X -> X, may complete (or continue) a UTF-8 scalar
+            if is_char_boundary_complete(&out) {
+                chars += 1;
+                if cfg.max_chars == Some(chars) {
+                    return Ok((String::from_utf8_lossy(&out).into_owned(), ReadStop::Count, any));
+                }
             }
             continue;
         }
@@ -2951,11 +2959,19 @@ fn builtin_read(
     // Assignment ALWAYS runs (even on EOF/empty) so named vars are cleared to
     // empty — bash sets them, it does not leave stale values. `line` is "" on a
     // pure EOF.
+    // `-N` (uppercase count) assigns the RAW read string — no IFS splitting,
+    // no leading/trailing trim — to the first named var (or as a single `-a`
+    // array element, or to REPLY). `-n` (lowercase) and the no-count case
+    // still split normally. `nchars_active_delim` is `false` only for `-N`.
+    let raw_count_mode = max_chars.is_some() && !nchars_active_delim;
+
     let ifs = shell.ifs();
     if let Some(arr) = array_name {
-        let fields = split_read_fields(&line, &ifs);
-        let map: std::collections::BTreeMap<usize, String> =
-            fields.into_iter().enumerate().collect();
+        let map: std::collections::BTreeMap<usize, String> = if raw_count_mode {
+            std::iter::once((0usize, line.clone())).collect()
+        } else {
+            split_read_fields(&line, &ifs).into_iter().enumerate().collect()
+        };
         if shell.replace_indexed(&arr, map).is_err() {
             return ExecOutcome::Continue(1); // replace_indexed printed the readonly message
         }
@@ -2963,6 +2979,13 @@ fn builtin_read(
     }
     let assignments: Vec<(String, String)> = if names.is_empty() {
         vec![("REPLY".to_string(), line)]
+    } else if raw_count_mode {
+        let mut out = Vec::with_capacity(names.len());
+        out.push((names[0].clone(), line));
+        for n in &names[1..] {
+            out.push((n.clone(), String::new()));
+        }
+        out
     } else {
         split_into_names(&line, &names, &ifs)
     };
