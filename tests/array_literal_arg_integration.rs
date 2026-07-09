@@ -72,8 +72,13 @@ fn declaration_array_unchanged() {
     assert_eq!(o, "a b\n", "o: {o:?}");
 }
 #[test]
-fn non_eval_arg_does_not_panic() {
+fn non_eval_arg_rejected_like_bash() {
+    // `echo x=(a b)` is a parse-time syntax error in bash (rc 2). Since the
+    // parser-driven front-end landed (v264 flip → oracle deletion → v268), huck
+    // now rejects it the same way instead of reconstructing the `x=(a b)` arg —
+    // i.e. it converged to bash. The must-not-panic guarantee still holds.
     let (o, _e, c) = run("echo x=(a b)\n");
     assert_ne!(c, 101, "must not panic (rc 101)");
-    assert_eq!(o, "x=(a b)\n", "o: {o:?}");
+    assert_eq!(c, 2, "syntax error like bash, rc: {c}");
+    assert_eq!(o, "", "no stdout, o: {o:?}");
 }

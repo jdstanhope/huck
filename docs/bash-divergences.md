@@ -106,16 +106,6 @@ huck behaves differently from bash here on purpose. Each links to its
 
 ---
 
-### `name=(…)` array literal as a non-declaration/non-eval command argument
-
-[Issue #20 · by-design](https://github.com/jdstanhope/huck/issues/20)
-
-- **huck**: the lexer accepts an array literal `name=(…)` as a command ARGUMENT and `expand()` reconstructs the argument to its `name=(…)` text — so `echo x=(a b)` prints `x=(a b)`.
-- **bash**: a parse-time syntax error (`echo x=(a b)` → `syntax error near unexpected token '('`).
-- **Why**: replicating bash's parse-time gating would need command-context-aware lexing; the reconstruction is harmless and is what makes `eval x=(a b)` / `declare`-style array-literal args work (v136 resolved the prior panic via this reconstruction).
-
----
-
 ### `trap '' PIPE` ignore-form is not preserved inside a forked subshell/pipeline stage
 
 [Issue #38 · by-design](https://github.com/jdstanhope/huck/issues/38)
