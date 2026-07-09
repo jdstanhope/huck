@@ -87,8 +87,9 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
             }
             TokenKind::BeginBacktick => {
                 // v245 T6: `` `cmd` `` signal from scan_step_param_operand.
-                // The cursor is at `` ` `` — parse_backtick_sub pushes Mode::Backtick
-                // and scan_step_backtick(depth=0) owns consuming the opening `` ` ``.
+                // The cursor is at `` ` `` — parse_backtick_sub (v274: capture the
+                // raw body under Mode::BacktickRaw, unescape, then re-parse with a
+                // fresh Lexer) owns consuming the opening `` ` ``.
                 // G1/v270: quoted when inside a `"…"` operand span.
                 let q = quoted || iter.operand_in_dquote();
                 let bt = parse_backtick_sub(iter, q)?;
@@ -2284,24 +2285,15 @@ fn parse_simple_with_leading_word(
         ) {
             break;
         }
-        // Nested `` \` `` backtick child inside a backtick BODY — the lexer has
-        // emitted a REAL `BeginBacktick` child-open token (single-frame depth
-        // already incremented), cursor already past the `` ` ``. Recurse to
-        // assemble a standalone Word carrying its `WordPart::CommandSub`.
-        // (Glued adjacency `` a\`b\`c `` — one word with literal + CommandSub parts
-        // — is not yet handled; deferred, untested at this level.)
-        //
-        // Guarded to `Mode::Backtick`: at TOP LEVEL (Command/DoubleQuote mode) a
-        // leading `` ` `` is instead a ZERO-WIDTH signal (v247 T3), handled by
-        // `parse_word_command`'s BeginBacktick arm below (which pre-consumes the
-        // signal so `parse_backtick_sub` re-scans the real opening `` ` ``).
-        if matches!(token, TokenKind::BeginBacktick)
-            && matches!(iter.current_mode(), Mode::Backtick { .. })
-        {
-            let part = parse_backtick_sub(iter, false)?;
-            all_words.push(Word(vec![part]));
-            continue;
-        }
+        // v274: the OLD single-frame `Mode::Backtick` depth-tracking scanner used
+        // to leave the lexer mid-body with a REAL `BeginBacktick` child-open token
+        // reachable here (nested `` \` `` inside a backtick BODY, recursed into
+        // directly by this generic word loop). That mode is gone: `parse_backtick_sub`
+        // now captures the raw body under `Mode::BacktickRaw` (never delegating to
+        // this loop) and any nesting falls out of the phase-3 re-parse hitting the
+        // ordinary top-level `BeginBacktick` ZERO-WIDTH signal instead (handled by
+        // `parse_word_command`'s BeginBacktick arm). So there is no longer a
+        // reachable `BeginBacktick` token at this point in the token stream.
         // Redirect tokens — parse in source order, extending the redirects
         // list.  Mirrors the `next_is_redirect` + `parse_trailing_redirects`
         // delegation in `parse_simple_stage`.
@@ -6961,8 +6953,8 @@ mod tests {
 
     #[test]
     fn bt_scaffolding_exists() {
-        // Verify that the new Mode variant and atom kinds compile.
-        let _ = Mode::Backtick { depth: 0 };
+        // Verify that the raw-capture Mode variant and atom kinds compile.
+        let _ = Mode::BacktickRaw;
         let _ = TokenKind::BeginBacktick;
         let _ = TokenKind::EndBacktick;
         // The new backtick path must be callable for a simple substitution.
