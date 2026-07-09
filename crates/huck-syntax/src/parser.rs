@@ -1,7 +1,7 @@
 //! Parser-driven front-end. Consumes the stack-mode lexer's atoms and builds the
 //! AST (`WordPart`/`Word` + `command.rs` command types). Live in production since
-//! the v264 flip and the sole front-end since v266 (the old Word-lexer/`command::parse`
-//! oracle is deleted): `parse_sequence` is the entry point.
+//! the v264 flip and the sole front-end since v266 (the old Word-lexer/oracle
+//! parser is deleted): `parse_sequence` is the entry point.
 
 use crate::command::{
     ArithForClause, AssignTarget, Assignment, CaseClause, CaseItem, CaseTerminator, Command,
@@ -3520,8 +3520,7 @@ pub(crate) fn parse_and_or(iter: &mut Lexer, stop_at: &[Keyword]) -> Result<Sequ
 /// The shared body of [`parse_and_or`]. When `stop_at_top_newline` is set, a
 /// top-level `TokenKind::Newline` terminates the command UNIT (used by
 /// [`parse_one_unit`] for the non-interactive script reader); otherwise a
-/// top-level newline is a Semi-like continue connector. Mirrors the oracle's
-/// `command::parse_sequence_opts`.
+/// top-level newline is a Semi-like continue connector.
 fn parse_and_or_opts(
     iter: &mut Lexer,
     stop_at: &[Keyword],
@@ -3945,8 +3944,8 @@ fn fill_sequence(seq: &mut Sequence, bodies: &mut impl Iterator<Item = Word>) {
     }
 }
 
-/// Entry point for the new flat command-list parser.  Mirrors `parse` /
-/// `parse_cursor` in `command.rs`.
+/// The atom-path entry point; assembles a `Sequence` from the lexer's atom
+/// stream.
 ///
 /// Returns `Ok(None)` on empty input (newlines only or EOF).
 pub fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
@@ -3955,22 +3954,22 @@ pub fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> 
     // path). Safe: the atom parse_sequence is the single non-reentrant top-level
     // entry, so nothing legitimately carries a body into a fresh call.
     let _ = iter.take_heredoc_bodies();
-    // Skip leading newlines AND inter-token blanks (mirrors `parse_cursor` →
-    // `skip_newlines`). The atom scanner emits a `Blank` where the oracle folds
-    // whitespace, so a blank-only / blank+comment line must reduce to `Ok(None)`
-    // exactly as the oracle does (which never sees a `Blank`).
+    // Skip leading newlines AND inter-token blanks (the atom scanner emits a
+    // `Blank` for folded whitespace), so a blank-only / blank+comment line
+    // reduces to `Ok(None)`.
     skip_newlines(iter)?;
     if iter.peek_kind()?.is_none() {
         return Ok(None);
     }
     let mut seq = parse_and_or(iter, &[])?;
-    // A leftover trailing `Blank` (atom path only — e.g. `"a; "`) is NOT content;
-    // skip it so the stray-terminator check below matches the oracle.
+    // A leftover trailing `Blank` (atom path only — e.g. `"a; "`) is NOT
+    // content; skip it so the stray-terminator check below sees the real
+    // next token.
     while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
         iter.next_kind()?;
     }
-    // Mirror `parse_cursor`: a stray terminator (`;;`/`;&`/`;;&`) left after
-    // the top-level sequence → `UnexpectedToken`.
+    // A stray terminator (`;;`/`;&`/`;;&`) left after the top-level
+    // sequence → `UnexpectedToken`.
     if iter.peek_kind()?.is_some() {
         return Err(ParseError::UnexpectedToken);
     }
@@ -3983,9 +3982,8 @@ pub fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> 
 
 /// v264: parse ONE top-level command unit from the atom stream, stopping at
 /// (and consuming) the next top-level newline or EOF. Skips leading blank
-/// lines. Returns `Ok(None)` when only newlines/blanks/EOF remain. The atom
-/// analog of `command::parse_one_unit`, used by the non-interactive script
-/// reader (`run_sourced_contents_in_sinks`).
+/// lines. Returns `Ok(None)` when only newlines/blanks/EOF remain. Used by
+/// the non-interactive script reader (`run_sourced_contents_in_sinks`).
 pub fn parse_one_unit(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
     iter.maybe_prune_history(); // bound history across units on the shared lexer
     // Discard any heredoc bodies leaked by a prior unit that errored after
@@ -8954,9 +8952,9 @@ mod tests {
         diff_cmd(r#"echo "${x:?'m'}""#); // ErrorIfUnset: enclosing_dquote=false
     }
 
-    // ── v264 parse_one_unit differential ─────────────────────────────────────
-    // Drive BOTH the oracle `command::parse_one_unit` and the atom
-    // `parse_one_unit` in a loop over the same script, comparing unit-by-unit.
+    // ── v264 parse_one_unit coverage ─────────────────────────────────────────
+    // Drive the atom `parse_one_unit` in a loop over the same script,
+    // checking each unit parses cleanly.
     fn new_unit(s: &str) -> Vec<Result<Option<Sequence>, ParseError>> {
         let mut lx = Lexer::new(s, &Default::default(), LexerOptions::default());
         drive_units(&mut super::parse_one_unit, &mut lx)
@@ -9002,10 +9000,9 @@ mod tests {
         diff_unit("a | b\nc"); // pipeline intra-unit
     }
 
-    // ── v264 extglob differential (atom-native vs oracle) ───────────────────
+    // ── v264 extglob coverage (atom-native) ──────────────────────────────────
     // Extglob is gated by `LexerOptions::extglob` (default off); these helpers
-    // turn it ON for both the oracle (`command::parse`, driven by
-    // `scan_extglob_group`) and the atom path, and assert byte-identical ASTs.
+    // turn it ON for the atom path and assert the parse succeeds.
     fn new_eg(s: &str) -> Result<Option<Sequence>, ParseError> {
         let mut lx = Lexer::new(
             s,
