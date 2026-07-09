@@ -27,8 +27,8 @@ stays in sync.
 
 | Tier | Count | Notes |
 | --- | --- | --- |
-| Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 8 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Bugs (Tier 1) | 4 | Real behavioral divergences (surfaced by the 2026-07-09 differential sweep). |
+| Missing features (Tier 2) | 11 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 66 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
@@ -36,9 +36,16 @@ stays in sync.
 
 ## Tier 1: Bugs
 
-huck behaves wrong without a design reason; should be fixed.
+huck behaves wrong without a design reason; should be fixed. (The `set -e` /
+ERR-trap and-or-list exemption bug — huck wrongly exited on `false && echo x` —
+was FIXED in v275; see git history / the iterations memory. The entries below
+are the remaining behavioral divergences surfaced by the 2026-07-09 differential
+sweep.)
 
-_None currently open._
+- **B-01: `! eval CMD` / `! (subshell)` does not suppress `set -e` for a failure INSIDE the body** — `[deferred]`, medium (found v275). `set -e; ! eval false; echo after` → bash prints `after` (rc 0: the `!` negates the whole command, so its failure is not a set-e trigger), but huck EXITS (rc 1). Same for `! eval '(exit 5)'` (huck exits rc 5) and, by the same root cause, a `!`-negated subshell whose body fails. `! false` and `! builtin false` are CORRECT — the divergence is specific to constructs that run an inner execution (`eval`, `( … )`): the outer `!`/errexit-suppression context (`err_suppressed_depth`) is not propagated into the eval/subshell body, so the inner command's failure fires errexit before the `!` negates it. Surfaced by bash's own `set-e.tests` (line 93 `! eval false`), which huck exits early on. Fix: thread the negation/suppression context into `eval`'s `process_line_in_sinks` and the subshell body execution.
+- **B-02: `read` returns 0 on a final line with no trailing newline** — `[deferred]`, medium. `printf abc | { read x; echo $?; }` → bash rc **1**, huck rc **0** (both set `x=abc`). bash returns non-zero when `read` consumes data but hits EOF before its delimiter; huck returns 0. Changes the ubiquitous `while read`/`if read` idiom on newline-less input (common from editors/generators): bash's naive `while read line` DROPS a final line lacking `\n` (the failing read skips the loop body), huck PROCESSES it. Root: `read`'s EOF/return-status path in `builtins.rs` does not distinguish "delimiter found" from "EOF with partial data". Fix: return 1 from `read` when the final field was terminated by EOF rather than the delimiter.
+- **B-03: `read` with a non-whitespace IFS keeps a trailing delimiter in the last variable** — `[deferred]`, low. `printf ':a:b:\n' | { IFS=: read x y z; echo "[$x][$y][$z]"; }` → bash `[][a][b]`, huck `[][a][b:]`. When there are more fields than variables, bash strips a single trailing IFS delimiter before assigning the remainder to the last variable; huck leaves it. Affects colon/CSV parsing (`IFS=: read user pass rest < /etc/passwd`-style) when the line ends in the delimiter.
+- **B-04: a failed arithmetic expansion returns rc 0 and still runs the command** — `[deferred]`, low. `echo $((3.5)); echo done` → bash prints the arith error to stderr, the `echo` does NOT run, and the command status is 1; huck prints the error, STILL runs `echo` (blank line), and the command status is 0. A malformed `$(( ))` in a simple command should abort the command with a non-zero status (bash), not be swallowed. Rare (a literal bad arithmetic expression in command position), but the rc/abort divergence can mask a real failure under `set -e`.
 
 ---
 
@@ -54,6 +61,8 @@ group.
 
 ### Builtins (other)
 
+- **M-162: `read -n NCHARS` / `read -N NCHARS`** — `[deferred]` medium (found 2026-07-09 sweep). huck rejects both with `read: -n: invalid option` and reads nothing; bash reads at most `NCHARS` characters (`-n` also stops early at a delimiter/newline, `-N` reads exactly `NCHARS` ignoring the delimiter). `read -n1` (single-keypress prompts, menu selection, byte-at-a-time processing) is a very common idiom. v270 added `read -u`; `-n`/`-N` remain. Fix: add char-count termination to the `read` byte loop (`-n`: stop at count OR delimiter; `-N`: stop at count only, delimiter is literal).
+- **M-163: `read -t TIMEOUT`** — `[deferred]` medium (also tracked under L-34). huck rejects `-t` with rc 2; bash reads with a timeout (rc >128 on expiry). `read -t` (and `read -t 0` availability probe) is common in interactive/polling scripts. Needs a timed read on the input fd.
 - **M-36b: system-data completion actions** — `[deferred]` low. `compgen -A
   hostname`/`user`/`group`/`service` are recognized but return nothing; bash reads
   `/etc/hosts`(`$HOSTFILE`)/`/etc/passwd`/`/etc/group`/`/etc/services`. Rarely the
@@ -105,6 +114,7 @@ group.
 
 ### Globbing
 
+- **M-165: `shopt -s failglob`** — `[deferred]` low (found 2026-07-09 sweep). huck ignores `failglob`: a pattern with no matches expands to itself (default) and the command runs; bash with `failglob` prints `no match` and the whole command fails (rc 1) WITHOUT running. `nullglob` is correctly implemented; `failglob` is the unimplemented sibling. Fix: when `failglob` is set and a glob matches nothing, error + abort the command instead of leaving the literal pattern.
 - **M-53: bare `**` globstar matches dirs-only (not files)** — `[deferred]` low (narrowed v193). `shopt globstar` now gates `**` correctly: OFF (default) `**` ≡ `*` (single level), ON `**` is recursive — both byte-identical to bash for the common `**/<glob>` form (v193, `collapse_globstar` in the glob path). RESIDUAL: a bare `**` with globstar ON matches directories at all depths but NOT the files bash also yields (huck's regular glob path uses the `glob` crate, whose bare `**` is dir-recursive only). Matching bash's bare-`**` set exactly needs huck's own recursive walker (the extglob `walk_components` path). Also: globstar inside an extglob pattern (`**/+(…)`) does not recurse. Rarely decisive; the dominant `**/<glob>` form is correct.
 
 ---
