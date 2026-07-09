@@ -2184,45 +2184,113 @@ fn read_one_record<R: std::io::Read>(
     }
 }
 
-fn read_one_line<R: std::io::Read>(
-    r: &mut R,
+#[derive(Clone)]
+struct ReadCfg {
     raw: bool,
     delim: u8,
-) -> std::io::Result<Option<String>> {
+    delim_active: bool,
+    max_chars: Option<usize>,
+    deadline: Option<std::time::Instant>,
+}
+
+enum ReadStop { Delim, Count, Eof, Timeout }
+
+/// Reads one `read`-record byte-at-a-time (the shared-fd-0 reason still applies —
+/// see RawFdReader). Honors `-r` backslash processing, a custom `delim`, an
+/// optional character-count cap (`-n`/`-N`), and an optional `-t` deadline
+/// (polled via `poll_fd`). Returns the decoded string, why it stopped, and
+/// whether any byte was read at all.
+fn read_record<R: std::io::Read>(
+    r: &mut R,
+    cfg: &ReadCfg,
+    poll_fd: Option<std::os::unix::io::RawFd>,
+) -> std::io::Result<(String, ReadStop, bool)> {
     let mut out: Vec<u8> = Vec::new();
-    let mut any_byte_read = false;
+    let mut any = false;
+    let mut chars: usize = 0;
+    // A count cap of 0 (`read -n 0`) reads nothing and succeeds via Count.
+    if cfg.max_chars == Some(0) {
+        return Ok((String::new(), ReadStop::Count, false));
+    }
     loop {
+        // -t timeout: poll before each byte. On expiry stop with what we have.
+        #[cfg(unix)]
+        if let (Some(deadline), Some(fd)) = (cfg.deadline, poll_fd) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok((String::from_utf8_lossy(&out).into_owned(), ReadStop::Timeout, any));
+            }
+            let ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let pr = unsafe { libc::poll(&mut pfd, 1, ms) };
+            if pr == 0 {
+                return Ok((String::from_utf8_lossy(&out).into_owned(), ReadStop::Timeout, any));
+            }
+            // pr < 0 (EINTR) or > 0: fall through and attempt the read.
+        }
         let mut byte = [0u8; 1];
         let n = r.read(&mut byte)?;
         if n == 0 {
-            if !any_byte_read {
-                return Ok(None);
-            }
-            break;
+            return Ok((String::from_utf8_lossy(&out).into_owned(), ReadStop::Eof, any));
         }
-        any_byte_read = true;
+        any = true;
         let b = byte[0];
-        if b == delim {
-            break;
+        if cfg.delim_active && b == cfg.delim {
+            return Ok((String::from_utf8_lossy(&out).into_owned(), ReadStop::Delim, any));
         }
-        if !raw && b == b'\\' {
+        if !cfg.raw && b == b'\\' {
             let mut nxt = [0u8; 1];
             let m = r.read(&mut nxt)?;
             if m == 0 {
-                // Trailing backslash at EOF: keep it.
-                out.push(b'\\');
-                break;
+                out.push(b'\\'); // trailing backslash at EOF
+                return Ok((String::from_utf8_lossy(&out).into_owned(), ReadStop::Eof, any));
             }
-            // any_byte_read already true
             if nxt[0] == b'\n' {
-                continue; // line continuation
+                continue; // line continuation — no char committed
             }
-            out.push(nxt[0]); // escape removal: \X → X
+            out.push(nxt[0]); // \X -> X, one char committed
+            chars += 1;
+            if cfg.max_chars == Some(chars) {
+                return Ok((String::from_utf8_lossy(&out).into_owned(), ReadStop::Count, any));
+            }
             continue;
         }
         out.push(b);
+        // Count a character only when this byte COMPLETES a UTF-8 scalar (or is a
+        // lone/invalid byte). A continuation byte (0b10xx_xxxx) mid-sequence does
+        // not bump the count.
+        if is_char_boundary_complete(&out) {
+            chars += 1;
+            if cfg.max_chars == Some(chars) {
+                return Ok((String::from_utf8_lossy(&out).into_owned(), ReadStop::Count, any));
+            }
+        }
     }
-    Ok(Some(String::from_utf8_lossy(&out).into_owned()))
+}
+
+/// True if `out` ends on a complete UTF-8 scalar boundary (so the last pushed
+/// byte finished a character). Uses the fact that a valid trailing sequence ends
+/// exactly when `from_utf8` succeeds on the final 1–4 bytes; a lone invalid byte
+/// also counts as one character (huck is lossy elsewhere).
+fn is_char_boundary_complete(out: &[u8]) -> bool {
+    let last = out[out.len() - 1];
+    if last < 0x80 { return true; }                 // ASCII
+    if last & 0b1100_0000 == 0b1000_0000 {          // continuation byte
+        // Complete iff it finishes the expected sequence length.
+        let mut i = out.len();
+        let mut cont = 0;
+        while i > 0 && out[i - 1] & 0b1100_0000 == 0b1000_0000 { i -= 1; cont += 1; }
+        if i == 0 { return true; } // dangling continuations: count each
+        let lead = out[i - 1];
+        let need = if lead >= 0xF0 { 3 } else if lead >= 0xE0 { 2 } else if lead >= 0xC0 { 1 } else { return true };
+        cont == need
+    } else {
+        // A lead byte just pushed: a 1-byte "character" only if it's a lone
+        // invalid lead (0xC0.. with a multibyte need) — treat as incomplete so
+        // the following continuation completes it. But a stray >=0x80 non-cont
+        // non-lead is its own char.
+        last < 0xC0
+    }
 }
 
 /// POSIX/bash `read`-style field splitting. Assigns fields to
@@ -2430,6 +2498,10 @@ impl RawFdReader {
     /// Reader over an arbitrary already-open fd (`read -u FD`).
     fn from_fd(fd: std::os::unix::io::RawFd) -> Self {
         RawFdReader { fd }
+    }
+
+    fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.fd
     }
 }
 
@@ -2773,8 +2845,10 @@ fn builtin_read(
         Some(fd) => RawFdReader::from_fd(fd),
         None => RawFdReader::new(),
     };
-    let line_opt = match read_one_line(&mut handle, raw, delim) {
-        Ok(opt) => opt,
+    let poll_fd = Some(handle.raw_fd());
+    let cfg = ReadCfg { raw, delim, delim_active: true, max_chars: None, deadline: None };
+    let (line, stop, any_read) = match read_record(&mut handle, &cfg, poll_fd) {
+        Ok(t) => t,
         Err(e) => {
             crate::sh_error_to!(shell, err, None, "read: {}", crate::bash_io_error(&e));
             #[cfg(unix)]
@@ -2806,10 +2880,10 @@ fn builtin_read(
         e!(err, "");
     }
 
-    let line = match line_opt {
-        Some(l) => l,
-        None => return ExecOutcome::Continue(1), // EOF, nothing read
-    };
+    // Task-1 shim (removed in Task 2): map EOF-with-nothing to the old None path.
+    if !any_read && matches!(stop, ReadStop::Eof) {
+        return ExecOutcome::Continue(1);
+    }
 
     // Assignment.
     let ifs = shell.ifs();
@@ -10881,67 +10955,73 @@ mod readonly_tests {
 #[cfg(test)]
 mod read_tests {
     use super::*;
-    use std::io::Cursor;
 
-    // ── read_one_line ──────────────────────────────────────────
+    // ── read_record ─────────────────────────────────────────────
 
     #[test]
-    fn read_one_line_basic() {
-        let mut c = Cursor::new(b"hello\n".as_slice());
-        let r = read_one_line(&mut c, false, b'\n').unwrap();
-        assert_eq!(r.as_deref(), Some("hello"));
+    fn read_record_stops_at_delim() {
+        let mut c = std::io::Cursor::new(b"abc\ndef".to_vec());
+        let cfg = ReadCfg { raw: false, delim: b'\n', delim_active: true, max_chars: None, deadline: None };
+        let (s, stop, any) = read_record(&mut c, &cfg, None).unwrap();
+        assert_eq!(s, "abc");
+        assert!(matches!(stop, ReadStop::Delim));
+        assert!(any);
     }
 
     #[test]
-    fn read_one_line_eof_returns_none() {
-        let mut c = Cursor::new(b"".as_slice());
-        let r = read_one_line(&mut c, false, b'\n').unwrap();
-        assert_eq!(r, None);
+    fn read_record_eof_partial_reports_eof() {
+        let mut c = std::io::Cursor::new(b"abc".to_vec());
+        let cfg = ReadCfg { raw: false, delim: b'\n', delim_active: true, max_chars: None, deadline: None };
+        let (s, stop, any) = read_record(&mut c, &cfg, None).unwrap();
+        assert_eq!(s, "abc");
+        assert!(matches!(stop, ReadStop::Eof));
+        assert!(any);
     }
 
     #[test]
-    fn read_one_line_eof_partial_returns_some() {
-        let mut c = Cursor::new(b"abc".as_slice());
-        let r = read_one_line(&mut c, false, b'\n').unwrap();
-        assert_eq!(r.as_deref(), Some("abc"));
+    fn read_record_eof_empty_reports_not_any() {
+        let mut c = std::io::Cursor::new(Vec::<u8>::new());
+        let cfg = ReadCfg { raw: false, delim: b'\n', delim_active: true, max_chars: None, deadline: None };
+        let (s, stop, any) = read_record(&mut c, &cfg, None).unwrap();
+        assert_eq!(s, "");
+        assert!(matches!(stop, ReadStop::Eof));
+        assert!(!any);
     }
 
     #[test]
-    fn read_one_line_escape_removal() {
-        // "a\\bc\n" — non-raw → "abc" (\\b → b).
-        let mut c = Cursor::new(b"a\\bc\n".as_slice());
-        let r = read_one_line(&mut c, false, b'\n').unwrap();
-        assert_eq!(r.as_deref(), Some("abc"));
+    fn read_record_backslash_continuation_and_escape() {
+        // "a\<newline>b\c" -> line continuation joins, \c -> c
+        let mut c = std::io::Cursor::new(b"a\\\nb\\c\n".to_vec());
+        let cfg = ReadCfg { raw: false, delim: b'\n', delim_active: true, max_chars: None, deadline: None };
+        let (s, stop, _) = read_record(&mut c, &cfg, None).unwrap();
+        assert_eq!(s, "abc");
+        assert!(matches!(stop, ReadStop::Delim));
     }
 
     #[test]
-    fn read_one_line_line_continuation() {
-        // "a\\\nb\n" — non-raw → "ab".
-        let mut c = Cursor::new(b"a\\\nb\n".as_slice());
-        let r = read_one_line(&mut c, false, b'\n').unwrap();
-        assert_eq!(r.as_deref(), Some("ab"));
+    fn read_record_raw_keeps_backslash() {
+        let mut c = std::io::Cursor::new(b"a\\c\n".to_vec());
+        let cfg = ReadCfg { raw: true, delim: b'\n', delim_active: true, max_chars: None, deadline: None };
+        let (s, _, _) = read_record(&mut c, &cfg, None).unwrap();
+        assert_eq!(s, "a\\c");
     }
 
     #[test]
-    fn read_one_line_raw_preserves_backslash() {
-        // "a\\b\n" — raw → "a\\b".
-        let mut c = Cursor::new(b"a\\b\n".as_slice());
-        let r = read_one_line(&mut c, true, b'\n').unwrap();
-        assert_eq!(r.as_deref(), Some("a\\b"));
+    fn read_record_custom_delim() {
+        let mut c = std::io::Cursor::new(b"foo:bar\n".to_vec());
+        let cfg = ReadCfg { raw: false, delim: b':', delim_active: true, max_chars: None, deadline: None };
+        let (s, stop, _) = read_record(&mut c, &cfg, None).unwrap();
+        assert_eq!(s, "foo");
+        assert!(matches!(stop, ReadStop::Delim));
     }
 
     #[test]
-    fn read_one_line_custom_delim() {
-        let mut c = Cursor::new(b"foo:bar\n".as_slice());
-        let r = read_one_line(&mut c, false, b':').unwrap();
-        assert_eq!(r.as_deref(), Some("foo"));
-    }
-
-    #[test]
-    fn read_one_line_nul_delim() {
-        let mut c = Cursor::new(b"foo\0bar".as_slice());
-        let r = read_one_line(&mut c, false, 0u8).unwrap();
-        assert_eq!(r.as_deref(), Some("foo"));
+    fn read_record_nul_delim() {
+        let mut c = std::io::Cursor::new(b"foo\0bar".to_vec());
+        let cfg = ReadCfg { raw: false, delim: 0u8, delim_active: true, max_chars: None, deadline: None };
+        let (s, stop, _) = read_record(&mut c, &cfg, None).unwrap();
+        assert_eq!(s, "foo");
+        assert!(matches!(stop, ReadStop::Delim));
     }
 
     // ── read -u FD ──────────────────────────────────────────────
