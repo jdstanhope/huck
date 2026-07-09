@@ -408,12 +408,16 @@ fn run_andor_group(
             return ExecOutcome::Continue(c);
         }
         crate::traps::dispatch_pending_traps(shell);
-        // ERR fires for first's failure if not suppressed AND the
-        // next connector (if any) is not Or.
-        let next_is_or = matches!(rest.first(), Some((Connector::Or, _)));
+        // errexit / ERR fire for first's failure only when it is the
+        // SYNTACTICALLY LAST command in this and-or list. bash exempts every
+        // and-or-list command except the last, regardless of whether the
+        // following connector is `&&` or `||` (a command followed by either is
+        // "part of a list being tested", not a standalone failure). `first`
+        // is last iff there is no `rest`.
+        let is_last = rest.is_empty();
         if c != 0
             && shell.err_suppressed_depth == 0
-            && !next_is_or
+            && is_last
             && !is_negated_pipeline(first)
         {
             crate::traps::fire_err_trap(shell);
@@ -448,13 +452,15 @@ fn run_andor_group(
                     return ExecOutcome::Continue(c);
                 }
                 crate::traps::dispatch_pending_traps(shell);
-                // ERR fires if this command failed AND we're not in a
-                // suppression context AND the NEXT connector is not Or
-                // (i.e. the failure isn't "handled" by a following || clause).
-                let next_is_or = matches!(rest.get(i + 1), Some((Connector::Or, _)));
+                // errexit / ERR fire only when this failing command is the
+                // SYNTACTICALLY LAST in the and-or list. A command followed by
+                // `&&` OR `||` is exempt (bash rule) — the two differ from the
+                // old `!next_is_or` gate only in the `&&`-next case, which was
+                // the bug. This command is last iff there is no rest[i+1].
+                let is_last = i + 1 == rest.len();
                 if c != 0
                     && shell.err_suppressed_depth == 0
-                    && !next_is_or
+                    && is_last
                     && !is_negated_pipeline(command)
                 {
                     crate::traps::fire_err_trap(shell);
@@ -10015,5 +10021,63 @@ mod g3_dbracket_extglob_noshopt_tests {
     fn quoted_paren_is_literal_not_extglob() {
         assert_eq!(status_of("x=y; [[ $x == \"(\" ]]"), 1); // y != "("
         assert_eq!(status_of("[[ '(' == \"(\" ]]"), 0);
+    }
+}
+
+#[cfg(test)]
+mod errexit_andor_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    /// Run a fragment under `set -e` and report whether errexit fired
+    /// (i.e. the sequence returned `ExecOutcome::Exit`). Mirrors the
+    /// non-interactive execute path.
+    fn errexit_fired(src: &str) -> bool {
+        let mut s = Shell::new();
+        s.shell_options.errexit = true;
+        let mut buf = String::from(src);
+        if !buf.ends_with('\n') {
+            buf.push('\n');
+        }
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            &buf,
+            &Default::default(),
+            crate::lexer::LexerOptions::default(),
+        ))
+        .expect("parse ok")
+        .expect("non-empty parse");
+        matches!(execute(&seq, &mut s, &buf), ExecOutcome::Exit(_))
+    }
+
+    #[test]
+    fn nonlast_andor_failure_is_exempt() {
+        // A failing command that is NOT the syntactically last in an and-or
+        // list does not trigger errexit — whether the next connector is `&&`
+        // or `||`.
+        assert!(!errexit_fired("false && echo x"), "false && echo x must not exit");
+        assert!(!errexit_fired("false && true"), "false && true must not exit");
+        assert!(!errexit_fired("false && false"), "false && false must not exit");
+        assert!(!errexit_fired("true && false && echo x"), "middle-fail must not exit");
+        assert!(!errexit_fired("false && echo x && echo y"), "non-last && must not exit");
+        assert!(!errexit_fired("false && echo a || echo b"), "false && a || b must not exit");
+    }
+
+    #[test]
+    fn last_andor_failure_triggers_errexit() {
+        // The syntactically last command failing DOES trigger errexit.
+        assert!(errexit_fired("echo a && false"), "echo a && false must exit");
+        assert!(errexit_fired("true && false"), "true && false must exit");
+        assert!(errexit_fired("false || false"), "false || false must exit");
+        assert!(errexit_fired("echo a && echo b && false"), "trailing false must exit");
+        assert!(errexit_fired("false"), "bare false must exit");
+    }
+
+    #[test]
+    fn or_short_circuit_unchanged() {
+        // `||` short-circuit behavior is unchanged: a leading false handled by
+        // a following `||` clause is exempt (regression guard for the fix,
+        // which generalized `!next_is_or` to `is_last`).
+        assert!(!errexit_fired("false || echo x"), "false || echo x must not exit");
+        assert!(!errexit_fired("true || false"), "true || false must not exit");
     }
 }
