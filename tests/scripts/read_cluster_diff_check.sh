@@ -21,5 +21,17 @@ check "eof-empty clears"   'printf "" | { x=OLD; read x; echo "rc=$? [$x]"; }'  
 check "eof-multi clears"   'printf "" | { x=A y=B; read x y; echo "rc=$? [$x][$y]"; }' # rc1 [][]
 check "full-line rc0"      'printf "abc\n" | { read x; echo "rc=$? [$x]"; }'      # rc0 [abc]
 
+# --- B-03: last-field trailing IFS delimiter ---
+check "b03 :a:b: 3v"   'printf ":a:b:\n"  | { IFS=: read x y z; echo "[$x][$y][$z]"; }'
+check "b03 :a:b:: 3v"  'printf ":a:b::\n" | { IFS=: read x y z; echo "[$x][$y][$z]"; }'
+check "b03 a:b:c:d 3v" 'printf "a:b:c:d\n"| { IFS=: read x y z; echo "[$x][$y][$z]"; }'
+check "b03 a: 2v"      'printf "a:\n"     | { IFS=: read x y; echo "[$x][$y]"; }'
+check "b03 a:: 2v"     'printf "a::\n"    | { IFS=: read x y; echo "[$x][$y]"; }'
+check "b03 a::: 2v"    'printf "a:::\n"   | { IFS=: read x y; echo "[$x][$y]"; }'
+check "b03 a:b:: 2v"   'printf "a:b::\n"  | { IFS=: read x y; echo "[$x][$y]"; }'
+check "b03 mixed"      'printf "a:b: \n"  | { IFS=": " read x y; echo "[$x][$y]"; }'
+check "b03 single var" 'printf "a:b:\n"   | { IFS=: read x; echo "[$x]"; }'
+check "b03 ws trail"   'printf "a b  \n"  | { read x y; echo "[$x][$y]"; }'
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

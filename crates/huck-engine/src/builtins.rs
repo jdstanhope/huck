@@ -2392,11 +2392,18 @@ fn split_into_names(
         fields.push(String::new());
     }
 
-    // Last field: rest of line from position i, with trailing
-    // ws-IFS stripped.
+    // Last field: remainder from `i`. Strip trailing ws-IFS; then strip ONE
+    // trailing non-ws IFS delimiter IFF it is the sole trailing delimiter (the
+    // char before it is not itself a non-ws IFS delimiter). See spec §4.
     let mut end = bytes.len();
     while end > i && is_ws(bytes[end - 1]) {
         end -= 1;
+    }
+    if end > i && is_nonws(bytes[end - 1]) && !(end - 1 > i && is_nonws(bytes[end - 2])) {
+        end -= 1;
+        while end > i && is_ws(bytes[end - 1]) {
+            end -= 1;
+        }
     }
     let last = String::from_utf8_lossy(&bytes[i..end]).into_owned();
     fields.push(last);
@@ -11173,6 +11180,23 @@ mod read_tests {
                 ("Y".to_string(), "b:c".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn split_last_field_strips_sole_trailing_delim() {
+        let n = vec!["x".to_string(), "y".to_string(), "z".to_string()];
+        let g = |s: &str| split_into_names(s, &n, ":").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+        assert_eq!(g(":a:b:"),  vec!["", "a", "b"]);     // sole trailing ':' stripped
+        assert_eq!(g(":a:b::"), vec!["", "a", "b::"]);   // two trailing -> kept
+        assert_eq!(g("a:b:c:d"), vec!["a", "b", "c:d"]); // interior kept
+        let n2 = vec!["x".to_string(), "y".to_string()];
+        let g2 = |s: &str| split_into_names(s, &n2, ":").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+        assert_eq!(g2("a"),     vec!["a", ""]);
+        assert_eq!(g2("a:"),    vec!["a", ""]);
+        assert_eq!(g2("a::"),   vec!["a", ""]);
+        assert_eq!(g2("a:::"),  vec!["a", "::"]);
+        assert_eq!(g2("a:b:"),  vec!["a", "b"]);
+        assert_eq!(g2("a:b::"), vec!["a", "b::"]);
     }
 
     #[test]
