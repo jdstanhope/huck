@@ -6,9 +6,10 @@ highlights huck's features and carries a blog/updates section that tracks the
 development process. The blog is generated from static MDX files committed to
 the repo — no CMS, no server, no database.
 
-This is a new subsystem, independent of the Rust shell. It ships via a pull
-request to `main` (the maintainer reviews and merges), consistent with the
-project's issue+PR workflow.
+This is a new subsystem, independent of the Rust shell. Tracked as
+[#88](https://github.com/jdstanhope/huck/issues/88); it ships via a pull request
+to `main` (the maintainer reviews and merges), consistent with the project's
+issue+PR workflow.
 
 ## Goals & non-goals
 
@@ -165,7 +166,7 @@ Documented in the spec so the process is explicit and repeatable:
 
 ## Rollout
 
-- Spec + plan committed to `main`; a tracking issue (label `enhancement`, and a
-  new `website` label) captures the work; implementation on a
-  `site-<topic>` branch; a PR to `main` (`Closes #N`) for the maintainer to
-  review and merge, after which Vercel publishes production.
+- Spec + plan committed to `main`; tracked by issue #88 (labels `website` +
+  `enhancement`); implementation on the `site-huck-website` branch; a PR to
+  `main` (`Closes #88`) for the maintainer to review and merge, after which
+  Vercel publishes production.
