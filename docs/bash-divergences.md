@@ -27,7 +27,7 @@ stays in sync.
 
 | Tier | Count | Notes |
 | --- | --- | --- |
-| Bugs (Tier 1) | 2 | Real behavioral divergences (surfaced by the 2026-07-09 differential sweep). |
+| Bugs (Tier 1) | 3 | Real behavioral divergences (surfaced by the 2026-07-09 differential sweep). |
 | Missing features (Tier 2) | 9 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 66 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
@@ -43,6 +43,7 @@ are the remaining behavioral divergences surfaced by the 2026-07-09 differential
 sweep.)
 
 - **B-01: `! eval CMD` / `! (subshell)` does not suppress `set -e` for a failure INSIDE the body** — `[deferred]`, medium (found v275). `set -e; ! eval false; echo after` → bash prints `after` (rc 0: the `!` negates the whole command, so its failure is not a set-e trigger), but huck EXITS (rc 1). Same for `! eval '(exit 5)'` (huck exits rc 5) and, by the same root cause, a `!`-negated subshell whose body fails. `! false` and `! builtin false` are CORRECT — the divergence is specific to constructs that run an inner execution (`eval`, `( … )`): the outer `!`/errexit-suppression context (`err_suppressed_depth`) is not propagated into the eval/subshell body, so the inner command's failure fires errexit before the `!` negates it. Surfaced by bash's own `set-e.tests` (line 93 `! eval false`), which huck exits early on. Fix: thread the negation/suppression context into `eval`'s `process_line_in_sinks` and the subshell body execution.
+- **B-03: `read` with a non-whitespace IFS keeps a trailing delimiter in the last variable** — `[deferred]`, low. `printf ':a:b:\n' | { IFS=: read x y z; echo "[$x][$y][$z]"; }` → bash `[][a][b]`, huck `[][a][b:]`. When there are more fields than variables, bash strips a trailing IFS delimiter from the remainder assigned to the last variable; huck strips only trailing IFS-**whitespace**, keeping a trailing non-ws delimiter. **v276 attempted a heuristic fix and REVERTED it**: the rule is genuinely subtle — for a multi-char IFS mixing whitespace and non-whitespace (`IFS=": "`), whether the trailing delimiter is stripped depends on preceding-character context in a way no simple "strip the sole trailing delimiter" heuristic captures (bash's own `ifs-posix.tests` enumerates hundreds of these; each heuristic tried fixed some rows and regressed others). A faithful fix requires porting bash's `read.def` last-field splitter and gating it on the full `ifs-posix` matrix — its own iteration. Narrow in practice (colon/CSV parsing where the line ends in the delimiter); huck keeps an extra trailing delimiter, it does not lose data.
 - **B-04: a failed arithmetic expansion returns rc 0 and still runs the command** — `[deferred]`, low. `echo $((3.5)); echo done` → bash prints the arith error to stderr, the `echo` does NOT run, and the command status is 1; huck prints the error, STILL runs `echo` (blank line), and the command status is 0. A malformed `$(( ))` in a simple command should abort the command with a non-zero status (bash), not be swallowed. Rare (a literal bad arithmetic expression in command position), but the rc/abort divergence can mask a real failure under `set -e`.
 
 ---

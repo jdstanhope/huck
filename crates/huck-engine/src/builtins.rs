@@ -2400,19 +2400,14 @@ fn split_into_names(
         fields.push(String::new());
     }
 
-    // Last field: remainder from `i`. Strip trailing ws-IFS; then strip ONE
-    // trailing non-ws IFS delimiter IFF it is the sole trailing delimiter (the
-    // char before it is not itself an IFS delimiter of ANY kind (ws or
-    // non-ws)). See spec §4.
+    // Last field: rest of line from position i, with trailing ws-IFS stripped.
+    // (B-03 — additionally stripping a trailing NON-ws IFS delimiter here — was
+    // reverted in v276: no simple heuristic matches bash's read.def last-field
+    // splitter across the ifs-posix suite's multi-char-IFS cases. Deferred to
+    // its own iteration that ports bash's algorithm faithfully.)
     let mut end = bytes.len();
     while end > i && is_ws(bytes[end - 1]) {
         end -= 1;
-    }
-    if end > i && is_nonws(bytes[end - 1]) && !(end - 1 > i && is_any_ifs(bytes[end - 2])) {
-        end -= 1;
-        while end > i && is_ws(bytes[end - 1]) {
-            end -= 1;
-        }
     }
     let last = String::from_utf8_lossy(&bytes[i..end]).into_owned();
     fields.push(last);
@@ -11259,29 +11254,21 @@ mod read_tests {
     }
 
     #[test]
-    fn split_last_field_strips_sole_trailing_delim() {
+    fn split_last_field_strips_only_ws_ifs() {
+        // B-03 (stripping a trailing NON-ws IFS delimiter from the last field)
+        // was reverted in v276 — the last field strips only trailing IFS
+        // WHITESPACE, keeping any trailing non-ws delimiter verbatim. (A faithful
+        // fix requires porting bash's read.def last-field splitter; deferred.)
         let n = vec!["x".to_string(), "y".to_string(), "z".to_string()];
         let g = |s: &str| split_into_names(s, &n, ":").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
-        assert_eq!(g(":a:b:"),  vec!["", "a", "b"]);     // sole trailing ':' stripped
-        assert_eq!(g(":a:b::"), vec!["", "a", "b::"]);   // two trailing -> kept
-        assert_eq!(g("a:b:c:d"), vec!["a", "b", "c:d"]); // interior kept
+        assert_eq!(g(":a:b:"),  vec!["", "a", "b:"]);    // trailing ':' KEPT (deferred divergence)
+        assert_eq!(g("a:b:c:d"), vec!["a", "b", "c:d"]); // interior kept (matches bash)
         let n2 = vec!["x".to_string(), "y".to_string()];
         let g2 = |s: &str| split_into_names(s, &n2, ":").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
-        assert_eq!(g2("a"),     vec!["a", ""]);
-        assert_eq!(g2("a:"),    vec!["a", ""]);
-        assert_eq!(g2("a::"),   vec!["a", ""]);
-        assert_eq!(g2("a:::"),  vec!["a", "::"]);
-        assert_eq!(g2("a:b:"),  vec!["a", "b"]);
-        assert_eq!(g2("a:b::"), vec!["a", "b::"]);
-
-        // Multi-char IFS mixing whitespace (' ') and non-ws (':') — the
-        // trailing-strip guard must treat a preceding WS-IFS char as blocking
-        // the strip too, not just a preceding non-ws-IFS char.
-        let n3 = vec!["x".to_string(), "y".to_string()];
-        let g3 = |s: &str| split_into_names(s, &n3, ": ").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
-        assert_eq!(g3(":: :"),  vec!["", ": :"]); // preceding char is ws-IFS -> strip blocked
-        assert_eq!(g3(": :"),   vec!["", ""]);    // sole trailing ':' with no preceding char -> stripped
-        assert_eq!(g3("a:b: "), vec!["a", "b"]);  // trailing ws then non-ws-preceded-by-non-ifs -> stripped
+        assert_eq!(g2("a:b::"), vec!["a", "b::"]);       // trailing delims kept
+        // default ws-IFS: trailing whitespace IS trimmed from the last field.
+        let gw = |s: &str| split_into_names(s, &n2, " \t\n").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+        assert_eq!(gw("a b  "), vec!["a", "b"]);
     }
 
     #[test]
