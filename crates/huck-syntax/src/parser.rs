@@ -439,7 +439,7 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
             }
             // Legacy Word-mode token: a COMPLETE word (the Word-lexer coalesces a
             // whole word into one `Word`). Reached when `parse_word_command` runs
-            // on the Word-lexer path — command-sub bodies (`new_live`), for/select
+            // on the Word-lexer path — command-sub bodies (`new`), for/select
             // in-lists, case patterns, and redirect targets. Consume exactly ONE
             // and stop: adjacent `Word` tokens are SEPARATE words in Word mode, so
             // gluing them would be wrong. (Without this arm the catch-all `break`
@@ -1881,7 +1881,7 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
     // `"`...`"`.
     let mut sub_opts = iter.opts();
     sub_opts.in_dquote = false;
-    let mut sub = Lexer::new_live_atoms(&cooked, iter.aliases(), sub_opts);
+    let mut sub = Lexer::new(&cooked, iter.aliases(), sub_opts);
     let sequence = match parse_sequence(&mut sub)? {
         Some(mut seq) => {
             zero_lines_in_sequence(&mut seq);
@@ -5259,7 +5259,7 @@ mod tests {
 
     /// Build the expected `WordPart` using the NEW parser-driven path.
     fn new_part(s: &str, quoted: bool) -> WordPart {
-        let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
+        let mut lx = Lexer::new(s, &Default::default(), LexerOptions::default());
         parse_param_expansion(&mut lx, quoted).expect("new parse")
     }
 
@@ -5439,7 +5439,7 @@ mod tests {
             "${x#\"$(cmd)\"}",
             "${x/y/\"$(cmd)\"}",
         ] {
-            let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
+            let mut lx = Lexer::new(s, &Default::default(), LexerOptions::default());
             assert!(
                 parse_param_expansion(&mut lx, false).is_ok(),
                 "expected a clean parse for {s}"
@@ -5450,7 +5450,7 @@ mod tests {
     // ── v242 differential harness ────────────────────────────────────────────
 
     fn new_seq(s: &str) -> Result<Option<Sequence>, ParseError> {
-        let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions::default());
+        let mut lx = Lexer::new(s, &Default::default(), LexerOptions::default());
         parse_sequence(&mut lx)
     }
     #[test]
@@ -5763,7 +5763,7 @@ mod tests {
         for (k, v) in pairs {
             al.insert(k.to_string(), v.to_string());
         }
-        let mut lx = Lexer::new_live_atoms(s, &al, LexerOptions::default());
+        let mut lx = Lexer::new(s, &al, LexerOptions::default());
         super::parse_sequence(&mut lx)
     }
     fn diff_al(s: &str, pairs: &[(&str, &str)]) {
@@ -7050,7 +7050,7 @@ mod tests {
             eof_closes_heredoc: true,
             ..Default::default()
         };
-        let mut lx = Lexer::new_live_atoms(s, &Default::default(), opts);
+        let mut lx = Lexer::new(s, &Default::default(), opts);
         parse_sequence(&mut lx)
     }
 
@@ -7191,7 +7191,7 @@ mod tests {
         // leaves the body in the Lexer-owned queue (early-Err path does not
         // drain). A subsequent parse_sequence on the SAME Lexer must discard
         // that leaked body at entry, so the queue is empty afterward.
-        let mut lx = Lexer::new_live_atoms(
+        let mut lx = Lexer::new(
             "cat <<E\nx\nE\n;;",
             &Default::default(),
             LexerOptions::default(),
@@ -7917,7 +7917,7 @@ mod tests {
 
     /// Build the expected `WordPart::CommandSub` using the NEW parser-driven path.
     fn new_cs(s: &str, quoted: bool) -> Result<WordPart, ParseError> {
-        let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
+        let mut lx = Lexer::new(s, &Default::default(), LexerOptions::default());
         parse_command_sub(&mut lx, quoted)
     }
 
@@ -8075,7 +8075,7 @@ mod tests {
     /// Build the expected `WordPart::CommandSub` using the NEW parser-driven
     /// backtick path (skeleton in Task 1; full body in Task 2+).
     fn new_bt(s: &str, quoted: bool) -> Result<WordPart, ParseError> {
-        let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
+        let mut lx = Lexer::new(s, &Default::default(), LexerOptions::default());
         parse_backtick_sub(&mut lx, quoted)
     }
 
@@ -8217,7 +8217,7 @@ mod tests {
 
     /// New parser-driven path.
     fn new_arith(s: &str, quoted: bool) -> Result<WordPart, ParseError> {
-        let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
+        let mut lx = Lexer::new(s, &Default::default(), LexerOptions::default());
         parse_arith_expansion(&mut lx, quoted)
     }
 
@@ -8918,7 +8918,7 @@ mod tests {
     // Drive BOTH the oracle `command::parse_one_unit` and the atom
     // `parse_one_unit` in a loop over the same script, comparing unit-by-unit.
     fn new_unit(s: &str) -> Vec<Result<Option<Sequence>, ParseError>> {
-        let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions::default());
+        let mut lx = Lexer::new(s, &Default::default(), LexerOptions::default());
         drive_units(&mut super::parse_one_unit, &mut lx)
     }
     fn drive_units(
@@ -8967,7 +8967,7 @@ mod tests {
     // turn it ON for both the oracle (`command::parse`, driven by
     // `scan_extglob_group`) and the atom path, and assert byte-identical ASTs.
     fn new_eg(s: &str) -> Result<Option<Sequence>, ParseError> {
-        let mut lx = Lexer::new_live_atoms(
+        let mut lx = Lexer::new(
             s,
             &Default::default(),
             LexerOptions {
@@ -9136,7 +9136,7 @@ mod tests {
         // bounded near HISTORY_PRUNE_THRESHOLD.
         let empty = std::collections::HashMap::new();
         let src: String = (0..5000).map(|i| format!("echo {i}\n")).collect();
-        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        let mut lx = Lexer::new(&src, &empty, LexerOptions::default());
         let mut units = 0;
         while parse_one_unit(&mut lx).unwrap().is_some() {
             units += 1;
@@ -9157,7 +9157,7 @@ mod tests {
             .map(|i| format!("echo {i}"))
             .collect::<Vec<_>>()
             .join("; ");
-        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        let mut lx = Lexer::new(&src, &empty, LexerOptions::default());
         let seq = parse_sequence(&mut lx).unwrap().unwrap();
         assert_eq!(1 + seq.rest.len(), n, "all commands parsed");
         assert!(
@@ -9182,7 +9182,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("; ");
         let src = format!("{filler}; echo $((echo x) )");
-        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        let mut lx = Lexer::new(&src, &empty, LexerOptions::default());
         assert!(parse_sequence(&mut lx).unwrap().is_some());
     }
 
@@ -9194,7 +9194,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("; ");
         let src = format!("x=$({inner})");
-        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        let mut lx = Lexer::new(&src, &empty, LexerOptions::default());
         assert!(parse_sequence(&mut lx).unwrap().is_some());
     }
 
@@ -9210,7 +9210,7 @@ mod tests {
             .map(|i| format!("; echo {i}"))
             .collect();
         let src = format!("cat <<EOF{filler}\nBODYLINE\nEOF\n");
-        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        let mut lx = Lexer::new(&src, &empty, LexerOptions::default());
         let seq = parse_one_unit(&mut lx).unwrap().unwrap();
         // Extract the first heredoc body from the first command.
         let Command::Pipeline(p) = &seq.first else {
@@ -9264,7 +9264,7 @@ mod tests {
             .take(HISTORY_PRUNE_THRESHOLD + 200)
             .collect();
         let src = format!("echo {prefix}$(( $({{ {inner} echo HI; }}) x)");
-        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        let mut lx = Lexer::new(&src, &empty, LexerOptions::default());
         let result = parse_sequence(&mut lx);
         assert!(
             matches!(result, Err(ParseError::UnterminatedSubshell)),
@@ -9281,11 +9281,8 @@ mod tests {
         use crate::command::{AssignTarget, Command, SimpleCommand};
         for (src, want_sub_lit) in [("a[0]=v", Some("0")), ("a[$(echo 2)]=v", None)] {
             let empty = std::collections::HashMap::new();
-            let mut lx = crate::lexer::Lexer::new_live_atoms(
-                src,
-                &empty,
-                crate::lexer::LexerOptions::default(),
-            );
+            let mut lx =
+                crate::lexer::Lexer::new(src, &empty, crate::lexer::LexerOptions::default());
             let seq = parse_sequence(&mut lx).unwrap().unwrap();
             // Bare assignment → Command::Simple(SimpleCommand::Assign([a], _))
             let Command::Pipeline(p) = &seq.first else {
@@ -9319,11 +9316,8 @@ mod tests {
         use crate::lexer::WordPart;
         let empty = std::collections::HashMap::new();
         // a[bc]: single literal word, program "a[bc]", no inline assignment.
-        let mut lx = crate::lexer::Lexer::new_live_atoms(
-            "a[bc]",
-            &empty,
-            crate::lexer::LexerOptions::default(),
-        );
+        let mut lx =
+            crate::lexer::Lexer::new("a[bc]", &empty, crate::lexer::LexerOptions::default());
         let seq = parse_sequence(&mut lx).unwrap().unwrap();
         let Command::Pipeline(p) = &seq.first else {
             panic!()
@@ -9343,11 +9337,8 @@ mod tests {
             }]
         );
         // a[$x]: program parts must contain a Var (proves expansion, D1 fix), not a literal "$x".
-        let mut lx2 = crate::lexer::Lexer::new_live_atoms(
-            "a[$x]",
-            &empty,
-            crate::lexer::LexerOptions::default(),
-        );
+        let mut lx2 =
+            crate::lexer::Lexer::new("a[$x]", &empty, crate::lexer::LexerOptions::default());
         let seq2 = parse_sequence(&mut lx2).unwrap().unwrap();
         let Command::Pipeline(p2) = &seq2.first else {
             panic!()
@@ -9371,11 +9362,8 @@ mod tests {
         use crate::command::{AssignTarget, Command, SimpleCommand};
         use crate::lexer::WordPart;
         let empty = std::collections::HashMap::new();
-        let mut lx = crate::lexer::Lexer::new_live_atoms(
-            "a[0]=~/y",
-            &empty,
-            crate::lexer::LexerOptions::default(),
-        );
+        let mut lx =
+            crate::lexer::Lexer::new("a[0]=~/y", &empty, crate::lexer::LexerOptions::default());
         let seq = parse_sequence(&mut lx).unwrap().unwrap();
         let Command::Pipeline(p) = &seq.first else {
             panic!()
@@ -9424,11 +9412,8 @@ mod tests {
             ("printf '%s\\n' a[=1", "printf", vec!["%s\\n", "a[=1"]),
             ("echo one a[=x two", "echo", vec!["one", "a[=x", "two"]),
         ] {
-            let mut lx = crate::lexer::Lexer::new_live_atoms(
-                src,
-                &empty,
-                crate::lexer::LexerOptions::default(),
-            );
+            let mut lx =
+                crate::lexer::Lexer::new(src, &empty, crate::lexer::LexerOptions::default());
             let result = parse_sequence(&mut lx);
             assert!(
                 result.is_ok(),

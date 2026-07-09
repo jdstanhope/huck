@@ -2451,7 +2451,7 @@ mod tests {
             // Parse `<src>` as the sole argument word of `echo` via the live
             // atom front-end, then reconstruct its source.
             let line = format!("echo {src}");
-            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
                 &line,
                 &Default::default(),
                 crate::lexer::LexerOptions::default(),
@@ -4063,7 +4063,7 @@ mod array_expansion_tests {
     /// produces (matters for the lexer-touching `${!a[@]}` shape).
     fn first_arg_word(input: &str) -> Word {
         let src = format!("echo {input}");
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
             &src,
             &Default::default(),
             crate::lexer::LexerOptions::default(),
@@ -4287,7 +4287,7 @@ mod positional_slicing_tests {
 
     fn first_arg_word(input: &str) -> Word {
         let src = format!("echo {input}");
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
             &src,
             &Default::default(),
             crate::lexer::LexerOptions::default(),
@@ -4374,7 +4374,7 @@ mod assoc_expansion_tests {
 
     fn first_arg_word(input: &str) -> Word {
         let src = format!("echo {input}");
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
             &src,
             &Default::default(),
             crate::lexer::LexerOptions::default(),

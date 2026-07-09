@@ -8887,20 +8887,19 @@ mod tests {
     fn render_test_leaf_forms() {
         let mut shell = Shell::new();
         shell.set("v", "hi".into());
-        let parse_expr = |src: &str| match crate::parser::parse_sequence(
-            &mut crate::lexer::Lexer::new_live_atoms(
+        let parse_expr =
+            |src: &str| match crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
                 src,
                 &Default::default(),
                 crate::lexer::LexerOptions::default(),
-            ),
-        )
-        .expect("parse")
-        .expect("seq")
-        .first
-        {
-            crate::command::Command::DoubleBracket { expr, .. } => *expr,
-            other => panic!("expected [[ ]], got {other:?}"),
-        };
+            ))
+            .expect("parse")
+            .expect("seq")
+            .first
+            {
+                crate::command::Command::DoubleBracket { expr, .. } => *expr,
+                other => panic!("expected [[ ]], got {other:?}"),
+            };
         assert_eq!(
             render_test_leaf(&parse_expr("[[ -n $v ]]"), &mut shell),
             "-n hi"
@@ -9979,13 +9978,11 @@ mod tests {
     fn run_exec_single_function_call_inline_assignment_does_not_persist() {
         let mut shell = Shell::new();
         // Define a no-op function via the parser.
-        if let Ok(Some(seq)) =
-            crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
-                "myfunc() { echo ok; }",
-                &Default::default(),
-                crate::lexer::LexerOptions::default(),
-            ))
-        {
+        if let Ok(Some(seq)) = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
+            "myfunc() { echo ok; }",
+            &Default::default(),
+            crate::lexer::LexerOptions::default(),
+        )) {
             let _ = execute(&seq, &mut shell, "myfunc() { echo ok; }");
         }
         let cmd = SimpleCommand::Exec(ExecCommand {
@@ -10246,7 +10243,7 @@ mod tests {
             {
                 let mut out = StdoutSink::Capture(&mut buf);
                 let mut err = StderrSink::Capture(&mut Vec::new());
-                let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+                let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
                     src,
                     &Default::default(),
                     crate::lexer::LexerOptions::default(),
@@ -10290,7 +10287,7 @@ mod tests {
             let mut out = StdoutSink::Capture(&mut buf_out);
             let mut err = StderrSink::Capture(&mut buf_err);
             let src = "/bin/sh -c 'echo out; echo err >&2'";
-            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
                 src,
                 &Default::default(),
                 crate::lexer::LexerOptions::default(),
@@ -10318,7 +10315,7 @@ mod tests {
             let mut out = StdoutSink::Capture(&mut buf);
             let mut err = StderrSink::Merged;
             let src = "/bin/sh -c 'printf out; printf err 1>&2; printf out2'";
-            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
                 src,
                 &Default::default(),
                 crate::lexer::LexerOptions::default(),
@@ -10347,7 +10344,7 @@ mod tests {
             // First stage prints to stderr (visible in err buf), pipes nothing.
             // Second stage `cat` reads (empty) and writes nothing → stdout empty.
             let src = "/bin/sh -c 'echo err >&2' | cat";
-            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
                 src,
                 &Default::default(),
                 crate::lexer::LexerOptions::default(),
@@ -10375,7 +10372,7 @@ mod tests {
             let mut out = StdoutSink::Capture(&mut buf_out);
             let mut err = StderrSink::Capture(&mut buf_err);
             let src = "( echo out; echo err >&2 )";
-            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
                 src,
                 &Default::default(),
                 crate::lexer::LexerOptions::default(),
@@ -10455,13 +10452,11 @@ mod tests {
         // A function named `myfunc` exists in shell.functions → InProcess.
         let mut shell = Shell::new();
         // Register myfunc in the function table via the parser.
-        if let Ok(Some(seq)) =
-            crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
-                "myfunc() { :; }",
-                &Default::default(),
-                crate::lexer::LexerOptions::default(),
-            ))
-        {
+        if let Ok(Some(seq)) = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
+            "myfunc() { :; }",
+            &Default::default(),
+            crate::lexer::LexerOptions::default(),
+        )) {
             let _ = execute(&seq, &mut shell, "myfunc() { :; }");
         }
         let cmd = simple_exec_cmd("myfunc");
@@ -10616,7 +10611,7 @@ mod tests {
         for line in src.lines() {
             buf.push_str(line);
             buf.push('\n');
-            match crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            match crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
                 &buf,
                 &Default::default(),
                 crate::lexer::LexerOptions::default(),
@@ -10639,12 +10634,11 @@ mod tests {
         }
         // Execute any remaining buffered content.
         if !buf.is_empty()
-            && let Ok(Some(seq)) =
-                crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
-                    &buf,
-                    &Default::default(),
-                    crate::lexer::LexerOptions::default(),
-                ))
+            && let Ok(Some(seq)) = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
+                &buf,
+                &Default::default(),
+                crate::lexer::LexerOptions::default(),
+            ))
         {
             let _ = execute(&seq, shell, &buf);
         }
@@ -10892,7 +10886,7 @@ mod tests {
         // waiting for the child.
         use crate::shell_state::Shell;
         let mut shell = Shell::new();
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
             "true && true &",
             &Default::default(),
             crate::lexer::LexerOptions::default(),
@@ -10916,7 +10910,7 @@ mod tests {
         // enough to observe.
         use crate::shell_state::Shell;
         let mut shell = Shell::new();
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
             "sleep 30 && true &",
             &Default::default(),
             crate::lexer::LexerOptions::default(),
@@ -11063,7 +11057,7 @@ mod array_assign_tests {
         if !src.ends_with('\n') {
             src.push('\n');
         }
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
             &src,
             &Default::default(),
             crate::lexer::LexerOptions::default(),
@@ -11888,7 +11882,7 @@ mod errexit_andor_tests {
         if !buf.ends_with('\n') {
             buf.push('\n');
         }
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
             &buf,
             &Default::default(),
             crate::lexer::LexerOptions::default(),

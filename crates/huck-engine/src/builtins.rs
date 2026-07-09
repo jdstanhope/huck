@@ -7287,7 +7287,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
         };
         let empty = std::collections::HashMap::new();
         let aliases_now = if expand { shell.aliases.clone() } else { empty };
-        let mut iter = crate::lexer::Lexer::new_live_atoms(&contents[start..], &aliases_now, opts);
+        let mut iter = crate::lexer::Lexer::new(&contents[start..], &aliases_now, opts);
         // Make span line numbers file-absolute (1-based from the start of
         // `contents`) so $LINENO reports the true file line even when start > 0.
         let base_line = contents.as_bytes()[..start]
@@ -13437,7 +13437,7 @@ mod type_tests {
     #[test]
     fn type_default_function() {
         let mut shell = Shell::new();
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
             "myfn(){ :; }",
             &Default::default(),
             crate::lexer::LexerOptions::default(),
@@ -13456,7 +13456,7 @@ mod type_tests {
     #[test]
     fn type_prints_function_body() {
         let mut shell = Shell::new();
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
             "tf(){ echo a; }",
             &Default::default(),
             crate::lexer::LexerOptions::default(),
@@ -13981,7 +13981,7 @@ mod declare_tests {
 
     #[cfg(test)]
     fn define_fn(shell: &mut Shell, src: &str) {
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
             src,
             &Default::default(),
             crate::lexer::LexerOptions::default(),

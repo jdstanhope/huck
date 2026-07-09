@@ -12,7 +12,7 @@ const syntaxExample = `use huck_syntax::lexer::{Lexer, LexerOptions};
 use huck_syntax::parser::parse_sequence;
 
 let src = "echo hello | wc -l";
-let mut lx = Lexer::new_live_atoms(src, &Default::default(), LexerOptions::default());
+let mut lx = Lexer::new(src, &Default::default(), LexerOptions::default());
 
 // A Sequence is huck's command AST: pipelines, and-or lists, redirections.
 let seq = parse_sequence(&mut lx).expect("valid syntax").expect("non-empty");
