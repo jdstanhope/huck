@@ -4,3 +4,9 @@
 # Generated parse/sweep artifacts (regenerate the corpus via find_shell_scripts.sh)
 /tools/*.tsv
 tools/run_results.tsv
+
+# huck website (Next.js app)
+site/node_modules
+site/.next
+site/.velite
+site/out
