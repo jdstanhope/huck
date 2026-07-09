@@ -139,11 +139,14 @@ assigned.
 ## 6. TTY handling (best-effort caveat)
 
 For `-n`/`-N`/`-t` on a terminal, bash switches to non-canonical mode for
-per-keystroke behavior. huck reuses the existing `-s` termios machinery to
-additionally clear `ICANON` (and `ECHO` when `-s`) for the read's duration, then
-restores. Byte-exactness is GUARANTEED only for pipes/files/redirects (the
-scriptable paths the harness covers); exact interactive terminal timing is
-out of scope.
+per-keystroke behavior. Byte-exactness is GUARANTEED only for
+pipes/files/redirects (the scriptable paths the harness covers). Interactive
+terminal behavior for `-n`/`-t` (non-canonical `ICANON`-off per-keystroke reads)
+is DEFERRED as a documented low-impact residual — huck reads via the fd loop, so
+on a canonical-mode tty `-n`/`-t` still function once a line is entered, just not
+per-keystroke. Wiring `ICANON`-toggling (reusing the `-s` termios machinery) is a
+straightforward follow-on but has no non-interactive test coverage, so it is out
+of this cluster's scope.
 
 ## 7. Non-goals / accepted divergences
 
