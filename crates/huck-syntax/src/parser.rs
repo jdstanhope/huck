@@ -15,6 +15,19 @@ use crate::lexer::{
     brace_expand_parts,
 };
 
+/// Parse shell source into a command AST using the default lexer configuration
+/// (no aliases, default `LexerOptions`). Returns `Ok(None)` for empty or
+/// comment-only input. For alias expansion or custom options, build a
+/// [`Lexer`](crate::lexer::Lexer) explicitly and call [`parse_sequence`].
+pub fn parse(src: &str) -> Result<Option<Sequence>, ParseError> {
+    let mut lx = crate::lexer::Lexer::new(
+        src,
+        &Default::default(),
+        crate::lexer::LexerOptions::default(),
+    );
+    parse_sequence(&mut lx)
+}
+
 /// Assemble a `Word` (Vec<WordPart>) from atoms in the CURRENT mode, stopping
 /// at a boundary atom (`ParamClose` / `ParamSep` / `RBracket`).  Does NOT
 /// consume the boundary token; callers consume it themselves.
@@ -5273,6 +5286,33 @@ mod tests {
     }
 
     // ── Tests ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_convenience_returns_ast_for_command() {
+        let seq = super::parse("echo hi")
+            .expect("no parse error")
+            .expect("non-empty");
+        assert!(!seq.background);
+    }
+
+    #[test]
+    fn parse_convenience_none_for_empty() {
+        assert!(super::parse("").expect("no parse error").is_none());
+    }
+
+    #[test]
+    fn parse_convenience_none_for_comment_only() {
+        assert!(
+            super::parse("# just a comment")
+                .expect("no parse error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_convenience_errors_on_incomplete() {
+        assert!(super::parse("if").is_err());
+    }
 
     #[test]
     fn scaffolding_types_exist() {

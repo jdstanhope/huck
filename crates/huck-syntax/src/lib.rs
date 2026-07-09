@@ -80,7 +80,8 @@ pub use command::{
 pub use errors::{lex_error_message, parse_error_message};
 pub use generate::{command_to_source, function_to_source};
 pub use lexer::{
-    LexError, LexerOptions, ParamModifier, Span, SubscriptKind, Token, TokenKind, TransformOp,
-    Word, WordPart,
+    LexError, Lexer, LexerOptions, ParamModifier, Span, SubscriptKind, Token, TokenKind,
+    TransformOp, Word, WordPart,
 };
+pub use parser::{parse, parse_sequence};
 pub use util::escape_double_quote_value;
