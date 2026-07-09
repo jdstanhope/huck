@@ -1122,45 +1122,14 @@ mod tests {
         assert!(err_lines.is_empty());
     }
 
-    #[test]
-    fn on_stdout_line_run_inherits_via_tee() {
-        use std::io::Read;
-        use std::os::fd::FromRawFd;
-        // Redirect real fd 1 to a pipe so we can verify the tee re-write.
-        let mut fds = [0; 2];
-        let r = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-        assert_eq!(r, 0);
-        let pipe_r = fds[0];
-        let pipe_w = fds[1];
-
-        let saved = unsafe { libc::dup(1) };
-        unsafe {
-            libc::dup2(pipe_w, 1);
-            libc::close(pipe_w);
-        }
-
-        let mut lines: Vec<String> = Vec::new();
-        let mut e = Engine::new();
-        let _ = e
-            .exec("echo tee-hi")
-            .on_stdout_line(|line| lines.push(line.to_string()))
-            .run();
-
-        unsafe {
-            libc::dup2(saved, 1);
-            libc::close(saved);
-        }
-
-        let mut buf = String::new();
-        let mut file = unsafe { std::fs::File::from_raw_fd(pipe_r) };
-        file.read_to_string(&mut buf).unwrap();
-
-        assert_eq!(lines, vec!["tee-hi"]);
-        assert_eq!(
-            buf, "tee-hi\n",
-            "embedder's real fd 1 should also see the line"
-        );
-    }
+    // NOTE: the fd-1/fd-2 tee-inheritance checks that used to live here
+    // (`on_stdout_line_run_inherits_via_tee` / `on_stderr_line_run_inherits_via_tee`)
+    // now live in `tests/tee_inherit.rs`. They swap a process-global std fd
+    // around a fork+exec, and `dup2` clears `O_CLOEXEC`, so ANY concurrently
+    // forking test in the same process can inherit the temporarily-installed
+    // pipe and clobber the result. No in-process lock fixes that (the racers
+    // are the other ~1800 forking tests, not each other); running them in a
+    // separate integration-test binary is the only reliable isolation. See #90.
 
     #[test]
     fn on_stdout_line_run_no_callback_no_pipe() {
@@ -1168,42 +1137,6 @@ mod tests {
         let mut e = Engine::new();
         let code = e.exec("true").run();
         assert_eq!(code, 0);
-    }
-
-    #[test]
-    fn on_stderr_line_run_inherits_via_tee() {
-        use std::io::Read;
-        use std::os::fd::FromRawFd;
-        let mut fds = [0; 2];
-        let r = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-        assert_eq!(r, 0);
-        let pipe_r = fds[0];
-        let pipe_w = fds[1];
-
-        let saved = unsafe { libc::dup(2) };
-        unsafe {
-            libc::dup2(pipe_w, 2);
-            libc::close(pipe_w);
-        }
-
-        let mut lines: Vec<String> = Vec::new();
-        let mut e = Engine::new();
-        let _ = e
-            .exec("echo err >&2")
-            .on_stderr_line(|line| lines.push(line.to_string()))
-            .run();
-
-        unsafe {
-            libc::dup2(saved, 2);
-            libc::close(saved);
-        }
-
-        let mut buf = String::new();
-        let mut file = unsafe { std::fs::File::from_raw_fd(pipe_r) };
-        file.read_to_string(&mut buf).unwrap();
-
-        assert_eq!(lines, vec!["err"]);
-        assert_eq!(buf, "err\n");
     }
 
     #[test]
