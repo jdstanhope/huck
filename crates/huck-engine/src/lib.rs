@@ -8,37 +8,47 @@
 mod macros;
 pub use macros::bash_io_error;
 
-pub mod arith;
+pub(crate) mod arith;
 pub(crate) mod array_transforms;
+#[doc(hidden)]
 pub mod builtins;
 pub(crate) mod callbacks_thread_local;
+#[doc(hidden)]
 pub mod completion;
-pub mod completion_builtins;
-pub mod completion_spec;
+pub(crate) mod completion_builtins;
+pub(crate) mod completion_spec;
+#[doc(hidden)]
 pub mod continuation;
 pub(crate) mod cwd_scope;
 pub mod engine;
-pub mod err_thread_local;
+pub(crate) mod err_thread_local;
 pub mod error_emit;
 pub mod exec_builder;
-pub mod executor;
-pub mod expand;
-pub mod glob_match;
+pub(crate) mod executor;
+pub(crate) mod expand;
+pub(crate) mod glob_match;
+#[doc(hidden)]
 pub mod history;
-pub mod job_spec;
+pub(crate) mod job_spec;
+#[doc(hidden)]
 pub mod jobs;
 pub(crate) mod line_buf;
-pub mod param_expansion;
-pub mod procsub;
+pub(crate) mod param_expansion;
+pub(crate) mod procsub;
+#[doc(hidden)]
 pub mod prompt;
+#[doc(hidden)]
 pub mod readline_bind;
 pub(crate) mod restricted;
+#[doc(hidden)]
 pub mod shell;
+#[doc(hidden)]
 pub mod shell_state;
 pub(crate) mod stdin_pipe;
 pub(crate) mod stream_loop;
-pub mod test_builtin;
+pub(crate) mod test_builtin;
 pub(crate) mod timeout;
+#[doc(hidden)]
 pub mod traps;
 pub(crate) mod wait_loop;
 

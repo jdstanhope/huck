@@ -102,6 +102,7 @@ impl Engine {
 
     /// Wrap a caller-owned (possibly pre-configured) shell cell. The caller keeps
     /// ownership of any process-global concerns (e.g. signal handlers).
+    #[doc(hidden)]
     pub fn from_shell_cell(cell: Rc<RefCell<Shell>>) -> Self {
         Engine { cell }
     }
@@ -201,6 +202,7 @@ impl Engine {
     }
 
     /// Access the underlying shell cell (advanced/dogfood use).
+    #[doc(hidden)]
     pub fn shell_cell(&self) -> &Rc<RefCell<Shell>> {
         &self.cell
     }
