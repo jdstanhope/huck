@@ -98,14 +98,16 @@ fn command_declaration_builtin_no_panic() {
 }
 
 #[test]
-fn command_declaration_array_literal_no_panic() {
-    // Compound RHS `arr=(x y z)` carries a parser-internal ArrayLiteral that
-    // previously panicked through expand() (rc 101). It must now run the
-    // declaration builtin cleanly. (bash actually rejects this with a syntax
-    // error after `command`; huck is a no-panic superset and assigns the array.)
+fn command_declaration_array_literal_rejected_like_bash() {
+    // `command declare -a a=(x y z)` is a parse-time syntax error in bash (the
+    // `(` after `command …` is unexpected). Since the parser-driven front-end
+    // landed (v264 flip → oracle deletion → v268) huck rejects it the same way
+    // (rc 2) instead of reconstructing and assigning the array — it converged to
+    // bash. The must-not-panic guarantee still holds.
     let (out, rc) = run("command declare -a a=(x y z); echo \"${a[1]}\"\n");
-    assert_eq!(out, "y\n");
-    assert_ne!(rc, 101); // never a panic
+    assert_ne!(rc, 101, "never a panic");
+    assert_eq!(rc, 2, "syntax error like bash, rc: {rc}");
+    assert_eq!(out, "", "no stdout, out: {out:?}");
 }
 
 #[test]

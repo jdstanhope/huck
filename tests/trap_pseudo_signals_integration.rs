@@ -108,9 +108,13 @@ fn err_fires_on_or_chain_when_all_fail() {
 }
 
 #[test]
-fn err_fires_on_and_chain_lhs_failure() {
+fn err_does_not_fire_on_and_chain_lhs_failure() {
+    // `false` is the LHS (non-last) of an `&&` list, so its failure does NOT
+    // trigger the ERR trap in bash — the list's status is decided by an exempt
+    // command. huck matched the pre-v275 (wrong) behavior of firing here; v275
+    // fixed the and-or exemption so huck now agrees with bash: no CAUGHT.
     let (out, _err, _) = run("trap 'echo CAUGHT' ERR\nfalse && true\nexit\n");
-    assert!(out.lines().any(|l| l == "CAUGHT"), "stdout: {out}");
+    assert!(!out.lines().any(|l| l == "CAUGHT"), "stdout: {out}");
 }
 
 #[test]
