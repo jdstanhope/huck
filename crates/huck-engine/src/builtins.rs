@@ -2847,7 +2847,7 @@ fn builtin_read(
     };
     let poll_fd = Some(handle.raw_fd());
     let cfg = ReadCfg { raw, delim, delim_active: true, max_chars: None, deadline: None };
-    let (line, stop, any_read) = match read_record(&mut handle, &cfg, poll_fd) {
+    let (line, stop, _any_read) = match read_record(&mut handle, &cfg, poll_fd) {
         Ok(t) => t,
         Err(e) => {
             crate::sh_error_to!(shell, err, None, "read: {}", crate::bash_io_error(&e));
@@ -2880,12 +2880,18 @@ fn builtin_read(
         e!(err, "");
     }
 
-    // Task-1 shim (removed in Task 2): map EOF-with-nothing to the old None path.
-    if !any_read && matches!(stop, ReadStop::Eof) {
-        return ExecOutcome::Continue(1);
-    }
+    // Base exit status from the stop reason (bash): 0 iff a delimiter or the
+    // -n/-N count was reached; 1 on EOF (even with partial data); 128+SIGALRM
+    // on -t timeout.
+    let base_exit = match stop {
+        ReadStop::Delim | ReadStop::Count => 0,
+        ReadStop::Eof => 1,
+        ReadStop::Timeout => 128 + libc::SIGALRM,
+    };
 
-    // Assignment.
+    // Assignment ALWAYS runs (even on EOF/empty) so named vars are cleared to
+    // empty — bash sets them, it does not leave stale values. `line` is "" on a
+    // pure EOF.
     let ifs = shell.ifs();
     if let Some(arr) = array_name {
         let fields = split_read_fields(&line, &ifs);
@@ -2894,7 +2900,7 @@ fn builtin_read(
         if shell.replace_indexed(&arr, map).is_err() {
             return ExecOutcome::Continue(1); // replace_indexed printed the readonly message
         }
-        return ExecOutcome::Continue(0);
+        return ExecOutcome::Continue(base_exit);
     }
     let assignments: Vec<(String, String)> = if names.is_empty() {
         vec![("REPLY".to_string(), line)]
@@ -2902,7 +2908,7 @@ fn builtin_read(
         split_into_names(&line, &names, &ifs)
     };
 
-    let mut exit = 0;
+    let mut exit = base_exit;
     for (name, value) in assignments {
         if shell.try_set(&name, value).is_err() {
             crate::sh_error_to!(shell, err, None, "read: {name}: readonly variable");
