@@ -8,6 +8,8 @@
   --color-accent-dim: #3fb950;
 }
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root { color-scheme: light dark; }
 
 html { scroll-behavior: smooth; }
