@@ -532,44 +532,10 @@ mod tests {
     // in-memory routing must defer to the real-fd dup chain when an earlier
     // file/pipe redirect targets the source fd.
 
-    #[test]
-    fn capture_with_file_then_dup_to_one_lets_file_win() {
-        // bash: cmd >file 2>&1 — file gets the bytes; nothing captured.
-        // Earlier `is_trailing_dup_to` predicate misfired here: it saw the
-        // trailing `2>&1` and routed the builtin's stderr to the in-memory
-        // stdout sink, leaving the file empty.
-        use std::io::Read;
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
-        let mut e = Engine::new();
-        let out = e.capture(&format!("echo HI > {path} 2>&1"));
-        assert_eq!(out.stdout, "");
-        assert_eq!(out.stderr, "");
-        let mut s = String::new();
-        std::fs::File::open(&path)
-            .unwrap()
-            .read_to_string(&mut s)
-            .unwrap();
-        assert_eq!(s, "HI\n");
-    }
-
-    #[test]
-    fn capture_with_file_then_dup_to_two_lets_file_win() {
-        // Symmetric: cmd 2>file >&2 — file gets the bytes; nothing captured.
-        use std::io::Read;
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
-        let mut e = Engine::new();
-        let out = e.capture(&format!("echo HI 2> {path} >&2"));
-        assert_eq!(out.stdout, "");
-        assert_eq!(out.stderr, "");
-        let mut s = String::new();
-        std::fs::File::open(&path)
-            .unwrap()
-            .read_to_string(&mut s)
-            .unwrap();
-        assert_eq!(s, "HI\n");
-    }
+    // NOTE: `capture_with_file_then_dup_to_{one,two}_lets_file_win` moved to
+    // `tests/streaming_fd_serial.rs` — they redirect a process-global fd to a
+    // file and read it back, which races libtest's own output under the parallel
+    // harness (reproducible on macOS). See that file and #90.
 
     #[test]
     fn capture_bare_dup_to_one_routes_to_stdout_sink() {
@@ -1021,18 +987,9 @@ mod tests {
         assert_eq!(lines, vec!["no-newline"]);
     }
 
-    #[test]
-    fn on_stderr_line_fires_per_line() {
-        let mut out_lines: Vec<String> = Vec::new();
-        let mut err_lines: Vec<String> = Vec::new();
-        let mut e = Engine::new();
-        e.exec("echo hi; echo err >&2")
-            .on_stdout_line(|line| out_lines.push(line.to_string()))
-            .on_stderr_line(|line| err_lines.push(line.to_string()))
-            .capture();
-        assert_eq!(out_lines, vec!["hi"]);
-        assert_eq!(err_lines, vec!["err"]);
-    }
+    // NOTE: `on_stderr_line_fires_per_line` moved to
+    // `tests/streaming_fd_serial.rs` (process-global fd swap; races the parallel
+    // harness on macOS). See that file and #90.
 
     #[test]
     fn on_stdout_line_captures_too() {
@@ -1107,20 +1064,9 @@ mod tests {
         assert_eq!(lines, vec!["HI"]);
     }
 
-    #[test]
-    fn on_stdout_line_merge_stderr_routes_through_stdout() {
-        let mut out_lines: Vec<String> = Vec::new();
-        let mut err_lines: Vec<String> = Vec::new();
-        let mut e = Engine::new();
-        e.exec("echo a; echo b >&2")
-            .merge_stderr()
-            .on_stdout_line(|line| out_lines.push(line.to_string()))
-            .on_stderr_line(|line| err_lines.push(line.to_string()))
-            .capture();
-        assert!(out_lines.contains(&"a".to_string()));
-        assert!(out_lines.contains(&"b".to_string()));
-        assert!(err_lines.is_empty());
-    }
+    // NOTE: `on_stdout_line_merge_stderr_routes_through_stdout` moved to
+    // `tests/streaming_fd_serial.rs` (process-global fd swap; races the parallel
+    // harness on macOS). See that file and #90.
 
     // NOTE: the fd-1/fd-2 tee-inheritance checks that used to live here
     // (`on_stdout_line_run_inherits_via_tee` / `on_stderr_line_run_inherits_via_tee`)
@@ -1271,39 +1217,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn on_stderr_line_builtin_redirect_to_err() {
-        // builtin >&2 with on_stderr_line — must fire. (v207 fixup: previously
-        // the side_err Vec<u8> aliasing-avoidance buffer bypassed
-        // LineDispatchWriter so streaming callbacks didn't see these bytes.)
-        let mut lines: Vec<String> = Vec::new();
-        let mut e = Engine::new();
-        let out = e
-            .exec("echo hi >&2")
-            .on_stderr_line(|line| lines.push(line.to_string()))
-            .capture();
-        assert_eq!(out.stderr, "hi\n");
-        assert_eq!(lines, vec!["hi"]);
-    }
-
-    #[test]
-    fn on_stdout_line_builtin_redirect_2to1() {
-        // builtin 2>&1 with on_stdout_line — must fire for what was originally
-        // stderr. Use `declare -p` on an undefined var to emit a builtin stderr
-        // diagnostic; the `2>&1` routes it to fd 1 so the embedder should see
-        // it as a stdout-stream event.
-        let mut lines: Vec<String> = Vec::new();
-        let mut e = Engine::new();
-        let _ = e
-            .exec("declare -p NOPE_NOT_DEFINED 2>&1")
-            .on_stdout_line(|line| lines.push(line.to_string()))
-            .capture();
-        // The diagnostic should arrive via on_stdout_line.
-        assert!(
-            lines.iter().any(|l| l.contains("NOPE_NOT_DEFINED")),
-            "expected stderr-redirected-to-stdout line via callback, got {lines:?}"
-        );
-    }
+    // NOTE: `on_stderr_line_builtin_redirect_to_err` and
+    // `on_stdout_line_builtin_redirect_2to1` moved to
+    // `tests/streaming_fd_serial.rs` (process-global fd swap; races the parallel
+    // harness on macOS). See that file and #90.
 
     // ===== Completion API (v208) =====
 

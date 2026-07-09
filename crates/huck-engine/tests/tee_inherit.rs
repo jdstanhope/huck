@@ -20,8 +20,19 @@ use huck_engine::Engine;
 /// callback, restore the fd, and return `(callback_lines, piped_bytes)`.
 fn run_with_fd_capture(target_fd: i32, script: &str, on_stderr: bool) -> (Vec<String>, String) {
     let mut fds = [0; 2];
+    // `pipe2` is Linux-only; fall back to `pipe` + `fcntl(FD_CLOEXEC)` elsewhere.
+    #[cfg(target_os = "linux")]
     let r = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    assert_eq!(r, 0, "pipe2 failed");
+    #[cfg(not(target_os = "linux"))]
+    let r = unsafe {
+        let rc = libc::pipe(fds.as_mut_ptr());
+        if rc == 0 {
+            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        rc
+    };
+    assert_eq!(r, 0, "pipe failed");
     let pipe_r = fds[0];
     let pipe_w = fds[1];
 

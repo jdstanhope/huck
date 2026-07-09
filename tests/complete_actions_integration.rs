@@ -41,7 +41,12 @@ fn registration_never_errors() {
 fn compgen_setopt_shopt_signal() {
     assert_eq!(run("compgen -A setopt e\n").0, "emacs\nerrexit\nerrtrace\n");
     assert_eq!(run("compgen -A shopt null\n").0, "nullglob\n");
+    // macOS/BSD define SIGINFO (signal 29), which also has the "SIGIN" prefix;
+    // Linux does not. Both bash and huck enumerate SIGINT then SIGINFO there.
+    #[cfg(target_os = "linux")]
     assert_eq!(run("compgen -A signal SIGIN\n").0, "SIGINT\n");
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(run("compgen -A signal SIGIN\n").0, "SIGINT\nSIGINFO\n");
 }
 
 #[test]

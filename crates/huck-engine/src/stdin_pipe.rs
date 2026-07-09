@@ -126,7 +126,20 @@ pub fn with_stdin_fd0<R>(
 
 fn make_pipe() -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0; 2];
+    // `pipe2(O_CLOEXEC)` is Linux-only; macOS/BSD have no `pipe2`, so create the
+    // pipe and set close-on-exec on both ends with `fcntl` (the standard portable
+    // fallback — a negligible race window versus a concurrent fork+exec).
+    #[cfg(target_os = "linux")]
     let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    let ret = unsafe {
+        let r = libc::pipe(fds.as_mut_ptr());
+        if r == 0 {
+            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        r
+    };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }

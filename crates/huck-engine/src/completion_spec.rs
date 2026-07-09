@@ -666,7 +666,15 @@ mod tests {
     #[test]
     fn enumerate_signal_helptopic_enabled() {
         let sh = Shell::new();
-        assert!(complete_action(Action::Signal, "SIGIN", &sh) == vec!["SIGINT".to_string()]);
+        // macOS/BSD also define SIGINFO (prefix "SIGIN"); Linux does not.
+        let sigin = complete_action(Action::Signal, "SIGIN", &sh);
+        #[cfg(target_os = "linux")]
+        assert!(sigin == vec!["SIGINT".to_string()]);
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            sigin.contains(&"SIGINT".to_string()) && sigin.contains(&"SIGINFO".to_string()),
+            "expected SIGINT and SIGINFO, got {sigin:?}"
+        );
         assert!(!complete_action(Action::Helptopic, "", &sh).is_empty());
         assert!(complete_action(Action::Enabled, "ech", &sh).contains(&"echo".to_string()));
     }
