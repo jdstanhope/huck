@@ -43,9 +43,12 @@ Run the standard iteration loop without being asked:
    one question at a time, propose 2-3 approaches, present design
    in sections with per-section approval.
 2. **Write spec** to `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md`
-   and commit on main.
+   and commit on main. The spec MUST reference the issue (`#N` with a link).
 3. **Write plan** to `docs/superpowers/plans/YYYY-MM-DD-<topic>.md`
-   via `superpowers:writing-plans` and commit on main.
+   via `superpowers:writing-plans` and commit on main. The plan MUST reference
+   the issue (`#N`). Once both are committed, **comment on the issue with links
+   to the committed spec and plan** (`gh issue comment N` with the
+   `github.com/.../blob/main/...` URLs) so the issue tracks its design trail.
 4. **Implement** via `superpowers:subagent-driven-development` on a
    `vNN-<topic>` branch: fresh subagent per task with spec + code
    quality review between tasks.
