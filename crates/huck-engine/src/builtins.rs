@@ -2402,12 +2402,13 @@ fn split_into_names(
 
     // Last field: remainder from `i`. Strip trailing ws-IFS; then strip ONE
     // trailing non-ws IFS delimiter IFF it is the sole trailing delimiter (the
-    // char before it is not itself a non-ws IFS delimiter). See spec §4.
+    // char before it is not itself an IFS delimiter of ANY kind (ws or
+    // non-ws)). See spec §4.
     let mut end = bytes.len();
     while end > i && is_ws(bytes[end - 1]) {
         end -= 1;
     }
-    if end > i && is_nonws(bytes[end - 1]) && !(end - 1 > i && is_nonws(bytes[end - 2])) {
+    if end > i && is_nonws(bytes[end - 1]) && !(end - 1 > i && is_any_ifs(bytes[end - 2])) {
         end -= 1;
         while end > i && is_ws(bytes[end - 1]) {
             end -= 1;
@@ -11272,6 +11273,15 @@ mod read_tests {
         assert_eq!(g2("a:::"),  vec!["a", "::"]);
         assert_eq!(g2("a:b:"),  vec!["a", "b"]);
         assert_eq!(g2("a:b::"), vec!["a", "b::"]);
+
+        // Multi-char IFS mixing whitespace (' ') and non-ws (':') — the
+        // trailing-strip guard must treat a preceding WS-IFS char as blocking
+        // the strip too, not just a preceding non-ws-IFS char.
+        let n3 = vec!["x".to_string(), "y".to_string()];
+        let g3 = |s: &str| split_into_names(s, &n3, ": ").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+        assert_eq!(g3(":: :"),  vec!["", ": :"]); // preceding char is ws-IFS -> strip blocked
+        assert_eq!(g3(": :"),   vec!["", ""]);    // sole trailing ':' with no preceding char -> stripped
+        assert_eq!(g3("a:b: "), vec!["a", "b"]);  // trailing ws then non-ws-preceded-by-non-ifs -> stripped
     }
 
     #[test]

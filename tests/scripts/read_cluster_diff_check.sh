@@ -46,6 +46,13 @@ check "b03 mixed"      'printf "a:b: \n"  | { IFS=": " read x y; echo "[$x][$y]"
 check "b03 single var" 'printf "a:b:\n"   | { IFS=: read x; echo "[$x]"; }'
 check "b03 ws trail"   'printf "a b  \n"  | { read x y; echo "[$x][$y]"; }'
 
+# --- B-03 regression: multi-char IFS mixing ws (' ') + non-ws (':') ---
+# preceding-ws-IFS char must block the trailing non-ws-IFS strip.
+check "b03mc :: :"     'printf ":: :"     | { IFS=": " read x y; echo "($x)($y)"; }'   # bash ()(: :)
+check "b03mc : :"      'printf ": :"      | { IFS=": " read x y; echo "($x)($y)"; }'   # bash ()()
+check "b03mc a:b: "    'printf "a:b: "    | { IFS=": " read x y; echo "($x)($y)"; }'   # bash (a)(b)
+check "b03mc 2:  2:"   'printf "  ::  :"  | { IFS=": " read x y; echo "($x)($y)"; }'
+
 # --- M-162: -n N / -N N character-counted reads ---
 check "n3 count"     'printf "hello" | { read -n 3 x; echo "rc=$? [$x]"; }'       # rc0 [hel]
 check "n5 stop-nl"   'printf "ab\ncd" | { read -n 5 x; echo "rc=$? [$x]"; }'      # rc0 [ab]
