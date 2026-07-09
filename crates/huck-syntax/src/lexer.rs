@@ -1174,6 +1174,18 @@ impl<'a> Lexer<'a> {
         self.opts.in_dquote
     }
 
+    /// v274: the alias table, for building a fresh sub-lexer over a backtick
+    /// body (phase-3 re-parse) that inherits the parent's aliases.
+    pub(crate) fn aliases(&self) -> &std::collections::HashMap<String, String> {
+        &self.aliases
+    }
+
+    /// v274: the current lexer options (Copy), for building a fresh sub-lexer
+    /// over a backtick body (phase-3 re-parse) with `in_dquote` cleared.
+    pub(crate) fn opts(&self) -> LexerOptions {
+        self.opts
+    }
+
     /// v264: record the `${`'s `$` byte offset in the current ParamExpansion frame,
     /// computed from the live cursor (which sits just past `${`, 2 ASCII bytes, once
     /// the ENCLOSING scanner has consumed the opener — in production the head

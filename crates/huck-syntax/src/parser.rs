@@ -1458,135 +1458,70 @@ pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseErr
     Ok(WordPart::ArrayLiteral(elements))
 }
 
-/// Parse the body of a backtick substitution: a `Sequence` of commands
-/// terminated by `EndBacktick`.  Mirrors `parse_subshell_sequence` but stops
-/// on `TokenKind::EndBacktick` instead of `Op(RParen)`.  Consumes the
-/// `EndBacktick` token before returning.
-fn parse_backtick_body_sequence(iter: &mut Lexer) -> Result<Sequence, ParseError> {
-    let first = parse_command_then_pipeline(iter)?;
-
-    let mut rest = Vec::new();
-    loop {
-        match iter.peek_kind()? {
-            // EOF before EndBacktick → unterminated.
-            None => return Err(ParseError::UnterminatedSubshell),
-            // EndBacktick terminates the body — consume and return.
-            Some(TokenKind::EndBacktick) => {
-                iter.next_kind()?; // consume EndBacktick
-                break;
-            }
-            Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline) => {
-                iter.next_kind()?; // consume `;` or newline
-                skip_newlines(iter)?;
-                // Trailing `;` or newline before the closing backtick — break cleanly.
-                if matches!(iter.peek_kind()?, Some(TokenKind::EndBacktick)) {
-                    iter.next_kind()?; // consume EndBacktick
-                    break;
-                }
-                if iter.peek_kind()?.is_none() {
-                    return Err(ParseError::UnterminatedSubshell);
-                }
-                let cmd = parse_command_then_pipeline(iter)?;
-                rest.push((Connector::Semi, cmd));
-            }
-            Some(TokenKind::Op(Operator::Background)) => {
-                iter.next_kind()?; // consume `&`
-                while matches!(
-                    iter.peek_kind()?,
-                    Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline)
-                ) {
-                    iter.next_kind()?;
-                }
-                skip_newlines(iter)?;
-                if matches!(iter.peek_kind()?, Some(TokenKind::EndBacktick)) {
-                    iter.next_kind()?; // consume EndBacktick
-                    return Ok(Sequence { first, rest, background: true });
-                }
-                if iter.peek_kind()?.is_none() {
-                    return Err(ParseError::UnterminatedSubshell);
-                }
-                let cmd = parse_command_then_pipeline(iter)?;
-                rest.push((Connector::Amp, cmd));
-            }
-            Some(TokenKind::Op(Operator::And)) => {
-                iter.next_kind()?;
-                skip_newlines(iter)?;
-                rest.push((Connector::And, parse_command_then_pipeline(iter)?));
-            }
-            Some(TokenKind::Op(Operator::Or)) => {
-                iter.next_kind()?;
-                skip_newlines(iter)?;
-                rest.push((Connector::Or, parse_command_then_pipeline(iter)?));
-            }
-            // Unexpected token after a complete command.
-            Some(_) => return Err(ParseError::UnterminatedSubshell),
-        }
+/// The empty `Sequence` an empty command substitution (`` `` `` / `$()`)
+/// yields — a `Pipeline` with no commands.
+fn empty_sequence() -> Sequence {
+    Sequence {
+        first: Command::Pipeline(Pipeline { negate: false, commands: Vec::new() }),
+        rest: Vec::new(),
+        background: false,
     }
-
-    Ok(Sequence { first, rest, background: false })
 }
 
-/// Assemble a `WordPart::CommandSub` for a `` `…` `` backtick substitution.
+/// Assemble a `WordPart::CommandSub` for a `` `…` `` backtick substitution using
+/// bash's three-phase model (v274):
 ///
-/// **OUTER call** (top mode is not `Backtick`): pushes `Mode::Backtick { depth: 0 }`
-/// itself, so callers must position the lexer at the opening backtick (the push
-/// ensures the backtick is scanned as atoms rather than a pre-built Word token).
+/// 1. **Raw capture** — push the dumb `Mode::BacktickRaw` and stream the body
+///    verbatim (`BacktickRawText` chunks between `BeginBacktick`/`EndBacktick`),
+///    concatenating into `raw`.  Quote-blind and `$()`-blind: the close is a bare
+///    backtick under one-char `\` lookahead.
+/// 2. **One-level unescape** — `unescape_backtick_body` removes the backslash for
+///    exactly `\\`, `\$`, `` \` ``; every other `\c` is kept verbatim.
+/// 3. **Recursive re-parse** — a FRESH sub-lexer over the cooked body (inheriting
+///    the parent's aliases + opts, but with `in_dquote` cleared) is parsed by
+///    `parse_sequence`.  Nesting and `$()` fall out of this recursion.
 ///
-/// **NESTED recursion** (top mode is already `Backtick`, i.e. this is a `` \` ``
-/// child inside a backtick body): the LEXER already owns the SINGLE depth counter
-/// and has emitted the child's `BeginBacktick` (incrementing depth in place), so
-/// this call must NOT push another frame — it consumes the buffered `BeginBacktick`
-/// and parses the child body under the same continuous depth.  The child's
-/// matching `EndBacktick` (lexer depth −1) terminates it.
-///
-/// Owns the push/pop lifecycle of its `Backtick` frame on the OUTER path and
-/// pops on ALL outer exit paths (Ok / empty / error).  Nested recursion neither
-/// pushes nor pops (the single frame is owned by the outer call).
+/// Always owns the push/pop of its own `BacktickRaw` frame (nesting is handled by
+/// phase 3, not by a shared depth counter); pops on ALL exit paths.
 pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
-    // Detect nested recursion: a `` \` `` child is entered while the top mode is
-    // already `Backtick` (the lexer has flipped the single frame's depth up and
-    // emitted the child's `BeginBacktick`).  Only the OUTER call owns push/pop.
-    let pushed = !matches!(iter.current_mode(), Mode::Backtick { .. });
-
-    // 1. Push the mode (outer only).  The fallible body runs inside an
-    //    immediately-invoked closure so that EVERY exit path — including a
-    //    `LexError` surfaced by `?` on a body pull — flows through the single
-    //    `pop_mode` below (outer only).  Nested recursion neither pushes nor pops.
-    if pushed {
-        iter.push_mode(Mode::Backtick { depth: 0 });
-    }
-    let result = (|| -> Result<Sequence, ParseError> {
-        // Pull the opening BeginBacktick atom.
+    // Phase 1 — capture the raw body under the dumb BacktickRaw mode.  The
+    // fallible body runs in an immediately-invoked closure so EVERY exit path
+    // (including a `?`-propagated LexError) flows through the single `pop_mode`.
+    iter.push_mode(Mode::BacktickRaw);
+    let raw = (|| -> Result<String, ParseError> {
         match iter.next_kind()? {
-            Some(TokenKind::BeginBacktick) => {} // continue
+            Some(TokenKind::BeginBacktick) => {}
             _ => return Err(ParseError::UnsupportedExpansion),
         }
-
-        // Dispatch: empty body or non-empty body.
-        if matches!(iter.peek_kind()?, Some(TokenKind::EndBacktick)) {
-            // Empty body `` `` `` — consume EndBacktick and return the same Sequence
-            // that the production oracle yields via `parse_substitution_body("")`.
-            iter.next_kind()?; // consume EndBacktick
-            Ok(Sequence {
-                first: Command::Pipeline(Pipeline { negate: false, commands: Vec::new() }),
-                rest: Vec::new(),
-                background: false,
-            })
-        } else {
-            // Non-empty body: parse_backtick_body_sequence consumes EndBacktick.
-            let mut seq = parse_backtick_body_sequence(iter).map_err(|e| match e {
-                ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
-                other => other,
-            })?;
-            // Zero all source-line fields to match the production oracle.
-            zero_lines_in_sequence(&mut seq);
-            Ok(seq)
+        let mut raw = String::new();
+        loop {
+            match iter.next_kind()? {
+                Some(TokenKind::BacktickRawText(s)) => raw.push_str(&s),
+                Some(TokenKind::EndBacktick) => return Ok(raw),
+                None => return Err(ParseError::UnterminatedSubshell), // unterminated `...`
+                _ => return Err(ParseError::UnsupportedExpansion),
+            }
         }
     })();
+    iter.pop_mode();
+    let raw = raw?;
 
-    // 2. Pop the Backtick frame (outer only) on EVERY path, then propagate.
-    if pushed { iter.pop_mode(); }
-    let sequence = result?;
+    // Phase 2 — one-level unescape.
+    let cooked = crate::lexer::unescape_backtick_body(&raw);
+
+    // Phase 3 — re-parse the cooked body as a command Sequence with a FRESH
+    // lexer.  `in_dquote` is cleared: the body is its own context even inside
+    // `"`...`"`.
+    let mut sub_opts = iter.opts();
+    sub_opts.in_dquote = false;
+    let mut sub = Lexer::new_live_atoms(&cooked, iter.aliases(), sub_opts);
+    let sequence = match parse_sequence(&mut sub)? {
+        Some(mut seq) => {
+            zero_lines_in_sequence(&mut seq);
+            seq
+        }
+        None => empty_sequence(), // `` `` `` — same empty Sequence as before.
+    };
     Ok(WordPart::CommandSub { sequence, quoted })
 }
 
@@ -7088,37 +7023,12 @@ mod tests {
         diff_bt("`echo \\`echo \\\\\\`echo hi\\\\\\`\\``");
     }
 
-    // ── v245 T5 (addendum): pin the bare-backtick-at-D≥2 malformed-input divergence ──
-    //
-    // KNOWN DIVERGENCE [deferred, v245]: the single-pass scan_step_backtick
-    // leniently accepts some malformed inputs that the recursive production oracle
-    // REJECTS at the lex stage.  Well-formed nesting is byte-identical (see
-    // bt_depth2_nesting).  Pinned here so the future Stage-2 live-wiring
-    // reconciles it (make the new path reject too) rather than silently shipping a
-    // parser that accepts what bash rejects.
-    #[test]
-    fn bt_malformed_divergence_deferred() {
-        // KNOWN DIVERGENCE [deferred, v245]: at backtick depth >= 2, a bare ` is
-        // not a valid delimiter (well-formed nesting always escapes deeper
-        // delimiters).  scan_step_backtick leniently consumes it as literal body
-        // content, so the NEW path accepts these MALFORMED inputs while the
-        // recursive production oracle rejects them at the lex stage with
-        // LexError::Substitution(UnterminatedSubstitution).  See the comment at
-        // the bare-`-at-D≥2 branch in scan_step_backtick (lexer.rs) and
-        // bt_depth2_nesting for the byte-identical well-formed proof.
-        for s in [
-            "`\\`x` y\\` z`",   // shell: `\`x` y\` z`  — bare ` inside D=2 body
-            "`\\`a`b\\``",      // shell: `\`a`b\``      — bare ` inside D=2 body
-        ] {
-            // The atom path leniently ACCEPTS these malformed bare-` D≥2 inputs
-            // (the now-deleted oracle rejected them at the lex stage — a documented
-            // divergence, now production behavior).
-            assert!(
-                new_bt(s, false).is_ok(),
-                "atom path accepts malformed {s:?} — update if reconciled",
-            );
-        }
-    }
+    // v274: the former `bt_malformed_divergence_deferred` test was DELETED here.
+    // It pinned the OLD single-pass `scan_step_backtick`'s LENIENT acceptance of
+    // malformed bare-` -at-D≥2 inputs (`\`x` y\` z`, `\`a`b\``).  The v274
+    // three-phase `parse_backtick_sub` (raw capture → unescape → re-parse) now
+    // correctly REJECTS those inputs (exit 2), byte-for-byte matching bash's
+    // rejection — so the old assertion (that the path ACCEPTS them) is obsolete.
 
     #[test]
     fn bt_backslash_run_divergence_deferred() {
