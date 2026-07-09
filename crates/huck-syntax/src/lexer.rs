@@ -5981,6 +5981,27 @@ pub fn line_at_offset(src: &str, off: usize) -> u32 {
     1 + src.as_bytes()[..off.min(src.len())].iter().filter(|&&b| b == b'\n').count() as u32
 }
 
+/// bash's one-level backtick unescape (spec §2 phase 2). Removes the backslash
+/// for exactly `\\`, `\$`, and `` \` ``; every other `\c` (and a trailing lone
+/// `\`) is copied verbatim for the phase-3 re-lex to handle.
+pub(crate) fn unescape_backtick_body(raw: &str) -> String {
+    let b = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() && matches!(b[i + 1], b'\\' | b'$' | b'`') {
+            out.push(b[i + 1] as char); // drop the backslash, keep the escaped byte
+            i += 2;
+        } else {
+            // Copy the next whole UTF-8 char verbatim (may be the lone `\`).
+            let ch = raw[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6057,6 +6078,27 @@ mod tests {
         assert_eq!(line_at_offset(s, 2), 2);   // first 'b'
         assert_eq!(line_at_offset(s, 5), 3);   // first 'c'
         assert_eq!(line_at_offset(s, 999), 3); // clamped
+    }
+
+    #[test]
+    fn unescape_backtick_body_rules() {
+        // The ONLY three de-escape pairs remove the backslash:
+        assert_eq!(unescape_backtick_body(r"\\"), r"\");        // \\ -> \
+        assert_eq!(unescape_backtick_body(r"\$x"), "$x");       // \$ -> $
+        assert_eq!(unescape_backtick_body("\\`"), "`");         // \` -> `
+        // Everything else keeps the backslash verbatim:
+        assert_eq!(unescape_backtick_body(r#"\""#), r#"\""#);   // \" kept
+        assert_eq!(unescape_backtick_body(r"\'"), r"\'");       // \' kept
+        assert_eq!(unescape_backtick_body(r"\n"), r"\n");       // \n kept (literal)
+        assert_eq!(unescape_backtick_body("a\\\nb"), "a\\\nb"); // \<newline> kept
+        // Runs collapse pairwise, left to right (the L-70 case):
+        assert_eq!(unescape_backtick_body(r"\\\X"), r"\\X");    // \\\X -> \\X  (was mis-ordered)
+        assert_eq!(unescape_backtick_body(r"\\\\"), r"\\");     // \\\\ -> \\
+        assert_eq!(unescape_backtick_body(r"\\\\\x"), r"\\\x"); // 5 bslashes -> 3 + x
+        // Trailing lone backslash kept:
+        assert_eq!(unescape_backtick_body("ab\\"), "ab\\");
+        // No backslashes: identity.
+        assert_eq!(unescape_backtick_body("echo hi"), "echo hi");
     }
 
     #[test]
