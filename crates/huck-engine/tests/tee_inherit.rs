@@ -45,7 +45,7 @@ fn run_with_fd_capture(target_fd: i32, script: &str, on_stderr: bool) -> (Vec<St
     let mut lines: Vec<String> = Vec::new();
     let mut e = Engine::new();
     {
-        let builder = e.exec(script);
+        let builder = e.prepare(script);
         let builder = if on_stderr {
             builder.on_stderr_line(|line| lines.push(line.to_string()))
         } else {

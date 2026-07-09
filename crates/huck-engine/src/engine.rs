@@ -17,7 +17,7 @@
 //! assert_eq!(e.var("NAME").as_deref(), Some("world"));
 //!
 //! // For stdin + stderr capture:
-//! let out = e.exec("read x; printf 'got=%s\\n' \"$x\"")
+//! let out = e.prepare("read x; printf 'got=%s\\n' \"$x\"")
 //!     .stdin(b"hello\n".to_vec())
 //!     .capture();
 //! assert_eq!(out.stdout, "got=hello\n");
@@ -25,7 +25,7 @@
 //! // Sandboxed run: tmpdir cwd, restricted mode, 5-second budget.
 //! # let sandbox_dir = std::env::temp_dir();
 //! # let generated_script = "echo hi";
-//! let out = e.exec(generated_script)
+//! let out = e.prepare(generated_script)
 //!     .cwd(sandbox_dir)
 //!     .restricted(true)
 //!     .timeout(std::time::Duration::from_secs(5))
@@ -33,7 +33,7 @@
 //!
 //! // Stream output as the script runs.
 //! let mut lines: Vec<String> = Vec::new();
-//! let exit = e.exec("for i in 1 2 3; do echo $i; done")
+//! let exit = e.prepare("for i in 1 2 3; do echo $i; done")
 //!     .on_stdout_line(|line| lines.push(line.to_string()))
 //!     .run();
 //! assert_eq!(exit, 0);
@@ -117,14 +117,14 @@ impl Engine {
     /// Run a script string, capturing stdout and stderr into separate buffers.
     /// `bash -c` semantics; returns `{ stdout, stderr, exit_code }`.
     pub fn capture(&mut self, src: &str) -> Output {
-        self.exec(src).capture()
+        self.prepare(src).capture()
     }
 
     /// Start an advanced execution chain. Borrows `&mut self` for the chain's
     /// lifetime. See [`ExecBuilder`].
     ///
     /// [`ExecBuilder`]: crate::exec_builder::ExecBuilder
-    pub fn exec(&mut self, src: &str) -> crate::exec_builder::ExecBuilder<'_> {
+    pub fn prepare(&mut self, src: &str) -> crate::exec_builder::ExecBuilder<'_> {
         crate::exec_builder::ExecBuilder::new(self, src.to_string())
     }
 
@@ -221,7 +221,7 @@ impl Engine {
     ) -> i32 {
         // Preserve the shell's current $0 + positionals (don't clobber them).
         let args = self.cell.borrow().positional_args.clone();
-        // stderr always inherits the process here; the public `Engine::exec`
+        // stderr always inherits the process here; the public `Engine::prepare`
         // builder will let callers opt into Capture/Merged later.
         let mut err_sink = StderrSink::Terminal;
         let code = crate::shell::run_program_in_sinks(
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn exec_capture_stdout_and_stderr_separately() {
         let mut e = Engine::new();
-        let out = e.exec("echo hi; echo err >&2").capture();
+        let out = e.prepare("echo hi; echo err >&2").capture();
         assert_eq!(out.stdout, "hi\n");
         assert_eq!(out.stderr, "err\n");
         assert_eq!(out.exit_code, 0);
@@ -445,7 +445,7 @@ mod tests {
     fn exec_merge_stderr_interleaves_into_stdout() {
         let mut e = Engine::new();
         let out = e
-            .exec("echo hi; echo err >&2; echo bye")
+            .prepare("echo hi; echo err >&2; echo bye")
             .merge_stderr()
             .capture();
         assert_eq!(out.stdout, "hi\nerr\nbye\n");
@@ -461,7 +461,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
         let out = e
-            .exec("read x; read y; echo \"$x-$y\"")
+            .prepare("read x; read y; echo \"$x-$y\"")
             .stdin(b"hello\nworld\n".to_vec())
             .capture();
         assert_eq!(out.stdout, "hello-world\n");
@@ -481,7 +481,7 @@ mod tests {
             .collect();
         let mut e = Engine::new();
         let out = e
-            .exec("read line; echo \"len=${#line}\"")
+            .prepare("read line; echo \"len=${#line}\"")
             .stdin(big)
             .capture();
         assert_eq!(out.stdout, "len=5000\n");
@@ -496,7 +496,7 @@ mod tests {
         // Read stdin, echo it, then write a separate stderr message.
         // With merge_stderr, the stderr should fold into the captured stdout.
         let out = e
-            .exec("read x; echo \"got:$x\"; echo err >&2; echo done")
+            .prepare("read x; echo \"got:$x\"; echo err >&2; echo done")
             .stdin(b"hello\n".to_vec())
             .merge_stderr()
             .capture();
@@ -526,8 +526,8 @@ mod tests {
     fn exec_run_inherits_then_exec_capture_works() {
         // Borrow discipline: back-to-back exec chains compile and work.
         let mut e = Engine::new();
-        e.exec("x=set-in-first").run();
-        let out = e.exec("echo \"$x\"").capture();
+        e.prepare("x=set-in-first").run();
+        let out = e.prepare("echo \"$x\"").capture();
         assert_eq!(out.stdout, "set-in-first\n");
     }
 
@@ -546,7 +546,7 @@ mod tests {
         // route_out_to_err: a builtin's `>&2` under stderr capture lands in
         // the separate stderr buffer (not the embedder's terminal).
         let mut e = Engine::new();
-        let out = e.exec("echo out; echo err >&2").capture();
+        let out = e.prepare("echo out; echo err >&2").capture();
         assert_eq!(out.stdout, "out\n");
         assert_eq!(out.stderr, "err\n");
 
@@ -555,7 +555,7 @@ mod tests {
         // output goes to stderr — `declare -p UNSET_NAME` writes the "not
         // found" diagnostic to fd 2.
         let mut e = Engine::new();
-        let out = e.exec("declare -p NOPE_NOT_DEFINED 2>&1").capture();
+        let out = e.prepare("declare -p NOPE_NOT_DEFINED 2>&1").capture();
         assert_eq!(out.stderr, "");
         assert!(
             out.stdout.contains("NOPE_NOT_DEFINED"),
@@ -574,7 +574,7 @@ mod tests {
         // string instead of capturing `cd`'s diagnostic.
         let mut e = Engine::new();
         let out = e
-            .exec(r#"x=$(cd /nonexistent_xyz_engine_test 2>&1); echo "$x""#)
+            .prepare(r#"x=$(cd /nonexistent_xyz_engine_test 2>&1); echo "$x""#)
             .capture();
         assert_eq!(out.stderr, "");
         assert!(
@@ -598,7 +598,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let canonical = std::fs::canonicalize(tmp.path()).unwrap();
         let mut e = Engine::new();
-        let out = e.exec("pwd").cwd(tmp.path()).capture();
+        let out = e.prepare("pwd").cwd(tmp.path()).capture();
         assert_eq!(
             out.stdout.trim(),
             canonical.display().to_string(),
@@ -615,7 +615,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut e = Engine::new();
         e.set_var("PWD", "before");
-        let _ = e.exec("cd /; echo \"in:$PWD\"").cwd(tmp.path()).capture();
+        let _ = e
+            .prepare("cd /; echo \"in:$PWD\"")
+            .cwd(tmp.path())
+            .capture();
         assert_eq!(e.var("PWD").as_deref(), Some("before"));
     }
 
@@ -630,7 +633,7 @@ mod tests {
         // 2) via `eprintln!` — by design, since the cwd guard runs OUTSIDE
         // the executor's sink installation. We assert exit code and stdout
         // here; the diagnostic itself lands on the test runner's stderr.
-        let out = e.exec("echo hi").cwd("/no/such/huck/v206").capture();
+        let out = e.prepare("echo hi").cwd("/no/such/huck/v206").capture();
         assert_eq!(out.stdout, "hi\n");
         assert_eq!(out.exit_code, 0);
     }
@@ -643,7 +646,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
-        let out = e.exec("cd /tmp; echo $PWD").capture();
+        let out = e.prepare("cd /tmp; echo $PWD").capture();
         assert_eq!(out.exit_code, 0, "stderr={:?}", out.stderr);
         let canonical_tmp = std::fs::canonicalize("/tmp")
             .map(|p| p.display().to_string())
@@ -661,7 +664,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
-        let out = e.exec("cd /tmp; echo \"$PWD\"").restricted(true).capture();
+        let out = e
+            .prepare("cd /tmp; echo \"$PWD\"")
+            .restricted(true)
+            .capture();
         assert!(
             out.stderr.contains("restricted: cd"),
             "stderr={:?}",
@@ -674,7 +680,7 @@ mod tests {
     #[test]
     fn restricted_refuses_exec() {
         let mut e = Engine::new();
-        let out = e.exec("exec /bin/true").restricted(true).capture();
+        let out = e.prepare("exec /bin/true").restricted(true).capture();
         assert!(
             out.stderr.contains("restricted: exec"),
             "stderr={:?}",
@@ -685,7 +691,7 @@ mod tests {
     #[test]
     fn restricted_refuses_command_name_with_slash() {
         let mut e = Engine::new();
-        let out = e.exec("/bin/echo hi").restricted(true).capture();
+        let out = e.prepare("/bin/echo hi").restricted(true).capture();
         assert!(
             out.stderr.contains("restricted:"),
             "stderr={:?}",
@@ -697,14 +703,14 @@ mod tests {
     #[test]
     fn restricted_accepts_command_name_without_slash() {
         let mut e = Engine::new();
-        let out = e.exec("true").restricted(true).capture();
+        let out = e.prepare("true").restricted(true).capture();
         assert_eq!(out.exit_code, 0);
     }
 
     #[test]
     fn restricted_refuses_source_with_slash() {
         let mut e = Engine::new();
-        let out = e.exec(". /etc/profile").restricted(true).capture();
+        let out = e.prepare(". /etc/profile").restricted(true).capture();
         assert!(
             out.stderr.contains("restricted: source"),
             "stderr={:?}",
@@ -716,7 +722,7 @@ mod tests {
     fn restricted_refuses_absolute_redirect() {
         let mut e = Engine::new();
         let out = e
-            .exec("echo hi > /tmp/v206-restricted-test")
+            .prepare("echo hi > /tmp/v206-restricted-test")
             .restricted(true)
             .capture();
         assert!(
@@ -736,7 +742,7 @@ mod tests {
     #[test]
     fn restricted_refuses_parent_dir_redirect() {
         let mut e = Engine::new();
-        let out = e.exec("echo hi > ../escape").restricted(true).capture();
+        let out = e.prepare("echo hi > ../escape").restricted(true).capture();
         assert!(
             out.stderr.contains("restricted:"),
             "stderr={:?}",
@@ -747,7 +753,7 @@ mod tests {
     #[test]
     fn restricted_refuses_path_assignment() {
         let mut e = Engine::new();
-        let out = e.exec("PATH=/tmp; echo done").restricted(true).capture();
+        let out = e.prepare("PATH=/tmp; echo done").restricted(true).capture();
         assert!(
             out.stderr.contains("restricted: PATH"),
             "stderr={:?}",
@@ -759,7 +765,7 @@ mod tests {
     fn restricted_refuses_shell_assignment() {
         let mut e = Engine::new();
         let out = e
-            .exec("SHELL=/bin/bash; echo done")
+            .prepare("SHELL=/bin/bash; echo done")
             .restricted(true)
             .capture();
         assert!(
@@ -775,7 +781,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
-        let out = e.exec("set +r; cd /tmp").restricted(true).capture();
+        let out = e.prepare("set +r; cd /tmp").restricted(true).capture();
         assert!(
             out.stderr.contains("restricted: cannot turn off")
                 || out.stderr.contains("restricted:"),
@@ -796,7 +802,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
-        let out = e.exec("f() { cd /tmp; }; f").restricted(true).capture();
+        let out = e.prepare("f() { cd /tmp; }; f").restricted(true).capture();
         assert!(
             out.stderr.contains("restricted: cd"),
             "stderr={:?}",
@@ -810,9 +816,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
-        let _ = e.exec("cd /tmp; pwd").restricted(true).capture();
+        let _ = e.prepare("cd /tmp; pwd").restricted(true).capture();
         // Next call, no restricted: cd works.
-        let out = e.exec("cd /; pwd").capture();
+        let out = e.prepare("cd /; pwd").capture();
         assert_eq!(out.stdout, "/\n", "stderr={:?}", out.stderr);
     }
 
@@ -824,7 +830,7 @@ mod tests {
         let mut e = Engine::new();
         let start = Instant::now();
         let code = e
-            .exec("while true; do :; done")
+            .prepare("while true; do :; done")
             .timeout(Duration::from_millis(100))
             .run();
         let elapsed = start.elapsed();
@@ -839,7 +845,10 @@ mod tests {
     fn exec_timeout_short_script_completes_normally() {
         use std::time::Duration;
         let mut e = Engine::new();
-        let out = e.exec("echo hi").timeout(Duration::from_secs(5)).capture();
+        let out = e
+            .prepare("echo hi")
+            .timeout(Duration::from_secs(5))
+            .capture();
         assert_eq!(out.exit_code, 0);
         assert_eq!(out.stdout, "hi\n");
     }
@@ -850,7 +859,7 @@ mod tests {
         let mut e = Engine::new();
         let start = Instant::now();
         let code = e
-            .exec("/bin/sleep 5")
+            .prepare("/bin/sleep 5")
             .timeout(Duration::from_millis(100))
             .run();
         let elapsed = start.elapsed();
@@ -867,7 +876,7 @@ mod tests {
         let mut e = Engine::new();
         // Long sleep then `exit 0` — the timeout fires first.
         let code = e
-            .exec("/bin/sleep 5; exit 0")
+            .prepare("/bin/sleep 5; exit 0")
             .timeout(Duration::from_millis(100))
             .run();
         assert_eq!(code, 124);
@@ -877,7 +886,7 @@ mod tests {
     fn exec_timeout_zero_returns_124() {
         use std::time::Duration;
         let mut e = Engine::new();
-        let out = e.exec("echo hi").timeout(Duration::ZERO).capture();
+        let out = e.prepare("echo hi").timeout(Duration::ZERO).capture();
         assert_eq!(out.exit_code, 124);
     }
 
@@ -895,7 +904,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut e = Engine::new();
         let out = e
-            .exec("read x; echo \"got:$x\"")
+            .prepare("read x; echo \"got:$x\"")
             .cwd(tmp.path())
             .restricted(true)
             .timeout(Duration::from_secs(2))
@@ -914,7 +923,7 @@ mod tests {
         let mut e = Engine::new();
         // `pwd` works inside restricted; `cd` doesn't.
         let out = e
-            .exec("pwd; cd /")
+            .prepare("pwd; cd /")
             .cwd(tmp.path())
             .restricted(true)
             .capture();
@@ -950,7 +959,7 @@ mod tests {
         // that never produces EOF; our with_stdin_fd0 helper writes finite
         // bytes and closes. Use sleep as a stand-in for "stuck after read".)
         let code = e
-            .exec("read x; /bin/sleep 5; echo \"$x\"")
+            .prepare("read x; /bin/sleep 5; echo \"$x\"")
             .stdin(b"data\n".to_vec())
             .timeout(Duration::from_millis(100))
             .run();
@@ -962,7 +971,7 @@ mod tests {
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
         let out = e
-            .exec("echo a; echo b; echo c")
+            .prepare("echo a; echo b; echo c")
             .on_stdout_line(|line| lines.push(line.to_string()))
             .capture();
         assert_eq!(out.exit_code, 0);
@@ -973,7 +982,7 @@ mod tests {
     fn on_stdout_line_empty_line() {
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
-        e.exec("echo \"\"")
+        e.prepare("echo \"\"")
             .on_stdout_line(|line| lines.push(line.to_string()))
             .capture();
         assert_eq!(lines, vec![""]);
@@ -983,7 +992,7 @@ mod tests {
     fn on_stdout_line_partial_at_eof() {
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
-        e.exec("printf 'no-newline'")
+        e.prepare("printf 'no-newline'")
             .on_stdout_line(|line| lines.push(line.to_string()))
             .capture();
         assert_eq!(lines, vec!["no-newline"]);
@@ -998,7 +1007,7 @@ mod tests {
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
         let out = e
-            .exec("echo a; echo b")
+            .prepare("echo a; echo b")
             .on_stdout_line(|line| lines.push(line.to_string()))
             .capture();
         // Tee: BOTH the buffer AND the callback have the lines.
@@ -1028,7 +1037,7 @@ mod tests {
         let mut timestamps: Vec<Instant> = Vec::new();
         let mut e = Engine::new();
         let _ = e
-            .exec("/bin/sh -c 'echo first; sleep 0.1; echo second'")
+            .prepare("/bin/sh -c 'echo first; sleep 0.1; echo second'")
             .on_stdout_line(|_line| timestamps.push(Instant::now()))
             .capture();
         assert_eq!(timestamps.len(), 2);
@@ -1050,7 +1059,7 @@ mod tests {
         let mut e = Engine::new();
         let f = flag.clone();
         let _ = e
-            .exec("/bin/sh -c 'echo early; sleep 0.5'")
+            .prepare("/bin/sh -c 'echo early; sleep 0.5'")
             .on_stdout_line(move |_| f.store(true, Ordering::Relaxed))
             .capture();
         assert!(flag.load(Ordering::Relaxed));
@@ -1060,7 +1069,7 @@ mod tests {
     fn on_stdout_line_pipeline_last_stage() {
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
-        e.exec("echo hi | tr a-z A-Z")
+        e.prepare("echo hi | tr a-z A-Z")
             .on_stdout_line(|line| lines.push(line.to_string()))
             .capture();
         assert_eq!(lines, vec!["HI"]);
@@ -1083,7 +1092,7 @@ mod tests {
     fn on_stdout_line_run_no_callback_no_pipe() {
         // Sanity: no callback under run() takes the fast path.
         let mut e = Engine::new();
-        let code = e.exec("true").run();
+        let code = e.prepare("true").run();
         assert_eq!(code, 0);
     }
 
@@ -1091,7 +1100,7 @@ mod tests {
     fn on_stdout_line_external_long_line() {
         let mut got_len: usize = 0;
         let mut e = Engine::new();
-        e.exec("/bin/sh -c 'head -c 100000 < /dev/zero | tr \\\\0 a; echo'")
+        e.prepare("/bin/sh -c 'head -c 100000 < /dev/zero | tr \\\\0 a; echo'")
             .on_stdout_line(|line| got_len = line.len())
             .capture();
         assert!(got_len >= 50_000, "expected long line, got {got_len}");
@@ -1107,7 +1116,7 @@ mod tests {
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
         let _ = e
-            .exec("read x; echo \"got:$x\"")
+            .prepare("read x; echo \"got:$x\"")
             .stdin(b"hi\n".to_vec())
             .on_stdout_line(|line| lines.push(line.to_string()))
             .capture();
@@ -1123,7 +1132,7 @@ mod tests {
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
         let _ = e
-            .exec("pwd")
+            .prepare("pwd")
             .cwd(tmp.path())
             .on_stdout_line(|line| lines.push(line.to_string()))
             .capture();
@@ -1136,7 +1145,7 @@ mod tests {
         let mut err_lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
         let _ = e
-            .exec("cd /tmp")
+            .prepare("cd /tmp")
             .restricted(true)
             .on_stderr_line(|line| err_lines.push(line.to_string()))
             .capture();
@@ -1149,7 +1158,7 @@ mod tests {
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
         let code = e
-            .exec("/bin/sh -c 'echo before; sleep 5'")
+            .prepare("/bin/sh -c 'echo before; sleep 5'")
             .timeout(Duration::from_millis(200))
             .on_stdout_line(|line| lines.push(line.to_string()))
             .capture()
@@ -1171,7 +1180,7 @@ mod tests {
         let mut out_lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
         let out = e
-            .exec("read x; echo \"got:$x\"")
+            .prepare("read x; echo \"got:$x\"")
             .cwd(tmp.path())
             .restricted(true)
             .timeout(Duration::from_secs(2))
@@ -1188,7 +1197,7 @@ mod tests {
     fn callback_panic_propagates_and_engine_recovers() {
         let mut e = Engine::new();
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            e.exec("echo a; echo b; echo c")
+            e.prepare("echo a; echo b; echo c")
                 .on_stdout_line(|line| {
                     if line == "b" {
                         panic!("test panic");
@@ -1208,7 +1217,7 @@ mod tests {
         let mut e = Engine::new();
         let start = Instant::now();
         let _ = e
-            .exec("for i in $(seq 1 20); do echo $i; done")
+            .prepare("for i in $(seq 1 20); do echo $i; done")
             .on_stdout_line(|_| std::thread::sleep(Duration::from_millis(20)))
             .capture();
         let elapsed = start.elapsed();

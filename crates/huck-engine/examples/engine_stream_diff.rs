@@ -19,13 +19,13 @@ fn main() {
     let mut e = Engine::new();
     let (stdout_bytes, exit_code) = match mode.as_str() {
         "cap" => {
-            let out = e.exec(&fragment).capture();
+            let out = e.prepare(&fragment).capture();
             (out.stdout.into_bytes(), out.exit_code)
         }
         "stream" => {
             let mut acc = String::new();
             let out = e
-                .exec(&fragment)
+                .prepare(&fragment)
                 .on_stdout_line(|line| {
                     acc.push_str(line);
                     acc.push('\n');

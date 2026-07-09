@@ -34,13 +34,13 @@ const engineExecExample = `use std::time::Duration;
 
 // Stream each line as the script runs...
 let mut lines: Vec<String> = Vec::new();
-let exit = e.exec("for i in 1 2 3; do echo $i; done")
+let exit = e.prepare("for i in 1 2 3; do echo $i; done")
     .on_stdout_line(|line| lines.push(line.to_string()))
     .run();
 assert_eq!(lines, vec!["1", "2", "3"]);
 
 // ...or run it sandboxed: a scratch cwd, restricted mode, a time budget.
-let out = e.exec(untrusted_script)
+let out = e.prepare(untrusted_script)
     .cwd(scratch_dir)
     .restricted(true)
     .timeout(Duration::from_secs(5))
@@ -112,7 +112,7 @@ export default function LibraryPage() {
         </p>
         <CodeBlock code={engineRunExample} lang="rust" />
         <p>
-          For finer control, <code>Engine::exec</code> returns an{" "}
+          For finer control, <code>Engine::prepare</code> returns an{" "}
           <code>ExecBuilder</code>: feed it stdin, redirect the working
           directory, stream each output line to a callback as it&apos;s written,
           run under <code>restricted</code> mode, or cap execution with a{" "}
