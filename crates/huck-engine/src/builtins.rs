@@ -2722,6 +2722,8 @@ fn builtin_read(
     let mut array_name: Option<String> = None;
     // `-u FD`: read from this file descriptor instead of stdin. `None` = stdin.
     let mut read_fd: Option<std::os::unix::io::RawFd> = None;
+    let mut max_chars: Option<usize> = None;
+    let mut nchars_active_delim = true;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -2782,6 +2784,21 @@ fn builtin_read(
                         Ok(fd) if fd >= 0 => read_fd = Some(fd),
                         _ => {
                             crate::sh_error_to!(shell, err, None, "read: {v}: invalid file descriptor specification");
+                            return ExecOutcome::Continue(1);
+                        }
+                    }
+                    break;
+                }
+                b'n' | b'N' => {
+                    let upper = bytes[j] == b'N';
+                    let v = match take_opt_value(args, &mut i, bytes, j, "read", bytes[j] as char, err, shell) {
+                        Ok(v) => v,
+                        Err(rc) => return ExecOutcome::Continue(rc),
+                    };
+                    match v.trim().parse::<usize>() {
+                        Ok(k) => { max_chars = Some(k); nchars_active_delim = !upper; }
+                        Err(_) => {
+                            crate::sh_error_to!(shell, err, None, "read: {v}: invalid number");
                             return ExecOutcome::Continue(1);
                         }
                     }
@@ -2853,7 +2870,7 @@ fn builtin_read(
         None => RawFdReader::new(),
     };
     let poll_fd = Some(handle.raw_fd());
-    let cfg = ReadCfg { raw, delim, delim_active: true, max_chars: None, deadline: None };
+    let cfg = ReadCfg { raw, delim, delim_active: nchars_active_delim, max_chars, deadline: None };
     let (line, stop, _any_read) = match read_record(&mut handle, &cfg, poll_fd) {
         Ok(t) => t,
         Err(e) => {
