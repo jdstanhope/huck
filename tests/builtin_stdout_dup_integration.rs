@@ -32,7 +32,11 @@ fn run_huck_frag(frag: &str) -> (String, String, i32) {
 #[test]
 fn echo_to_stderr_not_captured_on_stdout() {
     let (out, _err, _c) = run_huck_frag(r#"a=$(echo Z >&2); echo "[$a]""#);
-    assert_eq!(out.trim_end(), "[]", "stdout capture must be empty, got {out:?}");
+    assert_eq!(
+        out.trim_end(),
+        "[]",
+        "stdout capture must be empty, got {out:?}"
+    );
 }
 
 #[test]
@@ -44,7 +48,10 @@ fn printf_to_stderr_not_captured() {
 #[test]
 fn echo_redirect_to_2_reaches_stderr() {
     let (_o, err, _c) = run_huck_frag(r#"echo HELLO >&2"#);
-    assert!(err.contains("HELLO"), "stderr must contain HELLO, got {err:?}");
+    assert!(
+        err.contains("HELLO"),
+        "stderr must contain HELLO, got {err:?}"
+    );
 }
 
 #[test]
@@ -55,8 +62,7 @@ fn echo_ampersand1_still_stdout() {
 
 #[test]
 fn func_err_to_stderr_suppressed_by_caller_redirect() {
-    let (out, _e, _c) = run_huck_frag(
-        r#"f() { >&2 printf '%s\n' MSG; }; a=$( (f 2>/dev/null) ); echo "[$a]""#,
-    );
+    let (out, _e, _c) =
+        run_huck_frag(r#"f() { >&2 printf '%s\n' MSG; }; a=$( (f 2>/dev/null) ); echo "[$a]""#);
     assert_eq!(out.trim_end(), "[]", "{out:?}");
 }

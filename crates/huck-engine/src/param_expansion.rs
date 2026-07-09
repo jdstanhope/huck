@@ -11,7 +11,9 @@ pub enum ExpansionResult {
     /// surrounding simple command and (in non-interactive mode) exit
     /// the shell. The message has already been printed by the arm that
     /// produced this; `status` is the exit code.
-    Fatal { status: i32 },
+    Fatal {
+        status: i32,
+    },
     /// Word-list result for array-aware forms (`${a[@]}`, `${!a[@]}`,
     /// `${a[@]:o:l}`, and `${@:o:l}` / `${*:o:l}`). Consumers in the
     /// expansion pipeline decide how to materialise this: in a quoted
@@ -31,11 +33,7 @@ pub enum ExpansionResult {
 /// callers route through `expand_modifier_quoted` to pass the real outer
 /// quoting (M-110).
 #[allow(dead_code)]
-pub fn expand_modifier(
-    name: &str,
-    modifier: &ParamModifier,
-    shell: &mut Shell,
-) -> ExpansionResult {
+pub fn expand_modifier(name: &str, modifier: &ParamModifier, shell: &mut Shell) -> ExpansionResult {
     expand_modifier_with_value(name, modifier, ParamLookup::Scalar, false, shell)
 }
 
@@ -98,7 +96,10 @@ pub fn expand_modifier_with_value(
         if sh.positional_args.is_empty() {
             None
         } else {
-            Some(sh.positional_args.join(&crate::expand::ifs_join_sep(&sh.ifs())))
+            Some(
+                sh.positional_args
+                    .join(&crate::expand::ifs_join_sep(&sh.ifs())),
+            )
         }
     };
     let is_star_at = matches!(source, ParamLookup::Scalar) && (name == "*" || name == "@");
@@ -122,9 +123,7 @@ pub fn expand_modifier_with_value(
         }
     };
     match modifier {
-        ParamModifier::None => {
-            ExpansionResult::Value(get_raw(shell).unwrap_or_default())
-        }
+        ParamModifier::None => ExpansionResult::Value(get_raw(shell).unwrap_or_default()),
         ParamModifier::Length => {
             let n = match (source, name) {
                 (ParamLookup::Scalar, "@") | (ParamLookup::Scalar, "*") => {
@@ -169,8 +168,7 @@ pub fn expand_modifier_with_value(
                 // path). The caller (`expand_array_param`) handles
                 // any element-write semantics; here we just return the
                 // default value. For the scalar path behave as before.
-                if matches!(source, ParamLookup::Scalar)
-                    && shell.try_set(name, v.clone()).is_err()
+                if matches!(source, ParamLookup::Scalar) && shell.try_set(name, v.clone()).is_err()
                 {
                     crate::sh_error!(shell, None, "{name}: readonly variable");
                     return ExpansionResult::Fatal { status: 1 };
@@ -224,7 +222,12 @@ pub fn expand_modifier_with_value(
             let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
             ExpansionResult::Value(remove_suffix(&v, &p, *longest, extglob))
         }
-        ParamModifier::Substitute { pattern, replacement, anchor, all } => {
+        ParamModifier::Substitute {
+            pattern,
+            replacement,
+            anchor,
+            all,
+        } => {
             let v = get_raw(shell).unwrap_or_default();
             // The PATTERN respects quoting (quoted glob = literal); the
             // REPLACEMENT is a plain word (no pattern semantics).
@@ -254,13 +257,25 @@ pub fn expand_modifier_with_value(
                 }
             }
         }
-        ParamModifier::Case { direction, all, pattern } => {
+        ParamModifier::Case {
+            direction,
+            all,
+            pattern,
+        } => {
             let v = lookup_v(shell);
             // The case-modification pattern respects quoting (quoted glob =
             // literal), like the remove/substitute patterns above.
-            let pat_string = pattern.as_ref().map(|w| crate::expand::expand_pattern(w, shell));
+            let pat_string = pattern
+                .as_ref()
+                .map(|w| crate::expand::expand_pattern(w, shell));
             let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
-            ExpansionResult::Value(case_modify(&v, *direction, *all, pat_string.as_deref(), extglob))
+            ExpansionResult::Value(case_modify(
+                &v,
+                *direction,
+                *all,
+                pat_string.as_deref(),
+                extglob,
+            ))
         }
         ParamModifier::Transform { op } => {
             let v = lookup_v(shell);
@@ -284,26 +299,18 @@ pub fn expand_modifier_with_value(
                     None => String::new(),
                     Some(val) => shell_quote(&val),
                 },
-                crate::lexer::TransformOp::EscapeExpand => {
-                    crate::lexer::decode_ansi_c_escapes(&v)
-                }
-                crate::lexer::TransformOp::PromptExpand => {
-                    crate::prompt::expand_prompt(&v, shell)
-                }
-                crate::lexer::TransformOp::AssignDecl => {
-                    crate::array_transforms::assign_decl(
-                        name,
-                        crate::array_transforms::ScopeMode::ScalarOrElement(v.clone()),
-                        shell,
-                    )
-                }
-                crate::lexer::TransformOp::KvString => {
-                    crate::array_transforms::kv_string(
-                        name,
-                        crate::array_transforms::ScopeMode::ScalarOrElement(v.clone()),
-                        shell,
-                    )
-                }
+                crate::lexer::TransformOp::EscapeExpand => crate::lexer::decode_ansi_c_escapes(&v),
+                crate::lexer::TransformOp::PromptExpand => crate::prompt::expand_prompt(&v, shell),
+                crate::lexer::TransformOp::AssignDecl => crate::array_transforms::assign_decl(
+                    name,
+                    crate::array_transforms::ScopeMode::ScalarOrElement(v.clone()),
+                    shell,
+                ),
+                crate::lexer::TransformOp::KvString => crate::array_transforms::kv_string(
+                    name,
+                    crate::array_transforms::ScopeMode::ScalarOrElement(v.clone()),
+                    shell,
+                ),
                 crate::lexer::TransformOp::KvWords => {
                     // Scalar/element form returns a single-word Vec
                     // (since there's no [@] under scalar dispatch).
@@ -396,8 +403,8 @@ pub(crate) fn contains_shell_metas(s: &str) -> bool {
     let chars: Vec<char> = s.chars().collect();
     for (i, &c) in chars.iter().enumerate() {
         match c {
-            ' ' | '\t' | '\n' | '\'' | '"' | '\\' | '|' | '&' | ';' | '(' | ')'
-            | '<' | '>' | '!' | '{' | '}' | '*' | '[' | '?' | ']' | '^' | '$' | '`' => {
+            ' ' | '\t' | '\n' | '\'' | '"' | '\\' | '|' | '&' | ';' | '(' | ')' | '<' | '>'
+            | '!' | '{' | '}' | '*' | '[' | '?' | ']' | '^' | '$' | '`' => {
                 return true;
             }
             '~' if i == 0 || chars[i - 1] == '=' || chars[i - 1] == ':' => {
@@ -575,7 +582,9 @@ fn substitute(
         // `boundaries` is ascending, so iter().rev() yields descending —
         // once we drop below `start`, every remaining entry is also below.
         for &end in boundaries.iter().rev() {
-            if end < start { break; }
+            if end < start {
+                break;
+            }
             if pe_pattern_matches(pattern, &value[start..end], extglob, true) {
                 return Some(end);
             }
@@ -630,7 +639,11 @@ fn substitute(
                     if end == start {
                         // Empty match mid-string: advance one char so we
                         // don't re-enter at the same position.
-                        let next = boundaries.iter().copied().find(|&b| b > start).unwrap_or(value.len());
+                        let next = boundaries
+                            .iter()
+                            .copied()
+                            .find(|&b| b > start)
+                            .unwrap_or(value.len());
                         out.push_str(&value[start..next]);
                         cursor = next;
                         bi += 1;
@@ -670,9 +683,9 @@ fn case_modify(
     // Validate the pattern, if any. On a glob compile failure that is not a
     // valid extglob pattern, return value unchanged (matches v32 substitute's
     // silent-no-op convention).
-    if pattern
-        .is_some_and(|p| glob::Pattern::new(p).is_err() && !(extglob && crate::glob_match::has_extglob(p)))
-    {
+    if pattern.is_some_and(|p| {
+        glob::Pattern::new(p).is_err() && !(extglob && crate::glob_match::has_extglob(p))
+    }) {
         return value.to_string();
     }
 
@@ -805,11 +818,20 @@ mod tests {
         // is the IFS-joined positionals.
         let mut shell = Shell::new();
         shell.positional_args = vec!["a".to_string(), "b".to_string()];
-        let m = ParamModifier::UseDefault { word: lit("x"), colon: false };
-        assert_eq!(expand_modifier("*", &m, &mut shell), ExpansionResult::Value("a b".to_string()));
+        let m = ParamModifier::UseDefault {
+            word: lit("x"),
+            colon: false,
+        };
+        assert_eq!(
+            expand_modifier("*", &m, &mut shell),
+            ExpansionResult::Value("a b".to_string())
+        );
         // A single EMPTY positional still counts as set ($#==1) → no default.
         shell.positional_args = vec!["".to_string()];
-        assert_eq!(expand_modifier("*", &m, &mut shell), ExpansionResult::Value(String::new()));
+        assert_eq!(
+            expand_modifier("*", &m, &mut shell),
+            ExpansionResult::Value(String::new())
+        );
     }
 
     #[test]
@@ -817,7 +839,10 @@ mod tests {
         // `${*-x}` with NO positionals: `$*` is unset ($#==0) → default.
         let mut shell = Shell::new();
         shell.positional_args = vec![];
-        let m = ParamModifier::UseDefault { word: lit("x"), colon: false };
+        let m = ParamModifier::UseDefault {
+            word: lit("x"),
+            colon: false,
+        };
         assert_eq!(expand_modifier("*", &m, &mut shell), fields("x"));
     }
 
@@ -828,7 +853,10 @@ mod tests {
         for name in ["*", "@"] {
             let mut shell = Shell::new();
             shell.positional_args = vec![];
-            let m = ParamModifier::AssignDefault { word: lit("x"), colon: false };
+            let m = ParamModifier::AssignDefault {
+                word: lit("x"),
+                colon: false,
+            };
             assert_eq!(
                 expand_modifier(name, &m, &mut shell),
                 ExpansionResult::Fatal { status: 1 },
@@ -837,8 +865,14 @@ mod tests {
         // With positionals present, `$*` is set → no assign, no error.
         let mut shell = Shell::new();
         shell.positional_args = vec!["a".to_string(), "b".to_string()];
-        let m = ParamModifier::AssignDefault { word: lit("x"), colon: false };
-        assert_eq!(expand_modifier("*", &m, &mut shell), ExpansionResult::Value("a b".to_string()));
+        let m = ParamModifier::AssignDefault {
+            word: lit("x"),
+            colon: false,
+        };
+        assert_eq!(
+            expand_modifier("*", &m, &mut shell),
+            ExpansionResult::Value("a b".to_string())
+        );
     }
 
     #[test]
@@ -872,7 +906,10 @@ mod tests {
     use crate::lexer::{Word, WordPart};
 
     fn lit(s: &str) -> Word {
-        Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
+        Word(vec![WordPart::Literal {
+            text: s.to_string(),
+            quoted: false,
+        }])
     }
 
     /// Expected `Fields` result for a single unquoted literal word `s`
@@ -887,7 +924,10 @@ mod tests {
     #[test]
     fn use_default_colon_unset_uses_default() {
         let mut shell = Shell::new();
-        let m = ParamModifier::UseDefault { word: lit("default"), colon: true };
+        let m = ParamModifier::UseDefault {
+            word: lit("default"),
+            colon: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_UD1", &m, &mut shell);
         assert_eq!(r, fields("default"));
     }
@@ -896,7 +936,10 @@ mod tests {
     fn use_default_colon_empty_uses_default() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_UD2", "".to_string());
-        let m = ParamModifier::UseDefault { word: lit("default"), colon: true };
+        let m = ParamModifier::UseDefault {
+            word: lit("default"),
+            colon: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_UD2", &m, &mut shell);
         assert_eq!(r, fields("default"));
     }
@@ -905,7 +948,10 @@ mod tests {
     fn use_default_no_colon_empty_returns_empty_value_not_default() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_UD3", "".to_string());
-        let m = ParamModifier::UseDefault { word: lit("default"), colon: false };
+        let m = ParamModifier::UseDefault {
+            word: lit("default"),
+            colon: false,
+        };
         let r = expand_modifier("HUCK_TEST_PE_UD3", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("".to_string()));
     }
@@ -914,7 +960,10 @@ mod tests {
     fn use_default_set_nonempty_returns_value() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_UD4", "actual".to_string());
-        let m = ParamModifier::UseDefault { word: lit("default"), colon: true };
+        let m = ParamModifier::UseDefault {
+            word: lit("default"),
+            colon: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_UD4", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("actual".to_string()));
     }
@@ -922,7 +971,10 @@ mod tests {
     #[test]
     fn assign_default_colon_unset_mutates_shell() {
         let mut shell = Shell::new();
-        let m = ParamModifier::AssignDefault { word: lit("set!"), colon: true };
+        let m = ParamModifier::AssignDefault {
+            word: lit("set!"),
+            colon: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_AD1", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("set!".to_string()));
         assert_eq!(shell.get("HUCK_TEST_PE_AD1"), Some("set!"));
@@ -932,7 +984,10 @@ mod tests {
     fn assign_default_already_set_does_not_mutate() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_AD2", "keep".to_string());
-        let m = ParamModifier::AssignDefault { word: lit("override"), colon: true };
+        let m = ParamModifier::AssignDefault {
+            word: lit("override"),
+            colon: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_AD2", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("keep".to_string()));
         assert_eq!(shell.get("HUCK_TEST_PE_AD2"), Some("keep"));
@@ -941,7 +996,10 @@ mod tests {
     #[test]
     fn error_if_unset_colon_null_returns_empty_and_sets_status() {
         let mut shell = Shell::new();
-        let m = ParamModifier::ErrorIfUnset { word: lit("msg"), colon: true };
+        let m = ParamModifier::ErrorIfUnset {
+            word: lit("msg"),
+            colon: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_EU1", &m, &mut shell);
         // v34: ErrorIfUnset now returns Fatal instead of Empty + $?=1.
         assert_eq!(r, ExpansionResult::Fatal { status: 1 });
@@ -951,7 +1009,10 @@ mod tests {
     fn error_if_unset_set_returns_value_no_status_change() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_EU2", "ok".to_string());
-        let m = ParamModifier::ErrorIfUnset { word: lit("msg"), colon: true };
+        let m = ParamModifier::ErrorIfUnset {
+            word: lit("msg"),
+            colon: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_EU2", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("ok".to_string()));
         assert_eq!(shell.last_status(), 0);
@@ -961,7 +1022,10 @@ mod tests {
     fn error_if_unset_empty_operand_uses_default_message() {
         // ${X:?} with no operand word — should still error and set status.
         let mut shell = Shell::new();
-        let m = ParamModifier::ErrorIfUnset { word: Word(vec![]), colon: true };
+        let m = ParamModifier::ErrorIfUnset {
+            word: Word(vec![]),
+            colon: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_EU_EMPTY", &m, &mut shell);
         // v34: ErrorIfUnset now returns Fatal instead of Empty + $?=1.
         assert_eq!(r, ExpansionResult::Fatal { status: 1 });
@@ -971,7 +1035,10 @@ mod tests {
     fn use_alternate_set_returns_alternate() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_UA1", "anything".to_string());
-        let m = ParamModifier::UseAlternate { word: lit("alt"), colon: true };
+        let m = ParamModifier::UseAlternate {
+            word: lit("alt"),
+            colon: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_UA1", &m, &mut shell);
         assert_eq!(r, fields("alt"));
     }
@@ -979,7 +1046,10 @@ mod tests {
     #[test]
     fn use_alternate_unset_returns_empty() {
         let mut shell = Shell::new();
-        let m = ParamModifier::UseAlternate { word: lit("alt"), colon: true };
+        let m = ParamModifier::UseAlternate {
+            word: lit("alt"),
+            colon: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_UA2", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Empty);
     }
@@ -988,7 +1058,10 @@ mod tests {
     fn use_alternate_colon_empty_returns_empty() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_UA3", "".to_string());
-        let m = ParamModifier::UseAlternate { word: lit("alt"), colon: true };
+        let m = ParamModifier::UseAlternate {
+            word: lit("alt"),
+            colon: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_UA3", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Empty);
     }
@@ -997,7 +1070,10 @@ mod tests {
     fn use_alternate_no_colon_empty_returns_alternate() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_UA4", "".to_string());
-        let m = ParamModifier::UseAlternate { word: lit("alt"), colon: false };
+        let m = ParamModifier::UseAlternate {
+            word: lit("alt"),
+            colon: false,
+        };
         let r = expand_modifier("HUCK_TEST_PE_UA4", &m, &mut shell);
         assert_eq!(r, fields("alt"));
     }
@@ -1006,16 +1082,25 @@ mod tests {
     fn use_alternate_unquoted_returns_fields() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_M110_A", "set".to_string());
-        let m = ParamModifier::UseAlternate { word: lit("alt"), colon: false };
+        let m = ParamModifier::UseAlternate {
+            word: lit("alt"),
+            colon: false,
+        };
         // quoted=false (the 3-arg wrapper) → Fields.
-        assert_eq!(expand_modifier("HUCK_M110_A", &m, &mut shell), fields("alt"));
+        assert_eq!(
+            expand_modifier("HUCK_M110_A", &m, &mut shell),
+            fields("alt")
+        );
     }
 
     #[test]
     fn use_alternate_quoted_returns_value() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_M110_B", "set".to_string());
-        let m = ParamModifier::UseAlternate { word: lit("alt"), colon: false };
+        let m = ParamModifier::UseAlternate {
+            word: lit("alt"),
+            colon: false,
+        };
         // quoted=true → the old Value path (no split).
         assert_eq!(
             expand_modifier_quoted("HUCK_M110_B", &m, true, &mut shell),
@@ -1025,12 +1110,18 @@ mod tests {
 
     #[test]
     fn remove_prefix_shortest_match() {
-        assert_eq!(remove_prefix("/path/to/file.txt", "*/", false, false), "path/to/file.txt");
+        assert_eq!(
+            remove_prefix("/path/to/file.txt", "*/", false, false),
+            "path/to/file.txt"
+        );
     }
 
     #[test]
     fn remove_prefix_longest_match() {
-        assert_eq!(remove_prefix("/path/to/file.txt", "*/", true, false), "file.txt");
+        assert_eq!(
+            remove_prefix("/path/to/file.txt", "*/", true, false),
+            "file.txt"
+        );
     }
 
     #[test]
@@ -1052,7 +1143,10 @@ mod tests {
 
     #[test]
     fn remove_prefix_literal_match() {
-        assert_eq!(remove_prefix("hello world", "hello ", false, false), "world");
+        assert_eq!(
+            remove_prefix("hello world", "hello ", false, false),
+            "world"
+        );
     }
 
     #[test]
@@ -1085,7 +1179,10 @@ mod tests {
     fn expand_modifier_remove_prefix_shortest() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_RP1", "/path/to/file.txt".to_string());
-        let m = ParamModifier::RemovePrefix { pattern: lit("*/"), longest: false };
+        let m = ParamModifier::RemovePrefix {
+            pattern: lit("*/"),
+            longest: false,
+        };
         let r = expand_modifier("HUCK_TEST_PE_RP1", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("path/to/file.txt".to_string()));
     }
@@ -1094,7 +1191,10 @@ mod tests {
     fn expand_modifier_remove_prefix_longest() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_RP2", "/path/to/file.txt".to_string());
-        let m = ParamModifier::RemovePrefix { pattern: lit("*/"), longest: true };
+        let m = ParamModifier::RemovePrefix {
+            pattern: lit("*/"),
+            longest: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_RP2", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("file.txt".to_string()));
     }
@@ -1103,7 +1203,10 @@ mod tests {
     fn expand_modifier_remove_suffix_longest() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_RS1", "file.tar.gz".to_string());
-        let m = ParamModifier::RemoveSuffix { pattern: lit(".*"), longest: true };
+        let m = ParamModifier::RemoveSuffix {
+            pattern: lit(".*"),
+            longest: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_RS1", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("file".to_string()));
     }
@@ -1111,88 +1214,139 @@ mod tests {
     #[test]
     fn expand_modifier_remove_prefix_unset_returns_empty() {
         let mut shell = Shell::new();
-        let m = ParamModifier::RemovePrefix { pattern: lit("*"), longest: true };
+        let m = ParamModifier::RemovePrefix {
+            pattern: lit("*"),
+            longest: true,
+        };
         let r = expand_modifier("HUCK_TEST_PE_UNSET_RP", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("".to_string()));
     }
 
     #[test]
     fn substitute_first_match_unanchored() {
-        assert_eq!(substitute("foobar", "o", "X", SubstAnchor::None, false, false), "fXobar");
+        assert_eq!(
+            substitute("foobar", "o", "X", SubstAnchor::None, false, false),
+            "fXobar"
+        );
     }
 
     #[test]
     fn substitute_all_unanchored() {
-        assert_eq!(substitute("foobar", "o", "X", SubstAnchor::None, true, false), "fXXbar");
+        assert_eq!(
+            substitute("foobar", "o", "X", SubstAnchor::None, true, false),
+            "fXXbar"
+        );
     }
 
     #[test]
     fn substitute_first_unanchored_no_match_returns_value() {
-        assert_eq!(substitute("foobar", "z", "X", SubstAnchor::None, false, false), "foobar");
+        assert_eq!(
+            substitute("foobar", "z", "X", SubstAnchor::None, false, false),
+            "foobar"
+        );
     }
 
     #[test]
     fn substitute_all_with_empty_replacement_removes() {
-        assert_eq!(substitute("aaa", "a", "", SubstAnchor::None, true, false), "");
+        assert_eq!(
+            substitute("aaa", "a", "", SubstAnchor::None, true, false),
+            ""
+        );
     }
 
     #[test]
     fn substitute_anchored_prefix_hit() {
-        assert_eq!(substitute("hello", "he", "HI", SubstAnchor::Prefix, false, false), "HIllo");
+        assert_eq!(
+            substitute("hello", "he", "HI", SubstAnchor::Prefix, false, false),
+            "HIllo"
+        );
     }
 
     #[test]
     fn substitute_anchored_prefix_miss() {
-        assert_eq!(substitute("hello", "xo", "HI", SubstAnchor::Prefix, false, false), "hello");
+        assert_eq!(
+            substitute("hello", "xo", "HI", SubstAnchor::Prefix, false, false),
+            "hello"
+        );
     }
 
     #[test]
     fn substitute_anchored_suffix_hit() {
-        assert_eq!(substitute("hello", "lo", "LO", SubstAnchor::Suffix, false, false), "helLO");
+        assert_eq!(
+            substitute("hello", "lo", "LO", SubstAnchor::Suffix, false, false),
+            "helLO"
+        );
     }
 
     #[test]
     fn substitute_anchored_suffix_miss() {
-        assert_eq!(substitute("hello", "xo", "LO", SubstAnchor::Suffix, false, false), "hello");
+        assert_eq!(
+            substitute("hello", "xo", "LO", SubstAnchor::Suffix, false, false),
+            "hello"
+        );
     }
 
     #[test]
     fn substitute_glob_star_longest_match() {
         // `*` matches the whole tail at i=0; with all=true, the second pass
         // starts past the replacement and finds nothing more.
-        assert_eq!(substitute("xyz", "*", "Q", SubstAnchor::None, true, false), "Q");
+        assert_eq!(
+            substitute("xyz", "*", "Q", SubstAnchor::None, true, false),
+            "Q"
+        );
     }
 
     #[test]
     fn substitute_glob_question_mark() {
-        assert_eq!(substitute("abc", "?", "X", SubstAnchor::None, false, false), "Xbc");
-        assert_eq!(substitute("abc", "?", "X", SubstAnchor::None, true, false), "XXX");
+        assert_eq!(
+            substitute("abc", "?", "X", SubstAnchor::None, false, false),
+            "Xbc"
+        );
+        assert_eq!(
+            substitute("abc", "?", "X", SubstAnchor::None, true, false),
+            "XXX"
+        );
     }
 
     #[test]
     fn substitute_unicode_boundaries() {
-        assert_eq!(substitute("café", "é", "E", SubstAnchor::None, false, false), "cafE");
+        assert_eq!(
+            substitute("café", "é", "E", SubstAnchor::None, false, false),
+            "cafE"
+        );
     }
 
     #[test]
     fn substitute_invalid_glob_returns_value_unchanged() {
-        assert_eq!(substitute("hello", "[abc", "X", SubstAnchor::None, false, false), "hello");
+        assert_eq!(
+            substitute("hello", "[abc", "X", SubstAnchor::None, false, false),
+            "hello"
+        );
     }
 
     #[test]
     fn substitute_empty_value_returns_empty() {
-        assert_eq!(substitute("", "foo", "bar", SubstAnchor::None, true, false), "");
+        assert_eq!(
+            substitute("", "foo", "bar", SubstAnchor::None, true, false),
+            ""
+        );
     }
 
     #[test]
     fn substitute_empty_pattern_is_noop_first() {
         // Bash: empty pattern is a no-op for both /first and //all.
-        assert_eq!(substitute("abc", "", "X", SubstAnchor::None, false, false), "abc");
+        assert_eq!(
+            substitute("abc", "", "X", SubstAnchor::None, false, false),
+            "abc"
+        );
     }
 
     #[test]
     fn substitute_empty_pattern_is_noop_all() {
-        assert_eq!(substitute("abc", "", "X", SubstAnchor::None, true, false), "abc");
+        assert_eq!(
+            substitute("abc", "", "X", SubstAnchor::None, true, false),
+            "abc"
+        );
     }
 
     #[test]
@@ -1200,14 +1354,20 @@ mod tests {
         // `*` matches the whole string at i=0; after the replacement,
         // the empty-match guard must not emit a second replacement at
         // the trailing position.
-        assert_eq!(substitute("xyz", "*", "Q", SubstAnchor::None, true, false), "Q");
+        assert_eq!(
+            substitute("xyz", "*", "Q", SubstAnchor::None, true, false),
+            "Q"
+        );
     }
 
     #[test]
     fn substitute_glob_star_with_prefix_match_advances_past_match() {
         // `f*` against "foo bar foo" — greedy, all-mode still only one
         // replacement (matches whole tail from first `f`).
-        assert_eq!(substitute("foo bar foo", "f*", "X", SubstAnchor::None, true, false), "X");
+        assert_eq!(
+            substitute("foo bar foo", "f*", "X", SubstAnchor::None, true, false),
+            "X"
+        );
     }
 
     #[test]
@@ -1322,7 +1482,10 @@ mod tests {
     #[test]
     fn substring_negative_length_below_zero_is_error() {
         // eff_len = 3 + -4 - 0 = -1, below zero.
-        assert_eq!(substring("abc", 0, Some(-4)), Err("substring expression < 0"));
+        assert_eq!(
+            substring("abc", 0, Some(-4)),
+            Err("substring expression < 0")
+        );
     }
 
     #[test]
@@ -1515,40 +1678,61 @@ mod tests {
 
     #[test]
     fn case_modify_upper_all_no_pattern() {
-        assert_eq!(case_modify("hello", CaseDirection::Upper, true, None, false), "HELLO");
+        assert_eq!(
+            case_modify("hello", CaseDirection::Upper, true, None, false),
+            "HELLO"
+        );
     }
 
     #[test]
     fn case_modify_upper_first_no_pattern() {
-        assert_eq!(case_modify("hello", CaseDirection::Upper, false, None, false), "Hello");
+        assert_eq!(
+            case_modify("hello", CaseDirection::Upper, false, None, false),
+            "Hello"
+        );
     }
 
     #[test]
     fn case_modify_lower_all_no_pattern() {
-        assert_eq!(case_modify("HELLO", CaseDirection::Lower, true, None, false), "hello");
+        assert_eq!(
+            case_modify("HELLO", CaseDirection::Lower, true, None, false),
+            "hello"
+        );
     }
 
     #[test]
     fn case_modify_lower_first_no_pattern() {
-        assert_eq!(case_modify("HELLO", CaseDirection::Lower, false, None, false), "hELLO");
+        assert_eq!(
+            case_modify("HELLO", CaseDirection::Lower, false, None, false),
+            "hELLO"
+        );
     }
 
     #[test]
     fn case_modify_upper_all_with_pattern_filters_chars() {
         // [aeiou] — only vowels upper-cased.
-        assert_eq!(case_modify("hello", CaseDirection::Upper, true, Some("[aeiou]"), false), "hEllO");
+        assert_eq!(
+            case_modify("hello", CaseDirection::Upper, true, Some("[aeiou]"), false),
+            "hEllO"
+        );
     }
 
     #[test]
     fn case_modify_upper_first_with_pattern_picks_first_match() {
         // Only the first MATCHING char (the `e`) gets upper-cased.
-        assert_eq!(case_modify("hello", CaseDirection::Upper, false, Some("[aeiou]"), false), "hEllo");
+        assert_eq!(
+            case_modify("hello", CaseDirection::Upper, false, Some("[aeiou]"), false),
+            "hEllo"
+        );
     }
 
     #[test]
     fn case_modify_unicode_handles_multichar_uppercase() {
         // Rust's `'ß'.to_uppercase()` yields two chars: 'S', 'S'.
-        assert_eq!(case_modify("straße", CaseDirection::Upper, true, None, false), "STRASSE");
+        assert_eq!(
+            case_modify("straße", CaseDirection::Upper, true, None, false),
+            "STRASSE"
+        );
     }
 
     #[test]
@@ -1559,13 +1743,19 @@ mod tests {
     #[test]
     fn case_modify_invalid_glob_returns_value_unchanged() {
         // `[abc` (unclosed bracket) — glob::Pattern::new returns Err.
-        assert_eq!(case_modify("hello", CaseDirection::Upper, true, Some("[abc"), false), "hello");
+        assert_eq!(
+            case_modify("hello", CaseDirection::Upper, true, Some("[abc"), false),
+            "hello"
+        );
     }
 
     #[test]
     fn case_modify_no_match_first_form_returns_unchanged() {
         // No char in "hello" matches [xyz]; all=false → return unchanged.
-        assert_eq!(case_modify("hello", CaseDirection::Upper, false, Some("[xyz]"), false), "hello");
+        assert_eq!(
+            case_modify("hello", CaseDirection::Upper, false, Some("[xyz]"), false),
+            "hello"
+        );
     }
 
     #[test]
@@ -1616,8 +1806,11 @@ mod tests {
             op: crate::lexer::TransformOp::AssignDecl,
         };
         let result = expand_modifier_with_value(
-            "s", &m, ParamLookup::Element(Some("hello")),
-            false, &mut shell,
+            "s",
+            &m,
+            ParamLookup::Element(Some("hello")),
+            false,
+            &mut shell,
         );
         match result {
             ExpansionResult::Value(v) => assert_eq!(v, "s='hello'"),
@@ -1635,8 +1828,11 @@ mod tests {
             op: crate::lexer::TransformOp::AssignDecl,
         };
         let result = expand_modifier_with_value(
-            "ev", &m, ParamLookup::Element(Some("42")),
-            false, &mut shell,
+            "ev",
+            &m,
+            ParamLookup::Element(Some("42")),
+            false,
+            &mut shell,
         );
         match result {
             ExpansionResult::Value(v) => assert_eq!(v, "declare -x ev='42'"),
@@ -1651,10 +1847,8 @@ mod tests {
         let m = crate::lexer::ParamModifier::Transform {
             op: crate::lexer::TransformOp::AssignDecl,
         };
-        let result = expand_modifier_with_value(
-            "nope", &m, ParamLookup::Element(None),
-            false, &mut shell,
-        );
+        let result =
+            expand_modifier_with_value("nope", &m, ParamLookup::Element(None), false, &mut shell);
         // Both Empty and Value("") are bash-faithful for unset.
         // Bash byte output is empty either way.
         match result {
@@ -1674,8 +1868,11 @@ mod tests {
             op: crate::lexer::TransformOp::AttrFlags,
         };
         let result = expand_modifier_with_value(
-            "ev", &m, ParamLookup::Element(Some("42")),
-            false, &mut shell,
+            "ev",
+            &m,
+            ParamLookup::Element(Some("42")),
+            false,
+            &mut shell,
         );
         match result {
             ExpansionResult::Value(v) => assert_eq!(v, "x"),
@@ -1689,7 +1886,10 @@ mod xtrace_quote_tests {
     use super::xtrace_quote;
     #[test]
     fn bare_safe_words() {
-        for s in ["hello", "a-b", "a/b", "a.b", "a:b", "a=b", "a,b", "a%b", "a+b", "a@b", "a_b", "aZ9", "a#b", "a~b"] {
+        for s in [
+            "hello", "a-b", "a/b", "a.b", "a:b", "a=b", "a,b", "a%b", "a+b", "a@b", "a_b", "aZ9",
+            "a#b", "a~b",
+        ] {
             assert_eq!(xtrace_quote(s), s, "{s} should be bare");
         }
     }

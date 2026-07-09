@@ -14,7 +14,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     drop(child.stdin.take());
     let output = child.wait_with_output().expect("wait");
     (
@@ -58,7 +63,10 @@ fn dbracket_regex_invalid_errors() {
     // An UNQUOTED invalid regex (unclosed `[`) is a compile error -> rc 2.
     // (A QUOTED `"["` is a LITERAL `[` and matches normally — see L-23/v199.)
     let (out, err) = run("[[ x =~ [ ]]\necho $?\nexit\n");
-    assert!(out.lines().any(|l| l.trim() == "2"), "got out: {out} err: {err}");
+    assert!(
+        out.lines().any(|l| l.trim() == "2"),
+        "got out: {out} err: {err}"
+    );
 }
 
 #[test]

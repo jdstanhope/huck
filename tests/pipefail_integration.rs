@@ -40,12 +40,18 @@ fn pipefail_off_default_uses_last_stage() {
 
 #[test]
 fn pipefail_on_rightmost_nonzero() {
-    assert_eq!(run("set -o pipefail\nfalse | true\necho rc=$?\n").0, "rc=1\n");
+    assert_eq!(
+        run("set -o pipefail\nfalse | true\necho rc=$?\n").0,
+        "rc=1\n"
+    );
     assert_eq!(
         run("set -o pipefail\n(exit 2) | (exit 3)\necho rc=$?\n").0,
         "rc=3\n"
     );
-    assert_eq!(run("set -o pipefail\ntrue | true\necho rc=$?\n").0, "rc=0\n");
+    assert_eq!(
+        run("set -o pipefail\ntrue | true\necho rc=$?\n").0,
+        "rc=0\n"
+    );
 }
 
 #[test]

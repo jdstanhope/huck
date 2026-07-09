@@ -4,24 +4,36 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 /// Run `script` as a file arg (non-interactive). Returns (stdout, stderr, code).
 fn run_file(script: &str) -> (String, String, i32) {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("huck_v231al_{}_{}_.sh", std::process::id(), n));
-    { let mut f = std::fs::File::create(&path).unwrap(); f.write_all(script.as_bytes()).unwrap(); }
-    let out = Command::new(huck_bin()).arg(&path).stdin(Stdio::null()).output().unwrap();
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+    }
+    let out = Command::new(huck_bin())
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
     let _ = std::fs::remove_file(&path);
-    (String::from_utf8_lossy(&out.stdout).into_owned(),
-     String::from_utf8_lossy(&out.stderr).into_owned(),
-     out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
 fn expand_aliases_def_then_use_across_lines() {
     let (o, _, c) = run_file("shopt -s expand_aliases\nalias foo='echo HELLO'\nfoo\n");
-    assert_eq!(o, "HELLO\n"); assert_eq!(c, 0);
+    assert_eq!(o, "HELLO\n");
+    assert_eq!(c, 0);
 }
 
 #[test]
@@ -39,7 +51,8 @@ fn not_expanded_without_shopt() {
 
 #[test]
 fn unalias_then_use_is_command_not_found() {
-    let (o, e, _) = run_file("shopt -s expand_aliases\nalias foo='echo HI'\nfoo\nunalias foo\nfoo\n");
+    let (o, e, _) =
+        run_file("shopt -s expand_aliases\nalias foo='echo HI'\nfoo\nunalias foo\nfoo\n");
     assert_eq!(o, "HI\n");
     assert!(e.contains("foo: command not found"), "stderr: {e}");
 }
@@ -53,6 +66,7 @@ fn trailing_space_continues_expansion() {
 
 #[test]
 fn redefine_alias_affects_later_use() {
-    let (o, _, _) = run_file("shopt -s expand_aliases\nalias g='echo one'\ng\nalias g='echo two'\ng\n");
+    let (o, _, _) =
+        run_file("shopt -s expand_aliases\nalias g='echo one'\ng\nalias g='echo two'\ng\n");
     assert_eq!(o, "one\ntwo\n");
 }

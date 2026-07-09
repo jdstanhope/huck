@@ -32,9 +32,7 @@ fn wait_multiarg_all_succeed() {
     // cycle so %1/%2 are still resolvable when `wait` runs. (Without them,
     // `true` as a builtin (v53) returns instantly and the jobs reap before
     // `wait` resolves them.)
-    let (out, _) = run(
-        "(sleep 0.1; true) &\n(sleep 0.2; true) &\nwait %1 %2\necho $?\nexit\n",
-    );
+    let (out, _) = run("(sleep 0.1; true) &\n(sleep 0.2; true) &\nwait %1 %2\necho $?\nexit\n");
     assert!(out.lines().any(|l| l == "0"), "stdout: {:?}", out);
 }
 
@@ -43,9 +41,7 @@ fn wait_multiarg_returns_last_status() {
     // First bg job exits 5, second exits 3. wait %1 %2 → 3. Sleeps keep
     // both jobs alive past huck's between-statement reap+notify cycle so
     // %1 is still resolvable when `wait %1 %2` runs.
-    let (out, _) = run(
-        "(sleep 0.1; exit 5) &\n(sleep 0.2; exit 3) &\nwait %1 %2\necho $?\nexit\n",
-    );
+    let (out, _) = run("(sleep 0.1; exit 5) &\n(sleep 0.2; exit 3) &\nwait %1 %2\necho $?\nexit\n");
     assert!(out.lines().any(|l| l == "3"), "stdout: {:?}", out);
 }
 

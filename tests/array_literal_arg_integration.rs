@@ -1,17 +1,28 @@
 //! v136: array-literal / assign-prefix word as a command ARGUMENT reconstructs
 //! to text instead of panicking (M-114).
-use std::process::{Command, Stdio};
 use std::io::Write;
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+use std::process::{Command, Stdio};
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 fn run(script: &str) -> (String, String, i32) {
     let mut c = Command::new(huck_bin())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().expect("spawn");
-    c.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    c.stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let o = c.wait_with_output().unwrap();
-    (String::from_utf8_lossy(&o.stdout).into_owned(),
-     String::from_utf8_lossy(&o.stderr).into_owned(),
-     o.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+        o.status.code().unwrap_or(-1),
+    )
 }
 #[test]
 fn eval_array_literal_assignment() {

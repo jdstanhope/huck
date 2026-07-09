@@ -12,7 +12,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),

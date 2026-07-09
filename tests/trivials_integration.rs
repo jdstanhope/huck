@@ -60,9 +60,7 @@ fn command_v_finds_builtin() {
 
 #[test]
 fn command_v_missing_status_1() {
-    let (out, _) = run_capture(
-        "command -v __no_such_cmd_xyzzy__\nrc=$?\necho rc=$rc\nexit\n",
-    );
+    let (out, _) = run_capture("command -v __no_such_cmd_xyzzy__\nrc=$?\necho rc=$rc\nexit\n");
     let rc_line = out
         .lines()
         .find(|l| l.starts_with("rc="))

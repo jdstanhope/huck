@@ -27,9 +27,7 @@ fn run_capture(script: &str) -> (String, String) {
 
 #[test]
 fn readonly_basic_blocks_reassignment() {
-    let (out, err) = run_capture(
-        "readonly X=1\nX=2\nrc=$?\necho rc=$rc\necho X=$X\nexit\n",
-    );
+    let (out, err) = run_capture("readonly X=1\nX=2\nrc=$?\necho rc=$rc\necho X=$X\nexit\n");
     assert!(
         err.contains("readonly"),
         "expected stderr to mention readonly, got: {err:?}",
@@ -49,18 +47,14 @@ fn readonly_lists_in_posix_format() {
 
 #[test]
 fn readonly_blocks_unset() {
-    let (out, err) = run_capture(
-        "readonly X=1\nunset X\nrc=$?\necho rc=$rc\nexit\n",
-    );
+    let (out, err) = run_capture("readonly X=1\nunset X\nrc=$?\necho rc=$rc\nexit\n");
     assert!(err.contains("readonly"), "stderr: {err:?}");
     assert!(out.lines().any(|l| l == "rc=1"), "stdout: {out:?}");
 }
 
 #[test]
 fn readonly_blocks_inline_assignment() {
-    let (out, err) = run_capture(
-        "readonly X=1\nX=2 echo hi\nrc=$?\necho rc=$rc\nexit\n",
-    );
+    let (out, err) = run_capture("readonly X=1\nX=2 echo hi\nrc=$?\necho rc=$rc\nexit\n");
     assert!(err.contains("readonly"), "stderr: {err:?}");
     assert!(out.lines().any(|l| l == "rc=1"), "stdout: {out:?}");
     assert!(
@@ -84,9 +78,7 @@ fn readonly_blocks_for_loop() {
 
 #[test]
 fn readonly_with_single_quote_listing_escapes() {
-    let (out, _) = run_capture(
-        "readonly X=\"a'b\"\nreadonly\nexit\n",
-    );
+    let (out, _) = run_capture("readonly X=\"a'b\"\nreadonly\nexit\n");
     // declare -p style; the embedded single quote needs no escaping inside
     // a double-quoted value.
     assert!(

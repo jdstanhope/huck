@@ -28,9 +28,8 @@ fn run_capture(script: &str) -> (String, String, i32) {
 
 #[test]
 fn literal_then_for_loop_iterates_in_order() {
-    let (out, _, _) = run_capture(
-        "a=(red green blue)\nfor c in \"${a[@]}\"; do echo \"$c\"; done\nexit\n",
-    );
+    let (out, _, _) =
+        run_capture("a=(red green blue)\nfor c in \"${a[@]}\"; do echo \"$c\"; done\nexit\n");
     let lines: Vec<&str> = out.lines().collect();
     let color_lines: Vec<&str> = lines
         .iter()
@@ -76,9 +75,8 @@ fn scalar_promotes_on_element_assign() {
 
 #[test]
 fn quoted_at_preserves_empty_elements() {
-    let (out, _, _) = run_capture(
-        "a=(x \"\" z)\nfor v in \"${a[@]}\"; do echo \"[$v]\"; done\nexit\n",
-    );
+    let (out, _, _) =
+        run_capture("a=(x \"\" z)\nfor v in \"${a[@]}\"; do echo \"[$v]\"; done\nexit\n");
     let bracket_lines: Vec<&str> = out.lines().filter(|l| l.starts_with('[')).collect();
     assert_eq!(bracket_lines.len(), 3, "expected 3 elements, got: {out:?}");
     assert!(

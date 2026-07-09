@@ -58,7 +58,11 @@ fn oh_my_posh_prompt_renders_not_literal() {
             return;
         }
     };
-    if init_file.write_all(&init).and_then(|_| init_file.flush()).is_err() {
+    if init_file
+        .write_all(&init)
+        .and_then(|_| init_file.flush())
+        .is_err()
+    {
         eprintln!("prompt_omp_pty: skipping — cannot write temp init file");
         return;
     }
@@ -138,7 +142,5 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || needle.len() > haystack.len() {
         return needle.is_empty();
     }
-    haystack
-        .windows(needle.len())
-        .any(|w| w == needle)
+    haystack.windows(needle.len()).any(|w| w == needle)
 }

@@ -15,7 +15,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     drop(child.stdin.take());
     let output = child.wait_with_output().expect("wait");
     (
@@ -102,7 +107,10 @@ fn heredoc_multiple_per_command_last_wins() {
     // `cat <<A <<B` — cat sees body B; body A is collected and discarded.
     let (out, _) = run("cat <<A <<B\nfirst\nA\nsecond\nB\nexit\n");
     assert!(out.contains("second"), "last body should win: {out}");
-    assert!(!out.contains("first"), "first body should be discarded: {out}");
+    assert!(
+        !out.contains("first"),
+        "first body should be discarded: {out}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -175,9 +183,8 @@ fn heredoc_backgrounded_command_sees_body() {
     // (since backgrounded stdout doesn't round-trip cleanly through the
     // test harness). Modelled after inline_assignment_backgrounded_external_command_sees_var.
     let tmp = format!("/tmp/huck_v24_bg_heredoc_{}", std::process::id());
-    let script = format!(
-        "cat <<EOF > {tmp} &\nbackground-test\nEOF\nwait\ncat {tmp}\nrm -f {tmp}\nexit\n"
-    );
+    let script =
+        format!("cat <<EOF > {tmp} &\nbackground-test\nEOF\nwait\ncat {tmp}\nrm -f {tmp}\nexit\n");
     let (out, _) = run(&script);
     assert!(out.contains("background-test"), "got: {out}");
 }

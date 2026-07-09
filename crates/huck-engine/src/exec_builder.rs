@@ -33,10 +33,7 @@ pub(crate) struct Callbacks<'cb> {
 }
 
 impl<'cb> Callbacks<'cb> {
-    pub fn new(
-        stdout: Option<LineCallback<'cb>>,
-        stderr: Option<LineCallback<'cb>>,
-    ) -> Self {
+    pub fn new(stdout: Option<LineCallback<'cb>>, stderr: Option<LineCallback<'cb>>) -> Self {
         Self {
             stdout,
             stderr,
@@ -231,7 +228,11 @@ impl<'a> ExecBuilder<'a> {
         if !any_cb {
             // FAST PATH: no callbacks; fd 1/2 inherit, no pipe interposition.
             let mut out = StdoutSink::Terminal;
-            let mut err = if self.merge { StderrSink::Merged } else { StderrSink::Terminal };
+            let mut err = if self.merge {
+                StderrSink::Merged
+            } else {
+                StderrSink::Terminal
+            };
             return self.run_with_sinks(&mut out, &mut err);
         }
 
@@ -244,13 +245,21 @@ impl<'a> ExecBuilder<'a> {
             // Dup failure: fall back to the fast path (no tee, no callback).
             // The script still runs; the embedder still sees output.
             if saved_stdout_fd >= 0 {
-                unsafe { libc::close(saved_stdout_fd); }
+                unsafe {
+                    libc::close(saved_stdout_fd);
+                }
             }
             if saved_stderr_fd >= 0 {
-                unsafe { libc::close(saved_stderr_fd); }
+                unsafe {
+                    libc::close(saved_stderr_fd);
+                }
             }
             let mut out = StdoutSink::Terminal;
-            let mut err = if self.merge { StderrSink::Merged } else { StderrSink::Terminal };
+            let mut err = if self.merge {
+                StderrSink::Merged
+            } else {
+                StderrSink::Terminal
+            };
             return self.run_with_sinks(&mut out, &mut err);
         }
 
@@ -476,13 +485,14 @@ fn run_restricted_then_inner(
             self.cell.borrow_mut().restricted = self.prev;
         }
     }
-    let _r = R { cell, prev: prev_restricted };
+    let _r = R {
+        cell,
+        prev: prev_restricted,
+    };
 
     let label = cell.borrow().shell_argv0.clone();
     let args = cell.borrow().positional_args.clone();
-    let code = crate::shell::run_program_in_sinks(
-        src, None, args, &label, false, out, err, cell,
-    );
+    let code = crate::shell::run_program_in_sinks(src, None, args, &label, false, out, err, cell);
     cell.borrow_mut().set_last_status(code);
     code
 }

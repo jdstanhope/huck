@@ -32,13 +32,19 @@ fn bang_basic() {
 #[test]
 fn bang_in_if_condition() {
     assert_eq!(run("if ! false; then echo yes; fi\n").0, "yes\n");
-    assert_eq!(run("if ! true; then echo yes; else echo no; fi\n").0, "no\n");
+    assert_eq!(
+        run("if ! true; then echo yes; else echo no; fi\n").0,
+        "no\n"
+    );
 }
 
 #[test]
 fn bang_in_while_condition() {
     // `while ! true` never enters the loop.
-    assert_eq!(run("while ! true; do echo x; done\necho done\n").0, "done\n");
+    assert_eq!(
+        run("while ! true; do echo x; done\necho done\n").0,
+        "done\n"
+    );
 }
 
 #[test]

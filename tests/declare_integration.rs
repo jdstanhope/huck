@@ -43,18 +43,14 @@ fn declare_p_prints_decl() {
 
 #[test]
 fn declare_r_is_readonly() {
-    let (out, err, _) = run_capture(
-        "declare -r X=hi\nX=new\nrc=$?\necho \"rc=$rc\"\nexit\n",
-    );
+    let (out, err, _) = run_capture("declare -r X=hi\nX=new\nrc=$?\necho \"rc=$rc\"\nexit\n");
     assert!(err.contains("readonly"), "stderr: {err:?}");
     assert!(out.lines().any(|l| l == "rc=1"), "stdout: {out:?}");
 }
 
 #[test]
 fn declare_x_is_exported() {
-    let (out, _, _) = run_capture(
-        "declare -x X=hi\ndeclare -p X\nexit\n",
-    );
+    let (out, _, _) = run_capture("declare -x X=hi\ndeclare -p X\nexit\n");
     assert!(
         out.lines().any(|l| l == "declare -x X=\"hi\""),
         "stdout: {out:?}",
@@ -63,9 +59,7 @@ fn declare_x_is_exported() {
 
 #[test]
 fn declare_plus_x_unexports() {
-    let (out, _, _) = run_capture(
-        "declare -x X=hi\ndeclare +x X\ndeclare -p X\nexit\n",
-    );
+    let (out, _, _) = run_capture("declare -x X=hi\ndeclare +x X\ndeclare -p X\nexit\n");
     // After +x, attrs should be -- not -x.
     assert!(
         out.lines().any(|l| l == "declare -- X=\"hi\""),
@@ -75,33 +69,22 @@ fn declare_plus_x_unexports() {
 
 #[test]
 fn declare_inside_function_is_local() {
-    let (out, _, _) = run_capture(
-        "f() { declare X_LOCAL_DECL=in; }\nf\necho \"[$X_LOCAL_DECL]\"\nexit\n",
-    );
+    let (out, _, _) =
+        run_capture("f() { declare X_LOCAL_DECL=in; }\nf\necho \"[$X_LOCAL_DECL]\"\nexit\n");
     // X should be unset after function returns.
-    assert!(
-        out.lines().any(|l| l == "[]"),
-        "stdout: {out:?}",
-    );
+    assert!(out.lines().any(|l| l == "[]"), "stdout: {out:?}",);
 }
 
 #[test]
 #[allow(non_snake_case)]
 fn declare_F_lists_functions() {
-    let (out, _, _) = run_capture(
-        "f() { :; }\ndeclare -F\nexit\n",
-    );
-    assert!(
-        out.lines().any(|l| l == "declare -f f"),
-        "stdout: {out:?}",
-    );
+    let (out, _, _) = run_capture("f() { :; }\ndeclare -F\nexit\n");
+    assert!(out.lines().any(|l| l == "declare -f f"), "stdout: {out:?}",);
 }
 
 #[test]
 fn typeset_alias_works() {
-    let (out, err, _) = run_capture(
-        "typeset -r X=hi\nX=new\nrc=$?\necho \"rc=$rc\"\nexit\n",
-    );
+    let (out, err, _) = run_capture("typeset -r X=hi\nX=new\nrc=$?\necho \"rc=$rc\"\nexit\n");
     assert!(err.contains("readonly"), "stderr: {err:?}");
     assert!(out.lines().any(|l| l == "rc=1"), "stdout: {out:?}");
 }

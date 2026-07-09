@@ -3,16 +3,28 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 fn run(script: &str) -> (String, String, i32) {
     let mut child = Command::new(huck_bin())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().expect("spawn huck");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn huck");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
-    (String::from_utf8_lossy(&out.stdout).into_owned(),
-     String::from_utf8_lossy(&out.stderr).into_owned(),
-     out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]

@@ -91,7 +91,7 @@ pub struct CharCursor<'a> {
     s: &'a str,
     pos: usize,
     line: u32,
-    column: u32,            // NEW: 1-based character column
+    column: u32, // NEW: 1-based character column
     peeked: Option<char>,
     peeked_len: usize,
     /// v266: alias input-source stack. Top of stack is the active source;
@@ -105,7 +105,16 @@ pub struct CharCursor<'a> {
 
 impl<'a> CharCursor<'a> {
     pub fn new(s: &'a str) -> Self {
-        CharCursor { s, pos: 0, line: 1, column: 1, peeked: None, peeked_len: 0, injected: Vec::new(), consumed: 0 }
+        CharCursor {
+            s,
+            pos: 0,
+            line: 1,
+            column: 1,
+            peeked: None,
+            peeked_len: 0,
+            injected: Vec::new(),
+            consumed: 0,
+        }
     }
 
     /// v266: inject `body` as the active input source, read fully before the
@@ -133,7 +142,6 @@ impl<'a> CharCursor<'a> {
     fn injected_has_alias(&self, name: &str) -> bool {
         self.injected.iter().any(|f| f.alias_name == name)
     }
-
 
     /// Peek the next char without consuming it. v266: reads from the topmost
     /// injected frame that still has content, seeing THROUGH fully-exhausted
@@ -208,7 +216,10 @@ impl<'a> CharCursor<'a> {
     /// injected alias body (a malformed `${` inside an alias body is out of
     /// scope; see the module note). Debug builds assert the assumption.
     pub fn slice_from(&self, start: usize) -> &str {
-        debug_assert!(self.injected.is_empty(), "slice_from must not straddle an injected alias body");
+        debug_assert!(
+            self.injected.is_empty(),
+            "slice_from must not straddle an injected alias body"
+        );
         &self.s[start..self.pos]
     }
 
@@ -219,7 +230,10 @@ impl<'a> CharCursor<'a> {
     /// not occur mid-alias-body in practice; see the module note). Debug builds
     /// assert the assumption.
     pub fn seek(&mut self, offset: usize, line: u32, column: u32) {
-        debug_assert!(self.injected.is_empty(), "seek must not straddle an injected alias body");
+        debug_assert!(
+            self.injected.is_empty(),
+            "seek must not straddle an injected alias body"
+        );
         self.pos = offset;
         self.line = line;
         self.column = column;
@@ -275,18 +289,31 @@ impl Iterator for CharCursor<'_> {
                 Some(c)
             } else {
                 // Not exhausted (the pop loop above guaranteed remaining content).
-                let c = f.body[f.pos..].chars().next().expect("injected frame has content");
+                let c = f.body[f.pos..]
+                    .chars()
+                    .next()
+                    .expect("injected frame has content");
                 f.pos += c.len_utf8();
                 Some(c)
             }
         } else if let Some(c) = self.peeked.take() {
             self.pos += self.peeked_len;
             self.peeked_len = 0;
-            if c == '\n' { self.line += 1; self.column = 1; } else { self.column += 1; }
+            if c == '\n' {
+                self.line += 1;
+                self.column = 1;
+            } else {
+                self.column += 1;
+            }
             Some(c)
         } else if let Some(c) = self.s[self.pos..].chars().next() {
             self.pos += c.len_utf8();
-            if c == '\n' { self.line += 1; self.column = 1; } else { self.column += 1; }
+            if c == '\n' {
+                self.line += 1;
+                self.column = 1;
+            } else {
+                self.column += 1;
+            }
             Some(c)
         } else {
             None
@@ -300,30 +327,30 @@ impl Iterator for CharCursor<'_> {
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Operator {
-    Pipe,           // |
-    RedirOut,       // >
-    RedirAppend,    // >>
-    RedirIn,        // <
-    RedirErr,       // 2>
-    RedirErrAppend, // 2>>
-    And,            // &&
-    Or,             // ||
-    Semi,           // ;
-    Background,     // &
-    LParen,         // (
-    RParen,         // )
-    DoubleSemi,     // ;;
-    SemiAmp,        // ;&
-    DoubleSemiAmp,  // ;;&
-    HereString,     // <<<
-    DupOut,         // >&
-    DupErr,         // 2>&
-    AndRedirOut,    // &>
-    AndRedirAppend, // &>>
-    RedirClobber,   // >|
+    Pipe,            // |
+    RedirOut,        // >
+    RedirAppend,     // >>
+    RedirIn,         // <
+    RedirErr,        // 2>
+    RedirErrAppend,  // 2>>
+    And,             // &&
+    Or,              // ||
+    Semi,            // ;
+    Background,      // &
+    LParen,          // (
+    RParen,          // )
+    DoubleSemi,      // ;;
+    SemiAmp,         // ;&
+    DoubleSemiAmp,   // ;;&
+    HereString,      // <<<
+    DupOut,          // >&
+    DupErr,          // 2>&
+    AndRedirOut,     // &>
+    AndRedirAppend,  // &>>
+    RedirClobber,    // >|
     RedirErrClobber, // 2>|
-    DupIn,          // <&
-    RedirReadWrite, // <>
+    DupIn,           // <&
+    RedirReadWrite,  // <>
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -336,26 +363,35 @@ pub enum TildeSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum SubstAnchor {
-    None,    // ${var/pat/repl} and ${var//pat/repl}
-    Prefix,  // ${var/#pat/repl}
-    Suffix,  // ${var/%pat/repl}
+    None,   // ${var/pat/repl} and ${var//pat/repl}
+    Prefix, // ${var/#pat/repl}
+    Suffix, // ${var/%pat/repl}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseDirection {
-    Upper,  // ^ / ^^
-    Lower,  // , / ,,
+    Upper, // ^ / ^^
+    Lower, // , / ,,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SubstKind { First, All, Prefix, Suffix }   // / , // , /# , /%
+pub(crate) enum SubstKind {
+    First,
+    All,
+    Prefix,
+    Suffix,
+} // / , // , /# , /%
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParamOpKind {
-    UseDefault(bool), AssignDefault(bool), ErrorIfUnset(bool), UseAlternate(bool), // bool = colon-prefixed
-    RemovePrefix(bool), RemoveSuffix(bool),   // bool = longest (## / %%)
+    UseDefault(bool),
+    AssignDefault(bool),
+    ErrorIfUnset(bool),
+    UseAlternate(bool), // bool = colon-prefixed
+    RemovePrefix(bool),
+    RemoveSuffix(bool), // bool = longest (## / %%)
     Substitute(SubstKind),
-    Case(CaseDirection, bool),                // bool = all (^^ / ,,)
+    Case(CaseDirection, bool), // bool = all (^^ / ,,)
     Transform(TransformOp),
     Substring,
 }
@@ -398,13 +434,33 @@ pub enum ParamModifier {
     /// shell variables whose name starts with `prefix`. `at=false` (`*`)
     /// joins like `$*`; `at=true` (`@`) yields separate words like `$@`.
     /// The `name` field holds the prefix.
-    PrefixNames { at: bool },
-    UseDefault    { word: Word, colon: bool },
-    AssignDefault { word: Word, colon: bool },
-    ErrorIfUnset  { word: Word, colon: bool },
-    UseAlternate  { word: Word, colon: bool },
-    RemovePrefix  { pattern: Word, longest: bool },
-    RemoveSuffix  { pattern: Word, longest: bool },
+    PrefixNames {
+        at: bool,
+    },
+    UseDefault {
+        word: Word,
+        colon: bool,
+    },
+    AssignDefault {
+        word: Word,
+        colon: bool,
+    },
+    ErrorIfUnset {
+        word: Word,
+        colon: bool,
+    },
+    UseAlternate {
+        word: Word,
+        colon: bool,
+    },
+    RemovePrefix {
+        pattern: Word,
+        longest: bool,
+    },
+    RemoveSuffix {
+        pattern: Word,
+        longest: bool,
+    },
     Substitute {
         pattern: Word,
         replacement: Word,
@@ -421,13 +477,17 @@ pub enum ParamModifier {
         pattern: Option<Word>,
     },
     /// `${var@OP}` scalar transform (`@P`/`@Q`/`@U`/`@L`/`@u`/`@E`).
-    Transform { op: TransformOp },
+    Transform {
+        op: TransformOp,
+    },
     /// A `${…}` whose content is lexable (matching `}` found) but
     /// semantically invalid (bad modifier, special char as name, etc.).
     /// Parses successfully and defers to a RUNTIME "bad substitution"
     /// error, matching bash. `raw` is the literal `${…}` source for the
     /// message. Evaluated lazily — only errors when actually expanded.
-    BadSubst { raw: String },
+    BadSubst {
+        raw: String,
+    },
 }
 
 /// Subscript form attached to `${a[…]}` / `${a[@]}` / `${a[*]}`.
@@ -480,7 +540,10 @@ pub enum QuoteStyle {
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[non_exhaustive]
 pub enum WordPart {
-    Literal { text: String, quoted: bool },
+    Literal {
+        text: String,
+        quoted: bool,
+    },
     /// `assign_ctx` is true when this tilde was recognized in ASSIGNMENT-VALUE
     /// position (right after an unquoted `=`/`:` in a `name=value`-shaped word,
     /// e.g. the `~` in `foo=bar:~`), false for a word-start tilde (`~`, `~/x`).
@@ -489,15 +552,32 @@ pub enum WordPart {
     /// statements, so an assign-ctx tilde in a plain command ARGUMENT stays
     /// literal (the assignment path — leading assignments + declaration builtins
     /// — always resolves it regardless).
-    Tilde { spec: TildeSpec, assign_ctx: bool },
-    Var { name: String, quoted: bool },
-    LastStatus { quoted: bool },
-    CommandSub { sequence: crate::command::Sequence, quoted: bool },
+    Tilde {
+        spec: TildeSpec,
+        assign_ctx: bool,
+    },
+    Var {
+        name: String,
+        quoted: bool,
+    },
+    LastStatus {
+        quoted: bool,
+    },
+    CommandSub {
+        sequence: crate::command::Sequence,
+        quoted: bool,
+    },
     /// Process substitution `<(cmd)` / `>(cmd)`. Only produced when UNQUOTED
     /// (inside double/single quotes `<(`/`>(` are literal). Expands to a
     /// `/dev/fd/N` (or FIFO) path at runtime.
-    ProcessSub { sequence: crate::command::Sequence, dir: ProcDir },
-    Arith { body: Word, quoted: bool },
+    ProcessSub {
+        sequence: crate::command::Sequence,
+        dir: ProcDir,
+    },
+    Arith {
+        body: Word,
+        quoted: bool,
+    },
     ParamExpansion {
         name: String,
         modifier: ParamModifier,
@@ -513,7 +593,10 @@ pub enum WordPart {
     },
     /// `$@` (joined=false) or `$*` (joined=true). `quoted` reflects whether
     /// this was inside double quotes.
-    AllArgs { quoted: bool, joined: bool },
+    AllArgs {
+        quoted: bool,
+        joined: bool,
+    },
     /// Synthetic prefix marker emitted by the lexer at the head of an
     /// assignment Word whose LHS isn't expressible as a leading
     /// `Literal { text: "name=" }`. Specifically: `name+=…`,
@@ -533,7 +616,10 @@ pub enum WordPart {
     /// `parts` keep their own `quoted: true` flag so the expansion path is
     /// unchanged; the wrapper exists for reconstruction in `declare -f` /
     /// `type`.
-    Quoted { style: QuoteStyle, parts: Vec<WordPart> },
+    Quoted {
+        style: QuoteStyle,
+        parts: Vec<WordPart>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -552,9 +638,21 @@ impl Span {
     /// A span at byte `offset`, 1-based source `line`, and 1-based character
     /// `column`. Built at lex time from the `CharCursor` position of a token's
     /// first character, so location travels with the token (no sidecar arrays).
-    pub fn new(offset: usize, line: u32, column: u32) -> Span { Span { offset, line, column } }
+    pub fn new(offset: usize, line: u32, column: u32) -> Span {
+        Span {
+            offset,
+            line,
+            column,
+        }
+    }
     /// Placeholder span for synthesized tokens / test fixtures (line 0 = unknown).
-    pub fn unknown() -> Span { Span { offset: 0, line: 0, column: 0 } }
+    pub fn unknown() -> Span {
+        Span {
+            offset: 0,
+            line: 0,
+            column: 0,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -568,7 +666,11 @@ pub enum TokenKind {
     /// line, the body lines are consumed after the line's `\n`. The
     /// resulting TokenKind::Heredoc occupies the position where `<<DELIM`
     /// appeared (the delim word itself is not emitted).
-    Heredoc { body: Word, expand: bool, strip_tabs: bool },
+    Heredoc {
+        body: Word,
+        expand: bool,
+        strip_tabs: bool,
+    },
     /// Raw text inside a `(( ... ))` block (the outer `((` and `))`
     /// already consumed). Parsed by `crate::arith::parse` downstream.
     /// Captured verbatim including embedded `;` separators.
@@ -581,12 +683,20 @@ pub enum TokenKind {
     RedirFd(crate::command::RedirFd),
     // --- Phase C parser-driven atoms (dormant in v241; emitted only under the
     // ParamExpansion/operand modes, consumed only by parser.rs). ---
-    ParamOpen { quoted: bool }, ParamClose, LBracket, RBracket, ParamSep,
+    ParamOpen {
+        quoted: bool,
+    },
+    ParamClose,
+    LBracket,
+    RBracket,
+    ParamSep,
     /// v268: the `=` / `+=` that follows a command-word-start subscript
     /// (`name[sub]=`). Emitted by the command scanner ONLY when
     /// `pending_lvalue_subscript` is set; the parser consumes it to confirm an
     /// indexed assignment and then calls `begin_assignment_value`.
-    AssignEq { append: bool },
+    AssignEq {
+        append: bool,
+    },
     ParamName(String),
     /// v264: a braced parameter NAME assembled with `extquote` `$'…'` decoding
     /// (`${a$'b'}` → `ab`). Distinct from `ParamName` so the parser can apply
@@ -598,37 +708,50 @@ pub enum TokenKind {
     /// decoded identifier, or an unrecognised post-name modifier char). Carries
     /// the full `${…}` verbatim source so the parser can build
     /// `ParamModifier::BadSubst { raw }` (mirrors the oracle's `recover_bad_subst`).
-    ParamBadSubst { raw: String },
+    ParamBadSubst {
+        raw: String,
+    },
     /// v264: the `*}` / `@}` tail of a `${!prefix*}` / `${!prefix@}` prefix-name
     /// expansion (both the sigil and the closing `}` are consumed). `at` is true
     /// for the `@` form. Mirrors the oracle's `ParamModifier::PrefixNames { at }`.
-    ParamPrefixClose { at: bool },
-    ParamLengthPrefix, ParamIndirect,
+    ParamPrefixClose {
+        at: bool,
+    },
+    ParamLengthPrefix,
+    ParamIndirect,
     #[allow(private_interfaces)] // ParamOpKind is pub(crate); TokenKind is pub — dormant in v241
     ParamOp(ParamOpKind),
-    Lit { text: String, quoted: bool },
-    DollarName { name: String, quoted: bool },
-    DeferredExpansion,   // defensive fallback emitted ONLY by scan_step_command_sub when the cursor is not on a real `$(`/`(`/backtick opener (test-drive robustness). G1/v270 WIRED the operand-in-dquote sites: `$(cmd)`/`$((expr))`/backtick inside a `"…"` span within a `${…}` operand now emit real opener signals (CmdSubOpen/ArithOpen/BeginBacktick), quoted:true carried to the parser via Lexer::operand_in_dquote().
-    CmdSubOpen,          // $( opener atom — dual role: signal in an operand mode (v244 wiring), real opener in CommandSub mode
-    ProcSubOpen { dir: ProcDir },  // v251: `<(`/`>(` word-part signal (unquoted); parser assembles WordPart::ProcessSub via Mode::CommandSub. Cursor is left on `(`.
-    ArrayOpen,   // v252: zero-width signal that a compound array RHS `(…)` follows an assignment prefix; cursor left on `(`. Parser pushes Mode::ArrayLiteral.
-    ArrayClose,  // v252: the `)` closing an array literal, emitted by Mode::ArrayLiteral.
+    Lit {
+        text: String,
+        quoted: bool,
+    },
+    DollarName {
+        name: String,
+        quoted: bool,
+    },
+    DeferredExpansion, // defensive fallback emitted ONLY by scan_step_command_sub when the cursor is not on a real `$(`/`(`/backtick opener (test-drive robustness). G1/v270 WIRED the operand-in-dquote sites: `$(cmd)`/`$((expr))`/backtick inside a `"…"` span within a `${…}` operand now emit real opener signals (CmdSubOpen/ArithOpen/BeginBacktick), quoted:true carried to the parser via Lexer::operand_in_dquote().
+    CmdSubOpen, // $( opener atom — dual role: signal in an operand mode (v244 wiring), real opener in CommandSub mode
+    ProcSubOpen {
+        dir: ProcDir,
+    }, // v251: `<(`/`>(` word-part signal (unquoted); parser assembles WordPart::ProcessSub via Mode::CommandSub. Cursor is left on `(`.
+    ArrayOpen, // v252: zero-width signal that a compound array RHS `(…)` follows an assignment prefix; cursor left on `(`. Parser pushes Mode::ArrayLiteral.
+    ArrayClose, // v252: the `)` closing an array literal, emitted by Mode::ArrayLiteral.
     // --- Phase C v245/v274: backtick command-substitution atoms. ---
-    BeginBacktick,       // opening ` — dual role: signal in an operand mode (v245 T6 wiring), real opener in BacktickRaw mode
-    EndBacktick,         // closing ` — emitted by scan_step_backtick_raw on the closing backtick
+    BeginBacktick, // opening ` — dual role: signal in an operand mode (v245 T6 wiring), real opener in BacktickRaw mode
+    EndBacktick,   // closing ` — emitted by scan_step_backtick_raw on the closing backtick
     /// v274: a verbatim run of raw backtick-body bytes captured by the dumb
     /// `Mode::BacktickRaw` mode (phase 1 of capture→unescape→re-parse). Quote-blind
     /// and `$()`-blind — backslashes and their escaped char survive unchanged so the
     /// parser's phase-2 `unescape_backtick_body` can apply bash's one-level rule.
     BacktickRawText(String),
     // --- Phase C v246: arithmetic-expansion atoms (dormant). ---
-    ArithOpen,   // opening `$((` — dual role: zero-width signal in an operand mode, real opener in Arith mode
-    ArithClose,  // closing `))` — emitted by scan_step_arith at paren_depth 0
-    ArithBail,   // a `)` at paren_depth 0 NOT followed by `)` — parser rewinds and retries as `$( (…) )`
-    ArithSemi,   // v256: a `;` at paren_depth 0 inside a for-header — section separator
-    LegacyArithOpen,  // v258: opening `$[` of a legacy `$[ … ]` arith expansion — dual role like ArithOpen (zero-width operand signal + real opener in Arith{delim:Bracket})
+    ArithOpen, // opening `$((` — dual role: zero-width signal in an operand mode, real opener in Arith mode
+    ArithClose, // closing `))` — emitted by scan_step_arith at paren_depth 0
+    ArithBail, // a `)` at paren_depth 0 NOT followed by `)` — parser rewinds and retries as `$( (…) )`
+    ArithSemi, // v256: a `;` at paren_depth 0 inside a for-header — section separator
+    LegacyArithOpen, // v258: opening `$[` of a legacy `$[ … ]` arith expansion — dual role like ArithOpen (zero-width operand signal + real opener in Arith{delim:Bracket})
     // --- Phase C v247: atom-emitting Command-mode scaffolding (dormant). ---
-    Blank,   // v247: a run of unquoted inter-word whitespace in the atom-command stream (word boundary)
+    Blank, // v247: a run of unquoted inter-word whitespace in the atom-command stream (word boundary)
     /// v247 T2: ONE complete quoted run in command-word context — `'…'`, `"…"`
     /// (T2 scope: literal-only body, no embedded expansions), a single
     /// backslash escape `\c`, or a `$'…'` ANSI-C run (already escape-decoded).
@@ -637,11 +760,16 @@ pub enum TokenKind {
     /// quoting, which always wraps a quote run (never leaves it as a bare
     /// `Literal`). Kept separate from `Lit` (which is for UNQUOTED literal runs,
     /// glued Word assembly) so the oracle's `QuoteStyle` survives atom-ization.
-    QuoteRun { style: QuoteStyle, text: String },
+    QuoteRun {
+        style: QuoteStyle,
+        text: String,
+    },
     /// v247: a literal `$` that is not an expansion opener; a standalone Literal
     /// that must NOT coalesce with neighbors — mirrors the oracle flushing its
     /// buffer and pushing `$` alone.
-    DollarLit { quoted: bool },
+    DollarLit {
+        quoted: bool,
+    },
     // --- Phase C v247 T3: command-position expansions + parser-driven double quotes. ---
     /// v247 T3: a command-position tilde construct (`~`, `~user`, `~+`, `~-`,
     /// `~/…`). Emitted by `scan_command_word_atom` ONLY at word start (mirrors
@@ -649,7 +777,10 @@ pub enum TokenKind {
     /// `WordPart::Tilde { spec, assign_ctx }`. `assign_ctx` is set when the
     /// tilde was recognized in assignment-value position (after an unquoted
     /// `=`/`:` in a `name=value` word) rather than at word start.
-    Tilde { spec: TildeSpec, assign_ctx: bool },
+    Tilde {
+        spec: TildeSpec,
+        assign_ctx: bool,
+    },
     /// v247 T3: zero-width opener signal for a `"…"` double-quoted span in
     /// command-word context. The lexer does NOT consume the `"`; the parser
     /// (`parse_dquote`) pushes `Mode::DoubleQuote`, whose first scan consumes the
@@ -669,7 +800,9 @@ pub enum TokenKind {
     /// literal runs + expansion parts + `"\n"` separators), which produce DIFFERENT
     /// part lists for the SAME token bytes (e.g. a single blank line: literal keeps
     /// an empty `Literal`, expanding drops it).
-    HeredocBodyBegin { expand: bool },
+    HeredocBodyBegin {
+        expand: bool,
+    },
     /// v250: closes one heredoc body's part atoms.
     HeredocBodyEnd,
     /// v247 T4: an assignment-prefix atom for the STRUCTURED assignment lvalues
@@ -680,7 +813,10 @@ pub enum TokenKind {
     /// which `try_split_assignment` consumes. Plain `name=value` gets NO
     /// AssignPrefix — the `name=` flows into the literal run and the splitter
     /// breaks on the first unquoted `=` (mirrors the oracle's `scan_step_command`).
-    AssignPrefix { target: crate::command::AssignTarget, append: bool },
+    AssignPrefix {
+        target: crate::command::AssignTarget,
+        append: bool,
+    },
     /// v254: zero-width terminator of a `Mode::Regex` pattern operand — emitted
     /// (and the mode popped) at the depth-0 whitespace or EOF that ends the `=~`
     /// operand. The parser's `parse_regex_operand` assembles pattern atoms until
@@ -696,7 +832,9 @@ pub enum TokenKind {
     /// both and emits the opening `Lit`. `prefix` is carried only for
     /// documentation/debugging; the mode's own first-entry scan re-reads it
     /// from the cursor.
-    ExtglobOpen { prefix: char },
+    ExtglobOpen {
+        prefix: char,
+    },
     /// v264: zero-width terminator of a `Mode::Extglob` group, emitted (and the
     /// mode popped) by the lexer itself the moment the group's own `(` is
     /// balanced (`paren_depth` returns to 0 after a `)`). Consumed by
@@ -718,28 +856,43 @@ pub struct Token {
 }
 
 impl Token {
-    pub fn new(kind: TokenKind, span: Span) -> Token { Token { kind, span } }
-    pub fn kind(&self) -> &TokenKind { &self.kind }
+    pub fn new(kind: TokenKind, span: Span) -> Token {
+        Token { kind, span }
+    }
+    pub fn kind(&self) -> &TokenKind {
+        &self.kind
+    }
 }
 
 impl From<TokenKind> for Token {
     /// Wrap a kind with a placeholder span (line 0 = unknown). Used by test
     /// fixtures and synthesized tokens; real lexer output carries true spans.
-    fn from(kind: TokenKind) -> Token { Token { kind, span: Span::unknown() } }
+    fn from(kind: TokenKind) -> Token {
+        Token {
+            kind,
+            span: Span::unknown(),
+        }
+    }
 }
 
 impl PartialEq for Token {
-    fn eq(&self, other: &Self) -> bool { self.kind == other.kind }
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
 }
 impl Eq for Token {}
 
 #[cfg(test)]
 impl PartialEq<TokenKind> for Token {
-    fn eq(&self, other: &TokenKind) -> bool { &self.kind == other }
+    fn eq(&self, other: &TokenKind) -> bool {
+        &self.kind == other
+    }
 }
 #[cfg(test)]
 impl PartialEq<Token> for TokenKind {
-    fn eq(&self, other: &Token) -> bool { self == &other.kind }
+    fn eq(&self, other: &Token) -> bool {
+        self == &other.kind
+    }
 }
 
 /// State for a heredoc whose body hasn't been collected yet.
@@ -784,7 +937,6 @@ pub struct LexerOptions {
     pub eof_closes_heredoc: bool,
 }
 
-
 /// Core tokenizer body. `brace_expand` controls whether unquoted braces are
 /// expanded into multiple Words (`true` for normal command words) or left as
 /// literal text in a single Word (`false` for array-literal elements, which are
@@ -796,13 +948,21 @@ pub struct LexerOptions {
 /// other shape (e.g. `file2`, `{}`, `{1bad}`), leaving the Word intact as a
 /// normal argument.
 fn fd_prefix_of(token: Option<&TokenKind>) -> Option<crate::command::RedirFd> {
-    let Some(TokenKind::Word(w)) = token else { return None };
+    let Some(TokenKind::Word(w)) = token else {
+        return None;
+    };
     let text = crate::command::word_literal_text(w)?;
     if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) {
-        text.parse::<u16>().ok().map(crate::command::RedirFd::Number)
+        text.parse::<u16>()
+            .ok()
+            .map(crate::command::RedirFd::Number)
     } else if let Some(inner) = text.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
         if !inner.is_empty()
-            && inner.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+            && inner
+                .chars()
+                .next()
+                .map(|c| c.is_alphabetic() || c == '_')
+                .unwrap_or(false)
             && inner.chars().all(|c| c.is_alphanumeric() || c == '_')
         {
             Some(crate::command::RedirFd::Var(inner.to_string()))
@@ -838,15 +998,20 @@ enum Step {
 /// (paren-depth, closes on `))`); `Bracket` = `$[ … ]` legacy arith (bracket-depth,
 /// closes on a single `]`, parens are literal body chars).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ArithDelim { Paren, Bracket }
+pub(crate) enum ArithDelim {
+    Paren,
+    Bracket,
+}
 
 /// The lexing-rule context the lexer scans under. v240 implements only
 /// `Command`; the other variants are forward declarations for later Phase C
 /// iterations and are never the active mode in production yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
-    Command,        // default command-position scanner (emits atoms)
-    CommandSub { body_started: bool },  // $( … ) / `…`
+    Command, // default command-position scanner (emits atoms)
+    CommandSub {
+        body_started: bool,
+    }, // $( … ) / `…`
     /// v274: dumb quote-blind/`$()`-blind raw-capture backtick mode (phase 1 of
     /// capture→unescape→re-parse). Streams the body verbatim as `BacktickRawText`
     /// atoms framed by `BeginBacktick`…`EndBacktick`; entry is tracked by the
@@ -857,15 +1022,31 @@ pub(crate) enum Mode {
     // emitted (needed by Phase 2 to route `*}`/`@}` to the prefix-name form).
     // `start_off` — byte offset of the leading `$` of `${` (set by Phase 0's
     // write-back), used to reconstruct a bad-substitution's verbatim `${…}` raw.
-    ParamExpansion { seen_name: bool, indirect: bool, start_off: usize }, // ${ … }
+    ParamExpansion {
+        seen_name: bool,
+        indirect: bool,
+        start_off: usize,
+    }, // ${ … }
     // `enclosing_dquote` — the OUTER `"…"` context the `${…}` itself sits in
     // (seeded once at push time from the parser's `quoted` flag), distinct from
     // `in_dquote` which is the operand scanner's INTERNAL `'…'`/`"…"`-span state
     // that toggles as the operand text is scanned. See v264 operand-dquote fix.
-    ParamWordOperand            { in_dquote: bool, enclosing_dquote: bool },
-    ParamSubstPatternOperand    { in_dquote: bool, enclosing_dquote: bool },
-    ParamSubstringOffsetOperand { in_dquote: bool, enclosing_dquote: bool },
-    ParamSubscriptOperand       { in_dquote: bool, enclosing_dquote: bool },
+    ParamWordOperand {
+        in_dquote: bool,
+        enclosing_dquote: bool,
+    },
+    ParamSubstPatternOperand {
+        in_dquote: bool,
+        enclosing_dquote: bool,
+    },
+    ParamSubstringOffsetOperand {
+        in_dquote: bool,
+        enclosing_dquote: bool,
+    },
+    ParamSubscriptOperand {
+        in_dquote: bool,
+        enclosing_dquote: bool,
+    },
     // v261 T1: `in_squote`/`in_dquote` are the scanner's INTERNAL quote-span state
     // (repurposed from a formerly-dead `in_dquote` field) — NOT the outer
     // quoted-context of the enclosing word (arith bodies are always emitted as
@@ -873,16 +1054,35 @@ pub(crate) enum Mode {
     // outer quoted/unquoted branch to select). Both flags start `false` at every
     // push site (a fresh body opens outside any quote span) and are written back
     // to this frame by `sync_quotes!` on every `'`/`"` toggle in `scan_step_arith`.
-    Arith { paren_depth: u32, in_squote: bool, in_dquote: bool, body_started: bool, for_header: bool, delim: ArithDelim }, // $(( … )) / (( … )) / for (( … )) / $[ … ]
-    DoubleQuote { body_started: bool }, // "…" — v247 T3 (parser-driven word-level mode)
-    ArrayLiteral { body_started: bool, expect_subscript_eq: bool, at_element_start: bool, subscript_append: bool },   // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=`/`+=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal). subscript_append: the operator the lexer just consumed for the CURRENT subscripted element was `+=` (not `=`); the parser reads it via current_mode() after scanning the value.
-    Regex { paren_depth: u32, body_started: bool },  // v254: RHS of =~ inside [[ … ]]
+    Arith {
+        paren_depth: u32,
+        in_squote: bool,
+        in_dquote: bool,
+        body_started: bool,
+        for_header: bool,
+        delim: ArithDelim,
+    }, // $(( … )) / (( … )) / for (( … )) / $[ … ]
+    DoubleQuote {
+        body_started: bool,
+    }, // "…" — v247 T3 (parser-driven word-level mode)
+    ArrayLiteral {
+        body_started: bool,
+        expect_subscript_eq: bool,
+        at_element_start: bool,
+        subscript_append: bool,
+    }, // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=`/`+=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal). subscript_append: the operator the lexer just consumed for the CURRENT subscripted element was `+=` (not `=`); the parser reads it via current_mode() after scanning the value.
+    Regex {
+        paren_depth: u32,
+        body_started: bool,
+    }, // v254: RHS of =~ inside [[ … ]]
     /// v264: an extglob group `<prefix>( … )` (`?(...)`/`*(...)`/`+(...)`/
     /// `@(...)`/`!(...)`, gated by `LexerOptions::extglob`). `paren_depth == 0`
     /// on push means "not yet entered" — the first scan consumes the prefix
     /// char + `(` and sets it to 1; the group closes (and this mode is popped)
     /// when a `)` brings `paren_depth` back to 0.
-    Extglob { paren_depth: u32 },
+    Extglob {
+        paren_depth: u32,
+    },
 }
 
 /// A checkpoint of the lexer's scanning state. `rewind` restores it and re-lexes
@@ -894,8 +1094,8 @@ pub(crate) enum Mode {
 /// the mode stack.
 #[derive(Debug, Clone)]
 pub(crate) struct Mark {
-    pos: usize,                 // self.pos (pull index) at mark time
-    resume: (usize, u32, u32),  // (offset, line, column) to resume scanning from
+    pos: usize,                // self.pos (pull index) at mark time
+    resume: (usize, u32, u32), // (offset, line, column) to resume scanning from
     brace_expand: bool,
     has_token: bool,
     in_assignment_value: bool,
@@ -1088,7 +1288,10 @@ impl<'a> Lexer<'a> {
     }
 
     pub(crate) fn current_mode(&self) -> Mode {
-        *self.modes.last().expect("mode stack is never empty (Command is the floor)")
+        *self
+            .modes
+            .last()
+            .expect("mode stack is never empty (Command is the floor)")
     }
 
     /// True when the top-of-stack mode is a `${…}` operand scanner currently
@@ -1112,10 +1315,19 @@ impl<'a> Lexer<'a> {
         matches!(
             self.modes.last(),
             Some(
-                Mode::ParamWordOperand            { in_dquote: true, .. }
-                | Mode::ParamSubstPatternOperand    { in_dquote: true, .. }
-                | Mode::ParamSubstringOffsetOperand { in_dquote: true, .. }
-                | Mode::ParamSubscriptOperand       { in_dquote: true, .. },
+                Mode::ParamWordOperand {
+                    in_dquote: true,
+                    ..
+                } | Mode::ParamSubstPatternOperand {
+                    in_dquote: true,
+                    ..
+                } | Mode::ParamSubstringOffsetOperand {
+                    in_dquote: true,
+                    ..
+                } | Mode::ParamSubscriptOperand {
+                    in_dquote: true,
+                    ..
+                },
             )
         )
     }
@@ -1211,7 +1423,10 @@ impl<'a> Lexer<'a> {
         // Guard BEFORE popping so the floor is protected even in release builds:
         // popping the last element would leave `modes` empty and make the next
         // `current_mode()` panic with a confusing message.
-        debug_assert!(self.modes.len() > 1, "Command is the floor and must never be popped");
+        debug_assert!(
+            self.modes.len() > 1,
+            "Command is the floor and must never be popped"
+        );
         let popped_depth = self.modes.len();
         let popped = self.modes.pop().expect("pop_mode on an empty mode stack");
         // Delayed heredoc across a comsub/backtick boundary: a `cat <<D` opened
@@ -1290,7 +1505,11 @@ impl<'a> Lexer<'a> {
             let s = self.history[self.pos].span;
             (s.offset, s.line, s.column)
         } else {
-            (self.cursor.offset(), self.cursor.line(), self.cursor.column())
+            (
+                self.cursor.offset(),
+                self.cursor.line(),
+                self.cursor.column(),
+            )
         };
         Mark {
             pos: self.pos,
@@ -1397,18 +1616,50 @@ impl<'a> Lexer<'a> {
         match self.current_mode() {
             Mode::Command => self.scan_step_command_atoms(),
             Mode::ParamExpansion { .. } => self.scan_step_param_head(),
-            Mode::ParamWordOperand            { in_dquote, enclosing_dquote } => self.scan_step_param_operand(None,      '}', in_dquote, enclosing_dquote),
-            Mode::ParamSubstPatternOperand    { in_dquote, enclosing_dquote } => self.scan_step_param_operand(Some('/'), '}', in_dquote, enclosing_dquote),
-            Mode::ParamSubstringOffsetOperand { in_dquote, enclosing_dquote } => self.scan_step_param_operand(Some(':'), '}', in_dquote, enclosing_dquote),
-            Mode::ParamSubscriptOperand       { in_dquote, enclosing_dquote } => self.scan_step_param_operand(None,      ']', in_dquote, enclosing_dquote),
+            Mode::ParamWordOperand {
+                in_dquote,
+                enclosing_dquote,
+            } => self.scan_step_param_operand(None, '}', in_dquote, enclosing_dquote),
+            Mode::ParamSubstPatternOperand {
+                in_dquote,
+                enclosing_dquote,
+            } => self.scan_step_param_operand(Some('/'), '}', in_dquote, enclosing_dquote),
+            Mode::ParamSubstringOffsetOperand {
+                in_dquote,
+                enclosing_dquote,
+            } => self.scan_step_param_operand(Some(':'), '}', in_dquote, enclosing_dquote),
+            Mode::ParamSubscriptOperand {
+                in_dquote,
+                enclosing_dquote,
+            } => self.scan_step_param_operand(None, ']', in_dquote, enclosing_dquote),
             Mode::CommandSub { body_started } => self.scan_step_command_sub(body_started),
             Mode::BacktickRaw => self.scan_step_backtick_raw(),
-            Mode::Arith { paren_depth, in_squote, in_dquote, body_started, for_header, delim } =>
-                self.scan_step_arith(paren_depth, in_squote, in_dquote, body_started, for_header, delim),
+            Mode::Arith {
+                paren_depth,
+                in_squote,
+                in_dquote,
+                body_started,
+                for_header,
+                delim,
+            } => self.scan_step_arith(
+                paren_depth,
+                in_squote,
+                in_dquote,
+                body_started,
+                for_header,
+                delim,
+            ),
             Mode::DoubleQuote { body_started } => self.scan_step_dquote(body_started),
-            Mode::ArrayLiteral { body_started, expect_subscript_eq, at_element_start, .. } =>
-                self.scan_step_array_literal(body_started, expect_subscript_eq, at_element_start),
-            Mode::Regex { paren_depth, body_started } => self.scan_step_regex(paren_depth, body_started),
+            Mode::ArrayLiteral {
+                body_started,
+                expect_subscript_eq,
+                at_element_start,
+                ..
+            } => self.scan_step_array_literal(body_started, expect_subscript_eq, at_element_start),
+            Mode::Regex {
+                paren_depth,
+                body_started,
+            } => self.scan_step_regex(paren_depth, body_started),
             Mode::Extglob { paren_depth } => self.scan_step_extglob(paren_depth),
         }
     }
@@ -1453,8 +1704,8 @@ impl<'a> Lexer<'a> {
             probe.next(); // skip `$`
             if probe.peek() == Some(&'{') {
                 let off = self.cursor.offset();
-                let l   = self.cursor.line();
-                let c   = self.cursor.column();
+                let l = self.cursor.line();
+                let c = self.cursor.column();
                 self.cursor.next(); // `$`
                 self.cursor.next(); // `{`
                 // seen_name is already false on the freshly-pushed frame; no reset
@@ -1463,7 +1714,10 @@ impl<'a> Lexer<'a> {
                 if let Some(Mode::ParamExpansion { start_off, .. }) = self.modes.last_mut() {
                     *start_off = off;
                 }
-                self.history.push(Token::new(TokenKind::ParamOpen { quoted: false }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::ParamOpen { quoted: false },
+                    Span::new(off, l, c),
+                ));
                 return Ok(Step::Produced);
             }
             // Cursor is at `$` but not followed by `{` — shouldn't happen in
@@ -1473,7 +1727,13 @@ impl<'a> Lexer<'a> {
 
         // Copy `seen_name` out of the mode frame so we don't hold a &mut borrow
         // across cursor work.
-        let seen_name = matches!(self.modes.last(), Some(Mode::ParamExpansion { seen_name: true, .. }));
+        let seen_name = matches!(
+            self.modes.last(),
+            Some(Mode::ParamExpansion {
+                seen_name: true,
+                ..
+            })
+        );
 
         // Shared helper: emit a deferred bad-substitution. Consumes the rest of
         // the `${…}` body through the matching `}` (depth/quote/`$'…'`-aware, via
@@ -1483,7 +1743,11 @@ impl<'a> Lexer<'a> {
         // `recover_bad_subst`. Usable from both Phase 1 (name) and Phase 2 (op).
         macro_rules! emit_bad_subst {
             () => {{
-                let sp = Span::new(self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                let sp = Span::new(
+                    self.cursor.offset(),
+                    self.cursor.line(),
+                    self.cursor.column(),
+                );
                 let start_off = match self.modes.last() {
                     Some(Mode::ParamExpansion { start_off, .. }) => *start_off,
                     _ => 0,
@@ -1493,7 +1757,8 @@ impl<'a> Lexer<'a> {
                 if let Some(Mode::ParamExpansion { seen_name, .. }) = self.modes.last_mut() {
                     *seen_name = true;
                 }
-                self.history.push(Token::new(TokenKind::ParamBadSubst { raw }, sp));
+                self.history
+                    .push(Token::new(TokenKind::ParamBadSubst { raw }, sp));
                 return Ok(Step::Produced);
             }};
         }
@@ -1501,8 +1766,8 @@ impl<'a> Lexer<'a> {
         // ── Phase 1: pre-name (emit prefix and/or ParamName) ─────────────────────
         if !seen_name {
             let off = self.cursor.offset();
-            let l   = self.cursor.line();
-            let c   = self.cursor.column();
+            let l = self.cursor.line();
+            let c = self.cursor.column();
 
             // Helper macro: mark the current ParamExpansion frame as having seen
             // a name, then push `tok` and return Produced. The `self.modes` write
@@ -1534,12 +1799,18 @@ impl<'a> Lexer<'a> {
                                 if !self.opts.in_dquote || !is_valid_param_name(&name) {
                                     emit_bad_subst!();
                                 }
-                                emit_param_name!(Token::new(TokenKind::ParamNameDecoded(name), Span::new(off, l, c)));
+                                emit_param_name!(Token::new(
+                                    TokenKind::ParamNameDecoded(name),
+                                    Span::new(off, l, c)
+                                ));
                             } else if name.is_empty() {
                                 // `${}` / `${'x'}` etc. — no name char → bad subst.
                                 emit_bad_subst!();
                             } else {
-                                emit_param_name!(Token::new(TokenKind::ParamName(name), Span::new(off, l, c)));
+                                emit_param_name!(Token::new(
+                                    TokenKind::ParamName(name),
+                                    Span::new(off, l, c)
+                                ));
                             }
                         }
                     }
@@ -1554,11 +1825,17 @@ impl<'a> Lexer<'a> {
                     if probe.peek() == Some(&'}') {
                         // Bare `${#}` — emit the `#` as the ParamName.
                         self.cursor.next();
-                        emit_param_name!(Token::new(TokenKind::ParamName("#".into()), Span::new(off, l, c)));
+                        emit_param_name!(Token::new(
+                            TokenKind::ParamName("#".into()),
+                            Span::new(off, l, c)
+                        ));
                     } else {
                         // `${#name}` — emit length prefix; name comes next call.
                         self.cursor.next();
-                        self.history.push(Token::new(TokenKind::ParamLengthPrefix, Span::new(off, l, c)));
+                        self.history.push(Token::new(
+                            TokenKind::ParamLengthPrefix,
+                            Span::new(off, l, c),
+                        ));
                     }
                     return Ok(Step::Produced);
                 }
@@ -1570,7 +1847,10 @@ impl<'a> Lexer<'a> {
                     if probe.peek() == Some(&'}') {
                         // Bare `${!}` — emit the `!` as the ParamName.
                         self.cursor.next();
-                        emit_param_name!(Token::new(TokenKind::ParamName("!".into()), Span::new(off, l, c)));
+                        emit_param_name!(Token::new(
+                            TokenKind::ParamName("!".into()),
+                            Span::new(off, l, c)
+                        ));
                     } else {
                         // `${!name…}` — emit indirect prefix; name comes next call.
                         // Record `indirect` in the frame so Phase 2 can route a
@@ -1579,7 +1859,8 @@ impl<'a> Lexer<'a> {
                         if let Some(Mode::ParamExpansion { indirect, .. }) = self.modes.last_mut() {
                             *indirect = true;
                         }
-                        self.history.push(Token::new(TokenKind::ParamIndirect, Span::new(off, l, c)));
+                        self.history
+                            .push(Token::new(TokenKind::ParamIndirect, Span::new(off, l, c)));
                     }
                     return Ok(Step::Produced);
                 }
@@ -1598,7 +1879,10 @@ impl<'a> Lexer<'a> {
                         // following non-modifier char is bad-subst'd in Phase 2.
                         _ => {
                             self.cursor.next();
-                            emit_param_name!(Token::new(TokenKind::ParamName("$".into()), Span::new(off, l, c)));
+                            emit_param_name!(Token::new(
+                                TokenKind::ParamName("$".into()),
+                                Span::new(off, l, c)
+                            ));
                         }
                     }
                 }
@@ -1607,14 +1891,22 @@ impl<'a> Lexer<'a> {
                 // These are consumed as the full name.
                 Some(sc @ ('@' | '*' | '-' | '?')) => {
                     self.cursor.next();
-                    emit_param_name!(Token::new(TokenKind::ParamName(sc.to_string()), Span::new(off, l, c)));
+                    emit_param_name!(Token::new(
+                        TokenKind::ParamName(sc.to_string()),
+                        Span::new(off, l, c)
+                    ));
                 }
 
                 // Positional parameter: ${1}, ${10}, ${42}
                 Some(d) if d.is_ascii_digit() => {
                     let mut name = String::new();
                     while let Some(&dc) = self.cursor.peek() {
-                        if dc.is_ascii_digit() { name.push(dc); self.cursor.next(); } else { break; }
+                        if dc.is_ascii_digit() {
+                            name.push(dc);
+                            self.cursor.next();
+                        } else {
+                            break;
+                        }
                     }
                     emit_param_name!(Token::new(TokenKind::ParamName(name), Span::new(off, l, c)));
                 }
@@ -1634,25 +1926,30 @@ impl<'a> Lexer<'a> {
 
         // ── Phase 2: post-name (emit LBracket, ParamOp, or ParamClose) ──────────
         let off = self.cursor.offset();
-        let l   = self.cursor.line();
-        let c   = self.cursor.column();
+        let l = self.cursor.line();
+        let c = self.cursor.column();
 
         // Was the `${!…}` indirect prefix emitted? Needed to route a trailing
         // `*}`/`@}` to the prefix-name form (`${!pfx*}` / `${!pfx@}`).
-        let indirect = matches!(self.modes.last(), Some(Mode::ParamExpansion { indirect: true, .. }));
+        let indirect = matches!(
+            self.modes.last(),
+            Some(Mode::ParamExpansion { indirect: true, .. })
+        );
 
         match self.cursor.peek().copied() {
             // Closing brace → ParamClose (bare name or after subscript/op).
             Some('}') => {
                 self.cursor.next();
-                self.history.push(Token::new(TokenKind::ParamClose, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::ParamClose, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
 
             // Subscript opener → LBracket; parser will push subscript mode.
             Some('[') => {
                 self.cursor.next();
-                self.history.push(Token::new(TokenKind::LBracket, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::LBracket, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
 
@@ -1660,29 +1957,75 @@ impl<'a> Lexer<'a> {
             Some(':') => {
                 self.cursor.next(); // consume `:`
                 let kind = match self.cursor.peek().copied() {
-                    Some('-') => { self.cursor.next(); ParamOpKind::UseDefault(true)    }
-                    Some('=') => { self.cursor.next(); ParamOpKind::AssignDefault(true) }
-                    Some('?') => { self.cursor.next(); ParamOpKind::ErrorIfUnset(true)  }
-                    Some('+') => { self.cursor.next(); ParamOpKind::UseAlternate(true)  }
+                    Some('-') => {
+                        self.cursor.next();
+                        ParamOpKind::UseDefault(true)
+                    }
+                    Some('=') => {
+                        self.cursor.next();
+                        ParamOpKind::AssignDefault(true)
+                    }
+                    Some('?') => {
+                        self.cursor.next();
+                        ParamOpKind::ErrorIfUnset(true)
+                    }
+                    Some('+') => {
+                        self.cursor.next();
+                        ParamOpKind::UseAlternate(true)
+                    }
                     // `:` not followed by one of the four → Substring; only `:` consumed.
-                    _         =>                       ParamOpKind::Substring,
+                    _ => ParamOpKind::Substring,
                 };
-                self.history.push(Token::new(TokenKind::ParamOp(kind), Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::ParamOp(kind), Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
 
             // Bare (non-colon) forms.
-            Some('-') => { self.cursor.next(); self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::UseDefault(false)),    Span::new(off, l, c))); Ok(Step::Produced) }
-            Some('=') => { self.cursor.next(); self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::AssignDefault(false)), Span::new(off, l, c))); Ok(Step::Produced) }
-            Some('?') => { self.cursor.next(); self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::ErrorIfUnset(false)),  Span::new(off, l, c))); Ok(Step::Produced) }
-            Some('+') => { self.cursor.next(); self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::UseAlternate(false)),  Span::new(off, l, c))); Ok(Step::Produced) }
+            Some('-') => {
+                self.cursor.next();
+                self.history.push(Token::new(
+                    TokenKind::ParamOp(ParamOpKind::UseDefault(false)),
+                    Span::new(off, l, c),
+                ));
+                Ok(Step::Produced)
+            }
+            Some('=') => {
+                self.cursor.next();
+                self.history.push(Token::new(
+                    TokenKind::ParamOp(ParamOpKind::AssignDefault(false)),
+                    Span::new(off, l, c),
+                ));
+                Ok(Step::Produced)
+            }
+            Some('?') => {
+                self.cursor.next();
+                self.history.push(Token::new(
+                    TokenKind::ParamOp(ParamOpKind::ErrorIfUnset(false)),
+                    Span::new(off, l, c),
+                ));
+                Ok(Step::Produced)
+            }
+            Some('+') => {
+                self.cursor.next();
+                self.history.push(Token::new(
+                    TokenKind::ParamOp(ParamOpKind::UseAlternate(false)),
+                    Span::new(off, l, c),
+                ));
+                Ok(Step::Produced)
+            }
 
             // `#` / `##` → RemovePrefix.
             Some('#') => {
                 self.cursor.next();
                 let longest = self.cursor.peek() == Some(&'#');
-                if longest { self.cursor.next(); }
-                self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::RemovePrefix(longest)), Span::new(off, l, c)));
+                if longest {
+                    self.cursor.next();
+                }
+                self.history.push(Token::new(
+                    TokenKind::ParamOp(ParamOpKind::RemovePrefix(longest)),
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
 
@@ -1690,8 +2033,13 @@ impl<'a> Lexer<'a> {
             Some('%') => {
                 self.cursor.next();
                 let longest = self.cursor.peek() == Some(&'%');
-                if longest { self.cursor.next(); }
-                self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::RemoveSuffix(longest)), Span::new(off, l, c)));
+                if longest {
+                    self.cursor.next();
+                }
+                self.history.push(Token::new(
+                    TokenKind::ParamOp(ParamOpKind::RemoveSuffix(longest)),
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
 
@@ -1703,12 +2051,21 @@ impl<'a> Lexer<'a> {
                     SubstKind::All
                 } else {
                     match self.cursor.peek().copied() {
-                        Some('#') => { self.cursor.next(); SubstKind::Prefix }
-                        Some('%') => { self.cursor.next(); SubstKind::Suffix }
-                        _         =>                       SubstKind::First
+                        Some('#') => {
+                            self.cursor.next();
+                            SubstKind::Prefix
+                        }
+                        Some('%') => {
+                            self.cursor.next();
+                            SubstKind::Suffix
+                        }
+                        _ => SubstKind::First,
                     }
                 };
-                self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::Substitute(kind)), Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::ParamOp(ParamOpKind::Substitute(kind)),
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
 
@@ -1716,8 +2073,13 @@ impl<'a> Lexer<'a> {
             Some('^') => {
                 self.cursor.next();
                 let all = self.cursor.peek() == Some(&'^');
-                if all { self.cursor.next(); }
-                self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::Case(CaseDirection::Upper, all)), Span::new(off, l, c)));
+                if all {
+                    self.cursor.next();
+                }
+                self.history.push(Token::new(
+                    TokenKind::ParamOp(ParamOpKind::Case(CaseDirection::Upper, all)),
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
 
@@ -1725,8 +2087,13 @@ impl<'a> Lexer<'a> {
             Some(',') => {
                 self.cursor.next();
                 let all = self.cursor.peek() == Some(&',');
-                if all { self.cursor.next(); }
-                self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::Case(CaseDirection::Lower, all)), Span::new(off, l, c)));
+                if all {
+                    self.cursor.next();
+                }
+                self.history.push(Token::new(
+                    TokenKind::ParamOp(ParamOpKind::Case(CaseDirection::Lower, all)),
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
 
@@ -1739,7 +2106,10 @@ impl<'a> Lexer<'a> {
                 if indirect && probe.peek() == Some(&'}') {
                     self.cursor.next(); // `*`
                     self.cursor.next(); // `}`
-                    self.history.push(Token::new(TokenKind::ParamPrefixClose { at: false }, Span::new(off, l, c)));
+                    self.history.push(Token::new(
+                        TokenKind::ParamPrefixClose { at: false },
+                        Span::new(off, l, c),
+                    ));
                     Ok(Step::Produced)
                 } else {
                     emit_bad_subst!()
@@ -1753,25 +2123,61 @@ impl<'a> Lexer<'a> {
                 // `${!pfx@}` — prefix-name expansion (at form).
                 if indirect && self.cursor.peek() == Some(&'}') {
                     self.cursor.next(); // `}`
-                    self.history.push(Token::new(TokenKind::ParamPrefixClose { at: true }, Span::new(off, l, c)));
+                    self.history.push(Token::new(
+                        TokenKind::ParamPrefixClose { at: true },
+                        Span::new(off, l, c),
+                    ));
                     return Ok(Step::Produced);
                 }
                 let transform_op = match self.cursor.peek().copied() {
-                    Some('P') => { self.cursor.next(); Some(TransformOp::PromptExpand) }
-                    Some('Q') => { self.cursor.next(); Some(TransformOp::Quote) }
-                    Some('U') => { self.cursor.next(); Some(TransformOp::Upper) }
-                    Some('L') => { self.cursor.next(); Some(TransformOp::Lower) }
-                    Some('u') => { self.cursor.next(); Some(TransformOp::UpperFirst) }
-                    Some('E') => { self.cursor.next(); Some(TransformOp::EscapeExpand) }
-                    Some('A') => { self.cursor.next(); Some(TransformOp::AssignDecl) }
-                    Some('K') => { self.cursor.next(); Some(TransformOp::KvString) }
-                    Some('k') => { self.cursor.next(); Some(TransformOp::KvWords) }
-                    Some('a') => { self.cursor.next(); Some(TransformOp::AttrFlags) }
-                    _         => None,
+                    Some('P') => {
+                        self.cursor.next();
+                        Some(TransformOp::PromptExpand)
+                    }
+                    Some('Q') => {
+                        self.cursor.next();
+                        Some(TransformOp::Quote)
+                    }
+                    Some('U') => {
+                        self.cursor.next();
+                        Some(TransformOp::Upper)
+                    }
+                    Some('L') => {
+                        self.cursor.next();
+                        Some(TransformOp::Lower)
+                    }
+                    Some('u') => {
+                        self.cursor.next();
+                        Some(TransformOp::UpperFirst)
+                    }
+                    Some('E') => {
+                        self.cursor.next();
+                        Some(TransformOp::EscapeExpand)
+                    }
+                    Some('A') => {
+                        self.cursor.next();
+                        Some(TransformOp::AssignDecl)
+                    }
+                    Some('K') => {
+                        self.cursor.next();
+                        Some(TransformOp::KvString)
+                    }
+                    Some('k') => {
+                        self.cursor.next();
+                        Some(TransformOp::KvWords)
+                    }
+                    Some('a') => {
+                        self.cursor.next();
+                        Some(TransformOp::AttrFlags)
+                    }
+                    _ => None,
                 };
                 match transform_op {
                     Some(op) => {
-                        self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::Transform(op)), Span::new(off, l, c)));
+                        self.history.push(Token::new(
+                            TokenKind::ParamOp(ParamOpKind::Transform(op)),
+                            Span::new(off, l, c),
+                        ));
                         Ok(Step::Produced)
                     }
                     // Unknown/missing op letter (`${V@}`, `${x@Z}`) — bad substitution.
@@ -1804,10 +2210,10 @@ impl<'a> Lexer<'a> {
     fn set_operand_in_dquote(&mut self, val: bool) {
         match self.modes.last_mut() {
             Some(
-                Mode::ParamWordOperand            { in_dquote, .. }
-                | Mode::ParamSubstPatternOperand    { in_dquote, .. }
+                Mode::ParamWordOperand { in_dquote, .. }
+                | Mode::ParamSubstPatternOperand { in_dquote, .. }
                 | Mode::ParamSubstringOffsetOperand { in_dquote, .. }
-                | Mode::ParamSubscriptOperand       { in_dquote, .. },
+                | Mode::ParamSubscriptOperand { in_dquote, .. },
             ) => *in_dquote = val,
             _ => {}
         }
@@ -1844,10 +2250,16 @@ impl<'a> Lexer<'a> {
     /// The critical invariant: inside a `"…"` span, `}`, `/`, `:`, etc. are treated
     /// as ordinary literals and are NOT emitted as `ParamClose`/`ParamSep`.  Only
     /// `"`, `$`, `` ` ``, and `\` are special.
-    fn scan_step_param_operand(&mut self, sep: Option<char>, end: char, in_dquote: bool, enclosing_dquote: bool) -> Result<Step, LexError> {
+    fn scan_step_param_operand(
+        &mut self,
+        sep: Option<char>,
+        end: char,
+        in_dquote: bool,
+        enclosing_dquote: bool,
+    ) -> Result<Step, LexError> {
         let off = self.cursor.offset();
-        let l   = self.cursor.line();
-        let c   = self.cursor.column();
+        let l = self.cursor.line();
+        let c = self.cursor.column();
 
         if in_dquote {
             // ── Inside a double-quoted span ───────────────────────────────────
@@ -1869,15 +2281,23 @@ impl<'a> Lexer<'a> {
                         Some(e @ ('$' | '`' | '"' | '\\')) => {
                             self.cursor.next();
                             self.history.push(Token::new(
-                                TokenKind::Lit { text: e.to_string(), quoted: true },
+                                TokenKind::Lit {
+                                    text: e.to_string(),
+                                    quoted: true,
+                                },
                                 Span::new(off, l, c),
                             ));
                         }
                         _ => {
                             let mut s = String::from("\\");
-                            if let Some(ch) = self.cursor.next() { s.push(ch); }
+                            if let Some(ch) = self.cursor.next() {
+                                s.push(ch);
+                            }
                             self.history.push(Token::new(
-                                TokenKind::Lit { text: s, quoted: true },
+                                TokenKind::Lit {
+                                    text: s,
+                                    quoted: true,
+                                },
                                 Span::new(off, l, c),
                             ));
                         }
@@ -1891,7 +2311,8 @@ impl<'a> Lexer<'a> {
                 // capture), then unescape + re-parse it (phases 2-3).
                 // Mirrors the CmdSubOpen-signal pattern for `$(` (v244 T4).
                 Some('`') => {
-                    self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+                    self.history
+                        .push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
                     return Ok(Step::Produced);
                 }
 
@@ -1906,7 +2327,10 @@ impl<'a> Lexer<'a> {
                         Some('{') => {
                             self.cursor.next(); // `$`
                             self.cursor.next(); // `{`
-                            self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(off, l, c)));
+                            self.history.push(Token::new(
+                                TokenKind::ParamOpen { quoted: true },
+                                Span::new(off, l, c),
+                            ));
                         }
                         Some('(') => {
                             // `$(cmd)` / `$((expr))` inside a CONTINUING `"…"` operand
@@ -1921,30 +2345,50 @@ impl<'a> Lexer<'a> {
                             let mut probe2 = probe.clone();
                             probe2.next(); // skip the first `(`
                             if probe2.peek() == Some(&'(') {
-                                self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
+                                self.history
+                                    .push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
                             } else {
-                                self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
+                                self.history
+                                    .push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
                             }
                         }
                         Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
                             self.cursor.next(); // `$`
                             self.cursor.next(); // special char
-                            self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: true }, Span::new(off, l, c)));
+                            self.history.push(Token::new(
+                                TokenKind::DollarName {
+                                    name: sp.to_string(),
+                                    quoted: true,
+                                },
+                                Span::new(off, l, c),
+                            ));
                         }
                         Some(d) if d.is_ascii_digit() => {
                             self.cursor.next(); // `$`
                             let digit = self.cursor.next().unwrap();
-                            self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: true }, Span::new(off, l, c)));
+                            self.history.push(Token::new(
+                                TokenKind::DollarName {
+                                    name: digit.to_string(),
+                                    quoted: true,
+                                },
+                                Span::new(off, l, c),
+                            ));
                         }
                         Some(nc) if is_name_start(nc) => {
                             self.cursor.next(); // `$`
                             let name = scan_var_name(&mut self.cursor);
-                            self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(off, l, c)));
+                            self.history.push(Token::new(
+                                TokenKind::DollarName { name, quoted: true },
+                                Span::new(off, l, c),
+                            ));
                         }
                         _ => {
                             self.cursor.next(); // lone `$`
                             self.history.push(Token::new(
-                                TokenKind::Lit { text: "$".into(), quoted: true },
+                                TokenKind::Lit {
+                                    text: "$".into(),
+                                    quoted: true,
+                                },
                                 Span::new(off, l, c),
                             ));
                         }
@@ -1956,7 +2400,9 @@ impl<'a> Lexer<'a> {
                 Some(_) => {
                     let mut text = String::new();
                     while let Some(&ch) = self.cursor.peek() {
-                        if matches!(ch, '"' | '$' | '`' | '\\') { break; }
+                        if matches!(ch, '"' | '$' | '`' | '\\') {
+                            break;
+                        }
                         text.push(ch);
                         self.cursor.next();
                     }
@@ -1977,7 +2423,11 @@ impl<'a> Lexer<'a> {
                 // Unquoted `end` char (`}` or `]`) — emit the matching close atom.
                 Some(ch) if ch == end => {
                     self.cursor.next();
-                    let kind = if end == '}' { TokenKind::ParamClose } else { TokenKind::RBracket };
+                    let kind = if end == '}' {
+                        TokenKind::ParamClose
+                    } else {
+                        TokenKind::RBracket
+                    };
                     self.history.push(Token::new(kind, Span::new(off, l, c)));
                     return Ok(Step::Produced);
                 }
@@ -1985,7 +2435,8 @@ impl<'a> Lexer<'a> {
                 // Unquoted separator char (`/` or `:`) — emit ParamSep.
                 Some(ch) if Some(ch) == sep => {
                     self.cursor.next();
-                    self.history.push(Token::new(TokenKind::ParamSep, Span::new(off, l, c)));
+                    self.history
+                        .push(Token::new(TokenKind::ParamSep, Span::new(off, l, c)));
                     return Ok(Step::Produced);
                 }
 
@@ -1998,7 +2449,10 @@ impl<'a> Lexer<'a> {
                         Some('{') => {
                             self.cursor.next(); // `$`
                             self.cursor.next(); // `{`
-                            self.history.push(Token::new(TokenKind::ParamOpen { quoted: false }, Span::new(off, l, c)));
+                            self.history.push(Token::new(
+                                TokenKind::ParamOpen { quoted: false },
+                                Span::new(off, l, c),
+                            ));
                         }
                         // `$(` — v244 T4: distinguish `$(cmd)` from `$((`.
                         // `probe` is cloned past `$`; peek() is at the first `(`.
@@ -2011,13 +2465,15 @@ impl<'a> Lexer<'a> {
                                 // ArithOpen signal (do NOT consume `$((`); cursor stays at
                                 // `$` so parse_arith_expansion (which pushes Mode::Arith,
                                 // whose first scan consumes `$((`) can own it.
-                                self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
+                                self.history
+                                    .push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
                             } else {
                                 // `$(cmd)` — emit CmdSubOpen SIGNAL without consuming `$(`.
                                 // Cursor stays at `$` so parse_command_sub (which pushes
                                 // Mode::CommandSub) can own consuming `$(` via
                                 // scan_step_command_sub(false).
-                                self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
+                                self.history
+                                    .push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
                             }
                         }
                         // `$[expr]` legacy arith (v258) — zero-width `LegacyArithOpen`
@@ -2025,7 +2481,8 @@ impl<'a> Lexer<'a> {
                         // above. parse_legacy_arith_expansion (which pushes
                         // Mode::Arith{delim:Bracket}) owns consuming `$[`.
                         Some('[') => {
-                            self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
+                            self.history
+                                .push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
                         }
                         // `$'…'` ANSI-C quoting — decode via the shared leaf and emit
                         // a `QuoteRun{AnsiC}` (parse_word wraps it in Quoted{AnsiC}).
@@ -2035,7 +2492,13 @@ impl<'a> Lexer<'a> {
                             self.cursor.next(); // `$`
                             self.cursor.next(); // `'`
                             let text = scan_ansi_c_quoted(&mut self.cursor)?;
-                            self.history.push(Token::new(TokenKind::QuoteRun { style: QuoteStyle::AnsiC, text }, Span::new(off, l, c)));
+                            self.history.push(Token::new(
+                                TokenKind::QuoteRun {
+                                    style: QuoteStyle::AnsiC,
+                                    text,
+                                },
+                                Span::new(off, l, c),
+                            ));
                         }
                         // `$"…"` locale quoting (identity) — drop the `$`, emit the
                         // zero-width BeginDquote (cursor left on `"`); mirrors the
@@ -2050,31 +2513,53 @@ impl<'a> Lexer<'a> {
                         // Only outside an enclosing double quote (in_dquote guard).
                         Some('"') if !in_dquote => {
                             self.cursor.next(); // consume `$` only, leave `"`
-                            self.history.push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
+                            self.history
+                                .push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
                         }
                         // Special single-char params: `$?` `$@` `$*` `$#` `$$` `$!` `$-`.
                         Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
                             self.cursor.next(); // `$`
                             self.cursor.next(); // special char
-                            self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: false }, Span::new(off, l, c)));
+                            self.history.push(Token::new(
+                                TokenKind::DollarName {
+                                    name: sp.to_string(),
+                                    quoted: false,
+                                },
+                                Span::new(off, l, c),
+                            ));
                         }
                         // Positional parameter: `$0`–`$9`.
                         Some(d) if d.is_ascii_digit() => {
                             self.cursor.next(); // `$`
                             let digit = self.cursor.next().unwrap();
-                            self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: false }, Span::new(off, l, c)));
+                            self.history.push(Token::new(
+                                TokenKind::DollarName {
+                                    name: digit.to_string(),
+                                    quoted: false,
+                                },
+                                Span::new(off, l, c),
+                            ));
                         }
                         // Regular variable name: `$name`.
                         Some(nc) if is_name_start(nc) => {
                             self.cursor.next(); // `$`
                             let name = scan_var_name(&mut self.cursor);
-                            self.history.push(Token::new(TokenKind::DollarName { name, quoted: false }, Span::new(off, l, c)));
+                            self.history.push(Token::new(
+                                TokenKind::DollarName {
+                                    name,
+                                    quoted: false,
+                                },
+                                Span::new(off, l, c),
+                            ));
                         }
                         // Lone `$` — literal.
                         _ => {
                             self.cursor.next();
                             self.history.push(Token::new(
-                                TokenKind::Lit { text: "$".into(), quoted: false },
+                                TokenKind::Lit {
+                                    text: "$".into(),
+                                    quoted: false,
+                                },
                                 Span::new(off, l, c),
                             ));
                         }
@@ -2088,7 +2573,8 @@ impl<'a> Lexer<'a> {
                 // capture), then unescape + re-parse it (phases 2-3).
                 // Mirrors the CmdSubOpen-signal pattern for `$(` (v244 T4).
                 Some('`') => {
-                    self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+                    self.history
+                        .push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
                     return Ok(Step::Produced);
                 }
 
@@ -2113,7 +2599,10 @@ impl<'a> Lexer<'a> {
                     // Quoted{Single} (oracle scan_subscript). Emit QuoteRun{Single}
                     // so parse_word wraps it; value families keep the flat Lit.
                     let tok = if end == ']' {
-                        TokenKind::QuoteRun { style: QuoteStyle::Single, text }
+                        TokenKind::QuoteRun {
+                            style: QuoteStyle::Single,
+                            text,
+                        }
                     } else {
                         TokenKind::Lit { text, quoted: true }
                     };
@@ -2137,13 +2626,14 @@ impl<'a> Lexer<'a> {
                     // the mode switch to Mode::DoubleQuote guarantees forward
                     // progress. Value families (end == '}') keep the flat inline.
                     if end == ']' {
-                        self.history.push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
+                        self.history
+                            .push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
                         return Ok(Step::Produced);
                     }
                     self.cursor.next(); // consume opening `"`
                     let in_off = self.cursor.offset();
-                    let in_l   = self.cursor.line();
-                    let in_c   = self.cursor.column();
+                    let in_l = self.cursor.line();
+                    let in_c = self.cursor.column();
                     match self.cursor.peek().copied() {
                         None => return Err(LexError::UnterminatedQuote),
 
@@ -2152,7 +2642,10 @@ impl<'a> Lexer<'a> {
                         Some('"') => {
                             self.cursor.next(); // consume closing `"`
                             self.history.push(Token::new(
-                                TokenKind::Lit { text: String::new(), quoted: true },
+                                TokenKind::Lit {
+                                    text: String::new(),
+                                    quoted: true,
+                                },
                                 Span::new(in_off, in_l, in_c),
                             ));
                             return Ok(Step::Produced);
@@ -2165,15 +2658,23 @@ impl<'a> Lexer<'a> {
                                 Some(e @ ('$' | '`' | '"' | '\\')) => {
                                     self.cursor.next();
                                     self.history.push(Token::new(
-                                        TokenKind::Lit { text: e.to_string(), quoted: true },
+                                        TokenKind::Lit {
+                                            text: e.to_string(),
+                                            quoted: true,
+                                        },
                                         Span::new(in_off, in_l, in_c),
                                     ));
                                 }
                                 _ => {
                                     let mut s = String::from("\\");
-                                    if let Some(ch) = self.cursor.next() { s.push(ch); }
+                                    if let Some(ch) = self.cursor.next() {
+                                        s.push(ch);
+                                    }
                                     self.history.push(Token::new(
-                                        TokenKind::Lit { text: s, quoted: true },
+                                        TokenKind::Lit {
+                                            text: s,
+                                            quoted: true,
+                                        },
                                         Span::new(in_off, in_l, in_c),
                                     ));
                                 }
@@ -2209,7 +2710,10 @@ impl<'a> Lexer<'a> {
                                     self.cursor.next(); // `{`
                                     // Emit ParamOpen; in_dquote=true survives the nested
                                     // ParamExpansion push/pop because it lives in our frame.
-                                    self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(in_off, in_l, in_c)));
+                                    self.history.push(Token::new(
+                                        TokenKind::ParamOpen { quoted: true },
+                                        Span::new(in_off, in_l, in_c),
+                                    ));
                                     self.set_operand_in_dquote(true);
                                 }
                                 Some('(') => {
@@ -2222,34 +2726,58 @@ impl<'a> Lexer<'a> {
                                     let mut probe2 = probe.clone();
                                     probe2.next(); // skip the first `(`
                                     if probe2.peek() == Some(&'(') {
-                                        self.history.push(Token::new(TokenKind::ArithOpen, Span::new(in_off, in_l, in_c)));
+                                        self.history.push(Token::new(
+                                            TokenKind::ArithOpen,
+                                            Span::new(in_off, in_l, in_c),
+                                        ));
                                     } else {
-                                        self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(in_off, in_l, in_c)));
+                                        self.history.push(Token::new(
+                                            TokenKind::CmdSubOpen,
+                                            Span::new(in_off, in_l, in_c),
+                                        ));
                                     }
                                     self.set_operand_in_dquote(true);
                                 }
                                 Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
                                     self.cursor.next(); // `$`
                                     self.cursor.next(); // special char
-                                    self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: true }, Span::new(in_off, in_l, in_c)));
+                                    self.history.push(Token::new(
+                                        TokenKind::DollarName {
+                                            name: sp.to_string(),
+                                            quoted: true,
+                                        },
+                                        Span::new(in_off, in_l, in_c),
+                                    ));
                                     self.set_operand_in_dquote(true);
                                 }
                                 Some(d) if d.is_ascii_digit() => {
                                     self.cursor.next(); // `$`
                                     let digit = self.cursor.next().unwrap();
-                                    self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: true }, Span::new(in_off, in_l, in_c)));
+                                    self.history.push(Token::new(
+                                        TokenKind::DollarName {
+                                            name: digit.to_string(),
+                                            quoted: true,
+                                        },
+                                        Span::new(in_off, in_l, in_c),
+                                    ));
                                     self.set_operand_in_dquote(true);
                                 }
                                 Some(nc) if is_name_start(nc) => {
                                     self.cursor.next(); // `$`
                                     let name = scan_var_name(&mut self.cursor);
-                                    self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(in_off, in_l, in_c)));
+                                    self.history.push(Token::new(
+                                        TokenKind::DollarName { name, quoted: true },
+                                        Span::new(in_off, in_l, in_c),
+                                    ));
                                     self.set_operand_in_dquote(true);
                                 }
                                 _ => {
                                     self.cursor.next(); // lone `$`
                                     self.history.push(Token::new(
-                                        TokenKind::Lit { text: "$".into(), quoted: true },
+                                        TokenKind::Lit {
+                                            text: "$".into(),
+                                            quoted: true,
+                                        },
                                         Span::new(in_off, in_l, in_c),
                                     ));
                                     self.set_operand_in_dquote(true);
@@ -2265,7 +2793,9 @@ impl<'a> Lexer<'a> {
                         Some(_) => {
                             let mut text = String::new();
                             while let Some(&ch) = self.cursor.peek() {
-                                if matches!(ch, '"' | '$' | '`' | '\\') { break; }
+                                if matches!(ch, '"' | '$' | '`' | '\\') {
+                                    break;
+                                }
                                 text.push(ch);
                                 self.cursor.next();
                             }
@@ -2278,7 +2808,7 @@ impl<'a> Lexer<'a> {
                             // in_dquote stays false; otherwise set in_dquote=true.
                             if self.cursor.peek() == Some(&'"') {
                                 self.cursor.next(); // consume closing `"`
-                                // in_dquote stays false — no frame update needed
+                            // in_dquote stays false — no frame update needed
                             } else {
                                 self.set_operand_in_dquote(true);
                             }
@@ -2300,15 +2830,23 @@ impl<'a> Lexer<'a> {
                         Some(e @ ('$' | '`' | '"' | '\\')) => {
                             self.cursor.next();
                             self.history.push(Token::new(
-                                TokenKind::Lit { text: e.to_string(), quoted: true },
+                                TokenKind::Lit {
+                                    text: e.to_string(),
+                                    quoted: true,
+                                },
                                 Span::new(off, l, c),
                             ));
                         }
                         _ => {
                             let mut s = String::from("\\");
-                            if let Some(ch) = self.cursor.next() { s.push(ch); }
+                            if let Some(ch) = self.cursor.next() {
+                                s.push(ch);
+                            }
                             self.history.push(Token::new(
-                                TokenKind::Lit { text: s, quoted: true },
+                                TokenKind::Lit {
+                                    text: s,
+                                    quoted: true,
+                                },
                                 Span::new(off, l, c),
                             ));
                         }
@@ -2322,7 +2860,7 @@ impl<'a> Lexer<'a> {
                     self.cursor.next(); // consume `\`
                     let text = match self.cursor.next() {
                         Some(ch) => ch.to_string(),
-                        None     => "\\".to_string(), // trailing `\` at EOF — keep as literal
+                        None => "\\".to_string(), // trailing `\` at EOF — keep as literal
                     };
                     self.history.push(Token::new(
                         TokenKind::Lit { text, quoted: true },
@@ -2349,9 +2887,13 @@ impl<'a> Lexer<'a> {
                     let mut text = String::new();
                     while let Some(&ch) = self.cursor.peek() {
                         let is_term = ch == end || Some(ch) == sep;
-                        if is_term { break; }
+                        if is_term {
+                            break;
+                        }
                         if ch == '\\' {
-                            if !enclosing_dquote { break; }
+                            if !enclosing_dquote {
+                                break;
+                            }
                             let mut probe = self.cursor.clone();
                             probe.next(); // skip `\`
                             match probe.peek().copied() {
@@ -2365,15 +2907,22 @@ impl<'a> Lexer<'a> {
                                 }
                             }
                         }
-                        if ch == '\'' && !enclosing_dquote { break; }
-                        if matches!(ch, '$' | '"' | '`') { break; }
+                        if ch == '\'' && !enclosing_dquote {
+                            break;
+                        }
+                        if matches!(ch, '$' | '"' | '`') {
+                            break;
+                        }
                         text.push(ch);
                         self.cursor.next();
                     }
                     // `text` is non-empty: the outer match arm matched `Some(_)` (a non-special
                     // char) so we consumed at least one char into the run above.
                     self.history.push(Token::new(
-                        TokenKind::Lit { text, quoted: false },
+                        TokenKind::Lit {
+                            text,
+                            quoted: false,
+                        },
                         Span::new(off, l, c),
                     ));
                     return Ok(Step::Produced);
@@ -2426,20 +2975,26 @@ impl<'a> Lexer<'a> {
         if !body_started {
             // Record position BEFORE consuming the opener.
             let off = self.cursor.offset();
-            let l   = self.cursor.line();
-            let c   = self.cursor.column();
+            let l = self.cursor.line();
+            let c = self.cursor.column();
             match self.cursor.peek().copied() {
                 Some('$') => {
                     self.cursor.next(); // consume `$`
                     // If the char after `$` is not `(`, defer gracefully.
                     if self.cursor.peek() != Some(&'(') {
-                        self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                        self.history.push(Token::new(
+                            TokenKind::DeferredExpansion,
+                            Span::new(off, l, c),
+                        ));
                         return Ok(Step::Produced);
                     }
                     self.cursor.next(); // consume `(`
                     if self.cursor.peek() == Some(&'(') && !self.retokenize_arith_as_cmdsub {
                         // `$((` — arithmetic expansion; defer to runtime.
-                        self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                        self.history.push(Token::new(
+                            TokenKind::DeferredExpansion,
+                            Span::new(off, l, c),
+                        ));
                         return Ok(Step::Produced);
                     }
                     // Either a real `$(cmd)`, OR the v246 wrinkle retry: treat `$((` as
@@ -2458,7 +3013,10 @@ impl<'a> Lexer<'a> {
                     // iteration), emit DeferredExpansion rather than panicking. This
                     // keeps the dormant CommandSub mode robust when tests call
                     // parse_command_sub with non-`$(`/non-`(` input.
-                    self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                    self.history.push(Token::new(
+                        TokenKind::DeferredExpansion,
+                        Span::new(off, l, c),
+                    ));
                     return Ok(Step::Produced);
                 }
             }
@@ -2472,7 +3030,8 @@ impl<'a> Lexer<'a> {
             // `!has_token`, which is fresh in the isolated body). Set it so the
             // first body atom is treated as word-start (comment / keyword / tilde).
             self.cmd_at_word_start = true;
-            self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
+            self.history
+                .push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
             Ok(Step::Produced)
         } else {
             // Body is Command-mode tokens; the parser owns the terminating `)`.
@@ -2498,17 +3057,22 @@ impl<'a> Lexer<'a> {
         if !self.backtick_raw_started {
             // ENTRY: consume the opening backtick and emit BeginBacktick.
             let off = self.cursor.offset();
-            let l   = self.cursor.line();
-            let c   = self.cursor.column();
-            debug_assert_eq!(self.cursor.peek(), Some(&'`'), "scan_step_backtick_raw entry: expected opening `");
+            let l = self.cursor.line();
+            let c = self.cursor.column();
+            debug_assert_eq!(
+                self.cursor.peek(),
+                Some(&'`'),
+                "scan_step_backtick_raw entry: expected opening `"
+            );
             self.cursor.next(); // consume the opening '`'
             self.backtick_raw_started = true;
-            self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+            self.history
+                .push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
             return Ok(Step::Produced);
         }
         let off = self.cursor.offset();
-        let l   = self.cursor.line();
-        let c   = self.cursor.column();
+        let l = self.cursor.line();
+        let c = self.cursor.column();
         match self.cursor.peek().copied() {
             None => {
                 // EOF before the close — unterminated; parser surfaces the error.
@@ -2517,7 +3081,8 @@ impl<'a> Lexer<'a> {
             Some('`') => {
                 // Bare unescaped backtick closes the body.
                 self.cursor.next(); // consume the closing '`'
-                self.history.push(Token::new(TokenKind::EndBacktick, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::EndBacktick, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
             Some('\\') => {
@@ -2530,7 +3095,10 @@ impl<'a> Lexer<'a> {
                     self.cursor.next(); // consume the escaped char
                     text.push(ch);
                 }
-                self.history.push(Token::new(TokenKind::BacktickRawText(text), Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::BacktickRawText(text),
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
             Some(_) => {
@@ -2543,7 +3111,10 @@ impl<'a> Lexer<'a> {
                     self.cursor.next();
                     text.push(ch);
                 }
-                self.history.push(Token::new(TokenKind::BacktickRawText(text), Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::BacktickRawText(text),
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
         }
@@ -2553,25 +3124,43 @@ impl<'a> Lexer<'a> {
     /// Emits `$((` (ArithOpen) on entry, then body atoms, then `))` (ArithClose).
     /// `for_header` (v256) additionally emits `ArithSemi` at a depth-0 `;`.
     /// `delim` (v258) selects `$((`/ArithClose(`))`) vs `$[`/LegacyArithOpen/ArithClose(`]`).
-    fn scan_step_arith(&mut self, paren_depth: u32, in_squote: bool, in_dquote: bool, body_started: bool, for_header: bool, delim: ArithDelim) -> Result<Step, LexError> {
+    fn scan_step_arith(
+        &mut self,
+        paren_depth: u32,
+        in_squote: bool,
+        in_dquote: bool,
+        body_started: bool,
+        for_header: bool,
+        delim: ArithDelim,
+    ) -> Result<Step, LexError> {
         if !body_started {
             let off = self.cursor.offset();
             let l = self.cursor.line();
             let c = self.cursor.column();
-            debug_assert_eq!(self.cursor.peek(), Some(&'$'), "scan_step_arith entry: expected `$` of `$((`/`$[`");
+            debug_assert_eq!(
+                self.cursor.peek(),
+                Some(&'$'),
+                "scan_step_arith entry: expected `$` of `$((`/`$[`"
+            );
             match delim {
                 ArithDelim::Paren => {
                     self.cursor.next(); // `$`
                     self.cursor.next(); // `(`
                     self.cursor.next(); // `(`
-                    if let Some(Mode::Arith { body_started, .. }) = self.modes.last_mut() { *body_started = true; }
-                    self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
+                    if let Some(Mode::Arith { body_started, .. }) = self.modes.last_mut() {
+                        *body_started = true;
+                    }
+                    self.history
+                        .push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
                 }
                 ArithDelim::Bracket => {
                     self.cursor.next(); // `$`
                     self.cursor.next(); // `[`
-                    if let Some(Mode::Arith { body_started, .. }) = self.modes.last_mut() { *body_started = true; }
-                    self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
+                    if let Some(Mode::Arith { body_started, .. }) = self.modes.last_mut() {
+                        *body_started = true;
+                    }
+                    self.history
+                        .push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
                 }
             }
             return Ok(Step::Produced);
@@ -2586,20 +3175,32 @@ impl<'a> Lexer<'a> {
         let mut text = String::new();
         let mut depth = paren_depth;
         // Helper: write `depth` back into the top Arith frame before returning.
-        macro_rules! sync_depth { () => {
-            if let Some(Mode::Arith { paren_depth, .. }) = self.modes.last_mut() { *paren_depth = depth; }
-        }; }
+        macro_rules! sync_depth {
+            () => {
+                if let Some(Mode::Arith { paren_depth, .. }) = self.modes.last_mut() {
+                    *paren_depth = depth;
+                }
+            };
+        }
         let mut squote = in_squote;
         let mut dquote = in_dquote;
         // Write the current quote-span state back to the top Arith frame. Called
         // on every `'`/`"` toggle so the flag survives a `$`/backtick sub-parse
         // round-trip WITHOUT adding a sync to every `return` site (mirrors how
         // `body_started` is set directly on the frame).
-        macro_rules! sync_quotes { () => {
-            if let Some(Mode::Arith { in_squote, in_dquote, .. }) = self.modes.last_mut() {
-                *in_squote = squote; *in_dquote = dquote;
-            }
-        }; }
+        macro_rules! sync_quotes {
+            () => {
+                if let Some(Mode::Arith {
+                    in_squote,
+                    in_dquote,
+                    ..
+                }) = self.modes.last_mut()
+                {
+                    *in_squote = squote;
+                    *in_dquote = dquote;
+                }
+            };
+        }
         let (open_char, close_char) = match delim {
             ArithDelim::Paren => ('(', ')'),
             ArithDelim::Bracket => ('[', ']'),
@@ -2618,7 +3219,10 @@ impl<'a> Lexer<'a> {
                     }
                     if !text.is_empty() {
                         sync_depth!();
-                        self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                        self.history.push(Token::new(
+                            TokenKind::Lit { text, quoted: true },
+                            Span::new(off, l, c),
+                        ));
                         return Ok(Step::Produced);
                     }
                     return Err(LexError::UnterminatedArith);
@@ -2658,22 +3262,35 @@ impl<'a> Lexer<'a> {
                     dquote = !dquote;
                     sync_quotes!();
                 }
-                Some(oc) if oc == open_char && (matches!(delim, ArithDelim::Paren) || (!squote && !dquote)) => {
+                Some(oc)
+                    if oc == open_char
+                        && (matches!(delim, ArithDelim::Paren) || (!squote && !dquote)) =>
+                {
                     self.cursor.next();
                     text.push(oc);
                     depth += 1;
                 }
-                Some(cc) if cc == close_char && depth > 0 && (matches!(delim, ArithDelim::Paren) || (!squote && !dquote)) => {
+                Some(cc)
+                    if cc == close_char
+                        && depth > 0
+                        && (matches!(delim, ArithDelim::Paren) || (!squote && !dquote)) =>
+                {
                     self.cursor.next();
                     text.push(cc);
                     depth -= 1;
                 }
-                Some(cc) if cc == close_char && (matches!(delim, ArithDelim::Paren) || (!squote && !dquote)) => {
+                Some(cc)
+                    if cc == close_char
+                        && (matches!(delim, ArithDelim::Paren) || (!squote && !dquote)) =>
+                {
                     // depth == 0: flush any pending literal FIRST (emit the
                     // terminator/bail on the NEXT call), else classify now.
                     if !text.is_empty() {
                         sync_depth!();
-                        self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                        self.history.push(Token::new(
+                            TokenKind::Lit { text, quoted: true },
+                            Span::new(off, l, c),
+                        ));
                         return Ok(Step::Produced);
                     }
                     let poff = self.cursor.offset();
@@ -2684,18 +3301,25 @@ impl<'a> Lexer<'a> {
                             if self.cursor.peek_nth(1) == Some(')') {
                                 self.cursor.next(); // first `)`
                                 self.cursor.next(); // second `)`
-                                self.history.push(Token::new(TokenKind::ArithClose, Span::new(poff, pl, pc)));
+                                self.history.push(Token::new(
+                                    TokenKind::ArithClose,
+                                    Span::new(poff, pl, pc),
+                                ));
                             } else {
                                 // NOT a `))` close — the `$( (…) )` wrinkle.  Do NOT
                                 // consume; the parser rewinds via ArithBail.
-                                self.history.push(Token::new(TokenKind::ArithBail, Span::new(poff, pl, pc)));
+                                self.history.push(Token::new(
+                                    TokenKind::ArithBail,
+                                    Span::new(poff, pl, pc),
+                                ));
                             }
                         }
                         ArithDelim::Bracket => {
                             // `$[ … ]` closes on a single depth-0 `]` (no `]]` check,
                             // no bail — `$[` has no `$( (` wrinkle).
                             self.cursor.next(); // `]`
-                            self.history.push(Token::new(TokenKind::ArithClose, Span::new(poff, pl, pc)));
+                            self.history
+                                .push(Token::new(TokenKind::ArithClose, Span::new(poff, pl, pc)));
                         }
                     }
                     return Ok(Step::Produced);
@@ -2703,11 +3327,17 @@ impl<'a> Lexer<'a> {
                 Some('`') if !squote => {
                     if !text.is_empty() {
                         sync_depth!();
-                        self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                        self.history.push(Token::new(
+                            TokenKind::Lit { text, quoted: true },
+                            Span::new(off, l, c),
+                        ));
                         return Ok(Step::Produced);
                     }
-                    let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
-                    self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(so, sl, sc)));
+                    let so = self.cursor.offset();
+                    let sl = self.cursor.line();
+                    let sc = self.cursor.column();
+                    self.history
+                        .push(Token::new(TokenKind::BeginBacktick, Span::new(so, sl, sc)));
                     return Ok(Step::Produced);
                 }
                 Some('$') if !squote => {
@@ -2723,13 +3353,21 @@ impl<'a> Lexer<'a> {
                         Some('{') => {
                             if !text.is_empty() {
                                 sync_depth!();
-                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                self.history.push(Token::new(
+                                    TokenKind::Lit { text, quoted: true },
+                                    Span::new(off, l, c),
+                                ));
                                 return Ok(Step::Produced);
                             }
-                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            let so = self.cursor.offset();
+                            let sl = self.cursor.line();
+                            let sc = self.cursor.column();
                             self.cursor.next(); // `$`
                             self.cursor.next(); // `{`
-                            self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(so, sl, sc)));
+                            self.history.push(Token::new(
+                                TokenKind::ParamOpen { quoted: true },
+                                Span::new(so, sl, sc),
+                            ));
                             return Ok(Step::Produced);
                         }
                         Some('(') => {
@@ -2738,19 +3376,26 @@ impl<'a> Lexer<'a> {
                             // cursor stays at `$`.
                             if !text.is_empty() {
                                 sync_depth!();
-                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                self.history.push(Token::new(
+                                    TokenKind::Lit { text, quoted: true },
+                                    Span::new(off, l, c),
+                                ));
                                 return Ok(Step::Produced);
                             }
-                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            let so = self.cursor.offset();
+                            let sl = self.cursor.line();
+                            let sc = self.cursor.column();
                             let mut p2 = self.cursor.clone();
                             p2.next(); // `$`
                             p2.next(); // first `(`
                             if p2.peek() == Some(&'(') {
                                 // `$((` nested arith — emit a zero-width ArithOpen signal.
-                                self.history.push(Token::new(TokenKind::ArithOpen, Span::new(so, sl, sc)));
+                                self.history
+                                    .push(Token::new(TokenKind::ArithOpen, Span::new(so, sl, sc)));
                             } else {
                                 // `$(` cmdsub — emit a zero-width CmdSubOpen signal.
-                                self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(so, sl, sc)));
+                                self.history
+                                    .push(Token::new(TokenKind::CmdSubOpen, Span::new(so, sl, sc)));
                             }
                             return Ok(Step::Produced);
                         }
@@ -2766,27 +3411,48 @@ impl<'a> Lexer<'a> {
                             // `!body_started` branch consumes the real `$[`).
                             if !text.is_empty() {
                                 sync_depth!();
-                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                self.history.push(Token::new(
+                                    TokenKind::Lit { text, quoted: true },
+                                    Span::new(off, l, c),
+                                ));
                                 return Ok(Step::Produced);
                             }
-                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
-                            self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(so, sl, sc)));
+                            let so = self.cursor.offset();
+                            let sl = self.cursor.line();
+                            let sc = self.cursor.column();
+                            self.history.push(Token::new(
+                                TokenKind::LegacyArithOpen,
+                                Span::new(so, sl, sc),
+                            ));
                             return Ok(Step::Produced);
                         }
                         Some(nc) if nc.is_ascii_alphabetic() || nc == '_' => {
                             // `$name` variable — consume `$` + name run, emit DollarName.
                             if !text.is_empty() {
                                 sync_depth!();
-                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                self.history.push(Token::new(
+                                    TokenKind::Lit { text, quoted: true },
+                                    Span::new(off, l, c),
+                                ));
                                 return Ok(Step::Produced);
                             }
-                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            let so = self.cursor.offset();
+                            let sl = self.cursor.line();
+                            let sc = self.cursor.column();
                             self.cursor.next(); // `$`
                             let mut name = String::new();
                             while let Some(ch) = self.cursor.peek().copied() {
-                                if ch.is_ascii_alphanumeric() || ch == '_' { name.push(ch); self.cursor.next(); } else { break; }
+                                if ch.is_ascii_alphanumeric() || ch == '_' {
+                                    name.push(ch);
+                                    self.cursor.next();
+                                } else {
+                                    break;
+                                }
                             }
-                            self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(so, sl, sc)));
+                            self.history.push(Token::new(
+                                TokenKind::DollarName { name, quoted: true },
+                                Span::new(so, sl, sc),
+                            ));
                             return Ok(Step::Produced);
                         }
                         Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
@@ -2800,13 +3466,24 @@ impl<'a> Lexer<'a> {
                             // parser change is needed here.
                             if !text.is_empty() {
                                 sync_depth!();
-                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                self.history.push(Token::new(
+                                    TokenKind::Lit { text, quoted: true },
+                                    Span::new(off, l, c),
+                                ));
                                 return Ok(Step::Produced);
                             }
-                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            let so = self.cursor.offset();
+                            let sl = self.cursor.line();
+                            let sc = self.cursor.column();
                             self.cursor.next(); // `$`
                             self.cursor.next(); // special char
-                            self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: true }, Span::new(so, sl, sc)));
+                            self.history.push(Token::new(
+                                TokenKind::DollarName {
+                                    name: sp.to_string(),
+                                    quoted: true,
+                                },
+                                Span::new(so, sl, sc),
+                            ));
                             return Ok(Step::Produced);
                         }
                         Some(d) if d.is_ascii_digit() => {
@@ -2818,13 +3495,24 @@ impl<'a> Lexer<'a> {
                             // dquote digit arm (~1145-1149) does the same.
                             if !text.is_empty() {
                                 sync_depth!();
-                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                self.history.push(Token::new(
+                                    TokenKind::Lit { text, quoted: true },
+                                    Span::new(off, l, c),
+                                ));
                                 return Ok(Step::Produced);
                             }
-                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            let so = self.cursor.offset();
+                            let sl = self.cursor.line();
+                            let sc = self.cursor.column();
                             self.cursor.next(); // `$`
                             let digit = self.cursor.next().unwrap();
-                            self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: true }, Span::new(so, sl, sc)));
+                            self.history.push(Token::new(
+                                TokenKind::DollarName {
+                                    name: digit.to_string(),
+                                    quoted: true,
+                                },
+                                Span::new(so, sl, sc),
+                            ));
                             return Ok(Step::Produced);
                         }
                         _ => {
@@ -2834,12 +3522,23 @@ impl<'a> Lexer<'a> {
                             // structure so `$(( 1 $ 2 ))`/`$(( $'x' ))` are byte-identical.
                             if !text.is_empty() {
                                 sync_depth!();
-                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                self.history.push(Token::new(
+                                    TokenKind::Lit { text, quoted: true },
+                                    Span::new(off, l, c),
+                                ));
                                 return Ok(Step::Produced);
                             }
-                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            let so = self.cursor.offset();
+                            let sl = self.cursor.line();
+                            let sc = self.cursor.column();
                             self.cursor.next(); // `$`
-                            self.history.push(Token::new(TokenKind::Lit { text: "$".into(), quoted: true }, Span::new(so, sl, sc)));
+                            self.history.push(Token::new(
+                                TokenKind::Lit {
+                                    text: "$".into(),
+                                    quoted: true,
+                                },
+                                Span::new(so, sl, sc),
+                            ));
                             return Ok(Step::Produced);
                         }
                     }
@@ -2852,8 +3551,13 @@ impl<'a> Lexer<'a> {
                         // reprocessed normally.
                         self.cursor.next(); // consume `\`
                         match self.cursor.peek().copied() {
-                            Some(n @ ('"' | '\\' | '$' | '`')) => { self.cursor.next(); text.push(n); }
-                            _ => { text.push('\\'); }
+                            Some(n @ ('"' | '\\' | '$' | '`')) => {
+                                self.cursor.next();
+                                text.push(n);
+                            }
+                            _ => {
+                                text.push('\\');
+                            }
                         }
                     } else {
                         match delim {
@@ -2879,7 +3583,10 @@ impl<'a> Lexer<'a> {
                                 // are left for the main loop to re-expand (matches pass 2);
                                 // `'`/`"` open a span (the pinned two-pass residual).
                                 match self.cursor.peek().copied() {
-                                    Some(nc @ (']' | '[' | '\\')) => { self.cursor.next(); text.push(nc); }
+                                    Some(nc @ (']' | '[' | '\\')) => {
+                                        self.cursor.next();
+                                        text.push(nc);
+                                    }
                                     _ => { /* do NOT consume — main loop re-processes */ }
                                 }
                             }
@@ -2898,12 +3605,18 @@ impl<'a> Lexer<'a> {
                     // call), exactly like the depth-0 `)` arm above.
                     if !text.is_empty() {
                         sync_depth!();
-                        self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                        self.history.push(Token::new(
+                            TokenKind::Lit { text, quoted: true },
+                            Span::new(off, l, c),
+                        ));
                         return Ok(Step::Produced);
                     }
-                    let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                    let so = self.cursor.offset();
+                    let sl = self.cursor.line();
+                    let sc = self.cursor.column();
                     self.cursor.next(); // consume `;`
-                    self.history.push(Token::new(TokenKind::ArithSemi, Span::new(so, sl, sc)));
+                    self.history
+                        .push(Token::new(TokenKind::ArithSemi, Span::new(so, sl, sc)));
                     return Ok(Step::Produced);
                 }
                 Some(ch) => {
@@ -2935,16 +3648,31 @@ impl<'a> Lexer<'a> {
         // is NOT an assignment.
         if self.pending_lvalue_subscript {
             self.pending_lvalue_subscript = false;
-            let off = self.cursor.offset(); let l = self.cursor.line(); let c = self.cursor.column();
+            let off = self.cursor.offset();
+            let l = self.cursor.line();
+            let c = self.cursor.column();
             match self.cursor.peek().copied() {
                 Some('=') => {
                     self.cursor.next();
-                    self.history.push(Token::new(TokenKind::AssignEq { append: false }, Span::new(off, l, c)));
+                    self.history.push(Token::new(
+                        TokenKind::AssignEq { append: false },
+                        Span::new(off, l, c),
+                    ));
                     return Ok(Step::Produced);
                 }
-                Some('+') if { let mut p = self.cursor.clone(); p.next(); p.peek() == Some(&'=') } => {
-                    self.cursor.next(); self.cursor.next(); // `+` `=`
-                    self.history.push(Token::new(TokenKind::AssignEq { append: true }, Span::new(off, l, c)));
+                Some('+')
+                    if {
+                        let mut p = self.cursor.clone();
+                        p.next();
+                        p.peek() == Some(&'=')
+                    } =>
+                {
+                    self.cursor.next();
+                    self.cursor.next(); // `+` `=`
+                    self.history.push(Token::new(
+                        TokenKind::AssignEq { append: true },
+                        Span::new(off, l, c),
+                    ));
                     return Ok(Step::Produced);
                 }
                 _ => { /* glob: fall through to normal scanning below */ }
@@ -2975,13 +3703,20 @@ impl<'a> Lexer<'a> {
         // whitespace char is a mere word boundary. So the atom `Blank` covers all
         // whitespace EXCEPT `\n`, which is its own `TokenKind::Newline` below.
         if matches!(self.cursor.peek(), Some(w) if w.is_whitespace() && *w != '\n') {
-            let off = self.cursor.offset(); let l = self.cursor.line(); let c = self.cursor.column();
-            while matches!(self.cursor.peek(), Some(w) if w.is_whitespace() && *w != '\n') { self.cursor.next(); }
-            self.history.push(Token::new(TokenKind::Blank, Span::new(off, l, c)));
+            let off = self.cursor.offset();
+            let l = self.cursor.line();
+            let c = self.cursor.column();
+            while matches!(self.cursor.peek(), Some(w) if w.is_whitespace() && *w != '\n') {
+                self.cursor.next();
+            }
+            self.history
+                .push(Token::new(TokenKind::Blank, Span::new(off, l, c)));
             self.boundary_reset();
             return Ok(Step::Produced);
         }
-        let off = self.cursor.offset(); let l = self.cursor.line(); let c = self.cursor.column();
+        let off = self.cursor.offset();
+        let l = self.cursor.line();
+        let c = self.cursor.column();
         match self.cursor.peek().copied() {
             None => self.finish(),
 
@@ -2989,7 +3724,8 @@ impl<'a> Lexer<'a> {
             // arm). Heredoc bodies are DEFERRED (v247): no `collect_heredoc_bodies`.
             Some('\n') => {
                 self.cursor.next();
-                self.history.push(Token::new(TokenKind::Newline, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::Newline, Span::new(off, l, c)));
                 self.boundary_reset();
                 // v250: pending heredoc bodies are emitted as atoms after this
                 // newline. Flip on the lexer-internal emission state; the next
@@ -3007,7 +3743,11 @@ impl<'a> Lexer<'a> {
                 if self.emitting_heredoc.is_none()
                     && self.atom_heredoc_idx_at_depth(self.modes.len()).is_some()
                 {
-                    self.emitting_heredoc = Some(HeredocEmit { began: false, at_line_start: true, trigger_depth: self.modes.len() });
+                    self.emitting_heredoc = Some(HeredocEmit {
+                        began: false,
+                        at_line_start: true,
+                        trigger_depth: self.modes.len(),
+                    });
                     self.heredoc_gen += 1; // v250 T6: emitting_heredoc changed (newline trigger)
                 }
                 Ok(Step::Produced)
@@ -3026,8 +3766,9 @@ impl<'a> Lexer<'a> {
             // the oracle emits (lexer.rs ~2245-2509). fd-prefixes (`3>`, `{fd}<`)
             // are handled in the word-run arm (which emits `RedirFd` in place of
             // the digit/`{ident}` `Lit`), so these arms never look back.
-            Some('|') | Some('&') | Some(';') | Some('(') | Some(')')
-            | Some('<') | Some('>') => self.scan_command_operator_atom(off, l, c),
+            Some('|') | Some('&') | Some(';') | Some('(') | Some(')') | Some('<') | Some('>') => {
+                self.scan_command_operator_atom(off, l, c)
+            }
 
             // Quoting + literal word text — one atom per call (`Lit` for a
             // maximal unquoted run, `QuoteRun` for one complete quoted run),
@@ -3041,7 +3782,9 @@ impl<'a> Lexer<'a> {
     /// in the FIFO; they are skipped so a cmdsub/backtick-body heredoc emits at
     /// its own body's newline. Within a depth, FIFO order is preserved.
     fn atom_heredoc_idx_at_depth(&self, depth: usize) -> Option<usize> {
-        self.atom_pending_heredocs.iter().position(|ph| ph.reg_depth == depth)
+        self.atom_pending_heredocs
+            .iter()
+            .position(|ph| ph.reg_depth == depth)
     }
 
     /// v250: emit atoms for the current `atom_pending_heredocs` body (the first
@@ -3055,15 +3798,24 @@ impl<'a> Lexer<'a> {
             Some(s) => s.trigger_depth,
             None => return self.scan_step_command_atoms(), // no-op guard
         };
-        let idx = self.atom_heredoc_idx_at_depth(depth).expect("emitting implies a pending entry at this depth");
+        let idx = self
+            .atom_heredoc_idx_at_depth(depth)
+            .expect("emitting implies a pending entry at this depth");
         let ph = self.atom_pending_heredocs[idx].clone();
         // Emit the Begin bracket for the current heredoc (carries `expand` so the
         // parser picks the literal vs expanding assembly).
         if !self.emitting_heredoc.as_ref().expect("emitting").began {
             self.emitting_heredoc.as_mut().expect("emitting").began = true;
             self.heredoc_gen += 1; // v250 T6 fix: emitting_heredoc.began flip is a state change
-            let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
-            self.history.push(Token::new(TokenKind::HeredocBodyBegin { expand: ph.expand }, Span::new(off, l, c)));
+            let (off, l, c) = (
+                self.cursor.offset(),
+                self.cursor.line(),
+                self.cursor.column(),
+            );
+            self.history.push(Token::new(
+                TokenKind::HeredocBodyBegin { expand: ph.expand },
+                Span::new(off, l, c),
+            ));
             return Ok(Step::Produced);
         }
         if ph.expand {
@@ -3079,7 +3831,11 @@ impl<'a> Lexer<'a> {
     /// PARSER (`push_heredoc_literal_lines`) splits that merged text back into the
     /// oracle's per-line `(content, "\n")` `Literal` pairs. No expansions.
     fn scan_step_heredoc_body_literal(&mut self, ph: &PendingHeredoc) -> Result<Step, LexError> {
-        let trigger_depth = self.emitting_heredoc.as_ref().map(|s| s.trigger_depth).unwrap_or(self.modes.len());
+        let trigger_depth = self
+            .emitting_heredoc
+            .as_ref()
+            .map(|s| s.trigger_depth)
+            .unwrap_or(self.modes.len());
         let mut body = String::new();
         loop {
             // Heredoc-inside-comsub/backtick: a prefix delimiter match at the line
@@ -3088,10 +3844,22 @@ impl<'a> Lexer<'a> {
             // `)` / `` ` `` scanner. Checked BEFORE reading the line so the tail
             // (`)` / `` ` `` / trailing text) is not swallowed into the body.
             if let Some(consume) = self.heredoc_comsub_prefix_terminates(ph, trigger_depth) {
-                for _ in 0..consume { self.cursor.next(); }
-                let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                for _ in 0..consume {
+                    self.cursor.next();
+                }
+                let (off, l, c) = (
+                    self.cursor.offset(),
+                    self.cursor.line(),
+                    self.cursor.column(),
+                );
                 if !body.is_empty() {
-                    self.history.push(Token::new(TokenKind::Lit { text: body, quoted: true }, Span::new(off, l, c)));
+                    self.history.push(Token::new(
+                        TokenKind::Lit {
+                            text: body,
+                            quoted: true,
+                        },
+                        Span::new(off, l, c),
+                    ));
                 }
                 self.emit_heredoc_body_end();
                 return Ok(Step::Produced);
@@ -3099,7 +3867,10 @@ impl<'a> Lexer<'a> {
             let mut line = String::new();
             let mut got_nl = false;
             while let Some(ch) = self.cursor.next() {
-                if ch == '\n' { got_nl = true; break; }
+                if ch == '\n' {
+                    got_nl = true;
+                    break;
+                }
                 line.push(ch);
             }
             // `<<-` matches a close line by its tab-stripped form OR its raw form
@@ -3107,12 +3878,26 @@ impl<'a> Lexer<'a> {
             // delimiter) matches a `\tEND` close line raw, but does NOT match a
             // bare `END` close line (bash strips the close line's tabs but keeps
             // the delimiter's — see heredoc3.sub + heredoc_dash_tab_delim harness).
-            let check = if ph.strip_tabs { line.trim_start_matches('\t') } else { &line[..] };
+            let check = if ph.strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                &line[..]
+            };
             if check == ph.delim || line == ph.delim {
                 // Close delimiter reached — emit the accumulated Lit + End, pop.
-                let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                let (off, l, c) = (
+                    self.cursor.offset(),
+                    self.cursor.line(),
+                    self.cursor.column(),
+                );
                 if !body.is_empty() {
-                    self.history.push(Token::new(TokenKind::Lit { text: body, quoted: true }, Span::new(off, l, c)));
+                    self.history.push(Token::new(
+                        TokenKind::Lit {
+                            text: body,
+                            quoted: true,
+                        },
+                        Span::new(off, l, c),
+                    ));
                 }
                 self.emit_heredoc_body_end();
                 return Ok(Step::Produced);
@@ -3125,20 +3910,38 @@ impl<'a> Lexer<'a> {
                 // and finish the body normally instead of erroring.
                 if self.opts.eof_closes_heredoc {
                     if !line.is_empty() {
-                        let body_line = if ph.strip_tabs { line.trim_start_matches('\t').to_string() } else { line };
+                        let body_line = if ph.strip_tabs {
+                            line.trim_start_matches('\t').to_string()
+                        } else {
+                            line
+                        };
                         body.push_str(&body_line);
                         body.push('\n');
                     }
-                    let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                    let (off, l, c) = (
+                        self.cursor.offset(),
+                        self.cursor.line(),
+                        self.cursor.column(),
+                    );
                     if !body.is_empty() {
-                        self.history.push(Token::new(TokenKind::Lit { text: body, quoted: true }, Span::new(off, l, c)));
+                        self.history.push(Token::new(
+                            TokenKind::Lit {
+                                text: body,
+                                quoted: true,
+                            },
+                            Span::new(off, l, c),
+                        ));
                     }
                     self.emit_heredoc_body_end();
                     return Ok(Step::Produced);
                 }
                 return Err(LexError::UnterminatedHeredoc);
             }
-            let body_line = if ph.strip_tabs { line.trim_start_matches('\t').to_string() } else { line };
+            let body_line = if ph.strip_tabs {
+                line.trim_start_matches('\t').to_string()
+            } else {
+                line
+            };
             body.push_str(&body_line);
             body.push('\n');
         }
@@ -3156,9 +3959,16 @@ impl<'a> Lexer<'a> {
     /// never a scan for a matching delimiter across the whole body).
     fn scan_step_heredoc_body_expanding(&mut self, ph: &PendingHeredoc) -> Result<Step, LexError> {
         // At a logical line start: strip `<<-` leading tabs, then the delimiter check.
-        if self.emitting_heredoc.as_ref().expect("emitting").at_line_start {
+        if self
+            .emitting_heredoc
+            .as_ref()
+            .expect("emitting")
+            .at_line_start
+        {
             if ph.strip_tabs {
-                while self.cursor.peek() == Some(&'\t') { self.cursor.next(); }
+                while self.cursor.peek() == Some(&'\t') {
+                    self.cursor.next();
+                }
             }
             if let Some(consume) = self.heredoc_at_delim_line(ph) {
                 // Consume EXACTLY the physical span `heredoc_at_delim_line` read on
@@ -3177,9 +3987,15 @@ impl<'a> Lexer<'a> {
             // Heredoc-inside-comsub/backtick: a prefix delimiter match terminates
             // the body, consuming ONLY the delimiter chars and leaving the rest of
             // the line (`)` / `` ` `` / trailing text) for the enclosing scanner.
-            let trigger_depth = self.emitting_heredoc.as_ref().expect("emitting").trigger_depth;
+            let trigger_depth = self
+                .emitting_heredoc
+                .as_ref()
+                .expect("emitting")
+                .trigger_depth;
             if let Some(consume) = self.heredoc_comsub_prefix_terminates(ph, trigger_depth) {
-                for _ in 0..consume { self.cursor.next(); }
+                for _ in 0..consume {
+                    self.cursor.next();
+                }
                 self.emit_heredoc_body_end();
                 return Ok(Step::Produced);
             }
@@ -3194,7 +4010,10 @@ impl<'a> Lexer<'a> {
                 self.emit_heredoc_body_end();
                 return Ok(Step::Produced);
             }
-            self.emitting_heredoc.as_mut().expect("emitting").at_line_start = false;
+            self.emitting_heredoc
+                .as_mut()
+                .expect("emitting")
+                .at_line_start = false;
             self.heredoc_gen += 1; // v250 T6 fix: emitting_heredoc.at_line_start flip is a state change
             // Fall through to emit the first atom of this body line.
         }
@@ -3209,7 +4028,13 @@ impl<'a> Lexer<'a> {
             // append the missing line separator (bash terminates the final line with
             // a `\n` even without a trailing newline in the source) and finish.
             None if self.opts.eof_closes_heredoc => {
-                self.history.push(Token::new(TokenKind::Lit { text: "\n".into(), quoted: true }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::Lit {
+                        text: "\n".into(),
+                        quoted: true,
+                    },
+                    Span::new(off, l, c),
+                ));
                 self.emit_heredoc_body_end();
                 Ok(Step::Produced)
             }
@@ -3218,8 +4043,17 @@ impl<'a> Lexer<'a> {
             // the line-start delimiter check for the next line.
             Some('\n') => {
                 self.cursor.next();
-                self.history.push(Token::new(TokenKind::Lit { text: "\n".into(), quoted: true }, Span::new(off, l, c)));
-                self.emitting_heredoc.as_mut().expect("emitting").at_line_start = true;
+                self.history.push(Token::new(
+                    TokenKind::Lit {
+                        text: "\n".into(),
+                        quoted: true,
+                    },
+                    Span::new(off, l, c),
+                ));
+                self.emitting_heredoc
+                    .as_mut()
+                    .expect("emitting")
+                    .at_line_start = true;
                 self.heredoc_gen += 1; // v250 T6 fix: emitting_heredoc.at_line_start flip is a state change
                 Ok(Step::Produced)
             }
@@ -3232,7 +4066,13 @@ impl<'a> Lexer<'a> {
                 match self.cursor.peek().copied() {
                     Some(e @ ('$' | '`' | '\\')) => {
                         self.cursor.next();
-                        self.history.push(Token::new(TokenKind::Lit { text: e.to_string(), quoted: true }, Span::new(off, l, c)));
+                        self.history.push(Token::new(
+                            TokenKind::Lit {
+                                text: e.to_string(),
+                                quoted: true,
+                            },
+                            Span::new(off, l, c),
+                        ));
                         Ok(Step::Produced)
                     }
                     Some('\n') => {
@@ -3243,14 +4083,21 @@ impl<'a> Lexer<'a> {
                         self.scan_step_heredoc_body_expanding(ph)
                     }
                     _ => {
-                        self.history.push(Token::new(TokenKind::Lit { text: "\\".into(), quoted: false }, Span::new(off, l, c)));
+                        self.history.push(Token::new(
+                            TokenKind::Lit {
+                                text: "\\".into(),
+                                quoted: false,
+                            },
+                            Span::new(off, l, c),
+                        ));
                         Ok(Step::Produced)
                     }
                 }
             }
             // Backtick command substitution — zero-width BeginBacktick signal.
             Some('`') => {
-                self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
             // `$`-expansion — same classification/emission as a `"…"` operand
@@ -3266,11 +4113,19 @@ impl<'a> Lexer<'a> {
             Some(_) => {
                 let mut text = String::new();
                 while let Some(&ch) = self.cursor.peek() {
-                    if matches!(ch, '\n' | '$' | '`' | '\\') { break; }
+                    if matches!(ch, '\n' | '$' | '`' | '\\') {
+                        break;
+                    }
                     text.push(ch);
                     self.cursor.next();
                 }
-                self.history.push(Token::new(TokenKind::Lit { text, quoted: false }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::Lit {
+                        text,
+                        quoted: false,
+                    },
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
         }
@@ -3280,20 +4135,33 @@ impl<'a> Lexer<'a> {
     /// (or clear) `emitting_heredoc` for the next queued body. Shared by the
     /// literal and expanding body emitters.
     fn emit_heredoc_body_end(&mut self) {
-        let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
-        self.history.push(Token::new(TokenKind::HeredocBodyEnd, Span::new(off, l, c)));
+        let (off, l, c) = (
+            self.cursor.offset(),
+            self.cursor.line(),
+            self.cursor.column(),
+        );
+        self.history
+            .push(Token::new(TokenKind::HeredocBodyEnd, Span::new(off, l, c)));
         // v264: remove the entry we just finished (the first at the emitting
         // depth — NOT necessarily the FIFO front, since a shallower outer-line
         // heredoc may sit ahead of a cmdsub/backtick-body one), then re-arm for
         // the NEXT same-depth entry (more heredocs on the same body line) or
         // clear when none remain at this depth.
-        let depth = self.emitting_heredoc.as_ref().map(|s| s.trigger_depth).unwrap_or_else(|| self.modes.len());
+        let depth = self
+            .emitting_heredoc
+            .as_ref()
+            .map(|s| s.trigger_depth)
+            .unwrap_or_else(|| self.modes.len());
         if let Some(idx) = self.atom_heredoc_idx_at_depth(depth) {
             self.atom_pending_heredocs.remove(idx);
         }
         self.heredoc_gen += 1; // v250 T6: atom_pending_heredocs/emitting_heredoc changed
         self.emitting_heredoc = if self.atom_heredoc_idx_at_depth(depth).is_some() {
-            Some(HeredocEmit { began: false, at_line_start: true, trigger_depth: depth })
+            Some(HeredocEmit {
+                began: false,
+                at_line_start: true,
+                trigger_depth: depth,
+            })
         } else {
             None
         };
@@ -3316,7 +4184,11 @@ impl<'a> Lexer<'a> {
     /// against the chars at the current line start. Returns `Some(n)` — the number
     /// of chars to advance the real cursor (leading `<<-` tabs + the delimiter) —
     /// on a prefix match, else `None`.
-    fn heredoc_comsub_prefix_terminates(&self, ph: &PendingHeredoc, trigger_depth: usize) -> Option<usize> {
+    fn heredoc_comsub_prefix_terminates(
+        &self,
+        ph: &PendingHeredoc,
+        trigger_depth: usize,
+    ) -> Option<usize> {
         match trigger_depth.checked_sub(1).and_then(|i| self.modes.get(i)) {
             Some(Mode::CommandSub { .. }) | Some(Mode::BacktickRaw) => {}
             _ => return None,
@@ -3324,10 +4196,15 @@ impl<'a> Lexer<'a> {
         let mut probe = self.cursor.clone();
         let mut consumed = 0usize;
         if ph.strip_tabs {
-            while probe.peek() == Some(&'\t') { probe.next(); consumed += 1; }
+            while probe.peek() == Some(&'\t') {
+                probe.next();
+                consumed += 1;
+            }
         }
         for dch in ph.delim.chars() {
-            if probe.next() != Some(dch) { return None; }
+            if probe.next() != Some(dch) {
+                return None;
+            }
             consumed += 1;
         }
         Some(consumed)
@@ -3350,8 +4227,15 @@ impl<'a> Lexer<'a> {
         let mut consumed = 0usize;
         loop {
             match probe.next() {
-                Some('\n') => { consumed += 1; got_nl = true; break; }
-                Some(ch) => { consumed += 1; line.push(ch); }
+                Some('\n') => {
+                    consumed += 1;
+                    got_nl = true;
+                    break;
+                }
+                Some(ch) => {
+                    consumed += 1;
+                    line.push(ch);
+                }
                 None => break,
             }
         }
@@ -3365,8 +4249,15 @@ impl<'a> Lexer<'a> {
             got_nl = false;
             loop {
                 match probe.next() {
-                    Some('\n') => { consumed += 1; got_nl = true; break; }
-                    Some(ch) => { consumed += 1; line.push(ch); }
+                    Some('\n') => {
+                        consumed += 1;
+                        got_nl = true;
+                        break;
+                    }
+                    Some(ch) => {
+                        consumed += 1;
+                        line.push(ch);
+                    }
                     None => break,
                 }
             }
@@ -3375,8 +4266,16 @@ impl<'a> Lexer<'a> {
         // a harmless no-op that also matches the oracle's whole-line strip.
         // See `scan_step_heredoc_body_literal`: `<<-` matches on the tab-stripped
         // OR the raw close line against the raw delimiter word.
-        let check = if ph.strip_tabs { line.trim_start_matches('\t') } else { &line[..] };
-        if check == ph.delim || line == ph.delim { Some(consumed) } else { None }
+        let check = if ph.strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            &line[..]
+        };
+        if check == ph.delim || line == ph.delim {
+            Some(consumed)
+        } else {
+            None
+        }
     }
 
     /// v250 T4: emit ONE atom for a `$`-expansion in a QUOTED operand context —
@@ -3395,41 +4294,65 @@ impl<'a> Lexer<'a> {
             Some('{') => {
                 self.cursor.next(); // `$`
                 self.cursor.next(); // `{`
-                self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::ParamOpen { quoted: true },
+                    Span::new(off, l, c),
+                ));
             }
             Some('(') => {
                 let mut probe2 = probe.clone();
                 probe2.next(); // skip first `(`
                 if probe2.peek() == Some(&'(') {
-                    self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
+                    self.history
+                        .push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
                 } else {
-                    self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
+                    self.history
+                        .push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
                 }
             }
             Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
                 self.cursor.next(); // `$`
                 self.cursor.next(); // special char
-                self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: true }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::DollarName {
+                        name: sp.to_string(),
+                        quoted: true,
+                    },
+                    Span::new(off, l, c),
+                ));
             }
             Some(d) if d.is_ascii_digit() => {
                 self.cursor.next(); // `$`
                 let digit = self.cursor.next().unwrap();
-                self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: true }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::DollarName {
+                        name: digit.to_string(),
+                        quoted: true,
+                    },
+                    Span::new(off, l, c),
+                ));
             }
             Some(nc) if is_name_start(nc) => {
                 self.cursor.next(); // `$`
                 let name = scan_var_name(&mut self.cursor);
-                self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::DollarName { name, quoted: true },
+                    Span::new(off, l, c),
+                ));
             }
             // `$[expr]` legacy arith (v258) — zero-width `LegacyArithOpen` signal
             // (cursor stays on `$`); the parser pushes Mode::Arith{delim:Bracket},
             // whose first scan consumes `$[` and emits the real LegacyArithOpen.
             Some('[') => {
-                self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
             }
             _ => {
                 self.cursor.next(); // lone `$`
-                self.history.push(Token::new(TokenKind::DollarLit { quoted: true }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::DollarLit { quoted: true },
+                    Span::new(off, l, c),
+                ));
             }
         }
     }
@@ -3451,11 +4374,16 @@ impl<'a> Lexer<'a> {
     /// NOT scan a body (deferred — the parser returns `UnsupportedCommand`).
     fn scan_command_operator_atom(&mut self, off: usize, l: u32, c: u32) -> Result<Step, LexError> {
         let first = self.cursor.next().expect("caller peeked an operator char");
-        macro_rules! push { ($k:expr) => {{ self.history.push(Token::new($k, Span::new(off, l, c))) }} }
+        macro_rules! push {
+            ($k:expr) => {{ self.history.push(Token::new($k, Span::new(off, l, c))) }};
+        }
         match first {
             '|' => {
                 match self.cursor.peek().copied() {
-                    Some('|') => { self.cursor.next(); push!(TokenKind::Op(Operator::Or)); }
+                    Some('|') => {
+                        self.cursor.next();
+                        push!(TokenKind::Op(Operator::Or));
+                    }
                     Some('&') => {
                         // `|&` desugars to `2>&1 |` (mirrors the oracle ~2254-2266).
                         // The `1` is emitted as a `Lit` atom (not a `Word`) so the
@@ -3463,14 +4391,20 @@ impl<'a> Lexer<'a> {
                         self.cursor.next();
                         push!(TokenKind::RedirFd(crate::command::RedirFd::Number(2)));
                         push!(TokenKind::Op(Operator::DupOut));
-                        push!(TokenKind::Lit { text: "1".to_string(), quoted: false });
+                        push!(TokenKind::Lit {
+                            text: "1".to_string(),
+                            quoted: false
+                        });
                         push!(TokenKind::Op(Operator::Pipe));
                     }
                     _ => push!(TokenKind::Op(Operator::Pipe)),
                 }
             }
             '&' => match self.cursor.peek().copied() {
-                Some('&') => { self.cursor.next(); push!(TokenKind::Op(Operator::And)); }
+                Some('&') => {
+                    self.cursor.next();
+                    push!(TokenKind::Op(Operator::And));
+                }
                 Some('>') => {
                     self.cursor.next();
                     if self.cursor.peek() == Some(&'>') {
@@ -3485,10 +4419,15 @@ impl<'a> Lexer<'a> {
             ';' => {
                 let op = if self.cursor.peek() == Some(&';') {
                     self.cursor.next();
-                    if self.cursor.peek() == Some(&'&') { self.cursor.next(); Operator::DoubleSemiAmp }
-                    else { Operator::DoubleSemi }
+                    if self.cursor.peek() == Some(&'&') {
+                        self.cursor.next();
+                        Operator::DoubleSemiAmp
+                    } else {
+                        Operator::DoubleSemi
+                    }
                 } else if self.cursor.peek() == Some(&'&') {
-                    self.cursor.next(); Operator::SemiAmp
+                    self.cursor.next();
+                    Operator::SemiAmp
                 } else {
                     Operator::Semi
                 };
@@ -3502,7 +4441,10 @@ impl<'a> Lexer<'a> {
                     // signal; DON'T consume `(` (Mode::CommandSub consumes it).
                     // Word continuation, so no boundary_reset: mark that a word
                     // has started (mirrors scan_command_word_atom emitting a Lit).
-                    self.history.push(Token::new(TokenKind::ProcSubOpen { dir: ProcDir::In }, Span::new(off, l, c)));
+                    self.history.push(Token::new(
+                        TokenKind::ProcSubOpen { dir: ProcDir::In },
+                        Span::new(off, l, c),
+                    ));
                     self.cmd_at_word_start = false;
                     return Ok(Step::Produced);
                 }
@@ -3521,31 +4463,59 @@ impl<'a> Lexer<'a> {
                         // next_is_redirect recognizes it unchanged. The parser
                         // still defers on any `Heredoc` token, so this is dormant.
                         let strip_tabs = if self.cursor.peek() == Some(&'-') {
-                            self.cursor.next(); true
-                        } else { false };
+                            self.cursor.next();
+                            true
+                        } else {
+                            false
+                        };
                         let (delim, expand) = parse_heredoc_delim(&mut self.cursor)?;
-                        push!(TokenKind::Heredoc { body: Word(Vec::new()), expand, strip_tabs });
+                        push!(TokenKind::Heredoc {
+                            body: Word(Vec::new()),
+                            expand,
+                            strip_tabs
+                        });
                         self.atom_pending_heredocs.push_back(PendingHeredoc {
-                            delim, expand, strip_tabs, token_idx: 0, // token_idx unused on the atom path
+                            delim,
+                            expand,
+                            strip_tabs,
+                            token_idx: 0, // token_idx unused on the atom path
                             reg_depth: self.modes.len(),
                         });
                         self.heredoc_gen += 1; // v250 T6: atom_pending_heredocs changed
                     }
                 }
-                Some('&') => { self.cursor.next(); push!(TokenKind::Op(Operator::DupIn)); }
-                Some('>') => { self.cursor.next(); push!(TokenKind::Op(Operator::RedirReadWrite)); }
+                Some('&') => {
+                    self.cursor.next();
+                    push!(TokenKind::Op(Operator::DupIn));
+                }
+                Some('>') => {
+                    self.cursor.next();
+                    push!(TokenKind::Op(Operator::RedirReadWrite));
+                }
                 _ => push!(TokenKind::Op(Operator::RedirIn)),
             },
             '>' => match self.cursor.peek().copied() {
                 Some('(') => {
                     // v251: `>(` process substitution — see the `<(` arm above.
-                    self.history.push(Token::new(TokenKind::ProcSubOpen { dir: ProcDir::Out }, Span::new(off, l, c)));
+                    self.history.push(Token::new(
+                        TokenKind::ProcSubOpen { dir: ProcDir::Out },
+                        Span::new(off, l, c),
+                    ));
                     self.cmd_at_word_start = false;
                     return Ok(Step::Produced);
                 }
-                Some('>') => { self.cursor.next(); push!(TokenKind::Op(Operator::RedirAppend)); }
-                Some('&') => { self.cursor.next(); push!(TokenKind::Op(Operator::DupOut)); }
-                Some('|') => { self.cursor.next(); push!(TokenKind::Op(Operator::RedirClobber)); }
+                Some('>') => {
+                    self.cursor.next();
+                    push!(TokenKind::Op(Operator::RedirAppend));
+                }
+                Some('&') => {
+                    self.cursor.next();
+                    push!(TokenKind::Op(Operator::DupOut));
+                }
+                Some('|') => {
+                    self.cursor.next();
+                    push!(TokenKind::Op(Operator::RedirClobber));
+                }
                 _ => push!(TokenKind::Op(Operator::RedirOut)),
             },
             _ => unreachable!("scan_command_operator_atom called on non-operator char"),
@@ -3586,8 +4556,8 @@ impl<'a> Lexer<'a> {
     /// sitting on one, so that block would be dead code anyway.
     fn scan_command_word_atom(&mut self, in_array_value: bool) -> Result<Step, LexError> {
         let off = self.cursor.offset();
-        let l   = self.cursor.line();
-        let c   = self.cursor.column();
+        let l = self.cursor.line();
+        let c = self.cursor.column();
         // A `~` is tilde-special only at word start (mirrors the oracle's
         // `!has_token` guard); capture the flag before it's cleared below.
         let at_word_start = self.cmd_at_word_start;
@@ -3622,7 +4592,10 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 self.history.push(Token::new(
-                    TokenKind::QuoteRun { style: QuoteStyle::Single, text },
+                    TokenKind::QuoteRun {
+                        style: QuoteStyle::Single,
+                        text,
+                    },
                     Span::new(off, l, c),
                 ));
                 Ok(Step::Produced)
@@ -3636,7 +4609,8 @@ impl<'a> Lexer<'a> {
             // ``/`$((…))` — instead of the T2 flat single-shot body scan.
             Some('"') => {
                 self.cmd_at_word_start = false;
-                self.history.push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
 
@@ -3650,7 +4624,10 @@ impl<'a> Lexer<'a> {
                     None => {
                         self.cmd_at_word_start = false;
                         self.history.push(Token::new(
-                            TokenKind::Lit { text: "\\".to_string(), quoted: false },
+                            TokenKind::Lit {
+                                text: "\\".to_string(),
+                                quoted: false,
+                            },
                             Span::new(off, l, c),
                         ));
                         Ok(Step::Produced)
@@ -3659,7 +4636,10 @@ impl<'a> Lexer<'a> {
                     Some(ch) => {
                         self.cmd_at_word_start = false;
                         self.history.push(Token::new(
-                            TokenKind::QuoteRun { style: QuoteStyle::Backslash, text: ch.to_string() },
+                            TokenKind::QuoteRun {
+                                style: QuoteStyle::Backslash,
+                                text: ch.to_string(),
+                            },
                             Span::new(off, l, c),
                         ));
                         Ok(Step::Produced)
@@ -3674,7 +4654,10 @@ impl<'a> Lexer<'a> {
                 self.cursor.next(); // `'`
                 let text = scan_ansi_c_quoted(&mut self.cursor)?;
                 self.history.push(Token::new(
-                    TokenKind::QuoteRun { style: QuoteStyle::AnsiC, text },
+                    TokenKind::QuoteRun {
+                        style: QuoteStyle::AnsiC,
+                        text,
+                    },
                     Span::new(off, l, c),
                 ));
                 Ok(Step::Produced)
@@ -3696,7 +4679,8 @@ impl<'a> Lexer<'a> {
             // `Mode::BacktickRaw`, whose entry scan consumes the opening `` ` ``).
             Some('`') => {
                 self.cmd_at_word_start = false;
-                self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
 
@@ -3708,12 +4692,16 @@ impl<'a> Lexer<'a> {
             // scan, pushed by the parser's `parse_extglob_group`). Checked before
             // the literal-run catch-all so the group is recognized first; with
             // extglob off this arm never matches and lexing is unchanged.
-            Some(pc) if (self.opts.extglob || self.extglob_forced_here())
-                && matches!(pc, '?' | '*' | '+' | '@' | '!')
-                && self.cursor.peek_nth(1) == Some('(') =>
+            Some(pc)
+                if (self.opts.extglob || self.extglob_forced_here())
+                    && matches!(pc, '?' | '*' | '+' | '@' | '!')
+                    && self.cursor.peek_nth(1) == Some('(') =>
             {
                 self.cmd_at_word_start = false;
-                self.history.push(Token::new(TokenKind::ExtglobOpen { prefix: pc }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::ExtglobOpen { prefix: pc },
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
 
@@ -3738,7 +4726,10 @@ impl<'a> Lexer<'a> {
                         // assignment-value branch; `!at_word_start` here means it
                         // came from the latter (after an unquoted `=`/`:`).
                         self.history.push(Token::new(
-                            TokenKind::Tilde { spec, assign_ctx: !at_word_start },
+                            TokenKind::Tilde {
+                                spec,
+                                assign_ctx: !at_word_start,
+                            },
                             Span::new(off, l, c),
                         ));
                     }
@@ -3746,7 +4737,10 @@ impl<'a> Lexer<'a> {
                         // Not a tilde construct — `~` is a literal (coalesced with
                         // any following literal run by the parser).
                         self.history.push(Token::new(
-                            TokenKind::Lit { text: "~".into(), quoted: false },
+                            TokenKind::Lit {
+                                text: "~".into(),
+                                quoted: false,
+                            },
                             Span::new(off, l, c),
                         ));
                     }
@@ -3777,7 +4771,9 @@ impl<'a> Lexer<'a> {
                     // tracking for a plain unquoted `(` in a value). `#` is NOT
                     // a stop char either way: mid-word it is literal (`a#b`); a
                     // word-start `#` is a comment, handled before this arm runs.
-                    if ch.is_whitespace() { break; }
+                    if ch.is_whitespace() {
+                        break;
+                    }
                     // v264 extglob: a mid-run `?*+@!` immediately followed by
                     // `(` must break WITHOUT consuming it, so the top-level
                     // match's dedicated trigger arm fires on the next call
@@ -3787,12 +4783,22 @@ impl<'a> Lexer<'a> {
                     if (self.opts.extglob || self.extglob_forced_here())
                         && matches!(ch, '?' | '*' | '+' | '@' | '!')
                         && self.cursor.peek_nth(1) == Some('(')
-                    { break; }
+                    {
+                        break;
+                    }
                     if in_array_value {
-                        if ch == ')' || matches!(ch, '\'' | '"' | '\\' | '$' | '`') { break; }
-                    } else if matches!(ch, '\'' | '"' | '\\' | '$' | '`'
-                                    | ';' | '|' | '&' | '<' | '>' | '(' | ')') { break; }
-                    if boundary && ch == '~' { break; }
+                        if ch == ')' || matches!(ch, '\'' | '"' | '\\' | '$' | '`') {
+                            break;
+                        }
+                    } else if matches!(
+                        ch,
+                        '\'' | '"' | '\\' | '$' | '`' | ';' | '|' | '&' | '<' | '>' | '(' | ')'
+                    ) {
+                        break;
+                    }
+                    if boundary && ch == '~' {
+                        break;
+                    }
                     text.push(ch);
                     self.cursor.next();
                     boundary = self.in_assignment_value && matches!(ch, '=' | ':');
@@ -3808,7 +4814,10 @@ impl<'a> Lexer<'a> {
                 // chars in an array value, the run never stops with the cursor
                 // sitting on one, so this block would never fire there anyway —
                 // `in_array_value` just documents that explicitly.
-                if !in_array_value && at_word_start && matches!(self.cursor.peek(), Some('<') | Some('>')) {
+                if !in_array_value
+                    && at_word_start
+                    && matches!(self.cursor.peek(), Some('<') | Some('>'))
+                {
                     // Oracle special-case: a bare `1` glued to `>` (`1>`, `1>>`,
                     // `1>&2`, `1>|`) is a plain STDOUT redirect with the DEFAULT
                     // fd — NOT `RedirFd(1)` (`scan_step_command`'s `'1' if peek=='>'`
@@ -3825,7 +4834,8 @@ impl<'a> Lexer<'a> {
                     }
                     if let Some(fd) = fd_prefix_of_text(&text) {
                         self.assign_val_tilde_ok = false;
-                        self.history.push(Token::new(TokenKind::RedirFd(fd), Span::new(off, l, c)));
+                        self.history
+                            .push(Token::new(TokenKind::RedirFd(fd), Span::new(off, l, c)));
                         return Ok(Step::Produced);
                     }
                 }
@@ -3838,7 +4848,10 @@ impl<'a> Lexer<'a> {
                 // the top-level scanner; a value-tilde `~` at the very start is
                 // routed to the `~` arm above), so the loop consumes ≥1 char.
                 self.history.push(Token::new(
-                    TokenKind::Lit { text, quoted: false },
+                    TokenKind::Lit {
+                        text,
+                        quoted: false,
+                    },
                     Span::new(off, l, c),
                 ));
                 Ok(Step::Produced)
@@ -3872,28 +4885,47 @@ impl<'a> Lexer<'a> {
     ///
     /// ARRAY LITERALS (`name=(…)`, `name+=(…)`, `name[i]=(…)`) are DEFERRED: the
     /// compound `(` RHS is left unconsumed for a later task (do NOT scan it here).
-    fn try_scan_assign_prefix(&mut self, off: usize, l: u32, c: u32) -> Result<Option<Step>, LexError> {
+    fn try_scan_assign_prefix(
+        &mut self,
+        off: usize,
+        l: u32,
+        c: u32,
+    ) -> Result<Option<Step>, LexError> {
         // The prefix must begin with an identifier: [A-Za-z_][A-Za-z0-9_]*.
-        let Some(first) = self.cursor.peek().copied() else { return Ok(None) };
-        if !is_name_start(first) { return Ok(None); }
+        let Some(first) = self.cursor.peek().copied() else {
+            return Ok(None);
+        };
+        if !is_name_start(first) {
+            return Ok(None);
+        }
         // Scan the maximal identifier on a probe (nothing is consumed yet).
         let mut probe = self.cursor.clone();
         let mut name = String::new();
         while let Some(&ch) = probe.peek() {
-            if is_name_cont(ch) { name.push(ch); probe.next(); } else { break; }
+            if is_name_cont(ch) {
+                name.push(ch);
+                probe.next();
+            } else {
+                break;
+            }
         }
         // Identifier chars are ASCII, so `name.len()` (bytes) == the char count.
         match probe.peek().copied() {
             // `name=` — plain scalar: emit `Lit { "name=" }`, no AssignPrefix.
             Some('=') => {
-                for _ in 0..name.len() { self.cursor.next(); }
+                for _ in 0..name.len() {
+                    self.cursor.next();
+                }
                 self.cursor.next(); // `=`
                 name.push('=');
                 self.cmd_at_word_start = false;
                 self.in_assignment_value = true;
                 self.assign_val_tilde_ok = true; // buffer now ends in `=`
                 self.history.push(Token::new(
-                    TokenKind::Lit { text: name, quoted: false },
+                    TokenKind::Lit {
+                        text: name,
+                        quoted: false,
+                    },
                     Span::new(off, l, c),
                 ));
                 // v252: compound array RHS `name=(...)`. A `\<NL>` may sit between
@@ -3902,8 +4934,13 @@ impl<'a> Lexer<'a> {
                 // pushes Mode::ArrayLiteral. Cursor is LEFT on `(`.
                 skip_line_continuations(&mut self.cursor);
                 if self.cursor.peek() == Some(&'(') {
-                    let (ao, al, ac) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
-                    self.history.push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
+                    let (ao, al, ac) = (
+                        self.cursor.offset(),
+                        self.cursor.line(),
+                        self.cursor.column(),
+                    );
+                    self.history
+                        .push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
                 }
                 Ok(Some(Step::Produced))
             }
@@ -3912,8 +4949,12 @@ impl<'a> Lexer<'a> {
             Some('+') => {
                 let mut p2 = probe.clone();
                 p2.next(); // `+`
-                if p2.peek() != Some(&'=') { return Ok(None); }
-                for _ in 0..name.len() { self.cursor.next(); }
+                if p2.peek() != Some(&'=') {
+                    return Ok(None);
+                }
+                for _ in 0..name.len() {
+                    self.cursor.next();
+                }
                 self.cursor.next(); // `+`
                 self.cursor.next(); // `=`
                 self.cmd_at_word_start = false;
@@ -3932,8 +4973,13 @@ impl<'a> Lexer<'a> {
                 // pushes Mode::ArrayLiteral. Cursor is LEFT on `(`.
                 skip_line_continuations(&mut self.cursor);
                 if self.cursor.peek() == Some(&'(') {
-                    let (ao, al, ac) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
-                    self.history.push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
+                    let (ao, al, ac) = (
+                        self.cursor.offset(),
+                        self.cursor.line(),
+                        self.cursor.column(),
+                    );
+                    self.history
+                        .push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
                 }
                 Ok(Some(Step::Produced))
             }
@@ -3943,13 +4989,26 @@ impl<'a> Lexer<'a> {
             // let the PARSER assemble the subscript and decide by the trailing
             // `AssignEq` (v268 — severs the old forward-scan + parse_fragment_word).
             Some('[') => {
-                for _ in 0..name.len() { self.cursor.next(); }
+                for _ in 0..name.len() {
+                    self.cursor.next();
+                }
                 self.cursor.next(); // consume `[`
                 self.cmd_at_word_start = false;
                 self.pending_lvalue_subscript = true;
-                self.history.push(Token::new(TokenKind::Lit { text: name, quoted: false }, Span::new(off, l, c)));
-                let (bo, bl, bc) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
-                self.history.push(Token::new(TokenKind::LBracket, Span::new(bo, bl, bc)));
+                self.history.push(Token::new(
+                    TokenKind::Lit {
+                        text: name,
+                        quoted: false,
+                    },
+                    Span::new(off, l, c),
+                ));
+                let (bo, bl, bc) = (
+                    self.cursor.offset(),
+                    self.cursor.line(),
+                    self.cursor.column(),
+                );
+                self.history
+                    .push(Token::new(TokenKind::LBracket, Span::new(bo, bl, bc)));
                 Ok(Some(Step::Produced))
             }
             _ => Ok(None),
@@ -3967,8 +5026,13 @@ impl<'a> Lexer<'a> {
         self.assign_val_tilde_ok = true;
         skip_line_continuations(&mut self.cursor);
         if self.cursor.peek() == Some(&'(') {
-            let (ao, al, ac) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
-            self.history.push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
+            let (ao, al, ac) = (
+                self.cursor.offset(),
+                self.cursor.line(),
+                self.cursor.column(),
+            );
+            self.history
+                .push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
         }
     }
 
@@ -3988,7 +5052,11 @@ impl<'a> Lexer<'a> {
     fn scan_step_dquote(&mut self, body_started: bool) -> Result<Step, LexError> {
         if !body_started {
             // Consume the opening `"` and flip the frame to the body phase.
-            debug_assert_eq!(self.cursor.peek(), Some(&'"'), "scan_step_dquote entry: expected opening \"");
+            debug_assert_eq!(
+                self.cursor.peek(),
+                Some(&'"'),
+                "scan_step_dquote entry: expected opening \""
+            );
             self.cursor.next(); // consume opening `"`
             if let Some(Mode::DoubleQuote { body_started }) = self.modes.last_mut() {
                 *body_started = true;
@@ -3996,15 +5064,16 @@ impl<'a> Lexer<'a> {
             // Fall through to scan the first inner atom.
         }
         let off = self.cursor.offset();
-        let l   = self.cursor.line();
-        let c   = self.cursor.column();
+        let l = self.cursor.line();
+        let c = self.cursor.column();
         match self.cursor.peek().copied() {
             None => Err(LexError::UnterminatedQuote),
 
             // Closing `"` — emit EndDquote; the parser pops the DoubleQuote frame.
             Some('"') => {
                 self.cursor.next(); // consume closing `"`
-                self.history.push(Token::new(TokenKind::EndDquote, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::EndDquote, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
 
@@ -4016,7 +5085,10 @@ impl<'a> Lexer<'a> {
                     Some(e @ ('$' | '`' | '"' | '\\')) => {
                         self.cursor.next();
                         self.history.push(Token::new(
-                            TokenKind::Lit { text: e.to_string(), quoted: true },
+                            TokenKind::Lit {
+                                text: e.to_string(),
+                                quoted: true,
+                            },
                             Span::new(off, l, c),
                         ));
                     }
@@ -4025,9 +5097,14 @@ impl<'a> Lexer<'a> {
                     }
                     _ => {
                         let mut s = String::from("\\");
-                        if let Some(ch) = self.cursor.next() { s.push(ch); }
+                        if let Some(ch) = self.cursor.next() {
+                            s.push(ch);
+                        }
                         self.history.push(Token::new(
-                            TokenKind::Lit { text: s, quoted: true },
+                            TokenKind::Lit {
+                                text: s,
+                                quoted: true,
+                            },
                             Span::new(off, l, c),
                         ));
                     }
@@ -4037,7 +5114,8 @@ impl<'a> Lexer<'a> {
 
             // Backtick command substitution — zero-width BeginBacktick signal.
             Some('`') => {
-                self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
 
@@ -4053,7 +5131,9 @@ impl<'a> Lexer<'a> {
             Some(_) => {
                 let mut text = String::new();
                 while let Some(&ch) = self.cursor.peek() {
-                    if matches!(ch, '"' | '$' | '`' | '\\') { break; }
+                    if matches!(ch, '"' | '$' | '`' | '\\') {
+                        break;
+                    }
                     text.push(ch);
                     self.cursor.next();
                 }
@@ -4079,33 +5159,56 @@ impl<'a> Lexer<'a> {
             Some('{') => {
                 self.cursor.next(); // `$`
                 self.cursor.next(); // `{`
-                self.history.push(Token::new(TokenKind::ParamOpen { quoted: false }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::ParamOpen { quoted: false },
+                    Span::new(off, l, c),
+                ));
             }
             Some('(') => {
                 let mut probe2 = probe.clone();
                 probe2.next(); // skip first `(`
                 if probe2.peek() == Some(&'(') {
                     // `$((` — zero-width ArithOpen signal (cursor stays on `$`).
-                    self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
+                    self.history
+                        .push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
                 } else {
                     // `$(cmd)` — zero-width CmdSubOpen signal (cursor stays on `$`).
-                    self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
+                    self.history
+                        .push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
                 }
             }
             Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
                 self.cursor.next(); // `$`
                 self.cursor.next(); // special char
-                self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: false }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::DollarName {
+                        name: sp.to_string(),
+                        quoted: false,
+                    },
+                    Span::new(off, l, c),
+                ));
             }
             Some(d) if d.is_ascii_digit() => {
                 self.cursor.next(); // `$`
                 let digit = self.cursor.next().unwrap();
-                self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: false }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::DollarName {
+                        name: digit.to_string(),
+                        quoted: false,
+                    },
+                    Span::new(off, l, c),
+                ));
             }
             Some(nc) if is_name_start(nc) => {
                 self.cursor.next(); // `$`
                 let name = scan_var_name(&mut self.cursor);
-                self.history.push(Token::new(TokenKind::DollarName { name, quoted: false }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::DollarName {
+                        name,
+                        quoted: false,
+                    },
+                    Span::new(off, l, c),
+                ));
             }
             // `$"…"` — bash locale quoting; huck's translation is the identity,
             // so `$"…" ≡ "…"`. Drop the `$` and emit the zero-width BeginDquote
@@ -4114,13 +5217,15 @@ impl<'a> Lexer<'a> {
             // scan_dollar_expansion's `Some('"') if !quoted => {}`.)
             Some('"') => {
                 self.cursor.next(); // consume `$` only, leave `"`
-                self.history.push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
             }
             // `$[expr]` legacy arith (v258) — zero-width `LegacyArithOpen` signal
             // (cursor stays on `$`); the parser pushes Mode::Arith{delim:Bracket},
             // whose first scan consumes `$[` and emits the real LegacyArithOpen.
             Some('[') => {
-                self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
             }
             _ => {
                 self.cursor.next(); // lone `$`
@@ -4147,16 +5252,21 @@ impl<'a> Lexer<'a> {
     ///    (leading whitespace while `!body_started` is skipped, not a terminator).
     fn scan_step_regex(&mut self, paren_depth: u32, body_started: bool) -> Result<Step, LexError> {
         let off = self.cursor.offset();
-        let l   = self.cursor.line();
-        let c   = self.cursor.column();
+        let l = self.cursor.line();
+        let c = self.cursor.column();
 
         // Leading-whitespace / continuation skip while the operand is still empty.
         if !body_started {
             loop {
                 match self.cursor.peek().copied() {
-                    Some(ch) if ch.is_whitespace() => { self.cursor.next(); }
+                    Some(ch) if ch.is_whitespace() => {
+                        self.cursor.next();
+                    }
                     // `\<NL>` continuation before any operand content.
-                    Some('\\') if self.cursor.peek_nth(1) == Some('\n') => { self.cursor.next(); self.cursor.next(); }
+                    Some('\\') if self.cursor.peek_nth(1) == Some('\n') => {
+                        self.cursor.next();
+                        self.cursor.next();
+                    }
                     _ => break,
                 }
             }
@@ -4164,10 +5274,16 @@ impl<'a> Lexer<'a> {
 
         // Terminator: EOF or depth-0 whitespace ends the operand.
         match self.cursor.peek().copied() {
-            None => { self.pop_mode(); self.history.push(Token::new(TokenKind::RegexEnd, Span::new(off, l, c))); return Ok(Step::Produced); }
+            None => {
+                self.pop_mode();
+                self.history
+                    .push(Token::new(TokenKind::RegexEnd, Span::new(off, l, c)));
+                return Ok(Step::Produced);
+            }
             Some(ch) if ch.is_whitespace() && paren_depth == 0 => {
                 self.pop_mode();
-                self.history.push(Token::new(TokenKind::RegexEnd, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::RegexEnd, Span::new(off, l, c)));
                 return Ok(Step::Produced);
             }
             _ => {}
@@ -4197,22 +5313,46 @@ impl<'a> Lexer<'a> {
                         Some(ch) => text.push(ch),
                     }
                 }
-                self.history.push(Token::new(TokenKind::QuoteRun { style: QuoteStyle::Single, text }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::QuoteRun {
+                        style: QuoteStyle::Single,
+                        text,
+                    },
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
             // Double-quoted span → zero-width BeginDquote (parser pushes Mode::DoubleQuote).
-            Some('"') => { self.history.push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c))); Ok(Step::Produced) }
+            Some('"') => {
+                self.history
+                    .push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
             // `$'…'` ANSI-C (must precede the general `$` arm).
             Some('$') if self.cursor.peek_nth(1) == Some('\'') => {
-                self.cursor.next(); self.cursor.next();
+                self.cursor.next();
+                self.cursor.next();
                 let text = scan_ansi_c_quoted(&mut self.cursor)?;
-                self.history.push(Token::new(TokenKind::QuoteRun { style: QuoteStyle::AnsiC, text }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::QuoteRun {
+                        style: QuoteStyle::AnsiC,
+                        text,
+                    },
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
             // `$…` — same unquoted classification the command scanner uses.
-            Some('$') => { self.emit_unquoted_dollar_atom(off, l, c); Ok(Step::Produced) }
+            Some('$') => {
+                self.emit_unquoted_dollar_atom(off, l, c);
+                Ok(Step::Produced)
+            }
             // Backtick command-sub → zero-width BeginBacktick.
-            Some('`') => { self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c))); Ok(Step::Produced) }
+            Some('`') => {
+                self.history
+                    .push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
             // Literal run (incl. `| < > ; &`, depth-tracked `( )`, `\`-escapes,
             // and depth>0 whitespace). Stops at an expansion/quote opener, at
             // depth-0 whitespace, or EOF (the outer match re-enters).
@@ -4221,30 +5361,52 @@ impl<'a> Lexer<'a> {
                 let mut depth = paren_depth;
                 while let Some(&ch) = self.cursor.peek() {
                     match ch {
-                        '\'' | '"' | '`' => break,           // quote/backtick openers
-                        '$' => break,                        // expansion opener
+                        '\'' | '"' | '`' => break,                       // quote/backtick openers
+                        '$' => break,                                    // expansion opener
                         c2 if c2.is_whitespace() && depth == 0 => break, // terminator
                         '\\' => {
-                            self.cursor.next();              // consume `\`
+                            self.cursor.next(); // consume `\`
                             match self.cursor.next() {
-                                Some('\n') => {}             // line continuation: delete both
-                                Some(next) => { text.push('\\'); text.push(next); }
+                                Some('\n') => {} // line continuation: delete both
+                                Some(next) => {
+                                    text.push('\\');
+                                    text.push(next);
+                                }
                                 None => text.push('\\'),
                             }
                         }
-                        '(' => { text.push('('); depth += 1; self.cursor.next(); }
-                        ')' => { text.push(')'); depth = depth.saturating_sub(1); self.cursor.next(); }
-                        _   => { text.push(ch); self.cursor.next(); } // incl. | < > ; & and depth>0 ws
+                        '(' => {
+                            text.push('(');
+                            depth += 1;
+                            self.cursor.next();
+                        }
+                        ')' => {
+                            text.push(')');
+                            depth = depth.saturating_sub(1);
+                            self.cursor.next();
+                        }
+                        _ => {
+                            text.push(ch);
+                            self.cursor.next();
+                        } // incl. | < > ; & and depth>0 ws
                     }
                 }
                 // Persist the running paren depth on the mode for the next step.
-                if let Some(Mode::Regex { paren_depth: p, .. }) = self.modes.last_mut() { *p = depth; }
+                if let Some(Mode::Regex { paren_depth: p, .. }) = self.modes.last_mut() {
+                    *p = depth;
+                }
                 if text.is_empty() {
                     // Only reachable if the first char was `\<NL>` at operand start
                     // (already handled) — re-enter to hit the terminator/opener.
                     return self.scan_step_regex(depth, true);
                 }
-                self.history.push(Token::new(TokenKind::Lit { text, quoted: false }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::Lit {
+                        text,
+                        quoted: false,
+                    },
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
         }
@@ -4276,18 +5438,33 @@ impl<'a> Lexer<'a> {
     /// since `scan_step` is never invoked again for a popped mode frame.
     fn scan_step_extglob(&mut self, paren_depth: u32) -> Result<Step, LexError> {
         let off = self.cursor.offset();
-        let l   = self.cursor.line();
-        let c   = self.cursor.column();
+        let l = self.cursor.line();
+        let c = self.cursor.column();
 
         if paren_depth == 0 {
             // Fresh entry: the trigger guaranteed `<prefix>(` sits at the cursor.
-            let prefix = self.cursor.next().expect("extglob entry: prefix char present (trigger guaranteed it)");
-            debug_assert!(matches!(prefix, '?' | '*' | '+' | '@' | '!'), "extglob entry: unexpected prefix {prefix:?}");
-            debug_assert_eq!(self.cursor.peek(), Some(&'('), "extglob entry: expected '(' after prefix");
+            let prefix = self
+                .cursor
+                .next()
+                .expect("extglob entry: prefix char present (trigger guaranteed it)");
+            debug_assert!(
+                matches!(prefix, '?' | '*' | '+' | '@' | '!'),
+                "extglob entry: unexpected prefix {prefix:?}"
+            );
+            debug_assert_eq!(
+                self.cursor.peek(),
+                Some(&'('),
+                "extglob entry: expected '(' after prefix"
+            );
             self.cursor.next(); // consume '('
-            if let Some(Mode::Extglob { paren_depth: p }) = self.modes.last_mut() { *p = 1; }
+            if let Some(Mode::Extglob { paren_depth: p }) = self.modes.last_mut() {
+                *p = 1;
+            }
             self.history.push(Token::new(
-                TokenKind::Lit { text: format!("{prefix}("), quoted: false },
+                TokenKind::Lit {
+                    text: format!("{prefix}("),
+                    quoted: false,
+                },
                 Span::new(off, l, c),
             ));
             return Ok(Step::Produced);
@@ -4310,22 +5487,46 @@ impl<'a> Lexer<'a> {
                         Some(ch) => text.push(ch),
                     }
                 }
-                self.history.push(Token::new(TokenKind::QuoteRun { style: QuoteStyle::Single, text }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::QuoteRun {
+                        style: QuoteStyle::Single,
+                        text,
+                    },
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
             // Double-quoted span → zero-width BeginDquote (parser pushes Mode::DoubleQuote).
-            Some('"') => { self.history.push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c))); Ok(Step::Produced) }
+            Some('"') => {
+                self.history
+                    .push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
             // `$'…'` ANSI-C (must precede the general `$` arm).
             Some('$') if self.cursor.peek_nth(1) == Some('\'') => {
-                self.cursor.next(); self.cursor.next();
+                self.cursor.next();
+                self.cursor.next();
                 let text = scan_ansi_c_quoted(&mut self.cursor)?;
-                self.history.push(Token::new(TokenKind::QuoteRun { style: QuoteStyle::AnsiC, text }, Span::new(off, l, c)));
+                self.history.push(Token::new(
+                    TokenKind::QuoteRun {
+                        style: QuoteStyle::AnsiC,
+                        text,
+                    },
+                    Span::new(off, l, c),
+                ));
                 Ok(Step::Produced)
             }
             // `$…` — same unquoted classification the command scanner uses.
-            Some('$') => { self.emit_unquoted_dollar_atom(off, l, c); Ok(Step::Produced) }
+            Some('$') => {
+                self.emit_unquoted_dollar_atom(off, l, c);
+                Ok(Step::Produced)
+            }
             // Backtick command-sub → zero-width BeginBacktick.
-            Some('`') => { self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c))); Ok(Step::Produced) }
+            Some('`') => {
+                self.history
+                    .push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
             // Literal run: accumulate chars, tracking paren depth, until a
             // quote/`$`/backtick opener interrupts it OR the group's own `)`
             // brings depth back to 0 (closing the group). No whitespace-stop —
@@ -4345,15 +5546,28 @@ impl<'a> Lexer<'a> {
                             // main word/regex scanners' backslash handling).
                             self.cursor.next(); // consume `\`
                             text.push('\\');
-                            if let Some(next) = self.cursor.next() { text.push(next); }
+                            if let Some(next) = self.cursor.next() {
+                                text.push(next);
+                            }
                         }
-                        '(' => { text.push('('); depth += 1; self.cursor.next(); }
+                        '(' => {
+                            text.push('(');
+                            depth += 1;
+                            self.cursor.next();
+                        }
                         ')' => {
-                            text.push(')'); self.cursor.next();
+                            text.push(')');
+                            self.cursor.next();
                             depth -= 1;
-                            if depth == 0 { closed = true; break; }
+                            if depth == 0 {
+                                closed = true;
+                                break;
+                            }
                         }
-                        _ => { text.push(ch); self.cursor.next(); } // incl. | and any whitespace
+                        _ => {
+                            text.push(ch);
+                            self.cursor.next();
+                        } // incl. | and any whitespace
                     }
                 }
                 if !closed && self.cursor.peek().is_none() {
@@ -4363,11 +5577,20 @@ impl<'a> Lexer<'a> {
                 // (only reachable when NOT closed — the mode is popped below on
                 // closure, so writing back afterward would resurrect a stale
                 // frame; harmless either way since nothing reads it once popped).
-                if let Some(Mode::Extglob { paren_depth: p }) = self.modes.last_mut() { *p = depth; }
-                self.history.push(Token::new(TokenKind::Lit { text, quoted: false }, Span::new(off, l, c)));
+                if let Some(Mode::Extglob { paren_depth: p }) = self.modes.last_mut() {
+                    *p = depth;
+                }
+                self.history.push(Token::new(
+                    TokenKind::Lit {
+                        text,
+                        quoted: false,
+                    },
+                    Span::new(off, l, c),
+                ));
                 if closed {
                     self.pop_mode();
-                    self.history.push(Token::new(TokenKind::ExtglobEnd, Span::new(off, l, c)));
+                    self.history
+                        .push(Token::new(TokenKind::ExtglobEnd, Span::new(off, l, c)));
                 }
                 Ok(Step::Produced)
             }
@@ -4391,9 +5614,18 @@ impl<'a> Lexer<'a> {
     /// Bracketed subscripts (`[i]=value`) are NOT wired here (Task 3 widens
     /// this). Mirrors `scan_array_literal`/`scan_array_element_word`'s
     /// separator/value grammar.
-    fn scan_step_array_literal(&mut self, body_started: bool, expect_subscript_eq: bool, at_element_start: bool) -> Result<Step, LexError> {
+    fn scan_step_array_literal(
+        &mut self,
+        body_started: bool,
+        expect_subscript_eq: bool,
+        at_element_start: bool,
+    ) -> Result<Step, LexError> {
         if !body_started {
-            debug_assert_eq!(self.cursor.peek(), Some(&'('), "array-literal entry: expected '('");
+            debug_assert_eq!(
+                self.cursor.peek(),
+                Some(&'('),
+                "array-literal entry: expected '('"
+            );
             self.cursor.next(); // consume opening '('
             if let Some(Mode::ArrayLiteral { body_started, .. }) = self.modes.last_mut() {
                 *body_started = true;
@@ -4436,17 +5668,27 @@ impl<'a> Lexer<'a> {
             } else {
                 return Err(LexError::ArrayLiteralMissingEquals);
             }
-            if let Some(Mode::ArrayLiteral { expect_subscript_eq: e, subscript_append: sa, .. }) = self.modes.last_mut() {
+            if let Some(Mode::ArrayLiteral {
+                expect_subscript_eq: e,
+                subscript_append: sa,
+                ..
+            }) = self.modes.last_mut()
+            {
                 *e = false;
                 *sa = append;
             }
         }
-        let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+        let (off, l, c) = (
+            self.cursor.offset(),
+            self.cursor.line(),
+            self.cursor.column(),
+        );
         match self.cursor.peek().copied() {
             None => Err(LexError::UnterminatedArrayLiteral),
             Some(')') => {
                 self.cursor.next();
-                self.history.push(Token::new(TokenKind::ArrayClose, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::ArrayClose, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
             // Inter-element separators: whitespace / newline / `#`-comment.
@@ -4463,16 +5705,32 @@ impl<'a> Lexer<'a> {
             Some(ch) if ch.is_whitespace() || ch == '#' => {
                 loop {
                     match self.cursor.peek().copied() {
-                        Some(w) if w.is_whitespace() => { self.cursor.next(); }
-                        Some('#') => { while let Some(&x) = self.cursor.peek() { if x == '\n' { break; } self.cursor.next(); } }
+                        Some(w) if w.is_whitespace() => {
+                            self.cursor.next();
+                        }
+                        Some('#') => {
+                            while let Some(&x) = self.cursor.peek() {
+                                if x == '\n' {
+                                    break;
+                                }
+                                self.cursor.next();
+                            }
+                        }
                         Some('\\') => {
-                            let mut p = self.cursor.clone(); p.next();
-                            if p.peek() == Some(&'\n') { self.cursor.next(); self.cursor.next(); } else { break; }
+                            let mut p = self.cursor.clone();
+                            p.next();
+                            if p.peek() == Some(&'\n') {
+                                self.cursor.next();
+                                self.cursor.next();
+                            } else {
+                                break;
+                            }
                         }
                         _ => break,
                     }
                 }
-                self.history.push(Token::new(TokenKind::Blank, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::Blank, Span::new(off, l, c)));
                 // The NEXT value (if any) starts a fresh word — same reset as
                 // the entry bootstrap above. A separator opens a NEW element, so
                 // the persistent `at_element_start` flips back to true (a `[`
@@ -4480,7 +5738,10 @@ impl<'a> Lexer<'a> {
                 self.cmd_at_word_start = true;
                 self.in_assignment_value = false;
                 self.assign_val_tilde_ok = false;
-                if let Some(Mode::ArrayLiteral { at_element_start, .. }) = self.modes.last_mut() {
+                if let Some(Mode::ArrayLiteral {
+                    at_element_start, ..
+                }) = self.modes.last_mut()
+                {
                     *at_element_start = true;
                 }
                 Ok(Step::Produced)
@@ -4498,11 +5759,17 @@ impl<'a> Lexer<'a> {
             // subscript ends the element's start.
             Some('[') if at_element_start => {
                 self.cursor.next(); // consume '['
-                if let Some(Mode::ArrayLiteral { expect_subscript_eq, at_element_start, .. }) = self.modes.last_mut() {
+                if let Some(Mode::ArrayLiteral {
+                    expect_subscript_eq,
+                    at_element_start,
+                    ..
+                }) = self.modes.last_mut()
+                {
                     *expect_subscript_eq = true;
                     *at_element_start = false;
                 }
-                self.history.push(Token::new(TokenKind::LBracket, Span::new(off, l, c)));
+                self.history
+                    .push(Token::new(TokenKind::LBracket, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
             // Value content — shares `scan_command_word_atom`'s full atom
@@ -4515,7 +5782,10 @@ impl<'a> Lexer<'a> {
             // quote/`$`/backtick/tilde that ended its own call) see
             // `at_element_start == false` and keep a mid-value `[` literal.
             _ => {
-                if let Some(Mode::ArrayLiteral { at_element_start, .. }) = self.modes.last_mut() {
+                if let Some(Mode::ArrayLiteral {
+                    at_element_start, ..
+                }) = self.modes.last_mut()
+                {
                     *at_element_start = false;
                 }
                 self.scan_command_word_atom(true)
@@ -4529,7 +5799,16 @@ impl<'a> Lexer<'a> {
     fn finish(&mut self) -> Result<Step, LexError> {
         if self.has_token {
             flush_literal(&mut self.parts, &mut self.current, false);
-            emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
+            emit_word_with_braces(
+                &mut self.history,
+                std::mem::take(&mut self.parts),
+                self.brace_expand,
+                Span::new(
+                    self.token_start,
+                    self.token_start_line,
+                    self.token_start_col,
+                ),
+            )?;
             self.has_token = false;
             return Ok(Step::Produced);
         }
@@ -4579,8 +5858,9 @@ impl<'a> Lexer<'a> {
     /// incrementality tests to assert that `parse_one_unit` does not eagerly
     /// scan the entire input.
     #[cfg(test)]
-    pub fn scanned_token_count(&self) -> usize { self.history.len() }
-
+    pub fn scanned_token_count(&self) -> usize {
+        self.history.len()
+    }
 
     /// Ensure history[idx] exists AND is backfill-ready (heredoc body present),
     /// pulling lazily via scan_step. Mirrors next_token's readiness rule so a
@@ -4608,7 +5888,9 @@ impl<'a> Lexer<'a> {
     pub fn next(&mut self) -> Result<Option<Token>, LexError> {
         self.fill_to(self.pos)?;
         let t = self.history.get(self.pos).cloned();
-        if t.is_some() { self.pos += 1; }
+        if t.is_some() {
+            self.pos += 1;
+        }
         Ok(t)
     }
     pub fn peek_kind(&mut self) -> Result<Option<&TokenKind>, LexError> {
@@ -4718,24 +6000,29 @@ impl<'a> Lexer<'a> {
     /// bash's whole-body recursion prevention.
     fn maybe_expand_command_alias(&mut self) -> Result<(), LexError> {
         self.fill_to(self.pos)?;
-        self.alias_trailing_eligible = false;   // default: a non-expanding word leaves it false
-        let Some(tok) = self.history.get(self.pos) else { return Ok(()) };
+        self.alias_trailing_eligible = false; // default: a non-expanding word leaves it false
+        let Some(tok) = self.history.get(self.pos) else {
+            return Ok(());
+        };
         let name_span = tok.span;
         // `is_bare_atom_lit`: whether `name` came from a bare atom `Lit` (needs
         // the boundary re-check below) vs. a legacy `Word` token (already the
         // whole word by construction — no further check needed).
         let (name, is_bare_atom_lit) = match &tok.kind {
             TokenKind::Word(w) => {
-                let Some(name) = word_literal_text(w) else { return Ok(()) };
+                let Some(name) = word_literal_text(w) else {
+                    return Ok(());
+                };
                 (name, false)
             }
             // v264: the atom-command stream (`command_atoms`) has no `Word`
             // token at command position — the command word is a bare `Lit`
             // atom. Extract the name here; the boundary check (that this
             // `Lit` is the ENTIRE word, nothing glued on) happens below.
-            TokenKind::Lit { text, quoted: false } => {
-                (text.clone(), true)
-            }
+            TokenKind::Lit {
+                text,
+                quoted: false,
+            } => (text.clone(), true),
             _ => return Ok(()),
         };
         if is_bare_atom_lit {
@@ -4769,17 +6056,25 @@ impl<'a> Lexer<'a> {
             } else {
                 match self.cursor.peek().copied() {
                     None => true,
-                    Some(c) => c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')'),
+                    Some(c) => {
+                        c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')')
+                    }
                 }
             };
-            if !boundary { return Ok(()); }
+            if !boundary {
+                return Ok(());
+            }
         }
         // Recursion guard: `name` is active iff its body frame is still on the
         // injection stack (derived, not a separate set) — no re-expand while
         // mid-expansion. The leading body word is checked below during the
         // re-drive, when this just-pushed frame is present, so it cannot loop.
-        if self.cursor.injected_has_alias(&name) { return Ok(()); }
-        let Some(body) = self.aliases.get(&name).cloned() else { return Ok(()) };
+        if self.cursor.injected_has_alias(&name) {
+            return Ok(());
+        }
+        let Some(body) = self.aliases.get(&name).cloned() else {
+            return Ok(());
+        };
         // Remove the already-produced command-word `Lit`/`Word` token; the pushed
         // body re-lexes atoms in its place. The cursor was NOT advanced past the
         // name's follower (no `fill_to(pos+1)`), so pushing the body and reading
@@ -4789,7 +6084,8 @@ impl<'a> Lexer<'a> {
         // alias-name span. For a NESTED expansion `name_span` is already the
         // outer frozen anchor (the nested name `Lit` was produced under the outer
         // frame), so the anchor propagates outward-most automatically.
-        self.cursor.push_injection(body.clone(), name.clone(), name_span);
+        self.cursor
+            .push_injection(body.clone(), name.clone(), name_span);
         // Re-drive: lex the body's first command word so a DIFFERENT leading alias
         // still expands. `name` is now on the stack, so it cannot re-expand itself.
         self.maybe_expand_command_alias()?;
@@ -4820,7 +6116,11 @@ impl<'a> Lexer<'a> {
 
     /// Build a live lexer for the REPL: the lexer scans `input` incrementally
     /// and expands registered aliases at command position.
-    pub fn new_live(input: &'a str, aliases: &std::collections::HashMap<String, String>, opts: LexerOptions) -> Lexer<'a> {
+    pub fn new_live(
+        input: &'a str,
+        aliases: &std::collections::HashMap<String, String>,
+        opts: LexerOptions,
+    ) -> Lexer<'a> {
         let mut lx = Lexer::new(input, opts, true);
         lx.aliases = aliases.clone();
         lx
@@ -4843,27 +6143,22 @@ fn word_literal_text(w: &Word) -> Option<String> {
     let mut s = String::new();
     for part in &w.0 {
         match part {
-            WordPart::Literal { text, quoted: false } => s.push_str(text),
+            WordPart::Literal {
+                text,
+                quoted: false,
+            } => s.push_str(text),
             _ => return None,
         }
     }
     if s.is_empty() { None } else { Some(s) }
 }
 
-
-
-
-
-
-
-
-
 /// Returns true if any unquoted Literal part in `parts` contains
 /// an unquoted `{`. The fast-path check for brace expansion.
 fn word_contains_unquoted_brace(parts: &[WordPart]) -> bool {
-    parts.iter().any(|p| {
-        matches!(p, WordPart::Literal { text, quoted: false } if text.contains('{'))
-    })
+    parts
+        .iter()
+        .any(|p| matches!(p, WordPart::Literal { text, quoted: false } if text.contains('{')))
 }
 
 /// Builds a concat string for brace expansion. Unquoted Literal
@@ -4875,7 +6170,10 @@ fn build_concat_with_sentinels(parts: &[WordPart]) -> (String, Vec<WordPart>) {
     let mut placeholders: Vec<WordPart> = Vec::new();
     for p in parts {
         match p {
-            WordPart::Literal { text, quoted: false } => {
+            WordPart::Literal {
+                text,
+                quoted: false,
+            } => {
                 concat.push_str(text);
             }
             other => {
@@ -4901,7 +6199,10 @@ fn split_on_sentinels(s: &str, placeholders: &[WordPart]) -> Vec<WordPart> {
     while let Some(c) = chars.next() {
         if c == '\u{E000}' {
             if !buf.is_empty() {
-                out.push(WordPart::Literal { text: std::mem::take(&mut buf), quoted: false });
+                out.push(WordPart::Literal {
+                    text: std::mem::take(&mut buf),
+                    quoted: false,
+                });
             }
             let mut idx_str = String::new();
             while let Some(&nc) = chars.peek() {
@@ -4922,7 +6223,10 @@ fn split_on_sentinels(s: &str, placeholders: &[WordPart]) -> Vec<WordPart> {
         }
     }
     if !buf.is_empty() {
-        out.push(WordPart::Literal { text: buf, quoted: false });
+        out.push(WordPart::Literal {
+            text: buf,
+            quoted: false,
+        });
     }
     out
 }
@@ -4960,8 +6264,8 @@ pub(crate) fn brace_expand_parts(parts: Vec<WordPart>) -> Result<Vec<Vec<WordPar
         return Ok(vec![parts]);
     }
     let (concat, placeholders) = build_concat_with_sentinels(&parts);
-    let expansions = crate::brace_expand::expand(&concat)
-        .map_err(|_| LexError::BraceExpansionLimit)?;
+    let expansions =
+        crate::brace_expand::expand(&concat).map_err(|_| LexError::BraceExpansionLimit)?;
     Ok(expansions
         .into_iter()
         .map(|s| split_on_sentinels(&s, &placeholders))
@@ -4981,9 +6285,7 @@ fn flush_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: bool) 
 /// Returns `(delim_text, expand)` where `expand` is false if any character
 /// of the delimiter word was quoted (per POSIX 2.7.4: any quoting in the
 /// delimiter word forces literal-mode body collection).
-fn parse_heredoc_delim(
-    chars: &mut CharCursor<'_>,
-) -> Result<(String, bool), LexError> {
+fn parse_heredoc_delim(chars: &mut CharCursor<'_>) -> Result<(String, bool), LexError> {
     // Skip leading whitespace (POSIX: `<< EOF` is allowed).
     while matches!(chars.peek(), Some(&' ') | Some(&'\t')) {
         chars.next();
@@ -4998,7 +6300,9 @@ fn parse_heredoc_delim(
                 any_quoted = true;
                 while let Some(&ch) = chars.peek() {
                     chars.next();
-                    if ch == '\'' { break; }
+                    if ch == '\'' {
+                        break;
+                    }
                     delim.push(ch);
                 }
             }
@@ -5007,8 +6311,16 @@ fn parse_heredoc_delim(
                 any_quoted = true;
                 while let Some(&ch) = chars.peek() {
                     chars.next();
-                    if ch == '"' { break; }
-                    if ch == '\\' && let Some(&next) = chars.peek() { chars.next(); delim.push(next); continue; }
+                    if ch == '"' {
+                        break;
+                    }
+                    if ch == '\\'
+                        && let Some(&next) = chars.peek()
+                    {
+                        chars.next();
+                        delim.push(next);
+                        continue;
+                    }
                     delim.push(ch);
                 }
             }
@@ -5020,9 +6332,17 @@ fn parse_heredoc_delim(
                     // deleted and scanning continues on the next line (bash
                     // strips continuations before reading the delimiter word).
                     // It is NOT quoting, so `any_quoted` stays untouched.
-                    Some(&'\n') => { chars.next(); }
-                    Some(&next) => { chars.next(); any_quoted = true; delim.push(next); }
-                    None => { any_quoted = true; }
+                    Some(&'\n') => {
+                        chars.next();
+                    }
+                    Some(&next) => {
+                        chars.next();
+                        any_quoted = true;
+                        delim.push(next);
+                    }
+                    None => {
+                        any_quoted = true;
+                    }
                 }
             }
             _ => {
@@ -5037,24 +6357,17 @@ fn parse_heredoc_delim(
     Ok((delim, !any_quoted))
 }
 
-
 /// True when `s` ends with an odd-length run of backslashes — the final
 /// backslash is unescaped and acts as a line-continuation marker.
 pub fn ends_with_continuation_backslash(s: &str) -> bool {
     s.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
 }
 
-
-
-
-
 /// Reads the body of a `$'...'` ANSI-C quoted string. The opening `$'` has
 /// already been consumed; this scans forward, processing C-style backslash
 /// escapes, until the matching unescaped `'` is consumed. Returns the
 /// decoded string.
-fn scan_ansi_c_quoted(
-    chars: &mut CharCursor<'_>,
-) -> Result<String, LexError> {
+fn scan_ansi_c_quoted(chars: &mut CharCursor<'_>) -> Result<String, LexError> {
     let mut out = String::new();
     loop {
         match chars.next() {
@@ -5088,10 +6401,7 @@ pub fn decode_ansi_c_escapes(v: &str) -> String {
 
 /// Decodes a single backslash escape inside `$'...'` and appends the
 /// result to `out`. The leading `\` has already been consumed.
-fn decode_ansi_c_escape(
-    chars: &mut CharCursor<'_>,
-    out: &mut String,
-) -> Result<(), LexError> {
+fn decode_ansi_c_escape(chars: &mut CharCursor<'_>, out: &mut String) -> Result<(), LexError> {
     match chars.next() {
         None => return Err(LexError::UnterminatedQuote),
         Some('a') => out.push('\x07'),
@@ -5169,10 +6479,7 @@ fn decode_ansi_c_escape(
 /// Reads up to `max` hex digits (greedy, stops at first non-hex char) and
 /// returns their value. Caller has already confirmed at least one hex
 /// digit is available.
-fn scan_hex_digits(
-    chars: &mut CharCursor<'_>,
-    max: u32,
-) -> u32 {
+fn scan_hex_digits(chars: &mut CharCursor<'_>, max: u32) -> u32 {
     let mut v: u32 = 0;
     for _ in 0..max {
         match chars.peek().copied() {
@@ -5264,8 +6571,6 @@ fn extended_utf8_bytes(v: u32) -> Vec<u8> {
     }
 }
 
-
-
 /// Appends a quoted span — the opening quote already pushed by the caller —
 /// through its matching closing `quote`, verbatim. Single quotes take every
 /// char literally; double quotes honor `\` so `\"` does not close the span.
@@ -5293,8 +6598,6 @@ fn push_quoted_span(
         }
     }
 }
-
-
 
 /// Reads the inner text of a `${...}` operand. The opening `{` has already
 /// been consumed; this function consumes through the matching `}` at depth 0.
@@ -5531,16 +6834,11 @@ fn scan_backtick_body(
 /// Appends a backtick command substitution to `out` verbatim, the opening
 /// backtick having already been pushed by the caller: the kernel collects the
 /// raw body (excluding the closing backtick); this re-adds the closing backtick.
-fn consume_backtick_verbatim(
-    chars: &mut CharCursor<'_>,
-    out: &mut String,
-) -> Result<(), LexError> {
+fn consume_backtick_verbatim(chars: &mut CharCursor<'_>, out: &mut String) -> Result<(), LexError> {
     scan_backtick_body(chars, out, LexError::UnterminatedBrace)?;
     out.push('`');
     Ok(())
 }
-
-
 
 /// Collects a raw ANSI-C `$'…'` body (both `$` and opening `'` already consumed).
 /// Appends chars to `out` with `\`-escape pairs verbatim; does NOT push the
@@ -5555,7 +6853,9 @@ fn scan_raw_ansi_c_body(
             None => return Err(err),
             Some('\\') => {
                 out.push('\\');
-                if let Some(c) = chars.next() { out.push(c); }
+                if let Some(c) = chars.next() {
+                    out.push(c);
+                }
             }
             Some('\'') => return Ok(()),
             Some(c) => out.push(c),
@@ -5563,9 +6863,7 @@ fn scan_raw_ansi_c_body(
     }
 }
 
-fn scan_braced_operand(
-    chars: &mut CharCursor<'_>,
-) -> Result<String, LexError> {
+fn scan_braced_operand(chars: &mut CharCursor<'_>) -> Result<String, LexError> {
     // Known limitation: a `${...}` nested *inside* a double-quoted span of
     // the operand (e.g. `${X:-"${Y}}"}`) is not depth-tracked — the inner
     // `}` chars are consumed literally by the quote loop. Real scripts very
@@ -5578,17 +6876,24 @@ fn scan_braced_operand(
             None => return Err(LexError::UnterminatedBrace),
             Some('\\') => {
                 body.push('\\');
-                if let Some(c) = chars.next() { body.push(c); }
+                if let Some(c) = chars.next() {
+                    body.push(c);
+                }
             }
             Some('"') => {
                 body.push('"');
                 loop {
                     match chars.next() {
                         None => return Err(LexError::UnterminatedBrace),
-                        Some('"') => { body.push('"'); break; }
+                        Some('"') => {
+                            body.push('"');
+                            break;
+                        }
                         Some('\\') => {
                             body.push('\\');
-                            if let Some(c) = chars.next() { body.push(c); }
+                            if let Some(c) = chars.next() {
+                                body.push(c);
+                            }
                         }
                         Some(c) => body.push(c),
                     }
@@ -5637,10 +6942,15 @@ fn scan_braced_operand(
                         loop {
                             match chars.next() {
                                 None => return Err(LexError::UnterminatedBrace),
-                                Some('"') => { body.push('"'); break; }
+                                Some('"') => {
+                                    body.push('"');
+                                    break;
+                                }
                                 Some('\\') => {
                                     body.push('\\');
-                                    if let Some(c) = chars.next() { body.push(c); }
+                                    if let Some(c) = chars.next() {
+                                        body.push(c);
+                                    }
                                 }
                                 Some(c) => body.push(c),
                             }
@@ -5649,9 +6959,13 @@ fn scan_braced_operand(
                     _ => {}
                 }
             }
-            Some('{') => { body.push('{'); } // bare brace: literal, does not nest
+            Some('{') => {
+                body.push('{');
+            } // bare brace: literal, does not nest
             Some('}') => {
-                if depth == 1 { return Ok(body); }
+                if depth == 1 {
+                    return Ok(body);
+                }
                 depth -= 1;
                 body.push('}');
             }
@@ -5659,12 +6973,6 @@ fn scan_braced_operand(
         }
     }
 }
-
-
-
-
-
-
 
 fn scan_var_name(chars: &mut CharCursor<'_>) -> String {
     let mut name = String::new();
@@ -5678,10 +6986,6 @@ fn scan_var_name(chars: &mut CharCursor<'_>) -> String {
     }
     name
 }
-
-
-
-
 
 /// Consumes any run of `\`-newline line continuations at the cursor (POSIX
 /// 2.2.1: `\<NL>` is deleted before tokenizing). Uses a cloned-cursor 2-char
@@ -5698,7 +7002,6 @@ fn skip_line_continuations(chars: &mut CharCursor<'_>) {
     }
 }
 
-
 /// Consumes a `#` line comment's body up to (but NOT including) the terminating
 /// newline; the caller's loop handles the newline. The opening `#` must already
 /// be confirmed as a comment-start (word boundary) by the caller.
@@ -5710,9 +7013,6 @@ fn skip_line_comment(chars: &mut CharCursor<'_>) {
         chars.next();
     }
 }
-
-
-
 
 /// A valid POSIX parameter name: `[A-Za-z_][A-Za-z0-9_]*`, non-empty.
 fn is_valid_param_name(s: &str) -> bool {
@@ -5771,15 +7071,6 @@ fn scan_braced_name_ext(chars: &mut CharCursor<'_>) -> Result<NameScan, LexError
     Ok(NameScan::Name { name, decoded })
 }
 
-
-
-
-
-
-
-
-
-
 fn is_name_start(c: char) -> bool {
     c == '_' || c.is_ascii_alphabetic()
 }
@@ -5796,10 +7087,7 @@ fn is_name_cont(c: char) -> bool {
 /// `)` terminates a tilde-prefix via `is_tilde_terminator` (it closes an
 /// array-literal element `a=(a=~)`, a `case` pattern, a subshell, and a
 /// `$(…)`/backtick body — a value-final `~` before it must still be a tilde).
-fn try_parse_tilde(
-    chars: &mut CharCursor<'_>,
-    in_assignment_value: bool,
-) -> Option<TildeSpec> {
+fn try_parse_tilde(chars: &mut CharCursor<'_>, in_assignment_value: bool) -> Option<TildeSpec> {
     let term = |c: char| is_tilde_terminator(c) || (in_assignment_value && c == ':');
     match chars.peek().copied() {
         // Bare ~ at end of word.
@@ -5810,8 +7098,14 @@ fn try_parse_tilde(
             let mut lookahead = chars.clone();
             lookahead.next(); // consume the +
             match lookahead.peek().copied() {
-                None => { chars.next(); Some(TildeSpec::Pwd) }
-                Some(c) if term(c) => { chars.next(); Some(TildeSpec::Pwd) }
+                None => {
+                    chars.next();
+                    Some(TildeSpec::Pwd)
+                }
+                Some(c) if term(c) => {
+                    chars.next();
+                    Some(TildeSpec::Pwd)
+                }
                 _ => None,
             }
         }
@@ -5819,8 +7113,14 @@ fn try_parse_tilde(
             let mut lookahead = chars.clone();
             lookahead.next();
             match lookahead.peek().copied() {
-                None => { chars.next(); Some(TildeSpec::OldPwd) }
-                Some(c) if term(c) => { chars.next(); Some(TildeSpec::OldPwd) }
+                None => {
+                    chars.next();
+                    Some(TildeSpec::OldPwd)
+                }
+                Some(c) if term(c) => {
+                    chars.next();
+                    Some(TildeSpec::OldPwd)
+                }
                 _ => None,
             }
         }
@@ -5868,8 +7168,6 @@ fn is_tilde_terminator(c: char) -> bool {
         || matches!(c, '|' | '<' | '>' | '&' | ';' | ')')
 }
 
-
-
 fn is_user_name_start(c: char) -> bool {
     c == '_' || c.is_ascii_alphabetic()
 }
@@ -5882,7 +7180,10 @@ fn is_user_name_continue(c: char) -> bool {
 /// (1 + the count of '\n' bytes before `off`). Clamps `off` to `src.len()`.
 /// Used in tests and for isolated single-offset lookups.
 pub fn line_at_offset(src: &str, off: usize) -> u32 {
-    1 + src.as_bytes()[..off.min(src.len())].iter().filter(|&&b| b == b'\n').count() as u32
+    1 + src.as_bytes()[..off.min(src.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count() as u32
 }
 
 /// bash's one-level backtick unescape (spec §2 phase 2). Removes the backslash
@@ -5918,8 +7219,10 @@ mod tests {
         let src = include_str!("lexer.rs");
         let test_mod = src.find("mod tests").unwrap_or(src.len());
         let prod = &src[..test_mod];
-        assert!(!prod.contains("crate::parser"),
-            "lexer production code must not reference crate::parser (one-way invariant)");
+        assert!(
+            !prod.contains("crate::parser"),
+            "lexer production code must not reference crate::parser (one-way invariant)"
+        );
     }
 
     #[test]
@@ -5928,7 +7231,10 @@ mod tests {
         let mut lx = Lexer::new_live_atoms("x", &empty, LexerOptions::default());
         lx.begin_assignment_value(false);
         assert!(lx.in_assignment_value);
-        assert!(lx.assign_val_tilde_ok, "D2: tilde enabled for indexed value");
+        assert!(
+            lx.assign_val_tilde_ok,
+            "D2: tilde enabled for indexed value"
+        );
         assert!(!lx.cmd_at_word_start);
     }
 
@@ -5937,17 +7243,17 @@ mod tests {
         let mut c = CharCursor::new("ab\ncé\td");
         // before consuming: at 'a'
         assert_eq!((c.offset(), c.line(), c.column()), (0, 1, 1));
-        c.next();                       // consume 'a'
+        c.next(); // consume 'a'
         assert_eq!((c.offset(), c.line(), c.column()), (1, 1, 2)); // at 'b'
-        c.next();                       // consume 'b'
+        c.next(); // consume 'b'
         assert_eq!((c.offset(), c.line(), c.column()), (2, 1, 3)); // at '\n'
-        c.next();                       // consume '\n' -> next line, col resets
+        c.next(); // consume '\n' -> next line, col resets
         assert_eq!((c.offset(), c.line(), c.column()), (3, 2, 1)); // at 'c'
-        c.next();                       // consume 'c'
+        c.next(); // consume 'c'
         assert_eq!((c.offset(), c.line(), c.column()), (4, 2, 2)); // at 'é' (2 bytes)
-        c.next();                       // consume 'é' -> offset +2, column +1
+        c.next(); // consume 'é' -> offset +2, column +1
         assert_eq!((c.offset(), c.line(), c.column()), (6, 2, 3)); // at '\t'
-        c.next();                       // consume tab -> one column
+        c.next(); // consume tab -> one column
         assert_eq!((c.offset(), c.line(), c.column()), (7, 2, 4)); // at 'd'
     }
 
@@ -5964,40 +7270,29 @@ mod tests {
         assert_eq!(c.consumed, 3);
     }
 
-
-
-
-
-
-
-
-
-
-
-
     #[test]
     fn line_at_offset_counts_newlines() {
         let s = "a\nbb\nccc";
-        assert_eq!(line_at_offset(s, 0), 1);   // 'a'
-        assert_eq!(line_at_offset(s, 2), 2);   // first 'b'
-        assert_eq!(line_at_offset(s, 5), 3);   // first 'c'
+        assert_eq!(line_at_offset(s, 0), 1); // 'a'
+        assert_eq!(line_at_offset(s, 2), 2); // first 'b'
+        assert_eq!(line_at_offset(s, 5), 3); // first 'c'
         assert_eq!(line_at_offset(s, 999), 3); // clamped
     }
 
     #[test]
     fn unescape_backtick_body_rules() {
         // The ONLY three de-escape pairs remove the backslash:
-        assert_eq!(unescape_backtick_body(r"\\"), r"\");        // \\ -> \
-        assert_eq!(unescape_backtick_body(r"\$x"), "$x");       // \$ -> $
-        assert_eq!(unescape_backtick_body("\\`"), "`");         // \` -> `
+        assert_eq!(unescape_backtick_body(r"\\"), r"\"); // \\ -> \
+        assert_eq!(unescape_backtick_body(r"\$x"), "$x"); // \$ -> $
+        assert_eq!(unescape_backtick_body("\\`"), "`"); // \` -> `
         // Everything else keeps the backslash verbatim:
-        assert_eq!(unescape_backtick_body(r#"\""#), r#"\""#);   // \" kept
-        assert_eq!(unescape_backtick_body(r"\'"), r"\'");       // \' kept
-        assert_eq!(unescape_backtick_body(r"\n"), r"\n");       // \n kept (literal)
+        assert_eq!(unescape_backtick_body(r#"\""#), r#"\""#); // \" kept
+        assert_eq!(unescape_backtick_body(r"\'"), r"\'"); // \' kept
+        assert_eq!(unescape_backtick_body(r"\n"), r"\n"); // \n kept (literal)
         assert_eq!(unescape_backtick_body("a\\\nb"), "a\\\nb"); // \<newline> kept
         // Runs collapse pairwise, left to right (the L-70 case):
-        assert_eq!(unescape_backtick_body(r"\\\X"), r"\\X");    // \\\X -> \\X  (was mis-ordered)
-        assert_eq!(unescape_backtick_body(r"\\\\"), r"\\");     // \\\\ -> \\
+        assert_eq!(unescape_backtick_body(r"\\\X"), r"\\X"); // \\\X -> \\X  (was mis-ordered)
+        assert_eq!(unescape_backtick_body(r"\\\\"), r"\\"); // \\\\ -> \\
         assert_eq!(unescape_backtick_body(r"\\\\\x"), r"\\\x"); // 5 bslashes -> 3 + x
         // Trailing lone backslash kept:
         assert_eq!(unescape_backtick_body("ab\\"), "ab\\");
@@ -6009,20 +7304,27 @@ mod tests {
     fn char_cursor_tracks_line() {
         let mut c = CharCursor::new("a\nbb\nc");
         assert_eq!(c.line(), 1);
-        assert_eq!(c.next(), Some('a')); assert_eq!(c.line(), 1);
-        assert_eq!(c.next(), Some('\n')); assert_eq!(c.line(), 2); // after the newline
-        assert_eq!(c.next(), Some('b')); assert_eq!(c.line(), 2);
-        c.next(); c.next(); // 'b','\n'
+        assert_eq!(c.next(), Some('a'));
+        assert_eq!(c.line(), 1);
+        assert_eq!(c.next(), Some('\n'));
+        assert_eq!(c.line(), 2); // after the newline
+        assert_eq!(c.next(), Some('b'));
+        assert_eq!(c.line(), 2);
+        c.next();
+        c.next(); // 'b','\n'
         assert_eq!(c.line(), 3);
-        assert_eq!(c.next(), Some('c')); assert_eq!(c.line(), 3);
+        assert_eq!(c.next(), Some('c'));
+        assert_eq!(c.line(), 3);
     }
-
 
     fn word_text(t: &Token) -> Option<String> {
         // v266: atom-aware. A command-position word is a bare `Lit` atom; a
         // brace-expansion product is still a single-literal `Word`. Accept both.
         match &t.kind {
-            TokenKind::Lit { text, quoted: false } => Some(text.clone()),
+            TokenKind::Lit {
+                text,
+                quoted: false,
+            } => Some(text.clone()),
             TokenKind::Word(Word(parts))
                 if parts.len() == 1
                     && matches!(&parts[0], WordPart::Literal { quoted: false, .. }) =>
@@ -6036,22 +7338,6 @@ mod tests {
             _ => None,
         }
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn char_cursor_tracks_byte_offset() {
@@ -6070,10 +7356,6 @@ mod tests {
         assert_eq!(c.offset(), 4);
     }
 
-
-
-
-
     #[test]
     fn char_cursor_offset_with_multibyte() {
         // 'é' is 2 bytes in UTF-8.
@@ -6084,8 +7366,6 @@ mod tests {
         assert_eq!(c.next(), Some('!'));
         assert_eq!(c.offset(), 3);
     }
-
-
 
     // ---- v238: direct next_token (incremental pull) API ----
 
@@ -6119,12 +7399,51 @@ mod tests {
     fn mode_stack_push_pop_current() {
         let mut lx = Lexer::new("echo hi", LexerOptions::default(), true);
         assert_eq!(lx.current_mode(), Mode::Command);
-        lx.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
-        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
-        lx.push_mode(Mode::CommandSub { body_started: false });
-        assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
-        assert_eq!(lx.pop_mode(), Mode::CommandSub { body_started: false });
-        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
+        lx.push_mode(Mode::Arith {
+            paren_depth: 0,
+            in_squote: false,
+            in_dquote: false,
+            body_started: false,
+            for_header: false,
+            delim: ArithDelim::Paren,
+        });
+        assert_eq!(
+            lx.current_mode(),
+            Mode::Arith {
+                paren_depth: 0,
+                in_squote: false,
+                in_dquote: false,
+                body_started: false,
+                for_header: false,
+                delim: ArithDelim::Paren
+            }
+        );
+        lx.push_mode(Mode::CommandSub {
+            body_started: false,
+        });
+        assert_eq!(
+            lx.current_mode(),
+            Mode::CommandSub {
+                body_started: false
+            }
+        );
+        assert_eq!(
+            lx.pop_mode(),
+            Mode::CommandSub {
+                body_started: false
+            }
+        );
+        assert_eq!(
+            lx.pop_mode(),
+            Mode::Arith {
+                paren_depth: 0,
+                in_squote: false,
+                in_dquote: false,
+                body_started: false,
+                for_header: false,
+                delim: ArithDelim::Paren
+            }
+        );
         assert_eq!(lx.current_mode(), Mode::Command);
     }
 
@@ -6133,59 +7452,117 @@ mod tests {
         // Drive Mode::Arith with for_header=true over a for-header body (no `((`
         // prefix — body_started=true starts at the body loop). Top-level `;`
         // must emit ArithSemi; a `;` nested in `()` stays literal.
-        let mut lx = Lexer::new_live_atoms("i=0;i<3;i++))", &Default::default(), LexerOptions::default());
-        lx.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
+        let mut lx = Lexer::new_live_atoms(
+            "i=0;i<3;i++))",
+            &Default::default(),
+            LexerOptions::default(),
+        );
+        lx.push_mode(Mode::Arith {
+            paren_depth: 0,
+            in_squote: false,
+            in_dquote: false,
+            body_started: true,
+            for_header: true,
+            delim: ArithDelim::Paren,
+        });
         let mut kinds = Vec::new();
         loop {
             match lx.next_kind().expect("lex") {
-                Some(TokenKind::ArithClose) => { kinds.push(TokenKind::ArithClose); break; }
+                Some(TokenKind::ArithClose) => {
+                    kinds.push(TokenKind::ArithClose);
+                    break;
+                }
                 Some(k) => kinds.push(k),
                 None => break,
             }
         }
-        assert_eq!(kinds, vec![
-            TokenKind::Lit { text: "i=0".into(), quoted: true },
-            TokenKind::ArithSemi,
-            TokenKind::Lit { text: "i<3".into(), quoted: true },
-            TokenKind::ArithSemi,
-            TokenKind::Lit { text: "i++".into(), quoted: true },
-            TokenKind::ArithClose,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Lit {
+                    text: "i=0".into(),
+                    quoted: true
+                },
+                TokenKind::ArithSemi,
+                TokenKind::Lit {
+                    text: "i<3".into(),
+                    quoted: true
+                },
+                TokenKind::ArithSemi,
+                TokenKind::Lit {
+                    text: "i++".into(),
+                    quoted: true
+                },
+                TokenKind::ArithClose,
+            ]
+        );
 
         // Nested `;` (depth>0) stays literal — one Lit, no ArithSemi.
-        let mut lx2 = Lexer::new_live_atoms("(a;b)))", &Default::default(), LexerOptions::default());
-        lx2.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
+        let mut lx2 =
+            Lexer::new_live_atoms("(a;b)))", &Default::default(), LexerOptions::default());
+        lx2.push_mode(Mode::Arith {
+            paren_depth: 0,
+            in_squote: false,
+            in_dquote: false,
+            body_started: true,
+            for_header: true,
+            delim: ArithDelim::Paren,
+        });
         let mut kinds2 = Vec::new();
         loop {
             match lx2.next_kind().expect("lex") {
-                Some(TokenKind::ArithClose) => { kinds2.push(TokenKind::ArithClose); break; }
+                Some(TokenKind::ArithClose) => {
+                    kinds2.push(TokenKind::ArithClose);
+                    break;
+                }
                 Some(k) => kinds2.push(k),
                 None => break,
             }
         }
-        assert_eq!(kinds2, vec![
-            TokenKind::Lit { text: "(a;b)".into(), quoted: true },
-            TokenKind::ArithClose,
-        ]);
+        assert_eq!(
+            kinds2,
+            vec![
+                TokenKind::Lit {
+                    text: "(a;b)".into(),
+                    quoted: true
+                },
+                TokenKind::ArithClose,
+            ]
+        );
     }
 
     #[test]
     fn arith_bracket_mode_scans_legacy_arith() {
         // A Mode::Arith{delim:Bracket} body: `$[a[0]+1]` → LegacyArithOpen, the
         // body Lit "a[0]+1" (inner [0] bracket-nested), then ArithClose.
-        let mut lx = Lexer::new_live_atoms("$[a[0]+1]", &Default::default(), LexerOptions::default());
-        lx.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Bracket });
+        let mut lx =
+            Lexer::new_live_atoms("$[a[0]+1]", &Default::default(), LexerOptions::default());
+        lx.push_mode(Mode::Arith {
+            paren_depth: 0,
+            in_squote: false,
+            in_dquote: false,
+            body_started: false,
+            for_header: false,
+            delim: ArithDelim::Bracket,
+        });
         let mut kinds = Vec::new();
         loop {
             match lx.next_kind().expect("lex") {
-                Some(TokenKind::ArithClose) => { kinds.push(TokenKind::ArithClose); break; }
+                Some(TokenKind::ArithClose) => {
+                    kinds.push(TokenKind::ArithClose);
+                    break;
+                }
                 Some(k) => kinds.push(k),
                 None => break,
             }
         }
         assert_eq!(kinds.first(), Some(&TokenKind::LegacyArithOpen));
-        assert!(kinds.iter().any(|k| matches!(k, TokenKind::Lit { text, .. } if text == "a[0]+1")),
-            "expected body Lit \"a[0]+1\", got {kinds:?}");
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, TokenKind::Lit { text, .. } if text == "a[0]+1")),
+            "expected body Lit \"a[0]+1\", got {kinds:?}"
+        );
         assert_eq!(kinds.last(), Some(&TokenKind::ArithClose));
     }
 
@@ -6209,9 +7586,12 @@ mod tests {
         // The cursor has not advanced — next() must still yield 'a'.
         assert_eq!(cur.next(), Some('a'), "cursor should not have advanced");
         // Now first unconsumed char is 'b'; peek_nth(0) returns 'b'.
-        assert_eq!(cur.peek_nth(0), Some('b'), "after consuming 'a', peek_nth(0) should be 'b'");
+        assert_eq!(
+            cur.peek_nth(0),
+            Some('b'),
+            "after consuming 'a', peek_nth(0) should be 'b'"
+        );
     }
-
 
     #[test]
     fn next_token_is_lazy_not_greedy() {
@@ -6225,10 +7605,16 @@ mod tests {
         let first = lx.next_token().unwrap().unwrap();
         assert_eq!(word_text(&first).as_deref(), Some("w0"));
         let off = lx.cursor_offset();
-        assert!(off <= 3, "cursor advanced too far after first token: {off} (input len {})", src.len());
-        assert!(off < src.len(), "cursor jumped to EOF after first token (greedy consumption!)");
+        assert!(
+            off <= 3,
+            "cursor advanced too far after first token: {off} (input len {})",
+            src.len()
+        );
+        assert!(
+            off < src.len(),
+            "cursor jumped to EOF after first token (greedy consumption!)"
+        );
     }
-
 
     // v266: `next_token_brace_expansion_drains_one_at_a_time` and
     // `next_token_heredoc_body_complete_when_emitted` removed — both asserted the
@@ -6236,153 +7622,6 @@ mod tests {
     // and heredoc-body backfill are now parser-mediated on the atom path). The
     // behaviors are covered end-to-end by the brace/heredoc bash-diff harnesses
     // and the atom-path tests in `array_parse_tests`.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn skip_line_comment_stops_before_newline() {
@@ -6420,7 +7659,10 @@ mod tests {
     #[test]
     fn scan_braced_operand_unterminated_is_error() {
         let mut chars = CharCursor::new("foo");
-        assert_eq!(scan_braced_operand(&mut chars).unwrap_err(), LexError::UnterminatedBrace);
+        assert_eq!(
+            scan_braced_operand(&mut chars).unwrap_err(),
+            LexError::UnterminatedBrace
+        );
     }
 
     #[test]
@@ -6438,7 +7680,10 @@ mod tests {
     #[test]
     fn scan_braced_operand_skips_nested_cmdsub() {
         let mut chars = CharCursor::new("$(echo $(echo a}b))/Q}");
-        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "$(echo $(echo a}b))/Q");
+        assert_eq!(
+            scan_braced_operand(&mut chars).unwrap(),
+            "$(echo $(echo a}b))/Q"
+        );
     }
 
     #[test]
@@ -6585,7 +7830,8 @@ mod tests {
         let mut chars = CharCursor::new("echo hi");
         let mut out = String::new();
         assert_eq!(
-            scan_backtick_body(&mut chars, &mut out, LexError::UnterminatedSubstitution).unwrap_err(),
+            scan_backtick_body(&mut chars, &mut out, LexError::UnterminatedSubstitution)
+                .unwrap_err(),
             LexError::UnterminatedSubstitution
         );
         let mut chars = CharCursor::new("echo hi");
@@ -6602,12 +7848,16 @@ mod tests {
         // $()-blind) as BacktickRawText atoms framed by BeginBacktick…EndBacktick.
         // Body source (between the outer backticks):  a\`b\\c
         //   (an escaped backtick + an escaped backslash are raw body content).
-        let mut lx = Lexer::new_live_atoms("`a\\`b\\\\c`", &Default::default(), LexerOptions::default());
+        let mut lx =
+            Lexer::new_live_atoms("`a\\`b\\\\c`", &Default::default(), LexerOptions::default());
         lx.push_mode(Mode::BacktickRaw);
         let mut kinds: Vec<String> = Vec::new();
         loop {
             match lx.next_kind().expect("lex") {
-                Some(TokenKind::EndBacktick) => { kinds.push("END".to_string()); break; }
+                Some(TokenKind::EndBacktick) => {
+                    kinds.push("END".to_string());
+                    break;
+                }
                 Some(TokenKind::BeginBacktick) => kinds.push("BEGIN".to_string()),
                 Some(TokenKind::BacktickRawText(s)) => kinds.push(s),
                 Some(other) => panic!("unexpected atom: {other:?}"),
@@ -6625,7 +7875,11 @@ mod tests {
         assert_eq!(kinds.last().unwrap(), "END");
 
         // Quote-blind: a `'`/`"`/`(`/`#` inside the body is ordinary run text.
-        let mut lx2 = Lexer::new_live_atoms("`echo '(' \"#\"`", &Default::default(), LexerOptions::default());
+        let mut lx2 = Lexer::new_live_atoms(
+            "`echo '(' \"#\"`",
+            &Default::default(),
+            LexerOptions::default(),
+        );
         lx2.push_mode(Mode::BacktickRaw);
         let mut body = String::new();
         loop {
@@ -6645,7 +7899,10 @@ mod tests {
         let mut saw_end = false;
         loop {
             match lx3.next_kind().expect("lex") {
-                Some(TokenKind::EndBacktick) => { saw_end = true; break; }
+                Some(TokenKind::EndBacktick) => {
+                    saw_end = true;
+                    break;
+                }
                 Some(TokenKind::BeginBacktick) => {}
                 Some(TokenKind::BacktickRawText(s)) => body3.push_str(&s),
                 Some(other) => panic!("unexpected: {other:?}"),
@@ -6656,208 +7913,20 @@ mod tests {
         assert!(!saw_end, "unterminated body must not emit EndBacktick");
     }
 
-
-
     // Local test helper: concatenate the literal text of a Word's parts
     // (expansions render as a placeholder so structure tests stay simple).
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     // ---- Positional parameter lexer tests (v22 Task 4) ----------------------
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     // ---- v27 here-string lexer tests -------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     // ──────────────────────────────────────────────────────────────
     // >| clobber redirect tests (v123)
     // ──────────────────────────────────────────────────────────────
 
-
-
-
-
     // ──────────────────────────────────────────────────────────────
     // [[ ]] keyword recognition tests (v30)
     // ──────────────────────────────────────────────────────────────
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     // ── v241 T2: ParamExpansion head-mode tests ────────────────────────────────
 
@@ -6865,12 +7934,18 @@ mod tests {
     /// (and including) `ParamClose`.
     fn head_atoms(s: &str) -> Vec<TokenKind> {
         let mut lx = Lexer::new(s, LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamExpansion { seen_name: false, indirect: false, start_off: 0 });
+        lx.push_mode(Mode::ParamExpansion {
+            seen_name: false,
+            indirect: false,
+            start_off: 0,
+        });
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
             let stop = matches!(t.kind, TokenKind::ParamClose);
             out.push(t.kind);
-            if stop { break; }
+            if stop {
+                break;
+            }
         }
         out
     }
@@ -6879,12 +7954,18 @@ mod tests {
     /// (operand is a different mode, so we stop at the operator boundary).
     fn head_atoms_until_op(s: &str) -> Vec<TokenKind> {
         let mut lx = Lexer::new(s, LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamExpansion { seen_name: false, indirect: false, start_off: 0 });
+        lx.push_mode(Mode::ParamExpansion {
+            seen_name: false,
+            indirect: false,
+            start_off: 0,
+        });
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
             let stop = matches!(t.kind, TokenKind::ParamOp(_));
             out.push(t.kind);
-            if stop { break; }
+            if stop {
+                break;
+            }
         }
         out
     }
@@ -6957,10 +8038,22 @@ mod tests {
     fn head_subscript() {
         // ${a[...] emits ParamOpen, ParamName(a), LBracket then yields to subscript mode
         let mut lx = Lexer::new("${a[1]}", LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamExpansion { seen_name: false, indirect: false, start_off: 0 });
-        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen { .. }));
-        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "a"));
-        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::LBracket));
+        lx.push_mode(Mode::ParamExpansion {
+            seen_name: false,
+            indirect: false,
+            start_off: 0,
+        });
+        assert!(matches!(
+            lx.next_token().unwrap().unwrap().kind,
+            TokenKind::ParamOpen { .. }
+        ));
+        assert!(
+            matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "a")
+        );
+        assert!(matches!(
+            lx.next_token().unwrap().unwrap().kind,
+            TokenKind::LBracket
+        ));
     }
 
     /// Prove stack-safety: pushing a nested `ParamExpansion` frame must not
@@ -6977,31 +8070,61 @@ mod tests {
         // inner frame, pull its ParamOpen + ParamName("b"), then pop it.
         // The outer frame's seen_name must still be true afterwards.
         let mut lx = Lexer::new("${a${b}}", LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamExpansion { seen_name: false, indirect: false, start_off: 0 });
+        lx.push_mode(Mode::ParamExpansion {
+            seen_name: false,
+            indirect: false,
+            start_off: 0,
+        });
 
         // Outer frame: pull ParamOpen (${ of outer).
-        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen { .. }));
+        assert!(matches!(
+            lx.next_token().unwrap().unwrap().kind,
+            TokenKind::ParamOpen { .. }
+        ));
         // Outer frame: pull ParamName("a") → seen_name becomes true.
-        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "a"));
+        assert!(
+            matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "a")
+        );
         // Outer frame must now be in seen_name=true (post-name phase).
         assert!(
-            matches!(lx.modes.last(), Some(Mode::ParamExpansion { seen_name: true, .. })),
+            matches!(
+                lx.modes.last(),
+                Some(Mode::ParamExpansion {
+                    seen_name: true,
+                    ..
+                })
+            ),
             "outer frame should be seen_name=true after pulling its name"
         );
 
         // Simulate parser detecting nested ${b} and pushing a fresh inner frame.
-        lx.push_mode(Mode::ParamExpansion { seen_name: false, indirect: false, start_off: 0 });
+        lx.push_mode(Mode::ParamExpansion {
+            seen_name: false,
+            indirect: false,
+            start_off: 0,
+        });
         // Inner frame: pull ParamOpen (the ${ of ${b}).
-        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen { .. }));
+        assert!(matches!(
+            lx.next_token().unwrap().unwrap().kind,
+            TokenKind::ParamOpen { .. }
+        ));
         // Inner frame: pull ParamName("b") → inner seen_name becomes true.
-        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "b"));
+        assert!(
+            matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "b")
+        );
 
         // Parser exits the nested expansion: pop the inner frame.
         lx.pop_mode();
 
         // The OUTER frame must still be seen_name=true (was corrupted before fix).
         assert!(
-            matches!(lx.modes.last(), Some(Mode::ParamExpansion { seen_name: true, .. })),
+            matches!(
+                lx.modes.last(),
+                Some(Mode::ParamExpansion {
+                    seen_name: true,
+                    ..
+                })
+            ),
             "outer frame seen_name must survive nested push/pop"
         );
     }
@@ -7022,11 +8145,19 @@ mod tests {
             // `$((` (the signal is emitted without advancing the cursor). Stop here
             // just like we stop at boundary atoms. (v246 T6: ArithOpen added — this
             // exact omission OOM-crashed a prior session; see v245 T6 for BeginBacktick.)
-            let stop = matches!(t.kind,
-                TokenKind::ParamClose | TokenKind::RBracket | TokenKind::ParamSep
-                    | TokenKind::CmdSubOpen | TokenKind::BeginBacktick | TokenKind::ArithOpen);
+            let stop = matches!(
+                t.kind,
+                TokenKind::ParamClose
+                    | TokenKind::RBracket
+                    | TokenKind::ParamSep
+                    | TokenKind::CmdSubOpen
+                    | TokenKind::BeginBacktick
+                    | TokenKind::ArithOpen
+            );
             out.push(t.kind);
-            if stop { break; }
+            if stop {
+                break;
+            }
         }
         out
     }
@@ -7034,9 +8165,18 @@ mod tests {
     #[test]
     fn operand_plain_literal() {
         assert_eq!(
-            operand_atoms("foo}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }),
+            operand_atoms(
+                "foo}",
+                Mode::ParamWordOperand {
+                    in_dquote: false,
+                    enclosing_dquote: false
+                }
+            ),
             vec![
-                TokenKind::Lit { text: "foo".into(), quoted: false },
+                TokenKind::Lit {
+                    text: "foo".into(),
+                    quoted: false
+                },
                 TokenKind::ParamClose,
             ]
         );
@@ -7046,21 +8186,48 @@ mod tests {
     fn operand_var_and_nested() {
         // Plain `$a` followed by terminator.
         assert_eq!(
-            operand_atoms("$a}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }),
-            vec![TokenKind::DollarName { name: "a".into(), quoted: false }, TokenKind::ParamClose]
+            operand_atoms(
+                "$a}",
+                Mode::ParamWordOperand {
+                    in_dquote: false,
+                    enclosing_dquote: false
+                }
+            ),
+            vec![
+                TokenKind::DollarName {
+                    name: "a".into(),
+                    quoted: false
+                },
+                TokenKind::ParamClose
+            ]
         );
         // Nested `${b}` — the parser would push ParamExpansion mode on ParamOpen;
         // in this standalone test the first atom is ParamOpen and that is sufficient.
-        let nested = operand_atoms("${b}}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
+        let nested = operand_atoms(
+            "${b}}",
+            Mode::ParamWordOperand {
+                in_dquote: false,
+                enclosing_dquote: false,
+            },
+        );
         assert_eq!(nested[0], TokenKind::ParamOpen { quoted: false });
     }
 
     #[test]
     fn operand_subst_separator() {
         assert_eq!(
-            operand_atoms("pat/", Mode::ParamSubstPatternOperand { in_dquote: false, enclosing_dquote: false }),
+            operand_atoms(
+                "pat/",
+                Mode::ParamSubstPatternOperand {
+                    in_dquote: false,
+                    enclosing_dquote: false
+                }
+            ),
             vec![
-                TokenKind::Lit { text: "pat".into(), quoted: false },
+                TokenKind::Lit {
+                    text: "pat".into(),
+                    quoted: false
+                },
                 TokenKind::ParamSep,
             ]
         );
@@ -7069,9 +8236,18 @@ mod tests {
     #[test]
     fn operand_substring_separator() {
         assert_eq!(
-            operand_atoms("1:", Mode::ParamSubstringOffsetOperand { in_dquote: false, enclosing_dquote: false }),
+            operand_atoms(
+                "1:",
+                Mode::ParamSubstringOffsetOperand {
+                    in_dquote: false,
+                    enclosing_dquote: false
+                }
+            ),
             vec![
-                TokenKind::Lit { text: "1".into(), quoted: false },
+                TokenKind::Lit {
+                    text: "1".into(),
+                    quoted: false
+                },
                 TokenKind::ParamSep,
             ]
         );
@@ -7082,22 +8258,58 @@ mod tests {
         // v244 T4: unquoted `$(cmd)` in an operand emits CmdSubOpen (signal to parse_command_sub).
         // v245 T6: backtick emits BeginBacktick (signal to parse_backtick_sub).
         // v246 T6: `$((` emits ArithOpen (signal to parse_arith_expansion).
-        let a = operand_atoms("$(x)}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
-        assert_eq!(a[0], TokenKind::CmdSubOpen, "$(cmd) must emit CmdSubOpen signal");
+        let a = operand_atoms(
+            "$(x)}",
+            Mode::ParamWordOperand {
+                in_dquote: false,
+                enclosing_dquote: false,
+            },
+        );
+        assert_eq!(
+            a[0],
+            TokenKind::CmdSubOpen,
+            "$(cmd) must emit CmdSubOpen signal"
+        );
 
         // `$((` now emits ArithOpen (v246 T6) — no longer DeferredExpansion.
-        let b = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
-        assert_eq!(b[0], TokenKind::ArithOpen, "$((…)) must emit ArithOpen signal");
+        let b = operand_atoms(
+            "$((1+1))}",
+            Mode::ParamWordOperand {
+                in_dquote: false,
+                enclosing_dquote: false,
+            },
+        );
+        assert_eq!(
+            b[0],
+            TokenKind::ArithOpen,
+            "$((…)) must emit ArithOpen signal"
+        );
 
         // Backtick now emits BeginBacktick signal (v245 T6).
-        let c = operand_atoms("`echo x`}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
-        assert_eq!(c[0], TokenKind::BeginBacktick, "backtick must emit BeginBacktick signal");
+        let c = operand_atoms(
+            "`echo x`}",
+            Mode::ParamWordOperand {
+                in_dquote: false,
+                enclosing_dquote: false,
+            },
+        );
+        assert_eq!(
+            c[0],
+            TokenKind::BeginBacktick,
+            "backtick must emit BeginBacktick signal"
+        );
     }
 
     #[test]
     fn operand_arith_signal() {
         // v246 T6: `$((` in an unquoted operand emits ArithOpen (zero-width signal).
-        let a = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
+        let a = operand_atoms(
+            "$((1+1))}",
+            Mode::ParamWordOperand {
+                in_dquote: false,
+                enclosing_dquote: false,
+            },
+        );
         assert_eq!(a[0], TokenKind::ArithOpen, "$(( must emit ArithOpen signal");
     }
 
@@ -7112,9 +8324,15 @@ mod tests {
         // signal (parser would push the sub-mode there).
         fn signal_and_quoted(s: &str) -> (TokenKind, bool) {
             let mut lx = Lexer::new(s, LexerOptions::default(), true);
-            lx.push_mode(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
+            lx.push_mode(Mode::ParamWordOperand {
+                in_dquote: false,
+                enclosing_dquote: false,
+            });
             while let Some(t) = lx.next_token().unwrap() {
-                if matches!(t.kind, TokenKind::CmdSubOpen | TokenKind::ArithOpen | TokenKind::BeginBacktick) {
+                if matches!(
+                    t.kind,
+                    TokenKind::CmdSubOpen | TokenKind::ArithOpen | TokenKind::BeginBacktick
+                ) {
                     let q = lx.operand_in_dquote();
                     return (t.kind, q);
                 }
@@ -7127,18 +8345,39 @@ mod tests {
         }
 
         // FIRST char of the `"…"` span.
-        assert_eq!(signal_and_quoted("\"$(x)\"}"),      (TokenKind::CmdSubOpen,    true));
-        assert_eq!(signal_and_quoted("\"$((1+1))\"}"),  (TokenKind::ArithOpen,     true));
-        assert_eq!(signal_and_quoted("\"`x`\"}"),       (TokenKind::BeginBacktick, true));
+        assert_eq!(
+            signal_and_quoted("\"$(x)\"}"),
+            (TokenKind::CmdSubOpen, true)
+        );
+        assert_eq!(
+            signal_and_quoted("\"$((1+1))\"}"),
+            (TokenKind::ArithOpen, true)
+        );
+        assert_eq!(
+            signal_and_quoted("\"`x`\"}"),
+            (TokenKind::BeginBacktick, true)
+        );
         // CONTINUING the span (a literal precedes the expansion).
-        assert_eq!(signal_and_quoted("\"a$(x)\"}"),     (TokenKind::CmdSubOpen,    true));
-        assert_eq!(signal_and_quoted("\"a$((1+1))\"}"), (TokenKind::ArithOpen,     true));
-        assert_eq!(signal_and_quoted("\"a`x`\"}"),      (TokenKind::BeginBacktick, true));
+        assert_eq!(
+            signal_and_quoted("\"a$(x)\"}"),
+            (TokenKind::CmdSubOpen, true)
+        );
+        assert_eq!(
+            signal_and_quoted("\"a$((1+1))\"}"),
+            (TokenKind::ArithOpen, true)
+        );
+        assert_eq!(
+            signal_and_quoted("\"a`x`\"}"),
+            (TokenKind::BeginBacktick, true)
+        );
 
         // Regression: an UNQUOTED-operand opener reads `false` (still splittable).
-        assert_eq!(signal_and_quoted("$(x)}"),          (TokenKind::CmdSubOpen,    false));
-        assert_eq!(signal_and_quoted("$((1+1))}"),      (TokenKind::ArithOpen,     false));
-        assert_eq!(signal_and_quoted("`x`}"),           (TokenKind::BeginBacktick, false));
+        assert_eq!(signal_and_quoted("$(x)}"), (TokenKind::CmdSubOpen, false));
+        assert_eq!(
+            signal_and_quoted("$((1+1))}"),
+            (TokenKind::ArithOpen, false)
+        );
+        assert_eq!(signal_and_quoted("`x`}"), (TokenKind::BeginBacktick, false));
     }
 
     // ── v247 T7: Command-mode atom-stream shape ──────────────────────────────
@@ -7151,15 +8390,20 @@ mod tests {
         let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions::default());
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
-            let stop = matches!(t.kind,
-                TokenKind::CmdSubOpen | TokenKind::BeginBacktick
-                    | TokenKind::ArithOpen | TokenKind::ParamOpen { .. });
+            let stop = matches!(
+                t.kind,
+                TokenKind::CmdSubOpen
+                    | TokenKind::BeginBacktick
+                    | TokenKind::ArithOpen
+                    | TokenKind::ParamOpen { .. }
+            );
             out.push(t.kind);
-            if stop { break; }
+            if stop {
+                break;
+            }
         }
         out
     }
-
 
     // ── v250 T1: heredoc opener atom (dormant; body emission is a later task) ──
 
@@ -7168,16 +8412,42 @@ mod tests {
         // The atom `<<` opener consumes the delimiter and carries the correct
         // `expand`/`strip_tabs`; the delimiter is NOT left as a following word.
         let toks = command_atoms_of("cat <<EOF");
-        assert!(matches!(toks.last(), Some(TokenKind::Heredoc { expand: true, strip_tabs: false, .. })),
-            "unquoted delim → expanding; got {toks:?}");
+        assert!(
+            matches!(
+                toks.last(),
+                Some(TokenKind::Heredoc {
+                    expand: true,
+                    strip_tabs: false,
+                    ..
+                })
+            ),
+            "unquoted delim → expanding; got {toks:?}"
+        );
         // No trailing Lit("EOF") — the delimiter was consumed by the opener.
-        assert!(!toks.iter().any(|t| matches!(t, TokenKind::Lit { text, .. } if text == "EOF")),
-            "delimiter must be consumed, not emitted as a word: {toks:?}");
+        assert!(
+            !toks
+                .iter()
+                .any(|t| matches!(t, TokenKind::Lit { text, .. } if text == "EOF")),
+            "delimiter must be consumed, not emitted as a word: {toks:?}"
+        );
         // Quoted delimiter → literal (expand:false); `<<-` → strip_tabs.
         let q = command_atoms_of("cat <<'EOF'");
-        assert!(matches!(q.last(), Some(TokenKind::Heredoc { expand: false, .. })), "quoted delim → literal: {q:?}");
+        assert!(
+            matches!(q.last(), Some(TokenKind::Heredoc { expand: false, .. })),
+            "quoted delim → literal: {q:?}"
+        );
         let dash = command_atoms_of("cat <<-EOF");
-        assert!(matches!(dash.last(), Some(TokenKind::Heredoc { strip_tabs: true, expand: true, .. })), "<<- → strip_tabs: {dash:?}");
+        assert!(
+            matches!(
+                dash.last(),
+                Some(TokenKind::Heredoc {
+                    strip_tabs: true,
+                    expand: true,
+                    ..
+                })
+            ),
+            "<<- → strip_tabs: {dash:?}"
+        );
     }
 
     // ── v251 T1: ProcSubOpen atom (dormant; parser assembly is a later task) ──
@@ -7186,18 +8456,35 @@ mod tests {
     fn procsub_open_atoms_disambiguate() {
         // `<(`/`>(` → ProcSubOpen signal (NOT a redirect op); the `(` is NOT consumed.
         let a = command_atoms_of("cat <(echo hi)");
-        assert!(a.iter().any(|t| matches!(t, TokenKind::ProcSubOpen { dir: ProcDir::In })),
-            "expected ProcSubOpen In, got {a:?}");
-        assert!(!a.iter().any(|t| matches!(t, TokenKind::Op(Operator::RedirIn))),
-            "`<(` must NOT emit RedirIn: {a:?}");
+        assert!(
+            a.iter()
+                .any(|t| matches!(t, TokenKind::ProcSubOpen { dir: ProcDir::In })),
+            "expected ProcSubOpen In, got {a:?}"
+        );
+        assert!(
+            !a.iter()
+                .any(|t| matches!(t, TokenKind::Op(Operator::RedirIn))),
+            "`<(` must NOT emit RedirIn: {a:?}"
+        );
         let b = command_atoms_of("tee >(cat)");
-        assert!(b.iter().any(|t| matches!(t, TokenKind::ProcSubOpen { dir: ProcDir::Out })),
-            "expected ProcSubOpen Out, got {b:?}");
+        assert!(
+            b.iter()
+                .any(|t| matches!(t, TokenKind::ProcSubOpen { dir: ProcDir::Out })),
+            "expected ProcSubOpen Out, got {b:?}"
+        );
         // Non-`(` `<`/`>` are unaffected.
         let r = command_atoms_of("cat < f");
-        assert!(r.iter().any(|t| matches!(t, TokenKind::Op(Operator::RedirIn))), "plain `<` still RedirIn: {r:?}");
+        assert!(
+            r.iter()
+                .any(|t| matches!(t, TokenKind::Op(Operator::RedirIn))),
+            "plain `<` still RedirIn: {r:?}"
+        );
         let rr = command_atoms_of("echo >> f");
-        assert!(rr.iter().any(|t| matches!(t, TokenKind::Op(Operator::RedirAppend))), "`>>` still RedirAppend: {rr:?}");
+        assert!(
+            rr.iter()
+                .any(|t| matches!(t, TokenKind::Op(Operator::RedirAppend))),
+            "`>>` still RedirAppend: {rr:?}"
+        );
     }
 
     // ── v265 T6: focused, explicit-expected token-stream tests ───────────────
@@ -7208,30 +8495,56 @@ mod tests {
 
     #[test]
     fn t6_atoms_simple_command() {
-        assert_eq!(command_atoms_of("echo hi"), vec![
-            TokenKind::Lit { text: "echo".into(), quoted: false },
-            TokenKind::Blank,
-            TokenKind::Lit { text: "hi".into(), quoted: false },
-        ]);
+        assert_eq!(
+            command_atoms_of("echo hi"),
+            vec![
+                TokenKind::Lit {
+                    text: "echo".into(),
+                    quoted: false
+                },
+                TokenKind::Blank,
+                TokenKind::Lit {
+                    text: "hi".into(),
+                    quoted: false
+                },
+            ]
+        );
     }
 
     #[test]
     fn t6_atoms_single_and_ansic_quote() {
-        assert_eq!(command_atoms_of("'a b'"), vec![
-            TokenKind::QuoteRun { style: QuoteStyle::Single, text: "a b".into() },
-        ]);
-        assert_eq!(command_atoms_of("$'a\\tb'"), vec![
-            TokenKind::QuoteRun { style: QuoteStyle::AnsiC, text: "a\tb".into() },
-        ]);
+        assert_eq!(
+            command_atoms_of("'a b'"),
+            vec![TokenKind::QuoteRun {
+                style: QuoteStyle::Single,
+                text: "a b".into()
+            },]
+        );
+        assert_eq!(
+            command_atoms_of("$'a\\tb'"),
+            vec![TokenKind::QuoteRun {
+                style: QuoteStyle::AnsiC,
+                text: "a\tb".into()
+            },]
+        );
     }
 
     #[test]
     fn t6_atoms_dollar_name_and_param_open_signal() {
-        assert_eq!(command_atoms_of("echo $x"), vec![
-            TokenKind::Lit { text: "echo".into(), quoted: false },
-            TokenKind::Blank,
-            TokenKind::DollarName { name: "x".into(), quoted: false },
-        ]);
+        assert_eq!(
+            command_atoms_of("echo $x"),
+            vec![
+                TokenKind::Lit {
+                    text: "echo".into(),
+                    quoted: false
+                },
+                TokenKind::Blank,
+                TokenKind::DollarName {
+                    name: "x".into(),
+                    quoted: false
+                },
+            ]
+        );
         // `${x}` ends at the zero-width ParamOpen SIGNAL — the parser owns the body.
         assert!(matches!(
             command_atoms_of("echo ${x}").last(),
@@ -7243,46 +8556,100 @@ mod tests {
     fn t6_atoms_brace_stays_literal() {
         // Brace expansion is a parser/expansion concern; the lexer keeps `{a,b}`
         // as one literal word.
-        assert_eq!(command_atoms_of("echo {a,b}"), vec![
-            TokenKind::Lit { text: "echo".into(), quoted: false },
-            TokenKind::Blank,
-            TokenKind::Lit { text: "{a,b}".into(), quoted: false },
-        ]);
+        assert_eq!(
+            command_atoms_of("echo {a,b}"),
+            vec![
+                TokenKind::Lit {
+                    text: "echo".into(),
+                    quoted: false
+                },
+                TokenKind::Blank,
+                TokenKind::Lit {
+                    text: "{a,b}".into(),
+                    quoted: false
+                },
+            ]
+        );
     }
 
     #[test]
     fn t6_atoms_redirect_ops() {
-        assert_eq!(command_atoms_of("cat < f"), vec![
-            TokenKind::Lit { text: "cat".into(), quoted: false }, TokenKind::Blank,
-            TokenKind::Op(Operator::RedirIn), TokenKind::Blank,
-            TokenKind::Lit { text: "f".into(), quoted: false },
-        ]);
-        assert_eq!(command_atoms_of("echo >> f"), vec![
-            TokenKind::Lit { text: "echo".into(), quoted: false }, TokenKind::Blank,
-            TokenKind::Op(Operator::RedirAppend), TokenKind::Blank,
-            TokenKind::Lit { text: "f".into(), quoted: false },
-        ]);
+        assert_eq!(
+            command_atoms_of("cat < f"),
+            vec![
+                TokenKind::Lit {
+                    text: "cat".into(),
+                    quoted: false
+                },
+                TokenKind::Blank,
+                TokenKind::Op(Operator::RedirIn),
+                TokenKind::Blank,
+                TokenKind::Lit {
+                    text: "f".into(),
+                    quoted: false
+                },
+            ]
+        );
+        assert_eq!(
+            command_atoms_of("echo >> f"),
+            vec![
+                TokenKind::Lit {
+                    text: "echo".into(),
+                    quoted: false
+                },
+                TokenKind::Blank,
+                TokenKind::Op(Operator::RedirAppend),
+                TokenKind::Blank,
+                TokenKind::Lit {
+                    text: "f".into(),
+                    quoted: false
+                },
+            ]
+        );
         // here-string operator
-        assert!(command_atoms_of("cat <<< word").iter()
-            .any(|t| matches!(t, TokenKind::Op(Operator::HereString))));
+        assert!(
+            command_atoms_of("cat <<< word")
+                .iter()
+                .any(|t| matches!(t, TokenKind::Op(Operator::HereString)))
+        );
         // `2>&1`: fd-prefix (RedirFd) then dup-out operator.
         let d = command_atoms_of("echo 2>&1");
-        assert!(d.iter().any(|t| matches!(t, TokenKind::RedirFd(crate::command::RedirFd::Number(2)))), "fd prefix: {d:?}");
-        assert!(d.iter().any(|t| matches!(t, TokenKind::Op(Operator::DupOut))), "dup-out: {d:?}");
+        assert!(
+            d.iter()
+                .any(|t| matches!(t, TokenKind::RedirFd(crate::command::RedirFd::Number(2)))),
+            "fd prefix: {d:?}"
+        );
+        assert!(
+            d.iter()
+                .any(|t| matches!(t, TokenKind::Op(Operator::DupOut))),
+            "dup-out: {d:?}"
+        );
     }
 
     #[test]
     fn t6_atoms_array_literal_and_subscript_assign() {
         // `a=(1 2)` → `a=` literal, ArrayOpen signal, `(`, elements, `)`.
-        assert_eq!(command_atoms_of("a=(1 2)"), vec![
-            TokenKind::Lit { text: "a=".into(), quoted: false },
-            TokenKind::ArrayOpen,
-            TokenKind::Op(Operator::LParen),
-            TokenKind::Lit { text: "1".into(), quoted: false },
-            TokenKind::Blank,
-            TokenKind::Lit { text: "2".into(), quoted: false },
-            TokenKind::Op(Operator::RParen),
-        ]);
+        assert_eq!(
+            command_atoms_of("a=(1 2)"),
+            vec![
+                TokenKind::Lit {
+                    text: "a=".into(),
+                    quoted: false
+                },
+                TokenKind::ArrayOpen,
+                TokenKind::Op(Operator::LParen),
+                TokenKind::Lit {
+                    text: "1".into(),
+                    quoted: false
+                },
+                TokenKind::Blank,
+                TokenKind::Lit {
+                    text: "2".into(),
+                    quoted: false
+                },
+                TokenKind::Op(Operator::RParen),
+            ]
+        );
         // `a[0]=v` → (v268) the lexer no longer assembles the subscript itself:
         // it emits `Lit "a"` + a zero-width `LBracket` and defers to the PARSER
         // (which pushes `Mode::ParamSubscriptOperand`, assembles the subscript,
@@ -7293,11 +8660,20 @@ mod tests {
         // just continues plain Command-mode literal scanning, so `0]=v` comes
         // back as one literal run — that is the new, correct lexer-only
         // contract, not a regression.
-        assert_eq!(command_atoms_of("a[0]=v"), vec![
-            TokenKind::Lit { text: "a".into(), quoted: false },
-            TokenKind::LBracket,
-            TokenKind::Lit { text: "0]=v".into(), quoted: false },
-        ]);
+        assert_eq!(
+            command_atoms_of("a[0]=v"),
+            vec![
+                TokenKind::Lit {
+                    text: "a".into(),
+                    quoted: false
+                },
+                TokenKind::LBracket,
+                TokenKind::Lit {
+                    text: "0]=v".into(),
+                    quoted: false
+                },
+            ]
+        );
     }
 
     #[test]
@@ -7305,11 +8681,19 @@ mod tests {
         // `@(a|b)` with extglob on → a zero-width ExtglobOpen signal (the parser
         // assembles the group); the `(` is NOT consumed.
         let mut lx = Lexer::new_live_atoms(
-            "@(a|b)", &Default::default(),
-            LexerOptions { extglob: true, ..Default::default() },
+            "@(a|b)",
+            &Default::default(),
+            LexerOptions {
+                extglob: true,
+                ..Default::default()
+            },
         );
         let first = lx.next_token().unwrap().unwrap();
-        assert!(matches!(first.kind, TokenKind::ExtglobOpen { prefix: '@' }), "{:?}", first.kind);
+        assert!(
+            matches!(first.kind, TokenKind::ExtglobOpen { prefix: '@' }),
+            "{:?}",
+            first.kind
+        );
     }
 
     #[test]
@@ -7317,37 +8701,67 @@ mod tests {
         // Quoted delimiter → literal body: Newline, then Begin, one raw Lit, End.
         let toks = command_atoms_of("cat <<'EOF'\nhello $x\nEOF\n");
         // Find the body bracket.
-        let begin = toks.iter().position(|t| matches!(t, TokenKind::HeredocBodyBegin { .. })).expect("Begin");
-        assert!(matches!(&toks[begin + 1], TokenKind::Lit { text, quoted: true } if text == "hello $x\n"),
-            "literal body is one raw Lit (no expansion of $x): {toks:?}");
-        assert!(matches!(&toks[begin + 2], TokenKind::HeredocBodyEnd), "End after body: {toks:?}");
+        let begin = toks
+            .iter()
+            .position(|t| matches!(t, TokenKind::HeredocBodyBegin { .. }))
+            .expect("Begin");
+        assert!(
+            matches!(&toks[begin + 1], TokenKind::Lit { text, quoted: true } if text == "hello $x\n"),
+            "literal body is one raw Lit (no expansion of $x): {toks:?}"
+        );
+        assert!(
+            matches!(&toks[begin + 2], TokenKind::HeredocBodyEnd),
+            "End after body: {toks:?}"
+        );
     }
 
     #[test]
     fn heredoc_literal_body_atoms_dash_strips_tabs() {
         // `<<-` strips leading TABS (only) from each body line AND the delimiter check.
         let toks = command_atoms_of("cat <<-'EOF'\n\t\thello\n\tEOF\n");
-        let begin = toks.iter().position(|t| matches!(t, TokenKind::HeredocBodyBegin { .. })).expect("Begin");
-        assert!(matches!(&toks[begin + 1], TokenKind::Lit { text, quoted: true } if text == "hello\n"),
-            "<<- strips leading tabs from body lines: {toks:?}");
-        assert!(matches!(&toks[begin + 2], TokenKind::HeredocBodyEnd), "End after body: {toks:?}");
+        let begin = toks
+            .iter()
+            .position(|t| matches!(t, TokenKind::HeredocBodyBegin { .. }))
+            .expect("Begin");
+        assert!(
+            matches!(&toks[begin + 1], TokenKind::Lit { text, quoted: true } if text == "hello\n"),
+            "<<- strips leading tabs from body lines: {toks:?}"
+        );
+        assert!(
+            matches!(&toks[begin + 2], TokenKind::HeredocBodyEnd),
+            "End after body: {toks:?}"
+        );
     }
 
     #[test]
     fn heredoc_literal_body_atoms_empty_body() {
         // Empty body → no Lit emitted, just Begin then End.
         let toks = command_atoms_of("cat <<'EOF'\nEOF\n");
-        let begin = toks.iter().position(|t| matches!(t, TokenKind::HeredocBodyBegin { .. })).expect("Begin");
-        assert!(matches!(&toks[begin + 1], TokenKind::HeredocBodyEnd),
-            "empty body emits no Lit: {toks:?}");
+        let begin = toks
+            .iter()
+            .position(|t| matches!(t, TokenKind::HeredocBodyBegin { .. }))
+            .expect("Begin");
+        assert!(
+            matches!(&toks[begin + 1], TokenKind::HeredocBodyEnd),
+            "empty body emits no Lit: {toks:?}"
+        );
     }
 
     #[test]
     fn operand_subscript_close() {
         assert_eq!(
-            operand_atoms("3]", Mode::ParamSubscriptOperand { in_dquote: false, enclosing_dquote: false }),
+            operand_atoms(
+                "3]",
+                Mode::ParamSubscriptOperand {
+                    in_dquote: false,
+                    enclosing_dquote: false
+                }
+            ),
             vec![
-                TokenKind::Lit { text: "3".into(), quoted: false },
+                TokenKind::Lit {
+                    text: "3".into(),
+                    quoted: false
+                },
                 TokenKind::RBracket,
             ]
         );
@@ -7357,11 +8771,20 @@ mod tests {
     fn operand_dquote_simple_is_one_lit() {
         // `"a}b"` — no expansion: ONE quoted Lit (the `}` is literal because it's
         // inside `"…"`), then ParamClose.
-        let a = operand_atoms("\"a}b\"}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
+        let a = operand_atoms(
+            "\"a}b\"}",
+            Mode::ParamWordOperand {
+                in_dquote: false,
+                enclosing_dquote: false,
+            },
+        );
         assert_eq!(
             a,
             vec![
-                TokenKind::Lit { text: "a}b".into(), quoted: true },
+                TokenKind::Lit {
+                    text: "a}b".into(),
+                    quoted: true
+                },
                 TokenKind::ParamClose,
             ]
         );
@@ -7373,10 +8796,16 @@ mod tests {
         // DeferredExpansion).  The parser would push ParamExpansion on ParamOpen;
         // this test confirms the lexer emits the correct flat tokens.
         let mut lx = Lexer::new("\"a${y}b\"}", LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
+        lx.push_mode(Mode::ParamWordOperand {
+            in_dquote: false,
+            enclosing_dquote: false,
+        });
         assert_eq!(
             lx.next_token().unwrap().unwrap().kind,
-            TokenKind::Lit { text: "a".into(), quoted: true }
+            TokenKind::Lit {
+                text: "a".into(),
+                quoted: true
+            }
         );
         assert_eq!(
             lx.next_token().unwrap().unwrap().kind,
@@ -7388,10 +8817,16 @@ mod tests {
     fn operand_dquote_var_inside() {
         // `"$a"` — a DollarName token, not a DeferredExpansion.
         let mut lx = Lexer::new("\"$a\"}", LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
+        lx.push_mode(Mode::ParamWordOperand {
+            in_dquote: false,
+            enclosing_dquote: false,
+        });
         assert_eq!(
             lx.next_token().unwrap().unwrap().kind,
-            TokenKind::DollarName { name: "a".into(), quoted: true }
+            TokenKind::DollarName {
+                name: "a".into(),
+                quoted: true
+            }
         );
     }
 }
@@ -7400,76 +8835,29 @@ mod tests {
 mod array_parse_tests {
     use super::*;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     #[test]
     fn brace_expand_parts_literal_splits() {
-        let parts = vec![WordPart::Literal { text: "x{a,b}".to_string(), quoted: false }];
+        let parts = vec![WordPart::Literal {
+            text: "x{a,b}".to_string(),
+            quoted: false,
+        }];
         let out = brace_expand_parts(parts).unwrap();
         assert_eq!(out.len(), 2);
     }
 
     #[test]
     fn brace_expand_parts_no_brace_passthrough() {
-        let parts = vec![WordPart::Literal { text: "plain".to_string(), quoted: false }];
+        let parts = vec![WordPart::Literal {
+            text: "plain".to_string(),
+            quoted: false,
+        }];
         let out = brace_expand_parts(parts).unwrap();
         assert_eq!(out.len(), 1);
     }
 
-
-
-
-
-
-
-
-
     // --- process substitution lexer tests ---
 
-
-
-
-
-
-
     // --- bad-substitution lexer tests (v233) ---
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn pull_surfaces_lex_error_as_err() {
@@ -7483,7 +8871,10 @@ mod array_parse_tests {
         let empty = std::collections::HashMap::new();
         let mut lx = Lexer::new_live_atoms("echo \"unterminated", &empty, LexerOptions::default());
         let r = crate::parser::parse_sequence(&mut lx);
-        assert!(matches!(r, Err(crate::command::ParseError::Lex(_))), "got {r:?}");
+        assert!(
+            matches!(r, Err(crate::command::ParseError::Lex(_))),
+            "got {r:?}"
+        );
     }
 
     // --- Task 4: alias storage + command-position expansion ---
@@ -7497,7 +8888,9 @@ mod array_parse_tests {
     /// Build a LIVE atom lexer with `pairs` registered as aliases.
     fn lx_atoms_with_alias(input: &'static str, pairs: &[(&str, &str)]) -> Lexer<'static> {
         let mut m = std::collections::HashMap::new();
-        for (k, v) in pairs { m.insert(k.to_string(), v.to_string()); }
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v.to_string());
+        }
         Lexer::new_live_atoms(input, &m, LexerOptions::default())
     }
 
@@ -7532,7 +8925,9 @@ mod array_parse_tests {
                     lx.expand_command_alias().unwrap();
                 }
                 _ => {
-                    if let Some(t) = atom_word_text(&k) { out.push(t); }
+                    if let Some(t) = atom_word_text(&k) {
+                        out.push(t);
+                    }
                     lx.next().unwrap();
                 }
             }
@@ -7598,8 +8993,14 @@ mod array_parse_tests {
         while let Some(t) = lx.next().unwrap() {
             if let Some(txt) = atom_word_text(&t.kind) {
                 saw_body_word = true;
-                assert_eq!(t.span.offset, 2, "body atom {txt:?} must pin to the name span (offset 2)");
-                assert_eq!(t.span.line, 1, "body atom {txt:?} must pin to the name line");
+                assert_eq!(
+                    t.span.offset, 2,
+                    "body atom {txt:?} must pin to the name span (offset 2)"
+                );
+                assert_eq!(
+                    t.span.line, 1,
+                    "body atom {txt:?} must pin to the name line"
+                );
             }
         }
         assert!(saw_body_word, "expected the body to produce word atoms");
@@ -7626,12 +9027,13 @@ mod array_parse_tests {
         m.insert("x".to_string(), "echo \"".to_string()); // unterminated quote in body
         let mut lx = Lexer::new_live_atoms("x", &m, LexerOptions::default());
         let r = crate::parser::parse_sequence(&mut lx);
-        assert!(matches!(r, Err(crate::command::ParseError::Lex(_))), "got {r:?}");
+        assert!(
+            matches!(r, Err(crate::command::ParseError::Lex(_))),
+            "got {r:?}"
+        );
     }
 
     // --- Task 7: incrementality + live-lexer error tests ---
-
-
 
     // --- Task 2 (v240): mark/rewind checkpoint tests ---
 
@@ -7674,24 +9076,61 @@ mod array_parse_tests {
         let mut lx = Lexer::new("a\nbb\nccc", LexerOptions::default(), true);
         let _ = lx.next_token().unwrap().unwrap(); // Word "a" (line 1)
         let _ = lx.next_token().unwrap().unwrap(); // Newline (line 1)
-        let m = lx.mark();                         // at start of "bb" on line 2
+        let m = lx.mark(); // at start of "bb" on line 2
         let bb1 = lx.next_token().unwrap().unwrap().span;
         assert_eq!(bb1.line, 2);
         lx.rewind(&m);
         let bb2 = lx.next_token().unwrap().unwrap().span;
-        assert_eq!((bb1.offset, bb1.line, bb1.column), (bb2.offset, bb2.line, bb2.column));
+        assert_eq!(
+            (bb1.offset, bb1.line, bb1.column),
+            (bb2.offset, bb2.line, bb2.column)
+        );
     }
 
     #[test]
     fn rewind_restores_mode_stack() {
         let mut lx = Lexer::new("x", LexerOptions::default(), true);
-        lx.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
+        lx.push_mode(Mode::Arith {
+            paren_depth: 0,
+            in_squote: false,
+            in_dquote: false,
+            body_started: false,
+            for_header: false,
+            delim: ArithDelim::Paren,
+        });
         let m = lx.mark();
-        lx.push_mode(Mode::CommandSub { body_started: false });
-        assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
+        lx.push_mode(Mode::CommandSub {
+            body_started: false,
+        });
+        assert_eq!(
+            lx.current_mode(),
+            Mode::CommandSub {
+                body_started: false
+            }
+        );
         lx.rewind(&m);
-        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
-        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
+        assert_eq!(
+            lx.current_mode(),
+            Mode::Arith {
+                paren_depth: 0,
+                in_squote: false,
+                in_dquote: false,
+                body_started: false,
+                for_header: false,
+                delim: ArithDelim::Paren
+            }
+        );
+        assert_eq!(
+            lx.pop_mode(),
+            Mode::Arith {
+                paren_depth: 0,
+                in_squote: false,
+                in_dquote: false,
+                body_started: false,
+                for_header: false,
+                delim: ArithDelim::Paren
+            }
+        );
         assert_eq!(lx.current_mode(), Mode::Command);
     }
 
@@ -7713,18 +9152,33 @@ mod array_parse_tests {
             match lx.next() {
                 Ok(Some(_)) => continue,
                 Ok(None) => break,
-                Err(e) => { err = Some(e); break; }
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
             }
         }
-        assert!(matches!(err, Some(LexError::NoProgress)), "expected NoProgress, got {err:?}");
+        assert!(
+            matches!(err, Some(LexError::NoProgress)),
+            "expected NoProgress, got {err:?}"
+        );
     }
 
     #[test]
     fn scan_stall_guard_allows_normal_openers() {
-        for src in ["$((1+2))", "${x}", "$(echo hi)", "`echo hi`", "$(( $(( 1 + 1 )) + 1 ))"] {
+        for src in [
+            "$((1+2))",
+            "${x}",
+            "$(echo hi)",
+            "`echo hi`",
+            "$(( $(( 1 + 1 )) + 1 ))",
+        ] {
             let empty = std::collections::HashMap::new();
             let mut lx = Lexer::new_live_atoms(src, &empty, LexerOptions::default());
-            assert!(crate::parser::parse_sequence(&mut lx).is_ok(), "false NoProgress on {src:?}");
+            assert!(
+                crate::parser::parse_sequence(&mut lx).is_ok(),
+                "false NoProgress on {src:?}"
+            );
         }
     }
 
@@ -7789,13 +9243,19 @@ mod array_parse_tests {
         let empty = std::collections::HashMap::new();
         let src = "a ".repeat(HISTORY_PRUNE_THRESHOLD + 50); // many simple words + blanks
         let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
-        for _ in 0..(HISTORY_PRUNE_THRESHOLD + 1) { let _ = lx.next().unwrap(); }
+        for _ in 0..(HISTORY_PRUNE_THRESHOLD + 1) {
+            let _ = lx.next().unwrap();
+        }
         assert!(lx.pos >= HISTORY_PRUNE_THRESHOLD);
         let frontier = lx.peek_kind().unwrap().cloned(); // fill + capture next token
         lx.maybe_prune_history();
         assert_eq!(lx.pos, 0, "pos reset to 0");
         assert!(lx.scanned_token_count() <= 8, "consumed prefix drained");
-        assert_eq!(lx.peek_kind().unwrap().cloned(), frontier, "frontier token preserved");
+        assert_eq!(
+            lx.peek_kind().unwrap().cloned(),
+            frontier,
+            "frontier token preserved"
+        );
     }
 
     #[test]
@@ -7818,17 +9278,17 @@ mod array_parse_tests {
         // (value, bash's exact bytes). Valid scalars and the > 0x7FFFFFFF
         // (empty) range are byte-identical to bash 5.2.
         let cases: &[(u32, &[u8])] = &[
-            (0x0041, &[0x41]),                                     // 'A'
-            (0x00E9, &[0xC3, 0xA9]),                               // 'é'  2-byte
-            (0x0800, &[0xE0, 0xA0, 0x80]),                         // 3-byte
-            (0x10FFFF, &[0xF4, 0x8F, 0xBF, 0xBF]),                 // max scalar, 4-byte
-            (0x110000, &[0xF4, 0x90, 0x80, 0x80]),                 // just over max, 4-byte
-            (0x0020_0000, &[0xF8, 0x88, 0x80, 0x80, 0x80]),        // 5-byte
-            (0x03FF_FFFF, &[0xFB, 0xBF, 0xBF, 0xBF, 0xBF]),        // 5-byte max
-            (0x0400_0000, &[0xFC, 0x84, 0x80, 0x80, 0x80, 0x80]),  // 6-byte
-            (0x7FFF_FFFF, &[0xFD, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]),  // 6-byte max
-            (0xD800, &[0xED, 0xA0, 0x80]),                         // surrogate
-            (0xDFFF, &[0xED, 0xBF, 0xBF]),                         // surrogate
+            (0x0041, &[0x41]),                                    // 'A'
+            (0x00E9, &[0xC3, 0xA9]),                              // 'é'  2-byte
+            (0x0800, &[0xE0, 0xA0, 0x80]),                        // 3-byte
+            (0x10FFFF, &[0xF4, 0x8F, 0xBF, 0xBF]),                // max scalar, 4-byte
+            (0x110000, &[0xF4, 0x90, 0x80, 0x80]),                // just over max, 4-byte
+            (0x0020_0000, &[0xF8, 0x88, 0x80, 0x80, 0x80]),       // 5-byte
+            (0x03FF_FFFF, &[0xFB, 0xBF, 0xBF, 0xBF, 0xBF]),       // 5-byte max
+            (0x0400_0000, &[0xFC, 0x84, 0x80, 0x80, 0x80, 0x80]), // 6-byte
+            (0x7FFF_FFFF, &[0xFD, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]), // 6-byte max
+            (0xD800, &[0xED, 0xA0, 0x80]),                        // surrogate
+            (0xDFFF, &[0xED, 0xBF, 0xBF]),                        // surrogate
         ];
         for (v, want) in cases {
             assert_eq!(extended_utf8_bytes(*v), *want, "value {:#x}", v);
@@ -7846,7 +9306,10 @@ mod array_parse_tests {
         push_codepoint(&mut s, 0x00E9);
         push_codepoint(&mut s, 0x0800);
         push_codepoint(&mut s, 0x10FFFF);
-        assert_eq!(s.as_bytes(), &[0x41, 0xC3, 0xA9, 0xE0, 0xA0, 0x80, 0xF4, 0x8F, 0xBF, 0xBF]);
+        assert_eq!(
+            s.as_bytes(),
+            &[0x41, 0xC3, 0xA9, 0xE0, 0xA0, 0x80, 0xF4, 0x8F, 0xBF, 0xBF]
+        );
     }
 
     #[test]
@@ -7866,7 +9329,11 @@ mod array_parse_tests {
         for v in [0xD800u32, 0xDFFF, 0x110000, 0x0020_0000, 0x7FFF_FFFF] {
             let mut s = String::new();
             push_codepoint(&mut s, v); // must not panic
-            assert!(std::str::from_utf8(s.as_bytes()).is_ok(), "valid utf8 for {:#x}", v);
+            assert!(
+                std::str::from_utf8(s.as_bytes()).is_ok(),
+                "valid utf8 for {:#x}",
+                v
+            );
             assert!(!s.is_empty(), "non-empty replacement for {:#x}", v);
         }
     }
@@ -7883,4 +9350,3 @@ mod array_parse_tests {
         }
     }
 }
-

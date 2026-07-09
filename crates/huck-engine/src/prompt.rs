@@ -51,11 +51,7 @@ pub fn expand_prompt(template: &str, shell: &mut Shell) -> String {
             }
             let next = bytes[i + 1];
             // \033 special-case (alias for \e).
-            if next == b'0'
-                && i + 3 < bytes.len()
-                && bytes[i + 2] == b'3'
-                && bytes[i + 3] == b'3'
-            {
+            if next == b'0' && i + 3 < bytes.len() && bytes[i + 2] == b'3' && bytes[i + 3] == b'3' {
                 out.push('\x1B');
                 i += 4;
                 continue;
@@ -433,10 +429,7 @@ mod tests {
     #[test]
     fn prompt_raw_strips_marker_spans() {
         // \x01 <ANSI> \x02 X \x01 <ANSI> \x02  ->  "X"
-        assert_eq!(
-            prompt_raw("\x01\x1b[31m\x02X\x01\x1b[0m\x02"),
-            "X"
-        );
+        assert_eq!(prompt_raw("\x01\x1b[31m\x02X\x01\x1b[0m\x02"), "X");
     }
 
     #[test]

@@ -24,9 +24,18 @@ pub fn function_to_source(name: &str, body: &Command) -> String {
 /// identical spacing/ordering (stdin → stdout → stderr, empty slots skipped).
 fn append_slot_redirects(s: &mut String, redirects: &[crate::command::Redirection]) {
     let (stdin, stdout, stderr) = crate::command::slots_for_simple_path(redirects);
-    if let Some(r) = &stdin { s.push(' '); s.push_str(&redirect_to_source(r, RedirDefault::Stdin)); }
-    if let Some(r) = &stdout { s.push(' '); s.push_str(&redirect_to_source(r, RedirDefault::Stdout)); }
-    if let Some(r) = &stderr { s.push(' '); s.push_str(&redirect_to_source(r, RedirDefault::Stderr)); }
+    if let Some(r) = &stdin {
+        s.push(' ');
+        s.push_str(&redirect_to_source(r, RedirDefault::Stdin));
+    }
+    if let Some(r) = &stdout {
+        s.push(' ');
+        s.push_str(&redirect_to_source(r, RedirDefault::Stdout));
+    }
+    if let Some(r) = &stderr {
+        s.push(' ');
+        s.push_str(&redirect_to_source(r, RedirDefault::Stderr));
+    }
 }
 
 /// Render a function definition. `with_keyword` adds the leading `function `
@@ -41,13 +50,19 @@ fn render_function_def(name: &str, body: &Command, indent: usize, with_keyword: 
         Command::Redirected { inner, redirects }
             if matches!(inner.as_ref(), Command::BraceGroup(_)) =>
         {
-            let Command::BraceGroup(seq) = inner.as_ref() else { unreachable!() };
+            let Command::BraceGroup(seq) = inner.as_ref() else {
+                unreachable!()
+            };
             let mut hoisted = String::new();
             append_slot_redirects(&mut hoisted, redirects);
             ((**seq).clone(), hoisted)
         }
         other => (
-            Sequence { first: other.clone(), rest: Vec::new(), background: false },
+            Sequence {
+                first: other.clone(),
+                rest: Vec::new(),
+                background: false,
+            },
             String::new(),
         ),
     };
@@ -126,7 +141,11 @@ fn group_body(seq: &Sequence, indent: usize) -> String {
 /// already ends in `&` (a background command) or `\n` (e.g. a heredoc).
 fn loop_body(seq: &Sequence, indent: usize) -> String {
     let inner = sequence_to_source(seq, indent);
-    let semi = if inner.ends_with('&') || inner.ends_with('\n') { "" } else { ";" };
+    let semi = if inner.ends_with('&') || inner.ends_with('\n') {
+        ""
+    } else {
+        ";"
+    };
     format!("{}{}{}\n", pad(indent), inner, semi)
 }
 
@@ -148,11 +167,7 @@ fn if_to_source(c: &IfClause, indent: usize) -> String {
 /// bash has no `elif` node — it renders `elif` as a nested `else { if … fi; }`,
 /// deepening one indent level per branch. The inner `fi` takes a `;` (the outer
 /// `semicolon()`); the outermost `fi` (emitted by `if_to_source`) does not.
-fn nested_elif(
-    elifs: &[ElifBranch],
-    else_body: &Option<Sequence>,
-    indent: usize,
-) -> String {
+fn nested_elif(elifs: &[ElifBranch], else_body: &Option<Sequence>, indent: usize) -> String {
     if let Some((head, tail)) = elifs.split_first() {
         let inner = indent + 1;
         let mut s = format!("{}else\n", pad(indent));
@@ -199,9 +214,8 @@ fn for_to_source(c: &ForClause, indent: usize) -> String {
 }
 
 fn arith_for_to_source(c: &crate::command::ArithForClause, indent: usize) -> String {
-    let sec = |w: &Option<crate::lexer::Word>| {
-        w.as_ref().map(arith_body_to_source).unwrap_or_default()
-    };
+    let sec =
+        |w: &Option<crate::lexer::Word>| w.as_ref().map(arith_body_to_source).unwrap_or_default();
     let mut s = format!(
         "for (({}; {}; {}))\n{}do\n",
         sec(&c.init),
@@ -272,7 +286,10 @@ fn case_item_to_source(item: &CaseItem, indent: usize) -> String {
 fn pattern_word_to_source(w: &Word) -> String {
     w.0.iter()
         .map(|part| match part {
-            WordPart::Literal { text, quoted: false } => escape_bareword(text),
+            WordPart::Literal {
+                text,
+                quoted: false,
+            } => escape_bareword(text),
             other => part_to_source(other),
         })
         .collect()
@@ -523,22 +540,26 @@ fn arith_body_to_source(w: &Word) -> String {
             WordPart::Literal { text, .. } => out.push_str(text),
             WordPart::Var { name, .. } => out.push_str(&format!("${name}")),
             WordPart::LastStatus { .. } => out.push_str("$?"),
-            WordPart::AllArgs { joined, .. } => {
-                out.push_str(if *joined { "$*" } else { "$@" })
-            }
-            WordPart::CommandSub { sequence, .. } => {
-                out.push_str(&format!("$({})", sequence_to_source(sequence, 0).trim_end()))
-            }
+            WordPart::AllArgs { joined, .. } => out.push_str(if *joined { "$*" } else { "$@" }),
+            WordPart::CommandSub { sequence, .. } => out.push_str(&format!(
+                "$({})",
+                sequence_to_source(sequence, 0).trim_end()
+            )),
             WordPart::Arith { body, .. } => {
                 out.push_str(&format!("$(({}))", arith_body_to_source(body)))
             }
-            WordPart::ParamExpansion { name, modifier, subscript, indirect, .. } => out
-                .push_str(&param_expansion_to_source(
-                    name,
-                    modifier,
-                    subscript.as_ref(),
-                    *indirect,
-                )),
+            WordPart::ParamExpansion {
+                name,
+                modifier,
+                subscript,
+                indirect,
+                ..
+            } => out.push_str(&param_expansion_to_source(
+                name,
+                modifier,
+                subscript.as_ref(),
+                *indirect,
+            )),
             other => out.push_str(&part_to_source(other)),
         }
     }
@@ -566,12 +587,17 @@ fn part_to_source_in_double(part: &WordPart) -> String {
         WordPart::Var { name, .. } => format!("${name}"),
         WordPart::LastStatus { .. } => "$?".to_string(),
         WordPart::AllArgs { joined, .. } => (if *joined { "$*" } else { "$@" }).to_string(),
-        WordPart::CommandSub { sequence, .. } =>
-            format!("$({})", sequence_to_source(sequence, 0).trim_end()),
-        WordPart::Arith { body, .. } =>
-            format!("$(({}))", arith_body_to_source(body)),
-        WordPart::ParamExpansion { name, modifier, subscript, indirect, .. } =>
-            param_expansion_to_source(name, modifier, subscript.as_ref(), *indirect),
+        WordPart::CommandSub { sequence, .. } => {
+            format!("$({})", sequence_to_source(sequence, 0).trim_end())
+        }
+        WordPart::Arith { body, .. } => format!("$(({}))", arith_body_to_source(body)),
+        WordPart::ParamExpansion {
+            name,
+            modifier,
+            subscript,
+            indirect,
+            ..
+        } => param_expansion_to_source(name, modifier, subscript.as_ref(), *indirect),
         // Nested Quoted or anything else: delegate to the full renderer.
         other => part_to_source(other),
     }
@@ -612,9 +638,10 @@ fn part_to_source(part: &WordPart) -> String {
         WordPart::AllArgs { quoted, joined } => {
             quote_if(*quoted, (if *joined { "$*" } else { "$@" }).to_string())
         }
-        WordPart::CommandSub { sequence, quoted } => {
-            quote_if(*quoted, format!("$({})", sequence_to_source(sequence, 0).trim_end()))
-        }
+        WordPart::CommandSub { sequence, quoted } => quote_if(
+            *quoted,
+            format!("$({})", sequence_to_source(sequence, 0).trim_end()),
+        ),
         WordPart::Arith { body, quoted } => {
             quote_if(*quoted, format!("$(({}))", arith_body_to_source(body)))
         }
@@ -642,7 +669,7 @@ fn part_to_source(part: &WordPart) -> String {
         WordPart::ArrayLiteral(elems) => array_literal_to_source(elems),
         WordPart::ProcessSub { sequence, dir } => {
             let prefix = match dir {
-                crate::lexer::ProcDir::In  => "<(",
+                crate::lexer::ProcDir::In => "<(",
                 crate::lexer::ProcDir::Out => ">(",
             };
             format!("{}{})", prefix, sequence_to_source(sequence, 0).trim_end())
@@ -672,11 +699,7 @@ fn part_to_source(part: &WordPart) -> String {
 }
 
 fn quote_if(quoted: bool, body: String) -> String {
-    if quoted {
-        format!("\"{body}\"")
-    } else {
-        body
-    }
+    if quoted { format!("\"{body}\"") } else { body }
 }
 
 /// Backslash-escape characters that are special OUTSIDE quotes so a bareword
@@ -801,10 +824,18 @@ fn modifier_suffix(modifier: &ParamModifier) -> String {
             format!("{}+{}", if *colon { ":" } else { "" }, word_to_source(word))
         }
         ParamModifier::RemovePrefix { pattern, longest } => {
-            format!("{}{}", if *longest { "##" } else { "#" }, word_to_source(pattern))
+            format!(
+                "{}{}",
+                if *longest { "##" } else { "#" },
+                word_to_source(pattern)
+            )
         }
         ParamModifier::RemoveSuffix { pattern, longest } => {
-            format!("{}{}", if *longest { "%%" } else { "%" }, word_to_source(pattern))
+            format!(
+                "{}{}",
+                if *longest { "%%" } else { "%" },
+                word_to_source(pattern)
+            )
         }
         ParamModifier::Substitute {
             pattern,
@@ -900,7 +931,10 @@ mod tests {
         assert!(v.contains("echo hi"), "{v}");
         // re-parseable when prefixed with a name:
         let reparse = live_parse(&format!("f {v}"));
-        assert!(matches!(reparse.first, command::Command::FunctionDef { .. }));
+        assert!(matches!(
+            reparse.first,
+            command::Command::FunctionDef { .. }
+        ));
     }
 
     fn assert_rt(src: &str) {
@@ -917,7 +951,11 @@ mod tests {
         // reflows physical lines (`;`-joined commands onto separate lines), so AST
         // `line` metadata differs even when structure is identical. The source
         // fixpoint (parse(s1) regenerates to s1) is the line-agnostic check.
-        assert_eq!(sequence_to_source(&b, 0), s1, "AST changed across round-trip for {src:?}");
+        assert_eq!(
+            sequence_to_source(&b, 0),
+            s1,
+            "AST changed across round-trip for {src:?}"
+        );
     }
 
     #[test]
@@ -1196,7 +1234,9 @@ mod tests {
     fn arith_command_renders_unquoted() {
         use crate::command;
         let seq = live_parse("f(){ (( i < 3 )); }");
-        let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
+        let command::Command::FunctionDef { name, body } = seq.first else {
+            panic!()
+        };
         let s = function_to_source(&name, &body);
         assert!(s.contains("(( i < 3 ))"), "got: {s:?}");
         assert!(!s.contains("((\""), "spurious quote in: {s:?}");
@@ -1206,7 +1246,9 @@ mod tests {
     fn arith_expansion_renders_unquoted() {
         use crate::command;
         let seq = live_parse("f(){ i=$(( i + 1 )); }");
-        let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
+        let command::Command::FunctionDef { name, body } = seq.first else {
+            panic!()
+        };
         let s = function_to_source(&name, &body);
         assert!(s.contains("$(( i + 1 ))"), "got: {s:?}");
         assert!(!s.contains("$((\""), "spurious quote in: {s:?}");
@@ -1216,7 +1258,9 @@ mod tests {
     fn arith_with_var_renders_unquoted() {
         use crate::command;
         let seq = live_parse("f(){ (( x + $y )); }");
-        let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
+        let command::Command::FunctionDef { name, body } = seq.first else {
+            panic!()
+        };
         let s = function_to_source(&name, &body);
         assert!(s.contains("(( x + $y ))"), "got: {s:?}");
     }
@@ -1233,134 +1277,184 @@ mod tests {
 
     #[test]
     fn declf_simple_last_semi_suppressed() {
-        assert_eq!(declf("f(){ echo a; echo b; }"),
-            "f () \n{ \n    echo a;\n    echo b\n}");
+        assert_eq!(
+            declf("f(){ echo a; echo b; }"),
+            "f () \n{ \n    echo a;\n    echo b\n}"
+        );
     }
     #[test]
     fn declf_subshell_inline() {
-        assert_eq!(declf("f(){ ( exit 1 ); }"),
-            "f () \n{ \n    ( exit 1 )\n}");
+        assert_eq!(declf("f(){ ( exit 1 ); }"), "f () \n{ \n    ( exit 1 )\n}");
     }
     #[test]
     fn declf_subshell_multi() {
-        assert_eq!(declf("f(){ ( a; b ); }"),
-            "f () \n{ \n    ( a;\n    b )\n}");
+        assert_eq!(declf("f(){ ( a; b ); }"), "f () \n{ \n    ( a;\n    b )\n}");
     }
     #[test]
     fn declf_group_multiline() {
-        assert_eq!(declf("f(){ { echo a; }; }"),
-            "f () \n{ \n    { \n        echo a\n    }\n}");
+        assert_eq!(
+            declf("f(){ { echo a; }; }"),
+            "f () \n{ \n    { \n        echo a\n    }\n}"
+        );
     }
     #[test]
     fn declf_andor_inline() {
-        assert_eq!(declf("f(){ a && b || c; }"),
-            "f () \n{ \n    a && b || c\n}");
+        assert_eq!(
+            declf("f(){ a && b || c; }"),
+            "f () \n{ \n    a && b || c\n}"
+        );
     }
     #[test]
     fn declf_mid_background_inline() {
-        assert_eq!(declf("f(){ echo bg >/dev/null & echo next; }"),
-            "f () \n{ \n    echo bg > /dev/null & echo next\n}");
+        assert_eq!(
+            declf("f(){ echo bg >/dev/null & echo next; }"),
+            "f () \n{ \n    echo bg > /dev/null & echo next\n}"
+        );
     }
     #[test]
     fn declf_if() {
-        assert_eq!(declf("f(){ if a; then b; fi; }"),
-            "f () \n{ \n    if a; then\n        b;\n    fi\n}");
+        assert_eq!(
+            declf("f(){ if a; then b; fi; }"),
+            "f () \n{ \n    if a; then\n        b;\n    fi\n}"
+        );
     }
     #[test]
     fn declf_if_elif_else() {
-        assert_eq!(declf("f(){ if a; then b; elif c; then d; else e; fi; }"),
-            "f () \n{ \n    if a; then\n        b;\n    else\n        if c; then\n            d;\n        else\n            e;\n        fi;\n    fi\n}");
+        assert_eq!(
+            declf("f(){ if a; then b; elif c; then d; else e; fi; }"),
+            "f () \n{ \n    if a; then\n        b;\n    else\n        if c; then\n            d;\n        else\n            e;\n        fi;\n    fi\n}"
+        );
     }
     #[test]
     fn declf_while() {
-        assert_eq!(declf("f(){ while a; do b; done; }"),
-            "f () \n{ \n    while a; do\n        b;\n    done\n}");
+        assert_eq!(
+            declf("f(){ while a; do b; done; }"),
+            "f () \n{ \n    while a; do\n        b;\n    done\n}"
+        );
     }
     #[test]
     fn declf_until() {
-        assert_eq!(declf("f(){ until a; do b; done; }"),
-            "f () \n{ \n    until a; do\n        b;\n    done\n}");
+        assert_eq!(
+            declf("f(){ until a; do b; done; }"),
+            "f () \n{ \n    until a; do\n        b;\n    done\n}"
+        );
     }
     #[test]
     fn declf_for_in() {
-        assert_eq!(declf("f(){ for x in 1 2; do echo $x; done; }"),
-            "f () \n{ \n    for x in 1 2;\n    do\n        echo $x;\n    done\n}");
+        assert_eq!(
+            declf("f(){ for x in 1 2; do echo $x; done; }"),
+            "f () \n{ \n    for x in 1 2;\n    do\n        echo $x;\n    done\n}"
+        );
     }
     #[test]
     fn declf_for_noin() {
-        assert_eq!(declf("f(){ for x; do echo $x; done; }"),
-            "f () \n{ \n    for x in \"$@\";\n    do\n        echo $x;\n    done\n}");
+        assert_eq!(
+            declf("f(){ for x; do echo $x; done; }"),
+            "f () \n{ \n    for x in \"$@\";\n    do\n        echo $x;\n    done\n}"
+        );
     }
     #[test]
     fn declf_arith_for() {
-        assert_eq!(declf("f(){ for ((i=0; i<3; i++)); do echo $i; done; }"),
-            "f () \n{ \n    for ((i=0; i<3; i++))\n    do\n        echo $i;\n    done\n}");
+        assert_eq!(
+            declf("f(){ for ((i=0; i<3; i++)); do echo $i; done; }"),
+            "f () \n{ \n    for ((i=0; i<3; i++))\n    do\n        echo $i;\n    done\n}"
+        );
     }
     #[test]
     fn declf_select() {
-        assert_eq!(declf("f(){ select x in a b; do echo $x; done; }"),
-            "f () \n{ \n    select x in a b;\n    do\n        echo $x;\n    done\n}");
+        assert_eq!(
+            declf("f(){ select x in a b; do echo $x; done; }"),
+            "f () \n{ \n    select x in a b;\n    do\n        echo $x;\n    done\n}"
+        );
     }
     #[test]
     fn declf_case() {
-        assert_eq!(declf("f(){ case $x in a) echo A;; b|c) echo BC;; esac; }"),
-            "f () \n{ \n    case $x in \n        a)\n            echo A\n        ;;\n        b | c)\n            echo BC\n        ;;\n    esac\n}");
+        assert_eq!(
+            declf("f(){ case $x in a) echo A;; b|c) echo BC;; esac; }"),
+            "f () \n{ \n    case $x in \n        a)\n            echo A\n        ;;\n        b | c)\n            echo BC\n        ;;\n    esac\n}"
+        );
     }
     #[test]
     fn declf_loop_bg_tail_no_semi() {
-        assert_eq!(declf("f(){ while a; do b & done; }"),
-            "f () \n{ \n    while a; do\n        b &\n    done\n}");
+        assert_eq!(
+            declf("f(){ while a; do b & done; }"),
+            "f () \n{ \n    while a; do\n        b &\n    done\n}"
+        );
     }
     #[test]
     fn declf_nested_compound_tail_gets_semi() {
-        assert_eq!(declf("f(){ while a; do for x in 1; do b; done; done; }"),
-            "f () \n{ \n    while a; do\n        for x in 1;\n        do\n            b;\n        done;\n    done\n}");
+        assert_eq!(
+            declf("f(){ while a; do for x in 1; do b; done; done; }"),
+            "f () \n{ \n    while a; do\n        for x in 1;\n        do\n            b;\n        done;\n    done\n}"
+        );
     }
     #[test]
     fn declf_subshell_body_wrapped() {
-        assert_eq!(declf("f() ( echo hi )"),
-            "f () \n{ \n    ( echo hi )\n}");
+        assert_eq!(declf("f() ( echo hi )"), "f () \n{ \n    ( echo hi )\n}");
     }
 
     // ── v222: outer-vs-nested keyword split + redirect hoist ──
     #[test]
     fn declf_outer_no_function_keyword_all_forms() {
-        for src in ["f(){ echo a; }", "function f { echo a; }", "function f() { echo a; }"] {
+        for src in [
+            "f(){ echo a; }",
+            "function f { echo a; }",
+            "function f() { echo a; }",
+        ] {
             let s = declf(src);
             assert!(s.starts_with("f () \n"), "outer must omit keyword: {s:?}");
-            assert!(!s.starts_with("function "), "outer must not start with `function `: {s:?}");
+            assert!(
+                !s.starts_with("function "),
+                "outer must not start with `function `: {s:?}"
+            );
         }
     }
 
     #[test]
     fn declf_nested_def_gets_function_keyword_all_forms() {
         // All three nested forms render identically as `function f3 () `.
-        for inner in ["function f3() { echo b; }", "function f3 { echo b; }", "f3() { echo b; }"] {
+        for inner in [
+            "function f3() { echo b; }",
+            "function f3 { echo b; }",
+            "f3() { echo b; }",
+        ] {
             let s = declf(&format!("outer(){{ echo a; {inner}; }}"));
-            assert!(s.contains("function f3 () \n"), "nested def needs keyword (inner={inner:?}): {s:?}");
-            assert!(s.starts_with("outer () \n"), "outer still keyword-free: {s:?}");
+            assert!(
+                s.contains("function f3 () \n"),
+                "nested def needs keyword (inner={inner:?}): {s:?}"
+            );
+            assert!(
+                s.starts_with("outer () \n"),
+                "outer still keyword-free: {s:?}"
+            );
         }
     }
 
     #[test]
     fn declf_outer_redirected_brace_body_hoists() {
         // `{ …; } 1>&2` body → unwrapped, redirect on the function close brace.
-        assert_eq!(declf("f(){ echo a; echo b; } 1>&2"),
-            "f () \n{ \n    echo a;\n    echo b\n} 1>&2");
+        assert_eq!(
+            declf("f(){ echo a; echo b; } 1>&2"),
+            "f () \n{ \n    echo a;\n    echo b\n} 1>&2"
+        );
     }
 
     #[test]
     fn declf_nested_redirected_brace_body_hoists() {
         let s = declf("outer(){ f3() { echo b; } 1>&2; }");
-        assert!(s.contains("function f3 () \n    { \n        echo b\n    } 1>&2"),
-            "nested redirected brace body must hoist: {s:?}");
+        assert!(
+            s.contains("function f3 () \n    { \n        echo b\n    } 1>&2"),
+            "nested redirected brace body must hoist: {s:?}"
+        );
     }
 
     #[test]
     fn declf_subshell_body_with_redirect_not_hoisted() {
         // A subshell body keeps its redirect INSIDE the function braces.
-        assert_eq!(declf("funcc() ( echo c ) 2>&1"),
-            "funcc () \n{ \n    ( echo c ) 2>&1\n}");
+        assert_eq!(
+            declf("funcc() ( echo c ) 2>&1"),
+            "funcc () \n{ \n    ( echo c ) 2>&1\n}"
+        );
     }
 
     // ── Quoted variant rendering ──
@@ -1369,7 +1463,10 @@ mod tests {
         use crate::lexer::{QuoteStyle, Word, WordPart};
         let w = Word(vec![WordPart::Quoted {
             style: QuoteStyle::Single,
-            parts: vec![WordPart::Literal { text: "what a window".into(), quoted: true }],
+            parts: vec![WordPart::Literal {
+                text: "what a window".into(),
+                quoted: true,
+            }],
         }]);
         assert_eq!(word_to_source(&w), "'what a window'");
     }
@@ -1379,9 +1476,18 @@ mod tests {
         let w = Word(vec![WordPart::Quoted {
             style: QuoteStyle::Double,
             parts: vec![
-                WordPart::Var { name: "a".into(), quoted: true },
-                WordPart::Literal { text: " ".into(), quoted: true },
-                WordPart::Var { name: "b".into(), quoted: true },
+                WordPart::Var {
+                    name: "a".into(),
+                    quoted: true,
+                },
+                WordPart::Literal {
+                    text: " ".into(),
+                    quoted: true,
+                },
+                WordPart::Var {
+                    name: "b".into(),
+                    quoted: true,
+                },
             ],
         }]);
         assert_eq!(word_to_source(&w), "\"$a $b\"");
@@ -1390,33 +1496,56 @@ mod tests {
     fn render_quoted_backslash() {
         use crate::lexer::{QuoteStyle, Word, WordPart};
         let w = Word(vec![
-            WordPart::Quoted { style: QuoteStyle::Backslash,
-                parts: vec![WordPart::Literal { text: "$".into(), quoted: true }] },
-            WordPart::Literal { text: "PWD".into(), quoted: false },
+            WordPart::Quoted {
+                style: QuoteStyle::Backslash,
+                parts: vec![WordPart::Literal {
+                    text: "$".into(),
+                    quoted: true,
+                }],
+            },
+            WordPart::Literal {
+                text: "PWD".into(),
+                quoted: false,
+            },
         ]);
         assert_eq!(word_to_source(&w), "\\$PWD");
     }
     #[test]
     fn render_quoted_adjacent_double() {
         use crate::lexer::{QuoteStyle, Word, WordPart};
-        let run = |t: &str| WordPart::Quoted { style: QuoteStyle::Double,
-            parts: vec![WordPart::Literal { text: t.into(), quoted: true }] };
+        let run = |t: &str| WordPart::Quoted {
+            style: QuoteStyle::Double,
+            parts: vec![WordPart::Literal {
+                text: t.into(),
+                quoted: true,
+            }],
+        };
         let w = Word(vec![run("a b"), run("c d")]);
         assert_eq!(word_to_source(&w), "\"a b\"\"c d\"");
     }
     #[test]
     fn render_quoted_double_escapes_specials() {
         use crate::lexer::{QuoteStyle, Word, WordPart};
-        let w = Word(vec![WordPart::Quoted { style: QuoteStyle::Double,
-            parts: vec![WordPart::Literal { text: "a\"b$c".into(), quoted: true }] }]);
+        let w = Word(vec![WordPart::Quoted {
+            style: QuoteStyle::Double,
+            parts: vec![WordPart::Literal {
+                text: "a\"b$c".into(),
+                quoted: true,
+            }],
+        }]);
         // inside "...", a literal " and $ must be backslash-escaped
         assert_eq!(word_to_source(&w), "\"a\\\"b\\$c\"");
     }
     #[test]
     fn render_quoted_ansic_newline() {
         use crate::lexer::{QuoteStyle, Word, WordPart};
-        let w = Word(vec![WordPart::Quoted { style: QuoteStyle::AnsiC,
-            parts: vec![WordPart::Literal { text: "i\n".into(), quoted: true }] }]);
+        let w = Word(vec![WordPart::Quoted {
+            style: QuoteStyle::AnsiC,
+            parts: vec![WordPart::Literal {
+                text: "i\n".into(),
+                quoted: true,
+            }],
+        }]);
         assert_eq!(word_to_source(&w), "$'i\\n'");
     }
 
@@ -1425,14 +1554,34 @@ mod tests {
         use crate::command;
         let src = format!("f(){{ echo {body_word_src}; }}");
         let seq = live_parse(&src);
-        let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
+        let command::Command::FunctionDef { name, body } = seq.first else {
+            panic!()
+        };
         function_to_source(&name, &body)
     }
 
-    #[test] fn rt_quote_single()   { assert!(declf_word("'what a window'").contains("echo 'what a window'")); }
-    #[test] fn rt_quote_dq_span()  { assert!(declf_word("\"$a $b\"").contains("echo \"$a $b\"")); }
-    #[test] fn rt_quote_backslash(){ assert!(declf_word("\\$PWD").contains("echo \\$PWD")); }
-    #[test] fn rt_quote_adjacent() { assert!(declf_word("\"a b\"\"c d\"").contains("echo \"a b\"\"c d\"")); }
-    #[test] fn rt_quote_mixed()    { assert!(declf_word("ab'cd'ef").contains("echo ab'cd'ef")); }
-    #[test] fn rt_quote_specials() { assert!(declf_word("\\&\\|'()'").contains("echo \\&\\|'()'")); }
+    #[test]
+    fn rt_quote_single() {
+        assert!(declf_word("'what a window'").contains("echo 'what a window'"));
+    }
+    #[test]
+    fn rt_quote_dq_span() {
+        assert!(declf_word("\"$a $b\"").contains("echo \"$a $b\""));
+    }
+    #[test]
+    fn rt_quote_backslash() {
+        assert!(declf_word("\\$PWD").contains("echo \\$PWD"));
+    }
+    #[test]
+    fn rt_quote_adjacent() {
+        assert!(declf_word("\"a b\"\"c d\"").contains("echo \"a b\"\"c d\""));
+    }
+    #[test]
+    fn rt_quote_mixed() {
+        assert!(declf_word("ab'cd'ef").contains("echo ab'cd'ef"));
+    }
+    #[test]
+    fn rt_quote_specials() {
+        assert!(declf_word("\\&\\|'()'").contains("echo \\&\\|'()'"));
+    }
 }

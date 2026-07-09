@@ -98,7 +98,8 @@ fn for_nested_inside_if() {
 
 #[test]
 fn while_nested_inside_for() {
-    let script = "for x in p q; do i=0; while test $i -lt 2; do echo $x$i; i=$((i+1)); done; done\nexit\n";
+    let script =
+        "for x in p q; do i=0; while test $i -lt 2; do echo $x$i; i=$((i+1)); done; done\nexit\n";
     let (out, _) = run(script);
     for marker in ["p0", "p1", "q0", "q1"] {
         assert!(out.lines().any(|l| l == marker), "missing {marker}: {out}");
@@ -107,21 +108,25 @@ fn while_nested_inside_for() {
 
 #[test]
 fn for_break_exits_early() {
-    let (out, _) = run(
-        "for x in a b c d; do if test $x = c; then break; fi; echo k-$x; done\nexit\n",
-    );
+    let (out, _) =
+        run("for x in a b c d; do if test $x = c; then break; fi; echo k-$x; done\nexit\n");
     assert!(out.lines().any(|l| l == "k-a"), "stdout: {out}");
     assert!(out.lines().any(|l| l == "k-b"), "stdout: {out}");
-    assert!(!out.lines().any(|l| l == "k-c"), "loop should have broken: {out}");
+    assert!(
+        !out.lines().any(|l| l == "k-c"),
+        "loop should have broken: {out}"
+    );
 }
 
 #[test]
 fn for_continue_skips_iteration() {
-    let (out, _) = run(
-        "for x in a b c; do if test $x = b; then continue; fi; echo s-$x; done\nexit\n",
-    );
+    let (out, _) =
+        run("for x in a b c; do if test $x = b; then continue; fi; echo s-$x; done\nexit\n");
     assert!(out.lines().any(|l| l == "s-a"), "stdout: {out}");
-    assert!(!out.lines().any(|l| l == "s-b"), "s-b should be skipped: {out}");
+    assert!(
+        !out.lines().any(|l| l == "s-b"),
+        "s-b should be skipped: {out}"
+    );
     assert!(out.lines().any(|l| l == "s-c"), "stdout: {out}");
 }
 
@@ -138,6 +143,9 @@ fn for_invalid_variable_name_is_nonfatal_runtime_error() {
     // (body not run, the surrounding list continues — `still-alive` prints).
     let (out, err) = run("for 2x in a; do echo hi; done\necho still-alive\nexit\n");
     assert!(err.contains("not a valid identifier"), "stderr: {err}");
-    assert!(!out.lines().any(|l| l == "hi"), "loop body must not run: {out}");
+    assert!(
+        !out.lines().any(|l| l == "hi"),
+        "loop body must not run: {out}"
+    );
     assert!(out.lines().any(|l| l == "still-alive"), "stdout: {out}");
 }

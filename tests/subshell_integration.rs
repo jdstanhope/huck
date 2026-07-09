@@ -14,7 +14,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     drop(child.stdin.take());
     let output = child.wait_with_output().expect("wait");
     (
@@ -39,7 +44,9 @@ fn subshell_isolates_var_assignment() {
 #[test]
 fn subshell_isolates_cd() {
     // Capture cwd before and after a subshell `cd`; should be identical.
-    let (out, _) = run("pwd > /tmp/v28_cd_before_$$\n(cd /tmp)\npwd > /tmp/v28_cd_after_$$\ndiff /tmp/v28_cd_before_$$ /tmp/v28_cd_after_$$ && echo SAME\nrm -f /tmp/v28_cd_before_$$ /tmp/v28_cd_after_$$\nexit\n");
+    let (out, _) = run(
+        "pwd > /tmp/v28_cd_before_$$\n(cd /tmp)\npwd > /tmp/v28_cd_after_$$\ndiff /tmp/v28_cd_before_$$ /tmp/v28_cd_after_$$ && echo SAME\nrm -f /tmp/v28_cd_before_$$ /tmp/v28_cd_after_$$\nexit\n",
+    );
     assert!(out.lines().any(|l| l.trim() == "SAME"), "got: {out}");
 }
 
@@ -49,11 +56,18 @@ fn subshell_isolates_function_def() {
     // TODO(M-18): once `2>&1` lands, use `f 2>&1` for a cleaner stderr check.
     let (out, err) = run("(f() { echo defined; }; f)\nf\necho post-status=$?\nexit\n");
     // Inside subshell: `defined` line printed.
-    assert!(out.lines().any(|l| l.trim() == "defined"), "got out: {out} err: {err}");
+    assert!(
+        out.lines().any(|l| l.trim() == "defined"),
+        "got out: {out} err: {err}"
+    );
     // Outside: f is not defined; either stderr says "not found" or post-status != 0.
     let combined = format!("{out}{err}");
-    assert!(combined.contains("not found") || out.contains("post-status=127") || out.contains("post-status=1"),
-        "expected function-not-found indicator, got out: {out} err: {err}");
+    assert!(
+        combined.contains("not found")
+            || out.contains("post-status=127")
+            || out.contains("post-status=1"),
+        "expected function-not-found indicator, got out: {out} err: {err}"
+    );
 }
 
 #[test]
@@ -65,7 +79,10 @@ fn subshell_exit_status_propagates() {
 #[test]
 fn subshell_with_sequence() {
     let (out, _) = run("(echo a; echo b)\nexit\n");
-    let lines: Vec<&str> = out.lines().filter(|l| l.trim() == "a" || l.trim() == "b").collect();
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.trim() == "a" || l.trim() == "b")
+        .collect();
     assert_eq!(lines, vec!["a", "b"], "got: {out}");
 }
 
@@ -101,9 +118,7 @@ fn subshell_backgrounded() {
     let tmp = format!("/tmp/v28_bg_{}", std::process::id());
     // TODO(M-18): once compound-command redirects land, switch to
     // `(echo bg) > {tmp} &` (redirect on the subshell, not inside).
-    let script = format!(
-        "(echo bg > {tmp}) &\nwait\ncat {tmp}\nrm -f {tmp}\nexit\n"
-    );
+    let script = format!("(echo bg > {tmp}) &\nwait\ncat {tmp}\nrm -f {tmp}\nexit\n");
     let (out, _) = run(&script);
     assert!(out.lines().any(|l| l.trim() == "bg"), "got: {out}");
 }
@@ -117,7 +132,10 @@ fn subshell_inherits_vars_from_parent() {
 #[test]
 fn subshell_in_function_body() {
     let (out, _) = run("f() { (echo from-subshell-in-func); }\nf\nexit\n");
-    assert!(out.lines().any(|l| l.trim() == "from-subshell-in-func"), "got: {out}");
+    assert!(
+        out.lines().any(|l| l.trim() == "from-subshell-in-func"),
+        "got: {out}"
+    );
 }
 
 #[test]
@@ -144,11 +162,14 @@ fn subshell_backgrounded_does_not_block_parent() {
     // The wait DOES block for 1s — but that's expected. The bug-evidence
     // is "is $! set?" — verify that instead.
     let (out, _) = run("(/bin/sleep 1) &\necho [$!]\nwait\nexit\n");
-    let bracketed = out.lines().find(|l| l.starts_with('[') && l.ends_with(']')).unwrap_or_else(|| panic!("got: {out}"));
-    let inner = &bracketed[1..bracketed.len()-1];
+    let bracketed = out
+        .lines()
+        .find(|l| l.starts_with('[') && l.ends_with(']'))
+        .unwrap_or_else(|| panic!("got: {out}"));
+    let inner = &bracketed[1..bracketed.len() - 1];
     let pid: i32 = inner.parse().expect("integer pid");
     assert!(pid > 0, "expected real pid, got: {out}");
-    let _ = elapsed;  // silence unused
+    let _ = elapsed; // silence unused
 }
 
 #[test]
@@ -171,10 +192,10 @@ fn subshell_inner_background_is_truly_async() {
     // grandchild, we redirect the grandchild's output to /dev/null to avoid
     // test-harness pipe-blocking.
     let tmp = format!("/tmp/v28_innerbg_{}", std::process::id());
-    let script = format!(
-        "(echo done > {tmp} &)\nwait\ncat {tmp}\nrm -f {tmp}\nexit\n"
-    );
+    let script = format!("(echo done > {tmp} &)\nwait\ncat {tmp}\nrm -f {tmp}\nexit\n");
     let (out, _) = run(&script);
-    assert!(out.lines().any(|l| l.trim() == "done"),
-        "inner & body did not run; got: {out}");
+    assert!(
+        out.lines().any(|l| l.trim() == "done"),
+        "inner & body did not run; got: {out}"
+    );
 }

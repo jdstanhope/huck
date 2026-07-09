@@ -5,12 +5,12 @@
 //! `ProcSub` cleanup record. `cleanup` closes the parent fd, unlinks any FIFO, and
 //! reaps the inner pid. POSIX-only; macOS-portable (no `/proc`).
 
+use crate::command::{Command, Sequence};
+use crate::lexer::ProcDir;
+use crate::shell_state::Shell;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
-use crate::lexer::ProcDir;
-use crate::command::{Command, Sequence};
-use crate::shell_state::Shell;
 
 // `Clone` is derived only because `Shell` derives `Clone` and holds a
 // `Vec<ProcSub>`. A `ProcSub` owns a live fd + child pid, so a cloned copy must
@@ -45,7 +45,11 @@ pub fn realize(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Result<(S
 }
 
 /// Primary path: use a pipe + /dev/fd/N naming.
-fn realize_via_devfd(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Result<(String, ProcSub)> {
+fn realize_via_devfd(
+    seq: &Sequence,
+    dir: ProcDir,
+    shell: &mut Shell,
+) -> io::Result<(String, ProcSub)> {
     let mut fds = [0 as RawFd; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
@@ -56,7 +60,7 @@ fn realize_via_devfd(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Res
     // child_closes: the parent's retained end that the child must close for EOF to work.
     let (parent_fd, inner_stdin, inner_stdout, child_closes) = match dir {
         // <(cmd): parent reads cmd's stdout; inner writes to the pipe on fd 1.
-        ProcDir::In  => (read_fd,  libc::STDIN_FILENO,  write_fd, read_fd),
+        ProcDir::In => (read_fd, libc::STDIN_FILENO, write_fd, read_fd),
         // >(cmd): parent writes cmd's stdin; inner reads from the pipe on fd 0.
         ProcDir::Out => (write_fd, read_fd, libc::STDOUT_FILENO, write_fd),
     };
@@ -64,20 +68,44 @@ fn realize_via_devfd(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Res
     // Fork the inner sequence as a subshell. pgid_target = the shell's group so the
     // procsub child is NOT a foreground job and the terminal is never handed to it
     // (avoids the SIGTTOU / terminal-handoff deadlocks of v108/v124). No give_terminal_to.
-    let inner = Command::Subshell { body: Box::new(seq.clone()) };
+    let inner = Command::Subshell {
+        body: Box::new(seq.clone()),
+    };
     let child_close_list = [child_closes];
     let pid = crate::executor::fork_and_run_in_subshell(
-        &inner, shell,
-        inner_stdin, inner_stdout, libc::STDERR_FILENO,
-        shell.shell_pgid, &child_close_list, None, None,
-    ).inspect_err(|_| unsafe { libc::close(read_fd); libc::close(write_fd); })?;
+        &inner,
+        shell,
+        inner_stdin,
+        inner_stdout,
+        libc::STDERR_FILENO,
+        shell.shell_pgid,
+        &child_close_list,
+        None,
+        None,
+    )
+    .inspect_err(|_| unsafe {
+        libc::close(read_fd);
+        libc::close(write_fd);
+    })?;
 
     // Parent closes the end the inner owns (the inner has its own copy via dup2).
-    let inner_end = match dir { ProcDir::In => write_fd, ProcDir::Out => read_fd };
-    unsafe { libc::close(inner_end); }
+    let inner_end = match dir {
+        ProcDir::In => write_fd,
+        ProcDir::Out => read_fd,
+    };
+    unsafe {
+        libc::close(inner_end);
+    }
 
     let path = format!("/dev/fd/{parent_fd}");
-    Ok((path, ProcSub { pid, parent_fd, fifo_path: None }))
+    Ok((
+        path,
+        ProcSub {
+            pid,
+            parent_fd,
+            fifo_path: None,
+        },
+    ))
 }
 
 /// FIFO fallback (used only when /dev/fd is absent — unreachable on Linux/macOS).
@@ -87,9 +115,13 @@ fn realize_via_devfd(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Res
 /// the outer command opens the other end). The outer command receives the FIFO path
 /// and opens it, unblocking the child. This avoids the ENXIO that a parent-side
 /// O_WRONLY|O_NONBLOCK open produces when no reader exists yet.
-fn realize_via_fifo(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Result<(String, ProcSub)> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+fn realize_via_fifo(
+    seq: &Sequence,
+    dir: ProcDir,
+    shell: &mut Shell,
+) -> io::Result<(String, ProcSub)> {
     use crate::lexer::{Word, WordPart};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
@@ -112,18 +144,26 @@ fn realize_via_fifo(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Resu
     // Wrap the inner sequence in a redirect so the CHILD opens its FIFO end:
     //   <(cmd) → cmd > FIFO  (child opens O_WRONLY, blocks until outer opens O_RDONLY)
     //   >(cmd) → cmd < FIFO  (child opens O_RDONLY, blocks until outer opens O_WRONLY)
-    use crate::command::{Redirection, RedirFd, RedirOp, FileMode};
+    use crate::command::{FileMode, RedirFd, RedirOp, Redirection};
     let redirects: Vec<Redirection> = match dir {
         ProcDir::In => vec![Redirection {
             fd: RedirFd::Number(1),
-            op: RedirOp::File { mode: FileMode::Truncate, target: path_word },
+            op: RedirOp::File {
+                mode: FileMode::Truncate,
+                target: path_word,
+            },
         }],
         ProcDir::Out => vec![Redirection {
             fd: RedirFd::Number(0),
-            op: RedirOp::File { mode: FileMode::ReadOnly, target: path_word },
+            op: RedirOp::File {
+                mode: FileMode::ReadOnly,
+                target: path_word,
+            },
         }],
     };
-    let inner_body = Command::Subshell { body: Box::new(seq.clone()) };
+    let inner_body = Command::Subshell {
+        body: Box::new(seq.clone()),
+    };
     let inner = Command::Redirected {
         inner: Box::new(inner_body),
         redirects,
@@ -133,13 +173,29 @@ fn realize_via_fifo(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Resu
     // inside the child). Parent holds no fd — the FIFO path is passed to the outer.
     let child_close_list: &[RawFd] = &[];
     let pid_child = crate::executor::fork_and_run_in_subshell(
-        &inner, shell,
-        libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO,
-        shell.shell_pgid, child_close_list, None, None,
-    ).inspect_err(|_| { let _ = std::fs::remove_file(&fifo_path); })?;
+        &inner,
+        shell,
+        libc::STDIN_FILENO,
+        libc::STDOUT_FILENO,
+        libc::STDERR_FILENO,
+        shell.shell_pgid,
+        child_close_list,
+        None,
+        None,
+    )
+    .inspect_err(|_| {
+        let _ = std::fs::remove_file(&fifo_path);
+    })?;
 
     let path = fifo_path.to_str().unwrap().to_string();
-    Ok((path, ProcSub { pid: pid_child, parent_fd: -1, fifo_path: Some(fifo_path) }))
+    Ok((
+        path,
+        ProcSub {
+            pid: pid_child,
+            parent_fd: -1,
+            fifo_path: Some(fifo_path),
+        },
+    ))
 }
 
 /// Tear down one realized process substitution: close the parent fd, unlink any FIFO,
@@ -147,11 +203,15 @@ fn realize_via_fifo(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Resu
 /// be running when cleanup is called).
 pub fn cleanup(ps: ProcSub) {
     if ps.parent_fd >= 0 {
-        unsafe { libc::close(ps.parent_fd); }
+        unsafe {
+            libc::close(ps.parent_fd);
+        }
     }
     if let Some(p) = &ps.fifo_path {
         let _ = std::fs::remove_file(p);
     }
     let mut status = 0;
-    unsafe { libc::waitpid(ps.pid, &mut status, 0); }
+    unsafe {
+        libc::waitpid(ps.pid, &mut status, 0);
+    }
 }

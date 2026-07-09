@@ -4,7 +4,7 @@
 //! disagree with them.
 
 use crate::command::ParseError;
-use crate::lexer::{self, ends_with_continuation_backslash, LexError, Operator, TokenKind};
+use crate::lexer::{self, LexError, Operator, TokenKind, ends_with_continuation_backslash};
 use crate::parser;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -48,7 +48,10 @@ pub fn classify(buffer: &str, extglob: bool) -> Completeness {
     if ends_with_continuation_backslash(buffer) {
         return Completeness::Incomplete(ContinuationReason::Backslash);
     }
-    let opts = lexer::LexerOptions { extglob, ..Default::default() };
+    let opts = lexer::LexerOptions {
+        extglob,
+        ..Default::default()
+    };
     let empty = std::collections::HashMap::new();
     let mut lx = lexer::Lexer::new_live_atoms(buffer, &empty, opts);
     let parsed = parser::parse_sequence(&mut lx);
@@ -116,13 +119,13 @@ pub fn classify(buffer: &str, extglob: bool) -> Completeness {
         Err(ParseError::UnterminatedSubshell) => {
             Completeness::Incomplete(ContinuationReason::Subshell)
         }
-        Err(ParseError::UnterminatedIf
+        Err(
+            ParseError::UnterminatedIf
             | ParseError::UnterminatedLoop
             | ParseError::UnterminatedCase
             | ParseError::UnterminatedBrace
-            | ParseError::UnterminatedFunction) => {
-            Completeness::Incomplete(ContinuationReason::Compound)
-        }
+            | ParseError::UnterminatedFunction,
+        ) => Completeness::Incomplete(ContinuationReason::Compound),
         Err(_) => Completeness::Error,
     }
 }
@@ -132,7 +135,19 @@ pub fn classify(buffer: &str, extglob: bool) -> Completeness {
 fn ends_with_control_keyword(line: &str) -> bool {
     matches!(
         line.split_whitespace().next_back(),
-        Some("if" | "while" | "until" | "then" | "do" | "else" | "elif" | "for" | "select" | "in" | "case" | "{")
+        Some(
+            "if" | "while"
+                | "until"
+                | "then"
+                | "do"
+                | "else"
+                | "elif"
+                | "for"
+                | "select"
+                | "in"
+                | "case"
+                | "{"
+        )
     )
 }
 
@@ -171,7 +186,10 @@ mod tests {
 
     #[test]
     fn complete_multiline_if() {
-        assert_eq!(classify("if true\nthen echo hi\nfi", false), Completeness::Complete);
+        assert_eq!(
+            classify("if true\nthen echo hi\nfi", false),
+            Completeness::Complete
+        );
     }
 
     #[test]
@@ -357,7 +375,10 @@ mod tests {
 
     #[test]
     fn stray_word_after_fi_is_error() {
-        assert_eq!(classify("if true; then echo; fi extra", false), Completeness::Error);
+        assert_eq!(
+            classify("if true; then echo; fi extra", false),
+            Completeness::Error
+        );
     }
 
     #[test]
@@ -530,6 +551,9 @@ mod tests {
 
     #[test]
     fn joiner_for_double_bracket_is_space() {
-        assert_eq!(joiner_for(ContinuationReason::DoubleBracket, "[[ -f a &&"), " ");
+        assert_eq!(
+            joiner_for(ContinuationReason::DoubleBracket, "[[ -f a &&"),
+            " "
+        );
     }
 }

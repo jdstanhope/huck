@@ -2,11 +2,20 @@
 //! huck binary with the script in `-c` (here-strings keep `read` in the main shell).
 use std::process::Command;
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 fn huck_c(script: &str) -> (String, i32) {
-    let o = Command::new(huck_bin()).arg("-c").arg(script).output().expect("spawn");
-    (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code().unwrap_or(-1))
+    let o = Command::new(huck_bin())
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("spawn");
+    (
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+        o.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
@@ -24,7 +33,8 @@ fn read_a_custom_ifs() {
 
 #[test]
 fn read_a_clears_existing_array() {
-    let (out, _c) = huck_c(r#"arr=(old x y z); read -a arr <<< "a b"; echo "${arr[*]}|${#arr[@]}""#);
+    let (out, _c) =
+        huck_c(r#"arr=(old x y z); read -a arr <<< "a b"; echo "${arr[*]}|${#arr[@]}""#);
     assert_eq!(out, "a b|2\n", "out={out:?}");
 }
 
@@ -39,7 +49,8 @@ fn read_ra_raw_backslash() {
 #[test]
 fn read_a_leaves_trailing_names_untouched() {
     // bash leaves a pre-set trailing NAME alone when -a is used.
-    let (out, _c) = huck_c(r#"extra=PRESET; read -a arr extra <<< "a b"; echo "${arr[*]}|[$extra]""#);
+    let (out, _c) =
+        huck_c(r#"extra=PRESET; read -a arr extra <<< "a b"; echo "${arr[*]}|[$extra]""#);
     assert_eq!(out, "a b|[PRESET]\n", "out={out:?}");
 }
 
@@ -50,7 +61,10 @@ fn read_a_readonly_array_returns_1() {
     // would otherwise reset the whole-script exit code to 0 — matches bash).
     let (out, _c) =
         huck_c(r#"readonly arr=(keep); read -a arr <<< "a b"; echo "rc:$? arr:${arr[*]}""#);
-    assert_eq!(out, "rc:1 arr:keep\n", "read should fail and not modify array; out={out:?}");
+    assert_eq!(
+        out, "rc:1 arr:keep\n",
+        "read should fail and not modify array; out={out:?}"
+    );
 }
 
 #[test]
@@ -61,13 +75,15 @@ fn mapfile_t_strips_newline() {
 
 #[test]
 fn mapfile_keeps_newline_without_t() {
-    let (out, _c) = huck_c("mapfile arr <<< $'a\\nb'; printf '%q %q\\n' \"${arr[0]}\" \"${arr[1]}\"");
+    let (out, _c) =
+        huck_c("mapfile arr <<< $'a\\nb'; printf '%q %q\\n' \"${arr[0]}\" \"${arr[1]}\"");
     assert_eq!(out, "$'a\\n' $'b\\n'\n", "out={out:?}");
 }
 
 #[test]
 fn mapfile_n_limit() {
-    let (out, _c) = huck_c("mapfile -n 2 -t arr <<< $'a\\nb\\nc\\nd'; echo \"${arr[*]}|${#arr[@]}\"");
+    let (out, _c) =
+        huck_c("mapfile -n 2 -t arr <<< $'a\\nb\\nc\\nd'; echo \"${arr[*]}|${#arr[@]}\"");
     assert_eq!(out, "a b|2\n", "out={out:?}");
 }
 

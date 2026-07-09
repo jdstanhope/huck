@@ -12,7 +12,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -49,9 +54,8 @@ fn dollar_at_unquoted_word_splits() {
 #[test]
 fn dollar_at_quoted_preserves_args() {
     // "$@" preserves each arg as its own field, even if it contains spaces.
-    let (out, _) = run(
-        "f() { for x in \"$@\"; do echo i=$x; done; }\nf \"hello world\" foo\nexit\n",
-    );
+    let (out, _) =
+        run("f() { for x in \"$@\"; do echo i=$x; done; }\nf \"hello world\" foo\nexit\n");
     assert!(out.lines().any(|l| l == "i=hello world"), "stdout: {out}");
     assert!(out.lines().any(|l| l == "i=foo"), "stdout: {out}");
 }
@@ -70,9 +74,7 @@ fn return_with_status() {
 
 #[test]
 fn return_exits_early() {
-    let (out, _) = run(
-        "f() { echo before; return; echo never; }\nf\necho after\nexit\n",
-    );
+    let (out, _) = run("f() { echo before; return; echo never; }\nf\necho after\nexit\n");
     assert!(out.lines().any(|l| l == "before"), "stdout: {out}");
     assert!(!out.lines().any(|l| l == "never"), "return failed: {out}");
     assert!(out.lines().any(|l| l == "after"), "stdout: {out}");
@@ -101,16 +103,24 @@ fn function_shadows_regular_builtin() {
     let (out, _) = run("echo() { command_does_not_exist; }\necho should-be-silenced\nexit\n");
     // The literal "should-be-silenced" must NOT appear (the function body
     // doesn't echo its args).
-    assert!(!out.lines().any(|l| l == "should-be-silenced"), "stdout: {out}");
+    assert!(
+        !out.lines().any(|l| l == "should-be-silenced"),
+        "stdout: {out}"
+    );
 }
 
 #[test]
 fn return_is_unshadowable() {
-    let (out, _) = run(
-        "return() { echo BAD; }\nf() { return 3; echo NEVER; }\nf\necho status-$?\nexit\n",
+    let (out, _) =
+        run("return() { echo BAD; }\nf() { return 3; echo NEVER; }\nf\necho status-$?\nexit\n");
+    assert!(
+        !out.lines().any(|l| l == "BAD"),
+        "return called the user fn: {out}"
     );
-    assert!(!out.lines().any(|l| l == "BAD"), "return called the user fn: {out}");
-    assert!(!out.lines().any(|l| l == "NEVER"), "return did not exit f: {out}");
+    assert!(
+        !out.lines().any(|l| l == "NEVER"),
+        "return did not exit f: {out}"
+    );
     assert!(out.lines().any(|l| l == "status-3"), "stdout: {out}");
 }
 
@@ -121,12 +131,19 @@ fn break_inside_function_does_not_target_callers_loop() {
     // to stderr on EACH call and the loop continues through all iterations.
     // Verified with: printf 'leave() { break; }\nfor x in a b c; ...' | bash
     // → at-a, at-b, at-c, after (exit 0), diagnostic on stderr each iteration.
-    let script = "leave() { break; }\nfor x in a b c; do echo at-$x; leave; done\necho after\nexit\n";
+    let script =
+        "leave() { break; }\nfor x in a b c; do echo at-$x; leave; done\necho after\nexit\n";
     let (out, err) = run(script);
     // All three iterations must complete.
     assert!(out.lines().any(|l| l == "at-a"), "stdout: {out}");
-    assert!(out.lines().any(|l| l == "at-b"), "loop should not break: stdout: {out}");
-    assert!(out.lines().any(|l| l == "at-c"), "loop should not break: stdout: {out}");
+    assert!(
+        out.lines().any(|l| l == "at-b"),
+        "loop should not break: stdout: {out}"
+    );
+    assert!(
+        out.lines().any(|l| l == "at-c"),
+        "loop should not break: stdout: {out}"
+    );
     assert!(out.lines().any(|l| l == "after"), "stdout: {out}");
     // Each iteration should have printed the diagnostic to stderr.
     assert!(
@@ -147,7 +164,10 @@ fn multiline_function_definition() {
 fn standalone_brace_group_runs_in_current_shell() {
     let (out, _) = run("{ x=brace; echo x-set; }\necho after-x=$x\nexit\n");
     assert!(out.lines().any(|l| l == "x-set"), "stdout: {out}");
-    assert!(out.lines().any(|l| l == "after-x=brace"), "no isolation: {out}");
+    assert!(
+        out.lines().any(|l| l == "after-x=brace"),
+        "no isolation: {out}"
+    );
 }
 
 #[test]

@@ -12,7 +12,12 @@ fn run_capture(script: &str) -> (String, String, i32) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -35,17 +40,13 @@ fn if_with_or_combinator() {
 
 #[test]
 fn nested_parens_in_if() {
-    let (out, _, _) = run_capture(
-        "if [ \\( -n a -o -n b \\) -a -n c ]; then echo Y; fi\nexit\n"
-    );
+    let (out, _, _) = run_capture("if [ \\( -n a -o -n b \\) -a -n c ]; then echo Y; fi\nexit\n");
     assert!(out.lines().any(|l| l == "Y"), "got: {out:?}");
 }
 
 #[test]
 fn negated_combinator_in_if() {
-    let (out, _, _) = run_capture(
-        "if [ ! \\( -z a -o -z b \\) ]; then echo Y; fi\nexit\n"
-    );
+    let (out, _, _) = run_capture("if [ ! \\( -z a -o -z b \\) ]; then echo Y; fi\nexit\n");
     assert!(out.lines().any(|l| l == "Y"), "got: {out:?}");
 }
 
@@ -57,9 +58,7 @@ fn bracket_form_with_combinator() {
 
 #[test]
 fn unbalanced_paren_produces_non_zero_exit() {
-    let (out, _, _) = run_capture(
-        "[ \\( -n a ]\necho rc=$?\nexit\n"
-    );
+    let (out, _, _) = run_capture("[ \\( -n a ]\necho rc=$?\nexit\n");
     let rc_line = out.lines().find(|l| l.starts_with("rc=")).unwrap_or("rc=?");
     assert_ne!(rc_line, "rc=0", "expected non-zero rc, got: {rc_line}");
 }

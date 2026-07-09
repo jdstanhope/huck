@@ -165,7 +165,8 @@ pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Re
             let sigid = match &action {
                 Some(_) => {
                     // Install closure that sets the bitmask bit.
-                    let pending = TRAP_PENDING.get()
+                    let pending = TRAP_PENDING
+                        .get()
                         .expect("TRAP_PENDING initialised by Shell::new")
                         .clone();
                     // SAFETY: the registered closure must be async-signal-safe.
@@ -182,7 +183,8 @@ pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Re
                         signal_hook_registry::register_unchecked(signum, move |_: &_| {
                             pending.fetch_or(1u32 << signum, Ordering::SeqCst);
                         })
-                    }.map_err(|e| format!("install signal handler: {e}"))?
+                    }
+                    .map_err(|e| format!("install signal handler: {e}"))?
                 }
                 None => {
                     // `trap "" SIGNAL` (ignore form): register an empty closure that
@@ -198,9 +200,8 @@ pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Re
                     // the action-form comment above) so SEGV/FPE/ILL can be set to
                     // the ignore form without panicking. The action takes a
                     // `&siginfo_t` we ignore.
-                    unsafe {
-                        signal_hook_registry::register_unchecked(signum, move |_: &_| {})
-                    }.map_err(|e| format!("install signal handler: {e}"))?
+                    unsafe { signal_hook_registry::register_unchecked(signum, move |_: &_| {}) }
+                        .map_err(|e| format!("install signal handler: {e}"))?
                 }
             };
             shell.trap_sigids.insert(signum, sigid);
@@ -251,16 +252,35 @@ pub enum TrapSignal {
 /// 1..=31 only).
 fn standard_signals() -> Vec<(&'static str, i32)> {
     let mut v = vec![
-        ("HUP", libc::SIGHUP), ("INT", libc::SIGINT), ("QUIT", libc::SIGQUIT),
-        ("ILL", libc::SIGILL), ("TRAP", libc::SIGTRAP), ("ABRT", libc::SIGABRT),
-        ("BUS", libc::SIGBUS), ("FPE", libc::SIGFPE), ("KILL", libc::SIGKILL),
-        ("USR1", libc::SIGUSR1), ("SEGV", libc::SIGSEGV), ("USR2", libc::SIGUSR2),
-        ("PIPE", libc::SIGPIPE), ("ALRM", libc::SIGALRM), ("TERM", libc::SIGTERM),
-        ("CHLD", libc::SIGCHLD), ("CONT", libc::SIGCONT), ("STOP", libc::SIGSTOP),
-        ("TSTP", libc::SIGTSTP), ("TTIN", libc::SIGTTIN), ("TTOU", libc::SIGTTOU),
-        ("URG", libc::SIGURG), ("XCPU", libc::SIGXCPU), ("XFSZ", libc::SIGXFSZ),
-        ("VTALRM", libc::SIGVTALRM), ("PROF", libc::SIGPROF), ("WINCH", libc::SIGWINCH),
-        ("IO", libc::SIGIO), ("SYS", libc::SIGSYS),
+        ("HUP", libc::SIGHUP),
+        ("INT", libc::SIGINT),
+        ("QUIT", libc::SIGQUIT),
+        ("ILL", libc::SIGILL),
+        ("TRAP", libc::SIGTRAP),
+        ("ABRT", libc::SIGABRT),
+        ("BUS", libc::SIGBUS),
+        ("FPE", libc::SIGFPE),
+        ("KILL", libc::SIGKILL),
+        ("USR1", libc::SIGUSR1),
+        ("SEGV", libc::SIGSEGV),
+        ("USR2", libc::SIGUSR2),
+        ("PIPE", libc::SIGPIPE),
+        ("ALRM", libc::SIGALRM),
+        ("TERM", libc::SIGTERM),
+        ("CHLD", libc::SIGCHLD),
+        ("CONT", libc::SIGCONT),
+        ("STOP", libc::SIGSTOP),
+        ("TSTP", libc::SIGTSTP),
+        ("TTIN", libc::SIGTTIN),
+        ("TTOU", libc::SIGTTOU),
+        ("URG", libc::SIGURG),
+        ("XCPU", libc::SIGXCPU),
+        ("XFSZ", libc::SIGXFSZ),
+        ("VTALRM", libc::SIGVTALRM),
+        ("PROF", libc::SIGPROF),
+        ("WINCH", libc::SIGWINCH),
+        ("IO", libc::SIGIO),
+        ("SYS", libc::SIGSYS),
     ];
     #[cfg(target_os = "linux")]
     {
@@ -365,9 +385,15 @@ mod tests {
     fn drain_pending_returns_signals_in_ascending_order() {
         let mut shell = Shell::new();
         // Simulate three signal deliveries by manually setting bits.
-        shell.trap_pending.fetch_or(1 << libc::SIGINT, Ordering::SeqCst);
-        shell.trap_pending.fetch_or(1 << libc::SIGTERM, Ordering::SeqCst);
-        shell.trap_pending.fetch_or(1 << libc::SIGHUP, Ordering::SeqCst);
+        shell
+            .trap_pending
+            .fetch_or(1 << libc::SIGINT, Ordering::SeqCst);
+        shell
+            .trap_pending
+            .fetch_or(1 << libc::SIGTERM, Ordering::SeqCst);
+        shell
+            .trap_pending
+            .fetch_or(1 << libc::SIGHUP, Ordering::SeqCst);
         let drained = drain_pending(&mut shell);
         assert_eq!(drained, vec![libc::SIGHUP, libc::SIGINT, libc::SIGTERM]);
     }
@@ -375,7 +401,9 @@ mod tests {
     #[test]
     fn drain_pending_clears_the_bitmask() {
         let mut shell = Shell::new();
-        shell.trap_pending.fetch_or(1 << libc::SIGINT, Ordering::SeqCst);
+        shell
+            .trap_pending
+            .fetch_or(1 << libc::SIGINT, Ordering::SeqCst);
         let _ = drain_pending(&mut shell);
         assert_eq!(shell.trap_pending.load(Ordering::SeqCst), 0);
     }
@@ -383,8 +411,12 @@ mod tests {
     #[test]
     fn dispatch_pending_traps_runs_registered_action() {
         let mut shell = Shell::new();
-        shell.traps.insert(TrapSignal::Real(libc::SIGUSR1), Some("FOO=ran".to_string()));
-        shell.trap_pending.fetch_or(1 << libc::SIGUSR1, Ordering::SeqCst);
+        shell
+            .traps
+            .insert(TrapSignal::Real(libc::SIGUSR1), Some("FOO=ran".to_string()));
+        shell
+            .trap_pending
+            .fetch_or(1 << libc::SIGUSR1, Ordering::SeqCst);
         dispatch_pending_traps(&mut shell);
         assert_eq!(shell.get("FOO"), Some("ran"));
     }
@@ -393,7 +425,9 @@ mod tests {
     fn dispatch_pending_traps_skips_ignored_signal() {
         let mut shell = Shell::new();
         shell.traps.insert(TrapSignal::Real(libc::SIGUSR1), None); // ignore
-        shell.trap_pending.fetch_or(1 << libc::SIGUSR1, Ordering::SeqCst);
+        shell
+            .trap_pending
+            .fetch_or(1 << libc::SIGUSR1, Ordering::SeqCst);
         dispatch_pending_traps(&mut shell);
         // No action ran; no side effect to assert. The drain happened
         // (asserted by trap_pending now being 0).
@@ -404,7 +438,9 @@ mod tests {
     fn dispatch_pending_traps_skips_unregistered_signal() {
         let mut shell = Shell::new();
         // No entry in shell.traps for SIGUSR1.
-        shell.trap_pending.fetch_or(1 << libc::SIGUSR1, Ordering::SeqCst);
+        shell
+            .trap_pending
+            .fetch_or(1 << libc::SIGUSR1, Ordering::SeqCst);
         dispatch_pending_traps(&mut shell);
         assert_eq!(shell.trap_pending.load(Ordering::SeqCst), 0);
     }
@@ -412,7 +448,9 @@ mod tests {
     #[test]
     fn fire_exit_trap_runs_action_then_removes_it() {
         let mut shell = Shell::new();
-        shell.traps.insert(TrapSignal::Exit, Some("FOO=ran".to_string()));
+        shell
+            .traps
+            .insert(TrapSignal::Exit, Some("FOO=ran".to_string()));
         fire_exit_trap(&mut shell);
         assert_eq!(shell.get("FOO"), Some("ran"));
         // Trap is now absent: a second fire is a no-op.
@@ -422,16 +460,22 @@ mod tests {
     #[test]
     fn fire_exit_trap_no_action_is_noop() {
         let mut shell = Shell::new();
-        fire_exit_trap(&mut shell);  // no panic, no side effect
+        fire_exit_trap(&mut shell); // no panic, no side effect
         assert!(!shell.traps.contains_key(&TrapSignal::Exit));
     }
 
     #[test]
     fn clear_for_subshell_resets_traps_and_bitmask() {
         let mut shell = Shell::new();
-        shell.traps.insert(TrapSignal::Exit, Some("nope".to_string()));
-        shell.traps.insert(TrapSignal::Real(libc::SIGINT), Some("nope".to_string()));
-        shell.trap_pending.fetch_or(1 << libc::SIGINT, Ordering::SeqCst);
+        shell
+            .traps
+            .insert(TrapSignal::Exit, Some("nope".to_string()));
+        shell
+            .traps
+            .insert(TrapSignal::Real(libc::SIGINT), Some("nope".to_string()));
+        shell
+            .trap_pending
+            .fetch_or(1 << libc::SIGINT, Ordering::SeqCst);
         clear_for_subshell(&mut shell);
         assert!(shell.traps.is_empty());
         assert_eq!(shell.trap_pending.load(Ordering::SeqCst), 0);
@@ -452,14 +496,23 @@ mod tests {
     #[test]
     fn parse_trap_signal_name_no_prefix() {
         assert_eq!(parse_trap_signal("INT"), Ok(TrapSignal::Real(libc::SIGINT)));
-        assert_eq!(parse_trap_signal("TERM"), Ok(TrapSignal::Real(libc::SIGTERM)));
+        assert_eq!(
+            parse_trap_signal("TERM"),
+            Ok(TrapSignal::Real(libc::SIGTERM))
+        );
         assert_eq!(parse_trap_signal("HUP"), Ok(TrapSignal::Real(libc::SIGHUP)));
     }
 
     #[test]
     fn parse_trap_signal_sig_prefix() {
-        assert_eq!(parse_trap_signal("SIGINT"), Ok(TrapSignal::Real(libc::SIGINT)));
-        assert_eq!(parse_trap_signal("SIGTERM"), Ok(TrapSignal::Real(libc::SIGTERM)));
+        assert_eq!(
+            parse_trap_signal("SIGINT"),
+            Ok(TrapSignal::Real(libc::SIGINT))
+        );
+        assert_eq!(
+            parse_trap_signal("SIGTERM"),
+            Ok(TrapSignal::Real(libc::SIGTERM))
+        );
     }
 
     #[test]
@@ -483,16 +536,28 @@ mod tests {
     #[test]
     fn parse_trap_signal_kill_parses_ok() {
         // bash accepts `trap … KILL` (stores disposition, no OS handler).
-        assert_eq!(parse_trap_signal("KILL"), Ok(TrapSignal::Real(libc::SIGKILL)));
-        assert_eq!(parse_trap_signal("SIGKILL"), Ok(TrapSignal::Real(libc::SIGKILL)));
+        assert_eq!(
+            parse_trap_signal("KILL"),
+            Ok(TrapSignal::Real(libc::SIGKILL))
+        );
+        assert_eq!(
+            parse_trap_signal("SIGKILL"),
+            Ok(TrapSignal::Real(libc::SIGKILL))
+        );
         let n = libc::SIGKILL.to_string();
         assert_eq!(parse_trap_signal(&n), Ok(TrapSignal::Real(libc::SIGKILL)));
     }
 
     #[test]
     fn parse_trap_signal_stop_parses_ok() {
-        assert_eq!(parse_trap_signal("STOP"), Ok(TrapSignal::Real(libc::SIGSTOP)));
-        assert_eq!(parse_trap_signal("SIGSTOP"), Ok(TrapSignal::Real(libc::SIGSTOP)));
+        assert_eq!(
+            parse_trap_signal("STOP"),
+            Ok(TrapSignal::Real(libc::SIGSTOP))
+        );
+        assert_eq!(
+            parse_trap_signal("SIGSTOP"),
+            Ok(TrapSignal::Real(libc::SIGSTOP))
+        );
         let n = libc::SIGSTOP.to_string();
         assert_eq!(parse_trap_signal(&n), Ok(TrapSignal::Real(libc::SIGSTOP)));
     }
@@ -504,8 +569,10 @@ mod tests {
         let mut shell = Shell::new();
         assert!(install(&mut shell, TrapSignal::Real(libc::SIGKILL), None).is_ok());
         assert!(shell.traps.contains_key(&TrapSignal::Real(libc::SIGKILL)));
-        assert!(!shell.trap_sigids.contains_key(&libc::SIGKILL),
-            "KILL must not get an OS sigid");
+        assert!(
+            !shell.trap_sigids.contains_key(&libc::SIGKILL),
+            "KILL must not get an OS sigid"
+        );
     }
 
     #[test]
@@ -527,14 +594,28 @@ mod tests {
     fn name_table_has_full_standard_set_minus_kill_stop() {
         let t = name_table();
         // newly-added standard signals are present (trappable)
-        for name in ["ABRT", "SEGV", "BUS", "FPE", "ILL", "TRAP", "SYS", "URG", "XCPU"] {
-            assert!(t.iter().any(|(n, _)| *n == name), "trappable missing {name}");
+        for name in [
+            "ABRT", "SEGV", "BUS", "FPE", "ILL", "TRAP", "SYS", "URG", "XCPU",
+        ] {
+            assert!(
+                t.iter().any(|(n, _)| *n == name),
+                "trappable missing {name}"
+            );
         }
         // KILL and STOP are NOT trappable
-        assert!(!t.iter().any(|(n, _)| *n == "KILL"), "KILL must not be trappable");
-        assert!(!t.iter().any(|(n, _)| *n == "STOP"), "STOP must not be trappable");
+        assert!(
+            !t.iter().any(|(n, _)| *n == "KILL"),
+            "KILL must not be trappable"
+        );
+        assert!(
+            !t.iter().any(|(n, _)| *n == "STOP"),
+            "STOP must not be trappable"
+        );
         // all numbers fit the AtomicU32 pending mask (1..=31)
-        assert!(t.iter().all(|(_, num)| (1..=31).contains(num)), "signal out of 1..=31");
+        assert!(
+            t.iter().all(|(_, num)| (1..=31).contains(num)),
+            "signal out of 1..=31"
+        );
     }
 
     #[test]
@@ -545,8 +626,14 @@ mod tests {
         assert!(k.iter().any(|(n, _)| *n == "ABRT"));
         assert!(k.iter().any(|(n, _)| *n == "SEGV"));
         // number<->name agrees with libc
-        assert_eq!(k.iter().find(|(n, _)| *n == "ABRT").map(|(_, x)| *x), Some(libc::SIGABRT));
-        assert_eq!(k.iter().find(|(n, _)| *n == "SEGV").map(|(_, x)| *x), Some(libc::SIGSEGV));
+        assert_eq!(
+            k.iter().find(|(n, _)| *n == "ABRT").map(|(_, x)| *x),
+            Some(libc::SIGABRT)
+        );
+        assert_eq!(
+            k.iter().find(|(n, _)| *n == "SEGV").map(|(_, x)| *x),
+            Some(libc::SIGSEGV)
+        );
     }
 
     #[test]
@@ -578,7 +665,12 @@ mod tests {
     fn install_real_signal_stores_action_and_sigid() {
         let mut shell = Shell::new();
         // Use SIGUSR1 — unlikely to be ignored-at-startup in test env.
-        install(&mut shell, TrapSignal::Real(libc::SIGUSR1), Some("echo usr1".to_string())).unwrap();
+        install(
+            &mut shell,
+            TrapSignal::Real(libc::SIGUSR1),
+            Some("echo usr1".to_string()),
+        )
+        .unwrap();
         assert!(shell.trap_sigids.contains_key(&libc::SIGUSR1));
         assert_eq!(
             shell.traps.get(&TrapSignal::Real(libc::SIGUSR1)),
@@ -591,7 +683,12 @@ mod tests {
     #[test]
     fn reset_real_signal_unregisters_handler() {
         let mut shell = Shell::new();
-        install(&mut shell, TrapSignal::Real(libc::SIGUSR2), Some("echo usr2".to_string())).unwrap();
+        install(
+            &mut shell,
+            TrapSignal::Real(libc::SIGUSR2),
+            Some("echo usr2".to_string()),
+        )
+        .unwrap();
         reset(&mut shell, TrapSignal::Real(libc::SIGUSR2)).unwrap();
         assert!(!shell.trap_sigids.contains_key(&libc::SIGUSR2));
         assert!(!shell.traps.contains_key(&TrapSignal::Real(libc::SIGUSR2)));
@@ -600,7 +697,9 @@ mod tests {
     #[test]
     fn fire_err_trap_runs_action_without_remove() {
         let mut shell = Shell::new();
-        shell.traps.insert(TrapSignal::Err, Some("FOO=err_ran".to_string()));
+        shell
+            .traps
+            .insert(TrapSignal::Err, Some("FOO=err_ran".to_string()));
         fire_err_trap(&mut shell);
         assert_eq!(shell.get("FOO"), Some("err_ran"));
         // Trap entry MUST still be present (unlike EXIT which self-removes).
@@ -610,7 +709,9 @@ mod tests {
     #[test]
     fn fire_debug_trap_runs_action_without_remove() {
         let mut shell = Shell::new();
-        shell.traps.insert(TrapSignal::Debug, Some("FOO=dbg_ran".to_string()));
+        shell
+            .traps
+            .insert(TrapSignal::Debug, Some("FOO=dbg_ran".to_string()));
         fire_debug_trap(&mut shell);
         assert_eq!(shell.get("FOO"), Some("dbg_ran"));
         assert!(shell.traps.contains_key(&TrapSignal::Debug));
@@ -619,7 +720,9 @@ mod tests {
     #[test]
     fn fire_return_trap_runs_action_without_remove() {
         let mut shell = Shell::new();
-        shell.traps.insert(TrapSignal::Return, Some("FOO=ret_ran".to_string()));
+        shell
+            .traps
+            .insert(TrapSignal::Return, Some("FOO=ret_ran".to_string()));
         fire_return_trap(&mut shell);
         assert_eq!(shell.get("FOO"), Some("ret_ran"));
         assert!(shell.traps.contains_key(&TrapSignal::Return));
@@ -629,7 +732,9 @@ mod tests {
     fn fire_err_trap_recursion_guard_suppresses_reentry() {
         let mut shell = Shell::new();
         shell.firing_trap = Some(TrapSignal::Err);
-        shell.traps.insert(TrapSignal::Err, Some("FOO=should_not_run".to_string()));
+        shell
+            .traps
+            .insert(TrapSignal::Err, Some("FOO=should_not_run".to_string()));
         fire_err_trap(&mut shell);
         // Action should NOT have run because firing_trap was already set.
         assert_eq!(shell.get("FOO"), None);
@@ -639,7 +744,9 @@ mod tests {
     fn fire_debug_trap_recursion_guard_suppresses_reentry() {
         let mut shell = Shell::new();
         shell.firing_trap = Some(TrapSignal::Debug);
-        shell.traps.insert(TrapSignal::Debug, Some("FOO=should_not_run".to_string()));
+        shell
+            .traps
+            .insert(TrapSignal::Debug, Some("FOO=should_not_run".to_string()));
         fire_debug_trap(&mut shell);
         assert_eq!(shell.get("FOO"), None);
     }
@@ -648,7 +755,9 @@ mod tests {
     fn fire_return_trap_recursion_guard_suppresses_reentry() {
         let mut shell = Shell::new();
         shell.firing_trap = Some(TrapSignal::Return);
-        shell.traps.insert(TrapSignal::Return, Some("FOO=should_not_run".to_string()));
+        shell
+            .traps
+            .insert(TrapSignal::Return, Some("FOO=should_not_run".to_string()));
         fire_return_trap(&mut shell);
         assert_eq!(shell.get("FOO"), None);
     }
@@ -658,7 +767,9 @@ mod tests {
         // firing_trap is Some(Debug), but we're firing Err — should fire.
         let mut shell = Shell::new();
         shell.firing_trap = Some(TrapSignal::Debug);
-        shell.traps.insert(TrapSignal::Err, Some("FOO=err_ran".to_string()));
+        shell
+            .traps
+            .insert(TrapSignal::Err, Some("FOO=err_ran".to_string()));
         fire_err_trap(&mut shell);
         assert_eq!(shell.get("FOO"), Some("err_ran"));
         // firing_trap restored to its previous value (Debug) after the

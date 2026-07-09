@@ -14,8 +14,8 @@ use rustyline::{CompletionType, Config, Editor};
 
 use huck_engine::builtins::ExecOutcome;
 use huck_engine::shell::{
-    fire_prompt_command, install_job_control_signals, install_sigchld_handler,
-    install_sigint_handler, maybe_source_rc_file, parse_cli, process_line, RunMode,
+    RunMode, fire_prompt_command, install_job_control_signals, install_sigchld_handler,
+    install_sigint_handler, maybe_source_rc_file, parse_cli, process_line,
 };
 use huck_engine::shell_state::Shell;
 use huck_engine::{emit_cli_error, emit_error, emit_syntax_error};
@@ -108,7 +108,11 @@ pub fn run(args: &[String], version: &str) -> i32 {
 
     // Non-interactive program modes bypass the REPL entirely.
     match opts.mode {
-        RunMode::Command { command, argv0, args } => {
+        RunMode::Command {
+            command,
+            argv0,
+            args,
+        } => {
             let mut engine = huck_engine::Engine::from_shell_cell(Rc::clone(&shell_cell));
             if let Some(a0) = argv0 {
                 engine.set_arg0(&a0);
@@ -230,7 +234,8 @@ pub fn run(args: &[String], version: &str) -> i32 {
                             return shell_exit(&mut shell, fatal_status);
                         }
                     }
-                    ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
+                    ExecOutcome::LoopBreak(_, _)
+                    | ExecOutcome::LoopContinue(_)
                     | ExecOutcome::FunctionReturn(_) => {
                         let mut shell = shell_cell.borrow_mut();
                         shell.set_last_status(0)
@@ -254,7 +259,11 @@ pub fn run(args: &[String], version: &str) -> i32 {
                 // 1 (first line) + newlines already read + 1 (the missing one).
                 let line = buffer.matches('\n').count() as u32 + 2;
                 let mut shell = shell_cell.borrow_mut();
-                emit_syntax_error(&shell, line, format_args!("syntax error: unexpected end of input"));
+                emit_syntax_error(
+                    &shell,
+                    line,
+                    format_args!("syntax error: unexpected end of input"),
+                );
                 return shell_exit(&mut shell, 2);
             }
             ReadResult::ReadError(msg) => {
@@ -291,7 +300,11 @@ fn apply_readline_settings(
 
     // 1. Editor-mapped variables.
     if let Some(v) = shell.readline_settings.vars.get("editing-mode") {
-        let mode = if v == "vi" { rustyline::EditMode::Vi } else { rustyline::EditMode::Emacs };
+        let mode = if v == "vi" {
+            rustyline::EditMode::Vi
+        } else {
+            rustyline::EditMode::Emacs
+        };
         editor.set_edit_mode(mode);
     }
     if let Some(v) = shell.readline_settings.vars.get("bell-style") {
@@ -308,20 +321,27 @@ fn apply_readline_settings(
     // Numeric vars: parse as i64 and CLAMP to the setter's range so an
     // out-of-range value (the validator accepts any integer, like bash) still
     // applies clamped rather than being silently dropped.
-    if let Some(n) = shell.readline_settings.vars.get("completion-query-items").and_then(|s| s.parse::<i64>().ok()) {
+    if let Some(n) = shell
+        .readline_settings
+        .vars
+        .get("completion-query-items")
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         editor.set_completion_prompt_limit(n.max(0) as usize);
     }
-    if let Some(n) = shell.readline_settings.vars.get("keyseq-timeout").and_then(|s| s.parse::<i64>().ok()) {
+    if let Some(n) = shell
+        .readline_settings
+        .vars
+        .get("keyseq-timeout")
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         editor.set_keyseq_timeout(Some(n.clamp(0, u16::MAX as i64) as u16));
     }
 
     // 2. Pending key binds.
     let binds = std::mem::take(&mut shell.readline_settings.pending_binds);
     for (seq, func) in binds {
-        if let (Some(event), Some(cmd)) = (
-            parse_keyseq(&seq),
-            function_to_cmd(&func),
-        ) {
+        if let (Some(event), Some(cmd)) = (parse_keyseq(&seq), function_to_cmd(&func)) {
             editor.bind_sequence(event, cmd);
             shell.readline_settings.active_binds.insert(seq, func);
         }
@@ -352,9 +372,7 @@ fn read_stdin_line_raw() -> Option<String> {
     let mut bytes: Vec<u8> = Vec::new();
     loop {
         let mut b = [0u8; 1];
-        let n = unsafe {
-            libc::read(libc::STDIN_FILENO, b.as_mut_ptr() as *mut libc::c_void, 1)
-        };
+        let n = unsafe { libc::read(libc::STDIN_FILENO, b.as_mut_ptr() as *mut libc::c_void, 1) };
         if n < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
@@ -380,7 +398,7 @@ fn read_logical_command(
     editor: &mut Editor<HuckHelper, FileHistory>,
     cell: &RefCell<Shell>,
 ) -> ReadResult {
-    use huck_engine::continuation::{classify, joiner_for, Completeness};
+    use huck_engine::continuation::{Completeness, classify, joiner_for};
 
     let mut buffer = String::new();
     let mut history = String::new();

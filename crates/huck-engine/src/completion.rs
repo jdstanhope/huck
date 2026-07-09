@@ -131,12 +131,17 @@ pub(crate) fn analyze_full(line: &str, pos: usize) -> (usize, usize, CompletionC
             Some(rest) => (true, rest),
             None => (false, after),
         };
-        if name.chars().all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        if name
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        {
             let name_off = dollar + 1 + if brace { 1 } else { 0 };
             return (
                 word_start,
                 word_start + name_off,
-                CompletionContext::Variable { prefix: name.to_string() },
+                CompletionContext::Variable {
+                    prefix: name.to_string(),
+                },
             );
         }
     }
@@ -144,33 +149,55 @@ pub(crate) fn analyze_full(line: &str, pos: usize) -> (usize, usize, CompletionC
     if let Some(slash) = word.rfind('/') {
         let dir = unescape(&word[..=slash]);
         let prefix = unescape(&word[slash + 1..]);
-        return (word_start, word_start + slash + 1, CompletionContext::File { dir, prefix });
+        return (
+            word_start,
+            word_start + slash + 1,
+            CompletionContext::File { dir, prefix },
+        );
     }
 
     if !is_command_pos {
         return (
             word_start,
             word_start,
-            CompletionContext::File { dir: String::new(), prefix: unescape(word) },
+            CompletionContext::File {
+                dir: String::new(),
+                prefix: unescape(word),
+            },
         );
     }
 
-    (word_start, word_start, CompletionContext::Command { prefix: unescape(word) })
+    (
+        word_start,
+        word_start,
+        CompletionContext::Command {
+            prefix: unescape(word),
+        },
+    )
 }
 
 /// True if `word` looks like a `NAME=value` assignment prefix.
 fn is_assignment(word: &str) -> bool {
-    let Some(eq) = word.find('=') else { return false };
+    let Some(eq) = word.find('=') else {
+        return false;
+    };
     let name = &word[..eq];
     !name.is_empty()
-        && name.chars().next().map(|c| c == '_' || c.is_ascii_alphabetic()).unwrap_or(false)
+        && name
+            .chars()
+            .next()
+            .map(|c| c == '_' || c.is_ascii_alphabetic())
+            .unwrap_or(false)
         && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// True if `word` is a compound-command keyword after which the next word
 /// is in command position (i.e., the start of a new simple command).
 fn is_compound_keyword(word: &str) -> bool {
-    matches!(word, "then" | "do" | "else" | "elif" | "fi" | "done" | "esac" | "{" | "}")
+    matches!(
+        word,
+        "then" | "do" | "else" | "elif" | "fi" | "done" | "esac" | "{" | "}"
+    )
 }
 
 /// Byte offset of the last `$` in `word` that is not backslash-escaped.
@@ -210,8 +237,8 @@ fn unescape(s: &str) -> String {
 
 /// Shell keywords completed at command position (bash completes these too).
 const COMPLETION_KEYWORDS: &[&str] = &[
-    "if", "then", "else", "elif", "fi", "case", "esac", "for", "select",
-    "while", "until", "do", "done", "in", "function", "time", "coproc",
+    "if", "then", "else", "elif", "fi", "case", "esac", "for", "select", "while", "until", "do",
+    "done", "in", "function", "time", "coproc",
 ];
 
 /// Completes a command name: builtins, keywords, user-defined functions and
@@ -249,10 +276,14 @@ pub fn complete_command(
         if dir.is_empty() {
             continue;
         }
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else { continue };
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
             if name.starts_with(prefix) && is_executable_file(&entry) {
                 names.insert(name.to_string());
             }
@@ -305,7 +336,9 @@ pub fn complete_file(dir: &str, prefix: &str, home: &str) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = Vec::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else { continue };
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
         if !name.starts_with(prefix) {
             continue;
         }
@@ -362,8 +395,8 @@ fn resolve_dir(dir: &str, home: &str) -> Option<PathBuf> {
 /// Backslash-escapes shell metacharacters in a filename.
 fn escape_filename(name: &str) -> String {
     const SPECIAL: &[char] = &[
-        ' ', '\t', '\'', '"', '\\', '$', ';', '&', '|', '<', '>',
-        '(', ')', '*', '?', '[', ']', '~', '#', '`',
+        ' ', '\t', '\'', '"', '\\', '$', ';', '&', '|', '<', '>', '(', ')', '*', '?', '[', ']',
+        '~', '#', '`',
     ];
     let mut out = String::new();
     for c in name.chars() {
@@ -392,7 +425,7 @@ pub mod dispatch {
     //! a registered -F spec, default-spec fallback, or file completion.
 
     use super::*;
-    use crate::completion_spec::{run_spec, CompletionCtx, CompletionSpec};
+    use crate::completion_spec::{CompletionCtx, CompletionSpec, run_spec};
     use crate::shell_state::Shell;
 
     /// Entry point. Returns (start_offset, candidates) for rustyline.
@@ -468,10 +501,7 @@ pub mod dispatch {
         cmd_name: &str,
         shell: &mut Shell,
     ) -> Vec<Candidate> {
-        let wordbreaks = shell
-            .get("COMP_WORDBREAKS")
-            .unwrap_or(" \t\n")
-            .to_string();
+        let wordbreaks = shell.get("COMP_WORDBREAKS").unwrap_or(" \t\n").to_string();
         let (comp_words, comp_cword) = tokenize_comp_words(&line[..pos], &wordbreaks);
         let cur_word = comp_words.get(comp_cword).cloned().unwrap_or_default();
         let prev_word = if comp_cword > 0 {
@@ -667,17 +697,13 @@ pub mod dispatch {
         }
         let word_start = chars.peek().map(|(i, _)| *i).unwrap_or(region.len());
         let rest = &region[word_start..];
-        let word_end = rest
-            .find([' ', '\t'])
-            .unwrap_or(rest.len());
+        let word_end = rest.find([' ', '\t']).unwrap_or(rest.len());
         let candidate = &rest[..word_end];
 
         // If it looks like an assignment prefix, the command is the NEXT word.
         if is_assignment(candidate) {
             let after = rest[word_end..].trim_start();
-            let next_end = after
-                .find([' ', '\t'])
-                .unwrap_or(after.len());
+            let next_end = after.find([' ', '\t']).unwrap_or(after.len());
             if next_end == 0 {
                 return None;
             }
@@ -767,72 +793,128 @@ mod tests {
     fn analyze_empty_line_is_command() {
         let (start, ctx) = analyze("", 0);
         assert_eq!(start, 0);
-        assert_eq!(ctx, CompletionContext::Command { prefix: String::new() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: String::new()
+            }
+        );
     }
 
     #[test]
     fn analyze_first_word_is_command() {
         let (start, ctx) = analyze("ec", 2);
         assert_eq!(start, 0);
-        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "ec".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_after_command_is_file() {
         let (start, ctx) = analyze("echo fo", 7);
         assert_eq!(start, 5);
-        assert_eq!(ctx, CompletionContext::File { dir: String::new(), prefix: "fo".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::File {
+                dir: String::new(),
+                prefix: "fo".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_after_semicolon_is_command() {
         let (start, ctx) = analyze("echo hi; ec", 11);
         assert_eq!(start, 9);
-        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "ec".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_after_pipe_is_command() {
         let (_, ctx) = analyze("ls | gr", 7);
-        assert_eq!(ctx, CompletionContext::Command { prefix: "gr".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "gr".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_after_assignment_word_is_command() {
         let (start, ctx) = analyze("FOO=bar ec", 10);
         assert_eq!(start, 8);
-        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "ec".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_after_then_keyword_is_command() {
         let (start, ctx) = analyze("if true; then ec", 16);
         assert_eq!(start, 14);
-        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "ec".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_after_do_keyword_is_command() {
         let (_, ctx) = analyze("for x in 1; do ec", 17);
-        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "ec".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_after_else_keyword_is_command() {
         let (_, ctx) = analyze("if x; then y; else ec", 21);
-        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "ec".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_after_elif_keyword_is_command() {
         let (_, ctx) = analyze("if x; then y; elif ec", 21);
-        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "ec".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_after_open_brace_keyword_is_command() {
         let (_, ctx) = analyze("{ ec", 4);
-        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "ec".to_string()
+            }
+        );
     }
 
     #[test]
@@ -841,62 +923,111 @@ mod tests {
         // next word as a command position is the more useful completion default
         // — it lets the user tab-complete `if x; then y; fi <TAB>` to a command.
         let (_, ctx) = analyze("if x; then y; fi ec", 19);
-        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "ec".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_variable_dollar() {
         let (start, ctx) = analyze("echo $HO", 8);
         assert_eq!(start, 6);
-        assert_eq!(ctx, CompletionContext::Variable { prefix: "HO".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Variable {
+                prefix: "HO".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_variable_braced() {
         let (start, ctx) = analyze("echo ${HO", 9);
         assert_eq!(start, 7);
-        assert_eq!(ctx, CompletionContext::Variable { prefix: "HO".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Variable {
+                prefix: "HO".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_variable_mid_word() {
         let (start, ctx) = analyze("echo foo$BA", 11);
         assert_eq!(start, 9);
-        assert_eq!(ctx, CompletionContext::Variable { prefix: "BA".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Variable {
+                prefix: "BA".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_variable_empty_prefix() {
         let (start, ctx) = analyze("echo $", 6);
         assert_eq!(start, 6);
-        assert_eq!(ctx, CompletionContext::Variable { prefix: String::new() });
+        assert_eq!(
+            ctx,
+            CompletionContext::Variable {
+                prefix: String::new()
+            }
+        );
     }
 
     #[test]
     fn analyze_path_splits_at_slash() {
         let (start, ctx) = analyze("cat src/le", 10);
         assert_eq!(start, 8);
-        assert_eq!(ctx, CompletionContext::File { dir: "src/".to_string(), prefix: "le".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::File {
+                dir: "src/".to_string(),
+                prefix: "le".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_command_with_slash_is_file() {
         let (start, ctx) = analyze("./scr", 5);
         assert_eq!(start, 2);
-        assert_eq!(ctx, CompletionContext::File { dir: "./".to_string(), prefix: "scr".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::File {
+                dir: "./".to_string(),
+                prefix: "scr".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_escaped_space_stays_in_word() {
         let (start, ctx) = analyze("cat my\\ fi", 10);
         assert_eq!(start, 4);
-        assert_eq!(ctx, CompletionContext::File { dir: String::new(), prefix: "my fi".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::File {
+                dir: String::new(),
+                prefix: "my fi".to_string()
+            }
+        );
     }
 
     #[test]
     fn analyze_ignores_text_after_cursor() {
         let (_, ctx) = analyze("echo fo bar", 7);
-        assert_eq!(ctx, CompletionContext::File { dir: String::new(), prefix: "fo".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::File {
+                dir: String::new(),
+                prefix: "fo".to_string()
+            }
+        );
     }
 
     #[test]
@@ -913,7 +1044,10 @@ mod tests {
         assert_eq!(start, 12); // just past "projects/"
         assert_eq!(
             ctx,
-            CompletionContext::File { dir: "projects/".to_string(), prefix: "sub".to_string() }
+            CompletionContext::File {
+                dir: "projects/".to_string(),
+                prefix: "sub".to_string()
+            }
         );
     }
 
@@ -935,13 +1069,15 @@ mod tests {
             &mut sh,
             false,
         );
-        std::rc::Rc::make_mut(&mut sh.completion_specs).by_command.insert(
-            "cd".to_string(),
-            crate::completion_spec::CompletionSpec {
-                function: Some("_fake".to_string()),
-                ..Default::default()
-            },
-        );
+        std::rc::Rc::make_mut(&mut sh.completion_specs)
+            .by_command
+            .insert(
+                "cd".to_string(),
+                crate::completion_spec::CompletionSpec {
+                    function: Some("_fake".to_string()),
+                    ..Default::default()
+                },
+            );
         let (start, cands) = dispatch::resolve("cd projects/", 12, &mut sh);
         assert_eq!(start, 3, "must anchor at the start of `projects/`");
         let reps: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
@@ -953,13 +1089,15 @@ mod tests {
     fn spec_default_sorts_wordlist_results() {
         // Without `-o nosort`, a `-W` wordlist's results are sorted.
         let mut sh = Shell::new();
-        std::rc::Rc::make_mut(&mut sh.completion_specs).by_command.insert(
-            "foo".to_string(),
-            crate::completion_spec::CompletionSpec {
-                wordlist: Some("banana apple cherry".to_string()),
-                ..Default::default()
-            },
-        );
+        std::rc::Rc::make_mut(&mut sh.completion_specs)
+            .by_command
+            .insert(
+                "foo".to_string(),
+                crate::completion_spec::CompletionSpec {
+                    wordlist: Some("banana apple cherry".to_string()),
+                    ..Default::default()
+                },
+            );
         let (_start, cands) = dispatch::resolve("foo ", 4, &mut sh);
         let reps: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
         assert_eq!(reps, vec!["apple", "banana", "cherry"]);
@@ -969,17 +1107,19 @@ mod tests {
     fn spec_nosort_preserves_wordlist_order() {
         // `-o nosort` keeps the compspec's own ordering (here, wordlist order).
         let mut sh = Shell::new();
-        std::rc::Rc::make_mut(&mut sh.completion_specs).by_command.insert(
-            "foo".to_string(),
-            crate::completion_spec::CompletionSpec {
-                wordlist: Some("banana apple cherry".to_string()),
-                options: crate::completion_spec::CompOptions {
-                    nosort: true,
+        std::rc::Rc::make_mut(&mut sh.completion_specs)
+            .by_command
+            .insert(
+                "foo".to_string(),
+                crate::completion_spec::CompletionSpec {
+                    wordlist: Some("banana apple cherry".to_string()),
+                    options: crate::completion_spec::CompOptions {
+                        nosort: true,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            },
-        );
+            );
         let (_start, cands) = dispatch::resolve("foo ", 4, &mut sh);
         let reps: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
         assert_eq!(reps, vec!["banana", "apple", "cherry"]);
@@ -995,17 +1135,19 @@ mod tests {
         let base = dir.path().to_str().unwrap(); // absolute => no chdir needed
         let mut sh = Shell::new();
         let _ = crate::shell::process_line("_empty() { COMPREPLY=(); }", &mut sh, false);
-        std::rc::Rc::make_mut(&mut sh.completion_specs).by_command.insert(
-            "cd".to_string(),
-            crate::completion_spec::CompletionSpec {
-                function: Some("_empty".to_string()),
-                options: crate::completion_spec::CompOptions {
-                    default: true,
+        std::rc::Rc::make_mut(&mut sh.completion_specs)
+            .by_command
+            .insert(
+                "cd".to_string(),
+                crate::completion_spec::CompletionSpec {
+                    function: Some("_empty".to_string()),
+                    options: crate::completion_spec::CompOptions {
+                        default: true,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            },
-        );
+            );
         let line = format!("cd {base}/al");
         let pos = line.len();
         let (start, cands) = dispatch::resolve(&line, pos, &mut sh);
@@ -1019,7 +1161,10 @@ mod tests {
 
     #[test]
     fn expand_tilde_prefix_handles_leading_tilde_slash() {
-        assert_eq!(expand_tilde_prefix("~/projects", "/home/x"), "/home/x/projects");
+        assert_eq!(
+            expand_tilde_prefix("~/projects", "/home/x"),
+            "/home/x/projects"
+        );
         assert_eq!(expand_tilde_prefix("~/", "/home/x"), "/home/x/");
         assert_eq!(expand_tilde_prefix("projects/", "/home/x"), "projects/"); // no tilde
         assert_eq!(expand_tilde_prefix("~/p", ""), "~/p"); // empty home -> unchanged
@@ -1035,20 +1180,25 @@ mod tests {
         let mut sh = Shell::new();
         sh.set("HOME", home.path().to_str().unwrap().to_string());
         let _ = crate::shell::process_line("_t() { COMPREPLY=('~/projects'); }", &mut sh, false);
-        std::rc::Rc::make_mut(&mut sh.completion_specs).by_command.insert(
-            "cd".to_string(),
-            crate::completion_spec::CompletionSpec {
-                function: Some("_t".to_string()),
-                options: crate::completion_spec::CompOptions {
-                    filenames: true,
+        std::rc::Rc::make_mut(&mut sh.completion_specs)
+            .by_command
+            .insert(
+                "cd".to_string(),
+                crate::completion_spec::CompletionSpec {
+                    function: Some("_t".to_string()),
+                    options: crate::completion_spec::CompOptions {
+                        filenames: true,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            },
-        );
+            );
         let (_start, cands) = dispatch::resolve("cd ~/", 5, &mut sh);
         let reps: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
-        assert!(reps.contains(&"~/projects/"), "tilde dir should get trailing slash: {reps:?}");
+        assert!(
+            reps.contains(&"~/projects/"),
+            "tilde dir should get trailing slash: {reps:?}"
+        );
     }
 
     #[test]
@@ -1079,9 +1229,18 @@ mod tests {
         let path = dir.path().to_str().unwrap();
         let cands = complete_command("huckcmd_", path, &[], &[]);
         let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
-        assert!(names.contains(&"huckcmd_exe"), "exe should match: {names:?}");
-        assert!(!names.contains(&"huckcmd_plain"), "non-exe should not match");
-        assert!(!names.contains(&"huckcmd_subdir"), "subdir should not match");
+        assert!(
+            names.contains(&"huckcmd_exe"),
+            "exe should match: {names:?}"
+        );
+        assert!(
+            !names.contains(&"huckcmd_plain"),
+            "non-exe should not match"
+        );
+        assert!(
+            !names.contains(&"huckcmd_subdir"),
+            "subdir should not match"
+        );
     }
 
     #[test]
@@ -1094,11 +1253,7 @@ mod tests {
 
     #[test]
     fn complete_variable_matches_prefix() {
-        let names = vec![
-            "HOME".to_string(),
-            "HOST".to_string(),
-            "PATH".to_string(),
-        ];
+        let names = vec!["HOME".to_string(), "HOST".to_string(), "PATH".to_string()];
         let cands = complete_variable("HO", &names);
         let got: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
         assert_eq!(got, vec!["HOME", "HOST"]);
@@ -1170,7 +1325,10 @@ mod tests {
         touch(home.path(), "homefile");
         let home_str = home.path().to_str().unwrap();
         let cands = complete_file("~/", "homef", home_str);
-        assert!(cands.iter().any(|c| c.replacement == "homefile"), "{cands:?}");
+        assert!(
+            cands.iter().any(|c| c.replacement == "homefile"),
+            "{cands:?}"
+        );
     }
 
     #[test]
@@ -1199,7 +1357,10 @@ mod tests {
         let cands = complete_command("huckcmd_", path, &[], &[]);
         let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
         assert!(names.contains(&"huckcmd_real"), "{names:?}");
-        assert!(names.contains(&"huckcmd_link"), "symlinked exe should complete: {names:?}");
+        assert!(
+            names.contains(&"huckcmd_link"),
+            "symlinked exe should complete: {names:?}"
+        );
     }
 
     #[test]
@@ -1212,7 +1373,10 @@ mod tests {
 
         let cands = complete_file(dir.path().to_str().unwrap(), "linkd", "");
         assert_eq!(cands.len(), 1);
-        assert_eq!(cands[0].replacement, "linkdir/", "symlinked dir should get a trailing slash");
+        assert_eq!(
+            cands[0].replacement, "linkdir/",
+            "symlinked dir should get a trailing slash"
+        );
     }
 
     #[test]
@@ -1220,7 +1384,13 @@ mod tests {
         // `echo > lo` — the word after `>` is a redirect target (a file),
         // not a command.
         let (_, ctx) = analyze("echo > lo", 9);
-        assert_eq!(ctx, CompletionContext::File { dir: String::new(), prefix: "lo".to_string() });
+        assert_eq!(
+            ctx,
+            CompletionContext::File {
+                dir: String::new(),
+                prefix: "lo".to_string()
+            }
+        );
     }
 
     #[test]
@@ -1244,7 +1414,10 @@ mod tests {
         assert_eq!(start, 6);
         let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
         assert!(names.contains(&"MY_VAR"), "{names:?}");
-        assert!(!names.contains(&"should_not_appear"), "spec fired on var: {names:?}");
+        assert!(
+            !names.contains(&"should_not_appear"),
+            "spec fired on var: {names:?}"
+        );
     }
 
     #[test]
@@ -1291,7 +1464,10 @@ mod tests {
         // tokenizing on the space (cur word "~/"), so the spec still completes.
         let _g = CWD_LOCK.lock().unwrap();
         let mut shell = Shell::new();
-        shell.export_set("HOME", std::env::var("HOME").unwrap_or_else(|_| "/root".into()));
+        shell.export_set(
+            "HOME",
+            std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
+        );
         // Append ':' the way a completion script does.
         let wb = format!("{}:", shell.get("COMP_WORDBREAKS").unwrap());
         shell.export_set("COMP_WORDBREAKS", wb);
@@ -1299,12 +1475,18 @@ mod tests {
         Rc::make_mut(&mut shell.completion_specs).by_command.insert(
             "cd".to_string(),
             crate::completion_spec::CompletionSpec {
-                options: crate::completion_spec::CompOptions { default: true, ..Default::default() },
+                options: crate::completion_spec::CompOptions {
+                    default: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         );
         let (_, cands) = dispatch::resolve("cd ~/", 5, &mut shell);
-        assert!(!cands.is_empty(), "cd ~/ completion broke with ':'-appended COMP_WORDBREAKS");
+        assert!(
+            !cands.is_empty(),
+            "cd ~/ completion broke with ':'-appended COMP_WORDBREAKS"
+        );
     }
 
     #[test]
@@ -1313,10 +1495,15 @@ mod tests {
         // names (functions + aliases), not just builtins + PATH. (Functions go
         // through the identical wiring; an alias is trivial to set up here.)
         let mut shell = Shell::new();
-        shell.aliases.insert("myuniquealias".to_string(), "ls".to_string());
+        shell
+            .aliases
+            .insert("myuniquealias".to_string(), "ls".to_string());
         let (_, cands) = dispatch::resolve("myuniquea", 9, &mut shell);
         let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
-        assert!(names.contains(&"myuniquealias"), "alias not completed: {names:?}");
+        assert!(
+            names.contains(&"myuniquealias"),
+            "alias not completed: {names:?}"
+        );
     }
 
     #[test]
@@ -1363,13 +1550,18 @@ mod tests {
             },
             ..Default::default()
         };
-        Rc::make_mut(&mut shell.completion_specs).by_command.insert("mycmd".to_string(), spec);
+        Rc::make_mut(&mut shell.completion_specs)
+            .by_command
+            .insert("mycmd".to_string(), spec);
 
         let (_, cands) = dispatch::resolve("mycmd alpha", 11, &mut shell);
         std::env::set_current_dir(prior_cwd).unwrap();
 
         let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
-        assert!(names.contains(&"alphafile"), "fallback didn't fire: {names:?}");
+        assert!(
+            names.contains(&"alphafile"),
+            "fallback didn't fire: {names:?}"
+        );
     }
 
     #[test]
@@ -1415,9 +1607,7 @@ mod tests {
         // (all-default options) and use it to override the registered
         // spec's real options.
         let mut shell = Shell::new();
-        shell.current_completion_spec = Some(
-            crate::completion_spec::CompletionSpec::default(),
-        );
+        shell.current_completion_spec = Some(crate::completion_spec::CompletionSpec::default());
         // Register a spec whose -o filenames would be silently lost if
         // the leaked all-default spec replaced it. We exercise filenames
         // rendering by completing a real directory.

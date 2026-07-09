@@ -14,8 +14,8 @@
 use std::process::Command;
 use std::time::Duration;
 
-use expectrl::session::OsSession;
 use expectrl::Expect;
+use expectrl::session::OsSession;
 
 fn spawn() -> Option<OsSession> {
     let cmd = Command::new(env!("CARGO_BIN_EXE_huck"));

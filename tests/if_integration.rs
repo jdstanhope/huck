@@ -12,7 +12,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -63,9 +68,7 @@ fn if_chained_with_and() {
 
 #[test]
 fn nested_if() {
-    let (out, _) = run(
-        "if test 1 -eq 1; then if test 2 -eq 2; then echo deep; fi; fi\nexit\n",
-    );
+    let (out, _) = run("if test 1 -eq 1; then if test 2 -eq 2; then echo deep; fi; fi\nexit\n");
     assert!(out.lines().any(|l| l == "deep"), "stdout: {out}");
 }
 

@@ -27,7 +27,13 @@ pub fn with_cwd<R>(path: &Path, shell: &mut Shell, f: impl FnOnce() -> R) -> R {
     let saved_oldpwd = shell.lookup_var("OLDPWD");
 
     if let Err(e) = std::env::set_current_dir(path) {
-        crate::sh_error!(shell, None, "cwd: {}: {}", path.display(), crate::bash_io_error(&e));
+        crate::sh_error!(
+            shell,
+            None,
+            "cwd: {}: {}",
+            path.display(),
+            crate::bash_io_error(&e)
+        );
         return f();
     }
 

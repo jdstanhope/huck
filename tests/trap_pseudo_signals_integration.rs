@@ -12,7 +12,12 @@ fn run(script: &str) -> (String, String, std::process::ExitStatus) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -47,7 +52,10 @@ fn debug_does_not_fire_for_compound_command_itself() {
     let count = out.lines().filter(|l| **l == *"DBG").count();
     // Exactly 3 DBG lines: condition `true`, body `true`, `exit`.
     // No extra lines from the DEBUG action itself (recursion-guarded).
-    assert_eq!(count, 3, "expected exactly 3 DBG lines, got {count}; stdout: {out}");
+    assert_eq!(
+        count, 3,
+        "expected exactly 3 DBG lines, got {count}; stdout: {out}"
+    );
 }
 
 #[test]
@@ -60,7 +68,10 @@ fn debug_recursion_guard_prevents_infinite_fire() {
     let count = out.lines().filter(|l| **l == *"DBG").count();
     // 2 DBG lines: one for `true`, one for `exit` — the action's own
     // `echo DBG` is recursion-suppressed, so no runaway firing.
-    assert_eq!(count, 2, "expected exactly 2 DBG, got {count}; stdout: {out}");
+    assert_eq!(
+        count, 2,
+        "expected exactly 2 DBG, got {count}; stdout: {out}"
+    );
     assert_eq!(status.code(), Some(0));
 }
 
@@ -114,13 +125,17 @@ fn err_fires_on_and_chain_rhs_failure() {
 fn return_fires_after_function_return() {
     let (out, _err, _) = run("trap 'echo RET' RETURN\nf() { :; }\nf\nexit\n");
     let count = out.lines().filter(|l| **l == *"RET").count();
-    assert_eq!(count, 1, "expected exactly 1 RET, got {count}; stdout: {out}");
+    assert_eq!(
+        count, 1,
+        "expected exactly 1 RET, got {count}; stdout: {out}"
+    );
 }
 
 #[test]
 fn return_action_sees_function_status() {
     // The action runs with $? set to the function's return status.
-    let (out, _err, _) = run("trap 'echo got=$?' RETURN\nf() { return 7; }\nf\necho done=$?\nexit\n");
+    let (out, _err, _) =
+        run("trap 'echo got=$?' RETURN\nf() { return 7; }\nf\necho done=$?\nexit\n");
     assert!(out.lines().any(|l| l == "got=7"), "stdout: {out}");
     assert!(out.lines().any(|l| l == "done=7"), "stdout: {out}");
 }

@@ -133,8 +133,7 @@ fn declare_dash_A_on_indexed_errors() {
 
 #[test]
 fn nounset_on_missing_associative_key_is_fatal() {
-    let (_out, err, rc) =
-        run_capture("set -u\ndeclare -A m=([k]=v)\necho \"${m[nope]}\"\nexit\n");
+    let (_out, err, rc) = run_capture("set -u\ndeclare -A m=([k]=v)\necho \"${m[nope]}\"\nexit\n");
     assert!(err.contains("unbound variable"), "got stderr: {err:?}");
     assert_ne!(rc, 0);
 }

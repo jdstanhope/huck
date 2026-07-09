@@ -12,7 +12,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -23,7 +28,10 @@ fn run(script: &str) -> (String, String) {
 #[test]
 fn while_counting_loop() {
     let (out, _) = run("i=0; while test $i -lt 3; do echo $i; i=$((i+1)); done\nexit\n");
-    let nums: Vec<&str> = out.lines().filter(|l| *l == "0" || *l == "1" || *l == "2").collect();
+    let nums: Vec<&str> = out
+        .lines()
+        .filter(|l| *l == "0" || *l == "1" || *l == "2")
+        .collect();
     assert_eq!(nums, vec!["0", "1", "2"], "stdout: {out}");
 }
 
@@ -32,7 +40,10 @@ fn until_loop() {
     let (out, _) = run("n=3; until test $n -eq 0; do echo n$n; n=$((n-1)); done\nexit\n");
     assert!(out.lines().any(|l| l == "n3"), "stdout: {out}");
     assert!(out.lines().any(|l| l == "n1"), "stdout: {out}");
-    assert!(!out.lines().any(|l| l == "n0"), "n0 should not appear: {out}");
+    assert!(
+        !out.lines().any(|l| l == "n0"),
+        "n0 should not appear: {out}"
+    );
 }
 
 #[test]
@@ -42,7 +53,10 @@ fn break_exits_loop_early() {
     );
     assert!(out.lines().any(|l| l == "at-0"), "stdout: {out}");
     assert!(out.lines().any(|l| l == "at-1"), "stdout: {out}");
-    assert!(!out.lines().any(|l| l == "at-2"), "loop should have broken: {out}");
+    assert!(
+        !out.lines().any(|l| l == "at-2"),
+        "loop should have broken: {out}"
+    );
 }
 
 #[test]
@@ -51,7 +65,10 @@ fn continue_skips_iteration() {
         "i=0; while test $i -lt 4; do i=$((i+1)); if test $i -eq 2; then continue; fi; echo v$i; done\nexit\n",
     );
     assert!(out.lines().any(|l| l == "v1"), "stdout: {out}");
-    assert!(!out.lines().any(|l| l == "v2"), "v2 should be skipped: {out}");
+    assert!(
+        !out.lines().any(|l| l == "v2"),
+        "v2 should be skipped: {out}"
+    );
     assert!(out.lines().any(|l| l == "v3"), "stdout: {out}");
 }
 
@@ -76,12 +93,16 @@ fn nested_while() {
 fn stray_break_continues_script() {
     let (out, err) = run("break\necho alive\nexit\n");
     assert!(out.lines().any(|l| l == "alive"), "stdout: {out}");
-    assert!(err.contains("only meaningful"), "expected diagnostic: {err:?}");
+    assert!(
+        err.contains("only meaningful"),
+        "expected diagnostic: {err:?}"
+    );
 }
 
 #[test]
 fn while_loop_status_after() {
-    let (out, _) = run("i=0; while test $i -lt 1; do i=$((i+1)); test 1 -eq 2; done\necho $?\nexit\n");
+    let (out, _) =
+        run("i=0; while test $i -lt 1; do i=$((i+1)); test 1 -eq 2; done\necho $?\nexit\n");
     assert!(out.lines().any(|l| l == "1"), "stdout: {out}");
 }
 

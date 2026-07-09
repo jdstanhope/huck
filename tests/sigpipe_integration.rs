@@ -2,17 +2,20 @@
 //! a closed pipe dies silently (status 141) like bash instead of looping on
 //! EPIPE and spamming "Broken pipe". Tests run the huck binary as a subprocess
 //! (resetting SIGPIPE in the test process would not affect a spawned child).
-use std::process::{Command, Stdio};
 use std::io::Read;
 use std::os::unix::process::ExitStatusExt;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 /// Run `huck -c <script>` with no stdin; return (stdout, stderr, exit_code).
 fn huck_c(script: &str) -> (String, String, i32) {
     let o = Command::new(huck_bin())
-        .arg("-c").arg(script)
+        .arg("-c")
+        .arg(script)
         .stdin(Stdio::null())
         .output()
         .expect("spawn huck");
@@ -31,7 +34,10 @@ fn forked_producer_status_141_silent() {
         "{ for i in $(seq 1 5000); do echo $i; done; } | { read x; }; echo \"stages=${PIPESTATUS[*]}\"",
     );
     assert_eq!(code, 0, "overall rc; stderr={err:?}");
-    assert_eq!(out, "stages=141 0\n", "producer must be SIGPIPE-killed (141); out={out:?}");
+    assert_eq!(
+        out, "stages=141 0\n",
+        "producer must be SIGPIPE-killed (141); out={out:?}"
+    );
     assert_eq!(err, "", "no Broken pipe spam expected; err={err:?}");
 }
 
@@ -39,11 +45,12 @@ fn forked_producer_status_141_silent() {
 // "Broken pipe" lines on stderr (the assertion the fix fired).
 #[test]
 fn forked_producer_no_broken_pipe_spam() {
-    let (out, err, _code) = huck_c(
-        "for i in $(seq 1 5000); do echo \"line$i\"; done | head -1",
-    );
+    let (out, err, _code) = huck_c("for i in $(seq 1 5000); do echo \"line$i\"; done | head -1");
     assert_eq!(out, "line1\n", "out={out:?}");
-    assert!(!err.contains("Broken pipe"), "stderr leaked Broken pipe: {err:?}");
+    assert!(
+        !err.contains("Broken pipe"),
+        "stderr leaked Broken pipe: {err:?}"
+    );
 }
 
 // A subshell `( ... )` producer is a forked stage; it too must die silently.
@@ -78,7 +85,8 @@ fn function_producer_no_spam() {
 #[test]
 fn main_process_producer_terminates_on_broken_pipe() {
     let mut child = Command::new(huck_bin())
-        .arg("-c").arg("while true; do printf 'x\\n'; done")
+        .arg("-c")
+        .arg("while true; do printf 'x\\n'; done")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -96,7 +104,9 @@ fn main_process_producer_terminates_on_broken_pipe() {
     // Watchdog: huck must exit on its own within a few seconds.
     let deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
-        if let Some(st) = child.try_wait().expect("try_wait") { break st; }
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            break st;
+        }
         if Instant::now() > deadline {
             let _ = child.kill();
             panic!("huck did not terminate on a broken pipe (infinite loop)");
@@ -111,7 +121,10 @@ fn main_process_producer_terminates_on_broken_pipe() {
 
     let mut err = String::new();
     child.stderr.take().unwrap().read_to_string(&mut err).ok();
-    assert!(!err.contains("Broken pipe"), "stderr leaked Broken pipe: {err:?}");
+    assert!(
+        !err.contains("Broken pipe"),
+        "stderr leaked Broken pipe: {err:?}"
+    );
 }
 
 // Restoring SIG_DFL at startup makes SIGPIPE trappable again (was rejected with

@@ -19,8 +19,8 @@
 use std::process::Command;
 use std::time::Duration;
 
-use expectrl::session::OsSession;
 use expectrl::Expect;
+use expectrl::session::OsSession;
 
 // macOS: under a PTY, after Ctrl-C kills the foreground external child,
 // rustyline's subsequent read stalls and the shell stops accepting input

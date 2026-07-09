@@ -3,11 +3,14 @@
 //! `cd(){ builtin cd "$@"; }` wrapper.
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 fn huck_c(script: &str) -> (String, String, i32) {
     let o = Command::new(huck_bin())
-        .arg("-c").arg(script)
+        .arg("-c")
+        .arg(script)
         .stdin(Stdio::null())
         .output()
         .expect("spawn huck");
@@ -35,7 +38,10 @@ fn builtin_cd_runs_cd() {
 #[test]
 fn builtin_not_a_builtin_errors() {
     let (_o, err, code) = huck_c("builtin nosuchthing");
-    assert!(err.contains("builtin: nosuchthing: not a shell builtin"), "err={err:?}");
+    assert!(
+        err.contains("builtin: nosuchthing: not a shell builtin"),
+        "err={err:?}"
+    );
     assert_eq!(code, 1);
 }
 
@@ -108,7 +114,10 @@ fn command_builtin_declaration_does_not_panic() {
     let (_o, err, code) = huck_c(r#"f(){ command builtin local x=9; echo "$x"; }; f"#);
     assert_ne!(code, 101, "must not panic; err={err:?}");
     assert_eq!(code, 0, "graceful (echo resets $?); err={err:?}");
-    assert!(err.contains("must not be wrapped by `command builtin`"), "err={err:?}");
+    assert!(
+        err.contains("must not be wrapped by `command builtin`"),
+        "err={err:?}"
+    );
 }
 
 #[test]
@@ -117,5 +126,8 @@ fn command_builtin_declaration_guard_rc_is_1() {
     let (out, err, code) = huck_c(r#"f(){ command builtin local x=9; }; f; echo "rc=$?""#);
     assert_ne!(code, 101, "must not panic; err={err:?}");
     assert_eq!(out, "rc=1\n", "out={out:?}");
-    assert!(err.contains("must not be wrapped by `command builtin`"), "err={err:?}");
+    assert!(
+        err.contains("must not be wrapped by `command builtin`"),
+        "err={err:?}"
+    );
 }

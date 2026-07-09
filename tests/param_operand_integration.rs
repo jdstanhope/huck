@@ -9,10 +9,18 @@ fn run(script: &str) -> (String, i32) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     drop(child.stdin.take());
     let o = child.wait_with_output().unwrap();
-    (String::from_utf8_lossy(&o.stdout).into(), o.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&o.stdout).into(),
+        o.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
@@ -29,7 +37,8 @@ fn default_operand_with_metachars_literal() {
 #[test]
 fn debian_ps1_line_parses() {
     // The exact construct from the stock Debian ~/.bashrc PS1.
-    let (out, code) = run("debian_chroot=\nPS1=\"${debian_chroot:+($debian_chroot)}\\u@\\h\"\necho ok\n");
+    let (out, code) =
+        run("debian_chroot=\nPS1=\"${debian_chroot:+($debian_chroot)}\\u@\\h\"\necho ok\n");
     assert_eq!(code, 0);
     assert!(out.contains("ok"), "stdout: {out:?}");
 }

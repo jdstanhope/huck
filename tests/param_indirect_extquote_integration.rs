@@ -5,17 +5,28 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 fn run_file(script: &str) -> (String, String, i32) {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("huck_v234_{}_{}_.sh", std::process::id(), n));
-    { let mut f = std::fs::File::create(&path).unwrap(); f.write_all(script.as_bytes()).unwrap(); }
-    let out = Command::new(huck_bin()).arg(&path).stdin(Stdio::null()).output().unwrap();
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+    }
+    let out = Command::new(huck_bin())
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
     let _ = std::fs::remove_file(&path);
-    (String::from_utf8_lossy(&out.stdout).into_owned(),
-     String::from_utf8_lossy(&out.stderr).into_owned(),
-     out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
@@ -76,7 +87,10 @@ fn extquote_name_honors_nounset() {
     // Unset var with nounset should fail (rc 1, "unbound variable" on stderr).
     let (_o, e, c) = run_file("set -u; echo \"${$'unsetvar'}\"\n");
     assert_eq!(c, 1, "expected rc=1 (nounset), got {c}; stderr: {e}");
-    assert!(e.contains("unbound variable"), "expected 'unbound variable' in stderr: {e}");
+    assert!(
+        e.contains("unbound variable"),
+        "expected 'unbound variable' in stderr: {e}"
+    );
 
     // Set var with nounset should succeed.
     let (o, _e, c) = run_file("set -u; x1=set; echo \"${$'x1'}\"\n");
@@ -92,12 +106,18 @@ fn indirect_through_array_element_ref() {
     // huck PREVIOUSLY fired "invalid variable name" because brackets
     // made is_valid_name return false before split_name_subscript ran.
     let (o, e, c) = run_file("arr=(aa bb); v=\"arr[0]\"; echo \"${!v}\"\n");
-    assert_eq!(c, 0, "expected rc=0 for arr[0] indirect; rc={c}; stderr={e}");
+    assert_eq!(
+        c, 0,
+        "expected rc=0 for arr[0] indirect; rc={c}; stderr={e}"
+    );
     assert_eq!(o, "aa\n", "expected 'aa', got {o:?}");
 
     // Index 1
     let (o, e, c) = run_file("arr=(aa bb); v=\"arr[1]\"; echo \"${!v:-d}\"\n");
-    assert_eq!(c, 0, "expected rc=0 for arr[1] indirect; rc={c}; stderr={e}");
+    assert_eq!(
+        c, 0,
+        "expected rc=0 for arr[1] indirect; rc={c}; stderr={e}"
+    );
     assert_eq!(o, "bb\n", "expected 'bb', got {o:?}");
 
     // Associative array element

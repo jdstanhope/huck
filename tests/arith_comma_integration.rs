@@ -2,16 +2,28 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 fn run(script: &str) -> (String, String, i32) {
     let mut child = Command::new(huck_bin())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().expect("spawn huck");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn huck");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
-    (String::from_utf8_lossy(&out.stdout).into_owned(),
-     String::from_utf8_lossy(&out.stderr).into_owned(),
-     out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
@@ -49,10 +61,12 @@ fn reassemble_comp_words_shape() {
     // The bash_completion __reassemble loop shape that started this: a C-style
     // for with comma over a COMP_WORDS-like array must run without the
     // `((: unexpected character: ','` error.
-    let (out, err, _c) = run(
-        "COMP_WORDS=(mise \"\")\n\
+    let (out, err, _c) = run("COMP_WORDS=(mise \"\")\n\
          for ((i=0,j=0; i<${#COMP_WORDS[@]}; i++,j++)); do echo \"w$i=${COMP_WORDS[i]}\"; done\n\
          echo done\n");
     assert!(out.contains("done"), "loop did not complete: {out} / {err}");
-    assert!(!err.contains("unexpected character"), "comma error leaked: {err}");
+    assert!(
+        !err.contains("unexpected character"),
+        "comma error leaked: {err}"
+    );
 }

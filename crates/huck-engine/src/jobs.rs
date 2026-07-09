@@ -132,7 +132,8 @@ impl JobTable {
                     // handled this stop event for one stage; later WUNTRACED reports for
                     // sibling stages of the same pipeline must not re-fire the
                     // notification. Only update + re-notify if the state actually changes.
-                    let already_in_this_state = matches!(job.state, JobState::Stopped(s) if s == new_sig);
+                    let already_in_this_state =
+                        matches!(job.state, JobState::Stopped(s) if s == new_sig);
                     if !already_in_this_state {
                         job.state = JobState::Stopped(new_sig);
                         job.notified = false;
@@ -175,9 +176,8 @@ impl JobTable {
 
     /// Drops all jobs that are non-Running AND notified.
     pub fn remove_notified(&mut self) {
-        self.jobs.retain(|j| {
-            matches!(j.state, JobState::Running | JobState::Stopped(_)) || !j.notified
-        });
+        self.jobs
+            .retain(|j| matches!(j.state, JobState::Running | JobState::Stopped(_)) || !j.notified);
     }
 
     /// Returns the most-recent and previous job ids (for `+`/`-` markers).
@@ -219,10 +219,7 @@ impl JobTable {
     }
 
     /// Resolves a JobSpec to a job id, if any matching job exists.
-    pub fn resolve(
-        &self,
-        spec: &crate::job_spec::JobSpec,
-    ) -> Result<u32, JobSpecResolveError> {
+    pub fn resolve(&self, spec: &crate::job_spec::JobSpec) -> Result<u32, JobSpecResolveError> {
         use crate::job_spec::JobSpec;
         match spec {
             JobSpec::Id(id) => self
@@ -231,9 +228,7 @@ impl JobTable {
                 .find(|j| j.id == *id)
                 .map(|j| j.id)
                 .ok_or(JobSpecResolveError::NotFound),
-            JobSpec::Current => self
-                .current_id()
-                .ok_or(JobSpecResolveError::NotFound),
+            JobSpec::Current => self.current_id().ok_or(JobSpecResolveError::NotFound),
             JobSpec::Previous => {
                 let (_, prev) = self.current_and_previous();
                 prev.ok_or(JobSpecResolveError::NotFound)
@@ -306,9 +301,7 @@ pub fn reap_completed(shell: &mut crate::shell_state::Shell) {
         .store(false, std::sync::atomic::Ordering::Relaxed);
     loop {
         let mut raw_status: libc::c_int = 0;
-        let pid = unsafe {
-            libc::waitpid(-1, &mut raw_status, libc::WNOHANG | libc::WUNTRACED)
-        };
+        let pid = unsafe { libc::waitpid(-1, &mut raw_status, libc::WNOHANG | libc::WUNTRACED) };
         if pid <= 0 {
             // 0 = no children changed state; -1 = no children at all (ECHILD)
             break;
@@ -375,7 +368,10 @@ fn job_state_and_suffix(job: &Job) -> (String, &'static str) {
 /// width is 24 to fit `Stopped (tty output)`.
 pub fn notification_line(job: &Job, flag: char) -> String {
     let (state, suffix) = job_state_and_suffix(job);
-    format!("[{}]{} {:<24} {}{}", job.id, flag, state, job.command, suffix)
+    format!(
+        "[{}]{} {:<24} {}{}",
+        job.id, flag, state, job.command, suffix
+    )
 }
 
 /// Bash-faithful `jobs -l` output for a single job. Returns one
@@ -536,8 +532,8 @@ mod tests {
     #[test]
     fn current_id_returns_most_recent_running_or_stopped() {
         let mut t = JobTable::new();
-        let _ = t.add(100, vec![100], "a".to_string());      // id 1
-        let _ = t.add(200, vec![200], "b".to_string());      // id 2 — more recent
+        let _ = t.add(100, vec![100], "a".to_string()); // id 1
+        let _ = t.add(200, vec![200], "b".to_string()); // id 2 — more recent
         assert_eq!(t.current_id(), Some(2));
     }
 
@@ -562,8 +558,8 @@ mod tests {
     #[test]
     fn current_stopped_id_skips_running_jobs() {
         let mut t = JobTable::new();
-        let _ = t.add(100, vec![100], "a".to_string());      // Running, id 1
-        let _ = t.add(200, vec![200], "b".to_string());      // Running, id 2 (more recent)
+        let _ = t.add(100, vec![100], "a".to_string()); // Running, id 1
+        let _ = t.add(200, vec![200], "b".to_string()); // Running, id 2 (more recent)
         t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTSTP);
         // Most-recent is id 2 (Running); current_stopped should skip it and return id 1.
         assert_eq!(t.current_stopped_id(), Some(1));
@@ -629,10 +625,7 @@ mod tests {
 
     #[test]
     fn render_state_stopped_unknown_signal_falls_back_to_numeric() {
-        assert_eq!(
-            render_state(&JobState::Stopped(99)),
-            "Stopped (signal 99)"
-        );
+        assert_eq!(render_state(&JobState::Stopped(99)), "Stopped (signal 99)");
     }
 
     #[test]
@@ -679,10 +672,14 @@ mod tests {
         let j = &t.jobs_mut()[0];
         assert!(
             matches!(j.state, JobState::Stopped(s) if s == libc::SIGTSTP),
-            "got state {:?}", j.state
+            "got state {:?}",
+            j.state
         );
         assert!(!j.reaped[0], "stopped is not reaped — child still exists");
-        assert!(!j.notified, "stopped jobs must be visible to the next notification pass");
+        assert!(
+            !j.notified,
+            "stopped jobs must be visible to the next notification pass"
+        );
     }
 
     #[test]
@@ -712,8 +709,10 @@ mod tests {
         let exit_a: libc::c_int = 0; // WEXITSTATUS = 0
         let exit_b: libc::c_int = 7 << 8; // WEXITSTATUS = 7
         t.reap(100, exit_a);
-        assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(_)),
-            "still stopped while b is alive");
+        assert!(
+            matches!(t.jobs_mut()[0].state, JobState::Stopped(_)),
+            "still stopped while b is alive"
+        );
         t.reap(200, exit_b);
         assert!(matches!(t.jobs_mut()[0].state, JobState::Done(7)));
     }
@@ -730,11 +729,15 @@ mod tests {
         let exit_b: libc::c_int = 7 << 8;
         let exit_a: libc::c_int = 0;
         t.reap(200, exit_b);
-        assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(_)),
-            "still stopped while a is alive");
+        assert!(
+            matches!(t.jobs_mut()[0].state, JobState::Stopped(_)),
+            "still stopped while a is alive"
+        );
         t.reap(100, exit_a);
-        assert!(matches!(t.jobs_mut()[0].state, JobState::Done(7)),
-            "last stage status (b=7) must win, not a=0");
+        assert!(
+            matches!(t.jobs_mut()[0].state, JobState::Done(7)),
+            "last stage status (b=7) must win, not a=0"
+        );
     }
 
     #[test]
@@ -773,7 +776,10 @@ mod tests {
     fn resolve_previous_returns_not_found_when_only_one_job() {
         let mut t = JobTable::new();
         let _ = t.add(100, vec![100], "a".to_string());
-        assert_eq!(t.resolve(&crate::job_spec::JobSpec::Previous), Err(JobSpecResolveError::NotFound));
+        assert_eq!(
+            t.resolve(&crate::job_spec::JobSpec::Previous),
+            Err(JobSpecResolveError::NotFound)
+        );
     }
 
     #[test]
@@ -834,9 +840,12 @@ mod tests {
         // First stop: synchronous waiter would have set notified=true after this.
         t.reap(100, stopped);
         assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(s) if s == libc::SIGTSTP));
-        t.jobs_mut()[0].notified = true;  // simulate the synchronous waiter's bookkeeping
+        t.jobs_mut()[0].notified = true; // simulate the synchronous waiter's bookkeeping
         // Second stop for the same job (other pid, same signal).
         t.reap(200, stopped);
-        assert!(t.jobs_mut()[0].notified, "must NOT reset notified for the second stop");
+        assert!(
+            t.jobs_mut()[0].notified,
+            "must NOT reset notified for the second stop"
+        );
     }
 }

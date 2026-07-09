@@ -13,7 +13,9 @@ pub struct LineBuf {
 #[allow(dead_code)]
 impl LineBuf {
     pub fn new() -> Self {
-        Self { partial: Vec::new() }
+        Self {
+            partial: Vec::new(),
+        }
     }
 
     /// Append raw bytes. Caller pulls via `next_line()` after each push.

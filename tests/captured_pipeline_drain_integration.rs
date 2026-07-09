@@ -8,7 +8,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 /// SIGKILL the entire descendant tree rooted at `root` (BFS via `pgrep -P`),
 /// then `root` itself. A hung huck spawns its pipeline stages in their OWN
@@ -21,7 +23,11 @@ fn kill_process_tree(root: u32) {
     while i < pids.len() {
         let pid = pids[i];
         i += 1;
-        if let Ok(o) = Command::new("pgrep").arg("-P").arg(pid.to_string()).output() {
+        if let Ok(o) = Command::new("pgrep")
+            .arg("-P")
+            .arg(pid.to_string())
+            .output()
+        {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
                 if let Ok(child) = line.trim().parse::<u32>() {
                     pids.push(child);
@@ -32,7 +38,9 @@ fn kill_process_tree(root: u32) {
     for pid in pids {
         // SAFETY: `kill(pid, SIGKILL)` is an always-safe syscall; an already-dead
         // or reparented pid just yields ESRCH, which we ignore.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
     }
 }
 
@@ -40,10 +48,18 @@ fn kill_process_tree(root: u32) {
 /// `Some((stdout, stderr, code))` on normal completion, `None` if it hung.
 fn run_guarded(script: &str, secs: u64) -> Option<(String, String, i32)> {
     let mut child = Command::new(huck_bin())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().expect("spawn huck");
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn huck");
     let pid = child.id();
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let (tx, rx) = mpsc::channel::<()>();
     let wd = thread::spawn(move || -> bool {
         if rx.recv_timeout(Duration::from_secs(secs)).is_err() {
@@ -99,7 +115,11 @@ fn large_producer_small_final_output() {
     // (Linux) doesn't. The padding survives `$()` and lands inside the
     // brackets, so compare the inner numeric value with the spaces
     // trimmed rather than asserting exact bracket contents.
-    let inner = o.trim().trim_start_matches('[').trim_end_matches(']').trim();
+    let inner = o
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
     assert_eq!(inner, "500000", "o: {o:?}");
 }
 
@@ -114,5 +134,9 @@ fn non_capture_pipeline_unaffected() {
 fn pipestatus_after_captured_pipeline() {
     let r = run_guarded("x=$(false | true); echo \"[${PIPESTATUS[*]}]\"\n", 10);
     let (o, _e, _c) = r.expect("hung");
-    assert_eq!(o.trim(), "[0]", "o: {o:?} — if bash differs, set expected to bash's output");
+    assert_eq!(
+        o.trim(),
+        "[0]",
+        "o: {o:?} — if bash differs, set expected to bash's output"
+    );
 }

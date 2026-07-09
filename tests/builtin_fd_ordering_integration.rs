@@ -13,7 +13,11 @@ fn huck_binary() -> String {
 
 /// Run `prog -c script` and return its stdout.
 fn run_c(prog: &str, script: &str) -> String {
-    let out = Command::new(prog).arg("-c").arg(script).output().expect("spawn");
+    let out = Command::new(prog)
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("spawn");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 

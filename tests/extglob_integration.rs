@@ -25,7 +25,10 @@ fn run(script: &str) -> (String, i32) {
 
 #[test]
 fn param_expansion_extglob() {
-    assert_eq!(run("shopt -s extglob\nv=aaab\necho \"${v##+(a)}\"\n").0, "b\n");
+    assert_eq!(
+        run("shopt -s extglob\nv=aaab\necho \"${v##+(a)}\"\n").0,
+        "b\n"
+    );
     assert_eq!(
         run("shopt -s extglob\nv=foobarbar\necho \"${v%%+(bar)}\"\n").0,
         "foo\n"
@@ -96,16 +99,34 @@ fn dbracket_extglob_nocasematch() {
 
 #[test]
 fn extglob_group_expands_inner_variable() {
-    assert_eq!(run("shopt -s extglob\nx=\"a|b\"\n[[ ab == +($x) ]] && echo Y || echo N\n").0, "Y\n");
-    assert_eq!(run("shopt -s extglob\nx=\"a|b\"\ncase ab in +($x)) echo Y;; *) echo N;; esac\n").0, "Y\n");
-    assert_eq!(run("shopt -s extglob\np=ab\n[[ xaby == x@($p)y ]] && echo Y || echo N\n").0, "Y\n");
+    assert_eq!(
+        run("shopt -s extglob\nx=\"a|b\"\n[[ ab == +($x) ]] && echo Y || echo N\n").0,
+        "Y\n"
+    );
+    assert_eq!(
+        run("shopt -s extglob\nx=\"a|b\"\ncase ab in +($x)) echo Y;; *) echo N;; esac\n").0,
+        "Y\n"
+    );
+    assert_eq!(
+        run("shopt -s extglob\np=ab\n[[ xaby == x@($p)y ]] && echo Y || echo N\n").0,
+        "Y\n"
+    );
 }
 
 #[test]
 fn extglob_quoted_metachars_are_literal() {
     // A `|`/`(`/`)` typed literally inside quotes inside an extglob group must
     // be literal, not alternation/group syntax (regression guard).
-    assert_eq!(run("shopt -s extglob\n[[ a == @(\"a|b\") ]] && echo Y || echo N\n").0, "N\n");
-    assert_eq!(run("shopt -s extglob\n[[ 'a|b' == @(\"a|b\") ]] && echo Y || echo N\n").0, "Y\n");
-    assert_eq!(run("shopt -s extglob\n[[ 'a)b' == @(\"a)b\") ]] && echo Y || echo N\n").0, "Y\n");
+    assert_eq!(
+        run("shopt -s extglob\n[[ a == @(\"a|b\") ]] && echo Y || echo N\n").0,
+        "N\n"
+    );
+    assert_eq!(
+        run("shopt -s extglob\n[[ 'a|b' == @(\"a|b\") ]] && echo Y || echo N\n").0,
+        "Y\n"
+    );
+    assert_eq!(
+        run("shopt -s extglob\n[[ 'a)b' == @(\"a)b\") ]] && echo Y || echo N\n").0,
+        "Y\n"
+    );
 }

@@ -18,7 +18,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     drop(child.stdin.take());
     let output = child.wait_with_output().expect("wait");
     (
@@ -97,7 +102,10 @@ fn pipeline_function_def_as_stage_is_noop() {
     // No output from the pipeline itself.
     assert!(!out.contains("hi"), "stdin leaked to output: {out}");
     // The shell continues and the exit status is 0.
-    assert!(out.contains("exit_was=0"), "expected exit_was=0, got: {out}\nstderr: {err}");
+    assert!(
+        out.contains("exit_was=0"),
+        "expected exit_was=0, got: {out}\nstderr: {err}"
+    );
 }
 
 #[test]
@@ -121,7 +129,10 @@ fn pipeline_var_assignment_does_not_leak() {
     // The parent-side restore means the parent's FOO stays "outer".
     let (out, _) = run("FOO=outer\nFOO=inner true | cat\necho $FOO\nexit\n");
     assert!(out.contains("outer"), "expected 'outer', got: {out}");
-    assert!(!out.contains("inner"), "unexpected 'inner' in output: {out}");
+    assert!(
+        !out.contains("inner"),
+        "unexpected 'inner' in output: {out}"
+    );
 }
 
 #[test]
@@ -199,7 +210,10 @@ fn pipeline_middle_stage_with_explicit_stdin_redirect_doesnt_corrupt_downstream(
     // stage's output bleeding through a leaked pipe.
     let (out, _) = run("echo FIRST | cat <<EOF | grep MIDDLE\nMIDDLE\nEOF\nexit\n");
     assert!(out.contains("MIDDLE"), "got: {out}");
-    assert!(!out.contains("FIRST"), "first-stage output leaked into pipeline 3: {out}");
+    assert!(
+        !out.contains("FIRST"),
+        "first-stage output leaked into pipeline 3: {out}"
+    );
 }
 
 #[test]
@@ -226,15 +240,27 @@ fn pipeline_backgrounded_with_compound_stage_doesnt_panic() {
     // `wait` collects it; `echo done` confirms the shell is still running.
     let (out, _) = run("echo hi | { cat; } &\nwait\necho done\nexit\n");
     // The shell must not have panicked: "done" must appear.
-    assert!(out.contains("done"), "shell panicked or exited early, got: {out}");
+    assert!(
+        out.contains("done"),
+        "shell panicked or exited early, got: {out}"
+    );
     // The brace group runs cat which reads "hi" from the pipe and writes it.
-    assert!(out.contains("hi"), "expected 'hi' from pipeline, got: {out}");
+    assert!(
+        out.contains("hi"),
+        "expected 'hi' from pipeline, got: {out}"
+    );
 }
 
 #[test]
 fn pipeline_backgrounded_with_if_stage_doesnt_panic() {
     // Same as above but with an `if` compound as the pipeline stage.
     let (out, _) = run("echo hi | if true; then cat; fi &\nwait\necho done\nexit\n");
-    assert!(out.contains("done"), "shell panicked or exited early, got: {out}");
-    assert!(out.contains("hi"), "expected 'hi' from pipeline, got: {out}");
+    assert!(
+        out.contains("done"),
+        "shell panicked or exited early, got: {out}"
+    );
+    assert!(
+        out.contains("hi"),
+        "expected 'hi' from pipeline, got: {out}"
+    );
 }

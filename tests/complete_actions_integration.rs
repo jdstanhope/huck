@@ -2,22 +2,38 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 fn run(script: &str) -> (String, i32) {
     let mut child = Command::new(huck_bin())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-        .spawn().expect("spawn huck");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn huck");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
-    (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
 fn registration_never_errors() {
     assert_eq!(run("complete -u cmd; echo rc=$?\n").0, "rc=0\n");
     assert_eq!(run("complete -A stopped cmd; echo rc=$?\n").0, "rc=0\n");
-    assert_eq!(run("complete -A setopt -A shopt cmd; echo rc=$?\n").0, "rc=0\n");
+    assert_eq!(
+        run("complete -A setopt -A shopt cmd; echo rc=$?\n").0,
+        "rc=0\n"
+    );
     assert_eq!(run("complete -ev cmd; echo rc=$?\n").0, "rc=0\n");
 }
 

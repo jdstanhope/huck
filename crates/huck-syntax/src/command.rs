@@ -17,8 +17,8 @@ enum Keyword {
     Esac,
     LBrace,
     RBrace,
-    DoubleBracketOpen,   // [[
-    DoubleBracketClose,  // ]]
+    DoubleBracketOpen,  // [[
+    DoubleBracketClose, // ]]
     Function,
     Select,
     Coproc,
@@ -28,11 +28,17 @@ enum Keyword {
 /// keyword only when it is a `Word` of exactly one part — an *unquoted*
 /// `Literal` whose text equals the keyword.
 fn keyword_of(token: &TokenKind) -> Option<Keyword> {
-    let TokenKind::Word(Word(parts)) = token else { return None };
+    let TokenKind::Word(Word(parts)) = token else {
+        return None;
+    };
     if parts.len() != 1 {
         return None;
     }
-    let WordPart::Literal { text, quoted: false } = &parts[0] else {
+    let WordPart::Literal {
+        text,
+        quoted: false,
+    } = &parts[0]
+    else {
         return None;
     };
     match text.as_str() {
@@ -66,9 +72,7 @@ fn keyword_of(token: &TokenKind) -> Option<Keyword> {
 /// returns the structured `Assignment`. The value is moved (not cloned)
 /// from the input parts. Otherwise returns `Err(word)` handing the
 /// original back unchanged.
-pub fn try_split_assignment(
-    word: crate::lexer::Word,
-) -> Result<Assignment, crate::lexer::Word> {
+pub fn try_split_assignment(word: crate::lexer::Word) -> Result<Assignment, crate::lexer::Word> {
     use crate::lexer::WordPart;
     // 1. AssignPrefix-led: the lexer has already parsed the target.
     if matches!(word.0.first(), Some(WordPart::AssignPrefix { .. })) {
@@ -126,7 +130,10 @@ pub fn try_split_assignment(
     };
     let (name, rest_of_first) = (text[..eq].to_string(), text[eq + 1..].to_string());
     let mut value_parts: Vec<WordPart> = Vec::with_capacity(parts.len() + 1);
-    value_parts.push(WordPart::Literal { text: rest_of_first, quoted: false });
+    value_parts.push(WordPart::Literal {
+        text: rest_of_first,
+        quoted: false,
+    });
     value_parts.extend(parts);
     Ok(Assignment {
         target: AssignTarget::Bare(name),
@@ -134,7 +141,6 @@ pub fn try_split_assignment(
         append: false,
     })
 }
-
 
 /// Returns `true` if `w` looks like an assignment word without
 /// consuming or cloning it. Mirrors the shape check in `try_split_assignment`
@@ -147,10 +153,15 @@ pub fn is_assignment_word(w: &crate::lexer::Word) -> bool {
         return true;
     }
     let text = match w.0.first() {
-        Some(WordPart::Literal { text, quoted: false }) => text,
+        Some(WordPart::Literal {
+            text,
+            quoted: false,
+        }) => text,
         _ => return false,
     };
-    let Some(eq) = text.find('=') else { return false };
+    let Some(eq) = text.find('=') else {
+        return false;
+    };
     let name_slice = &text[..eq];
     if name_slice.is_empty() {
         return false;
@@ -164,9 +175,11 @@ pub fn is_assignment_word(w: &crate::lexer::Word) -> bool {
 /// Constructs a single-part unquoted literal `Word` from a static string.
 /// Used by the parser to synthesize the "1" source-word in `&>` / `&>>` desugaring.
 pub(crate) fn lit_word(s: &str) -> Word {
-    Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
+    Word(vec![WordPart::Literal {
+        text: s.to_string(),
+        quoted: false,
+    }])
 }
-
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Redirect {
@@ -182,7 +195,11 @@ pub enum Redirect {
     /// `expand` is false for `<<'DELIM'` (any quoted part of the delim
     /// word triggers literal mode). `strip_tabs` is true for `<<-`.
     /// The body has tabs already stripped at lex time for `<<-`.
-    Heredoc { body: Word, expand: bool, strip_tabs: bool },
+    Heredoc {
+        body: Word,
+        expand: bool,
+        strip_tabs: bool,
+    },
     /// `<<<word` — here-string: the body is a single Word to be expanded
     /// (no split/glob) with a trailing newline appended.
     HereString(Word),
@@ -212,22 +229,32 @@ pub enum RedirFd {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum FileMode {
-    ReadOnly,   // <     default fd 0
-    Truncate,   // >     default fd 1
-    Append,     // >>    default fd 1
-    Clobber,    // >|    default fd 1
-    ReadWrite,  // <>    default fd 0
+    ReadOnly,  // <     default fd 0
+    Truncate,  // >     default fd 1
+    Append,    // >>    default fd 1
+    Clobber,   // >|    default fd 1
+    ReadWrite, // <>    default fd 0
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum RedirOp {
-    File { mode: FileMode, target: Word },
+    File {
+        mode: FileMode,
+        target: Word,
+    },
     /// `>&w` (output=true) / `<&w` (output=false). `source` is an fd-number
     /// word; a `-` source is normalized to `Close` by the parser.
-    Dup { source: Word, output: bool },
+    Dup {
+        source: Word,
+        output: bool,
+    },
     /// `N>&-` / `N<&-`.
     Close,
-    Heredoc { body: Word, expand: bool, strip_tabs: bool },
+    Heredoc {
+        body: Word,
+        expand: bool,
+        strip_tabs: bool,
+    },
     HereString(Word),
 }
 
@@ -235,7 +262,10 @@ impl RedirOp {
     /// The fd this op targets when `RedirFd::Default` (no explicit prefix).
     pub fn default_fd(&self) -> u16 {
         match self {
-            RedirOp::File { mode: FileMode::ReadOnly | FileMode::ReadWrite, .. } => 0,
+            RedirOp::File {
+                mode: FileMode::ReadOnly | FileMode::ReadWrite,
+                ..
+            } => 0,
             RedirOp::File { .. } => 1,
             RedirOp::Dup { output: true, .. } => 1,
             RedirOp::Dup { output: false, .. } => 0,
@@ -273,19 +303,50 @@ impl Redirection {
 /// stages, and an fd>2 heredoc on a pipeline-stage external is dropped. The
 /// single-command builtin and external paths do NOT use this helper anymore —
 /// they apply `cmd.redirects` in source order (so L-08 is fixed there).
-pub fn slots_for_simple_path(redirs: &[Redirection]) -> (Option<Redirect>, Option<Redirect>, Option<Redirect>) {
+pub fn slots_for_simple_path(
+    redirs: &[Redirection],
+) -> (Option<Redirect>, Option<Redirect>, Option<Redirect>) {
     let (mut sin, mut sout, mut serr) = (None, None, None);
     for r in redirs {
         let Some(fd) = r.target_fd() else { continue };
         let legacy = match &r.op {
-            RedirOp::File { mode: FileMode::ReadOnly, target } => Some(Redirect::Read(target.clone())),
-            RedirOp::File { mode: FileMode::Truncate, target } => Some(Redirect::Truncate(target.clone())),
-            RedirOp::File { mode: FileMode::Append, target } => Some(Redirect::Append(target.clone())),
-            RedirOp::File { mode: FileMode::Clobber, target } => Some(Redirect::Clobber(target.clone())),
-            RedirOp::File { mode: FileMode::ReadWrite, .. } => None,
-            RedirOp::Dup { source, output: true } => Some(Redirect::Dup { fd: fd as i32, source: source.clone() }),
+            RedirOp::File {
+                mode: FileMode::ReadOnly,
+                target,
+            } => Some(Redirect::Read(target.clone())),
+            RedirOp::File {
+                mode: FileMode::Truncate,
+                target,
+            } => Some(Redirect::Truncate(target.clone())),
+            RedirOp::File {
+                mode: FileMode::Append,
+                target,
+            } => Some(Redirect::Append(target.clone())),
+            RedirOp::File {
+                mode: FileMode::Clobber,
+                target,
+            } => Some(Redirect::Clobber(target.clone())),
+            RedirOp::File {
+                mode: FileMode::ReadWrite,
+                ..
+            } => None,
+            RedirOp::Dup {
+                source,
+                output: true,
+            } => Some(Redirect::Dup {
+                fd: fd as i32,
+                source: source.clone(),
+            }),
             RedirOp::Dup { output: false, .. } | RedirOp::Close => None,
-            RedirOp::Heredoc { body, expand, strip_tabs } => Some(Redirect::Heredoc { body: body.clone(), expand: *expand, strip_tabs: *strip_tabs }),
+            RedirOp::Heredoc {
+                body,
+                expand,
+                strip_tabs,
+            } => Some(Redirect::Heredoc {
+                body: body.clone(),
+                expand: *expand,
+                strip_tabs: *strip_tabs,
+            }),
             RedirOp::HereString(w) => Some(Redirect::HereString(w.clone())),
         };
         // Only fill a slot when the op direction matches the fd:
@@ -296,27 +357,36 @@ pub fn slots_for_simple_path(redirs: &[Redirection]) -> (Option<Redirect>, Optio
         // become fully functional when the applier tasks are migrated.
         match fd {
             0 => {
-                if matches!(&r.op,
-                    RedirOp::File { mode: FileMode::ReadOnly, .. }
-                    | RedirOp::Heredoc { .. }
-                    | RedirOp::HereString(_))
-                {
+                if matches!(
+                    &r.op,
+                    RedirOp::File {
+                        mode: FileMode::ReadOnly,
+                        ..
+                    } | RedirOp::Heredoc { .. }
+                        | RedirOp::HereString(_)
+                ) {
                     sin = legacy;
                 }
             }
             1 => {
-                if matches!(&r.op,
-                    RedirOp::File { mode: FileMode::Truncate | FileMode::Append | FileMode::Clobber, .. }
-                    | RedirOp::Dup { output: true, .. })
-                {
+                if matches!(
+                    &r.op,
+                    RedirOp::File {
+                        mode: FileMode::Truncate | FileMode::Append | FileMode::Clobber,
+                        ..
+                    } | RedirOp::Dup { output: true, .. }
+                ) {
                     sout = legacy;
                 }
             }
             2 => {
-                if matches!(&r.op,
-                    RedirOp::File { mode: FileMode::Truncate | FileMode::Append | FileMode::Clobber, .. }
-                    | RedirOp::Dup { output: true, .. })
-                {
+                if matches!(
+                    &r.op,
+                    RedirOp::File {
+                        mode: FileMode::Truncate | FileMode::Append | FileMode::Clobber,
+                        ..
+                    } | RedirOp::Dup { output: true, .. }
+                ) {
                     serr = legacy;
                 }
             }
@@ -398,7 +468,10 @@ impl ExecCommand {
     /// InProcess (fork-subshell) path, which is always correct.
     pub fn program_static_text(&self) -> Option<String> {
         if self.program.0.len() == 1
-            && let WordPart::Literal { text, quoted: false } = &self.program.0[0]
+            && let WordPart::Literal {
+                text,
+                quoted: false,
+            } = &self.program.0[0]
         {
             return Some(text.clone());
         }
@@ -457,30 +530,30 @@ pub enum Connector {
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum TestUnaryOp {
-    FileExists,      // -e
-    IsRegFile,       // -f
-    IsDir,           // -d
-    IsReadable,      // -r
-    IsWritable,      // -w
-    IsExecutable,    // -x
-    IsNonEmpty,      // -s (non-empty file)
-    IsSymlink,       // -L
-    StringNonEmpty,  // -n
-    StringEmpty,     // -z
-    VarSet,          // -v  (variable is set)
+    FileExists,     // -e
+    IsRegFile,      // -f
+    IsDir,          // -d
+    IsReadable,     // -r
+    IsWritable,     // -w
+    IsExecutable,   // -x
+    IsNonEmpty,     // -s (non-empty file)
+    IsSymlink,      // -L
+    StringNonEmpty, // -n
+    StringEmpty,    // -z
+    VarSet,         // -v  (variable is set)
     /// `[[ -o NAME ]]` — true iff the `set -o` option NAME is enabled.
-    OptEnabled,      // -o
-    IsFifo,          // -p
-    IsSocket,        // -S
-    IsBlockDev,      // -b
-    IsCharDev,       // -c
-    OwnedByEuid,     // -O
-    OwnedByEgid,     // -G
-    NewerThanRead,   // -N
-    IsSticky,        // -k
-    IsSetuid,        // -u
-    IsSetgid,        // -g
-    IsTerminal,      // -t
+    OptEnabled, // -o
+    IsFifo,         // -p
+    IsSocket,       // -S
+    IsBlockDev,     // -b
+    IsCharDev,      // -c
+    OwnedByEuid,    // -O
+    OwnedByEgid,    // -G
+    NewerThanRead,  // -N
+    IsSticky,       // -k
+    IsSetuid,       // -u
+    IsSetgid,       // -g
+    IsTerminal,     // -t
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -502,12 +575,22 @@ pub enum TestBinaryOp {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum TestExpr {
-    Unary  { op: TestUnaryOp,  operand: Word },
-    Binary { op: TestBinaryOp, lhs: Word, rhs: Word },
-    Regex  { lhs: Word, pattern: Word },
+    Unary {
+        op: TestUnaryOp,
+        operand: Word,
+    },
+    Binary {
+        op: TestBinaryOp,
+        lhs: Word,
+        rhs: Word,
+    },
+    Regex {
+        lhs: Word,
+        pattern: Word,
+    },
     Not(Box<TestExpr>),
     And(Box<TestExpr>, Box<TestExpr>),
-    Or(Box<TestExpr>,  Box<TestExpr>),
+    Or(Box<TestExpr>, Box<TestExpr>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -520,8 +603,13 @@ pub enum Command {
     For(Box<ForClause>),
     Case(Box<CaseClause>),
     BraceGroup(Box<Sequence>),
-    Subshell { body: Box<Sequence> }, // NEW (v28): `(list)` subshell
-    FunctionDef { name: String, body: Box<Command> },
+    Subshell {
+        body: Box<Sequence>,
+    }, // NEW (v28): `(list)` subshell
+    FunctionDef {
+        name: String,
+        body: Box<Command>,
+    },
     /// NEW (v30): `[[ … ]]` extended test.
     /// `inline_assignments` holds any `NAME=value` prefixes (e.g. `FOO=hi [[ … ]]`).
     DoubleBracket {
@@ -545,7 +633,10 @@ pub enum Command {
     /// `coproc [NAME] command` (v157). `name` is "COPROC" when anonymous. The
     /// body runs asynchronously with its stdin/stdout wired to two pipes the
     /// shell holds as NAME[0] (read) / NAME[1] (write).
-    Coproc { name: String, body: Box<Command> },
+    Coproc {
+        name: String,
+        body: Box<Command>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -651,12 +742,12 @@ pub enum ParseError {
     FunctionName,
     FunctionBody,
     UnterminatedFunction,
-    EmptySubshell,              // NEW (v28): `()` — empty subshell body
-    UnterminatedSubshell,       // NEW (v28): `(cmd` with no closing `)`
-    EmptyDoubleBracket,         // NEW (v30): `[[ ]]` — no expression
-    UnterminatedDoubleBracket,  // NEW (v30): `[[ x == y` — missing `]]`
-    TestExprBadOperator(String),// NEW (v30): unrecognised operator inside `[[ ]]`
-    TestExprMissingOperand,     // NEW (v30): e.g. `[[ -f ]]` or `[[ x == ]]`
+    EmptySubshell,               // NEW (v28): `()` — empty subshell body
+    UnterminatedSubshell,        // NEW (v28): `(cmd` with no closing `)`
+    EmptyDoubleBracket,          // NEW (v30): `[[ ]]` — no expression
+    UnterminatedDoubleBracket,   // NEW (v30): `[[ x == y` — missing `]]`
+    TestExprBadOperator(String), // NEW (v30): unrecognised operator inside `[[ ]]`
+    TestExprMissingOperand,      // NEW (v30): e.g. `[[ -f ]]` or `[[ x == ]]`
     /// NEW (v78): `crate::arith::parse` failed on the body of a `((...))`
     /// block or a for-loop header section. Carries the inner error message.
     ArithBlock(String),
@@ -687,14 +778,6 @@ impl From<crate::lexer::LexError> for ParseError {
     }
 }
 
-
-
-
-
-
-
-
-
 /// True if `body` is one of the compound-command shapes that's
 /// allowed as a function body in both POSIX `name() body` form and
 /// the bash `function NAME body` form.
@@ -722,14 +805,6 @@ pub(crate) fn is_function_body_shape(body: &Command) -> bool {
     )
 }
 
-
-
-
-
-
-
-
-
 /// Returns the function name if `word` is a single, unquoted, non-empty
 /// `Literal` that is not a reserved keyword. Unlike `valid_identifier_text`, this
 /// does NOT restrict the character set: bash accepts almost any single word as a
@@ -741,7 +816,11 @@ pub(crate) fn valid_function_name_text(word: &Word) -> Option<String> {
     if word.0.len() != 1 {
         return None;
     }
-    let WordPart::Literal { text, quoted: false } = &word.0[0] else {
+    let WordPart::Literal {
+        text,
+        quoted: false,
+    } = &word.0[0]
+    else {
         return None;
     };
     if text.is_empty() {
@@ -756,16 +835,6 @@ pub(crate) fn valid_function_name_text(word: &Word) -> Option<String> {
     }
     Some(text.clone())
 }
-
-
-
-
-
-
-
-
-
-
 
 /// True if `tok` is the first token of a compound command
 /// (`{`, `(`, if/while/until/for/case/select, `[[`, `((`).
@@ -787,12 +856,6 @@ pub(crate) fn is_compound_opener(tok: Option<&TokenKind>) -> bool {
         None => false,
     }
 }
-
-
-
-
-
-
 
 /// True for the operators that introduce a redirection (and thus a trailing
 /// target word). Excludes pipeline/grouping operators (`|`, `(`, `)`, etc.).
@@ -835,35 +898,59 @@ pub(crate) fn build_redirections(
     match op {
         Operator::RedirIn => vec![Redirection {
             fd: plain_fd(),
-            op: RedirOp::File { mode: FileMode::ReadOnly, target },
+            op: RedirOp::File {
+                mode: FileMode::ReadOnly,
+                target,
+            },
         }],
         Operator::RedirOut => vec![Redirection {
             fd: plain_fd(),
-            op: RedirOp::File { mode: FileMode::Truncate, target },
+            op: RedirOp::File {
+                mode: FileMode::Truncate,
+                target,
+            },
         }],
         Operator::RedirAppend => vec![Redirection {
             fd: plain_fd(),
-            op: RedirOp::File { mode: FileMode::Append, target },
+            op: RedirOp::File {
+                mode: FileMode::Append,
+                target,
+            },
         }],
         Operator::RedirClobber => vec![Redirection {
             fd: plain_fd(),
-            op: RedirOp::File { mode: FileMode::Clobber, target },
+            op: RedirOp::File {
+                mode: FileMode::Clobber,
+                target,
+            },
         }],
         Operator::RedirReadWrite => vec![Redirection {
             fd: plain_fd(),
-            op: RedirOp::File { mode: FileMode::ReadWrite, target },
+            op: RedirOp::File {
+                mode: FileMode::ReadWrite,
+                target,
+            },
         }],
         Operator::RedirErr => vec![Redirection {
             fd: err_fd(),
-            op: RedirOp::File { mode: FileMode::Truncate, target },
+            op: RedirOp::File {
+                mode: FileMode::Truncate,
+                target,
+            },
         }],
         Operator::RedirErrAppend => vec![Redirection {
             fd: err_fd(),
-            op: RedirOp::File { mode: FileMode::Append, target },
+            op: RedirOp::File {
+                mode: FileMode::Append,
+                target,
+            },
         }],
         Operator::RedirErrClobber => vec![Redirection {
             fd: err_fd(),
-            op: RedirOp::File { mode: FileMode::Clobber, target },
+            op: RedirOp::File {
+                mode: FileMode::Clobber,
+                target,
+            },
         }],
         Operator::HereString => vec![Redirection {
             fd: plain_fd(),
@@ -904,21 +991,33 @@ pub(crate) fn build_redirections(
         Operator::AndRedirOut => vec![
             Redirection {
                 fd: plain_fd(),
-                op: RedirOp::File { mode: FileMode::Truncate, target },
+                op: RedirOp::File {
+                    mode: FileMode::Truncate,
+                    target,
+                },
             },
             Redirection {
                 fd: RedirFd::Number(2),
-                op: RedirOp::Dup { source: lit_word("1"), output: true },
+                op: RedirOp::Dup {
+                    source: lit_word("1"),
+                    output: true,
+                },
             },
         ],
         Operator::AndRedirAppend => vec![
             Redirection {
                 fd: plain_fd(),
-                op: RedirOp::File { mode: FileMode::Append, target },
+                op: RedirOp::File {
+                    mode: FileMode::Append,
+                    target,
+                },
             },
             Redirection {
                 fd: RedirFd::Number(2),
-                op: RedirOp::Dup { source: lit_word("1"), output: true },
+                op: RedirOp::Dup {
+                    source: lit_word("1"),
+                    output: true,
+                },
             },
         ],
         // is_redirect_op gates the callers; no other operator reaches here.
@@ -946,17 +1045,9 @@ pub(crate) fn next_is_redirect(iter: &mut Lexer) -> Result<bool, ParseError> {
     })
 }
 
-
-
-
-
-
-
 // ──────────────────────────────────────────────────────────────
 // [[ ]] extended test — Pratt-style parser (v30)
 // ──────────────────────────────────────────────────────────────
-
-
 
 /// Skips zero or more `TokenKind::Newline` tokens inside a `[[ … ]]` expression.
 /// Bash treats newlines as whitespace anywhere inside `[[ ]]`.
@@ -974,7 +1065,10 @@ pub fn word_literal_text(w: &Word) -> Option<&str> {
         return None;
     }
     match &w.0[0] {
-        WordPart::Literal { text, quoted: false } => Some(text.as_str()),
+        WordPart::Literal {
+            text,
+            quoted: false,
+        } => Some(text.as_str()),
         _ => None,
     }
 }
@@ -1011,197 +1105,21 @@ pub(crate) fn try_unary_op(w: &Word) -> Option<TestUnaryOp> {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::lexer::WordPart;
 
-
-
     fn ww(s: &str) -> Word {
-        Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
+        Word(vec![WordPart::Literal {
+            text: s.to_string(),
+            quoted: false,
+        }])
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     // --- Here-document parser tests (v24) ---
 
-
-
-
-
     // --- Pipeline compound-stage parser tests (v25 Task 2) ---
-
-
-
-
-
-
 
     #[test]
     #[ignore = "TODO(M-11): subshell syntax `(list)` not yet lexed; nested multi-stage \
@@ -1214,132 +1132,66 @@ mod tests {
 
     // --- Pipeline compound-as-FIRST-stage parser tests (v25 Task 2 fix) ---
 
-
-
-
-
-
     // ---- v27 here-string parser tests ------------------------------------------
-
-
-
-
-
 
     // ── v28 subshell parser tests ────────────────────────────────────────────
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     // ── v156: ordered redirect-list parser tests ─────────────────────────────
-
-
-
-
-
 
     // ──────────────────────────────────────────────────────────────
     // [[ ]] parser tests (v30)
     // ──────────────────────────────────────────────────────────────
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     // -----------------------------------------------------------------------
     // Regression tests: multi-assign speculative-peel iterator-drain bug
     // -----------------------------------------------------------------------
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     // ----- v78: arith block + C-style for-loop parser tests -----
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn redirop_default_fds() {
         let w = ww("f");
-        assert_eq!(RedirOp::File { mode: FileMode::ReadOnly, target: w.clone() }.default_fd(), 0);
-        assert_eq!(RedirOp::File { mode: FileMode::Truncate, target: w.clone() }.default_fd(), 1);
-        assert_eq!(RedirOp::File { mode: FileMode::ReadWrite, target: w.clone() }.default_fd(), 0);
-        assert_eq!(RedirOp::Dup { source: ww("1"), output: true }.default_fd(), 1);
-        let r = Redirection { fd: RedirFd::Number(3), op: RedirOp::Close };
+        assert_eq!(
+            RedirOp::File {
+                mode: FileMode::ReadOnly,
+                target: w.clone()
+            }
+            .default_fd(),
+            0
+        );
+        assert_eq!(
+            RedirOp::File {
+                mode: FileMode::Truncate,
+                target: w.clone()
+            }
+            .default_fd(),
+            1
+        );
+        assert_eq!(
+            RedirOp::File {
+                mode: FileMode::ReadWrite,
+                target: w.clone()
+            }
+            .default_fd(),
+            0
+        );
+        assert_eq!(
+            RedirOp::Dup {
+                source: ww("1"),
+                output: true
+            }
+            .default_fd(),
+            1
+        );
+        let r = Redirection {
+            fd: RedirFd::Number(3),
+            op: RedirOp::Close,
+        };
         assert_eq!(r.target_fd(), Some(3));
-        let v = Redirection { fd: RedirFd::Var("x".into()), op: RedirOp::Close };
+        let v = Redirection {
+            fd: RedirFd::Var("x".into()),
+            op: RedirOp::Close,
+        };
         assert_eq!(v.target_fd(), None);
     }
 
@@ -1351,7 +1203,10 @@ mod tests {
         // Read-op on fd 1 (stdout): must not fill any slot.
         let r_read_on_fd1 = Redirection {
             fd: RedirFd::Number(1),
-            op: RedirOp::File { mode: FileMode::ReadOnly, target: ww("f") },
+            op: RedirOp::File {
+                mode: FileMode::ReadOnly,
+                target: ww("f"),
+            },
         };
         let (sin, sout, serr) = slots_for_simple_path(&[r_read_on_fd1]);
         assert!(sin.is_none(), "Read on fd1 must not fill stdin");
@@ -1361,7 +1216,10 @@ mod tests {
         // Truncate-op on fd 0 (stdin): must not fill any slot.
         let r_trunc_on_fd0 = Redirection {
             fd: RedirFd::Number(0),
-            op: RedirOp::File { mode: FileMode::Truncate, target: ww("f") },
+            op: RedirOp::File {
+                mode: FileMode::Truncate,
+                target: ww("f"),
+            },
         };
         let (sin, sout, serr) = slots_for_simple_path(&[r_trunc_on_fd0]);
         assert!(sin.is_none(), "Truncate on fd0 must not fill stdin");
@@ -1371,7 +1229,10 @@ mod tests {
         // Dup{output:true} on fd 0: must not fill any slot.
         let r_dup_out_on_fd0 = Redirection {
             fd: RedirFd::Number(0),
-            op: RedirOp::Dup { source: ww("1"), output: true },
+            op: RedirOp::Dup {
+                source: ww("1"),
+                output: true,
+            },
         };
         let (sin, sout, serr) = slots_for_simple_path(&[r_dup_out_on_fd0]);
         assert!(sin.is_none(), "Dup(output) on fd0 must not fill stdin");
@@ -1381,7 +1242,10 @@ mod tests {
         // Read-op on fd 2 (stderr): must not fill any slot.
         let r_read_on_fd2 = Redirection {
             fd: RedirFd::Number(2),
-            op: RedirOp::File { mode: FileMode::ReadOnly, target: ww("f") },
+            op: RedirOp::File {
+                mode: FileMode::ReadOnly,
+                target: ww("f"),
+            },
         };
         let (sin, sout, serr) = slots_for_simple_path(&[r_read_on_fd2]);
         assert!(sin.is_none(), "Read on fd2 must not fill stdin");
@@ -1391,15 +1255,24 @@ mod tests {
         // Sanity: direction-matched ops still fill slots correctly.
         let r_read_fd0 = Redirection {
             fd: RedirFd::Number(0),
-            op: RedirOp::File { mode: FileMode::ReadOnly, target: ww("f") },
+            op: RedirOp::File {
+                mode: FileMode::ReadOnly,
+                target: ww("f"),
+            },
         };
         let r_trunc_fd1 = Redirection {
             fd: RedirFd::Number(1),
-            op: RedirOp::File { mode: FileMode::Truncate, target: ww("g") },
+            op: RedirOp::File {
+                mode: FileMode::Truncate,
+                target: ww("g"),
+            },
         };
         let r_trunc_fd2 = Redirection {
             fd: RedirFd::Number(2),
-            op: RedirOp::File { mode: FileMode::Truncate, target: ww("h") },
+            op: RedirOp::File {
+                mode: FileMode::Truncate,
+                target: ww("h"),
+            },
         };
         let (sin, sout, serr) = slots_for_simple_path(&[r_read_fd0, r_trunc_fd1, r_trunc_fd2]);
         assert!(sin.is_some(), "Read on fd0 should fill stdin");
@@ -1408,12 +1281,4 @@ mod tests {
     }
 
     // ── coproc parser tests (v157 task 2) ─────────────────────────────────
-
-
-
-
-
-
-
-
 }

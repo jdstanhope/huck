@@ -49,9 +49,7 @@ pub(crate) fn assign_decl(name: &str, scope: ScopeMode, shell: &Shell) -> String
     let resolved_name = resolve_target_name(name, shell);
     match scope {
         ScopeMode::Whole => assign_decl_whole(&resolved_name, var),
-        ScopeMode::ScalarOrElement(val) => {
-            assign_decl_scalar_or_element(&resolved_name, var, &val)
-        }
+        ScopeMode::ScalarOrElement(val) => assign_decl_scalar_or_element(&resolved_name, var, &val),
     }
 }
 
@@ -71,11 +69,8 @@ fn assign_decl_whole(name: &str, var: &Variable) -> String {
 #[allow(dead_code)]
 fn assign_decl_scalar_or_element(name: &str, var: &Variable, val: &str) -> String {
     let quoted_val = always_quote(val);
-    let has_attrs = var.exported
-        || var.readonly
-        || var.integer
-        || var.case_fold.is_some()
-        || var.nameref;
+    let has_attrs =
+        var.exported || var.readonly || var.integer || var.case_fold.is_some() || var.nameref;
     match &var.value {
         VarValue::Scalar(_) => {
             if has_attrs {
@@ -371,11 +366,7 @@ mod tests {
         // nameref's own scalar value (see builtins.rs declare path).
         shell.set_nameref("ref", true);
         shell.set("ref", "target".to_string());
-        let out = assign_decl(
-            "ref",
-            ScopeMode::ScalarOrElement("hello".into()),
-            &shell,
-        );
+        let out = assign_decl("ref", ScopeMode::ScalarOrElement("hello".into()), &shell);
         assert_eq!(out, "target='hello'");
     }
 

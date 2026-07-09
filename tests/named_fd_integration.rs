@@ -19,7 +19,11 @@ fn huck_binary() -> String {
 
 /// Run `prog -c script` and return (stdout, exit_code).
 fn run_c(prog: &str, script: &str) -> (String, i32) {
-    let out = Command::new(prog).arg("-c").arg(script).output().expect("spawn");
+    let out = Command::new(prog)
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("spawn");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         out.status.code().unwrap_or(-1),
@@ -54,9 +58,8 @@ fn in_process_builtin_named_fd_persists_var() {
     // A bare in-process builtin (`:`) with `{fd}>file` still allocates the fd and
     // persists $fd >= 10 (bash leaves $fd set after a builtin command).
     let f = format!("/tmp/huck_named_b_{}", std::process::id());
-    let script = format!(
-        ": {{fd}}>{f}; if [ \"$fd\" -ge 10 ]; then echo ok; else echo bad; fi; rm -f {f}"
-    );
+    let script =
+        format!(": {{fd}}>{f}; if [ \"$fd\" -ge 10 ]; then echo ok; else echo bad; fi; rm -f {f}");
     assert_matches_bash(&script);
 }
 
@@ -93,9 +96,8 @@ fn inprocess_named_fd_stays_open_until_explicit_close() {
     // Part 1: write to `$fd` AFTER the compound command ends — the fd is still
     // live so the write succeeds and the file contains "b".
     let f1 = format!("/tmp/huck_named_life1_{}", std::process::id());
-    let script1 = format!(
-        "{{ :; }} {{fd}}>{f1}; echo b >&$fd; echo \"rc=$?\"; cat {f1}; rm -f {f1}"
-    );
+    let script1 =
+        format!("{{ :; }} {{fd}}>{f1}; echo b >&$fd; echo \"rc=$?\"; cat {f1}; rm -f {f1}");
     // Verify vs bash: same output (rc=0, file has "b").
     let (bash_out, _) = run_c("bash", &script1);
     let (huck_out, _) = run_c(&huck_binary(), &script1);
@@ -139,9 +141,7 @@ fn external_parent_var_not_modified() {
     // in the forked child, so the PARENT's $fd is untouched (a pre-set value is
     // preserved). huck matches: $fd stays 99.
     let f = format!("/tmp/huck_named_ext_{}", std::process::id());
-    let script = format!(
-        "fd=99; /bin/echo hi {{fd}}>{f} >/dev/null; echo \"fd=[$fd]\"; rm -f {f}"
-    );
+    let script = format!("fd=99; /bin/echo hi {{fd}}>{f} >/dev/null; echo \"fd=[$fd]\"; rm -f {f}");
     assert_matches_bash(&script);
 }
 

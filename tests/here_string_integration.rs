@@ -14,7 +14,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     drop(child.stdin.take());
     let output = child.wait_with_output().expect("wait");
     (
@@ -77,12 +82,13 @@ fn here_string_no_split_with_spaces() {
 #[test]
 fn here_string_last_wins_over_file() {
     let tmp = format!("/tmp/huck_v27_lastwins_{}", std::process::id());
-    let script = format!(
-        "echo wrong > {tmp}\ncat <{tmp} <<< right\nrm {tmp}\nexit\n"
-    );
+    let script = format!("echo wrong > {tmp}\ncat <{tmp} <<< right\nrm {tmp}\nexit\n");
     let (out, _) = run(&script);
     assert!(out.lines().any(|l| l.trim() == "right"), "got: {out}");
-    assert!(!out.contains("wrong"), "file content leaked through; got: {out}");
+    assert!(
+        !out.contains("wrong"),
+        "file content leaked through; got: {out}"
+    );
 }
 
 #[test]
@@ -112,9 +118,7 @@ fn here_string_backgrounded() {
     // Background a here-string redirected to a temp file; verify the
     // file contents include the body.
     let tmp = format!("/tmp/huck_v27_bg_{}", std::process::id());
-    let script = format!(
-        "cat <<< body > {tmp} &\nwait\ncat {tmp}\nrm -f {tmp}\nexit\n"
-    );
+    let script = format!("cat <<< body > {tmp} &\nwait\ncat {tmp}\nrm -f {tmp}\nexit\n");
     let (out, _) = run(&script);
     assert!(out.lines().any(|l| l.trim() == "body"), "got: {out}");
 }

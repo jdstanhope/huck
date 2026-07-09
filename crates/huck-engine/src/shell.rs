@@ -19,7 +19,11 @@ pub enum RunMode {
     Interactive,
     /// `-c COMMAND [NAME [ARG...]]`: argv0 = NAME (None → keep the shell's
     /// default $0), args = the rest.
-    Command { command: String, argv0: Option<String>, args: Vec<String> },
+    Command {
+        command: String,
+        argv0: Option<String>,
+        args: Vec<String>,
+    },
     /// `SCRIPT [ARG...]`: $0 = path, args = the rest.
     File { path: PathBuf, args: Vec<String> },
     /// `--version` / `-V`: print "huck {version}" and exit 0.
@@ -130,7 +134,13 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
         RunMode::Interactive
     };
 
-    Ok(CliOptions { rcfile_path, norc, noexec, posix, mode })
+    Ok(CliOptions {
+        rcfile_path,
+        norc,
+        noexec,
+        posix,
+        mode,
+    })
 }
 
 /// POSIX mode is enabled at startup when `--posix` was passed, the shell was
@@ -283,7 +293,16 @@ pub fn run_program(
 ) -> i32 {
     let mut sink = crate::executor::StdoutSink::Terminal;
     let mut err_sink = crate::executor::StderrSink::Terminal;
-    run_program_in_sinks(contents, argv0, args, label, push_main_frame, &mut sink, &mut err_sink, shell_cell)
+    run_program_in_sinks(
+        contents,
+        argv0,
+        args,
+        label,
+        push_main_frame,
+        &mut sink,
+        &mut err_sink,
+        shell_cell,
+    )
 }
 
 /// Installs a SIGINT handler that sets the supplied flag. Called once at
@@ -293,7 +312,12 @@ pub fn run_program(
 /// the unified emitter (`sh_error!`) rather than a raw `eprintln!`.
 pub fn install_sigint_handler(flag: Arc<AtomicBool>, shell: &Shell) {
     if let Err(e) = signal_hook::flag::register(SIGINT, flag) {
-        crate::sh_error!(shell, None, "warning: could not install SIGINT handler: {}", crate::bash_io_error(&e));
+        crate::sh_error!(
+            shell,
+            None,
+            "warning: could not install SIGINT handler: {}",
+            crate::bash_io_error(&e)
+        );
     }
 }
 
@@ -301,7 +325,12 @@ pub fn install_sigint_handler(flag: Arc<AtomicBool>, shell: &Shell) {
 /// at startup; the flag lives on the `Shell` so the reap path can poll it.
 pub fn install_sigchld_handler(flag: Arc<AtomicBool>, shell: &Shell) {
     if let Err(e) = signal_hook::flag::register(SIGCHLD, flag) {
-        crate::sh_error!(shell, None, "warning: could not install SIGCHLD handler: {}", crate::bash_io_error(&e));
+        crate::sh_error!(
+            shell,
+            None,
+            "warning: could not install SIGCHLD handler: {}",
+            crate::bash_io_error(&e)
+        );
     }
 }
 
@@ -331,7 +360,9 @@ pub fn install_job_control_signals(prog: &str) {
     // of getting EPIPE back from write(2) and looping. bash runs with SIGPIPE at
     // SIG_DFL everywhere; an interactive shell survives because its stdout is the
     // terminal, never a pipe. (v137)
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
 }
 
 /// Fires `$PROMPT_COMMAND` if set, non-empty, and the shell is
@@ -397,7 +428,11 @@ pub fn process_line_in_sinks(
     // reads tokens. For non-interactive / non-alias paths, use an empty alias map
     // so the live lexer is alias-free (byte-identical to the old token pre-pass).
     let empty = std::collections::HashMap::new();
-    let aliases = if expand_aliases { &shell.aliases } else { &empty };
+    let aliases = if expand_aliases {
+        &shell.aliases
+    } else {
+        &empty
+    };
     let mut lx = lexer::Lexer::new_live_atoms(line, aliases, opts);
     // `set +o braceexpand` / `set +B` disables `{a,b}` brace expansion.
     lx.set_brace_expand(shell.shell_options.braceexpand);
@@ -413,9 +448,16 @@ pub fn process_line_in_sinks(
             // (bash counts lines across the whole non-interactive input, which
             // huck's per-command REPL loop does not track today).
             let off = lx.cursor_pos().min(line.len());
-            let ln = 1 + line.as_bytes()[..off].iter().filter(|&&b| b == b'\n').count() as u32;
+            let ln = 1 + line.as_bytes()[..off]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count() as u32;
             crate::err_thread_local::install_err_sinks(sink, err_sink, || {
-                crate::emit_syntax_error(shell, ln, format_args!("syntax error: {}", crate::parse_error_message(&e)));
+                crate::emit_syntax_error(
+                    shell,
+                    ln,
+                    format_args!("syntax error: {}", crate::parse_error_message(&e)),
+                );
             });
             ExecOutcome::Continue(2)
         }
@@ -493,7 +535,11 @@ mod prompt_command_tests {
     }
 
     fn arr(elems: &[&str]) -> std::collections::BTreeMap<usize, String> {
-        elems.iter().enumerate().map(|(i, s)| (i, s.to_string())).collect()
+        elems
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, s.to_string()))
+            .collect()
     }
 
     #[test]
@@ -501,16 +547,25 @@ mod prompt_command_tests {
         let mut shell = interactive_shell();
         // literal element strings — NOT pre-expanded; each runs as a command later.
         shell
-            .replace_indexed("PROMPT_COMMAND", arr(&["ORDER=${ORDER}a", "ORDER=${ORDER}b"]))
+            .replace_indexed(
+                "PROMPT_COMMAND",
+                arr(&["ORDER=${ORDER}a", "ORDER=${ORDER}b"]),
+            )
             .unwrap();
         assert_eq!(fire_prompt_command(&mut shell), None);
-        assert_eq!(shell.get("ORDER"), Some("ab"), "both elements ran, in order");
+        assert_eq!(
+            shell.get("ORDER"),
+            Some("ab"),
+            "both elements ran, in order"
+        );
     }
 
     #[test]
     fn array_skips_empty_elements() {
         let mut shell = interactive_shell();
-        shell.replace_indexed("PROMPT_COMMAND", arr(&["MA=1", "", "MB=1"])).unwrap();
+        shell
+            .replace_indexed("PROMPT_COMMAND", arr(&["MA=1", "", "MB=1"]))
+            .unwrap();
         assert_eq!(fire_prompt_command(&mut shell), None);
         assert_eq!(shell.get("MA"), Some("1"));
         assert_eq!(shell.get("MB"), Some("1"));
@@ -519,7 +574,9 @@ mod prompt_command_tests {
     #[test]
     fn array_propagates_exit_and_stops() {
         let mut shell = interactive_shell();
-        shell.replace_indexed("PROMPT_COMMAND", arr(&["MA=1", "exit 7", "MB=1"])).unwrap();
+        shell
+            .replace_indexed("PROMPT_COMMAND", arr(&["MA=1", "exit 7", "MB=1"]))
+            .unwrap();
         assert_eq!(fire_prompt_command(&mut shell), Some(7));
         assert_eq!(shell.get("MA"), Some("1"), "element before exit ran");
         assert_eq!(shell.get("MB"), None, "element after exit did NOT run");
@@ -528,7 +585,9 @@ mod prompt_command_tests {
     #[test]
     fn array_last_status_reflects_last_element() {
         let mut shell = interactive_shell();
-        shell.replace_indexed("PROMPT_COMMAND", arr(&["true", "false"])).unwrap();
+        shell
+            .replace_indexed("PROMPT_COMMAND", arr(&["true", "false"]))
+            .unwrap();
         assert_eq!(fire_prompt_command(&mut shell), None);
         assert_eq!(shell.last_status(), 1, "last element (false) sets $?");
     }
@@ -565,11 +624,24 @@ mod rc_tests {
         // `-n script.sh args` → noexec + File mode.
         let o = parse_cli(&["-n".to_string(), "s.sh".to_string(), "a".to_string()]).unwrap();
         assert!(o.noexec);
-        assert_eq!(o.mode, RunMode::File { path: "s.sh".into(), args: vec!["a".into()] });
+        assert_eq!(
+            o.mode,
+            RunMode::File {
+                path: "s.sh".into(),
+                args: vec!["a".into()]
+            }
+        );
         // `-n -c 'echo'` → noexec + Command mode.
         let o = parse_cli(&["-n".to_string(), "-c".to_string(), "echo hi".to_string()]).unwrap();
         assert!(o.noexec);
-        assert_eq!(o.mode, RunMode::Command { command: "echo hi".into(), argv0: None, args: vec![] });
+        assert_eq!(
+            o.mode,
+            RunMode::Command {
+                command: "echo hi".into(),
+                argv0: None,
+                args: vec![]
+            }
+        );
         // default: no -n → noexec false.
         let o = parse_cli(&["-c".to_string(), "echo".to_string()]).unwrap();
         assert!(!o.noexec);
@@ -579,7 +651,13 @@ mod rc_tests {
     fn parse_cli_posix_flag() {
         let o = parse_cli(&["--posix".into(), "script.sh".into()]).unwrap();
         assert!(o.posix);
-        assert_eq!(o.mode, RunMode::File { path: PathBuf::from("script.sh"), args: vec![] });
+        assert_eq!(
+            o.mode,
+            RunMode::File {
+                path: PathBuf::from("script.sh"),
+                args: vec![]
+            }
+        );
     }
 
     #[test]
@@ -593,17 +671,20 @@ mod rc_tests {
         assert!(startup_posix(true, "/usr/bin/huck", false), "--posix");
         assert!(startup_posix(false, "/bin/sh", false), "invoked as sh");
         assert!(startup_posix(false, "sh", false), "argv0 bare sh");
-        assert!(startup_posix(false, "/usr/bin/huck", true), "POSIXLY_CORRECT");
+        assert!(
+            startup_posix(false, "/usr/bin/huck", true),
+            "POSIXLY_CORRECT"
+        );
         assert!(!startup_posix(false, "/usr/bin/huck", false), "none → off");
-        assert!(!startup_posix(false, "/usr/bin/bash", false), "bash basename → off");
+        assert!(
+            !startup_posix(false, "/usr/bin/bash", false),
+            "bash basename → off"
+        );
     }
 
     #[test]
     fn parse_cli_rcfile_separate() {
-        let opts = parse_cli(&[
-            "--rcfile".to_string(),
-            "/x".to_string(),
-        ]).unwrap();
+        let opts = parse_cli(&["--rcfile".to_string(), "/x".to_string()]).unwrap();
         assert_eq!(opts.rcfile_path, Some(std::path::PathBuf::from("/x")));
         assert!(!opts.norc);
     }
@@ -636,23 +717,39 @@ mod rc_tests {
     #[test]
     fn cli_file_mode_sets_path_and_args() {
         let o = parse_cli(&["s.sh".into(), "a".into(), "b".into()]).unwrap();
-        assert_eq!(o.mode, RunMode::File { path: "s.sh".into(), args: vec!["a".into(), "b".into()] });
+        assert_eq!(
+            o.mode,
+            RunMode::File {
+                path: "s.sh".into(),
+                args: vec!["a".into(), "b".into()]
+            }
+        );
     }
 
     #[test]
     fn cli_dash_c_first_operand_is_argv0() {
         let o = parse_cli(&["-c".into(), "echo hi".into(), "name".into(), "x".into()]).unwrap();
-        assert_eq!(o.mode, RunMode::Command {
-            command: "echo hi".into(),
-            argv0: Some("name".into()),
-            args: vec!["x".into()],
-        });
+        assert_eq!(
+            o.mode,
+            RunMode::Command {
+                command: "echo hi".into(),
+                argv0: Some("name".into()),
+                args: vec!["x".into()],
+            }
+        );
     }
 
     #[test]
     fn cli_dash_c_no_operands_argv0_none() {
         let o = parse_cli(&["-c".into(), "echo hi".into()]).unwrap();
-        assert_eq!(o.mode, RunMode::Command { command: "echo hi".into(), argv0: None, args: vec![] });
+        assert_eq!(
+            o.mode,
+            RunMode::Command {
+                command: "echo hi".into(),
+                argv0: None,
+                args: vec![]
+            }
+        );
     }
 
     #[test]
@@ -664,16 +761,27 @@ mod rc_tests {
     fn cli_double_dash_ends_options_for_file() {
         // `--` lets a dash-leading name be the script path.
         let o = parse_cli(&["--".into(), "-weird".into(), "a".into()]).unwrap();
-        assert_eq!(o.mode, RunMode::File { path: "-weird".into(), args: vec!["a".into()] });
+        assert_eq!(
+            o.mode,
+            RunMode::File {
+                path: "-weird".into(),
+                args: vec!["a".into()]
+            }
+        );
     }
 
     #[test]
     fn cli_operands_after_c_are_verbatim_including_dashdash() {
         // After `-c CMD`, operands are taken verbatim: `--` becomes $0, `-x` becomes $1.
         let o = parse_cli(&["-c".into(), "cmd".into(), "--".into(), "-x".into()]).unwrap();
-        assert_eq!(o.mode, RunMode::Command {
-            command: "cmd".into(), argv0: Some("--".into()), args: vec!["-x".into()],
-        });
+        assert_eq!(
+            o.mode,
+            RunMode::Command {
+                command: "cmd".into(),
+                argv0: Some("--".into()),
+                args: vec!["-x".into()],
+            }
+        );
     }
 
     #[test]
@@ -685,14 +793,27 @@ mod rc_tests {
     fn cli_dash_c_precedence_over_file() {
         // `-c` wins; the operand is $0, not a script path.
         let o = parse_cli(&["-c".into(), "cmd".into(), "file.sh".into()]).unwrap();
-        assert_eq!(o.mode, RunMode::Command { command: "cmd".into(), argv0: Some("file.sh".into()), args: vec![] });
+        assert_eq!(
+            o.mode,
+            RunMode::Command {
+                command: "cmd".into(),
+                argv0: Some("file.sh".into()),
+                args: vec![]
+            }
+        );
     }
 
     #[test]
     fn cli_norc_then_file_still_parses() {
         let o = parse_cli(&["--norc".into(), "s.sh".into()]).unwrap();
         assert!(o.norc);
-        assert_eq!(o.mode, RunMode::File { path: "s.sh".into(), args: vec![] });
+        assert_eq!(
+            o.mode,
+            RunMode::File {
+                path: "s.sh".into(),
+                args: vec![]
+            }
+        );
     }
 
     #[test]
@@ -836,8 +957,12 @@ mod rc_tests {
         }
         let result = maybe_source_rc_file(&mut shell, &opts);
         unsafe {
-            if let Some(h) = saved_home { std::env::set_var("HOME", h); }
-            if let Some(r) = saved_huck_rc { std::env::set_var("HUCK_RC", r); }
+            if let Some(h) = saved_home {
+                std::env::set_var("HOME", h);
+            }
+            if let Some(r) = saved_huck_rc {
+                std::env::set_var("HUCK_RC", r);
+            }
         }
         assert_eq!(result, None);
     }

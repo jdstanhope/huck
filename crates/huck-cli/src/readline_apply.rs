@@ -161,12 +161,30 @@ mod tests {
     #[test]
     fn parse_keyseq_produces_correct_events() {
         use rustyline::{KeyCode, KeyEvent, Modifiers};
-        assert_eq!(parse_keyseq("\\C-w"), Some(KeyEvent(KeyCode::Char('W'), Modifiers::CTRL).into()));
-        assert_eq!(parse_keyseq("\\C-i"), Some(KeyEvent(KeyCode::Tab, Modifiers::NONE).into()));
-        assert_eq!(parse_keyseq("\\C-m"), Some(KeyEvent(KeyCode::Enter, Modifiers::NONE).into()));
-        assert_eq!(parse_keyseq("\\C-h"), Some(KeyEvent(KeyCode::Backspace, Modifiers::NONE).into()));
-        assert_eq!(parse_keyseq("\\e[A"), Some(KeyEvent(KeyCode::Up, Modifiers::NONE).into()));
-        assert_eq!(parse_keyseq("\\M-f"), Some(KeyEvent(KeyCode::Char('f'), Modifiers::ALT).into()));
+        assert_eq!(
+            parse_keyseq("\\C-w"),
+            Some(KeyEvent(KeyCode::Char('W'), Modifiers::CTRL).into())
+        );
+        assert_eq!(
+            parse_keyseq("\\C-i"),
+            Some(KeyEvent(KeyCode::Tab, Modifiers::NONE).into())
+        );
+        assert_eq!(
+            parse_keyseq("\\C-m"),
+            Some(KeyEvent(KeyCode::Enter, Modifiers::NONE).into())
+        );
+        assert_eq!(
+            parse_keyseq("\\C-h"),
+            Some(KeyEvent(KeyCode::Backspace, Modifiers::NONE).into())
+        );
+        assert_eq!(
+            parse_keyseq("\\e[A"),
+            Some(KeyEvent(KeyCode::Up, Modifiers::NONE).into())
+        );
+        assert_eq!(
+            parse_keyseq("\\M-f"),
+            Some(KeyEvent(KeyCode::Char('f'), Modifiers::ALT).into())
+        );
     }
 
     #[test]
@@ -175,10 +193,32 @@ mod tests {
         // must agree with the cli's real `parse_keyseq` on accept/reject for
         // every input — they are hand-kept in sync across the crate split.
         let cases = [
-            "\\C-a", "\\M-f", "\\e[A", "\\C-", "", "a", "\\x41", "\\x4",
-            "\\101", "\\C-\\M-a", "\"\\C-a\"", "\\e", "\\t", "\\r", "\\n",
-            "\\b", "\\C-i", "\\C-m", "\\C-h", "\\x7f", "\\xZZ", "abc",
-            "\\C-x", "\\M-\\C-a", "\\0", "\\377",
+            "\\C-a",
+            "\\M-f",
+            "\\e[A",
+            "\\C-",
+            "",
+            "a",
+            "\\x41",
+            "\\x4",
+            "\\101",
+            "\\C-\\M-a",
+            "\"\\C-a\"",
+            "\\e",
+            "\\t",
+            "\\r",
+            "\\n",
+            "\\b",
+            "\\C-i",
+            "\\C-m",
+            "\\C-h",
+            "\\x7f",
+            "\\xZZ",
+            "abc",
+            "\\C-x",
+            "\\M-\\C-a",
+            "\\0",
+            "\\377",
         ];
         for s in cases {
             assert_eq!(

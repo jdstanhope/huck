@@ -15,7 +15,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -68,8 +73,7 @@ fn inline_assignment_unset_before_restores_to_unset() {
 fn inline_assignment_set_unexported_before_keeps_unexported_after() {
     // FOO=outer is a plain assignment (not exported). After FOO=inner true,
     // FOO reverts to its prior unexported state — env should not include it.
-    let (out, _) =
-        run("FOO=outer\nFOO=inner true\nenv | grep ^FOO= || echo not-exported\nexit\n");
+    let (out, _) = run("FOO=outer\nFOO=inner true\nenv | grep ^FOO= || echo not-exported\nexit\n");
     assert!(out.contains("not-exported"), "got: {out}");
 }
 
@@ -177,9 +181,7 @@ fn inline_assignment_backgrounded_external_command_sees_var() {
     // We capture the child's env to a temp file (via shell redirection) since
     // backgrounded stdout doesn't round-trip cleanly through the test harness.
     let tmp = format!("/tmp/huck_bg_inline_test_{}", std::process::id());
-    let script = format!(
-        "FOO=hi env > {tmp} &\nwait\ncat {tmp} | grep ^FOO=\nrm -f {tmp}\nexit\n"
-    );
+    let script = format!("FOO=hi env > {tmp} &\nwait\ncat {tmp} | grep ^FOO=\nrm -f {tmp}\nexit\n");
     let (out, _) = run(&script);
     assert!(out.contains("FOO=hi"), "got: {out}");
 }
@@ -195,7 +197,10 @@ fn multi_assign_with_trailing_semi_command_runs_both() {
     // sub-iter, and tokens after the `;` in the sub-iter were dropped when
     // parse_pipeline_with_first returned.
     let (out, _) = run("A=1 B=2 echo first; echo second\nexit\n");
-    let lines: Vec<&str> = out.lines().filter(|l| *l == "first" || *l == "second").collect();
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| *l == "first" || *l == "second")
+        .collect();
     assert_eq!(lines, vec!["first", "second"], "got: {out}");
 }
 

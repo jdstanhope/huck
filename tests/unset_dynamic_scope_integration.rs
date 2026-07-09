@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 fn run(script: &str) -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -14,7 +16,11 @@ fn run(script: &str) -> String {
         let mut f = std::fs::File::create(&path).expect("create temp script");
         f.write_all(script.as_bytes()).unwrap();
     }
-    let out = Command::new(huck_bin()).arg(&path).stdin(Stdio::null()).output().expect("spawn huck");
+    let out = Command::new(huck_bin())
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn huck");
     let _ = std::fs::remove_file(&path);
     String::from_utf8_lossy(&out.stdout).into_owned()
 }

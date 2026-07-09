@@ -5,7 +5,9 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 /// Returns (stdout, stderr, exit_code).
 fn run(script: &str) -> (String, String, i32) {
@@ -36,7 +38,10 @@ fn subshell_pipeline_output_unchanged() {
 
 #[test]
 fn subshell_multistage_pipeline_output() {
-    assert_eq!(run("( printf 'a\\nb\\nc\\n' | head -n 2 | tail -n 1 )\n").0, "b\n");
+    assert_eq!(
+        run("( printf 'a\\nb\\nc\\n' | head -n 2 | tail -n 1 )\n").0,
+        "b\n"
+    );
 }
 
 #[test]

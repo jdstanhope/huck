@@ -40,7 +40,7 @@ use std::cell::Cell;
 use std::io::Write;
 use std::ptr::NonNull;
 
-use crate::executor::{err_writer, StderrSink, StdoutSink};
+use crate::executor::{StderrSink, StdoutSink, err_writer};
 
 // The thread-local stores `'static`-lifetimed NonNulls. The `'static` is a lie —
 // see `install_err_sinks` and the safety comment for why this is sound
@@ -115,31 +115,24 @@ pub unsafe fn install_err_sinks_raw(
     // Erase the borrows' lifetimes to `'static` so they can sit in
     // thread-locals. The guard's `Drop` restores the prior pointers.
     let out_raw: StdoutPtr = unsafe {
-        std::mem::transmute::<NonNull<StdoutSink<'_>>, NonNull<StdoutSink<'static>>>(
-            NonNull::from(sink),
-        )
+        std::mem::transmute::<NonNull<StdoutSink<'_>>, NonNull<StdoutSink<'static>>>(NonNull::from(
+            sink,
+        ))
     };
     let err_raw: StderrPtr = unsafe {
-        std::mem::transmute::<NonNull<StderrSink<'_>>, NonNull<StderrSink<'static>>>(
-            NonNull::from(err_sink),
-        )
+        std::mem::transmute::<NonNull<StderrSink<'_>>, NonNull<StderrSink<'static>>>(NonNull::from(
+            err_sink,
+        ))
     };
     let prev_out = OUT_SINK_PTR.with(|c| c.replace(Some(out_raw)));
     let prev_err = ERR_SINK_PTR.with(|c| c.replace(Some(err_raw)));
-    ErrSinkGuard {
-        prev_out,
-        prev_err,
-    }
+    ErrSinkGuard { prev_out, prev_err }
 }
 
 /// Convenience closure-style wrapper around [`install_err_sinks_raw`] for
 /// callers that want a scoped install without managing the guard explicitly.
 /// Mostly used by tests.
-pub fn install_err_sinks<F, R>(
-    sink: &mut StdoutSink<'_>,
-    err_sink: &mut StderrSink<'_>,
-    f: F,
-) -> R
+pub fn install_err_sinks<F, R>(sink: &mut StdoutSink<'_>, err_sink: &mut StderrSink<'_>, f: F) -> R
 where
     F: FnOnce() -> R,
 {
@@ -183,8 +176,8 @@ mod tests {
             let mut err_sink = StderrSink::Capture(&mut buf);
             install_err_sinks(&mut sink, &mut err_sink, || {});
         }
-        let still_installed = ERR_SINK_PTR.with(|c| c.get().is_some())
-            || OUT_SINK_PTR.with(|c| c.get().is_some());
+        let still_installed =
+            ERR_SINK_PTR.with(|c| c.get().is_some()) || OUT_SINK_PTR.with(|c| c.get().is_some());
         assert!(!still_installed);
     }
 
@@ -214,8 +207,8 @@ mod tests {
             });
         }));
         assert!(result.is_err());
-        let still_installed = ERR_SINK_PTR.with(|c| c.get().is_some())
-            || OUT_SINK_PTR.with(|c| c.get().is_some());
+        let still_installed =
+            ERR_SINK_PTR.with(|c| c.get().is_some()) || OUT_SINK_PTR.with(|c| c.get().is_some());
         assert!(!still_installed);
     }
 }

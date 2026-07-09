@@ -9,8 +9,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn run_huck_frag(frag: &str) -> (String, String, i32) {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir()
-        .join(format!("huck_v123_{}_{}.sh", std::process::id(), n));
+    let path = std::env::temp_dir().join(format!("huck_v123_{}_{}.sh", std::process::id(), n));
     {
         let mut f = std::fs::File::create(&path).expect("create temp script");
         f.write_all(frag.as_bytes()).expect("write temp script");
@@ -36,7 +35,10 @@ fn blocked_overwrite_keeps_file_and_errors() {
         r#"d=$(mktemp -d); echo orig > "$d/f"; set -C; echo new > "$d/f"; echo "c=$(cat "$d/f")""#,
     );
     assert!(out.contains("c=orig"), "file must be untouched: {out}");
-    assert!(err.contains("cannot overwrite existing file"), "stderr: {err}");
+    assert!(
+        err.contains("cannot overwrite existing file"),
+        "stderr: {err}"
+    );
 }
 
 #[test]
@@ -51,14 +53,16 @@ fn force_clobber_overwrites() {
 fn devnull_exempt_under_noclobber() {
     let (out, _e, code) = run_huck_frag(r#"set -C; echo x > /dev/null; echo done"#);
     assert_eq!(code, 0);
-    assert!(out.contains("done"), "command after /dev/null redirect must run: {out}");
+    assert!(
+        out.contains("done"),
+        "command after /dev/null redirect must run: {out}"
+    );
 }
 
 #[test]
 fn blocked_redirect_command_exit_status_is_1() {
-    let (_o, _e, code) = run_huck_frag(
-        r#"d=$(mktemp -d); echo orig > "$d/f"; set -C; echo new > "$d/f""#,
-    );
+    let (_o, _e, code) =
+        run_huck_frag(r#"d=$(mktemp -d); echo orig > "$d/f"; set -C; echo new > "$d/f""#);
     assert_eq!(code, 1, "a redirect-blocked command exits 1");
 }
 
@@ -67,5 +71,8 @@ fn pipeline_stage_force_clobber() {
     let (out, _e, _c) = run_huck_frag(
         r#"d=$(mktemp -d); echo orig > "$d/f"; set -C; echo hi | cat >| "$d/f"; cat "$d/f""#,
     );
-    assert!(out.contains("hi"), "pipeline-stage >| must force-overwrite: {out}");
+    assert!(
+        out.contains("hi"),
+        "pipeline-stage >| must force-overwrite: {out}"
+    );
 }

@@ -18,8 +18,8 @@
 use std::process::Command;
 use std::time::Duration;
 
-use expectrl::session::OsSession;
 use expectrl::Expect;
+use expectrl::session::OsSession;
 
 fn spawn() -> Option<OsSession> {
     let cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
@@ -68,5 +68,8 @@ fn bind_rebinds_ctrl_o_to_accept_line() {
     let _ = session.send("exit\r");
     drop(session);
 
-    assert!(accepted, "Ctrl-O rebound to accept-line did not submit the line");
+    assert!(
+        accepted,
+        "Ctrl-O rebound to accept-line did not submit the line"
+    );
 }

@@ -7,8 +7,8 @@
 use std::process::Command;
 use std::time::Duration;
 
-use expectrl::session::OsSession;
 use expectrl::Expect;
+use expectrl::session::OsSession;
 
 #[test]
 fn interactive_subshell_pipeline_does_not_hang() {
@@ -24,12 +24,18 @@ fn interactive_subshell_pipeline_does_not_hang() {
 
     let _ = session.send("echo WARM_$((6*7))");
     let _ = session.send("\r");
-    assert!(session.expect("WARM_42").is_ok(), "shell did not start / read a command");
+    assert!(
+        session.expect("WARM_42").is_ok(),
+        "shell did not start / read a command"
+    );
 
     let _ = session.send("( command ls -1qA /usr/bin | grep -q . ); echo SUB_$((7*8))");
     let _ = session.send("\r");
     let ok = session.expect("SUB_56").is_ok();
 
     drop(session);
-    assert!(ok, "interactive subshell pipeline hung (Fix A): shell unresponsive after `( ls | grep -q . )`");
+    assert!(
+        ok,
+        "interactive subshell pipeline hung (Fix A): shell unresponsive after `( ls | grep -q . )`"
+    );
 }

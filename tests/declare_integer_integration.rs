@@ -12,7 +12,12 @@ fn run_capture(script: &str) -> (String, String, i32) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -50,18 +55,14 @@ fn integer_p_format() {
 
 #[test]
 fn plus_i_unmarks() {
-    let (out, _, _) = run_capture(
-        "declare -i X=10\ndeclare +i X\nX=2+3\necho $X\nexit\n",
-    );
+    let (out, _, _) = run_capture("declare -i X=10\ndeclare +i X\nX=2+3\necho $X\nexit\n");
     // After +i, X=2+3 stores literally.
     assert!(out.lines().any(|l| l == "2+3"), "stdout: {out:?}");
 }
 
 #[test]
 fn integer_in_for_loop() {
-    let (out, _, _) = run_capture(
-        "declare -i X\nfor X in 2+3 7-1; do echo $X; done\nexit\n",
-    );
+    let (out, _, _) = run_capture("declare -i X\nfor X in 2+3 7-1; do echo $X; done\nexit\n");
     let collected: Vec<&str> = out.lines().take(2).collect();
     assert_eq!(collected, vec!["5", "6"], "stdout: {out:?}");
 }

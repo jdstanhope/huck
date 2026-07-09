@@ -102,16 +102,21 @@ fn case_leading_paren_form() {
 fn case_quoted_metacharacter_is_literal() {
     // the pattern "*" (quoted) matches only the literal string *, not abc
     let (out1, _) = run("case abc in \"*\") echo wild;; *) echo other;; esac\nexit\n");
-    assert!(out1.lines().any(|l| l == "other"), "quoted * must not match abc: {out1}");
+    assert!(
+        out1.lines().any(|l| l == "other"),
+        "quoted * must not match abc: {out1}"
+    );
     let (out2, _) = run("case * in \"*\") echo literal;; esac\nexit\n");
-    assert!(out2.lines().any(|l| l == "literal"), "quoted * should match \"*\": {out2}");
+    assert!(
+        out2.lines().any(|l| l == "literal"),
+        "quoted * should match \"*\": {out2}"
+    );
 }
 
 #[test]
 fn case_nested_in_for() {
-    let (out, _) = run(
-        "for x in a b c; do case $x in b) echo got-b;; *) echo skip-$x;; esac; done\nexit\n",
-    );
+    let (out, _) =
+        run("for x in a b c; do case $x in b) echo got-b;; *) echo skip-$x;; esac; done\nexit\n");
     assert!(out.lines().any(|l| l == "got-b"), "stdout: {out}");
     assert!(out.lines().any(|l| l == "skip-a"), "stdout: {out}");
     assert!(out.lines().any(|l| l == "skip-c"), "stdout: {out}");
@@ -124,8 +129,14 @@ fn break_from_case_inside_loop() {
     let (out, _) = run(script);
     assert!(out.lines().any(|l| l == "n1"), "stdout: {out}");
     assert!(out.lines().any(|l| l == "n2"), "stdout: {out}");
-    assert!(!out.lines().any(|l| l == "n3"), "loop should have broken: {out}");
-    assert!(!out.lines().any(|l| l == "n4"), "loop should have broken: {out}");
+    assert!(
+        !out.lines().any(|l| l == "n3"),
+        "loop should have broken: {out}"
+    );
+    assert!(
+        !out.lines().any(|l| l == "n4"),
+        "loop should have broken: {out}"
+    );
 }
 
 #[test]

@@ -90,7 +90,9 @@ pub struct Engine {
 impl Engine {
     /// A fresh session (`$0` = "huck"). Installs no signal handlers, reads no rc file.
     pub fn new() -> Self {
-        Engine { cell: Rc::new(RefCell::new(Shell::new())) }
+        Engine {
+            cell: Rc::new(RefCell::new(Shell::new())),
+        }
     }
 
     /// Start building a configured engine.
@@ -137,8 +139,7 @@ impl Engine {
     pub fn complete(&mut self, line: &str, cursor: usize) -> Completion {
         let clamped = cursor.min(line.len());
         let mut shell = self.cell.borrow_mut();
-        let (start, candidates) =
-            crate::completion::dispatch::resolve(line, clamped, &mut shell);
+        let (start, candidates) = crate::completion::dispatch::resolve(line, clamped, &mut shell);
         Completion { start, candidates }
     }
 
@@ -329,11 +330,20 @@ mod tests {
         // `$()`/`` `…` `` strip the trailing newline, so the body `hi\n` → `hi`.
         let mut e = Engine::new();
         // comsub-eof0: `EOF )` (delimiter, space, `)`).
-        assert_eq!(e.capture("foo=$(cat <<EOF\nhi\nEOF )\necho $foo").stdout, "hi\n");
+        assert_eq!(
+            e.capture("foo=$(cat <<EOF\nhi\nEOF )\necho $foo").stdout,
+            "hi\n"
+        );
         // comsub-eof1: heredoc inside a BACKTICK (the former panic case).
-        assert_eq!(e.capture("foo=`cat <<EOF\nhi\nEOF`\necho $foo").stdout, "hi\n");
+        assert_eq!(
+            e.capture("foo=`cat <<EOF\nhi\nEOF`\necho $foo").stdout,
+            "hi\n"
+        );
         // comsub-eof4: `EOF)` (no space before the `)`).
-        assert_eq!(e.capture("e=$(cat <<EOF\ncontents\nEOF)\necho $e").stdout, "contents\n");
+        assert_eq!(
+            e.capture("e=$(cat <<EOF\ncontents\nEOF)\necho $e").stdout,
+            "contents\n"
+        );
     }
 
     #[test]
@@ -444,7 +454,9 @@ mod tests {
     fn exec_feeds_stdin() {
         // Gate on STDIN_LOCK: this test swaps the process-global fd 0 via
         // `with_stdin_fd0`, racing with stdin_pipe's own tests if not serialized.
-        let _guard = crate::test_support::STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::STDIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
         let out = e
             .exec("read x; read y; echo \"$x-$y\"")
@@ -459,7 +471,9 @@ mod tests {
         // path completes the read.
         // Gate on STDIN_LOCK: this test swaps the process-global fd 0 via
         // `with_stdin_fd0`, racing with stdin_pipe's own tests if not serialized.
-        let _guard = crate::test_support::STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::STDIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let big: Vec<u8> = std::iter::repeat_n(b'a', 5000)
             .chain(std::iter::once(b'\n'))
             .collect();
@@ -532,7 +546,10 @@ mod tests {
         assert_eq!(out.stdout, "");
         assert_eq!(out.stderr, "");
         let mut s = String::new();
-        std::fs::File::open(&path).unwrap().read_to_string(&mut s).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
         assert_eq!(s, "HI\n");
     }
 
@@ -547,7 +564,10 @@ mod tests {
         assert_eq!(out.stdout, "");
         assert_eq!(out.stderr, "");
         let mut s = String::new();
-        std::fs::File::open(&path).unwrap().read_to_string(&mut s).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
         assert_eq!(s, "HI\n");
     }
 
@@ -569,7 +589,11 @@ mod tests {
         let mut e = Engine::new();
         let out = e.exec("declare -p NOPE_NOT_DEFINED 2>&1").capture();
         assert_eq!(out.stderr, "");
-        assert!(out.stdout.contains("NOPE_NOT_DEFINED"), "got stdout=[{:?}]", out.stdout);
+        assert!(
+            out.stdout.contains("NOPE_NOT_DEFINED"),
+            "got stdout=[{:?}]",
+            out.stdout
+        );
     }
 
     #[test]
@@ -600,7 +624,9 @@ mod tests {
 
     #[test]
     fn exec_cwd_runs_script_in_path() {
-        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let canonical = std::fs::canonicalize(tmp.path()).unwrap();
         let mut e = Engine::new();
@@ -608,13 +634,16 @@ mod tests {
         assert_eq!(
             out.stdout.trim(),
             canonical.display().to_string(),
-            "stderr={:?}", out.stderr
+            "stderr={:?}",
+            out.stderr
         );
     }
 
     #[test]
     fn exec_cwd_restores_engine_pwd() {
-        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let mut e = Engine::new();
         e.set_var("PWD", "before");
@@ -624,7 +653,9 @@ mod tests {
 
     #[test]
     fn exec_cwd_chdir_failure_is_best_effort() {
-        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
         // .capture() routes the script's stderr into out.stderr, but the
         // chdir diagnostic in `with_cwd` goes to the PROCESS stderr (real fd
@@ -640,7 +671,9 @@ mod tests {
 
     #[test]
     fn restricted_off_by_default() {
-        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
         let out = e.exec("cd /tmp; echo $PWD").capture();
         assert_eq!(out.exit_code, 0, "stderr={:?}", out.stderr);
@@ -656,10 +689,16 @@ mod tests {
 
     #[test]
     fn restricted_refuses_cd() {
-        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
         let out = e.exec("cd /tmp; echo \"$PWD\"").restricted(true).capture();
-        assert!(out.stderr.contains("restricted: cd"), "stderr={:?}", out.stderr);
+        assert!(
+            out.stderr.contains("restricted: cd"),
+            "stderr={:?}",
+            out.stderr
+        );
         // The script keeps running after the refused cd; echo still fires.
         assert!(out.stdout.ends_with("\n"));
     }
@@ -668,14 +707,22 @@ mod tests {
     fn restricted_refuses_exec() {
         let mut e = Engine::new();
         let out = e.exec("exec /bin/true").restricted(true).capture();
-        assert!(out.stderr.contains("restricted: exec"), "stderr={:?}", out.stderr);
+        assert!(
+            out.stderr.contains("restricted: exec"),
+            "stderr={:?}",
+            out.stderr
+        );
     }
 
     #[test]
     fn restricted_refuses_command_name_with_slash() {
         let mut e = Engine::new();
         let out = e.exec("/bin/echo hi").restricted(true).capture();
-        assert!(out.stderr.contains("restricted:"), "stderr={:?}", out.stderr);
+        assert!(
+            out.stderr.contains("restricted:"),
+            "stderr={:?}",
+            out.stderr
+        );
         assert_eq!(out.stdout, "");
     }
 
@@ -690,7 +737,11 @@ mod tests {
     fn restricted_refuses_source_with_slash() {
         let mut e = Engine::new();
         let out = e.exec(". /etc/profile").restricted(true).capture();
-        assert!(out.stderr.contains("restricted: source"), "stderr={:?}", out.stderr);
+        assert!(
+            out.stderr.contains("restricted: source"),
+            "stderr={:?}",
+            out.stderr
+        );
     }
 
     #[test]
@@ -700,12 +751,15 @@ mod tests {
             .exec("echo hi > /tmp/v206-restricted-test")
             .restricted(true)
             .capture();
-        assert!(out.stderr.contains("restricted:"), "stderr={:?}", out.stderr);
+        assert!(
+            out.stderr.contains("restricted:"),
+            "stderr={:?}",
+            out.stderr
+        );
         // The file MUST NOT have been written.
         let target = std::path::Path::new("/tmp/v206-restricted-test");
         assert!(
-            !target.exists()
-                || std::fs::read(target).map(|b| b.is_empty()).unwrap_or(true),
+            !target.exists() || std::fs::read(target).map(|b| b.is_empty()).unwrap_or(true),
             "the refused redirect wrote a file"
         );
         let _ = std::fs::remove_file(target);
@@ -715,14 +769,22 @@ mod tests {
     fn restricted_refuses_parent_dir_redirect() {
         let mut e = Engine::new();
         let out = e.exec("echo hi > ../escape").restricted(true).capture();
-        assert!(out.stderr.contains("restricted:"), "stderr={:?}", out.stderr);
+        assert!(
+            out.stderr.contains("restricted:"),
+            "stderr={:?}",
+            out.stderr
+        );
     }
 
     #[test]
     fn restricted_refuses_path_assignment() {
         let mut e = Engine::new();
         let out = e.exec("PATH=/tmp; echo done").restricted(true).capture();
-        assert!(out.stderr.contains("restricted: PATH"), "stderr={:?}", out.stderr);
+        assert!(
+            out.stderr.contains("restricted: PATH"),
+            "stderr={:?}",
+            out.stderr
+        );
     }
 
     #[test]
@@ -732,33 +794,53 @@ mod tests {
             .exec("SHELL=/bin/bash; echo done")
             .restricted(true)
             .capture();
-        assert!(out.stderr.contains("restricted: SHELL"), "stderr={:?}", out.stderr);
+        assert!(
+            out.stderr.contains("restricted: SHELL"),
+            "stderr={:?}",
+            out.stderr
+        );
     }
 
     #[test]
     fn restricted_refuses_set_plus_r() {
-        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
         let out = e.exec("set +r; cd /tmp").restricted(true).capture();
         assert!(
-            out.stderr.contains("restricted: cannot turn off") || out.stderr.contains("restricted:"),
-            "stderr={:?}", out.stderr
+            out.stderr.contains("restricted: cannot turn off")
+                || out.stderr.contains("restricted:"),
+            "stderr={:?}",
+            out.stderr
         );
         // cd should STILL be refused after the refused `set +r`.
-        assert!(out.stderr.contains("restricted: cd"), "stderr={:?}", out.stderr);
+        assert!(
+            out.stderr.contains("restricted: cd"),
+            "stderr={:?}",
+            out.stderr
+        );
     }
 
     #[test]
     fn restricted_propagates_to_function() {
-        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
         let out = e.exec("f() { cd /tmp; }; f").restricted(true).capture();
-        assert!(out.stderr.contains("restricted: cd"), "stderr={:?}", out.stderr);
+        assert!(
+            out.stderr.contains("restricted: cd"),
+            "stderr={:?}",
+            out.stderr
+        );
     }
 
     #[test]
     fn restricted_lifts_after_call() {
-        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
         let _ = e.exec("cd /tmp; pwd").restricted(true).capture();
         // Next call, no restricted: cd works.
@@ -779,7 +861,10 @@ mod tests {
             .run();
         let elapsed = start.elapsed();
         assert_eq!(code, 124, "expected 124, got {code}");
-        assert!(elapsed < Duration::from_millis(2000), "took too long: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "took too long: {elapsed:?}"
+        );
     }
 
     #[test]
@@ -802,7 +887,10 @@ mod tests {
             .run();
         let elapsed = start.elapsed();
         assert_eq!(code, 124);
-        assert!(elapsed < Duration::from_millis(2000), "took too long: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "took too long: {elapsed:?}"
+        );
     }
 
     #[test]
@@ -830,8 +918,12 @@ mod tests {
     #[test]
     fn exec_all_knobs_compose() {
         use std::time::Duration;
-        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _g2 = crate::test_support::STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::test_support::STDIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let mut e = Engine::new();
         let out = e
@@ -847,18 +939,33 @@ mod tests {
 
     #[test]
     fn exec_cwd_and_restricted() {
-        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let mut e = Engine::new();
         // `pwd` works inside restricted; `cd` doesn't.
-        let out = e.exec("pwd; cd /").cwd(tmp.path()).restricted(true).capture();
-        assert!(out.stderr.contains("restricted: cd"), "stderr={:?}", out.stderr);
-        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap().display().to_string();
+        let out = e
+            .exec("pwd; cd /")
+            .cwd(tmp.path())
+            .restricted(true)
+            .capture();
+        assert!(
+            out.stderr.contains("restricted: cd"),
+            "stderr={:?}",
+            out.stderr
+        );
+        let canonical_tmp = std::fs::canonicalize(tmp.path())
+            .unwrap()
+            .display()
+            .to_string();
         let raw_tmp = tmp.path().display().to_string();
         assert!(
             out.stdout.contains(&canonical_tmp) || out.stdout.contains(&raw_tmp),
             "stdout={:?} expected to contain {:?} or {:?}",
-            out.stdout, raw_tmp, canonical_tmp
+            out.stdout,
+            raw_tmp,
+            canonical_tmp
         );
     }
 
@@ -971,15 +1078,15 @@ mod tests {
             gap >= Duration::from_millis(50),
             "expected ~100ms gap, got {gap:?}"
         );
-        assert!(
-            gap <= Duration::from_secs(2),
-            "gap too large: {gap:?}"
-        );
+        assert!(gap <= Duration::from_secs(2), "gap too large: {gap:?}");
     }
 
     #[test]
     fn on_stdout_line_external_fires_during_wait() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
         let flag = Arc::new(AtomicBool::new(false));
         let mut e = Engine::new();
         let f = flag.clone();
@@ -1027,22 +1134,32 @@ mod tests {
         let pipe_w = fds[1];
 
         let saved = unsafe { libc::dup(1) };
-        unsafe { libc::dup2(pipe_w, 1); libc::close(pipe_w); }
+        unsafe {
+            libc::dup2(pipe_w, 1);
+            libc::close(pipe_w);
+        }
 
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
-        let _ = e.exec("echo tee-hi")
+        let _ = e
+            .exec("echo tee-hi")
             .on_stdout_line(|line| lines.push(line.to_string()))
             .run();
 
-        unsafe { libc::dup2(saved, 1); libc::close(saved); }
+        unsafe {
+            libc::dup2(saved, 1);
+            libc::close(saved);
+        }
 
         let mut buf = String::new();
         let mut file = unsafe { std::fs::File::from_raw_fd(pipe_r) };
         file.read_to_string(&mut buf).unwrap();
 
         assert_eq!(lines, vec!["tee-hi"]);
-        assert_eq!(buf, "tee-hi\n", "embedder's real fd 1 should also see the line");
+        assert_eq!(
+            buf, "tee-hi\n",
+            "embedder's real fd 1 should also see the line"
+        );
     }
 
     #[test]
@@ -1064,15 +1181,22 @@ mod tests {
         let pipe_w = fds[1];
 
         let saved = unsafe { libc::dup(2) };
-        unsafe { libc::dup2(pipe_w, 2); libc::close(pipe_w); }
+        unsafe {
+            libc::dup2(pipe_w, 2);
+            libc::close(pipe_w);
+        }
 
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
-        let _ = e.exec("echo err >&2")
+        let _ = e
+            .exec("echo err >&2")
             .on_stderr_line(|line| lines.push(line.to_string()))
             .run();
 
-        unsafe { libc::dup2(saved, 2); libc::close(saved); }
+        unsafe {
+            libc::dup2(saved, 2);
+            libc::close(saved);
+        }
 
         let mut buf = String::new();
         let mut file = unsafe { std::fs::File::from_raw_fd(pipe_r) };
@@ -1096,10 +1220,13 @@ mod tests {
 
     #[test]
     fn on_stdout_line_with_stdin() {
-        let _g = crate::test_support::STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_support::STDIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
-        let _ = e.exec("read x; echo \"got:$x\"")
+        let _ = e
+            .exec("read x; echo \"got:$x\"")
             .stdin(b"hi\n".to_vec())
             .on_stdout_line(|line| lines.push(line.to_string()))
             .capture();
@@ -1108,11 +1235,14 @@ mod tests {
 
     #[test]
     fn on_stdout_line_with_cwd() {
-        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
-        let _ = e.exec("pwd")
+        let _ = e
+            .exec("pwd")
             .cwd(tmp.path())
             .on_stdout_line(|line| lines.push(line.to_string()))
             .capture();
@@ -1124,7 +1254,8 @@ mod tests {
     fn on_stdout_line_with_restricted() {
         let mut err_lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
-        let _ = e.exec("cd /tmp")
+        let _ = e
+            .exec("cd /tmp")
             .restricted(true)
             .on_stderr_line(|line| err_lines.push(line.to_string()))
             .capture();
@@ -1136,7 +1267,8 @@ mod tests {
         use std::time::Duration;
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
-        let code = e.exec("/bin/sh -c 'echo before; sleep 5'")
+        let code = e
+            .exec("/bin/sh -c 'echo before; sleep 5'")
             .timeout(Duration::from_millis(200))
             .on_stdout_line(|line| lines.push(line.to_string()))
             .capture()
@@ -1148,12 +1280,17 @@ mod tests {
     #[test]
     fn all_knobs_compose() {
         use std::time::Duration;
-        let _g1 = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _g2 = crate::test_support::STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g1 = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::test_support::STDIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let mut out_lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
-        let out = e.exec("read x; echo \"got:$x\"")
+        let out = e
+            .exec("read x; echo \"got:$x\"")
             .cwd(tmp.path())
             .restricted(true)
             .timeout(Duration::from_secs(2))
@@ -1172,7 +1309,9 @@ mod tests {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             e.exec("echo a; echo b; echo c")
                 .on_stdout_line(|line| {
-                    if line == "b" { panic!("test panic"); }
+                    if line == "b" {
+                        panic!("test panic");
+                    }
                 })
                 .capture()
         }));
@@ -1187,7 +1326,8 @@ mod tests {
         use std::time::{Duration, Instant};
         let mut e = Engine::new();
         let start = Instant::now();
-        let _ = e.exec("for i in $(seq 1 20); do echo $i; done")
+        let _ = e
+            .exec("for i in $(seq 1 20); do echo $i; done")
             .on_stdout_line(|_| std::thread::sleep(Duration::from_millis(20)))
             .capture();
         let elapsed = start.elapsed();
@@ -1205,7 +1345,8 @@ mod tests {
         // LineDispatchWriter so streaming callbacks didn't see these bytes.)
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
-        let out = e.exec("echo hi >&2")
+        let out = e
+            .exec("echo hi >&2")
             .on_stderr_line(|line| lines.push(line.to_string()))
             .capture();
         assert_eq!(out.stderr, "hi\n");
@@ -1220,7 +1361,8 @@ mod tests {
         // it as a stdout-stream event.
         let mut lines: Vec<String> = Vec::new();
         let mut e = Engine::new();
-        let _ = e.exec("declare -p NOPE_NOT_DEFINED 2>&1")
+        let _ = e
+            .exec("declare -p NOPE_NOT_DEFINED 2>&1")
             .on_stdout_line(|line| lines.push(line.to_string()))
             .capture();
         // The diagnostic should arrive via on_stdout_line.
@@ -1238,7 +1380,11 @@ mod tests {
         let comp = e.complete("", 0);
         assert_eq!(comp.start, 0);
         // Empty-prefix command position: at minimum some builtins are present.
-        assert!(!comp.candidates.is_empty(), "expected some builtins, got {:?}", comp.candidates);
+        assert!(
+            !comp.candidates.is_empty(),
+            "expected some builtins, got {:?}",
+            comp.candidates
+        );
     }
 
     #[test]
@@ -1248,7 +1394,8 @@ mod tests {
         let comp = e.complete(line, line.len());
         assert!(
             comp.candidates.iter().any(|c| c.display == "HOME"),
-            "expected HOME in {:?}", comp.candidates
+            "expected HOME in {:?}",
+            comp.candidates
         );
     }
 
@@ -1260,8 +1407,16 @@ mod tests {
         let beyond = e.complete(line, 9999);
         assert_eq!(beyond.start, at_end.start);
         assert_eq!(
-            beyond.candidates.iter().map(|c| c.display.as_str()).collect::<Vec<_>>(),
-            at_end.candidates.iter().map(|c| c.display.as_str()).collect::<Vec<_>>(),
+            beyond
+                .candidates
+                .iter()
+                .map(|c| c.display.as_str())
+                .collect::<Vec<_>>(),
+            at_end
+                .candidates
+                .iter()
+                .map(|c| c.display.as_str())
+                .collect::<Vec<_>>(),
         );
     }
 
@@ -1269,7 +1424,10 @@ mod tests {
     fn complete_command_position_stamps_command() {
         let mut e = Engine::new();
         let comp = e.complete("ec", 2);
-        let echo = comp.candidates.iter().find(|c| c.display == "echo")
+        let echo = comp
+            .candidates
+            .iter()
+            .find(|c| c.display == "echo")
             .expect("echo should complete");
         assert_eq!(echo.kind, crate::CandidateKind::Command);
     }
@@ -1280,7 +1438,10 @@ mod tests {
         e.set_var("MY_V208_TEST_VAR", "x");
         let line = "echo $MY_V208_T";
         let comp = e.complete(line, line.len());
-        let v = comp.candidates.iter().find(|c| c.display == "MY_V208_TEST_VAR")
+        let v = comp
+            .candidates
+            .iter()
+            .find(|c| c.display == "MY_V208_TEST_VAR")
             .expect("var should complete");
         assert_eq!(v.kind, crate::CandidateKind::Variable);
     }
@@ -1293,7 +1454,9 @@ mod tests {
         let mut e = Engine::new();
         let line = format!("ls {}/v208_test", tmp.path().display());
         let comp = e.complete(&line, line.len());
-        let cand = comp.candidates.iter()
+        let cand = comp
+            .candidates
+            .iter()
             .find(|c| c.display == "v208_test_file.txt")
             .expect("file should complete");
         assert_eq!(cand.kind, crate::CandidateKind::File);
@@ -1307,7 +1470,9 @@ mod tests {
         let mut e = Engine::new();
         let line = format!("ls {}/v208_test", tmp.path().display());
         let comp = e.complete(&line, line.len());
-        let cand = comp.candidates.iter()
+        let cand = comp
+            .candidates
+            .iter()
             .find(|c| c.display == "v208_test_dir/")
             .expect("dir should complete with trailing /");
         assert_eq!(cand.kind, crate::CandidateKind::Directory);
@@ -1319,7 +1484,9 @@ mod tests {
         // Register a -F func that produces a single candidate.
         let _ = e.run("_my_v208_completer() { COMPREPLY=( custom_v208_result ); }; complete -F _my_v208_completer mycmd");
         let comp = e.complete("mycmd ", 6);
-        let cand = comp.candidates.iter()
+        let cand = comp
+            .candidates
+            .iter()
             .find(|c| c.display == "custom_v208_result")
             .expect("custom result should appear");
         assert_eq!(cand.kind, crate::CandidateKind::Custom);

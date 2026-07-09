@@ -46,12 +46,26 @@ fn brace_range_in_for_loop() {
 
 #[test]
 fn brace_cartesian() {
-    let (out, _) = run_capture(
-        "for d in /tmp/{a,b}/{x,y}; do echo $d; done\nexit\n",
-    );
+    let (out, _) = run_capture("for d in /tmp/{a,b}/{x,y}; do echo $d; done\nexit\n");
     let lines: Vec<&str> = out.lines().collect();
-    assert!(lines.contains(&"/tmp/a/x"), "missing /tmp/a/x in: {:?}", out);
-    assert!(lines.contains(&"/tmp/a/y"), "missing /tmp/a/y in: {:?}", out);
-    assert!(lines.contains(&"/tmp/b/x"), "missing /tmp/b/x in: {:?}", out);
-    assert!(lines.contains(&"/tmp/b/y"), "missing /tmp/b/y in: {:?}", out);
+    assert!(
+        lines.contains(&"/tmp/a/x"),
+        "missing /tmp/a/x in: {:?}",
+        out
+    );
+    assert!(
+        lines.contains(&"/tmp/a/y"),
+        "missing /tmp/a/y in: {:?}",
+        out
+    );
+    assert!(
+        lines.contains(&"/tmp/b/x"),
+        "missing /tmp/b/x in: {:?}",
+        out
+    );
+    assert!(
+        lines.contains(&"/tmp/b/y"),
+        "missing /tmp/b/y in: {:?}",
+        out
+    );
 }

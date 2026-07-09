@@ -39,13 +39,16 @@ fn alias_expansion_via_repl() {
 
 #[test]
 fn unalias_removes_expansion() {
-    let script =
-        "alias ll='echo HELLO'\nunalias ll\nll\nrc=$?\necho rc=$rc\nexit\n";
+    let script = "alias ll='echo HELLO'\nunalias ll\nll\nrc=$?\necho rc=$rc\nexit\n";
     let (out, err) = run_capture(script);
     let rc_line = out.lines().find(|l| l.starts_with("rc="));
     assert!(rc_line.is_some(), "no rc= line in: {:?}", out);
     let rc = rc_line.unwrap();
-    assert_ne!(rc, "rc=0", "expected non-zero rc, got {rc}; stderr {:?}", err);
+    assert_ne!(
+        rc, "rc=0",
+        "expected non-zero rc, got {rc}; stderr {:?}",
+        err
+    );
 }
 
 #[test]

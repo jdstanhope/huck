@@ -5,7 +5,9 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 /// Run huck with piped `script` on stdin and the given extra env vars; return the
 /// resulting HISTFILE contents.
@@ -17,9 +19,16 @@ fn run_hist(envs: &[(&str, &str)], script: &str) -> String {
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut child = cmd.spawn().expect("spawn huck");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     child.wait().unwrap();
     std::fs::read_to_string(&hf).unwrap_or_default()
 }
@@ -32,7 +41,10 @@ fn histsize_caps_in_memory_list() {
 
 #[test]
 fn histfilesize_caps_file_below_histsize() {
-    let out = run_hist(&[("HISTSIZE", "100"), ("HISTFILESIZE", "1")], "echo a\necho b\n");
+    let out = run_hist(
+        &[("HISTSIZE", "100"), ("HISTFILESIZE", "1")],
+        "echo a\necho b\n",
+    );
     assert_eq!(out, "echo b\n", "out={out:?}");
 }
 

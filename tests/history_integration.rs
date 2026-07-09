@@ -14,7 +14,12 @@ fn run_with_histfile(script: &str, histfile: &std::path::Path) -> (String, Strin
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -68,13 +73,13 @@ fn history_builtin_lists_commands() {
 fn history_dash_c_clears() {
     let dir = tempfile::tempdir().unwrap();
     let hf = dir.path().join("h");
-    let (out, _) = run_with_histfile(
-        "echo keep\nhistory -c\nhistory\nexit\n",
-        &hf,
-    );
+    let (out, _) = run_with_histfile("echo keep\nhistory -c\nhistory\nexit\n", &hf);
     // After clearing with history -c, the only entry in history is the 'history' command itself
     // Check that 'echo keep' is NOT in the output
-    assert!(!out.contains("echo keep"), "history should not contain 'echo keep' after clear, stdout: {out}");
+    assert!(
+        !out.contains("echo keep"),
+        "history should not contain 'echo keep' after clear, stdout: {out}"
+    );
 }
 
 #[test]

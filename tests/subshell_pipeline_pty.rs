@@ -13,8 +13,8 @@
 use std::process::Command;
 use std::time::Duration;
 
-use expectrl::session::OsSession;
 use expectrl::Expect;
+use expectrl::session::OsSession;
 
 /// Result of driving huck under a PTY: each requested `marker` is recorded as
 /// `(marker, true)` if it appeared on the PTY stream within the timeout, or
@@ -27,11 +27,7 @@ struct PtyRun {
 
 impl PtyRun {
     fn saw(&self, marker: &str) -> bool {
-        self.skipped
-            || self
-                .markers
-                .iter()
-                .any(|(m, ok)| m == marker && *ok)
+        self.skipped || self.markers.iter().any(|(m, ok)| m == marker && *ok)
     }
 }
 
@@ -72,7 +68,10 @@ fn run_in_pty(steps: &[(&str, &str)], timeout: Duration) -> PtyRun {
         }
     }
     // Dropping `session` closes the master fd; a wedged child is killed.
-    PtyRun { markers, skipped: false }
+    PtyRun {
+        markers,
+        skipped: false,
+    }
 }
 
 #[test]
@@ -85,7 +84,10 @@ fn subshell_pipeline_does_not_hang_on_tty() {
         ],
         Duration::from_secs(5),
     );
-    assert!(run.saw("hi"), "missing pipeline output (subshell hung before producing 'hi')");
+    assert!(
+        run.saw("hi"),
+        "missing pipeline output (subshell hung before producing 'hi')"
+    );
     assert!(
         run.saw("DONE_MARK"),
         "subshell hung (no DONE_MARK within timeout)"
@@ -102,5 +104,8 @@ fn subshell_multistage_pipeline_does_not_hang_on_tty() {
         ],
         Duration::from_secs(5),
     );
-    assert!(run.saw("DONE2"), "multistage subshell hung (no DONE2 within timeout)");
+    assert!(
+        run.saw("DONE2"),
+        "multistage subshell hung (no DONE2 within timeout)"
+    );
 }

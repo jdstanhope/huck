@@ -191,10 +191,22 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
     // Try integer range.
     if let (Ok(l), Ok(r)) = (left.parse::<i64>(), right.parse::<i64>()) {
         let step = match step_str {
-            None => if r >= l { 1i64 } else { -1i64 },
+            None => {
+                if r >= l {
+                    1i64
+                } else {
+                    -1i64
+                }
+            }
             Some(s) => match s.parse::<i64>() {
                 Ok(0) => return None,
-                Ok(n) if n > 0 => if r >= l { n } else { -n },
+                Ok(n) if n > 0 => {
+                    if r >= l {
+                        n
+                    } else {
+                        -n
+                    }
+                }
                 _ => return None,
             },
         };
@@ -216,9 +228,13 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
                 return Some(out);
             }
             if step > 0 {
-                if cur >= r { break; }
+                if cur >= r {
+                    break;
+                }
             } else {
-                if cur <= r { break; }
+                if cur <= r {
+                    break;
+                }
             }
             cur = match cur.checked_add(step) {
                 Some(n) => n,
@@ -244,10 +260,22 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
         let l = left_chars[0] as i64;
         let r = right_chars[0] as i64;
         let step: i64 = match step_str {
-            None => if r >= l { 1 } else { -1 },
+            None => {
+                if r >= l {
+                    1
+                } else {
+                    -1
+                }
+            }
             Some(s) => match s.parse::<i64>() {
                 Ok(0) => return None,
-                Ok(n) if n > 0 => if r >= l { n } else { -n },
+                Ok(n) if n > 0 => {
+                    if r >= l {
+                        n
+                    } else {
+                        -n
+                    }
+                }
                 _ => return None,
             },
         };
@@ -263,9 +291,13 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
                 return Some(out);
             }
             if step > 0 {
-                if cur >= r { break; }
+                if cur >= r {
+                    break;
+                }
             } else {
-                if cur <= r { break; }
+                if cur <= r {
+                    break;
+                }
             }
             cur += step;
             if (step > 0 && cur > r) || (step < 0 && cur < r) {
@@ -301,7 +333,10 @@ mod tests {
 
     #[test]
     fn comma_list_with_prefix_suffix() {
-        assert_eq!(expand("pre{a,b}post").unwrap(), vec!["preapost", "prebpost"]);
+        assert_eq!(
+            expand("pre{a,b}post").unwrap(),
+            vec!["preapost", "prebpost"]
+        );
     }
 
     #[test]
@@ -326,7 +361,10 @@ mod tests {
 
     #[test]
     fn zero_padded_range() {
-        assert_eq!(expand("{01..05}").unwrap(), vec!["01", "02", "03", "04", "05"]);
+        assert_eq!(
+            expand("{01..05}").unwrap(),
+            vec!["01", "02", "03", "04", "05"]
+        );
     }
 
     #[test]

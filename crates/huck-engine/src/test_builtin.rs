@@ -45,10 +45,7 @@ pub fn evaluate(args: &[String]) -> Result<bool, String> {
     evaluate_with(args, &|_| false)
 }
 
-fn evaluate_short_form(
-    args: &[String],
-    var_is_set: &dyn Fn(&str) -> bool,
-) -> Result<bool, String> {
+fn evaluate_short_form(args: &[String], var_is_set: &dyn Fn(&str) -> bool) -> Result<bool, String> {
     match args.len() {
         2 => {
             if args[0] == "!" {
@@ -91,8 +88,28 @@ fn is_unary_op(s: &str) -> bool {
         // `-a` is bash's deprecated unary alias for `-e` (file exists).
         // It also serves as the binary AND combinator in operator
         // position; the grammar parser (v75) disambiguates by context.
-        "-a" | "-e" | "-f" | "-d" | "-r" | "-w" | "-x" | "-s" | "-L" | "-z" | "-n" | "-v"
-            | "-p" | "-S" | "-b" | "-c" | "-O" | "-G" | "-N" | "-k" | "-u" | "-g" | "-t"
+        "-a" | "-e"
+            | "-f"
+            | "-d"
+            | "-r"
+            | "-w"
+            | "-x"
+            | "-s"
+            | "-L"
+            | "-z"
+            | "-n"
+            | "-v"
+            | "-p"
+            | "-S"
+            | "-b"
+            | "-c"
+            | "-O"
+            | "-G"
+            | "-N"
+            | "-k"
+            | "-u"
+            | "-g"
+            | "-t"
     )
 }
 
@@ -110,7 +127,8 @@ fn is_binary_op(s: &str) -> bool {
 pub(crate) fn compare_files(op: &str, lhs: &str, rhs: &str) -> bool {
     let lm = std::fs::metadata(lhs);
     let rm = std::fs::metadata(rhs);
-    let nanos = |m: &std::fs::Metadata| (m.mtime() as i128) * 1_000_000_000 + (m.mtime_nsec() as i128);
+    let nanos =
+        |m: &std::fs::Metadata| (m.mtime() as i128) * 1_000_000_000 + (m.mtime_nsec() as i128);
     match op {
         "-nt" => match (&lm, &rm) {
             (Ok(a), Ok(b)) => nanos(a) > nanos(b),
@@ -136,11 +154,7 @@ pub(crate) fn compare_files(op: &str, lhs: &str, rhs: &str) -> bool {
 // cross-platform build; that cast is a no-op on Linux, where clippy then flags it
 // as unnecessary. The cast is required on macOS, so suppress the Linux-only lint.
 #[allow(clippy::unnecessary_cast)]
-fn apply_unary(
-    op: &str,
-    operand: &str,
-    var_is_set: &dyn Fn(&str) -> bool,
-) -> Result<bool, String> {
+fn apply_unary(op: &str, operand: &str, var_is_set: &dyn Fn(&str) -> bool) -> Result<bool, String> {
     match op {
         "-v" => Ok(var_is_set(operand)),
         "-z" => Ok(operand.is_empty()),
@@ -173,8 +187,12 @@ fn apply_unary(
         "-k" => Ok(mode_bit_set(operand, libc::S_ISVTX as u32)),
         "-u" => Ok(mode_bit_set(operand, libc::S_ISUID as u32)),
         "-g" => Ok(mode_bit_set(operand, libc::S_ISGID as u32)),
-        "-O" => Ok(std::fs::metadata(operand).map(|m| m.uid() == unsafe { libc::geteuid() }).unwrap_or(false)),
-        "-G" => Ok(std::fs::metadata(operand).map(|m| m.gid() == unsafe { libc::getegid() }).unwrap_or(false)),
+        "-O" => Ok(std::fs::metadata(operand)
+            .map(|m| m.uid() == unsafe { libc::geteuid() })
+            .unwrap_or(false)),
+        "-G" => Ok(std::fs::metadata(operand)
+            .map(|m| m.gid() == unsafe { libc::getegid() })
+            .unwrap_or(false)),
         "-N" => Ok(std::fs::metadata(operand)
             .map(|m| {
                 // Full-timespec comparison (bash compares struct timespec; match
@@ -184,7 +202,10 @@ fn apply_unary(
                 mt > at
             })
             .unwrap_or(false)),
-        "-t" => Ok(operand.parse::<i32>().map(|fd| unsafe { libc::isatty(fd) } == 1).unwrap_or(false)),
+        "-t" => Ok(operand
+            .parse::<i32>()
+            .map(|fd| unsafe { libc::isatty(fd) } == 1)
+            .unwrap_or(false)),
         _ => Err(format!("{op}: unknown operator")),
     }
 }
@@ -198,7 +219,9 @@ fn file_mode(path: &str) -> Option<u32> {
 /// `S_IFMT as u32` cast is a no-op on Linux but required on macOS/BSD.
 #[allow(clippy::unnecessary_cast)]
 fn file_type_is(operand: &str, ftype: u32) -> bool {
-    file_mode(operand).map(|m| m & libc::S_IFMT as u32 == ftype).unwrap_or(false)
+    file_mode(operand)
+        .map(|m| m & libc::S_IFMT as u32 == ftype)
+        .unwrap_or(false)
 }
 
 /// True if `operand`'s mode has `bit` set (an `S_IS*` constant).
@@ -431,10 +454,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let old = dir.join("old");
         let new = dir.join("new");
-        std::fs::File::create(&old).unwrap().write_all(b"x").unwrap();
+        std::fs::File::create(&old)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
         // Force `new` to be strictly newer.
         std::thread::sleep(std::time::Duration::from_millis(10));
-        std::fs::File::create(&new).unwrap().write_all(b"y").unwrap();
+        std::fs::File::create(&new)
+            .unwrap()
+            .write_all(b"y")
+            .unwrap();
         let (o, n) = (old.to_str().unwrap(), new.to_str().unwrap());
         let missing = dir.join("missing");
         let m = missing.to_str().unwrap();
@@ -456,8 +485,14 @@ mod tests {
     fn test_v_uses_predicate() {
         let setvars = ["HOME", "EMPTYVAR"];
         let pred = |n: &str| setvars.contains(&n);
-        assert_eq!(evaluate_with(&["-v".into(), "HOME".into()], &pred), Ok(true));
-        assert_eq!(evaluate_with(&["-v".into(), "NOPE".into()], &pred), Ok(false));
+        assert_eq!(
+            evaluate_with(&["-v".into(), "HOME".into()], &pred),
+            Ok(true)
+        );
+        assert_eq!(
+            evaluate_with(&["-v".into(), "NOPE".into()], &pred),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -553,7 +588,10 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert_eq!(evaluate(&args(&["-L", link.to_str().unwrap()])), Ok(true));
-        assert_eq!(evaluate(&args(&["-L", target.to_str().unwrap()])), Ok(false));
+        assert_eq!(
+            evaluate(&args(&["-L", target.to_str().unwrap()])),
+            Ok(false)
+        );
         assert_eq!(evaluate(&args(&["-f", link.to_str().unwrap()])), Ok(true));
     }
 
@@ -696,10 +734,7 @@ mod tests {
     #[test]
     fn nested_parens() {
         // [ ( ( -n a ) ) ] → true
-        assert_eq!(
-            evaluate(&args(&["(", "(", "-n", "a", ")", ")"])),
-            Ok(true)
-        );
+        assert_eq!(evaluate(&args(&["(", "(", "-n", "a", ")", ")"])), Ok(true));
     }
 
     #[test]
@@ -709,7 +744,9 @@ mod tests {
         // With parens around the OR: [ ( -z a -o -n b ) -a -n c ]
         // = (false OR true) AND true = true.
         assert_eq!(
-            evaluate(&args(&["(", "-z", "a", "-o", "-n", "b", ")", "-a", "-n", "c"])),
+            evaluate(&args(&[
+                "(", "-z", "a", "-o", "-n", "b", ")", "-a", "-n", "c"
+            ])),
             Ok(true)
         );
     }
@@ -726,7 +763,10 @@ mod tests {
     #[test]
     fn negation_of_combinator_lhs() {
         // [ ! -n a -a -n b ] = (NOT (-n a)) AND (-n b) = false AND true = false.
-        assert_eq!(evaluate(&args(&["!", "-n", "a", "-a", "-n", "b"])), Ok(false));
+        assert_eq!(
+            evaluate(&args(&["!", "-n", "a", "-a", "-n", "b"])),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -816,7 +856,13 @@ mod tests {
         // LHS is true (-z "" → true), so -a evaluates the RHS.
         // Verify the result is false (RHS file doesn't exist).
         assert_eq!(
-            evaluate(&args(&["-z", "", "-a", "-f", "/no/such/path/that/does/not/exist"])),
+            evaluate(&args(&[
+                "-z",
+                "",
+                "-a",
+                "-f",
+                "/no/such/path/that/does/not/exist"
+            ])),
             Ok(false)
         );
     }

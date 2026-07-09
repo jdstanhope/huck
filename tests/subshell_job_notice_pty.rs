@@ -3,15 +3,18 @@
 //! for a top-level `&`. nvm's alias loops are `( … & … wait ) | sort`.
 //! Skips (passes) if no PTY.
 
+use expectrl::Expect;
+use expectrl::session::OsSession;
 use std::process::Command;
 use std::time::Duration;
-use expectrl::session::OsSession;
-use expectrl::Expect;
 
 fn run_in_pty(cmd: &str) -> Option<String> {
     let mut session = match OsSession::spawn(Command::new(env!("CARGO_BIN_EXE_huck"))) {
         Ok(s) => s,
-        Err(e) => { eprintln!("subshell_job_notice_pty: skipping — no PTY: {e}"); return None; }
+        Err(e) => {
+            eprintln!("subshell_job_notice_pty: skipping — no PTY: {e}");
+            return None;
+        }
     };
     session.set_expect_timeout(Some(Duration::from_secs(8)));
     let _ = session.send("echo READY_$((6*7))");
@@ -34,7 +37,12 @@ fn strip_ansi(s: &str) -> String {
         if c == '\u{1b}' {
             if it.peek() == Some(&'[') {
                 it.next();
-                while let Some(&n) = it.peek() { it.next(); if ('@'..='~').contains(&n) { break; } }
+                while let Some(&n) = it.peek() {
+                    it.next();
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
             }
             continue;
         }
@@ -44,24 +52,44 @@ fn strip_ansi(s: &str) -> String {
 }
 
 fn job_notice_lines(out: &str) -> usize {
-    strip_ansi(out).lines().filter(|l| {
-        let t = l.trim_start();
-        t.starts_with('[') && t[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
-    }).count()
+    strip_ansi(out)
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with('[') && t[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
+        })
+        .count()
 }
 
 #[test]
 fn subshell_background_job_emits_no_notice() {
-    let Some(out) = run_in_pty("( sleep 0.05 & wait )") else { return };
-    assert_eq!(job_notice_lines(&out), 0, "subshell `&` must not notify; got:\n{out}");
+    let Some(out) = run_in_pty("( sleep 0.05 & wait )") else {
+        return;
+    };
+    assert_eq!(
+        job_notice_lines(&out),
+        0,
+        "subshell `&` must not notify; got:\n{out}"
+    );
 }
 #[test]
 fn subshell_pipeline_background_job_emits_no_notice() {
-    let Some(out) = run_in_pty("( sleep 0.05 & wait ) | cat") else { return };
-    assert_eq!(job_notice_lines(&out), 0, "subshell|pipe `&` must not notify; got:\n{out}");
+    let Some(out) = run_in_pty("( sleep 0.05 & wait ) | cat") else {
+        return;
+    };
+    assert_eq!(
+        job_notice_lines(&out),
+        0,
+        "subshell|pipe `&` must not notify; got:\n{out}"
+    );
 }
 #[test]
 fn top_level_background_job_still_notifies() {
-    let Some(out) = run_in_pty("sleep 0.05 & wait") else { return };
-    assert!(job_notice_lines(&out) >= 1, "top-level `&` must still notify; got:\n{out}");
+    let Some(out) = run_in_pty("sleep 0.05 & wait") else {
+        return;
+    };
+    assert!(
+        job_notice_lines(&out) >= 1,
+        "top-level `&` must still notify; got:\n{out}"
+    );
 }

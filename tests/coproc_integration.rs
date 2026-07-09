@@ -63,8 +63,7 @@ fn assert_matches_bash(script: &str) {
 fn coproc_anonymous_roundtrip() {
     // Default name COPROC: write a line to COPROC[1], the coproc body reads it
     // and echoes "got:<line>" to its stdout (COPROC[0]); read it back.
-    let script =
-        r#"coproc { read l; echo "got:$l"; }; echo hi >&"${COPROC[1]}"; read r <&"${COPROC[0]}"; echo "$r""#;
+    let script = r#"coproc { read l; echo "got:$l"; }; echo hi >&"${COPROC[1]}"; read r <&"${COPROC[0]}"; echo "$r""#;
     let (huck_out, _) = run_c(&huck_binary(), script);
     assert_eq!(huck_out, "got:hi\n", "huck anon round-trip");
     assert_matches_bash(script);
@@ -73,8 +72,7 @@ fn coproc_anonymous_roundtrip() {
 #[test]
 fn coproc_named_roundtrip() {
     // Named coproc MYP: the fd array is MYP[0]/MYP[1].
-    let script =
-        r#"coproc MYP { read l; echo "echo:$l"; }; echo yo >&"${MYP[1]}"; read r <&"${MYP[0]}"; echo "$r""#;
+    let script = r#"coproc MYP { read l; echo "echo:$l"; }; echo yo >&"${MYP[1]}"; read r <&"${MYP[0]}"; echo "$r""#;
     let (huck_out, _) = run_c(&huck_binary(), script);
     assert_eq!(huck_out, "echo:yo\n", "huck named round-trip");
     assert_matches_bash(script);
@@ -110,7 +108,8 @@ fn coproc_autounset_after_exit() {
     // so at the `echo` point both bash and huck have unset COPROC. The test
     // uses `${COPROC[0]-unset}` to distinguish unset-array (→ "unset") from
     // set-but-empty (→ "").
-    let script = r#"coproc { :; }; pid=$COPROC_PID; wait "$pid" 2>/dev/null; echo "[${COPROC[0]-unset}]""#;
+    let script =
+        r#"coproc { :; }; pid=$COPROC_PID; wait "$pid" 2>/dev/null; echo "[${COPROC[0]-unset}]""#;
     assert_matches_bash(script);
 
     // Sanity: a still-running coproc must NOT be prematurely unset.

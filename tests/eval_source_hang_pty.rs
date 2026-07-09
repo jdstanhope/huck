@@ -7,8 +7,8 @@
 use std::process::Command;
 use std::time::Duration;
 
-use expectrl::session::OsSession;
 use expectrl::Expect;
+use expectrl::session::OsSession;
 
 #[test]
 fn interactive_eval_capture_does_not_hang() {
@@ -24,7 +24,10 @@ fn interactive_eval_capture_does_not_hang() {
 
     let _ = session.send("echo WARM_$((6*7))");
     let _ = session.send("\r");
-    assert!(session.expect("WARM_42").is_ok(), "shell did not start / read a command");
+    assert!(
+        session.expect("WARM_42").is_ok(),
+        "shell did not start / read a command"
+    );
 
     // Large captured external output through eval — pre-v132 this deadlocked.
     let _ = session.send("x=$(eval 'seq 1 500000'); echo \"EVLEN=${#x} EVDONE\"");
@@ -52,7 +55,10 @@ fn interactive_eval_pipe_capture_does_not_hang() {
 
     let _ = session.send("echo WARM_$((6*7))");
     let _ = session.send("\r");
-    assert!(session.expect("WARM_42").is_ok(), "shell did not start / read a command");
+    assert!(
+        session.expect("WARM_42").is_ok(),
+        "shell did not start / read a command"
+    );
 
     // A pipeline inside the captured eval — also exercised the job-control path.
     let _ = session.send("x=$(eval 'seq 1 200000 | wc -l'); echo \"WC=$x WCDONE\"");

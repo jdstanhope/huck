@@ -2,7 +2,7 @@ use crate::command::Sequence;
 use crate::executor;
 use crate::lexer::{TildeSpec, Word, WordPart};
 use crate::shell_state::Shell;
-use glob::{glob_with, MatchOptions};
+use glob::{MatchOptions, glob_with};
 
 /// Pathname-expansion behavior toggles derived from `shopt` state.
 /// All-false ⇒ huck's default (pre-v86) globbing behavior.
@@ -19,8 +19,8 @@ pub struct GlobOpts {
 
 fn resolve_tilde(spec: &TildeSpec, shell: &Shell) -> Option<String> {
     match spec {
-        TildeSpec::Home   => shell.get("HOME").map(str::to_string),
-        TildeSpec::Pwd    => shell.get("PWD").map(str::to_string),
+        TildeSpec::Home => shell.get("HOME").map(str::to_string),
+        TildeSpec::Pwd => shell.get("PWD").map(str::to_string),
         TildeSpec::OldPwd => shell.get("OLDPWD").map(str::to_string),
         TildeSpec::User(name) => lookup_home_for_user(name),
     }
@@ -28,9 +28,9 @@ fn resolve_tilde(spec: &TildeSpec, shell: &Shell) -> Option<String> {
 
 fn render_tilde_literal(spec: &TildeSpec) -> String {
     match spec {
-        TildeSpec::Home       => "~".to_string(),
-        TildeSpec::Pwd        => "~+".to_string(),
-        TildeSpec::OldPwd     => "~-".to_string(),
+        TildeSpec::Home => "~".to_string(),
+        TildeSpec::Pwd => "~+".to_string(),
+        TildeSpec::OldPwd => "~-".to_string(),
         TildeSpec::User(name) => format!("~{name}"),
     }
 }
@@ -78,7 +78,10 @@ pub struct Field {
 
 impl Field {
     pub fn new() -> Self {
-        Self { chars: String::new(), quoted: Vec::new() }
+        Self {
+            chars: String::new(),
+            quoted: Vec::new(),
+        }
     }
 
     pub fn push_str(&mut self, s: &str, quoted: bool) {
@@ -102,10 +105,7 @@ impl Default for Field {
 /// command substitution apply, but no arith. Used for associative
 /// array subscripts. The caller decides string vs arith based on the
 /// variable's current `VarValue` variant.
-pub(crate) fn eval_subscript_key(
-    subscript: &Word,
-    shell: &mut Shell,
-) -> String {
+pub(crate) fn eval_subscript_key(subscript: &Word, shell: &mut Shell) -> String {
     crate::param_expansion::expand_word_to_string(subscript, shell)
 }
 
@@ -144,10 +144,8 @@ pub(crate) fn eval_subscript(
     name: &str,
 ) -> Result<usize, String> {
     let s = crate::param_expansion::expand_word_to_string(subscript, shell);
-    let expr = crate::arith::parse(&s)
-        .map_err(|_| format!("{name}: bad array subscript"))?;
-    let n = crate::arith::eval(&expr, shell)
-        .map_err(|_| format!("{name}: bad array subscript"))?;
+    let expr = crate::arith::parse(&s).map_err(|_| format!("{name}: bad array subscript"))?;
+    let n = crate::arith::eval(&expr, shell).map_err(|_| format!("{name}: bad array subscript"))?;
     if n >= 0 {
         Ok(n as usize)
     } else {
@@ -256,13 +254,14 @@ fn expand_positional_substring(
     let end = match length {
         Some(lw) => {
             let len_s = crate::param_expansion::expand_word_to_string(lw, shell);
-            let len_n = match crate::arith::parse(&len_s).and_then(|e| crate::arith::eval(&e, shell)) {
-                Ok(n) => n,
-                Err(_) => {
-                    crate::sh_error!(shell, None, "{name}: bad slice length");
-                    return ExpansionResult::Fatal { status: 1 };
-                }
-            };
+            let len_n =
+                match crate::arith::parse(&len_s).and_then(|e| crate::arith::eval(&e, shell)) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        crate::sh_error!(shell, None, "{name}: bad slice length");
+                        return ExpansionResult::Fatal { status: 1 };
+                    }
+                };
             if len_n < 0 {
                 let total = values.len() as i64;
                 (((total + len_n).max(start as i64)) as usize).min(values.len())
@@ -306,7 +305,10 @@ fn is_per_element_modifier(m: &crate::lexer::ParamModifier) -> bool {
 /// U (upper), L (lower), u (upper-first), E (escape-expand).
 fn is_per_element_transform_op(op: crate::lexer::TransformOp) -> bool {
     use crate::lexer::TransformOp::*;
-    matches!(op, PromptExpand | Quote | Upper | Lower | UpperFirst | EscapeExpand)
+    matches!(
+        op,
+        PromptExpand | Quote | Upper | Lower | UpperFirst | EscapeExpand
+    )
 }
 
 /// `${var@OP}` ops that operate on the whole array (KEYS+VALUES or
@@ -333,7 +335,7 @@ fn scalar_apply_per_element(
     quoted: bool,
     shell: &mut crate::shell_state::Shell,
 ) -> String {
-    use crate::param_expansion::{expand_modifier_with_value, ExpansionResult, ParamLookup};
+    use crate::param_expansion::{ExpansionResult, ParamLookup, expand_modifier_with_value};
     match expand_modifier_with_value(
         name,
         modifier,
@@ -365,10 +367,7 @@ fn expand_assoc_param(
     // Snapshot the pairs once up-front so the rest of the function can
     // borrow `shell` mutably for sub-expansions (e.g., modifier word
     // evaluation, subscript-as-Word expansion).
-    let pairs: Vec<(String, String)> = shell
-        .get_associative(name)
-        .cloned()
-        .unwrap_or_default();
+    let pairs: Vec<(String, String)> = shell.get_associative(name).cloned().unwrap_or_default();
     let values: Vec<String> = pairs.iter().map(|(_, v)| v.clone()).collect();
     let keys: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
 
@@ -398,7 +397,9 @@ fn expand_assoc_param(
         // ${#m[k]} — char count of the value at string key `k`.
         (PM::Length, SK::Index(w)) => {
             let key = eval_subscript_key(w, shell);
-            let val = shell.lookup_associative_element(name, &key).unwrap_or_default();
+            let val = shell
+                .lookup_associative_element(name, &key)
+                .unwrap_or_default();
             ExpansionResult::Value(val.chars().count().to_string())
         }
         // ${!m[@]} / ${!m[*]} — list of string keys in insertion order.
@@ -463,8 +464,7 @@ fn expand_assoc_param(
             } else if quoted {
                 // Quoted outer: keep the existing field-preserving WordList /
                 // [*]-join path (already correct).
-                let words: Vec<String> =
-                    expand(word, shell).into_iter().map(|f| f.chars).collect();
+                let words: Vec<String> = expand(word, shell).into_iter().map(|f| f.chars).collect();
                 if matches!(subscript, SK::Star) {
                     let ifs = shell.ifs();
                     let sep = ifs_join_sep(&ifs);
@@ -490,8 +490,7 @@ fn expand_assoc_param(
                 }
             } else if quoted {
                 // Unset, quoted outer: existing field-preserving path.
-                let words: Vec<String> =
-                    expand(word, shell).into_iter().map(|f| f.chars).collect();
+                let words: Vec<String> = expand(word, shell).into_iter().map(|f| f.chars).collect();
                 if matches!(subscript, SK::Star) {
                     let ifs = shell.ifs();
                     let sep = ifs_join_sep(&ifs);
@@ -588,9 +587,7 @@ fn expand_indirect(
     // Nameref special case: ${!r} where r is a nameref yields the TARGET NAME
     // (the raw stored value), not value-as-name indirection (bash behavior).
     if subscript.is_none() && shell.is_nameref(name) {
-        return ExpansionResult::Value(
-            shell.nameref_raw_target(name).unwrap_or_default(),
-        );
+        return ExpansionResult::Value(shell.nameref_raw_target(name).unwrap_or_default());
     }
     // `${!*}` / `${!@}` (v233 M2): indirect through `$*` / `$@`. bash uses
     // the IFS-joined positional params as the effective NAME: no positionals
@@ -599,14 +596,12 @@ fn expand_indirect(
     // variable name -> fatal rc 1. (The positionals are NOT reachable via
     // `lookup_var("*")`, so handle them before the generic through-value path.)
     if subscript.is_none() && (name == "*" || name == "@") {
-        let through = shell
-            .positional_args
-            .join(&ifs_join_sep(&shell.ifs()));
+        let through = shell.positional_args.join(&ifs_join_sep(&shell.ifs()));
         if through.is_empty() {
             return ExpansionResult::Value(String::new());
         }
-        let valid = crate::builtins::is_valid_name(&through)
-            || through.bytes().all(|b| b.is_ascii_digit());
+        let valid =
+            crate::builtins::is_valid_name(&through) || through.bytes().all(|b| b.is_ascii_digit());
         if !valid {
             crate::sh_error!(shell, None, "{through}: invalid variable name");
             return ExpansionResult::Fatal { status: 1 };
@@ -624,13 +619,25 @@ fn expand_indirect(
             // a single-index `[i]` read that element's scalar value.
             match sub {
                 crate::lexer::SubscriptKind::All | crate::lexer::SubscriptKind::Star => {
-                    match expand_array_param(name, &crate::lexer::ParamModifier::None, sub, /* quoted */ true, shell) {
+                    match expand_array_param(
+                        name,
+                        &crate::lexer::ParamModifier::None,
+                        sub,
+                        /* quoted */ true,
+                        shell,
+                    ) {
                         ExpansionResult::WordList(ws) => ws.join(&ifs_join_sep(&shell.ifs())),
                         ExpansionResult::Value(v) => v,
                         _ => String::new(),
                     }
                 }
-                _ => match expand_array_param(name, &crate::lexer::ParamModifier::None, sub, quoted, shell) {
+                _ => match expand_array_param(
+                    name,
+                    &crate::lexer::ParamModifier::None,
+                    sub,
+                    quoted,
+                    shell,
+                ) {
                     ExpansionResult::Value(v) => v,
                     _ => String::new(),
                 },
@@ -648,8 +655,8 @@ fn expand_indirect(
     // Exception: `name[sub]` element-references (e.g. `arr[0]`, `m[k]`) are
     // valid indirect targets and are handled by the `split_name_subscript`
     // path below — exclude them from this guard.
-    let is_element_ref = split_name_subscript(n)
-        .is_some_and(|(base, _)| crate::builtins::is_valid_name(&base));
+    let is_element_ref =
+        split_name_subscript(n).is_some_and(|(base, _)| crate::builtins::is_valid_name(&base));
     if !through.is_empty()
         && !crate::builtins::is_valid_name(n)
         && !n.bytes().all(|b| b.is_ascii_digit())
@@ -721,9 +728,10 @@ fn expand_indirect(
     // Step 2: parse N into (effective_name, effective_subscript) and
     // re-expand. The only structured form we honor is `name[sub]`.
     if let Some((base, sub_text)) = split_name_subscript(n) {
-        let sub = crate::lexer::SubscriptKind::Index(Word(vec![
-            WordPart::Literal { text: sub_text, quoted: false },
-        ]));
+        let sub = crate::lexer::SubscriptKind::Index(Word(vec![WordPart::Literal {
+            text: sub_text,
+            quoted: false,
+        }]));
         return expand_array_param(&base, modifier, &sub, quoted, shell);
     }
     // The effective name N is a valid parameter. When N is itself unset
@@ -873,10 +881,7 @@ fn expand_array_param(
         }
         // ${!a[@]} / ${!a[*]} — list of subscripts.
         (PM::IndirectKeys, SK::All) | (PM::IndirectKeys, SK::Star) => {
-            let keys: Vec<String> = collect_keys(shell)
-                .iter()
-                .map(usize::to_string)
-                .collect();
+            let keys: Vec<String> = collect_keys(shell).iter().map(usize::to_string).collect();
             if matches!(subscript, SK::All) && quoted {
                 ExpansionResult::WordList(keys)
             } else {
@@ -889,7 +894,8 @@ fn expand_array_param(
         // through array element"); produce empty.
         (PM::IndirectKeys, SK::Index(_)) => ExpansionResult::Value(String::new()),
         // ${a[@]:o:l} / ${a[*]:o:l} — slicing.
-        (PM::Substring { offset, length }, SK::All) | (PM::Substring { offset, length }, SK::Star) => {
+        (PM::Substring { offset, length }, SK::All)
+        | (PM::Substring { offset, length }, SK::Star) => {
             let values = collect_values(shell);
             let sliced = match slice_word_list(&values, offset, length.as_ref(), shell) {
                 Ok(v) => v,
@@ -937,8 +943,7 @@ fn expand_array_param(
             } else if quoted {
                 // Quoted outer: keep the existing field-preserving WordList /
                 // [*]-join path (already correct).
-                let words: Vec<String> =
-                    expand(word, shell).into_iter().map(|f| f.chars).collect();
+                let words: Vec<String> = expand(word, shell).into_iter().map(|f| f.chars).collect();
                 if matches!(subscript, SK::Star) {
                     let ifs = shell.ifs();
                     let sep = ifs_join_sep(&ifs);
@@ -965,8 +970,7 @@ fn expand_array_param(
                 }
             } else if quoted {
                 // Unset, quoted outer: existing field-preserving path.
-                let words: Vec<String> =
-                    expand(word, shell).into_iter().map(|f| f.chars).collect();
+                let words: Vec<String> = expand(word, shell).into_iter().map(|f| f.chars).collect();
                 if matches!(subscript, SK::Star) {
                     let ifs = shell.ifs();
                     let sep = ifs_join_sep(&ifs);
@@ -1011,9 +1015,7 @@ fn expand_array_param(
                         let vs = collect_values(shell);
                         vs.into_iter().next().unwrap_or_default()
                     }
-                    _ => {
-                        shell.lookup_var(name).unwrap_or_default()
-                    }
+                    _ => shell.lookup_var(name).unwrap_or_default(),
                 };
                 ScopeMode::ScalarOrElement(val)
             };
@@ -1077,8 +1079,7 @@ fn expand_part(
             let text = if *assign_ctx && shell.shell_options.posix {
                 render_tilde_literal(spec)
             } else {
-                resolve_tilde(spec, shell)
-                    .unwrap_or_else(|| render_tilde_literal(spec))
+                resolve_tilde(spec, shell).unwrap_or_else(|| render_tilde_literal(spec))
             };
             current.push_str(&text, false);
             *has_emitted = true;
@@ -1102,7 +1103,10 @@ fn expand_part(
             current.push_str(&snapshot_status.to_string(), true);
             *has_emitted = true;
         }
-        WordPart::Var { name, quoted: false } => {
+        WordPart::Var {
+            name,
+            quoted: false,
+        } => {
             let value = match shell.lookup_var(name) {
                 Some(v) => v,
                 None => {
@@ -1117,7 +1121,10 @@ fn expand_part(
             let ifs = shell.ifs();
             emit_split_fields(&value, &ifs, current, result, has_emitted);
         }
-        WordPart::AllArgs { quoted: false, joined: _ } => {
+        WordPart::AllArgs {
+            quoted: false,
+            joined: _,
+        } => {
             // Unquoted $@ and $* are identical: each arg becomes its
             // own field(s), IFS-split. Args are independent — the
             // last IFS-fragment of arg N must NOT merge with the
@@ -1131,7 +1138,10 @@ fn expand_part(
                 emit_split_fields(arg, &ifs, current, result, has_emitted);
             }
         }
-        WordPart::AllArgs { quoted: true, joined: false } => {
+        WordPart::AllArgs {
+            quoted: true,
+            joined: false,
+        } => {
             // "$@" — each arg its own quoted field, no splitting.
             // First arg merges into current; subsequent start new
             // fields; last becomes the new current.
@@ -1148,7 +1158,10 @@ fn expand_part(
             }
             // Empty args: zero fields — do nothing.
         }
-        WordPart::AllArgs { quoted: true, joined: true } => {
+        WordPart::AllArgs {
+            quoted: true,
+            joined: true,
+        } => {
             // "$*" — single field, args joined by the first IFS char.
             // Empty IFS concatenates without a separator (POSIX § 2.5.2).
             let sep = ifs_join_sep(&shell.ifs());
@@ -1161,12 +1174,18 @@ fn expand_part(
             let ifs = shell.ifs();
             emit_split_fields(&value, &ifs, current, result, has_emitted);
         }
-        WordPart::CommandSub { sequence, quoted: true } => {
+        WordPart::CommandSub {
+            sequence,
+            quoted: true,
+        } => {
             let output = run_substitution(sequence, shell);
             current.push_str(&output, true);
             *has_emitted = true;
         }
-        WordPart::CommandSub { sequence, quoted: false } => {
+        WordPart::CommandSub {
+            sequence,
+            quoted: false,
+        } => {
             let output = run_substitution(sequence, shell);
             let ifs = shell.ifs();
             emit_split_fields(&output, &ifs, current, result, has_emitted);
@@ -1190,7 +1209,13 @@ fn expand_part(
                 }
             }
         }
-        WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect } => {
+        WordPart::ParamExpansion {
+            name,
+            modifier,
+            quoted,
+            subscript,
+            indirect,
+        } => {
             // A lexable-but-invalid `${…}` (BadSubst) errors at runtime with
             // bash's whole-word "bad substitution" message (see emit_bad_subst).
             if emit_bad_subst(modifier, word, shell) {
@@ -1282,9 +1307,7 @@ fn expand_part(
                         if i > 0 {
                             result.push(std::mem::take(current));
                         }
-                        emit_split_field_quoted(
-                            &f, &ifs, current, result, has_emitted,
-                        );
+                        emit_split_field_quoted(&f, &ifs, current, result, has_emitted);
                     }
                 }
                 crate::param_expansion::ExpansionResult::Fatal { status } => {
@@ -1313,7 +1336,12 @@ fn expand_part(
                     *has_emitted = true;
                 }
                 Err(e) => {
-                    crate::sh_error!(shell, None, "process substitution: {}", crate::bash_io_error(&e));
+                    crate::sh_error!(
+                        shell,
+                        None,
+                        "process substitution: {}",
+                        crate::bash_io_error(&e)
+                    );
                     // Emit nothing; the field stays empty if no other parts.
                 }
             }
@@ -1323,7 +1351,17 @@ fn expand_part(
             // individual `quoted: true` flags so expansion semantics are
             // unchanged; the wrapper exists only for source reconstruction.
             for inner in parts {
-                if expand_part(inner, current, result, has_emitted, shell, snapshot_status, word).is_break() {
+                if expand_part(
+                    inner,
+                    current,
+                    result,
+                    has_emitted,
+                    shell,
+                    snapshot_status,
+                    word,
+                )
+                .is_break()
+                {
                     return ControlFlow::Break(());
                 }
             }
@@ -1358,7 +1396,17 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
     let mut result: Vec<Field> = Vec::new();
 
     for part in &word.0 {
-        if expand_part(part, &mut current, &mut result, &mut has_emitted, shell, snapshot_status, word).is_break() {
+        if expand_part(
+            part,
+            &mut current,
+            &mut result,
+            &mut has_emitted,
+            shell,
+            snapshot_status,
+            word,
+        )
+        .is_break()
+        {
             return result;
         }
     }
@@ -1514,11 +1562,20 @@ fn reconstruct_part(part: &WordPart, out: &mut String) {
             out.push(')');
         }
         P::ProcessSub { sequence, dir } => {
-            out.push_str(match dir { ProcDir::In => "<(", ProcDir::Out => ">(" });
+            out.push_str(match dir {
+                ProcDir::In => "<(",
+                ProcDir::Out => ">(",
+            });
             out.push_str(&reconstruct_sequence_source(sequence));
             out.push(')');
         }
-        P::ParamExpansion { name, modifier, subscript, indirect, .. } => {
+        P::ParamExpansion {
+            name,
+            modifier,
+            subscript,
+            indirect,
+            ..
+        } => {
             reconstruct_param_expansion(name, modifier, subscript.as_ref(), *indirect, out);
         }
         P::AssignPrefix { .. } | P::ArrayLiteral(_) => {}
@@ -1541,7 +1598,9 @@ fn reconstruct_param_expansion(
     indirect: bool,
     out: &mut String,
 ) {
-    use crate::lexer::{ParamModifier as M, SubstAnchor, CaseDirection, SubscriptKind as S, TransformOp};
+    use crate::lexer::{
+        CaseDirection, ParamModifier as M, SubscriptKind as S, SubstAnchor, TransformOp,
+    };
     // A bad substitution carries its full `${…}` source verbatim; emit it as-is
     // so `set -x` traces reproduce the original (matches generate.rs).
     if let M::BadSubst { raw } = modifier {
@@ -1601,9 +1660,16 @@ fn reconstruct_param_expansion(
             out.push_str(if *longest { "%%" } else { "%" });
             out.push_str(&reconstruct_word_source_inner(pattern));
         }
-        M::Substitute { pattern, replacement, anchor, all } => {
+        M::Substitute {
+            pattern,
+            replacement,
+            anchor,
+            all,
+        } => {
             out.push('/');
-            if *all { out.push('/'); }
+            if *all {
+                out.push('/');
+            }
             match anchor {
                 SubstAnchor::None => {}
                 SubstAnchor::Prefix => out.push('#'),
@@ -1621,10 +1687,19 @@ fn reconstruct_param_expansion(
                 out.push_str(&reconstruct_word_source_inner(len));
             }
         }
-        M::Case { direction, all, pattern } => {
-            let c = match direction { CaseDirection::Upper => '^', CaseDirection::Lower => ',' };
+        M::Case {
+            direction,
+            all,
+            pattern,
+        } => {
+            let c = match direction {
+                CaseDirection::Upper => '^',
+                CaseDirection::Lower => ',',
+            };
             out.push(c);
-            if *all { out.push(c); }
+            if *all {
+                out.push(c);
+            }
             if let Some(p) = pattern {
                 out.push_str(&reconstruct_word_source_inner(p));
             }
@@ -1707,22 +1782,19 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 // `case`/`[[` patterns): always resolve — posix does NOT restrict
                 // tilde here. The `assign_ctx` tag is only consulted by the
                 // argument-expansion path (`expand_part`).
-                let text = resolve_tilde(spec, shell)
-                    .unwrap_or_else(|| render_tilde_literal(spec));
+                let text = resolve_tilde(spec, shell).unwrap_or_else(|| render_tilde_literal(spec));
                 result.push_str(&text);
             }
-            WordPart::Var { name, .. } => {
-                match shell.lookup_var(name) {
-                    Some(value) => result.push_str(&value),
-                    None => {
-                        if shell.shell_options.nounset {
-                            crate::sh_error!(shell, None, "{name}: unbound variable");
-                            shell.pending_fatal_status = Some(1);
-                            return result;
-                        }
+            WordPart::Var { name, .. } => match shell.lookup_var(name) {
+                Some(value) => result.push_str(&value),
+                None => {
+                    if shell.shell_options.nounset {
+                        crate::sh_error!(shell, None, "{name}: unbound variable");
+                        shell.pending_fatal_status = Some(1);
+                        return result;
                     }
                 }
-            }
+            },
             WordPart::LastStatus { .. } => {
                 result.push_str(&snapshot_status.to_string());
             }
@@ -1738,11 +1810,22 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                         // mode prints and continues. Empty contribution to
                         // the assignment value matches bash. (-c mode
                         // divergence: L-55.)
-                        crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&src, &e));
+                        crate::sh_error!(
+                            shell,
+                            None,
+                            "{}",
+                            crate::arith::render_error_body(&src, &e)
+                        );
                     }
                 }
             }
-            WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect } => {
+            WordPart::ParamExpansion {
+                name,
+                modifier,
+                quoted,
+                subscript,
+                indirect,
+            } => {
                 if emit_bad_subst(modifier, word, shell) {
                     return result;
                 }
@@ -1864,7 +1947,11 @@ fn escape_pattern_literal(text: &str) -> String {
 /// Shared body for `expand_pattern` and `expand_regex_operand`: expands `word`
 /// with no field splitting, calling `escape` on text contributed by quoted
 /// parts so that quoted metacharacters match literally.
-fn expand_word_with_quote_escape(word: &Word, shell: &mut Shell, escape: fn(&str) -> String) -> String {
+fn expand_word_with_quote_escape(
+    word: &Word,
+    shell: &mut Shell,
+    escape: fn(&str) -> String,
+) -> String {
     // Snapshot `$?` so `LastStatus` parts read the value at the start of
     // the expansion, not whatever a preceding `$(cmd)` mutated it to.
     // Matches the contract in `expand()` (used for command arguments).
@@ -1923,7 +2010,7 @@ pub fn run_substitution(seq: &Sequence, shell: &mut Shell) -> String {
     cloned.xtrace_depth += 1; // PS4 depth-repeat: $() / backticks add a level (bash)
     let (output, status) = executor::execute_capturing(seq, &mut cloned);
     shell.set_last_status(status);
-    shell.set_last_cmd_sub_status(Some(status));   // for bare-assignment exit status (v126)
+    shell.set_last_cmd_sub_status(Some(status)); // for bare-assignment exit status (v126)
     strip_trailing_newlines(&output)
 }
 
@@ -1936,7 +2023,10 @@ fn strip_trailing_newlines(s: &str) -> String {
 /// IFS. Matches bash § 3.5.5 ("If IFS is null, the parameters are joined
 /// without intervening separators").
 pub(crate) fn ifs_join_sep(ifs: &str) -> String {
-    ifs.chars().next().map(|c| c.to_string()).unwrap_or_default()
+    ifs.chars()
+        .next()
+        .map(|c| c.to_string())
+        .unwrap_or_default()
 }
 
 fn emit_split_fields(
@@ -2052,8 +2142,7 @@ fn emit_split_field_quoted(
     let chars: Vec<char> = field.chars.chars().collect();
     // A char is a separator iff it is an IFS char AND unquoted.
     let sep_at = |idx: usize| -> bool {
-        !field.quoted.get(idx).copied().unwrap_or(false)
-            && ifs.contains(chars[idx])
+        !field.quoted.get(idx).copied().unwrap_or(false) && ifs.contains(chars[idx])
     };
     let is_ws = |c: char| matches!(c, ' ' | '\t' | '\n') && ifs.contains(c);
 
@@ -2071,7 +2160,10 @@ fn emit_split_field_quoted(
     // Empty IFS → no splitting; append the whole field verbatim.
     if ifs.is_empty() {
         for (idx, c) in chars.iter().enumerate() {
-            current.push_str(&c.to_string(), field.quoted.get(idx).copied().unwrap_or(false));
+            current.push_str(
+                &c.to_string(),
+                field.quoted.get(idx).copied().unwrap_or(false),
+            );
         }
         *has_emitted = true;
         return;
@@ -2088,7 +2180,10 @@ fn emit_split_field_quoted(
         // Read one field: run of chars that are not unquoted-IFS separators.
         let mut piece = Field::new();
         while i < n && !sep_at(i) {
-            piece.push_str(&chars[i].to_string(), field.quoted.get(i).copied().unwrap_or(false));
+            piece.push_str(
+                &chars[i].to_string(),
+                field.quoted.get(i).copied().unwrap_or(false),
+            );
             i += 1;
         }
         if first_field {
@@ -2186,8 +2281,7 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts, shell: &Shell
             // literal `.`. We accept both bare `.` and the `[.]` single-element
             // bracket form (verified empirically against `glob` 0.3). `dotglob`
             // forces `*`/`?` to also match a leading dot.
-            let literal_leading_dot =
-                pattern.starts_with('.') || pattern.starts_with("[.]");
+            let literal_leading_dot = pattern.starts_with('.') || pattern.starts_with("[.]");
             let match_opts = MatchOptions {
                 case_sensitive: !opts.nocaseglob,
                 require_literal_separator: true,
@@ -2197,7 +2291,11 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts, shell: &Shell
             // `**` is recursive only with `shopt -s globstar`; otherwise it is
             // two ordinary `*` (≡ `*`). The `glob` crate always treats `**` as
             // recursive, so collapse it to `*` when globstar is off.
-            let npat = if opts.globstar { npat } else { collapse_globstar(&npat).into() };
+            let npat = if opts.globstar {
+                npat
+            } else {
+                collapse_globstar(&npat).into()
+            };
             match glob_with(&npat, match_opts) {
                 Ok(paths) => {
                     let mut m = Vec::new();
@@ -2238,7 +2336,10 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts, shell: &Shell
             words.extend(matched);
         }
     }
-    GlobExpansion { words, failglob_unmatched }
+    GlobExpansion {
+        words,
+        failglob_unmatched,
+    }
 }
 
 /// Back-compat: default (all-off) globbing. Retained as a thin wrapper over
@@ -2317,12 +2418,18 @@ fn has_unquoted_metachar(field: &Field) -> bool {
 impl Field {
     pub fn from_unquoted(s: &str) -> Self {
         let count = s.chars().count();
-        Self { chars: s.to_string(), quoted: vec![false; count] }
+        Self {
+            chars: s.to_string(),
+            quoted: vec![false; count],
+        }
     }
 
     pub fn from_quoted(s: &str) -> Self {
         let count = s.chars().count();
-        Self { chars: s.to_string(), quoted: vec![true; count] }
+        Self {
+            chars: s.to_string(),
+            quoted: vec![true; count],
+        }
     }
 }
 
@@ -2332,7 +2439,10 @@ mod tests {
     use crate::command::{Command, ExecCommand, Pipeline, SimpleCommand};
 
     fn lit(s: &str) -> Word {
-        Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
+        Word(vec![WordPart::Literal {
+            text: s.to_string(),
+            quoted: false,
+        }])
     }
 
     #[test]
@@ -2383,9 +2493,9 @@ mod tests {
         assert_eq!(collapse_globstar("***"), "*");
         assert_eq!(collapse_globstar("**/*.txt"), "*/*.txt");
         assert_eq!(collapse_globstar("a/**/b"), "a/*/b");
-        assert_eq!(collapse_globstar("a*b"), "a*b");          // single star unchanged
-        assert_eq!(collapse_globstar("[**]"), "[**]");        // inside bracket class: untouched
-        assert_eq!(collapse_globstar("\\*\\*"), "\\*\\*");    // escaped stars: untouched
+        assert_eq!(collapse_globstar("a*b"), "a*b"); // single star unchanged
+        assert_eq!(collapse_globstar("[**]"), "[**]"); // inside bracket class: untouched
+        assert_eq!(collapse_globstar("\\*\\*"), "\\*\\*"); // escaped stars: untouched
     }
 
     /// Test helper: project `Vec<Field>` back to `Vec<String>` so the existing
@@ -2396,10 +2506,16 @@ mod tests {
     }
 
     fn var_unq(name: &str) -> Word {
-        Word(vec![WordPart::Var { name: name.to_string(), quoted: false }])
+        Word(vec![WordPart::Var {
+            name: name.to_string(),
+            quoted: false,
+        }])
     }
     fn var_q(name: &str) -> Word {
-        Word(vec![WordPart::Var { name: name.to_string(), quoted: true }])
+        Word(vec![WordPart::Var {
+            name: name.to_string(),
+            quoted: true,
+        }])
     }
 
     /// Builds a synthetic Sequence for `echo <args>` — used to drive
@@ -2441,7 +2557,10 @@ mod tests {
     #[test]
     fn expand_literal_word() {
         let mut shell = Shell::new();
-        assert_eq!(expand_strings(&lit("hello"), &mut shell), vec!["hello".to_string()]);
+        assert_eq!(
+            expand_strings(&lit("hello"), &mut shell),
+            vec!["hello".to_string()]
+        );
     }
 
     #[test]
@@ -2454,10 +2573,19 @@ mod tests {
     fn expand_multiple_literals_concatenate() {
         let mut shell = Shell::new();
         let word = Word(vec![
-            WordPart::Literal { text: "foo".to_string(), quoted: false },
-            WordPart::Literal { text: "bar".to_string(), quoted: false },
+            WordPart::Literal {
+                text: "foo".to_string(),
+                quoted: false,
+            },
+            WordPart::Literal {
+                text: "bar".to_string(),
+                quoted: false,
+            },
         ]);
-        assert_eq!(expand_strings(&word, &mut shell), vec!["foobar".to_string()]);
+        assert_eq!(
+            expand_strings(&word, &mut shell),
+            vec!["foobar".to_string()]
+        );
     }
 
     #[test]
@@ -2479,7 +2607,10 @@ mod tests {
     fn expand_set_var_quoted_preserves_whitespace() {
         let mut shell = Shell::new();
         shell.set("HUCK_T", "a b".to_string());
-        assert_eq!(expand_strings(&var_q("HUCK_T"), &mut shell), vec!["a b".to_string()]);
+        assert_eq!(
+            expand_strings(&var_q("HUCK_T"), &mut shell),
+            vec!["a b".to_string()]
+        );
     }
 
     #[test]
@@ -2497,8 +2628,14 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("HUCK_T", "x y".to_string());
         let word = Word(vec![
-            WordPart::Literal { text: "a".to_string(), quoted: false },
-            WordPart::Var { name: "HUCK_T".to_string(), quoted: false },
+            WordPart::Literal {
+                text: "a".to_string(),
+                quoted: false,
+            },
+            WordPart::Var {
+                name: "HUCK_T".to_string(),
+                quoted: false,
+            },
         ]);
         assert_eq!(
             expand_strings(&word, &mut shell),
@@ -2519,8 +2656,14 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("HOME", "/tmp/huck_test".to_string());
         let word = Word(vec![
-            WordPart::Tilde { spec: TildeSpec::Home, assign_ctx: false },
-            WordPart::Literal { text: "/foo".to_string(), quoted: false },
+            WordPart::Tilde {
+                spec: TildeSpec::Home,
+                assign_ctx: false,
+            },
+            WordPart::Literal {
+                text: "/foo".to_string(),
+                quoted: false,
+            },
         ]);
         assert_eq!(
             expand_strings(&word, &mut shell),
@@ -2531,20 +2674,34 @@ mod tests {
     #[test]
     fn expand_unset_unquoted_returns_no_fields_for_redirect_check() {
         let mut shell = Shell::new();
-        assert_eq!(expand_strings(&Word(vec![WordPart::Var {
-            name: "DEFINITELY_NOT_SET_REDIR".to_string(),
-            quoted: false,
-        }]), &mut shell).len(), 0);
+        assert_eq!(
+            expand_strings(
+                &Word(vec![WordPart::Var {
+                    name: "DEFINITELY_NOT_SET_REDIR".to_string(),
+                    quoted: false,
+                }]),
+                &mut shell
+            )
+            .len(),
+            0
+        );
     }
 
     #[test]
     fn expand_unquoted_var_with_two_fields_returns_two_for_redirect_check() {
         let mut shell = Shell::new();
         shell.set("HUCK_T_TWOFIELD", "a b".to_string());
-        assert_eq!(expand_strings(&Word(vec![WordPart::Var {
-            name: "HUCK_T_TWOFIELD".to_string(),
-            quoted: false,
-        }]), &mut shell).len(), 2);
+        assert_eq!(
+            expand_strings(
+                &Word(vec![WordPart::Var {
+                    name: "HUCK_T_TWOFIELD".to_string(),
+                    quoted: false,
+                }]),
+                &mut shell
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
@@ -2563,20 +2720,41 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("HUCK_T_X", "x".to_string());
         let word = Word(vec![
-            WordPart::Literal { text: "pre-".to_string(), quoted: false },
-            WordPart::Var { name: "HUCK_T_X".to_string(), quoted: false },
-            WordPart::Literal { text: "-post".to_string(), quoted: false },
+            WordPart::Literal {
+                text: "pre-".to_string(),
+                quoted: false,
+            },
+            WordPart::Var {
+                name: "HUCK_T_X".to_string(),
+                quoted: false,
+            },
+            WordPart::Literal {
+                text: "-post".to_string(),
+                quoted: false,
+            },
         ]);
-        assert_eq!(expand_assignment(&word, &mut shell), "pre-x-post".to_string());
+        assert_eq!(
+            expand_assignment(&word, &mut shell),
+            "pre-x-post".to_string()
+        );
     }
 
     #[test]
     fn expand_assignment_unset_var_yields_empty_segment() {
         let mut shell = Shell::new();
         let word = Word(vec![
-            WordPart::Literal { text: "[".to_string(), quoted: false },
-            WordPart::Var { name: "DEFINITELY_NOT_SET_ASN".to_string(), quoted: false },
-            WordPart::Literal { text: "]".to_string(), quoted: false },
+            WordPart::Literal {
+                text: "[".to_string(),
+                quoted: false,
+            },
+            WordPart::Var {
+                name: "DEFINITELY_NOT_SET_ASN".to_string(),
+                quoted: false,
+            },
+            WordPart::Literal {
+                text: "]".to_string(),
+                quoted: false,
+            },
         ]);
         assert_eq!(expand_assignment(&word, &mut shell), "[]".to_string());
     }
@@ -2620,7 +2798,10 @@ mod tests {
     fn expand_command_sub_with_literal_prefix_merges_first_field() {
         let mut shell = Shell::new();
         let word = Word(vec![
-            WordPart::Literal { text: "pre".to_string(), quoted: false },
+            WordPart::Literal {
+                text: "pre".to_string(),
+                quoted: false,
+            },
             WordPart::CommandSub {
                 sequence: echo_sequence(&["x", "y"]),
                 quoted: false,
@@ -2719,7 +2900,10 @@ mod tests {
     fn expand_tilde_home_unset_falls_back_to_literal() {
         let mut shell = Shell::new();
         shell.unset("HOME");
-        let word = Word(vec![WordPart::Tilde { spec: TildeSpec::Home, assign_ctx: false }]);
+        let word = Word(vec![WordPart::Tilde {
+            spec: TildeSpec::Home,
+            assign_ctx: false,
+        }]);
         assert_eq!(expand_strings(&word, &mut shell), vec!["~"]);
     }
 
@@ -2732,8 +2916,14 @@ mod tests {
         shell.export_set("HOME", "/usr/xyz".to_string());
         shell.shell_options.posix = true;
         let word = Word(vec![
-            WordPart::Literal { text: "foo=bar:".to_string(), quoted: false },
-            WordPart::Tilde { spec: TildeSpec::Home, assign_ctx: true },
+            WordPart::Literal {
+                text: "foo=bar:".to_string(),
+                quoted: false,
+            },
+            WordPart::Tilde {
+                spec: TildeSpec::Home,
+                assign_ctx: true,
+            },
         ]);
         assert_eq!(expand_strings(&word, &mut shell), vec!["foo=bar:~"]);
         // Non-posix: the same word DOES expand.
@@ -2741,7 +2931,10 @@ mod tests {
         assert_eq!(expand_strings(&word, &mut shell), vec!["foo=bar:/usr/xyz"]);
         // POSIX word-start tilde (assign_ctx=false) still expands even in an arg.
         shell.shell_options.posix = true;
-        let ws = Word(vec![WordPart::Tilde { spec: TildeSpec::Home, assign_ctx: false }]);
+        let ws = Word(vec![WordPart::Tilde {
+            spec: TildeSpec::Home,
+            assign_ctx: false,
+        }]);
         assert_eq!(expand_strings(&ws, &mut shell), vec!["/usr/xyz"]);
         // POSIX assignment PATH (expand_assignment) always resolves an
         // assign-ctx tilde — leading assignments / declaration builtins.
@@ -2755,7 +2948,10 @@ mod tests {
     fn expand_tilde_pwd_resolves_when_pwd_set() {
         let mut shell = Shell::new();
         shell.export_set("PWD", "/var/tmp".to_string());
-        let word = Word(vec![WordPart::Tilde { spec: TildeSpec::Pwd, assign_ctx: false }]);
+        let word = Word(vec![WordPart::Tilde {
+            spec: TildeSpec::Pwd,
+            assign_ctx: false,
+        }]);
         assert_eq!(expand_strings(&word, &mut shell), vec!["/var/tmp"]);
     }
 
@@ -2763,7 +2959,10 @@ mod tests {
     fn expand_tilde_pwd_unset_falls_back_to_literal_plus() {
         let mut shell = Shell::new();
         shell.unset("PWD");
-        let word = Word(vec![WordPart::Tilde { spec: TildeSpec::Pwd, assign_ctx: false }]);
+        let word = Word(vec![WordPart::Tilde {
+            spec: TildeSpec::Pwd,
+            assign_ctx: false,
+        }]);
         assert_eq!(expand_strings(&word, &mut shell), vec!["~+"]);
     }
 
@@ -2771,7 +2970,10 @@ mod tests {
     fn expand_tilde_oldpwd_unset_falls_back_to_literal_minus() {
         let mut shell = Shell::new();
         shell.unset("OLDPWD");
-        let word = Word(vec![WordPart::Tilde { spec: TildeSpec::OldPwd, assign_ctx: false }]);
+        let word = Word(vec![WordPart::Tilde {
+            spec: TildeSpec::OldPwd,
+            assign_ctx: false,
+        }]);
         assert_eq!(expand_strings(&word, &mut shell), vec!["~-"]);
     }
 
@@ -2779,8 +2981,14 @@ mod tests {
     fn expand_tilde_unknown_user_falls_back_to_literal() {
         let mut shell = Shell::new();
         let word = Word(vec![
-            WordPart::Tilde { spec: TildeSpec::User("definitely_not_a_real_user_xyz_42".to_string()), assign_ctx: false },
-            WordPart::Literal { text: "/x".to_string(), quoted: false },
+            WordPart::Tilde {
+                spec: TildeSpec::User("definitely_not_a_real_user_xyz_42".to_string()),
+                assign_ctx: false,
+            },
+            WordPart::Literal {
+                text: "/x".to_string(),
+                quoted: false,
+            },
         ]);
         assert_eq!(
             expand_strings(&word, &mut shell),
@@ -2793,9 +3001,18 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("HOME", "/h".to_string());
         let word = Word(vec![
-            WordPart::Literal { text: "PATH=".to_string(), quoted: false },
-            WordPart::Tilde { spec: TildeSpec::Home, assign_ctx: false },
-            WordPart::Literal { text: "/bin".to_string(), quoted: false },
+            WordPart::Literal {
+                text: "PATH=".to_string(),
+                quoted: false,
+            },
+            WordPart::Tilde {
+                spec: TildeSpec::Home,
+                assign_ctx: false,
+            },
+            WordPart::Literal {
+                text: "/bin".to_string(),
+                quoted: false,
+            },
         ]);
         assert_eq!(expand_assignment(&word, &mut shell), "PATH=/h/bin");
     }
@@ -2835,7 +3052,10 @@ mod tests {
     #[test]
     fn expand_literal_unquoted_marks_chars_unquoted() {
         let mut shell = Shell::new();
-        let word = Word(vec![WordPart::Literal { text: "abc".to_string(), quoted: false }]);
+        let word = Word(vec![WordPart::Literal {
+            text: "abc".to_string(),
+            quoted: false,
+        }]);
         let fields = expand(&word, &mut shell);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].quoted, vec![false, false, false]);
@@ -2844,7 +3064,10 @@ mod tests {
     #[test]
     fn expand_literal_quoted_marks_chars_quoted() {
         let mut shell = Shell::new();
-        let word = Word(vec![WordPart::Literal { text: "abc".to_string(), quoted: true }]);
+        let word = Word(vec![WordPart::Literal {
+            text: "abc".to_string(),
+            quoted: true,
+        }]);
         let fields = expand(&word, &mut shell);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].quoted, vec![true, true, true]);
@@ -2854,21 +3077,36 @@ mod tests {
     fn expand_mixed_quoted_unquoted_literal_parts() {
         let mut shell = Shell::new();
         let word = Word(vec![
-            WordPart::Literal { text: "foo".to_string(), quoted: false },
-            WordPart::Literal { text: "*".to_string(), quoted: true },
-            WordPart::Literal { text: "bar".to_string(), quoted: false },
+            WordPart::Literal {
+                text: "foo".to_string(),
+                quoted: false,
+            },
+            WordPart::Literal {
+                text: "*".to_string(),
+                quoted: true,
+            },
+            WordPart::Literal {
+                text: "bar".to_string(),
+                quoted: false,
+            },
         ]);
         let fields = expand(&word, &mut shell);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].chars, "foo*bar");
-        assert_eq!(fields[0].quoted, vec![false, false, false, true, false, false, false]);
+        assert_eq!(
+            fields[0].quoted,
+            vec![false, false, false, true, false, false, false]
+        );
     }
 
     #[test]
     fn expand_quoted_var_marks_chars_quoted() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_Q", "val".to_string());
-        let word = Word(vec![WordPart::Var { name: "HUCK_Q".to_string(), quoted: true }]);
+        let word = Word(vec![WordPart::Var {
+            name: "HUCK_Q".to_string(),
+            quoted: true,
+        }]);
         let fields = expand(&word, &mut shell);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].quoted, vec![true, true, true]);
@@ -2878,7 +3116,10 @@ mod tests {
     fn expand_unquoted_var_marks_chars_unquoted() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_Q", "val".to_string());
-        let word = Word(vec![WordPart::Var { name: "HUCK_Q".to_string(), quoted: false }]);
+        let word = Word(vec![WordPart::Var {
+            name: "HUCK_Q".to_string(),
+            quoted: false,
+        }]);
         let fields = expand(&word, &mut shell);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].quoted, vec![false, false, false]);
@@ -2888,7 +3129,10 @@ mod tests {
     fn expand_tilde_marks_chars_unquoted() {
         let mut shell = Shell::new();
         shell.export_set("HOME", "/h".to_string());
-        let word = Word(vec![WordPart::Tilde { spec: TildeSpec::Home, assign_ctx: false }]);
+        let word = Word(vec![WordPart::Tilde {
+            spec: TildeSpec::Home,
+            assign_ctx: false,
+        }]);
         let fields = expand(&word, &mut shell);
         assert_eq!(fields[0].chars, "/h");
         assert_eq!(fields[0].quoted, vec![false, false]);
@@ -3113,7 +3357,10 @@ mod tests {
     #[test]
     fn expand_then_glob_end_to_end_for_literal() {
         let mut shell = Shell::new();
-        let word = Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }]);
+        let word = Word(vec![WordPart::Literal {
+            text: "hello".to_string(),
+            quoted: false,
+        }]);
         let argv = glob_expand_fields(expand(&word, &mut shell), &shell);
         assert_eq!(argv, vec!["hello".to_string()]);
     }
@@ -3122,7 +3369,10 @@ mod tests {
     /// post-v93 deferred-parse shape; arithmetic is parsed at eval time).
     fn arith_part(text: &str) -> WordPart {
         WordPart::Arith {
-            body: Word(vec![WordPart::Literal { text: text.to_string(), quoted: true }]),
+            body: Word(vec![WordPart::Literal {
+                text: text.to_string(),
+                quoted: true,
+            }]),
             quoted: false,
         }
     }
@@ -3186,7 +3436,10 @@ mod tests {
         let word = Word(vec![WordPart::ParamExpansion {
             name: "HUCK_TEST_PE_E1".to_string(),
             modifier: ParamModifier::UseDefault {
-                word: Word(vec![WordPart::Literal { text: "fallback".to_string(), quoted: false }]),
+                word: Word(vec![WordPart::Literal {
+                    text: "fallback".to_string(),
+                    quoted: false,
+                }]),
                 colon: true,
             },
             quoted: false,
@@ -3205,7 +3458,10 @@ mod tests {
         let word = Word(vec![WordPart::ParamExpansion {
             name: "HUCK_TEST_PE_E2".to_string(),
             modifier: ParamModifier::UseDefault {
-                word: Word(vec![WordPart::Literal { text: "a b c".to_string(), quoted: false }]),
+                word: Word(vec![WordPart::Literal {
+                    text: "a b c".to_string(),
+                    quoted: false,
+                }]),
                 colon: true,
             },
             quoted: true,
@@ -3234,7 +3490,10 @@ mod tests {
         }]);
         let fields = expand(&word, &mut shell);
         let strings: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
-        assert_eq!(strings, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            strings,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]
@@ -3244,7 +3503,10 @@ mod tests {
         let word = Word(vec![WordPart::ParamExpansion {
             name: "HUCK_TEST_PE_E4".to_string(),
             modifier: ParamModifier::UseDefault {
-                word: Word(vec![WordPart::Literal { text: "a b c".to_string(), quoted: false }]),
+                word: Word(vec![WordPart::Literal {
+                    text: "a b c".to_string(),
+                    quoted: false,
+                }]),
                 colon: true,
             },
             quoted: false,
@@ -3262,7 +3524,10 @@ mod tests {
         let word = Word(vec![WordPart::ParamExpansion {
             name: "HUCK_TEST_PE_E5".to_string(),
             modifier: ParamModifier::ErrorIfUnset {
-                word: Word(vec![WordPart::Literal { text: "missing".to_string(), quoted: false }]),
+                word: Word(vec![WordPart::Literal {
+                    text: "missing".to_string(),
+                    quoted: false,
+                }]),
                 colon: true,
             },
             quoted: false,
@@ -3302,7 +3567,10 @@ mod tests {
             background: false,
         };
         let word = Word(vec![
-            WordPart::CommandSub { sequence: false_cmd, quoted: false },
+            WordPart::CommandSub {
+                sequence: false_cmd,
+                quoted: false,
+            },
             WordPart::LastStatus { quoted: false },
         ]);
 
@@ -3338,7 +3606,10 @@ mod tests {
     fn expand_dollar_digit_reads_positional() {
         let mut shell = Shell::new();
         shell.positional_args = vec!["alpha".to_string(), "beta".to_string()];
-        let w = Word(vec![WordPart::Var { name: "1".to_string(), quoted: false }]);
+        let w = Word(vec![WordPart::Var {
+            name: "1".to_string(),
+            quoted: false,
+        }]);
         let fields = expand(&w, &mut shell);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].chars, "alpha");
@@ -3347,7 +3618,10 @@ mod tests {
     #[test]
     fn expand_dollar_digit_unset_is_empty() {
         let mut shell = Shell::new();
-        let w = Word(vec![WordPart::Var { name: "1".to_string(), quoted: false }]);
+        let w = Word(vec![WordPart::Var {
+            name: "1".to_string(),
+            quoted: false,
+        }]);
         let fields = expand(&w, &mut shell);
         // Unset positional → no field (consistent with unset var behaviour)
         assert!(fields.is_empty());
@@ -3357,7 +3631,10 @@ mod tests {
     fn expand_dollar_hash_is_arg_count() {
         let mut shell = Shell::new();
         shell.positional_args = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let w = Word(vec![WordPart::Var { name: "#".to_string(), quoted: false }]);
+        let w = Word(vec![WordPart::Var {
+            name: "#".to_string(),
+            quoted: false,
+        }]);
         let fields = expand(&w, &mut shell);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].chars, "3");
@@ -3367,7 +3644,10 @@ mod tests {
     fn expand_dollar_at_quoted_produces_field_per_arg() {
         let mut shell = Shell::new();
         shell.positional_args = vec!["a a".to_string(), "b".to_string()];
-        let w = Word(vec![WordPart::AllArgs { joined: false, quoted: true }]);
+        let w = Word(vec![WordPart::AllArgs {
+            joined: false,
+            quoted: true,
+        }]);
         let fields = expand(&w, &mut shell);
         // Each arg its own field; the space inside "a a" is preserved (no splitting).
         assert_eq!(fields.len(), 2);
@@ -3379,7 +3659,10 @@ mod tests {
     fn expand_dollar_star_quoted_joins_with_space() {
         let mut shell = Shell::new();
         shell.positional_args = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let w = Word(vec![WordPart::AllArgs { joined: true, quoted: true }]);
+        let w = Word(vec![WordPart::AllArgs {
+            joined: true,
+            quoted: true,
+        }]);
         let fields = expand(&w, &mut shell);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].chars, "a b c");
@@ -3392,7 +3675,10 @@ mod tests {
         let mut shell = Shell::new();
         shell.positional_args = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         shell.set("IFS", ":".to_string());
-        let w = Word(vec![WordPart::AllArgs { joined: true, quoted: true }]);
+        let w = Word(vec![WordPart::AllArgs {
+            joined: true,
+            quoted: true,
+        }]);
         let fields = expand(&w, &mut shell);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].chars, "a:b:c");
@@ -3401,7 +3687,10 @@ mod tests {
     #[test]
     fn expand_dollar_at_empty_produces_no_fields() {
         let mut shell = Shell::new();
-        let w = Word(vec![WordPart::AllArgs { joined: false, quoted: true }]);
+        let w = Word(vec![WordPart::AllArgs {
+            joined: false,
+            quoted: true,
+        }]);
         let fields = expand(&w, &mut shell);
         // Either zero fields or all-empty fields are acceptable per the spec.
         assert!(fields.is_empty());
@@ -3414,7 +3703,10 @@ mod tests {
         // args do NOT merge across boundaries.
         let mut shell = Shell::new();
         shell.positional_args = vec!["hello world".to_string(), "x".to_string()];
-        let w = Word(vec![WordPart::AllArgs { joined: false, quoted: false }]);
+        let w = Word(vec![WordPart::AllArgs {
+            joined: false,
+            quoted: false,
+        }]);
         let fields = expand(&w, &mut shell);
         assert_eq!(fields.len(), 3, "fields: {fields:?}");
         assert_eq!(fields[0].chars, "hello");
@@ -3424,11 +3716,15 @@ mod tests {
 
     #[test]
     fn case_modifier_on_indexed_array_at() {
-        use crate::shell_state::Shell;
         use crate::param_expansion::ExpansionResult;
+        use crate::shell_state::Shell;
         let mut shell = Shell::new();
-        shell.set_indexed_element("a", 0, "foo".to_string()).unwrap();
-        shell.set_indexed_element("a", 1, "bar".to_string()).unwrap();
+        shell
+            .set_indexed_element("a", 0, "foo".to_string())
+            .unwrap();
+        shell
+            .set_indexed_element("a", 1, "bar".to_string())
+            .unwrap();
         let result = expand_array_param(
             "a",
             &crate::lexer::ParamModifier::Case {
@@ -3448,11 +3744,15 @@ mod tests {
 
     #[test]
     fn case_modifier_on_indexed_array_star() {
-        use crate::shell_state::Shell;
         use crate::param_expansion::ExpansionResult;
+        use crate::shell_state::Shell;
         let mut shell = Shell::new();
-        shell.set_indexed_element("a", 0, "foo".to_string()).unwrap();
-        shell.set_indexed_element("a", 1, "bar".to_string()).unwrap();
+        shell
+            .set_indexed_element("a", 0, "foo".to_string())
+            .unwrap();
+        shell
+            .set_indexed_element("a", 1, "bar".to_string())
+            .unwrap();
         let result = expand_array_param(
             "a",
             &crate::lexer::ParamModifier::Case {
@@ -3472,16 +3772,26 @@ mod tests {
 
     #[test]
     fn remove_suffix_per_element_indexed() {
-        use crate::shell_state::Shell;
         use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, Word, WordPart};
         use crate::param_expansion::ExpansionResult;
+        use crate::shell_state::Shell;
         let mut shell = Shell::new();
-        shell.set_indexed_element("a", 0, "foo.txt".to_string()).unwrap();
-        shell.set_indexed_element("a", 1, "bar.md".to_string()).unwrap();
-        let pat = Word(vec![WordPart::Literal { text: ".*".into(), quoted: false }]);
+        shell
+            .set_indexed_element("a", 0, "foo.txt".to_string())
+            .unwrap();
+        shell
+            .set_indexed_element("a", 1, "bar.md".to_string())
+            .unwrap();
+        let pat = Word(vec![WordPart::Literal {
+            text: ".*".into(),
+            quoted: false,
+        }]);
         let result = expand_array_param(
             "a",
-            &PM::RemoveSuffix { pattern: pat, longest: false },
+            &PM::RemoveSuffix {
+                pattern: pat,
+                longest: false,
+            },
             &SK::All,
             true,
             &mut shell,
@@ -3494,8 +3804,8 @@ mod tests {
 
     #[test]
     fn empty_array_per_element_modifier() {
-        use crate::shell_state::Shell;
         use crate::param_expansion::ExpansionResult;
+        use crate::shell_state::Shell;
         let mut shell = Shell::new();
         let result = expand_array_param(
             "a",
@@ -3509,19 +3819,25 @@ mod tests {
             &mut shell,
         );
         match result {
-            ExpansionResult::WordList(words) => assert!(words.is_empty(), "expected empty WordList, got {words:?}"),
+            ExpansionResult::WordList(words) => {
+                assert!(words.is_empty(), "expected empty WordList, got {words:?}")
+            }
             other => panic!("expected WordList, got {other:?}"),
         }
     }
 
     #[test]
     fn case_modifier_on_associative_array() {
-        use crate::shell_state::Shell;
         use crate::param_expansion::ExpansionResult;
+        use crate::shell_state::Shell;
         let mut shell = Shell::new();
         shell.declare_associative("m").unwrap();
-        shell.set_associative_element("m", "k".to_string(), "foo".to_string()).unwrap();
-        shell.set_associative_element("m", "j".to_string(), "bar".to_string()).unwrap();
+        shell
+            .set_associative_element("m", "k".to_string(), "foo".to_string())
+            .unwrap();
+        shell
+            .set_associative_element("m", "j".to_string(), "bar".to_string())
+            .unwrap();
         let result = expand_array_param(
             "m",
             &crate::lexer::ParamModifier::Case {
@@ -3545,15 +3861,25 @@ mod tests {
 
     #[test]
     fn substitute_per_element_assoc() {
-        use crate::shell_state::Shell;
         use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, SubstAnchor, Word, WordPart};
         use crate::param_expansion::ExpansionResult;
+        use crate::shell_state::Shell;
         let mut shell = Shell::new();
         shell.declare_associative("m").unwrap();
-        shell.set_associative_element("m", "k".to_string(), "foo".to_string()).unwrap();
-        shell.set_associative_element("m", "j".to_string(), "boo".to_string()).unwrap();
-        let pat = Word(vec![WordPart::Literal { text: "o".into(), quoted: false }]);
-        let repl = Word(vec![WordPart::Literal { text: "X".into(), quoted: false }]);
+        shell
+            .set_associative_element("m", "k".to_string(), "foo".to_string())
+            .unwrap();
+        shell
+            .set_associative_element("m", "j".to_string(), "boo".to_string())
+            .unwrap();
+        let pat = Word(vec![WordPart::Literal {
+            text: "o".into(),
+            quoted: false,
+        }]);
+        let repl = Word(vec![WordPart::Literal {
+            text: "X".into(),
+            quoted: false,
+        }]);
         let result = expand_array_param(
             "m",
             &PM::Substitute {
@@ -3578,12 +3904,17 @@ mod tests {
 
     #[test]
     fn assign_default_on_array_still_errors() {
-        use crate::shell_state::Shell;
         use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, Word, WordPart};
         use crate::param_expansion::ExpansionResult;
+        use crate::shell_state::Shell;
         let mut shell = Shell::new();
-        shell.set_indexed_element("a", 0, "foo".to_string()).unwrap();
-        let word = Word(vec![WordPart::Literal { text: "default".into(), quoted: false }]);
+        shell
+            .set_indexed_element("a", 0, "foo".to_string())
+            .unwrap();
+        let word = Word(vec![WordPart::Literal {
+            text: "default".into(),
+            quoted: false,
+        }]);
         let result = expand_array_param(
             "a",
             &PM::AssignDefault { word, colon: true },
@@ -3599,11 +3930,14 @@ mod tests {
 
     #[test]
     fn error_if_unset_on_array_still_errors() {
-        use crate::shell_state::Shell;
         use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, Word, WordPart};
         use crate::param_expansion::ExpansionResult;
+        use crate::shell_state::Shell;
         let mut shell = Shell::new();
-        let word = Word(vec![WordPart::Literal { text: "msg".into(), quoted: false }]);
+        let word = Word(vec![WordPart::Literal {
+            text: "msg".into(),
+            quoted: false,
+        }]);
         let result = expand_array_param(
             "a",
             &PM::ErrorIfUnset { word, colon: true },
@@ -3619,15 +3953,17 @@ mod tests {
 
     #[test]
     fn transform_assign_decl_on_indexed_at() {
-        use crate::shell_state::Shell;
+        use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, TransformOp};
         use crate::param_expansion::ExpansionResult;
-        use crate::lexer::{ParamModifier as PM, TransformOp, SubscriptKind as SK};
+        use crate::shell_state::Shell;
         let mut shell = Shell::new();
         shell.set_indexed_element("a", 0, "x".to_string()).unwrap();
         shell.set_indexed_element("a", 1, "y".to_string()).unwrap();
         let result = expand_array_param(
             "a",
-            &PM::Transform { op: TransformOp::AssignDecl },
+            &PM::Transform {
+                op: TransformOp::AssignDecl,
+            },
             &SK::All,
             true,
             &mut shell,
@@ -3640,15 +3976,17 @@ mod tests {
 
     #[test]
     fn transform_kv_words_on_indexed_yields_wordlist() {
-        use crate::shell_state::Shell;
+        use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, TransformOp};
         use crate::param_expansion::ExpansionResult;
-        use crate::lexer::{ParamModifier as PM, TransformOp, SubscriptKind as SK};
+        use crate::shell_state::Shell;
         let mut shell = Shell::new();
         shell.set_indexed_element("a", 0, "x".to_string()).unwrap();
         shell.set_indexed_element("a", 1, "y".to_string()).unwrap();
         let result = expand_array_param(
             "a",
-            &PM::Transform { op: TransformOp::KvWords },
+            &PM::Transform {
+                op: TransformOp::KvWords,
+            },
             &SK::All,
             true,
             &mut shell,
@@ -3661,14 +3999,16 @@ mod tests {
 
     #[test]
     fn transform_attr_flags_indexed_yields_a() {
-        use crate::shell_state::Shell;
+        use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, TransformOp};
         use crate::param_expansion::ExpansionResult;
-        use crate::lexer::{ParamModifier as PM, TransformOp, SubscriptKind as SK};
+        use crate::shell_state::Shell;
         let mut shell = Shell::new();
         shell.set_indexed_element("a", 0, "x".to_string()).unwrap();
         let result = expand_array_param(
             "a",
-            &PM::Transform { op: TransformOp::AttrFlags },
+            &PM::Transform {
+                op: TransformOp::AttrFlags,
+            },
             &SK::All,
             true,
             &mut shell,
@@ -3681,15 +4021,19 @@ mod tests {
 
     #[test]
     fn transform_assign_decl_on_assoc_at() {
-        use crate::shell_state::Shell;
+        use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, TransformOp};
         use crate::param_expansion::ExpansionResult;
-        use crate::lexer::{ParamModifier as PM, TransformOp, SubscriptKind as SK};
+        use crate::shell_state::Shell;
         let mut shell = Shell::new();
         shell.declare_associative("m").unwrap();
-        shell.set_associative_element("m", "k".to_string(), "v1".to_string()).unwrap();
+        shell
+            .set_associative_element("m", "k".to_string(), "v1".to_string())
+            .unwrap();
         let result = expand_array_param(
             "m",
-            &PM::Transform { op: TransformOp::AssignDecl },
+            &PM::Transform {
+                op: TransformOp::AssignDecl,
+            },
             &SK::All,
             true,
             &mut shell,
@@ -3719,7 +4063,13 @@ mod array_expansion_tests {
     /// produces (matters for the lexer-touching `${!a[@]}` shape).
     fn first_arg_word(input: &str) -> Word {
         let src = format!("echo {input}");
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(&src, &Default::default(), crate::lexer::LexerOptions::default())).expect("parse").expect("non-empty");
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            &src,
+            &Default::default(),
+            crate::lexer::LexerOptions::default(),
+        ))
+        .expect("parse")
+        .expect("non-empty");
         let pipeline = match seq.first {
             Command::Pipeline(p) => p,
             other => panic!("expected Pipeline, got {other:?}"),
@@ -3920,7 +4270,7 @@ mod array_expansion_tests {
     // element (not the default). Pin the happy path.
     #[test]
     fn modifier_on_existing_index_returns_element() {
-        let mut s = shell_with_a();  // a=[(0,"x"),(1,"y"),(2,"z")]
+        let mut s = shell_with_a(); // a=[(0,"x"),(1,"y"),(2,"z")]
         let out = expand_for_test(&mut s, "${a[1]:-fallback}");
         assert_eq!(out, "y");
     }
@@ -3937,7 +4287,13 @@ mod positional_slicing_tests {
 
     fn first_arg_word(input: &str) -> Word {
         let src = format!("echo {input}");
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(&src, &Default::default(), crate::lexer::LexerOptions::default())).expect("parse").expect("non-empty");
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            &src,
+            &Default::default(),
+            crate::lexer::LexerOptions::default(),
+        ))
+        .expect("parse")
+        .expect("non-empty");
         let pipeline = match seq.first {
             Command::Pipeline(p) => p,
             other => panic!("expected Pipeline, got {other:?}"),
@@ -4018,7 +4374,13 @@ mod assoc_expansion_tests {
 
     fn first_arg_word(input: &str) -> Word {
         let src = format!("echo {input}");
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(&src, &Default::default(), crate::lexer::LexerOptions::default())).expect("parse").expect("non-empty");
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            &src,
+            &Default::default(),
+            crate::lexer::LexerOptions::default(),
+        ))
+        .expect("parse")
+        .expect("non-empty");
         let pipeline = match seq.first {
             Command::Pipeline(p) => p,
             other => panic!("expected Pipeline, got {other:?}"),
@@ -4045,9 +4407,12 @@ mod assoc_expansion_tests {
     fn shell_with_m() -> Shell {
         let mut s = Shell::new();
         s.declare_associative("m").unwrap();
-        s.set_associative_element("m", "first".into(), "x".into()).unwrap();
-        s.set_associative_element("m", "second".into(), "y".into()).unwrap();
-        s.set_associative_element("m", "third".into(), "z".into()).unwrap();
+        s.set_associative_element("m", "first".into(), "x".into())
+            .unwrap();
+        s.set_associative_element("m", "second".into(), "y".into())
+            .unwrap();
+        s.set_associative_element("m", "third".into(), "z".into())
+            .unwrap();
         s
     }
 
@@ -4104,7 +4469,8 @@ mod assoc_expansion_tests {
     fn element_length_for_associative() {
         let mut s = Shell::new();
         s.declare_associative("m").unwrap();
-        s.set_associative_element("m", "k".into(), "hello".into()).unwrap();
+        s.set_associative_element("m", "k".into(), "hello".into())
+            .unwrap();
         let out = expand_for_test(&mut s, "${#m[k]}");
         assert_eq!(out, "5");
     }
@@ -4277,11 +4643,15 @@ mod ifs_splitter_tests {
         current.push_str("prefix-", false);
         let mut result: Vec<Field> = Vec::new();
         let mut has_emitted = true;
-        emit_split_fields("a b c", " \t\n", &mut current, &mut result,
-                          &mut has_emitted);
+        emit_split_fields(
+            "a b c",
+            " \t\n",
+            &mut current,
+            &mut result,
+            &mut has_emitted,
+        );
         result.push(current);
         let words: Vec<String> = result.into_iter().map(|f| f.chars).collect();
         assert_eq!(words, vec!["prefix-a", "b", "c"]);
     }
 }
-

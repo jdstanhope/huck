@@ -34,27 +34,20 @@ pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
         ParseError::FunctionName => "invalid function name".to_string(),
         ParseError::FunctionBody => {
             "function definition: expected '()' and a compound-command body \
-             (`if`/`while`/`for`/`case`/`{ … }`)".to_string()
+             (`if`/`while`/`for`/`case`/`{ … }`)"
+                .to_string()
         }
         ParseError::UnterminatedFunction => {
             "unterminated function definition (expected a compound-command body)".to_string()
         }
         ParseError::EmptySubshell => "empty subshell '()' is not allowed".to_string(),
-        ParseError::UnterminatedSubshell => {
-            "unterminated '(' (expected matching ')')".to_string()
-        }
-        ParseError::EmptyDoubleBracket => {
-            "'[[ ]]' with empty body is not allowed".to_string()
-        }
-        ParseError::UnterminatedDoubleBracket => {
-            "unterminated '[[ ]]' (missing ']]')".to_string()
-        }
+        ParseError::UnterminatedSubshell => "unterminated '(' (expected matching ')')".to_string(),
+        ParseError::EmptyDoubleBracket => "'[[ ]]' with empty body is not allowed".to_string(),
+        ParseError::UnterminatedDoubleBracket => "unterminated '[[ ]]' (missing ']]')".to_string(),
         ParseError::TestExprBadOperator(op) => {
             format!("unrecognised operator in '[[ ]]': '{op}'")
         }
-        ParseError::TestExprMissingOperand => {
-            "missing operand in '[[ ]]'".to_string()
-        }
+        ParseError::TestExprMissingOperand => "missing operand in '[[ ]]'".to_string(),
         ParseError::ArithBlock(msg) => {
             format!("arithmetic '((...))': {msg}")
         }
@@ -91,25 +84,20 @@ pub(crate) fn lex_error_message_impl(error: &LexError) -> String {
             format!(" in command substitution{}", lex_error_message_impl(inner))
         }
         LexError::SubstitutionParseError(inner) => {
-            format!(" in command substitution: {}", parse_error_message_impl(inner))
+            format!(
+                " in command substitution: {}",
+                parse_error_message_impl(inner)
+            )
         }
         LexError::UnterminatedHeredoc => ": unterminated here-document".to_string(),
         LexError::BraceExpansionLimit => ": brace expansion: too many elements".to_string(),
-        LexError::UnterminatedSubscript => {
-            ": missing ']' in subscript".to_string()
-        }
-        LexError::UnterminatedArrayLiteral => {
-            ": unterminated array literal '('".to_string()
-        }
+        LexError::UnterminatedSubscript => ": missing ']' in subscript".to_string(),
+        LexError::UnterminatedArrayLiteral => ": unterminated array literal '('".to_string(),
         LexError::ArrayLiteralMissingEquals => {
             ": array element subscript requires '=' after ']'".to_string()
         }
-        LexError::UnterminatedArithBlock => {
-            ": unterminated '((' arithmetic block".to_string()
-        }
-        LexError::UnterminatedExtglob => {
-            ": unterminated extglob group".to_string()
-        }
+        LexError::UnterminatedArithBlock => ": unterminated '((' arithmetic block".to_string(),
+        LexError::UnterminatedExtglob => ": unterminated extglob group".to_string(),
         LexError::NoProgress => ": lexer made no forward progress".to_string(),
     }
 }

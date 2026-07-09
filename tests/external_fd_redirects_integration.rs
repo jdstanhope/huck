@@ -76,9 +76,8 @@ fn close_extra_fd_external() {
 fn append_extra_fd_external() {
     // Append to a high fd then read it back.
     let tmp = format!("/tmp/huck_app_{}", std::process::id());
-    let script = format!(
-        "printf 'a\\n' >{tmp}; sh -c 'echo b >&4' 4>>{tmp}; cat {tmp}; rm -f {tmp}"
-    );
+    let script =
+        format!("printf 'a\\n' >{tmp}; sh -c 'echo b >&4' 4>>{tmp}; cat {tmp}; rm -f {tmp}");
     assert_matches_bash(&script);
 }
 
@@ -91,8 +90,7 @@ fn pipeline_stage_high_fd_redirect_not_clobbered_by_pipe_close() {
     let tmp = format!("/tmp/hk_pf_{}", std::process::id());
     // Use fd 9 (high, unlikely to be a pipe fd) to reduce collision chance.
     // The inner sh writes "hi" to &9, which the outer shell mapped to $tmp.
-    let script = format!(
-        "sh -c 'echo hi >&9' 9>{tmp} | cat; echo \"file=$(cat {tmp})\"; rm -f {tmp}"
-    );
+    let script =
+        format!("sh -c 'echo hi >&9' 9>{tmp} | cat; echo \"file=$(cat {tmp})\"; rm -f {tmp}");
     assert_matches_bash(&script);
 }

@@ -96,7 +96,12 @@ macro_rules! sh_error {
 /// swap that a bare-builtin `2>&1`/`>&2` redirect performs. A site that holds
 /// such a writer MUST emit to it — see the design spec's §1(a2) — otherwise
 /// the diagnostic is lost under `$(builtin 2>&1)` capture.
-pub fn emit_error_to(shell: &Shell, w: &mut dyn std::io::Write, cmd: Option<&str>, body: std::fmt::Arguments) {
+pub fn emit_error_to(
+    shell: &Shell,
+    w: &mut dyn std::io::Write,
+    cmd: Option<&str>,
+    body: std::fmt::Arguments,
+) {
     let _ = write!(w, "{}", shell.error_prefix(Diag::Runtime(cmd)));
     let _ = w.write_fmt(body);
     let _ = w.write_all(b"\n");
@@ -192,7 +197,10 @@ mod prologue_literal_invariant {
         ("executor.rs", include_str!("executor.rs")),
         ("expand.rs", include_str!("expand.rs")),
         ("param_expansion.rs", include_str!("param_expansion.rs")),
-        ("completion_builtins.rs", include_str!("completion_builtins.rs")),
+        (
+            "completion_builtins.rs",
+            include_str!("completion_builtins.rs"),
+        ),
         ("shell_state.rs", include_str!("shell_state.rs")),
         ("restricted.rs", include_str!("restricted.rs")),
         ("shell.rs", include_str!("shell.rs")),
@@ -201,7 +209,10 @@ mod prologue_literal_invariant {
         ("engine.rs", include_str!("engine.rs")),
         ("cwd_scope.rs", include_str!("cwd_scope.rs")),
         ("error_emit.rs", include_str!("error_emit.rs")),
-        ("../huck-cli/src/repl.rs", include_str!("../../../crates/huck-cli/src/repl.rs")),
+        (
+            "../huck-cli/src/repl.rs",
+            include_str!("../../../crates/huck-cli/src/repl.rs"),
+        ),
     ];
 
     /// Strips every `#[cfg(test)]`-guarded item (a standalone attribute line
@@ -223,7 +234,10 @@ mod prologue_literal_invariant {
                     let l = lines[i];
                     for ch in l.chars() {
                         match ch {
-                            '{' => { depth += 1; opened = true; }
+                            '{' => {
+                                depth += 1;
+                                opened = true;
+                            }
                             '}' => depth -= 1,
                             _ => {}
                         }

@@ -30,12 +30,21 @@ const INLINE_STDIN_THRESHOLD: usize = 4096;
 /// caller's closure) typically re-enters the same `Shell` via its own
 /// `.borrow_mut()` (see `exec_builder::run_cwd_inner`'s doc comment on this
 /// exact hazard).
-pub fn with_stdin_fd0<R>(input: &[u8], shell_cell: &Rc<RefCell<Shell>>, f: impl FnOnce() -> R) -> R {
+pub fn with_stdin_fd0<R>(
+    input: &[u8],
+    shell_cell: &Rc<RefCell<Shell>>,
+    f: impl FnOnce() -> R,
+) -> R {
     let (r, w) = match make_pipe() {
         Ok(pair) => pair,
         Err(e) => {
             // Hard-fail before any state change.
-            crate::sh_error!(&*shell_cell.borrow(), None, "pipe: {}", crate::bash_io_error(&e));
+            crate::sh_error!(
+                &*shell_cell.borrow(),
+                None,
+                "pipe: {}",
+                crate::bash_io_error(&e)
+            );
             return f(); // run anyway with caller's fd 0; matches "best effort"
         }
     };
@@ -43,7 +52,12 @@ pub fn with_stdin_fd0<R>(input: &[u8], shell_cell: &Rc<RefCell<Shell>>, f: impl 
     let saved = unsafe { libc::dup(0) };
     if saved < 0 {
         let e = io::Error::last_os_error();
-        crate::sh_error!(&*shell_cell.borrow(), None, "dup: {}", crate::bash_io_error(&e));
+        crate::sh_error!(
+            &*shell_cell.borrow(),
+            None,
+            "dup: {}",
+            crate::bash_io_error(&e)
+        );
         unsafe {
             libc::close(r);
             libc::close(w);
@@ -53,7 +67,12 @@ pub fn with_stdin_fd0<R>(input: &[u8], shell_cell: &Rc<RefCell<Shell>>, f: impl 
 
     if unsafe { libc::dup2(r, 0) } < 0 {
         let e = io::Error::last_os_error();
-        crate::sh_error!(&*shell_cell.borrow(), None, "dup2: {}", crate::bash_io_error(&e));
+        crate::sh_error!(
+            &*shell_cell.borrow(),
+            None,
+            "dup2: {}",
+            crate::bash_io_error(&e)
+        );
         unsafe {
             libc::close(r);
             libc::close(w);

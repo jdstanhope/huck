@@ -14,7 +14,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     drop(child.stdin.take());
     let output = child.wait_with_output().expect("wait");
     (
@@ -38,21 +43,21 @@ fn dup_stdout_to_stderr() {
     // effect (left-to-right POSIX ordering), "hi" goes to stderr (the old fd 2),
     // not the file. The file is empty; "hi" appears on stderr.
     let tmp = format!("/tmp/v29_dup_stdout_{}", std::process::id());
-    let script = format!(
-        "echo hi 1>&2 2> {tmp}\ncat {tmp}\nrm -f {tmp}\nexit\n"
-    );
+    let script = format!("echo hi 1>&2 2> {tmp}\ncat {tmp}\nrm -f {tmp}\nexit\n");
     let (out, err) = run(&script);
     // stdout (from `cat {tmp}`) is empty; "hi" reached stderr
     assert!(out.trim().is_empty(), "stdout must be empty, got: {out:?}");
-    assert!(err.lines().any(|l| l.trim() == "hi"), "stderr must contain 'hi', got: {err:?}");
+    assert!(
+        err.lines().any(|l| l.trim() == "hi"),
+        "stderr must contain 'hi', got: {err:?}"
+    );
 }
 
 #[test]
 fn combined_redirect_canonical_form() {
     let tmp = format!("/tmp/v29_combined_{}", std::process::id());
-    let script = format!(
-        "sh -c 'echo out; echo err >&2' >{tmp} 2>&1\nwc -l < {tmp}\nrm -f {tmp}\nexit\n"
-    );
+    let script =
+        format!("sh -c 'echo out; echo err >&2' >{tmp} 2>&1\nwc -l < {tmp}\nrm -f {tmp}\nexit\n");
     let (out, _) = run(&script);
     assert!(out.lines().any(|l| l.trim() == "2"), "got: {out}");
 }
@@ -60,9 +65,8 @@ fn combined_redirect_canonical_form() {
 #[test]
 fn and_redir_out_to_file() {
     let tmp = format!("/tmp/v29_andout_{}", std::process::id());
-    let script = format!(
-        "sh -c 'echo out; echo err >&2' &>{tmp}\nwc -l < {tmp}\nrm -f {tmp}\nexit\n"
-    );
+    let script =
+        format!("sh -c 'echo out; echo err >&2' &>{tmp}\nwc -l < {tmp}\nrm -f {tmp}\nexit\n");
     let (out, _) = run(&script);
     assert!(out.lines().any(|l| l.trim() == "2"), "got: {out}");
 }
@@ -102,8 +106,10 @@ fn dup_runtime_bad_fd_target() {
     // Non-numeric target → runtime error.
     let (out, err) = run("sh -c true 2>&notanumber\nexit\n");
     let combined = format!("{out}{err}");
-    assert!(combined.contains("bad fd") || combined.contains("notanumber"),
-        "expected bad-fd error, got out: {out} err: {err}");
+    assert!(
+        combined.contains("bad fd") || combined.contains("notanumber"),
+        "expected bad-fd error, got out: {out} err: {err}"
+    );
 }
 
 #[test]
@@ -112,13 +118,14 @@ fn echo_to_stderr_shorthand() {
     // takes effect after `1>&2` per POSIX left-to-right ordering, so "error"
     // goes to the original fd 2 (stderr), and the file is empty.
     let tmp = format!("/tmp/v29_shorthand_{}", std::process::id());
-    let script = format!(
-        "echo error >&2 2> {tmp}\ncat {tmp}\nrm -f {tmp}\nexit\n"
-    );
+    let script = format!("echo error >&2 2> {tmp}\ncat {tmp}\nrm -f {tmp}\nexit\n");
     let (out, err) = run(&script);
     // stdout (from `cat {tmp}`) is empty; "error" reached stderr
     assert!(out.trim().is_empty(), "stdout must be empty, got: {out:?}");
-    assert!(err.lines().any(|l| l.trim() == "error"), "stderr must contain 'error', got: {err:?}");
+    assert!(
+        err.lines().any(|l| l.trim() == "error"),
+        "stderr must contain 'error', got: {err:?}"
+    );
 }
 
 #[test]

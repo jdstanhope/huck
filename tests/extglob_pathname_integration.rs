@@ -2,7 +2,9 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 /// Builds a fresh temp fixture dir, runs `script` in it (cwd = fixture),
 /// returns (stdout, exit_code).
@@ -27,24 +29,45 @@ fn run_in_fixture(script: &str) -> (String, i32) {
     std::fs::write(dir.join("dir2/foo.txt"), b"").unwrap();
     let mut child = Command::new(huck_bin())
         .current_dir(dir)
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-        .spawn().expect("spawn huck");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn huck");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
-    (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
 fn echo_extglob_expands_sorted() {
-    assert_eq!(run_in_fixture("shopt -s extglob\necho +(a|b)\n").0, "a aab ab b\n");
-    assert_eq!(run_in_fixture("shopt -s extglob\necho @(a|cd)\n").0, "a cd\n");
-    assert_eq!(run_in_fixture("shopt -s extglob\necho dir*/+(foo|bar).txt\n").0, "dir1/foo.txt dir2/foo.txt\n");
+    assert_eq!(
+        run_in_fixture("shopt -s extglob\necho +(a|b)\n").0,
+        "a aab ab b\n"
+    );
+    assert_eq!(
+        run_in_fixture("shopt -s extglob\necho @(a|cd)\n").0,
+        "a cd\n"
+    );
+    assert_eq!(
+        run_in_fixture("shopt -s extglob\necho dir*/+(foo|bar).txt\n").0,
+        "dir1/foo.txt dir2/foo.txt\n"
+    );
 }
 
 #[test]
 fn for_loop_over_extglob() {
     assert_eq!(
-        run_in_fixture("shopt -s extglob\nfor f in @(a|cd); do printf '%s|' \"$f\"; done\necho\n").0,
+        run_in_fixture("shopt -s extglob\nfor f in @(a|cd); do printf '%s|' \"$f\"; done\necho\n")
+            .0,
         "a|cd|\n"
     );
 }
@@ -62,15 +85,24 @@ fn extglob_off_is_literal() {
 #[test]
 fn quoted_extglob_is_literal() {
     // A quoted group is literal, never filesystem-expanded.
-    assert_eq!(run_in_fixture("shopt -s extglob\necho \"+(a|b)\"\n").0, "+(a|b)\n");
+    assert_eq!(
+        run_in_fixture("shopt -s extglob\necho \"+(a|b)\"\n").0,
+        "+(a|b)\n"
+    );
 }
 
 #[test]
 fn nullglob_extglob_no_match_empty() {
-    assert_eq!(run_in_fixture("shopt -s extglob nullglob\necho zzz+(q)\n").0, "\n");
+    assert_eq!(
+        run_in_fixture("shopt -s extglob nullglob\necho zzz+(q)\n").0,
+        "\n"
+    );
 }
 
 #[test]
 fn no_match_is_literal() {
-    assert_eq!(run_in_fixture("shopt -s extglob\necho zzz+(q)\n").0, "zzz+(q)\n");
+    assert_eq!(
+        run_in_fixture("shopt -s extglob\necho zzz+(q)\n").0,
+        "zzz+(q)\n"
+    );
 }

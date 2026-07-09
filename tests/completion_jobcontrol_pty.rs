@@ -17,8 +17,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use expectrl::session::OsSession;
 use expectrl::Expect;
+use expectrl::session::OsSession;
 
 const BASH_COMPLETION: &str = "/usr/share/bash-completion/bash_completion";
 
@@ -43,7 +43,8 @@ fn external_pipeline_completer_does_not_hang() {
     //    Expect a sentinel on the SAME line so the read stream stays in sync
     //    before we send the next line (back-to-back sends without an
     //    intervening read desync expectrl's incremental buffer).
-    let _ = session.send("source /usr/share/bash-completion/bash_completion; echo SETUP_OK_$((6*7))");
+    let _ =
+        session.send("source /usr/share/bash-completion/bash_completion; echo SETUP_OK_$((6*7))");
     let _ = session.send("\r");
     assert!(
         session.expect("SETUP_OK_42").is_ok(),

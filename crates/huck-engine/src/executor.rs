@@ -6,8 +6,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 use crate::builtins::{self, ExecOutcome, InterruptReason};
 use crate::command::{
     CaseClause, CaseItem, CaseTerminator, Command, Connector, ExecCommand, FileMode, ForClause,
-    IfClause, Pipeline, Redirect, RedirFd, RedirOp, Redirection, Sequence, SimpleCommand, TestBinaryOp,
-    TestExpr, TestUnaryOp, WhileClause,
+    IfClause, Pipeline, RedirFd, RedirOp, Redirect, Redirection, Sequence, SimpleCommand,
+    TestBinaryOp, TestExpr, TestUnaryOp, WhileClause,
 };
 use crate::expand::{expand, expand_assignment, expand_pattern, glob_expand_fields_opts};
 use crate::shell_state::Shell;
@@ -139,7 +139,13 @@ pub(crate) fn redir_open_error(
     e: &std::io::Error,
 ) {
     let mut err = err_writer(err_sink, out_sink);
-    crate::sh_error_to!(shell, &mut *err, None, "{path}: {}", crate::bash_io_error(e));
+    crate::sh_error_to!(
+        shell,
+        &mut *err,
+        None,
+        "{path}: {}",
+        crate::bash_io_error(e)
+    );
 }
 
 /// Flush huck's buffered stdout (Rust wraps fd 1 in a `LineWriter`, so a trailing
@@ -156,10 +162,7 @@ fn flush_stdout() {
 /// v36's ERR-trap gate), returns the Exit outcome to terminate the shell
 /// with that status. Caller propagates the outcome with an early return.
 fn maybe_errexit(shell: &Shell, status: i32) -> Option<ExecOutcome> {
-    if shell.shell_options.errexit
-        && shell.err_suppressed_depth == 0
-        && status != 0
-    {
+    if shell.shell_options.errexit && shell.err_suppressed_depth == 0 && status != 0 {
         Some(ExecOutcome::Exit(status))
     } else {
         None
@@ -276,7 +279,9 @@ fn execute_with_sink_inner(
                 rest: seq.rest.clone(),
                 background: false,
             };
-            let subshell = Command::Subshell { body: Box::new(inner) };
+            let subshell = Command::Subshell {
+                body: Box::new(inner),
+            };
             return run_background_subshell(&subshell, shell, sink, err_sink, source);
         }
     }
@@ -313,16 +318,18 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     // Spawning real background children whose pids the parent's JobTable
     // doesn't track would let them escape `wait`/`jobs` and litter the
     // terminal. Amp → Semi so each group runs foreground in source order.
-    let sanitized = if seq.background
-        || seq.rest.iter().any(|(c, _)| matches!(c, Connector::Amp))
-    {
+    let sanitized = if seq.background || seq.rest.iter().any(|(c, _)| matches!(c, Connector::Amp)) {
         Sequence {
             first: seq.first.clone(),
             rest: seq
                 .rest
                 .iter()
                 .map(|(c, cmd)| {
-                    let c = if matches!(c, Connector::Amp) { Connector::Semi } else { *c };
+                    let c = if matches!(c, Connector::Amp) {
+                        Connector::Semi
+                    } else {
+                        *c
+                    };
                     (c, cmd.clone())
                 })
                 .collect(),
@@ -393,8 +400,11 @@ fn run_andor_group(
     }
     if matches!(
         status,
-        ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-            | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_)
+        ExecOutcome::Exit(_)
+            | ExecOutcome::LoopBreak(_, _)
+            | ExecOutcome::LoopContinue(_)
+            | ExecOutcome::FunctionReturn(_)
+            | ExecOutcome::Interrupted(_)
     ) {
         return status;
     }
@@ -415,11 +425,7 @@ fn run_andor_group(
         // "part of a list being tested", not a standalone failure). `first`
         // is last iff there is no `rest`.
         let is_last = rest.is_empty();
-        if c != 0
-            && shell.err_suppressed_depth == 0
-            && is_last
-            && !is_negated_pipeline(first)
-        {
+        if c != 0 && shell.err_suppressed_depth == 0 && is_last && !is_negated_pipeline(first) {
             crate::traps::fire_err_trap(shell);
             if let Some(out) = maybe_errexit(shell, c) {
                 return out;
@@ -441,8 +447,11 @@ fn run_andor_group(
             }
             if matches!(
                 status,
-                ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-                    | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_)
+                ExecOutcome::Exit(_)
+                    | ExecOutcome::LoopBreak(_, _)
+                    | ExecOutcome::LoopContinue(_)
+                    | ExecOutcome::FunctionReturn(_)
+                    | ExecOutcome::Interrupted(_)
             ) {
                 return status;
             }
@@ -546,7 +555,9 @@ fn execute_sequence_body(
             // a label from the group's first command's static program name when
             // possible (good enough for `jobs` listings — not byte-diffed).
             let source = group_display_label(group.first);
-            let subshell = Command::Subshell { body: Box::new(inner) };
+            let subshell = Command::Subshell {
+                body: Box::new(inner),
+            };
             // Launch; ignore the Continue(0) it returns — the foreground status
             // is unchanged by a background launch.
             run_background_subshell(&subshell, shell, sink, err_sink, &source);
@@ -602,7 +613,16 @@ fn run_command(
                 StdoutSink::Capture(_) => match make_pipe() {
                     Ok((r, w)) => (w, Some(r)),
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "pipe: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
                         return ExecOutcome::Continue(1);
                     }
                 },
@@ -619,9 +639,26 @@ fn run_command(
                 StderrSink::Capture(_) => match make_pipe() {
                     Ok((r, w)) => (w, Some(r)),
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
-                        if let Some(r) = capture_read_fd { unsafe { libc::close(r); } }
-                        if stdout_fd != libc::STDOUT_FILENO { unsafe { libc::close(stdout_fd); } }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "pipe: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
+                        if let Some(r) = capture_read_fd {
+                            unsafe {
+                                libc::close(r);
+                            }
+                        }
+                        if stdout_fd != libc::STDOUT_FILENO {
+                            unsafe {
+                                libc::close(stdout_fd);
+                            }
+                        }
                         return ExecOutcome::Continue(1);
                     }
                 },
@@ -640,18 +677,35 @@ fn run_command(
             ) {
                 Ok(p) => p,
                 Err(e) => {
-                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "fork: {}", crate::bash_io_error(&e)); }
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(
+                            shell,
+                            &mut *err,
+                            None,
+                            "fork: {}",
+                            crate::bash_io_error(&e)
+                        );
+                    }
                     if let Some(r) = capture_read_fd {
-                        unsafe { libc::close(r); }
+                        unsafe {
+                            libc::close(r);
+                        }
                     }
                     if let Some(r) = capture_err_read_fd {
-                        unsafe { libc::close(r); }
+                        unsafe {
+                            libc::close(r);
+                        }
                     }
                     if stdout_fd != libc::STDOUT_FILENO {
-                        unsafe { libc::close(stdout_fd); }
+                        unsafe {
+                            libc::close(stdout_fd);
+                        }
                     }
                     if stderr_fd != libc::STDERR_FILENO && stderr_fd != stdout_fd {
-                        unsafe { libc::close(stderr_fd); }
+                        unsafe {
+                            libc::close(stderr_fd);
+                        }
                     }
                     return ExecOutcome::Continue(1);
                 }
@@ -662,12 +716,17 @@ fn run_command(
             // guard pops on every exit path (including early returns / panics).
             let live_pids = shell.live_external_children.clone();
             live_pids.lock().unwrap().push(pid as libc::pid_t);
-            let _pid_guard = LiveChildGuard { pids: &live_pids, pid: pid as libc::pid_t };
+            let _pid_guard = LiveChildGuard {
+                pids: &live_pids,
+                pid: pid as libc::pid_t,
+            };
 
             // Close the write-end in the parent so the child's write-end is
             // the only writer; once the child exits, the read-end sees EOF.
             if stdout_fd != libc::STDOUT_FILENO {
-                unsafe { libc::close(stdout_fd); }
+                unsafe {
+                    libc::close(stdout_fd);
+                }
             }
             // Same for the dedicated stderr pipe (skip if it's the merged-stdout
             // alias; that fd has already been closed above).
@@ -675,7 +734,9 @@ fn run_command(
                 && stderr_fd != libc::STDERR_FILENO
                 && stderr_fd != stdout_fd
             {
-                unsafe { libc::close(stderr_fd); }
+                unsafe {
+                    libc::close(stderr_fd);
+                }
             }
 
             if interactive {
@@ -739,16 +800,19 @@ fn run_command(
                                 break;
                             }
                         }
-                        let line = shell.jobs.iter()
+                        let line = shell
+                            .jobs
+                            .iter()
                             .find(|j| j.id == job_id)
                             .map(|j| crate::jobs::notification_line(j, '+'))
                             .unwrap_or_default();
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "\n{line}"); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            e!(&mut *err, "\n{line}");
+                        }
                         128 + sig
                     }
-                    Ok((raw_status, false)) => {
-                        raw_status_to_exit_code(raw_status, shell)
-                    }
+                    Ok((raw_status, false)) => raw_status_to_exit_code(raw_status, shell),
                     Err(()) => 1,
                 };
                 give_terminal_to(shell.shell_pgid);
@@ -766,11 +830,12 @@ fn run_command(
                     StdoutSink::Capture(buf) => Some(*buf),
                     StdoutSink::Terminal => None,
                 };
-                let stderr_sink_buf: Option<&mut Vec<u8>> = if matches!(err_sink, StderrSink::Capture(_)) {
-                    Some(&mut stderr_capture)
-                } else {
-                    None
-                };
+                let stderr_sink_buf: Option<&mut Vec<u8>> =
+                    if matches!(err_sink, StderrSink::Capture(_)) {
+                        Some(&mut stderr_capture)
+                    } else {
+                        None
+                    };
                 let sinks = crate::stream_loop::CaptureSinks {
                     stdout: stdout_sink_buf,
                     stderr: stderr_sink_buf,
@@ -784,10 +849,14 @@ fn run_command(
                 );
                 // Close pipe read-ends we owned.
                 if pipe_out >= 0 {
-                    unsafe { libc::close(pipe_out); }
+                    unsafe {
+                        libc::close(pipe_out);
+                    }
                 }
                 if pipe_err >= 0 {
-                    unsafe { libc::close(pipe_err); }
+                    unsafe {
+                        libc::close(pipe_err);
+                    }
                 }
                 let raw_status = match loop_result {
                     Ok(s) => s,
@@ -807,16 +876,20 @@ fn run_command(
             // POSIX: a function may not be named after a special builtin; a
             // non-interactive posix shell errors and exits (default mode allows it).
             if shell.shell_options.posix && builtins::is_special_builtin(name) {
-                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: is a special builtin"); }
+                {
+                    let mut err = err_writer(err_sink, sink);
+                    crate::sh_error_to!(shell, &mut *err, None, "{name}: is a special builtin");
+                }
                 shell.posix_fatal(2);
                 return ExecOutcome::Continue(2);
             }
             shell.define_function(name.clone(), body.clone());
             ExecOutcome::Continue(0)
         }
-        Command::DoubleBracket { expr, inline_assignments } => {
-            run_double_bracket(expr, inline_assignments, shell, sink, err_sink)
-        }
+        Command::DoubleBracket {
+            expr,
+            inline_assignments,
+        } => run_double_bracket(expr, inline_assignments, shell, sink, err_sink),
         Command::ArithFor(clause) => run_arith_for(clause, shell, sink, err_sink),
         Command::Arith(expr) => run_arith(expr, shell, sink, err_sink),
         Command::Select(clause) => run_select(clause, shell, sink, err_sink),
@@ -825,7 +898,10 @@ fn run_command(
         }
         Command::Coproc { name, body } => run_coproc(name, body, shell, sink, err_sink),
         _ => {
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "unsupported command variant"); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "unsupported command variant");
+            }
             ExecOutcome::Continue(1)
         }
     }
@@ -849,7 +925,10 @@ struct RedirectScope {
 
 impl RedirectScope {
     fn new() -> Self {
-        RedirectScope { saved: Vec::new(), heredoc_writers: Vec::new() }
+        RedirectScope {
+            saved: Vec::new(),
+            heredoc_writers: Vec::new(),
+        }
     }
 
     /// Replace `target_fd` with a dup of `new_fd`, saving the original so Drop
@@ -871,7 +950,16 @@ impl RedirectScope {
             // -1 so Drop closes target_fd back to its unopened state.
             let saved = libc::dup(target_fd);
             if libc::dup2(new_fd, target_fd) < 0 {
-                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "dup2: {}", io::Error::last_os_error()); }
+                {
+                    let mut err = err_writer(err_sink, sink);
+                    crate::sh_error_to!(
+                        shell,
+                        &mut *err,
+                        None,
+                        "dup2: {}",
+                        io::Error::last_os_error()
+                    );
+                }
                 if saved >= 0 {
                     libc::close(saved);
                 }
@@ -908,7 +996,10 @@ impl RedirectScope {
         }
         let Some(target) = redir.target_fd() else {
             // RedirFd::Var is handled above; any other None is unexpected.
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "ambiguous redirect"); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "ambiguous redirect");
+            }
             return Err(ExecOutcome::Continue(1));
         };
         let target = target as RawFd;
@@ -942,7 +1033,13 @@ impl RedirectScope {
                         match open_resolved(&resolved) {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &resolved_path(&resolved), &e);
+                                redir_open_error(
+                                    shell,
+                                    err_sink,
+                                    sink,
+                                    &resolved_path(&resolved),
+                                    &e,
+                                );
                                 return Err(ExecOutcome::Continue(1));
                             }
                         }
@@ -950,7 +1047,13 @@ impl RedirectScope {
                     FileMode::ReadWrite => {
                         // `<>`: O_RDWR|O_CREAT — open in place, do NOT truncate
                         // (bash keeps existing content for read-write access).
-                        match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+                        match OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .open(&path)
+                        {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -972,7 +1075,10 @@ impl RedirectScope {
                     // closed), dup2 the opened file onto the target, then close
                     // the temp fd. `redirect()` already records saved=-1 when
                     // dup(target) returns EBADF (target was free but not lowest).
-                    if self.redirect(shell, new_fd, target, sink, err_sink).is_err() {
+                    if self
+                        .redirect(shell, new_fd, target, sink, err_sink)
+                        .is_err()
+                    {
                         unsafe { libc::close(new_fd) };
                         return Err(ExecOutcome::Continue(1));
                     }
@@ -987,13 +1093,25 @@ impl RedirectScope {
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "{}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
                         return Err(ExecOutcome::Continue(1));
                     }
                 };
                 // Validate the source fd is open before dup2 (bash: bad fd error).
                 if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
-                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor"); }
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor");
+                    }
                     return Err(ExecOutcome::Continue(1));
                 }
                 if self.redirect(shell, src, target, sink, err_sink).is_err() {
@@ -1022,7 +1140,16 @@ impl RedirectScope {
                         Ok(())
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "heredoc: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
                         Err(ExecOutcome::Continue(1))
                     }
                 }
@@ -1041,7 +1168,16 @@ impl RedirectScope {
                         Ok(())
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "heredoc: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
                         Err(ExecOutcome::Continue(1))
                     }
                 }
@@ -1071,7 +1207,10 @@ impl RedirectScope {
             let fd: RawFd = match cur.trim().parse::<i32>() {
                 Ok(n) if n >= 0 => n,
                 _ => {
-                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: ambiguous redirect"); }
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(shell, &mut *err, None, "{name}: ambiguous redirect");
+                    }
                     return Err(ExecOutcome::Continue(1));
                 }
             };
@@ -1112,13 +1251,25 @@ impl RedirectScope {
                         match open_resolved(&resolved) {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &resolved_path(&resolved), &e);
+                                redir_open_error(
+                                    shell,
+                                    err_sink,
+                                    sink,
+                                    &resolved_path(&resolved),
+                                    &e,
+                                );
                                 return Err(ExecOutcome::Continue(1));
                             }
                         }
                     }
                     FileMode::ReadWrite => {
-                        match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+                        match OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .open(&path)
+                        {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -1133,12 +1284,24 @@ impl RedirectScope {
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "{}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
                         return Err(ExecOutcome::Continue(1));
                     }
                 };
                 if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
-                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor"); }
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor");
+                    }
                     return Err(ExecOutcome::Continue(1));
                 }
                 (src, false)
@@ -1151,7 +1314,16 @@ impl RedirectScope {
                         (rfd, true)
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "heredoc: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
                         return Err(ExecOutcome::Continue(1));
                     }
                 }
@@ -1165,7 +1337,16 @@ impl RedirectScope {
                         (rfd, true)
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "heredoc: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
                         return Err(ExecOutcome::Continue(1));
                     }
                 }
@@ -1181,7 +1362,16 @@ impl RedirectScope {
                 if owns_src {
                     unsafe { libc::close(src) };
                 }
-                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: {}", crate::bash_io_error(&e)); }
+                {
+                    let mut err = err_writer(err_sink, sink);
+                    crate::sh_error_to!(
+                        shell,
+                        &mut *err,
+                        None,
+                        "{name}: {}",
+                        crate::bash_io_error(&e)
+                    );
+                }
                 return Err(ExecOutcome::Continue(1));
             }
         };
@@ -1202,7 +1392,9 @@ impl RedirectScope {
     fn reap_heredoc_writers(&mut self) {
         for pid in self.heredoc_writers.drain(..) {
             let mut st = 0;
-            unsafe { libc::waitpid(pid, &mut st, 0); }
+            unsafe {
+                libc::waitpid(pid, &mut st, 0);
+            }
         }
     }
 }
@@ -1248,10 +1440,13 @@ fn redirs_write_stdout(redirs: &[Redirection]) -> bool {
             && matches!(
                 &r.op,
                 RedirOp::File {
-                    mode: FileMode::Truncate | FileMode::Append | FileMode::Clobber | FileMode::ReadWrite,
+                    mode: FileMode::Truncate
+                        | FileMode::Append
+                        | FileMode::Clobber
+                        | FileMode::ReadWrite,
                     ..
                 } | RedirOp::Dup { .. }
-                  | RedirOp::Close
+                    | RedirOp::Close
             )
     })
 }
@@ -1283,22 +1478,22 @@ enum RedirectDest {
 /// Source words on `Dup` are resolved via `resolve_fd_target`; an unresolvable
 /// source falls back to `External` (conservative: the real-fd scope will
 /// report the error and we want to skip software routing).
-fn final_dests_for_1_2(
-    redirs: &[Redirection],
-    shell: &mut Shell,
-) -> (RedirectDest, RedirectDest) {
+fn final_dests_for_1_2(redirs: &[Redirection], shell: &mut Shell) -> (RedirectDest, RedirectDest) {
     let mut fd1 = RedirectDest::Sink;
     let mut fd2 = RedirectDest::Sink;
     for r in redirs {
         let Some(fd) = r.target_fd() else { continue };
-        if fd != 1 && fd != 2 { continue; }
+        if fd != 1 && fd != 2 {
+            continue;
+        }
         let dest = match &r.op {
-            RedirOp::Dup { source: src_word, output: true } => {
-                match resolve_fd_target(src_word, shell) {
-                    Ok(n) if n >= 0 => RedirectDest::Follows(n as u32),
-                    _ => RedirectDest::External,
-                }
-            }
+            RedirOp::Dup {
+                source: src_word,
+                output: true,
+            } => match resolve_fd_target(src_word, shell) {
+                Ok(n) if n >= 0 => RedirectDest::Follows(n as u32),
+                _ => RedirectDest::External,
+            },
             // Any other op (File, Close, Heredoc, HereString, Dup{output:false})
             // hands the fd to the real-fd scope.
             _ => RedirectDest::External,
@@ -1338,8 +1533,10 @@ fn slot_consumes(r: &Redirection) -> bool {
     match r.target_fd() {
         Some(0) => matches!(
             &r.op,
-            RedirOp::File { mode: FileMode::ReadOnly, .. }
-                | RedirOp::Heredoc { .. }
+            RedirOp::File {
+                mode: FileMode::ReadOnly,
+                ..
+            } | RedirOp::Heredoc { .. }
                 | RedirOp::HereString(_)
         ),
         Some(1) | Some(2) => matches!(
@@ -1434,7 +1631,8 @@ where
     drop(scope);
     drain_procsubs(shell, procsub_base);
     debug_assert_eq!(
-        shell.procsub_pending.len(), procsub_base,
+        shell.procsub_pending.len(),
+        procsub_base,
         "process-substitution leak: a return path in with_redirect_scope skipped drain_procsubs"
     );
     outcome
@@ -1516,8 +1714,8 @@ fn run_builtin_with_redirects(
     // `redirs_write_stdout` true and force fd-1 writes, but we want to route
     // the builtin's stdout to the in-memory stderr sink instead. The `if
     // route_out_to_err` arm below handles this; suppress `write_to_fd1` here.
-    let write_to_fd1 = !route_out_to_err
-        && (redirs_write_stdout(redirs) || matches!(sink, StdoutSink::Terminal));
+    let write_to_fd1 =
+        !route_out_to_err && (redirs_write_stdout(redirs) || matches!(sink, StdoutSink::Terminal));
     let run = |out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, shell: &mut Shell| {
         if let Some(da) = resolved.decl_args.as_deref() {
             builtins::run_declaration_builtin(&resolved.program, da, out, err, shell)
@@ -1588,7 +1786,9 @@ fn run_builtin_with_redirects(
                 let mut err = err_writer(err_sink, sink);
                 run(&mut out, &mut *err, shell)
             }
-            (_, StderrSink::Terminal) => unreachable!("route_out_to_err requires non-Terminal err_sink"),
+            (_, StderrSink::Terminal) => {
+                unreachable!("route_out_to_err requires non-Terminal err_sink")
+            }
         }
     } else if route_err_to_out {
         // `2>&1` under captured stdout: route the builtin's stderr into the
@@ -1702,9 +1902,13 @@ fn run_redirected(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
-    with_redirect_scope(redirects, shell, sink, err_sink, |shell, inner_sink, inner_err_sink| {
-        run_command(inner, shell, inner_sink, inner_err_sink)
-    })
+    with_redirect_scope(
+        redirects,
+        shell,
+        sink,
+        err_sink,
+        |shell, inner_sink, inner_err_sink| run_command(inner, shell, inner_sink, inner_err_sink),
+    )
 }
 
 /// Runs a `while`/`until` loop. The body runs while the condition's
@@ -1738,12 +1942,19 @@ fn run_while_inner(
         let cond = execute_sequence_body(&clause.condition, shell, sink, err_sink);
         shell.err_suppressed_depth -= 1;
         let keep_going = match cond {
-            ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-                | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_) => {
+            ExecOutcome::Exit(_)
+            | ExecOutcome::LoopBreak(_, _)
+            | ExecOutcome::LoopContinue(_)
+            | ExecOutcome::FunctionReturn(_)
+            | ExecOutcome::Interrupted(_) => {
                 return cond;
             }
             ExecOutcome::Continue(c) => {
-                if clause.until { c != 0 } else { c == 0 }
+                if clause.until {
+                    c != 0
+                } else {
+                    c == 0
+                }
             }
         };
         if !keep_going {
@@ -1803,7 +2014,16 @@ fn run_for_inner(
     // body not run, the surrounding list continues). Reserved words like `if`
     // are valid identifiers and fall through to run normally.
     if !crate::builtins::is_valid_name(&clause.var) {
-        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "`{}': not a valid identifier", clause.var); }
+        {
+            let mut err = err_writer(err_sink, sink);
+            crate::sh_error_to!(
+                shell,
+                &mut *err,
+                None,
+                "`{}': not a valid identifier",
+                clause.var
+            );
+        }
         return ExecOutcome::Continue(1);
     }
 
@@ -1843,7 +2063,10 @@ fn run_for_inner(
             return o;
         }
         if shell.try_set(&clause.var, value).is_err() {
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}: readonly variable", clause.var); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "{}: readonly variable", clause.var);
+            }
             shell.posix_fatal(127);
             return ExecOutcome::Continue(1);
         }
@@ -1971,14 +2194,26 @@ fn run_arith(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
-    xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(body)));
+    xtrace_compound(
+        shell,
+        &format!(
+            "(( {} ))",
+            crate::expand::reconstruct_word_source_inner(body)
+        ),
+    );
     let (src, res) = crate::expand::eval_arith_word_src(body, shell);
     match res {
         Ok(0) => ExecOutcome::Continue(1),
         Ok(_) => ExecOutcome::Continue(0),
         Err(e) => {
             let mut err = err_writer(err_sink, sink);
-            crate::sh_error_to!(shell, &mut *err, Some("(("), "{}", crate::arith::render_error_body(&src, &e));
+            crate::sh_error_to!(
+                shell,
+                &mut *err,
+                Some("(("),
+                "{}",
+                crate::arith::render_error_body(&src, &e)
+            );
             ExecOutcome::Continue(1)
         }
     }
@@ -2006,15 +2241,23 @@ fn run_arith_for_inner(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
-
     // 1. Eval init once (if present).
     if let Some(init) = &clause.init {
-        xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(init)));
+        xtrace_compound(
+            shell,
+            &format!(
+                "(( {} ))",
+                crate::expand::reconstruct_word_source_inner(init)
+            ),
+        );
     }
     if let Some(init) = &clause.init
         && let Err(e) = crate::expand::eval_arith_word(init, shell)
     {
-        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "((: {e}"); }
+        {
+            let mut err = err_writer(err_sink, sink);
+            crate::sh_error_to!(shell, &mut *err, None, "((: {e}");
+        }
         return ExecOutcome::Continue(1);
     }
 
@@ -2026,7 +2269,10 @@ fn run_arith_for_inner(
         }
 
         if let Some(c) = &clause.cond {
-            xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(c)));
+            xtrace_compound(
+                shell,
+                &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(c)),
+            );
         }
         // 2. Eval cond. Empty cond = always true (matches bash).
         let cond_value = match &clause.cond {
@@ -2034,7 +2280,10 @@ fn run_arith_for_inner(
             Some(c) => match crate::expand::eval_arith_word(c, shell) {
                 Ok(v) => v,
                 Err(e) => {
-                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "((: {e}"); }
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(shell, &mut *err, None, "((: {e}");
+                    }
                     return ExecOutcome::Continue(1);
                 }
             },
@@ -2070,12 +2319,21 @@ fn run_arith_for_inner(
 
         // 4. Eval step (if present).
         if let Some(step) = &clause.step {
-            xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(step)));
+            xtrace_compound(
+                shell,
+                &format!(
+                    "(( {} ))",
+                    crate::expand::reconstruct_word_source_inner(step)
+                ),
+            );
         }
         if let Some(step) = &clause.step
             && let Err(e) = crate::expand::eval_arith_word(step, shell)
         {
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "((: {e}"); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "((: {e}");
+            }
             return ExecOutcome::Continue(1);
         }
     }
@@ -2116,7 +2374,6 @@ fn run_select_inner(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
-
     // 1. Build the item list: expand `in WORDS` (Some), or "$@" (None).
     let items: Vec<String> = match &clause.words {
         Some(words) => {
@@ -2137,8 +2394,11 @@ fn run_select_inner(
             Some(words) => format!(
                 "select {} in {}",
                 clause.var,
-                words.iter().map(crate::expand::reconstruct_word_source)
-                    .collect::<Vec<_>>().join(" ")
+                words
+                    .iter()
+                    .map(crate::expand::reconstruct_word_source)
+                    .collect::<Vec<_>>()
+                    .join(" ")
             ),
             None => format!("select {}", clause.var),
         };
@@ -2212,7 +2472,10 @@ fn run_select_inner(
 
         // 3c. Bind NAME (honor readonly like the other loop runners).
         if shell.try_set(&clause.var, selection).is_err() {
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}: readonly variable", clause.var); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "{}: readonly variable", clause.var);
+            }
             return ExecOutcome::Continue(1);
         }
 
@@ -2295,7 +2558,10 @@ fn run_case(
     let subject = expand_assignment(&clause.subject, shell);
     xtrace_compound(
         shell,
-        &format!("case {} in", crate::expand::reconstruct_word_source(&clause.subject)),
+        &format!(
+            "case {} in",
+            crate::expand::reconstruct_word_source(&clause.subject)
+        ),
     );
     let mut last = ExecOutcome::Continue(0);
     let mut i = 0;
@@ -2350,8 +2616,11 @@ fn run_if(
     shell.err_suppressed_depth -= 1;
     if matches!(
         cond,
-        ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-            | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_)
+        ExecOutcome::Exit(_)
+            | ExecOutcome::LoopBreak(_, _)
+            | ExecOutcome::LoopContinue(_)
+            | ExecOutcome::FunctionReturn(_)
+            | ExecOutcome::Interrupted(_)
     ) {
         return cond;
     }
@@ -2364,8 +2633,11 @@ fn run_if(
         shell.err_suppressed_depth -= 1;
         if matches!(
             elif_cond,
-            ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-                | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_)
+            ExecOutcome::Exit(_)
+                | ExecOutcome::LoopBreak(_, _)
+                | ExecOutcome::LoopContinue(_)
+                | ExecOutcome::FunctionReturn(_)
+                | ExecOutcome::Interrupted(_)
         ) {
             return elif_cond;
         }
@@ -2398,10 +2670,13 @@ fn run_double_bracket(
         }
     };
     let result = match eval_test_expr(expr, shell) {
-        Ok(true)  => ExecOutcome::Continue(0),
+        Ok(true) => ExecOutcome::Continue(0),
         Ok(false) => ExecOutcome::Continue(1),
-        Err(msg)  => {
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "[[: {msg}"); }
+        Err(msg) => {
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "[[: {msg}");
+            }
             ExecOutcome::Continue(2)
         }
     };
@@ -2412,30 +2687,58 @@ fn run_double_bracket(
 fn test_unary_op_str(op: crate::command::TestUnaryOp) -> &'static str {
     use crate::command::TestUnaryOp as U;
     match op {
-        U::FileExists => "-e", U::IsRegFile => "-f", U::IsDir => "-d",
-        U::IsReadable => "-r", U::IsWritable => "-w", U::IsExecutable => "-x",
-        U::IsNonEmpty => "-s", U::IsSymlink => "-L", U::StringNonEmpty => "-n",
-        U::StringEmpty => "-z", U::VarSet => "-v", U::OptEnabled => "-o",
-        U::IsFifo => "-p", U::IsSocket => "-S", U::IsBlockDev => "-b",
-        U::IsCharDev => "-c", U::OwnedByEuid => "-O", U::OwnedByEgid => "-G",
-        U::NewerThanRead => "-N", U::IsSticky => "-k", U::IsSetuid => "-u",
-        U::IsSetgid => "-g", U::IsTerminal => "-t",
+        U::FileExists => "-e",
+        U::IsRegFile => "-f",
+        U::IsDir => "-d",
+        U::IsReadable => "-r",
+        U::IsWritable => "-w",
+        U::IsExecutable => "-x",
+        U::IsNonEmpty => "-s",
+        U::IsSymlink => "-L",
+        U::StringNonEmpty => "-n",
+        U::StringEmpty => "-z",
+        U::VarSet => "-v",
+        U::OptEnabled => "-o",
+        U::IsFifo => "-p",
+        U::IsSocket => "-S",
+        U::IsBlockDev => "-b",
+        U::IsCharDev => "-c",
+        U::OwnedByEuid => "-O",
+        U::OwnedByEgid => "-G",
+        U::NewerThanRead => "-N",
+        U::IsSticky => "-k",
+        U::IsSetuid => "-u",
+        U::IsSetgid => "-g",
+        U::IsTerminal => "-t",
     }
 }
 
 fn test_binary_op_str(op: crate::command::TestBinaryOp) -> &'static str {
     use crate::command::TestBinaryOp as B;
     match op {
-        B::StringEq => "==", B::StringNe => "!=", B::StringLt => "<", B::StringGt => ">",
-        B::IntEq => "-eq", B::IntNe => "-ne", B::IntLt => "-lt", B::IntGt => "-gt",
-        B::IntLe => "-le", B::IntGe => "-ge", B::NewerThan => "-nt",
-        B::OlderThan => "-ot", B::SameFile => "-ef",
+        B::StringEq => "==",
+        B::StringNe => "!=",
+        B::StringLt => "<",
+        B::StringGt => ">",
+        B::IntEq => "-eq",
+        B::IntNe => "-ne",
+        B::IntLt => "-lt",
+        B::IntGt => "-gt",
+        B::IntLe => "-le",
+        B::IntGe => "-ge",
+        B::NewerThan => "-nt",
+        B::OlderThan => "-ot",
+        B::SameFile => "-ef",
     }
 }
 
 /// bash shows an empty `[[ ]]` operand as `''` and a non-empty one raw.
 fn xtrace_operand(s: &str) -> String {
-    if s.is_empty() { "''".to_string() } else { s.to_string() }
+    if s.is_empty() {
+        "''".to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 /// Render the `[[ … ]]` body for a single leaf (operands EXPANDED), for `set -x`.
@@ -2448,7 +2751,12 @@ fn render_test_leaf(expr: &TestExpr, shell: &mut Shell) -> String {
         TestExpr::Binary { op, lhs, rhs } => {
             let l = expand_assignment(lhs, shell);
             let r = expand_assignment(rhs, shell);
-            format!("{} {} {}", xtrace_operand(&l), test_binary_op_str(*op), xtrace_operand(&r))
+            format!(
+                "{} {} {}",
+                xtrace_operand(&l),
+                test_binary_op_str(*op),
+                xtrace_operand(&r)
+            )
         }
         TestExpr::Regex { lhs, pattern } => {
             let l = expand_assignment(lhs, shell);
@@ -2463,10 +2771,17 @@ fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
     eval_test_expr_traced(expr, shell, false)
 }
 
-fn eval_test_expr_traced(expr: &TestExpr, shell: &mut Shell, suppress: bool) -> Result<bool, String> {
+fn eval_test_expr_traced(
+    expr: &TestExpr,
+    shell: &mut Shell,
+    suppress: bool,
+) -> Result<bool, String> {
     if !suppress
         && shell.shell_options.xtrace
-        && matches!(expr, TestExpr::Unary { .. } | TestExpr::Binary { .. } | TestExpr::Regex { .. })
+        && matches!(
+            expr,
+            TestExpr::Unary { .. } | TestExpr::Binary { .. } | TestExpr::Regex { .. }
+        )
     {
         let body = render_test_leaf(expr, shell);
         let p4 = ps4(shell);
@@ -2492,7 +2807,11 @@ fn eval_test_expr_traced(expr: &TestExpr, shell: &mut Shell, suppress: bool) -> 
             // A QUOTED span of the operand matches literally (regex metachars
             // escaped); an unquoted span stays an active regex (bash 3.2+, L-23).
             let p = crate::expand::expand_regex_operand(pattern, shell);
-            let p = if shell.nocasematch() { format!("(?i){p}") } else { p };
+            let p = if shell.nocasematch() {
+                format!("(?i){p}")
+            } else {
+                p
+            };
             let re = regex::Regex::new(&p).map_err(|e| format!("regex error: {e}"))?;
             match re.captures(&l) {
                 Some(caps) => {
@@ -2513,7 +2832,8 @@ fn eval_test_expr_traced(expr: &TestExpr, shell: &mut Shell, suppress: bool) -> 
                 }
                 None => {
                     // bash clears BASH_REMATCH to an empty array on no match.
-                    let _ = shell.replace_indexed("BASH_REMATCH", std::collections::BTreeMap::new());
+                    let _ =
+                        shell.replace_indexed("BASH_REMATCH", std::collections::BTreeMap::new());
                     Ok(false)
                 }
             }
@@ -2521,7 +2841,10 @@ fn eval_test_expr_traced(expr: &TestExpr, shell: &mut Shell, suppress: bool) -> 
         TestExpr::Not(inner) => {
             if !suppress
                 && shell.shell_options.xtrace
-                && matches!(**inner, TestExpr::Unary { .. } | TestExpr::Binary { .. } | TestExpr::Regex { .. })
+                && matches!(
+                    **inner,
+                    TestExpr::Unary { .. } | TestExpr::Binary { .. } | TestExpr::Regex { .. }
+                )
             {
                 let body = render_test_leaf(inner, shell);
                 let p4 = ps4(shell);
@@ -2551,29 +2874,67 @@ fn eval_unary(op: TestUnaryOp, s: &str) -> bool {
     use crate::test_builtin;
     match op {
         TestUnaryOp::StringNonEmpty => !s.is_empty(),
-        TestUnaryOp::StringEmpty    => s.is_empty(),
+        TestUnaryOp::StringEmpty => s.is_empty(),
         // Delegate all file tests to the shared test_builtin logic.
-        TestUnaryOp::FileExists   => test_builtin::evaluate(&["-e".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsRegFile    => test_builtin::evaluate(&["-f".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsDir        => test_builtin::evaluate(&["-d".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsReadable   => test_builtin::evaluate(&["-r".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsWritable   => test_builtin::evaluate(&["-w".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsExecutable => test_builtin::evaluate(&["-x".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsNonEmpty   => test_builtin::evaluate(&["-s".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsSymlink    => test_builtin::evaluate(&["-L".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsFifo       => test_builtin::evaluate(&["-p".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsSocket     => test_builtin::evaluate(&["-S".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsBlockDev   => test_builtin::evaluate(&["-b".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsCharDev    => test_builtin::evaluate(&["-c".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::OwnedByEuid  => test_builtin::evaluate(&["-O".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::OwnedByEgid  => test_builtin::evaluate(&["-G".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::NewerThanRead => test_builtin::evaluate(&["-N".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsSticky     => test_builtin::evaluate(&["-k".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsSetuid     => test_builtin::evaluate(&["-u".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsSetgid     => test_builtin::evaluate(&["-g".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::IsTerminal   => test_builtin::evaluate(&["-t".to_string(), s.to_string()]).unwrap_or(false),
-        TestUnaryOp::VarSet       => unreachable!("VarSet handled in eval_test_expr"),
-        TestUnaryOp::OptEnabled   => unreachable!("OptEnabled handled in eval_test_expr"),
+        TestUnaryOp::FileExists => {
+            test_builtin::evaluate(&["-e".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsRegFile => {
+            test_builtin::evaluate(&["-f".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsDir => {
+            test_builtin::evaluate(&["-d".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsReadable => {
+            test_builtin::evaluate(&["-r".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsWritable => {
+            test_builtin::evaluate(&["-w".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsExecutable => {
+            test_builtin::evaluate(&["-x".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsNonEmpty => {
+            test_builtin::evaluate(&["-s".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsSymlink => {
+            test_builtin::evaluate(&["-L".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsFifo => {
+            test_builtin::evaluate(&["-p".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsSocket => {
+            test_builtin::evaluate(&["-S".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsBlockDev => {
+            test_builtin::evaluate(&["-b".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsCharDev => {
+            test_builtin::evaluate(&["-c".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::OwnedByEuid => {
+            test_builtin::evaluate(&["-O".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::OwnedByEgid => {
+            test_builtin::evaluate(&["-G".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::NewerThanRead => {
+            test_builtin::evaluate(&["-N".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsSticky => {
+            test_builtin::evaluate(&["-k".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsSetuid => {
+            test_builtin::evaluate(&["-u".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsSetgid => {
+            test_builtin::evaluate(&["-g".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::IsTerminal => {
+            test_builtin::evaluate(&["-t".to_string(), s.to_string()]).unwrap_or(false)
+        }
+        TestUnaryOp::VarSet => unreachable!("VarSet handled in eval_test_expr"),
+        TestUnaryOp::OptEnabled => unreachable!("OptEnabled handled in eval_test_expr"),
     }
 }
 
@@ -2611,15 +2972,21 @@ fn eval_binary(
                 crate::glob_match::extglob_match(&pattern_str, lhs, nocase)
             } else {
                 let npat = crate::glob_match::translate_bracket_negation(&pattern_str);
-                let pat = glob::Pattern::new(&npat)
-                    .map_err(|e| format!("bad pattern: {e}"))?;
-                pat.matches_with(lhs, glob::MatchOptions {
-                    case_sensitive: !nocase,
-                    require_literal_separator: false,
-                    require_literal_leading_dot: false,
-                })
+                let pat = glob::Pattern::new(&npat).map_err(|e| format!("bad pattern: {e}"))?;
+                pat.matches_with(
+                    lhs,
+                    glob::MatchOptions {
+                        case_sensitive: !nocase,
+                        require_literal_separator: false,
+                        require_literal_leading_dot: false,
+                    },
+                )
             };
-            Ok(if matches!(op, TestBinaryOp::StringEq) { matched } else { !matched })
+            Ok(if matches!(op, TestBinaryOp::StringEq) {
+                matched
+            } else {
+                !matched
+            })
         }
         TestBinaryOp::StringLt | TestBinaryOp::StringGt => {
             let rhs = expand_assignment(rhs_word, shell);
@@ -2722,15 +3089,23 @@ fn run_background_subshell(
     ) {
         Ok(pid) => {
             shell.last_bg_pid = Some(pid);
-            let id = shell.jobs.add_with_pgroup(pid, vec![pid], display, job_control);
+            let id = shell
+                .jobs
+                .add_with_pgroup(pid, vec![pid], display, job_control);
             // bash suppresses automatic job notices inside a subshell environment / completion funcs
             if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
-                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "[{id}] {pid}"); }
+                {
+                    let mut err = err_writer(err_sink, sink);
+                    e!(&mut *err, "[{id}] {pid}");
+                }
             }
             ExecOutcome::Continue(0)
         }
         Err(e) => {
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "fork: {}", crate::bash_io_error(&e)); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "fork: {}", crate::bash_io_error(&e));
+            }
             ExecOutcome::Continue(1)
         }
     }
@@ -2768,7 +3143,16 @@ fn run_background_sequence(
         match File::open("/dev/null") {
             Ok(f) => f.into_raw_fd(),
             Err(e) => {
-                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "/dev/null: {}", crate::bash_io_error(&e)); }
+                {
+                    let mut err = err_writer(err_sink, sink);
+                    crate::sh_error_to!(
+                        shell,
+                        &mut *err,
+                        None,
+                        "/dev/null: {}",
+                        crate::bash_io_error(&e)
+                    );
+                }
                 return ExecOutcome::Continue(1);
             }
         }
@@ -2791,11 +3175,17 @@ fn run_background_sequence(
             // Drop incoming pipe (no-op stage produces no output).
             if let Some(r) = prev_pipe_read.take() {
                 parent_held.retain(|&fd| fd != r);
-                unsafe { libc::close(r); }
+                unsafe {
+                    libc::close(r);
+                }
             }
             // Run via fork so it's isolated (assignments don't affect parent).
             let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone(), *aline));
-            let pgid_target = if job_control { first_pid.unwrap_or(0) } else { NO_PGROUP };
+            let pgid_target = if job_control {
+                first_pid.unwrap_or(0)
+            } else {
+                NO_PGROUP
+            };
             let stdin_fd = devnull_fd; // stage 0 default (overridden below if not first)
             // For a no-op assign stage, stdout is irrelevant but we still need
             // to either pipe or close it for downstream stages.
@@ -2808,30 +3198,62 @@ fn run_background_sequence(
                         w
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
-                        return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "pipe: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
+                        return bail_teardown_bg(
+                            shell,
+                            procsub_base,
+                            first_pid,
+                            &spawned_pids,
+                            &mut parent_held,
+                        );
                     }
                 }
             } else {
                 libc::STDOUT_FILENO
             };
-            let fds_to_close: Vec<RawFd> = parent_held.iter().copied()
+            let fds_to_close: Vec<RawFd> = parent_held
+                .iter()
+                .copied()
                 .filter(|&fd| fd != stdout_fd && fd != stdin_fd)
                 .collect();
-            match fork_and_run_in_subshell(&assign_cmd, shell, stdin_fd, stdout_fd, libc::STDERR_FILENO, pgid_target, &fds_to_close, None, None) {
+            match fork_and_run_in_subshell(
+                &assign_cmd,
+                shell,
+                stdin_fd,
+                stdout_fd,
+                libc::STDERR_FILENO,
+                pgid_target,
+                &fds_to_close,
+                None,
+                None,
+            ) {
                 Ok(pid) => {
                     if stdout_fd > 2 {
                         parent_held.retain(|&fd| fd != stdout_fd);
-                        unsafe { libc::close(stdout_fd); }
+                        unsafe {
+                            libc::close(stdout_fd);
+                        }
                     }
                     if first_pid.is_none() {
                         first_pid = Some(pid);
                         if job_control {
                             unsafe {
                                 if libc::setpgid(pid, pid) != 0 {
-                                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                                    debug_assert!(errno == libc::ESRCH || errno == libc::EACCES,
-                                        "setpgid({pid},{pid}) failed errno {errno}");
+                                    let errno =
+                                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                                    debug_assert!(
+                                        errno == libc::ESRCH || errno == libc::EACCES,
+                                        "setpgid({pid},{pid}) failed errno {errno}"
+                                    );
                                 }
                             }
                         }
@@ -2839,9 +3261,28 @@ fn run_background_sequence(
                     spawned_pids.push(pid);
                 }
                 Err(e) => {
-                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "fork: {}", crate::bash_io_error(&e)); }
-                    if stdout_fd > 2 { unsafe { libc::close(stdout_fd); } }
-                    return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(
+                            shell,
+                            &mut *err,
+                            None,
+                            "fork: {}",
+                            crate::bash_io_error(&e)
+                        );
+                    }
+                    if stdout_fd > 2 {
+                        unsafe {
+                            libc::close(stdout_fd);
+                        }
+                    }
+                    return bail_teardown_bg(
+                        shell,
+                        procsub_base,
+                        first_pid,
+                        &spawned_pids,
+                        &mut parent_held,
+                    );
                 }
             }
             continue;
@@ -2858,7 +3299,13 @@ fn run_background_sequence(
             Ok(s) => s,
             Err(s) => {
                 restore_inline_assignments(s, shell);
-                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+                return bail_teardown_bg(
+                    shell,
+                    procsub_base,
+                    first_pid,
+                    &spawned_pids,
+                    &mut parent_held,
+                );
             }
         };
 
@@ -2871,13 +3318,21 @@ fn run_background_sequence(
                 Some(Redirect::Read(word)) => {
                     if let Some(r) = prev_pipe_read.take() {
                         parent_held.retain(|&fd| fd != r);
-                        unsafe { libc::close(r); }
+                        unsafe {
+                            libc::close(r);
+                        }
                     }
                     let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
                         Ok(p) => p,
                         Err(()) => {
                             restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
                         }
                     };
                     use std::os::unix::io::IntoRawFd;
@@ -2886,14 +3341,22 @@ fn run_background_sequence(
                         Err(e) => {
                             redir_open_error(shell, err_sink, sink, &path, &e);
                             restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
                         }
                     }
                 }
                 Some(Redirect::Heredoc { body, .. }) => {
                     if let Some(r) = prev_pipe_read.take() {
                         parent_held.retain(|&fd| fd != r);
-                        unsafe { libc::close(r); }
+                        unsafe {
+                            libc::close(r);
+                        }
                     }
                     // Forked writer (M-120): the read end is this stage's stdin;
                     // the writer process is an internal helper collected by the
@@ -2903,16 +3366,33 @@ fn run_background_sequence(
                     match spawn_heredoc_writer(&bytes) {
                         Ok((r, _pid)) => r,
                         Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
+                            {
+                                let mut err = err_writer(err_sink, sink);
+                                crate::sh_error_to!(
+                                    shell,
+                                    &mut *err,
+                                    None,
+                                    "heredoc: {}",
+                                    crate::bash_io_error(&e)
+                                );
+                            }
                             restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
                         }
                     }
                 }
                 Some(Redirect::HereString(body)) => {
                     if let Some(r) = prev_pipe_read.take() {
                         parent_held.retain(|&fd| fd != r);
-                        unsafe { libc::close(r); }
+                        unsafe {
+                            libc::close(r);
+                        }
                     }
                     // Here-string: expand with no split/glob + trailing newline,
                     // then feed via a forked writer (M-120; see Heredoc above).
@@ -2921,9 +3401,24 @@ fn run_background_sequence(
                     match spawn_heredoc_writer(&bytes) {
                         Ok((r, _pid)) => r,
                         Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
+                            {
+                                let mut err = err_writer(err_sink, sink);
+                                crate::sh_error_to!(
+                                    shell,
+                                    &mut *err,
+                                    None,
+                                    "heredoc: {}",
+                                    crate::bash_io_error(&e)
+                                );
+                            }
                             restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
                         }
                     }
                 }
@@ -2938,112 +3433,208 @@ fn run_background_sequence(
         parent_held.retain(|&fd| fd != stdin_fd);
 
         // ---- Stdout redirect (ExecCommand only) ------------------------------
-        let explicit_stdout_fd: Option<RawFd> =
-            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.slot_stdout() {
-                    Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+        let explicit_stdout_fd: Option<RawFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
+            stage_cmd
+        {
+            match &exec.slot_stdout() {
+                Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
                             }
-                        };
-                        use std::os::unix::io::IntoRawFd;
-                        let guard = shell.shell_options.noclobber
-                            && !matches!(r, Redirect::Clobber(_));
-                        match open_writable(&path, guard) {
-                            Ok(f) => Some(f.into_raw_fd()),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    };
+                    use std::os::unix::io::IntoRawFd;
+                    let guard = shell.shell_options.noclobber && !matches!(r, Redirect::Clobber(_));
+                    match open_writable(&path, guard) {
+                        Ok(f) => Some(f.into_raw_fd()),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
                             }
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
                         }
                     }
-                    Some(Redirect::Append(w)) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
-                            }
-                        };
-                        use std::os::unix::io::IntoRawFd;
-                        match OpenOptions::new().create(true).append(true).open(&path) {
-                            Ok(f) => Some(f.into_raw_fd()),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
-                            }
-                        }
-                    }
-                    _ => None,
                 }
-            } else {
-                None
-            };
+                Some(Redirect::Append(w)) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    };
+                    use std::os::unix::io::IntoRawFd;
+                    match OpenOptions::new().create(true).append(true).open(&path) {
+                        Ok(f) => Some(f.into_raw_fd()),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         // ---- Stderr redirect (ExecCommand only) ------------------------------
-        let explicit_stderr_fd: Option<RawFd> =
-            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.slot_stderr() {
-                    Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+        let explicit_stderr_fd: Option<RawFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
+            stage_cmd
+        {
+            match &exec.slot_stderr() {
+                Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
                             }
-                        };
-                        use std::os::unix::io::IntoRawFd;
-                        let guard = shell.shell_options.noclobber
-                            && !matches!(r, Redirect::Clobber(_));
-                        match open_writable(&path, guard) {
-                            Ok(f) => Some(f.into_raw_fd()),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+                            if let Some(fd) = explicit_stdout_fd {
+                                unsafe {
+                                    libc::close(fd);
+                                }
                             }
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    };
+                    use std::os::unix::io::IntoRawFd;
+                    let guard = shell.shell_options.noclobber && !matches!(r, Redirect::Clobber(_));
+                    match open_writable(&path, guard) {
+                        Ok(f) => Some(f.into_raw_fd()),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            if let Some(fd) = explicit_stdout_fd {
+                                unsafe {
+                                    libc::close(fd);
+                                }
+                            }
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
                         }
                     }
-                    Some(Redirect::Append(w)) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
-                            }
-                        };
-                        use std::os::unix::io::IntoRawFd;
-                        match OpenOptions::new().create(true).append(true).open(&path) {
-                            Ok(f) => Some(f.into_raw_fd()),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
-                            }
-                        }
-                    }
-                    _ => None,
                 }
-            } else {
-                None
-            };
+                Some(Redirect::Append(w)) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            if let Some(fd) = explicit_stdout_fd {
+                                unsafe {
+                                    libc::close(fd);
+                                }
+                            }
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    };
+                    use std::os::unix::io::IntoRawFd;
+                    match OpenOptions::new().create(true).append(true).open(&path) {
+                        Ok(f) => Some(f.into_raw_fd()),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            if let Some(fd) = explicit_stdout_fd {
+                                unsafe {
+                                    libc::close(fd);
+                                }
+                            }
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         // ---- Stdout fd -------------------------------------------------------
         let stdout_fd: RawFd = if let Some(fd) = explicit_stdout_fd {
@@ -3057,14 +3648,37 @@ fn run_background_sequence(
                         parent_held.push(r);
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "pipe: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
                         restore_inline_assignments(snap, shell);
-                        if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                        if let Some(efd) = explicit_stderr_fd { unsafe { libc::close(efd); } }
-                        unsafe { libc::close(fd); } // close the open file fd we won't use
+                        if stdin_fd > 2 {
+                            unsafe {
+                                libc::close(stdin_fd);
+                            }
+                        }
+                        if let Some(efd) = explicit_stderr_fd {
+                            unsafe {
+                                libc::close(efd);
+                            }
+                        }
+                        unsafe {
+                            libc::close(fd);
+                        } // close the open file fd we won't use
                         drain_procsubs(shell, procsub_base);
                         cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                        for pfd in parent_held.drain(..) { unsafe { libc::close(pfd); } }
+                        for pfd in parent_held.drain(..) {
+                            unsafe {
+                                libc::close(pfd);
+                            }
+                        }
                         return ExecOutcome::Continue(1);
                     }
                 }
@@ -3079,11 +3693,34 @@ fn run_background_sequence(
                     w
                 }
                 Err(e) => {
-                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(
+                            shell,
+                            &mut *err,
+                            None,
+                            "pipe: {}",
+                            crate::bash_io_error(&e)
+                        );
+                    }
                     restore_inline_assignments(snap, shell);
-                    if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                    if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
-                    return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+                    if stdin_fd > 2 {
+                        unsafe {
+                            libc::close(stdin_fd);
+                        }
+                    }
+                    if let Some(fd) = explicit_stderr_fd {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
+                    return bail_teardown_bg(
+                        shell,
+                        procsub_base,
+                        first_pid,
+                        &spawned_pids,
+                        &mut parent_held,
+                    );
                 }
             }
         } else {
@@ -3093,9 +3730,15 @@ fn run_background_sequence(
         let stderr_fd = explicit_stderr_fd.unwrap_or(libc::STDERR_FILENO);
 
         // ---- Classify and spawn ----------------------------------------------
-        let pgid_target = if job_control { first_pid.unwrap_or(0) } else { NO_PGROUP };
+        let pgid_target = if job_control {
+            first_pid.unwrap_or(0)
+        } else {
+            NO_PGROUP
+        };
 
-        let fds_to_close_in_child: Vec<RawFd> = parent_held.iter().copied()
+        let fds_to_close_in_child: Vec<RawFd> = parent_held
+            .iter()
+            .copied()
             .filter(|&fd| fd != stdout_fd && fd != stdin_fd && fd != stderr_fd)
             .collect();
         // (Any heredoc pipe write end lives in the forked writer process, not
@@ -3107,31 +3750,65 @@ fn run_background_sequence(
         let (stdout_dup_target, stderr_dup_target) =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 let sdt = match &exec.slot_stdout() {
-                    Some(Redirect::Dup { source, .. }) => {
-                        match resolve_fd_target(source, shell) {
-                            Ok(fd) => Some(fd),
-                            Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+                    Some(Redirect::Dup { source, .. }) => match resolve_fd_target(source, shell) {
+                        Ok(fd) => Some(fd),
+                        Err(e) => {
+                            {
+                                let mut err = err_writer(err_sink, sink);
+                                crate::sh_error_to!(
+                                    shell,
+                                    &mut *err,
+                                    None,
+                                    "{}",
+                                    crate::bash_io_error(&e)
+                                );
                             }
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
                         }
-                    }
+                    },
                     _ => None,
                 };
                 let sedt = match &exec.slot_stderr() {
-                    Some(Redirect::Dup { source, .. }) => {
-                        match resolve_fd_target(source, shell) {
-                            Ok(fd) => Some(fd),
-                            Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+                    Some(Redirect::Dup { source, .. }) => match resolve_fd_target(source, shell) {
+                        Ok(fd) => Some(fd),
+                        Err(e) => {
+                            {
+                                let mut err = err_writer(err_sink, sink);
+                                crate::sh_error_to!(
+                                    shell,
+                                    &mut *err,
+                                    None,
+                                    "{}",
+                                    crate::bash_io_error(&e)
+                                );
                             }
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
                         }
-                    }
+                    },
                     _ => None,
                 };
                 (sdt, sedt)
@@ -3143,11 +3820,31 @@ fn run_background_sequence(
         let spawn_result = match classify_stage(stage_cmd, shell) {
             StageKind::External(simple) => {
                 went_external = true;
-                spawn_external_with_fds(simple, shell, sink, err_sink, stdin_fd, stdout_fd, stderr_fd, pgid_target, &fds_to_close_in_child)
+                spawn_external_with_fds(
+                    simple,
+                    shell,
+                    sink,
+                    err_sink,
+                    stdin_fd,
+                    stdout_fd,
+                    stderr_fd,
+                    pgid_target,
+                    &fds_to_close_in_child,
+                )
             }
             StageKind::InProcess(cmd) => {
                 went_external = false;
-                fork_and_run_in_subshell(cmd, shell, stdin_fd, stdout_fd, stderr_fd, pgid_target, &fds_to_close_in_child, stdout_dup_target, stderr_dup_target)
+                fork_and_run_in_subshell(
+                    cmd,
+                    shell,
+                    stdin_fd,
+                    stdout_fd,
+                    stderr_fd,
+                    pgid_target,
+                    &fds_to_close_in_child,
+                    stdout_dup_target,
+                    stderr_dup_target,
+                )
             }
         };
 
@@ -3156,28 +3853,61 @@ fn run_background_sequence(
         let pid = match spawn_result {
             Ok(p) => p,
             Err(e) => {
-                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
+                {
+                    let mut err = err_writer(err_sink, sink);
+                    crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e));
+                }
                 if !went_external {
-                    if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                    if stdout_fd > 2 { unsafe { libc::close(stdout_fd); } }
-                    if stderr_fd > 2 { unsafe { libc::close(stderr_fd); } }
+                    if stdin_fd > 2 {
+                        unsafe {
+                            libc::close(stdin_fd);
+                        }
+                    }
+                    if stdout_fd > 2 {
+                        unsafe {
+                            libc::close(stdout_fd);
+                        }
+                    }
+                    if stderr_fd > 2 {
+                        unsafe {
+                            libc::close(stderr_fd);
+                        }
+                    }
                 }
                 for fd in [stdout_fd, stdin_fd, stderr_fd] {
-                    if fd > 2 { parent_held.retain(|&x| x != fd); }
+                    if fd > 2 {
+                        parent_held.retain(|&x| x != fd);
+                    }
                 }
-                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
+                return bail_teardown_bg(
+                    shell,
+                    procsub_base,
+                    first_pid,
+                    &spawned_pids,
+                    &mut parent_held,
+                );
             }
         };
 
         // Close parent copies of fds given to child.
         if !went_external {
-            if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-            if stderr_fd > 2 { unsafe { libc::close(stderr_fd); } }
+            if stdin_fd > 2 {
+                unsafe {
+                    libc::close(stdin_fd);
+                }
+            }
+            if stderr_fd > 2 {
+                unsafe {
+                    libc::close(stderr_fd);
+                }
+            }
         }
         if stdout_fd > 2 {
             parent_held.retain(|&fd| fd != stdout_fd);
             if !went_external {
-                unsafe { libc::close(stdout_fd); }
+                unsafe {
+                    libc::close(stdout_fd);
+                }
             }
         }
 
@@ -3205,7 +3935,9 @@ fn run_background_sequence(
     // Close all remaining parent-held fds (inter-stage pipe read-ends that
     // weren't consumed, and the /dev/null fd).
     for fd in parent_held.drain(..) {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
     }
 
     // (Heredoc/herestring bodies are written by their forked writer processes,
@@ -3226,10 +3958,15 @@ fn run_background_sequence(
 
     let last_pid = *spawned_pids.last().unwrap();
     shell.last_bg_pid = Some(last_pid);
-    let id = shell.jobs.add_with_pgroup(pgid, spawned_pids, display, job_control);
+    let id = shell
+        .jobs
+        .add_with_pgroup(pgid, spawned_pids, display, job_control);
     // bash suppresses automatic job notices inside a subshell environment / completion funcs
     if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
-        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "[{id}] {last_pid}"); }
+        {
+            let mut err = err_writer(err_sink, sink);
+            e!(&mut *err, "[{id}] {last_pid}");
+        }
     }
     // Non-blocking drain: close parent fds and attempt WNOHANG reap of inner
     // procsub children. We don't block here because a long-running inner producer
@@ -3252,7 +3989,11 @@ fn bail_teardown_bg(
 ) -> ExecOutcome {
     drain_procsubs(shell, procsub_base);
     cleanup_partial_pipeline_raw(first_pid, spawned_pids);
-    for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+    for fd in parent_held.drain(..) {
+        unsafe {
+            libc::close(fd);
+        }
+    }
     ExecOutcome::Continue(1)
 }
 
@@ -3267,7 +4008,11 @@ fn bail_teardown_stage(
     parent_held: &mut Vec<RawFd>,
 ) -> ExecOutcome {
     drain_procsubs(shell, procsub_base);
-    for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+    for fd in parent_held.drain(..) {
+        unsafe {
+            libc::close(fd);
+        }
+    }
     ExecOutcome::Continue(1)
 }
 
@@ -3328,7 +4073,9 @@ fn cleanup_partial_pipeline_raw(pgid: Option<i32>, pids: &[i32]) {
     }
     for &pid in pids {
         let mut raw: libc::c_int = 0;
-        unsafe { libc::waitpid(pid, &mut raw, 0); }
+        unsafe {
+            libc::waitpid(pid, &mut raw, 0);
+        }
     }
 }
 
@@ -3352,7 +4099,11 @@ fn group_display_label(first: &Command) -> String {
     let simple = match first {
         Command::Simple(s) => Some(s),
         Command::Pipeline(p) if p.commands.len() == 1 => {
-            if let Command::Simple(s) = &p.commands[0] { Some(s) } else { None }
+            if let Command::Simple(s) = &p.commands[0] {
+                Some(s)
+            } else {
+                None
+            }
         }
         _ => None,
     };
@@ -3429,7 +4180,13 @@ fn glob_expand_word(
     let fields = expand(word, shell);
     let exp = glob_expand_fields_opts(fields, opts, shell);
     if !exp.failglob_unmatched.is_empty() {
-        crate::sh_error_to!(shell, err, None, "no match: {}", exp.failglob_unmatched.join(" "));
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "no match: {}",
+            exp.failglob_unmatched.join(" ")
+        );
         return Err(());
     }
     Ok(exp.words)
@@ -3505,7 +4262,11 @@ fn resolve(
     // apply `cmd.redirects` in source order at execution time; the pipeline-stage
     // path reads `exec.slot_stdin/stdout/stderr()` directly off the AST. So
     // resolve() only expands the program + arguments.
-    Ok(ResolvedCommand { program, args, decl_args })
+    Ok(ResolvedCommand {
+        program,
+        args,
+        decl_args,
+    })
 }
 
 // ----- redirect file handling -----------------------------------------------
@@ -3526,7 +4287,10 @@ fn spawn_heredoc_writer(bytes: &[u8]) -> Result<(RawFd, libc::pid_t), io::Error>
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let e = io::Error::last_os_error();
-        unsafe { libc::close(r); libc::close(w); }
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
         return Err(e);
     }
     if pid == 0 {
@@ -3534,11 +4298,18 @@ fn spawn_heredoc_writer(bytes: &[u8]) -> Result<(RawFd, libc::pid_t), io::Error>
         // v137: keep SIGPIPE ignored here (the process is otherwise SIG_DFL now)
         // so the writer retains its manual EPIPE handling and closes cleanly,
         // preserving v134 large-heredoc behavior exactly.
-        unsafe { libc::close(r); libc::signal(libc::SIGPIPE, libc::SIG_IGN); }
+        unsafe {
+            libc::close(r);
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        }
         let mut off = 0usize;
         while off < bytes.len() {
             let n = unsafe {
-                libc::write(w, bytes[off..].as_ptr() as *const libc::c_void, bytes.len() - off)
+                libc::write(
+                    w,
+                    bytes[off..].as_ptr() as *const libc::c_void,
+                    bytes.len() - off,
+                )
             };
             if n < 0 {
                 // Read errno directly (async-signal-safe; no Rust io::Error
@@ -3550,15 +4321,24 @@ fn spawn_heredoc_writer(bytes: &[u8]) -> Result<(RawFd, libc::pid_t), io::Error>
                 let errno = unsafe { *libc::__errno_location() };
                 #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 let errno = unsafe { *libc::__error() };
-                if errno == libc::EINTR { continue; }
+                if errno == libc::EINTR {
+                    continue;
+                }
                 break;
             }
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             off += n as usize;
         }
-        unsafe { libc::close(w); libc::_exit(0); }
+        unsafe {
+            libc::close(w);
+            libc::_exit(0);
+        }
     }
-    unsafe { libc::close(w); }
+    unsafe {
+        libc::close(w);
+    }
     Ok((r, pid))
 }
 
@@ -3566,10 +4346,7 @@ fn open_resolved(redirect: &ResolvedRedirect) -> io::Result<File> {
     match redirect {
         ResolvedRedirect::Truncate(path) => open_writable(path, false),
         ResolvedRedirect::NoclobberTruncate(path) => open_writable(path, true),
-        ResolvedRedirect::Append(path) => OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path),
+        ResolvedRedirect::Append(path) => OpenOptions::new().create(true).append(true).open(path),
     }
 }
 
@@ -3689,7 +4466,15 @@ pub(crate) fn call_function(
         .filter(|f| matches!(f.kind, crate::shell_state::FrameKind::Function))
         .count();
     if depth >= limit {
-        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, Some(name), "maximum function nesting level exceeded ({limit})"); }
+        {
+            let mut err = err_writer(err_sink, sink);
+            crate::sh_error_to!(
+                shell,
+                &mut *err,
+                Some(name),
+                "maximum function nesting level exceeded ({limit})"
+            );
+        }
         return ExecOutcome::Continue(1);
     }
     let saved = std::mem::take(&mut shell.positional_args);
@@ -3703,7 +4488,11 @@ pub(crate) fn call_function(
     shell.positional_args = args;
     let frame = crate::shell_state::Frame {
         funcname: name.to_string(),
-        source: shell.function_source.get(name).cloned().unwrap_or_else(|| "environment".to_string()),
+        source: shell
+            .function_source
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| "environment".to_string()),
         call_line: shell.current_lineno,
         kind: crate::shell_state::FrameKind::Function,
     };
@@ -3752,11 +4541,7 @@ pub(crate) fn call_function(
 /// function doesn't exist. Stdout from the function goes to the real
 /// stdout (matches bash's behavior where completion functions that
 /// print produce visible output).
-pub(crate) fn call_function_body(
-    name: &str,
-    args: Vec<String>,
-    shell: &mut Shell,
-) -> ExecOutcome {
+pub(crate) fn call_function_body(name: &str, args: Vec<String>, shell: &mut Shell) -> ExecOutcome {
     let body = match shell.functions.get(name) {
         Some(b) => b.clone(),
         None => return ExecOutcome::Continue(1),
@@ -3782,11 +4567,15 @@ fn ps4(shell: &mut Shell) -> String {
     shell.set_last_status(saved_status);
     shell.set_last_cmd_sub_status(saved_cmd_sub);
     let mut chars = expanded.chars();
-    let Some(first) = chars.next() else { return String::new(); };
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
     let rest: String = chars.collect();
     let level = shell.xtrace_depth + 1;
     let mut out = String::with_capacity(level * first.len_utf8() + rest.len());
-    for _ in 0..level { out.push(first); }
+    for _ in 0..level {
+        out.push(first);
+    }
     out.push_str(&rest);
     out
 }
@@ -3862,7 +4651,9 @@ fn drain_procsubs_nonblocking(shell: &mut Shell, base: usize) {
         if let Some(ps) = shell.procsub_pending.pop() {
             // Close the parent end so the inner child sees EOF / SIGPIPE.
             if ps.parent_fd >= 0 {
-                unsafe { libc::close(ps.parent_fd); }
+                unsafe {
+                    libc::close(ps.parent_fd);
+                }
             }
             // Remove the FIFO file if present.
             if let Some(ref p) = ps.fifo_path {
@@ -3872,7 +4663,9 @@ fn drain_procsubs_nonblocking(shell: &mut Shell, base: usize) {
             // (e.g. a long-running producer used with a background consumer),
             // skip the wait — it will be reaped by SIGCHLD handling or shell exit.
             let mut status = 0;
-            unsafe { libc::waitpid(ps.pid, &mut status, libc::WNOHANG); }
+            unsafe {
+                libc::waitpid(ps.pid, &mut status, libc::WNOHANG);
+            }
         }
     }
 }
@@ -3897,7 +4690,10 @@ fn run_assignment_list(
         // For namerefs, skip the early readonly check and let assign() check the
         // RESOLVED target's readonly — a readonly nameref lets you write through.
         if !shell.is_nameref(name) && shell.is_readonly(name) {
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: readonly variable"); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "{name}: readonly variable");
+            }
             shell.posix_fatal(127);
             st = 1;
             break;
@@ -3914,8 +4710,10 @@ fn run_assignment_list(
         if shell.shell_options.xtrace {
             let val = shell.lookup_var(name).unwrap_or_default();
             let p4 = ps4(shell);
-            xtrace_emit(&format!("{p4}{name}={}",
-                      crate::param_expansion::xtrace_quote(&val)));
+            xtrace_emit(&format!(
+                "{p4}{name}={}",
+                crate::param_expansion::xtrace_quote(&val)
+            ));
         }
     }
     // bash: a bare assignment's status is the last command substitution in its
@@ -4002,9 +4800,7 @@ fn run_exec_single_inner(
             .args
             .first()
             .and_then(word_static_text)
-            .map(|s| {
-                builtins::is_declaration_command(&s) || s == "builtin" || s == "command"
-            })
+            .map(|s| builtins::is_declaration_command(&s) || s == "builtin" || s == "command")
             .unwrap_or(false)
     {
         let inner = ExecCommand {
@@ -4041,12 +4837,18 @@ fn run_exec_single_inner(
             && matches!(sink, StdoutSink::Capture(_))
         {
             let redir = &cmd.redirects[0];
-            if let RedirOp::File { mode: crate::command::FileMode::ReadOnly, target } = &redir.op
+            if let RedirOp::File {
+                mode: crate::command::FileMode::ReadOnly,
+                target,
+            } = &redir.op
                 && redir.target_fd() == Some(0)
             {
                 let path = match expand_single(target, shell, &mut *err_writer(err_sink, sink)) {
                     Ok(p) => p,
-                    Err(()) => { drain_procsubs(shell, procsub_base); return ExecOutcome::Continue(1); }
+                    Err(()) => {
+                        drain_procsubs(shell, procsub_base);
+                        return ExecOutcome::Continue(1);
+                    }
                 };
                 let outcome = match std::fs::read(&path) {
                     Ok(bytes) => {
@@ -4092,7 +4894,10 @@ fn run_exec_single_inner(
 
     let mut resolved = match resolve(cmd, shell, &mut *err_writer(err_sink, sink)) {
         Ok(r) => r,
-        Err(code) => { drain_procsubs(shell, procsub_base); return ExecOutcome::Continue(code); }
+        Err(code) => {
+            drain_procsubs(shell, procsub_base);
+            return ExecOutcome::Continue(code);
+        }
     };
 
     // `command CMD args` (bare form): run CMD suppressing shell-FUNCTION lookup
@@ -4116,7 +4921,10 @@ fn run_exec_single_inner(
                     break;
                 }
                 Some(s) if s.starts_with('-') && s.len() > 1 => {
-                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "command: {s}: invalid option"); }
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(shell, &mut *err, None, "command: {s}: invalid option");
+                    }
                     drain_procsubs(shell, procsub_base);
                     return ExecOutcome::Continue(2);
                 }
@@ -4128,7 +4936,10 @@ fn run_exec_single_inner(
         }
         // Bare form: the operand at `idx` (if any) becomes the new program.
         match resolved.args.get(idx) {
-            None => { drain_procsubs(shell, procsub_base); return ExecOutcome::Continue(0); } // `command` / `command -p` alone
+            None => {
+                drain_procsubs(shell, procsub_base);
+                return ExecOutcome::Continue(0);
+            } // `command` / `command -p` alone
             Some(_) => {
                 command_prefix.push("command".to_string());
                 command_prefix.extend(resolved.args[..idx].iter().cloned());
@@ -4152,7 +4963,10 @@ fn run_exec_single_inner(
     let mut require_builtin = false;
     while resolved.program == "builtin" {
         match resolved.args.first() {
-            None => { drain_procsubs(shell, procsub_base); return ExecOutcome::Continue(0); } // `builtin` alone
+            None => {
+                drain_procsubs(shell, procsub_base);
+                return ExecOutcome::Continue(0);
+            } // `builtin` alone
             Some(_) => {
                 let new_program = resolved.args[0].clone();
                 let new_args = resolved.args[1..].to_vec();
@@ -4186,7 +5000,16 @@ fn run_exec_single_inner(
         return ExecOutcome::Continue(1);
     }
     if require_builtin && !builtins::is_builtin(&resolved.program) {
-        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "builtin: {}: not a shell builtin", resolved.program); }
+        {
+            let mut err = err_writer(err_sink, sink);
+            crate::sh_error_to!(
+                shell,
+                &mut *err,
+                None,
+                "builtin: {}: not a shell builtin",
+                resolved.program
+            );
+        }
         drain_procsubs(shell, procsub_base);
         return ExecOutcome::Continue(1);
     }
@@ -4236,7 +5059,10 @@ fn run_exec_single_inner(
         for a in &cmd.inline_assignments {
             let name = a.target.name();
             let val = shell.lookup_var(name).unwrap_or_default();
-            xtrace_emit(&format!("{p4}{name}={}", crate::param_expansion::xtrace_quote(&val)));
+            xtrace_emit(&format!(
+                "{p4}{name}={}",
+                crate::param_expansion::xtrace_quote(&val)
+            ));
         }
         if !resolved.program.is_empty() {
             let body = if let Some(dargs) = &resolved.decl_args {
@@ -4305,7 +5131,10 @@ fn run_exec_single_inner(
         if crate::restricted::is_restricted(shell)
             && let Err(msg) = crate::restricted::check_exec()
         {
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{msg}"); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "{msg}");
+            }
             drain_procsubs(shell, procsub_base);
             return ExecOutcome::Continue(1);
         }
@@ -4314,7 +5143,9 @@ fn run_exec_single_inner(
         // shell. A `command exec`/`builtin exec` wrapper strips it (matches bash).
         // exec returns early here (it never reaches the post-dispatch consume), so
         // mirror that consume on this path, gated identically on a BARE invocation.
-        if !wrapped && command_prefix.is_empty() && !require_builtin
+        if !wrapped
+            && command_prefix.is_empty()
+            && !require_builtin
             && let Some(st) = shell.builtin_usage_error.take()
         {
             shell.posix_fatal(st);
@@ -4326,12 +5157,17 @@ fn run_exec_single_inner(
     // Section 3: track this command's snapshotted names on a shell-managed stack
     // so a nested posix special-builtin persist can delete them from enclosing
     // scopes. finalize_inline_scope (every exit path below) pops exactly this.
-    shell.inline_scopes.push(snap.iter().map(|(n, _)| n.clone()).collect());
+    shell
+        .inline_scopes
+        .push(snap.iter().map(|(n, _)| n.clone()).collect());
 
     if crate::restricted::is_restricted(shell)
         && let Err(msg) = crate::restricted::check_command_name(&resolved.program)
     {
-        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{msg}"); }
+        {
+            let mut err = err_writer(err_sink, sink);
+            crate::sh_error_to!(shell, &mut *err, None, "{msg}");
+        }
         finalize_inline_scope(snap, persistent, shell);
         drain_procsubs(shell, procsub_base);
         return ExecOutcome::Continue(1);
@@ -4348,12 +5184,20 @@ fn run_exec_single_inner(
         // assignments (POSIX special-builtin), so no restore on the redirect-open
         // failure path inside the helper.
         run_builtin_with_redirects(&resolved, &cmd.redirects, shell, sink, err_sink)
-    } else if !bypass_functions && let Some(body) = shell.functions.get(&resolved.program).cloned() {
+    } else if !bypass_functions && let Some(body) = shell.functions.get(&resolved.program).cloned()
+    {
         let name = resolved.program.clone();
         let args = resolved.args;
         if has_any_redirect(cmd) {
-            with_redirect_scope(&cmd.redirects, shell, sink, err_sink,
-                move |shell, inner_sink, inner_err_sink| call_function(&name, body, args, shell, inner_sink, inner_err_sink))
+            with_redirect_scope(
+                &cmd.redirects,
+                shell,
+                sink,
+                err_sink,
+                move |shell, inner_sink, inner_err_sink| {
+                    call_function(&name, body, args, shell, inner_sink, inner_err_sink)
+                },
+            )
         } else {
             call_function(&name, body, args, shell, sink, err_sink)
         }
@@ -4365,18 +5209,30 @@ fn run_exec_single_inner(
     } else if resolved.program == "eval" {
         let args = resolved.args;
         if has_any_redirect(cmd) {
-            with_redirect_scope(&cmd.redirects, shell, sink, err_sink,
-                move |shell, inner_sink, inner_err_sink| builtins::eval_in_sink(&args, shell, inner_sink, inner_err_sink))
+            with_redirect_scope(
+                &cmd.redirects,
+                shell,
+                sink,
+                err_sink,
+                move |shell, inner_sink, inner_err_sink| {
+                    builtins::eval_in_sink(&args, shell, inner_sink, inner_err_sink)
+                },
+            )
         } else {
             builtins::eval_in_sink(&args, shell, sink, err_sink)
         }
     } else if resolved.program == "source" || resolved.program == "." {
         let args = resolved.args;
         if has_any_redirect(cmd) {
-            with_redirect_scope(&cmd.redirects, shell, sink, err_sink,
+            with_redirect_scope(
+                &cmd.redirects,
+                shell,
+                sink,
+                err_sink,
                 move |shell, inner_sink, inner_err_sink| {
                     builtins::source_in_sink(&args, shell, inner_sink, inner_err_sink)
-                })
+                },
+            )
         } else {
             builtins::source_in_sink(&args, shell, sink, err_sink)
         }
@@ -4410,7 +5266,9 @@ fn run_exec_single_inner(
     // reached via the pre-resolve decl-rewrite — `wrapped`) do NOT exit; they
     // leave the signal for the next command's top-of-fn clear. Runtime errors
     // never set the signal, so they fall through here untouched.
-    if !wrapped && command_prefix.is_empty() && !require_builtin
+    if !wrapped
+        && command_prefix.is_empty()
+        && !require_builtin
         && builtins::is_special_builtin(&resolved.program)
         && let Some(st) = shell.builtin_usage_error.take()
     {
@@ -4431,7 +5289,8 @@ fn run_exec_single_inner(
         drain_procsubs(shell, procsub_base);
     }
     debug_assert_eq!(
-        shell.procsub_pending.len(), procsub_base,
+        shell.procsub_pending.len(),
+        procsub_base,
         "process-substitution leak: a return path in run_exec_single skipped drain_procsubs"
     );
     outcome
@@ -4452,7 +5311,12 @@ struct ExecFlags {
 /// Parses leading `-c`/`-l`/`-a NAME` flags from `exec`'s arguments. Stops at
 /// the first non-flag word or `--`. Returns an error message on a bad flag.
 fn parse_exec_flags(args: &[String]) -> Result<ExecFlags, String> {
-    let mut f = ExecFlags { clear_env: false, login: false, argv0: None, operand_start: args.len() };
+    let mut f = ExecFlags {
+        clear_env: false,
+        login: false,
+        argv0: None,
+        operand_start: args.len(),
+    };
     let mut i = 0;
     'outer: while i < args.len() {
         let arg = &args[i];
@@ -4502,8 +5366,7 @@ fn parse_exec_flags(args: &[String]) -> Result<ExecFlags, String> {
 /// Job-control signals huck `SIG_IGN`s at the shell level (see
 /// `install_job_control_signals`). They must be reset to `SIG_DFL` for an
 /// `exec` replacement, since `SIG_IGN` is inherited across `execve`.
-const EXEC_RESET_SIGNALS: [libc::c_int; 3] =
-    [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU];
+const EXEC_RESET_SIGNALS: [libc::c_int; 3] = [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU];
 
 /// Set the job-control signals to `SIG_DFL` for the about-to-exec replacement,
 /// returning their prior handlers. Because `CommandExt::exec` does NOT fork,
@@ -4526,7 +5389,9 @@ unsafe fn reset_exec_signals_saving() -> [libc::sighandler_t; 3] {
 
 unsafe fn restore_exec_signals(prev: [libc::sighandler_t; 3]) {
     for (i, &sig) in EXEC_RESET_SIGNALS.iter().enumerate() {
-        unsafe { libc::signal(sig, prev[i]); }
+        unsafe {
+            libc::signal(sig, prev[i]);
+        }
     }
 }
 
@@ -4575,7 +5440,9 @@ fn apply_redirects_permanently(
     // empty `saved` vec even if it somehow runs.
     for (_target, saved) in scope.saved.drain(..) {
         if saved >= 0 {
-            unsafe { libc::close(saved); }
+            unsafe {
+                libc::close(saved);
+            }
         }
         // saved == -1 means the target fd was previously free/closed — there is
         // no original fd to restore, so we leave the target fd open (permanent).
@@ -4603,7 +5470,10 @@ fn run_exec_builtin(
     let flags = match parse_exec_flags(&resolved.args) {
         Ok(f) => f,
         Err(msg) => {
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{msg}"); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "{msg}");
+            }
             // POSIX case #1: bad option is a usage error (the exec interception
             // consumes this for a bare invocation).
             shell.builtin_usage_error = Some(2);
@@ -4616,7 +5486,11 @@ fn run_exec_builtin(
     // failed exec COMMAND below) — it prints the error and returns failure, so
     // the shell continues. Match that with Continue(1).
     let exit_or_continue = |code: i32, shell: &Shell| {
-        if shell.is_interactive { ExecOutcome::Continue(code) } else { ExecOutcome::Exit(code) }
+        if shell.is_interactive {
+            ExecOutcome::Continue(code)
+        } else {
+            ExecOutcome::Exit(code)
+        }
     };
     if has_any_redirect(cmd) {
         flush_stdout();
@@ -4640,7 +5514,10 @@ fn run_exec_builtin(
             } else {
                 ("not found", 127)
             };
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "exec: {name}: {msg}"); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "exec: {name}: {msg}");
+            }
             return exit_or_continue(code, shell);
         }
     };
@@ -4651,7 +5528,11 @@ fn run_exec_builtin(
     process.args(&operands[1..]);
     // argv[0]: `-a NAME` overrides; `-l` prepends `-`; default is the name as given.
     let base0 = flags.argv0.clone().unwrap_or_else(|| name.clone());
-    process.arg0(if flags.login { format!("-{base0}") } else { base0 });
+    process.arg0(if flags.login {
+        format!("-{base0}")
+    } else {
+        base0
+    });
     process.env_clear();
     if !flags.clear_env {
         process.envs(shell.exported_env());
@@ -4663,13 +5544,18 @@ fn run_exec_builtin(
     // restores the shell's own handlers (exec() does not fork).
     let saved = unsafe { reset_exec_signals_saving() };
     let err = process.exec();
-    unsafe { restore_exec_signals(saved); }
+    unsafe {
+        restore_exec_signals(saved);
+    }
 
     let code = match err.raw_os_error() {
         Some(libc::ENOENT) => 127,
         _ => 126, // EACCES / ENOEXEC / EISDIR / etc.: "cannot execute".
     };
-    { let mut errw = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *errw, None, "exec: {name}: {err}"); }
+    {
+        let mut errw = err_writer(err_sink, sink);
+        crate::sh_error_to!(shell, &mut *errw, None, "exec: {name}: {err}");
+    }
     exit_or_continue(code, shell)
 }
 
@@ -4699,7 +5585,10 @@ unsafe fn replay_redir_ops(ops: &[ChildRedirOp]) -> std::io::Result<()> {
                     // exactly on `target` and was CLOEXEC'd, so it would
                     // vanish on exec. Clear CLOEXEC so it survives.
                     let flags = unsafe { libc::fcntl(target, libc::F_GETFD) };
-                    if flags < 0 || unsafe { libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+                    if flags < 0
+                        || unsafe { libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) }
+                            < 0
+                    {
                         return Err(std::io::Error::last_os_error());
                     }
                 } else if unsafe { libc::dup2(source, target) } < 0 {
@@ -4789,7 +5678,11 @@ fn build_child_redir_plan(
     err_sink: &mut StderrSink,
 ) -> Result<ChildRedirPlan, i32> {
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-    let mut plan = ChildRedirPlan { ops: Vec::new(), held: Vec::new(), heredoc_writers: Vec::new() };
+    let mut plan = ChildRedirPlan {
+        ops: Vec::new(),
+        held: Vec::new(),
+        heredoc_writers: Vec::new(),
+    };
     for redir in redirects {
         // `{var}` named-fd: allocate a free fd >= 10 in the PARENT (non-CLOEXEC so
         // the child inherits it), assign $var (persists), and emit a source==target
@@ -4803,7 +5696,15 @@ fn build_child_redir_plan(
                 let fd: i32 = match cur.trim().parse::<i32>() {
                     Ok(n) if n >= 0 => n,
                     _ => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: ambiguous redirect"); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "{name}: ambiguous redirect"
+                            );
+                        }
                         return Err(1);
                     }
                 };
@@ -4825,7 +5726,10 @@ fn build_child_redir_plan(
                     let file: File = match mode {
                         FileMode::ReadOnly => match File::open(&path) {
                             Ok(f) => f,
-                            Err(e) => { redir_open_error(shell, err_sink, sink, &path, &e); return Err(1); }
+                            Err(e) => {
+                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                return Err(1);
+                            }
                         },
                         FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
                             let resolved = match mode {
@@ -4838,13 +5742,31 @@ fn build_child_redir_plan(
                             };
                             match open_resolved(&resolved) {
                                 Ok(f) => f,
-                                Err(e) => { redir_open_error(shell, err_sink, sink, &resolved_path(&resolved), &e); return Err(1); }
+                                Err(e) => {
+                                    redir_open_error(
+                                        shell,
+                                        err_sink,
+                                        sink,
+                                        &resolved_path(&resolved),
+                                        &e,
+                                    );
+                                    return Err(1);
+                                }
                             }
                         }
                         FileMode::ReadWrite => {
-                            match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+                            match OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .create(true)
+                                .truncate(false)
+                                .open(&path)
+                            {
                                 Ok(f) => f,
-                                Err(e) => { redir_open_error(shell, err_sink, sink, &path, &e); return Err(1); }
+                                Err(e) => {
+                                    redir_open_error(shell, err_sink, sink, &path, &e);
+                                    return Err(1);
+                                }
                             }
                         }
                     };
@@ -4853,23 +5775,65 @@ fn build_child_redir_plan(
                 RedirOp::Dup { source, .. } => {
                     let src = match resolve_fd_target(source, shell) {
                         Ok(fd) => fd,
-                        Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); } return Err(1); }
+                        Err(e) => {
+                            {
+                                let mut err = err_writer(err_sink, sink);
+                                crate::sh_error_to!(
+                                    shell,
+                                    &mut *err,
+                                    None,
+                                    "{}",
+                                    crate::bash_io_error(&e)
+                                );
+                            }
+                            return Err(1);
+                        }
                     };
                     (src, false)
                 }
                 RedirOp::Heredoc { body, .. } => {
                     let bytes = expand_assignment(body, shell).into_bytes();
                     match spawn_heredoc_writer(&bytes) {
-                        Ok((rfd, pid)) => { plan.heredoc_writers.push(pid); (rfd, true) }
-                        Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); } return Err(1); }
+                        Ok((rfd, pid)) => {
+                            plan.heredoc_writers.push(pid);
+                            (rfd, true)
+                        }
+                        Err(e) => {
+                            {
+                                let mut err = err_writer(err_sink, sink);
+                                crate::sh_error_to!(
+                                    shell,
+                                    &mut *err,
+                                    None,
+                                    "heredoc: {}",
+                                    crate::bash_io_error(&e)
+                                );
+                            }
+                            return Err(1);
+                        }
                     }
                 }
                 RedirOp::HereString(w) => {
                     let mut bytes = expand_assignment(w, shell).into_bytes();
                     bytes.push(b'\n');
                     match spawn_heredoc_writer(&bytes) {
-                        Ok((rfd, pid)) => { plan.heredoc_writers.push(pid); (rfd, true) }
-                        Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); } return Err(1); }
+                        Ok((rfd, pid)) => {
+                            plan.heredoc_writers.push(pid);
+                            (rfd, true)
+                        }
+                        Err(e) => {
+                            {
+                                let mut err = err_writer(err_sink, sink);
+                                crate::sh_error_to!(
+                                    shell,
+                                    &mut *err,
+                                    None,
+                                    "heredoc: {}",
+                                    crate::bash_io_error(&e)
+                                );
+                            }
+                            return Err(1);
+                        }
                     }
                 }
                 RedirOp::Close => unreachable!("Close handled above"),
@@ -4877,8 +5841,19 @@ fn build_child_redir_plan(
             let high = match alloc_high_fd(src) {
                 Ok(h) => h,
                 Err(e) => {
-                    if owns_src { unsafe { libc::close(src) }; }
-                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: {}", crate::bash_io_error(&e)); }
+                    if owns_src {
+                        unsafe { libc::close(src) };
+                    }
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(
+                            shell,
+                            &mut *err,
+                            None,
+                            "{name}: {}",
+                            crate::bash_io_error(&e)
+                        );
+                    }
                     return Err(1);
                 }
             };
@@ -4895,13 +5870,19 @@ fn build_child_redir_plan(
             // source == target makes the child's replay clear CLOEXEC on `high`
             // (it is non-CLOEXEC already, but the branch must NOT dup2 onto a
             // lower fd — `high` itself is the inherited descriptor).
-            plan.ops.push(ChildRedirOp::Dup { target: high, source: high });
+            plan.ops.push(ChildRedirOp::Dup {
+                target: high,
+                source: high,
+            });
             plan.held.push(unsafe { OwnedFd::from_raw_fd(high) });
             continue;
         }
         let Some(target) = redir.target_fd() else {
             // RedirFd::Var is handled above; any other None is unexpected.
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "ambiguous redirect"); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "ambiguous redirect");
+            }
             return Err(1);
         };
         let target = target as i32;
@@ -4934,13 +5915,25 @@ fn build_child_redir_plan(
                         match open_resolved(&resolved) {
                             Ok(f) => f,
                             Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &resolved_path(&resolved), &e);
+                                redir_open_error(
+                                    shell,
+                                    err_sink,
+                                    sink,
+                                    &resolved_path(&resolved),
+                                    &e,
+                                );
                                 return Err(1);
                             }
                         }
                     }
                     FileMode::ReadWrite => {
-                        match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+                        match OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .open(&path)
+                        {
                             Ok(f) => f,
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -4953,7 +5946,10 @@ fn build_child_redir_plan(
                 // explicit-redirect target (e.g. `2>file 3>&2`).
                 let raw = relocate_high_cloexec(file.into_raw_fd());
                 let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-                plan.ops.push(ChildRedirOp::Dup { target, source: raw });
+                plan.ops.push(ChildRedirOp::Dup {
+                    target,
+                    source: raw,
+                });
                 plan.held.push(owned);
             }
             RedirOp::Dup { source, .. } => {
@@ -4962,9 +5958,24 @@ fn build_child_redir_plan(
                 // number is valid in the child after fork.
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
-                    Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); } return Err(1); }
+                    Err(e) => {
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "{}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
+                        return Err(1);
+                    }
                 };
-                plan.ops.push(ChildRedirOp::Dup { target, source: src });
+                plan.ops.push(ChildRedirOp::Dup {
+                    target,
+                    source: src,
+                });
             }
             RedirOp::Close => {
                 plan.ops.push(ChildRedirOp::Close { target });
@@ -4976,10 +5987,25 @@ fn build_child_redir_plan(
                         plan.heredoc_writers.push(pid);
                         let rfd = relocate_high_cloexec(rfd);
                         let owned = unsafe { OwnedFd::from_raw_fd(rfd) };
-                        plan.ops.push(ChildRedirOp::Dup { target, source: rfd });
+                        plan.ops.push(ChildRedirOp::Dup {
+                            target,
+                            source: rfd,
+                        });
                         plan.held.push(owned);
                     }
-                    Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); } return Err(1); }
+                    Err(e) => {
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "heredoc: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
+                        return Err(1);
+                    }
                 }
             }
             RedirOp::HereString(w) => {
@@ -4990,10 +6016,25 @@ fn build_child_redir_plan(
                         plan.heredoc_writers.push(pid);
                         let rfd = relocate_high_cloexec(rfd);
                         let owned = unsafe { OwnedFd::from_raw_fd(rfd) };
-                        plan.ops.push(ChildRedirOp::Dup { target, source: rfd });
+                        plan.ops.push(ChildRedirOp::Dup {
+                            target,
+                            source: rfd,
+                        });
                         plan.held.push(owned);
                     }
-                    Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); } return Err(1); }
+                    Err(e) => {
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "heredoc: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
+                        return Err(1);
+                    }
                 }
             }
         }
@@ -5027,7 +6068,10 @@ fn build_child_extra_ops(
     let mut held: Vec<OwnedFd> = Vec::new();
     for redir in &extra {
         let Some(target) = redir.target_fd() else {
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "ambiguous redirect"); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "ambiguous redirect");
+            }
             return Err(1);
         };
         let target = target as i32;
@@ -5043,37 +6087,78 @@ fn build_child_extra_ops(
                 let file: File = match mode {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f,
-                        Err(e) => { redir_open_error(shell, err_sink, sink, &path, &e); return Err(1); }
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            return Err(1);
+                        }
                     },
                     FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
                         let resolved = match mode {
                             FileMode::Append => ResolvedRedirect::Append(path),
                             FileMode::Clobber => ResolvedRedirect::Truncate(path),
-                            _ if shell.shell_options.noclobber => ResolvedRedirect::NoclobberTruncate(path),
+                            _ if shell.shell_options.noclobber => {
+                                ResolvedRedirect::NoclobberTruncate(path)
+                            }
                             _ => ResolvedRedirect::Truncate(path),
                         };
                         match open_resolved(&resolved) {
                             Ok(f) => f,
-                            Err(e) => { redir_open_error(shell, err_sink, sink, &resolved_path(&resolved), &e); return Err(1); }
+                            Err(e) => {
+                                redir_open_error(
+                                    shell,
+                                    err_sink,
+                                    sink,
+                                    &resolved_path(&resolved),
+                                    &e,
+                                );
+                                return Err(1);
+                            }
                         }
                     }
                     FileMode::ReadWrite => {
-                        match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+                        match OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .open(&path)
+                        {
                             Ok(f) => f,
-                            Err(e) => { redir_open_error(shell, err_sink, sink, &path, &e); return Err(1); }
+                            Err(e) => {
+                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                return Err(1);
+                            }
                         }
                     }
                 };
                 let raw = relocate_high_cloexec(file.into_raw_fd());
-                ops.push(ChildRedirOp::Dup { target, source: raw });
+                ops.push(ChildRedirOp::Dup {
+                    target,
+                    source: raw,
+                });
                 held.push(unsafe { OwnedFd::from_raw_fd(raw) });
             }
             RedirOp::Dup { source, .. } => {
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
-                    Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); } return Err(1); }
+                    Err(e) => {
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "{}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
+                        return Err(1);
+                    }
                 };
-                ops.push(ChildRedirOp::Dup { target, source: src });
+                ops.push(ChildRedirOp::Dup {
+                    target,
+                    source: src,
+                });
             }
             RedirOp::Close => ops.push(ChildRedirOp::Close { target }),
             RedirOp::Heredoc { .. } | RedirOp::HereString(_) => {
@@ -5103,7 +6188,10 @@ fn emit_exec_spawn_diag(
 ) {
     match sink {
         StdoutSink::Capture(obuf) if stderr_follows_stdout => {
-            let mut w = LineDispatchWriter { inner: obuf, stream: LineStream::Stdout };
+            let mut w = LineDispatchWriter {
+                inner: obuf,
+                stream: LineStream::Stdout,
+            };
             crate::emit_error_to(shell, &mut w, None, body);
         }
         _ => {
@@ -5141,7 +6229,9 @@ fn run_subprocess(
     // exec — without this, Ctrl-Z would never stop foreground children like
     // vim/less, and background readers could never receive SIGTTIN.
     use std::os::unix::process::CommandExt;
-    unsafe { process.pre_exec(reset_job_control_signals_in_child); }
+    unsafe {
+        process.pre_exec(reset_job_control_signals_in_child);
+    }
 
     // Replay the ordered redirect ops in the child (AFTER the signal-reset
     // pre_exec). All ops are pure dup2/close (async-signal-safe). On any failure
@@ -5158,11 +6248,19 @@ fn run_subprocess(
         let last_2_from_1 = ops
             .iter()
             .rev()
-            .find(|op| matches!(op, ChildRedirOp::Dup { target: 2, .. } | ChildRedirOp::Close { target: 2 }))
+            .find(|op| {
+                matches!(
+                    op,
+                    ChildRedirOp::Dup { target: 2, .. } | ChildRedirOp::Close { target: 2 }
+                )
+            })
             .is_some_and(|op| matches!(op, ChildRedirOp::Dup { source: 1, .. }));
-        let fd1_overridden = ops
-            .iter()
-            .any(|op| matches!(op, ChildRedirOp::Dup { target: 1, .. } | ChildRedirOp::Close { target: 1 }));
+        let fd1_overridden = ops.iter().any(|op| {
+            matches!(
+                op,
+                ChildRedirOp::Dup { target: 1, .. } | ChildRedirOp::Close { target: 1 }
+            )
+        });
         last_2_from_1 && !fd1_overridden
     };
     unsafe {
@@ -5228,7 +6326,10 @@ fn run_subprocess(
             // every exit path (including early returns / panics).
             let live_pids = shell.live_external_children.clone();
             live_pids.lock().unwrap().push(pid as libc::pid_t);
-            let _pid_guard = LiveChildGuard { pids: &live_pids, pid: pid as libc::pid_t };
+            let _pid_guard = LiveChildGuard {
+                pids: &live_pids,
+                pid: pid as libc::pid_t,
+            };
 
             let outcome = if interactive {
                 // Race-close: also setpgid in the parent so the child's pgrp
@@ -5251,11 +6352,16 @@ fn run_subprocess(
                                 break;
                             }
                         }
-                        let line = shell.jobs.iter()
+                        let line = shell
+                            .jobs
+                            .iter()
                             .find(|j| j.id == job_id)
                             .map(|j| crate::jobs::notification_line(j, '+'))
                             .unwrap_or_default();
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "\n{line}"); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            e!(&mut *err, "\n{line}");
+                        }
                         // The command was STOPPED: its process substitutions are
                         // still alive (tied to the stopped job), so the drain in
                         // run_exec_single's epilogue must be non-blocking.
@@ -5283,16 +6389,8 @@ fn run_subprocess(
                 // This runs on the embedder's thread (no drainer thread), so
                 // streaming callbacks fire in real time as bytes arrive.
                 use std::os::fd::IntoRawFd;
-                let pipe_out: RawFd = child
-                    .stdout
-                    .take()
-                    .map(|cs| cs.into_raw_fd())
-                    .unwrap_or(-1);
-                let pipe_err: RawFd = child
-                    .stderr
-                    .take()
-                    .map(|cs| cs.into_raw_fd())
-                    .unwrap_or(-1);
+                let pipe_out: RawFd = child.stdout.take().map(|cs| cs.into_raw_fd()).unwrap_or(-1);
+                let pipe_err: RawFd = child.stderr.take().map(|cs| cs.into_raw_fd()).unwrap_or(-1);
                 // Stash a separate capture buffer for stderr so we don't have to
                 // juggle two &mut Vec<u8> borrows of the *sink/err_sink enums
                 // simultaneously inside CaptureSinks.
@@ -5319,10 +6417,14 @@ fn run_subprocess(
                 );
                 // Close pipe fds we took ownership of.
                 if pipe_out >= 0 {
-                    unsafe { libc::close(pipe_out); }
+                    unsafe {
+                        libc::close(pipe_out);
+                    }
                 }
                 if pipe_err >= 0 {
-                    unsafe { libc::close(pipe_err); }
+                    unsafe {
+                        libc::close(pipe_err);
+                    }
                 }
                 // We have already reaped the child via waitpid(WNOHANG) inside
                 // the loop. Tell `Child` not to reap (or wait on) again — the
@@ -5332,16 +6434,24 @@ fn run_subprocess(
                     Ok(raw_status) => {
                         // Fold the separately-captured stderr bytes into err_sink
                         // now that the stdout &mut borrow is released.
-                        if want_capture_err
-                            && let StderrSink::Capture(buf) = err_sink
-                        {
+                        if want_capture_err && let StderrSink::Capture(buf) = err_sink {
                             buf.extend_from_slice(&stderr_capture);
                         }
                         let code = raw_status_to_exit_code(raw_status, shell);
                         ExecOutcome::Continue(code)
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}: {}", cmd.program, crate::bash_io_error(&e)); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "{}: {}",
+                                cmd.program,
+                                crate::bash_io_error(&e)
+                            );
+                        }
                         ExecOutcome::Continue(1)
                     }
                 }
@@ -5350,7 +6460,9 @@ fn run_subprocess(
             // exited (M-120). They are internal helpers — not jobs, not $!.
             for wpid in heredoc_writers {
                 let mut st = 0;
-                unsafe { libc::waitpid(wpid, &mut st, 0); }
+                unsafe {
+                    libc::waitpid(wpid, &mut st, 0);
+                }
             }
             outcome
         }
@@ -5358,19 +6470,35 @@ fn run_subprocess(
             // Spawn failed: reap any heredoc writers so they don't linger.
             for wpid in heredoc_writers {
                 let mut st = 0;
-                unsafe { libc::waitpid(wpid, &mut st, 0); }
+                unsafe {
+                    libc::waitpid(wpid, &mut st, 0);
+                }
             }
             // bash format: `<src>: line N: <name>: command not found` (the name
             // precedes the phrase; error_prefix supplies the prologue + mode split).
-            emit_exec_spawn_diag(shell, sink, err_sink, stderr_follows_stdout, format_args!("{}: command not found", cmd.program));
+            emit_exec_spawn_diag(
+                shell,
+                sink,
+                err_sink,
+                stderr_follows_stdout,
+                format_args!("{}: command not found", cmd.program),
+            );
             ExecOutcome::Continue(127)
         }
         Err(e) => {
             for wpid in heredoc_writers {
                 let mut st = 0;
-                unsafe { libc::waitpid(wpid, &mut st, 0); }
+                unsafe {
+                    libc::waitpid(wpid, &mut st, 0);
+                }
             }
-            emit_exec_spawn_diag(shell, sink, err_sink, stderr_follows_stdout, format_args!("{}: {}", cmd.program, crate::bash_io_error(&e)));
+            emit_exec_spawn_diag(
+                shell,
+                sink,
+                err_sink,
+                stderr_follows_stdout,
+                format_args!("{}: {}", cmd.program, crate::bash_io_error(&e)),
+            );
             ExecOutcome::Continue(1)
         }
     }
@@ -5416,7 +6544,8 @@ fn run_coproc(
                 &mut *err,
                 None,
                 "warning: execute_coproc: coproc [{}:{}] still exists",
-                existing.pid, existing.name
+                existing.pid,
+                existing.name
             );
         }
     }
@@ -5426,7 +6555,16 @@ fn run_coproc(
     let (in_r, in_w) = match make_pipe() {
         Ok(p) => p,
         Err(e) => {
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "coproc: {}", crate::bash_io_error(&e)); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(
+                    shell,
+                    &mut *err,
+                    None,
+                    "coproc: {}",
+                    crate::bash_io_error(&e)
+                );
+            }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5437,7 +6575,16 @@ fn run_coproc(
                 libc::close(in_r);
                 libc::close(in_w);
             }
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "coproc: {}", crate::bash_io_error(&e)); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(
+                    shell,
+                    &mut *err,
+                    None,
+                    "coproc: {}",
+                    crate::bash_io_error(&e)
+                );
+            }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5463,7 +6610,16 @@ fn run_coproc(
                 libc::close(out_r);
                 libc::close(out_w);
             }
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "coproc: {}", crate::bash_io_error(&e)); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(
+                    shell,
+                    &mut *err,
+                    None,
+                    "coproc: {}",
+                    crate::bash_io_error(&e)
+                );
+            }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5485,7 +6641,16 @@ fn run_coproc(
                 libc::close(out_r);
                 libc::close(in_w);
             }
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "coproc: {}", crate::bash_io_error(&e)); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(
+                    shell,
+                    &mut *err,
+                    None,
+                    "coproc: {}",
+                    crate::bash_io_error(&e)
+                );
+            }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5502,7 +6667,16 @@ fn run_coproc(
                 libc::close(read_fd);
                 libc::close(in_w);
             }
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "coproc: {}", crate::bash_io_error(&e)); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(
+                    shell,
+                    &mut *err,
+                    None,
+                    "coproc: {}",
+                    crate::bash_io_error(&e)
+                );
+            }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5542,7 +6716,9 @@ fn make_pipe() -> io::Result<(RawFd, RawFd)> {
 #[allow(dead_code)]
 fn make_orphan_pipe_for_eof_reader() -> io::Result<RawFd> {
     let (r, w) = make_pipe()?;
-    unsafe { libc::close(w); }
+    unsafe {
+        libc::close(w);
+    }
     Ok(r)
 }
 
@@ -5619,7 +6795,16 @@ fn run_multi_stage(
                     (Some(w), Some(r))
                 }
                 Err(e) => {
-                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(
+                            shell,
+                            &mut *err,
+                            None,
+                            "pipe: {}",
+                            crate::bash_io_error(&e)
+                        );
+                    }
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -5652,12 +6837,20 @@ fn run_multi_stage(
             // Close any incoming pipe read-end (it goes nowhere).
             if let Some(r) = prev_pipe_read.take() {
                 let pos = parent_held.iter().position(|&fd| fd == r);
-                if let Some(p) = pos { parent_held.remove(p); }
-                unsafe { libc::close(r); }
+                if let Some(p) = pos {
+                    parent_held.remove(p);
+                }
+                unsafe {
+                    libc::close(r);
+                }
             }
             // Run the assignments via fork so they're isolated.
             let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone(), *aline));
-            let pgid_target = if interactive { first_pid.unwrap_or(0) } else { NO_PGROUP };
+            let pgid_target = if interactive {
+                first_pid.unwrap_or(0)
+            } else {
+                NO_PGROUP
+            };
             let stdin_fd = libc::STDIN_FILENO;
             let stdout_fd = if !is_last {
                 // Create a pipe; next stage reads from it (will be empty).
@@ -5669,39 +6862,71 @@ fn run_multi_stage(
                         w
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "pipe: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
                         // Clean up all held fds.
                         return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                     }
                 }
             } else {
                 match sink {
-                    StdoutSink::Capture(_) => {
-                        match make_pipe() {
-                            Ok((r, w)) => {
-                                capture_read_fd = Some(r);
-                                parent_held.push(r);
-                                w
-                            }
-                            Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                            }
+                    StdoutSink::Capture(_) => match make_pipe() {
+                        Ok((r, w)) => {
+                            capture_read_fd = Some(r);
+                            parent_held.push(r);
+                            w
                         }
-                    }
+                        Err(e) => {
+                            {
+                                let mut err = err_writer(err_sink, sink);
+                                crate::sh_error_to!(
+                                    shell,
+                                    &mut *err,
+                                    None,
+                                    "pipe: {}",
+                                    crate::bash_io_error(&e)
+                                );
+                            }
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    },
                     StdoutSink::Terminal => libc::STDOUT_FILENO,
                 }
             };
-            let fds_to_close: Vec<RawFd> = parent_held.iter().copied()
+            let fds_to_close: Vec<RawFd> = parent_held
+                .iter()
+                .copied()
                 .filter(|&fd| fd != stdout_fd)
                 .collect();
-            match fork_and_run_in_subshell(&assign_cmd, shell, stdin_fd, stdout_fd, libc::STDERR_FILENO, pgid_target, &fds_to_close, None, None) {
+            match fork_and_run_in_subshell(
+                &assign_cmd,
+                shell,
+                stdin_fd,
+                stdout_fd,
+                libc::STDERR_FILENO,
+                pgid_target,
+                &fds_to_close,
+                None,
+                None,
+            ) {
                 Ok(pid) => {
                     // Close the stdout fd we gave to the child.
                     if stdout_fd > 2 {
                         let pos = parent_held.iter().position(|&fd| fd == stdout_fd);
-                        if let Some(p) = pos { parent_held.remove(p); }
-                        unsafe { libc::close(stdout_fd); }
+                        if let Some(p) = pos {
+                            parent_held.remove(p);
+                        }
+                        unsafe {
+                            libc::close(stdout_fd);
+                        }
                     }
                     if interactive && first_pid.is_none() {
                         first_pid = Some(pid);
@@ -5711,7 +6936,16 @@ fn run_multi_stage(
                     pipeline_stages.push(PipelineStage::Forked(pid));
                 }
                 Err(e) => {
-                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "fork: {}", crate::bash_io_error(&e)); }
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(
+                            shell,
+                            &mut *err,
+                            None,
+                            "fork: {}",
+                            crate::bash_io_error(&e)
+                        );
+                    }
                     return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                 }
             }
@@ -5752,7 +6986,9 @@ fn run_multi_stage(
                     // deadlocking the previous stage's writer.
                     if let Some(r) = prev_pipe_read.take() {
                         parent_held.retain(|&fd| fd != r);
-                        unsafe { libc::close(r); }
+                        unsafe {
+                            libc::close(r);
+                        }
                     }
                     let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
                         Ok(p) => p,
@@ -5778,7 +7014,9 @@ fn run_multi_stage(
                     // stage's writer once the pipe buffer fills.
                     if let Some(r) = prev_pipe_read.take() {
                         parent_held.retain(|&fd| fd != r);
-                        unsafe { libc::close(r); }
+                        unsafe {
+                            libc::close(r);
+                        }
                     }
                     // Expand the body NOW while inline assignments are still applied,
                     // then hand it to a forked writer process (M-120): a body larger
@@ -5791,7 +7029,16 @@ fn run_multi_stage(
                             r
                         }
                         Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
+                            {
+                                let mut err = err_writer(err_sink, sink);
+                                crate::sh_error_to!(
+                                    shell,
+                                    &mut *err,
+                                    None,
+                                    "heredoc: {}",
+                                    crate::bash_io_error(&e)
+                                );
+                            }
                             restore_inline_assignments(snap, shell);
                             return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
@@ -5802,7 +7049,9 @@ fn run_multi_stage(
                     // overrides stdin via here-string.
                     if let Some(r) = prev_pipe_read.take() {
                         parent_held.retain(|&fd| fd != r);
-                        unsafe { libc::close(r); }
+                        unsafe {
+                            libc::close(r);
+                        }
                     }
                     // Expand NOW (inline assignments still applied) + trailing newline,
                     // then feed via a forked writer (M-120).
@@ -5814,7 +7063,16 @@ fn run_multi_stage(
                             r
                         }
                         Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
+                            {
+                                let mut err = err_writer(err_sink, sink);
+                                crate::sh_error_to!(
+                                    shell,
+                                    &mut *err,
+                                    None,
+                                    "heredoc: {}",
+                                    crate::bash_io_error(&e)
+                                );
+                            }
                             restore_inline_assignments(snap, shell);
                             return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
@@ -5833,116 +7091,166 @@ fn run_multi_stage(
         // stdin_fd is now consumed by this stage; remove from parent_held if it was there.
         {
             let pos = parent_held.iter().position(|&fd| fd == stdin_fd);
-            if let Some(p) = pos { parent_held.remove(p); }
+            if let Some(p) = pos {
+                parent_held.remove(p);
+            }
         }
 
         // ---- Determine stdout redirect (from ExecCommand if Simple) ----------
-        let explicit_stdout_fd: Option<RawFd> =
-            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.slot_stdout() {
-                    Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+        let explicit_stdout_fd: Option<RawFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
+            stage_cmd
+        {
+            match &exec.slot_stdout() {
+                Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
                             }
-                        };
-                        use std::os::unix::io::IntoRawFd;
-                        let guard = shell.shell_options.noclobber
-                            && !matches!(r, Redirect::Clobber(_));
-                        match open_writable(&path, guard) {
-                            Ok(f) => Some(f.into_raw_fd()),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    };
+                    use std::os::unix::io::IntoRawFd;
+                    let guard = shell.shell_options.noclobber && !matches!(r, Redirect::Clobber(_));
+                    match open_writable(&path, guard) {
+                        Ok(f) => Some(f.into_raw_fd()),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
                             }
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     }
-                    Some(Redirect::Append(w)) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                            }
-                        };
-                        use std::os::unix::io::IntoRawFd;
-                        match OpenOptions::new().create(true).append(true).open(&path) {
-                            Ok(f) => Some(f.into_raw_fd()),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                            }
-                        }
-                    }
-                    _ => None,
                 }
-            } else {
-                None
-            };
+                Some(Redirect::Append(w)) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    };
+                    use std::os::unix::io::IntoRawFd;
+                    match OpenOptions::new().create(true).append(true).open(&path) {
+                        Ok(f) => Some(f.into_raw_fd()),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         // ---- Determine stderr redirect (from ExecCommand if Simple) ----------
-        let explicit_stderr_fd: Option<RawFd> =
-            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.slot_stderr() {
-                    Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+        let explicit_stderr_fd: Option<RawFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
+            stage_cmd
+        {
+            match &exec.slot_stderr() {
+                Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
                             }
-                        };
-                        use std::os::unix::io::IntoRawFd;
-                        let guard = shell.shell_options.noclobber
-                            && !matches!(r, Redirect::Clobber(_));
-                        match open_writable(&path, guard) {
-                            Ok(f) => Some(f.into_raw_fd()),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                            if let Some(fd) = explicit_stdout_fd {
+                                unsafe {
+                                    libc::close(fd);
+                                }
                             }
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    };
+                    use std::os::unix::io::IntoRawFd;
+                    let guard = shell.shell_options.noclobber && !matches!(r, Redirect::Clobber(_));
+                    match open_writable(&path, guard) {
+                        Ok(f) => Some(f.into_raw_fd()),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            if let Some(fd) = explicit_stdout_fd {
+                                unsafe {
+                                    libc::close(fd);
+                                }
+                            }
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     }
-                    Some(Redirect::Append(w)) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                            }
-                        };
-                        use std::os::unix::io::IntoRawFd;
-                        match OpenOptions::new().create(true).append(true).open(&path) {
-                            Ok(f) => Some(f.into_raw_fd()),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                            }
-                        }
-                    }
-                    _ => None,
                 }
-            } else {
-                None
-            };
+                Some(Redirect::Append(w)) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            if let Some(fd) = explicit_stdout_fd {
+                                unsafe {
+                                    libc::close(fd);
+                                }
+                            }
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    };
+                    use std::os::unix::io::IntoRawFd;
+                    match OpenOptions::new().create(true).append(true).open(&path) {
+                        Ok(f) => Some(f.into_raw_fd()),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            if let Some(fd) = explicit_stdout_fd {
+                                unsafe {
+                                    libc::close(fd);
+                                }
+                            }
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         // ---- Build stdout fd -------------------------------------------------
         // Priority: explicit redirect > inter-stage pipe > Capture sink pipe > STDOUT_FILENO.
@@ -5957,13 +7265,36 @@ fn run_multi_stage(
                         parent_held.push(r);
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "pipe: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
                         restore_inline_assignments(snap, shell);
-                        if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                        if let Some(efd) = explicit_stderr_fd { unsafe { libc::close(efd); } }
-                        unsafe { libc::close(fd); } // close the open file fd we won't use
+                        if stdin_fd > 2 {
+                            unsafe {
+                                libc::close(stdin_fd);
+                            }
+                        }
+                        if let Some(efd) = explicit_stderr_fd {
+                            unsafe {
+                                libc::close(efd);
+                            }
+                        }
+                        unsafe {
+                            libc::close(fd);
+                        } // close the open file fd we won't use
                         drain_procsubs(shell, procsub_base);
-                        for pfd in parent_held.drain(..) { unsafe { libc::close(pfd); } }
+                        for pfd in parent_held.drain(..) {
+                            unsafe {
+                                libc::close(pfd);
+                            }
+                        }
                         return ExecOutcome::Continue(1);
                     }
                 }
@@ -5980,31 +7311,63 @@ fn run_multi_stage(
                     w
                 }
                 Err(e) => {
-                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(
+                            shell,
+                            &mut *err,
+                            None,
+                            "pipe: {}",
+                            crate::bash_io_error(&e)
+                        );
+                    }
                     restore_inline_assignments(snap, shell);
-                    if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                    if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
+                    if stdin_fd > 2 {
+                        unsafe {
+                            libc::close(stdin_fd);
+                        }
+                    }
+                    if let Some(fd) = explicit_stderr_fd {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
                     return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                 }
             }
         } else {
             match sink {
-                StdoutSink::Capture(_) => {
-                    match make_pipe() {
-                        Ok((r, w)) => {
-                            capture_read_fd = Some(r);
-                            parent_held.push(r);
-                            w
-                        }
-                        Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                            if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
-                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                        }
+                StdoutSink::Capture(_) => match make_pipe() {
+                    Ok((r, w)) => {
+                        capture_read_fd = Some(r);
+                        parent_held.push(r);
+                        w
                     }
-                }
+                    Err(e) => {
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "pipe: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
+                        restore_inline_assignments(snap, shell);
+                        if stdin_fd > 2 {
+                            unsafe {
+                                libc::close(stdin_fd);
+                            }
+                        }
+                        if let Some(fd) = explicit_stderr_fd {
+                            unsafe {
+                                libc::close(fd);
+                            }
+                        }
+                        return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                    }
+                },
                 StdoutSink::Terminal => libc::STDOUT_FILENO,
             }
         };
@@ -6034,16 +7397,33 @@ fn run_multi_stage(
                     let fd = unsafe { libc::dup(shared) };
                     if fd < 0 {
                         let e = io::Error::last_os_error();
-                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "dup: {}", crate::bash_io_error(&e)); }
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "dup: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
                         restore_inline_assignments(snap, shell);
-                        if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                        if stdin_fd > 2 {
+                            unsafe {
+                                libc::close(stdin_fd);
+                            }
+                        }
                         if stdout_fd > 2 {
                             parent_held.retain(|&x| x != stdout_fd);
-                            unsafe { libc::close(stdout_fd); }
+                            unsafe {
+                                libc::close(stdout_fd);
+                            }
                         }
                         if let Some(r) = capture_read_fd {
                             parent_held.retain(|&x| x != r);
-                            unsafe { libc::close(r); }
+                            unsafe {
+                                libc::close(r);
+                            }
                         }
                         return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                     }
@@ -6053,7 +7433,11 @@ fn run_multi_stage(
         };
 
         // ---- Classify and spawn ----------------------------------------------
-        let pgid_target = if interactive { first_pid.unwrap_or(0) } else { NO_PGROUP };
+        let pgid_target = if interactive {
+            first_pid.unwrap_or(0)
+        } else {
+            NO_PGROUP
+        };
 
         // parent_fds_to_close: all fds the parent currently holds that the
         // child must close (so it doesn't hold downstream pipe write-ends open,
@@ -6061,7 +7445,9 @@ fn run_multi_stage(
         // to this stage as stdio (those are the child's to keep). The heredoc
         // pipe's write end lives in the forked writer process, not here, so
         // there is nothing extra to add.
-        let fds_to_close_in_child: Vec<RawFd> = parent_held.iter().copied()
+        let fds_to_close_in_child: Vec<RawFd> = parent_held
+            .iter()
+            .copied()
             .filter(|&fd| fd != stdout_fd && fd != stdin_fd && fd != stderr_fd)
             .collect();
 
@@ -6071,39 +7457,65 @@ fn run_multi_stage(
         let (stdout_dup_target, stderr_dup_target) =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 let sdt = match &exec.slot_stdout() {
-                    Some(Redirect::Dup { source, .. }) => {
-                        match resolve_fd_target(source, shell) {
-                            Ok(fd) => Some(fd),
-                            Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(r) = capture_read_fd {
-                                    parent_held.retain(|&fd| fd != r);
-                                    unsafe { libc::close(r); }
-                                }
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                    Some(Redirect::Dup { source, .. }) => match resolve_fd_target(source, shell) {
+                        Ok(fd) => Some(fd),
+                        Err(e) => {
+                            {
+                                let mut err = err_writer(err_sink, sink);
+                                crate::sh_error_to!(
+                                    shell,
+                                    &mut *err,
+                                    None,
+                                    "{}",
+                                    crate::bash_io_error(&e)
+                                );
                             }
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            if let Some(r) = capture_read_fd {
+                                parent_held.retain(|&fd| fd != r);
+                                unsafe {
+                                    libc::close(r);
+                                }
+                            }
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
-                    }
+                    },
                     _ => None,
                 };
                 let sedt = match &exec.slot_stderr() {
-                    Some(Redirect::Dup { source, .. }) => {
-                        match resolve_fd_target(source, shell) {
-                            Ok(fd) => Some(fd),
-                            Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
-                                restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(r) = capture_read_fd {
-                                    parent_held.retain(|&fd| fd != r);
-                                    unsafe { libc::close(r); }
-                                }
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                    Some(Redirect::Dup { source, .. }) => match resolve_fd_target(source, shell) {
+                        Ok(fd) => Some(fd),
+                        Err(e) => {
+                            {
+                                let mut err = err_writer(err_sink, sink);
+                                crate::sh_error_to!(
+                                    shell,
+                                    &mut *err,
+                                    None,
+                                    "{}",
+                                    crate::bash_io_error(&e)
+                                );
                             }
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 {
+                                unsafe {
+                                    libc::close(stdin_fd);
+                                }
+                            }
+                            if let Some(r) = capture_read_fd {
+                                parent_held.retain(|&fd| fd != r);
+                                unsafe {
+                                    libc::close(r);
+                                }
+                            }
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
-                    }
+                    },
                     _ => None,
                 };
                 (sdt, sedt)
@@ -6156,19 +7568,36 @@ fn run_multi_stage(
         let pid = match spawn_result {
             Ok(p) => p,
             Err(e) => {
-                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
+                {
+                    let mut err = err_writer(err_sink, sink);
+                    crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e));
+                }
                 // For InProcess (fork failed), close the fds we were going to
                 // pass. For External, they were already consumed by OwnedFd.
                 if !went_external {
-                    if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                    if stdout_fd > 2 { unsafe { libc::close(stdout_fd); } }
-                    if stderr_fd > 2 { unsafe { libc::close(stderr_fd); } }
+                    if stdin_fd > 2 {
+                        unsafe {
+                            libc::close(stdin_fd);
+                        }
+                    }
+                    if stdout_fd > 2 {
+                        unsafe {
+                            libc::close(stdout_fd);
+                        }
+                    }
+                    if stderr_fd > 2 {
+                        unsafe {
+                            libc::close(stderr_fd);
+                        }
+                    }
                 }
                 // Remove consumed fds from parent_held.
                 for fd in [stdout_fd, stdin_fd, stderr_fd] {
                     if fd > 2 {
                         let pos = parent_held.iter().position(|&x| x == fd);
-                        if let Some(p) = pos { parent_held.remove(p); }
+                        if let Some(p) = pos {
+                            parent_held.remove(p);
+                        }
                     }
                 }
                 // Exclude capture_read_fd from the drain: it will be closed
@@ -6177,8 +7606,16 @@ fn run_multi_stage(
                     parent_held.retain(|&fd| fd != r);
                 }
                 drain_procsubs(shell, procsub_base);
-                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                if let Some(r) = capture_read_fd { unsafe { libc::close(r); } }
+                for fd in parent_held.drain(..) {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
+                if let Some(r) = capture_read_fd {
+                    unsafe {
+                        libc::close(r);
+                    }
+                }
                 return ExecOutcome::Continue(1);
             }
         };
@@ -6189,9 +7626,17 @@ fn run_multi_stage(
         // For External: spawn_external_with_fds consumed them via OwnedFd;
         // they are already closed. Do NOT close again.
         if !went_external {
-            if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+            if stdin_fd > 2 {
+                unsafe {
+                    libc::close(stdin_fd);
+                }
+            }
             // stdout_fd will be closed below (shared with External path).
-            if stderr_fd > 2 { unsafe { libc::close(stderr_fd); } }
+            if stderr_fd > 2 {
+                unsafe {
+                    libc::close(stderr_fd);
+                }
+            }
         }
         // stdout_fd (write-end of the inter-stage pipe or explicit redirect):
         // - For External: already closed by OwnedFd inside spawn_external_with_fds.
@@ -6200,10 +7645,14 @@ fn run_multi_stage(
         // subsequent stages don't include it in their fds_to_close_in_child.
         if stdout_fd > 2 {
             let pos = parent_held.iter().position(|&fd| fd == stdout_fd);
-            if let Some(p) = pos { parent_held.remove(p); }
+            if let Some(p) = pos {
+                parent_held.remove(p);
+            }
             // Only close if InProcess (External already closed it).
             if !went_external {
-                unsafe { libc::close(stdout_fd); }
+                unsafe {
+                    libc::close(stdout_fd);
+                }
             }
         }
 
@@ -6230,7 +7679,9 @@ fn run_multi_stage(
     // the read-end see EOF after the last stage exits).
     for fd in parent_held.iter().copied() {
         if Some(fd) != capture_read_fd && Some(fd) != capture_err_read_fd {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
     }
     parent_held.retain(|&fd| Some(fd) == capture_read_fd || Some(fd) == capture_err_read_fd);
@@ -6261,10 +7712,14 @@ fn run_multi_stage(
         let _ = crate::stream_loop::pipeline_drain_loop(pipe_out, pipe_err, sinks);
     }
     if pipe_out >= 0 {
-        unsafe { libc::close(pipe_out); }
+        unsafe {
+            libc::close(pipe_out);
+        }
     }
     if pipe_err >= 0 {
-        unsafe { libc::close(pipe_err); }
+        unsafe {
+            libc::close(pipe_err);
+        }
     }
     // Fold captured stderr bytes into err_sink now that &mut sink is released.
     if let StderrSink::Capture(buf) = err_sink {
@@ -6277,7 +7732,15 @@ fn run_multi_stage(
     }
 
     // ---- Wait for all stages ------------------------------------------------
-    let last_status = wait_pipeline_raw(&pipeline_stages, &stage_pids, first_pid, shell, sink, err_sink, interactive);
+    let last_status = wait_pipeline_raw(
+        &pipeline_stages,
+        &stage_pids,
+        first_pid,
+        shell,
+        sink,
+        err_sink,
+        interactive,
+    );
 
     // Clear this pipeline's stage pids from the live-children registry in one
     // pass. They were published per-stage above so the timeout timer thread
@@ -6292,7 +7755,9 @@ fn run_multi_stage(
     // ECHILD or any error is fine — they are transient helpers.
     for wpid in heredoc_writers {
         let mut st = 0;
-        unsafe { libc::waitpid(wpid, &mut st, 0); }
+        unsafe {
+            libc::waitpid(wpid, &mut st, 0);
+        }
     }
 
     if interactive {
@@ -6385,7 +7850,9 @@ fn wait_pipeline_raw(
                 if r < 0 {
                     // ECHILD — fill unfilled with 1.
                     for slot in stage_status.iter_mut() {
-                        if slot.is_none() { *slot = Some(1); }
+                        if slot.is_none() {
+                            *slot = Some(1);
+                        }
                     }
                     break;
                 }
@@ -6406,7 +7873,10 @@ fn wait_pipeline_raw(
                         .find(|j| j.id == job_id)
                         .map(|j| crate::jobs::notification_line(j, '+'))
                         .unwrap_or_default();
-                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "\n{line}"); }
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        e!(&mut *err, "\n{line}");
+                    }
                     return PipelineWaitResult::Stopped(sig);
                 }
                 if libc::WIFEXITED(raw) || libc::WIFSIGNALED(raw) {
@@ -6437,7 +7907,9 @@ fn wait_pipeline_raw(
                 let r = unsafe { libc::waitpid(*pid, &mut raw, 0) };
                 if r < 0 {
                     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                    if errno == libc::EINTR { continue; }
+                    if errno == libc::EINTR {
+                        continue;
+                    }
                     *slot = Some(1);
                     break;
                 }
@@ -6506,7 +7978,10 @@ fn apply_inline_assignments(
         let prior = shell.snapshot_var(&snap_name);
         // For namerefs, skip the early readonly check; assign() checks the resolved target.
         if !shell.is_nameref(name) && shell.is_readonly(name) {
-            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: readonly variable"); }
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(shell, &mut *err, None, "{name}: readonly variable");
+            }
             return Err(snap);
         }
         if apply_one_assignment(a, shell, &mut *err_writer(err_sink, sink)).is_err() {
@@ -6573,7 +8048,10 @@ fn finalize_inline_scope(snap: AssignmentSnapshot, persistent: bool, shell: &mut
 /// `ExecCommand::program_static_text` at the `Word` level.
 fn word_static_text(word: &crate::lexer::Word) -> Option<String> {
     if word.0.len() == 1
-        && let crate::lexer::WordPart::Literal { text, quoted: false } = &word.0[0]
+        && let crate::lexer::WordPart::Literal {
+            text,
+            quoted: false,
+        } = &word.0[0]
     {
         return Some(text.clone());
     }
@@ -6614,10 +8092,7 @@ fn command_decl_operand_index(args: &[crate::lexer::Word]) -> Option<usize> {
 /// True iff `word` has a trailing `ArrayLiteral` WordPart (the lexer
 /// shape produced for `name=(...)` / `name+=(...)`).
 fn is_array_value_word(word: &crate::lexer::Word) -> bool {
-    matches!(
-        word.0.last(),
-        Some(crate::lexer::WordPart::ArrayLiteral(_))
-    )
+    matches!(word.0.last(), Some(crate::lexer::WordPart::ArrayLiteral(_)))
 }
 
 /// Applies one `Assignment` to `shell`. Dispatches on the four
@@ -6676,9 +8151,7 @@ pub(crate) fn apply_one_assignment(
                                 .append_associative_element(name, &k, &v)
                                 .map_err(|_| ())?;
                         } else {
-                            shell
-                                .set_associative_element(name, k, v)
-                                .map_err(|_| ())?;
+                            shell.set_associative_element(name, k, v).map_err(|_| ())?;
                         }
                     }
                     return Ok(());
@@ -6696,7 +8169,11 @@ pub(crate) fn apply_one_assignment(
                     err,
                     None,
                     "{name}: {} not valid on associative array",
-                    if a.append { "scalar append" } else { "scalar assignment" }
+                    if a.append {
+                        "scalar append"
+                    } else {
+                        "scalar assignment"
+                    }
                 );
                 return Err(());
             }
@@ -6764,9 +8241,7 @@ pub(crate) fn apply_one_assignment(
                 // a+=v: on a scalar, concatenate; on an array, append to element 0
                 // (bash: `a=(x y); a+=z; echo "${a[0]}"` → "xz").
                 match shell.get_indexed(name) {
-                    Some(_) => shell
-                        .append_indexed_element(name, 0, &s)
-                        .map_err(|_| ()),
+                    Some(_) => shell.append_indexed_element(name, 0, &s).map_err(|_| ()),
                     None => {
                         // Use lookup_var (nameref-aware) so that `r+=v` where r is a
                         // nameref prepends with the TARGET's current value, not the
@@ -6814,7 +8289,9 @@ pub(crate) fn apply_one_assignment(
                     let existing = shell.lookup_indexed_element(name, idx).unwrap_or_default();
                     let cur = arith_eval_operand(&existing, shell).unwrap_or(0);
                     let add = arith_eval_operand(&v, shell).unwrap_or(0);
-                    shell.set_indexed_element(name, idx, (cur + add).to_string()).map_err(|_| ())
+                    shell
+                        .set_indexed_element(name, idx, (cur + add).to_string())
+                        .map_err(|_| ())
                 } else {
                     shell.append_indexed_element(name, idx, &v).map_err(|_| ())
                 }
@@ -6824,7 +8301,12 @@ pub(crate) fn apply_one_assignment(
         }
         // Subscripted lvalue + compound array RHS: bash rejects this.
         (AssignTarget::Indexed { name, .. }, Some(_)) => {
-            crate::sh_error_to!(shell, err, None, "{name}: cannot assign array literal to array element");
+            crate::sh_error_to!(
+                shell,
+                err,
+                None,
+                "{name}: cannot assign array literal to array element"
+            );
             Err(())
         }
     }
@@ -6849,7 +8331,12 @@ fn build_associative_map(
         let key = match &elem.subscript {
             Some(sw) => crate::expand::eval_subscript_key(sw, shell),
             None => {
-                crate::sh_error_to!(shell, err, None, "associative array initializer requires [key]=value form");
+                crate::sh_error_to!(
+                    shell,
+                    err,
+                    None,
+                    "associative array initializer requires [key]=value form"
+                );
                 return Err(());
             }
         };
@@ -7202,7 +8689,10 @@ fn spawn_external_with_fds(
     let SimpleCommand::Exec(exec) = cmd else {
         // Assign-only stages are classified as InProcess by classify_stage;
         // reaching here is a caller bug.
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "spawn_external_with_fds called on Assign stage"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "spawn_external_with_fds called on Assign stage",
+        ));
     };
 
     // Resolve (expand) the command — same path as run_exec_single / run_multi_stage.
@@ -7211,8 +8701,10 @@ fn spawn_external_with_fds(
 
     if shell.shell_options.xtrace {
         let p4 = ps4(shell);
-        xtrace_emit(&format!("{p4}{}",
-                  xtrace_command_line(&[], &resolved.program, &resolved.args)));
+        xtrace_emit(&format!(
+            "{p4}{}",
+            xtrace_command_line(&[], &resolved.program, &resolved.args)
+        ));
     }
 
     // Resolve Dup targets pre-fork (Word expansion may allocate; not async-signal-safe).
@@ -7240,7 +8732,9 @@ fn spawn_external_with_fds(
     process.envs(shell.exported_function_env());
 
     // Reset job-control signals to SIG_DFL before exec.
-    unsafe { process.pre_exec(reset_job_control_signals_in_child); }
+    unsafe {
+        process.pre_exec(reset_job_control_signals_in_child);
+    }
 
     // If there are Dup redirects, chain a second pre_exec to apply dup2 in the
     // child. This runs AFTER the signal-reset pre_exec (registration order).
@@ -7248,10 +8742,14 @@ fn spawn_external_with_fds(
     if stdout_dup_target.is_some() || stderr_dup_target.is_some() {
         unsafe {
             process.pre_exec(move || {
-                if let Some(fd) = stdout_dup_target && libc::dup2(fd, 1) < 0 {
+                if let Some(fd) = stdout_dup_target
+                    && libc::dup2(fd, 1) < 0
+                {
                     return Err(io::Error::last_os_error());
                 }
-                if let Some(fd) = stderr_dup_target && libc::dup2(fd, 2) < 0 {
+                if let Some(fd) = stderr_dup_target
+                    && libc::dup2(fd, 2) < 0
+                {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -7262,9 +8760,12 @@ fn spawn_external_with_fds(
     // Collect the target fds that extra_ops will set up in the child, so we
     // can exclude them from fds_to_close below (Fix B: a dup2 then close on
     // the same fd would silently defeat the redirect).
-    let extra_targets: Vec<RawFd> = extra_ops.iter().map(|op| match *op {
-        ChildRedirOp::Dup { target, .. } | ChildRedirOp::Close { target } => target,
-    }).collect();
+    let extra_targets: Vec<RawFd> = extra_ops
+        .iter()
+        .map(|op| match *op {
+            ChildRedirOp::Dup { target, .. } | ChildRedirOp::Close { target } => target,
+        })
+        .collect();
 
     // Replay the extra (fd>2 / dup-in / close / ReadWrite) ops in source order,
     // AFTER the bridge stdio + dup-target pre_execs above. Pure dup2/close, so
@@ -7300,7 +8801,9 @@ fn spawn_external_with_fds(
         // Dup on stdout: inherit so the dup2 pre_exec can redirect to target.
         // We must still consume stdout_fd so it isn't leaked in the parent.
         if stdout_fd != 1 {
-            unsafe { libc::close(stdout_fd); }
+            unsafe {
+                libc::close(stdout_fd);
+            }
         }
         Stdio::inherit()
     } else if stdout_fd == 1 {
@@ -7311,7 +8814,9 @@ fn spawn_external_with_fds(
     let stderr_stdio = if stderr_dup_target.is_some() {
         // Dup on stderr: inherit so the dup2 pre_exec can redirect to target.
         if stderr_fd != 2 {
-            unsafe { libc::close(stderr_fd); }
+            unsafe {
+                libc::close(stderr_fd);
+            }
         }
         Stdio::inherit()
     } else if stderr_fd == 2 {
@@ -7329,7 +8834,8 @@ fn spawn_external_with_fds(
     // Exclude any fd that extra_ops already claimed as a redirect target: a
     // dup2 into that fd followed by close(fd) would silently defeat the redirect.
     // The closure must be async-signal-safe; libc::close is.
-    let fds_to_close: Vec<RawFd> = parent_fds_to_close.iter()
+    let fds_to_close: Vec<RawFd> = parent_fds_to_close
+        .iter()
         .copied()
         .filter(|fd| !extra_targets.contains(fd))
         .collect();
@@ -7381,16 +8887,36 @@ mod tests {
     fn render_test_leaf_forms() {
         let mut shell = Shell::new();
         shell.set("v", "hi".into());
-        let parse_expr = |src: &str| {
-            match crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(src, &Default::default(), crate::lexer::LexerOptions::default())).expect("parse").expect("seq").first {
-                crate::command::Command::DoubleBracket { expr, .. } => *expr,
-                other => panic!("expected [[ ]], got {other:?}"),
-            }
+        let parse_expr = |src: &str| match crate::parser::parse_sequence(
+            &mut crate::lexer::Lexer::new_live_atoms(
+                src,
+                &Default::default(),
+                crate::lexer::LexerOptions::default(),
+            ),
+        )
+        .expect("parse")
+        .expect("seq")
+        .first
+        {
+            crate::command::Command::DoubleBracket { expr, .. } => *expr,
+            other => panic!("expected [[ ]], got {other:?}"),
         };
-        assert_eq!(render_test_leaf(&parse_expr("[[ -n $v ]]"), &mut shell), "-n hi");
-        assert_eq!(render_test_leaf(&parse_expr("[[ -z \"\" ]]"), &mut shell), "-z ''");
-        assert_eq!(render_test_leaf(&parse_expr("[[ $v == h* ]]"), &mut shell), "hi == h*");
-        assert_eq!(render_test_leaf(&parse_expr("[[ 5 -gt 3 ]]"), &mut shell), "5 -gt 3");
+        assert_eq!(
+            render_test_leaf(&parse_expr("[[ -n $v ]]"), &mut shell),
+            "-n hi"
+        );
+        assert_eq!(
+            render_test_leaf(&parse_expr("[[ -z \"\" ]]"), &mut shell),
+            "-z ''"
+        );
+        assert_eq!(
+            render_test_leaf(&parse_expr("[[ $v == h* ]]"), &mut shell),
+            "hi == h*"
+        );
+        assert_eq!(
+            render_test_leaf(&parse_expr("[[ 5 -gt 3 ]]"), &mut shell),
+            "5 -gt 3"
+        );
     }
 
     #[test]
@@ -7461,7 +8987,10 @@ mod tests {
         // traced -> re-enters ps4() -> infinite recursion -> stack overflow.
         let _ = ps4(&mut shell);
         // Reaching here (no abort) IS the assertion. Also confirm xtrace restored:
-        assert!(shell.shell_options.xtrace, "xtrace must be restored after ps4");
+        assert!(
+            shell.shell_options.xtrace,
+            "xtrace must be restored after ps4"
+        );
     }
 
     #[test]
@@ -7482,8 +9011,14 @@ mod tests {
         let p = dir.join("exists.txt");
         std::fs::write(&p, b"orig").unwrap();
         let f = open_writable(p.to_str().unwrap(), true);
-        assert!(f.is_err(), "guarded open must refuse an existing regular file");
-        assert_eq!(f.err().unwrap().to_string(), "cannot overwrite existing file");
+        assert!(
+            f.is_err(),
+            "guarded open must refuse an existing regular file"
+        );
+        assert_eq!(
+            f.err().unwrap().to_string(),
+            "cannot overwrite existing file"
+        );
         assert_eq!(std::fs::read(&p).unwrap(), b"orig");
         let _ = std::fs::remove_file(&p);
     }
@@ -7491,7 +9026,10 @@ mod tests {
     #[test]
     fn open_writable_guard_exempts_dev_null() {
         let f = open_writable("/dev/null", true);
-        assert!(f.is_ok(), "guarded open must allow non-regular files like /dev/null");
+        assert!(
+            f.is_ok(),
+            "guarded open must allow non-regular files like /dev/null"
+        );
     }
 
     #[test]
@@ -7500,19 +9038,34 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join("trunc.txt");
         std::fs::write(&p, b"original-content").unwrap();
-        { let _f = open_writable(p.to_str().unwrap(), false).unwrap(); }
-        assert_eq!(std::fs::read(&p).unwrap(), b"", "unguarded open should truncate");
+        {
+            let _f = open_writable(p.to_str().unwrap(), false).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"",
+            "unguarded open should truncate"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
     /// A top-level sequence wrapping a single Command.
     fn seq_of(cmd: Command) -> Sequence {
-        Sequence { first: cmd, rest: vec![], background: false }
+        Sequence {
+            first: cmd,
+            rest: vec![],
+            background: false,
+        }
     }
 
     /// A one-pipeline Sequence running `echo <word>`.
     fn echo_seq(word: &str) -> Sequence {
-        let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
+        let ww = |s: &str| {
+            Word(vec![WordPart::Literal {
+                text: s.to_string(),
+                quoted: false,
+            }])
+        };
         Sequence {
             first: Command::Pipeline(Pipeline {
                 negate: false,
@@ -7534,7 +9087,12 @@ mod tests {
     /// side-effect-free `test` builtin — `test 0 -eq 0` succeeds,
     /// `test 1 -eq 0` fails.
     fn cond_seq(succeed: bool) -> Sequence {
-        let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
+        let ww = |s: &str| {
+            Word(vec![WordPart::Literal {
+                text: s.to_string(),
+                quoted: false,
+            }])
+        };
         let lhs = if succeed { "0" } else { "1" };
         Sequence {
             first: Command::Pipeline(Pipeline {
@@ -7553,7 +9111,10 @@ mod tests {
     }
 
     fn lit_word(s: &str) -> Word {
-        Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
+        Word(vec![WordPart::Literal {
+            text: s.to_string(),
+            quoted: false,
+        }])
     }
 
     fn bare_assign(name: &str, value: Word) -> crate::command::Assignment {
@@ -7576,7 +9137,10 @@ mod tests {
 
     fn one_command_sequence(cmd: SimpleCommand) -> Sequence {
         Sequence {
-            first: Command::Pipeline(Pipeline { negate: false, commands: vec![Command::Simple(cmd)] }),
+            first: Command::Pipeline(Pipeline {
+                negate: false,
+                commands: vec![Command::Simple(cmd)],
+            }),
             rest: vec![],
             background: false,
         }
@@ -7677,7 +9241,10 @@ mod tests {
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
                 negate: false,
-                commands: vec![Command::Simple(exec("echo", &["first"])), Command::Simple(exec("echo", &["second"]))],
+                commands: vec![
+                    Command::Simple(exec("echo", &["first"])),
+                    Command::Simple(exec("echo", &["second"])),
+                ],
             }),
             rest: vec![],
             background: false,
@@ -7687,8 +9254,6 @@ mod tests {
         assert_eq!(out, "second\n");
         assert_eq!(status, 0);
     }
-
-    
 
     #[test]
     fn background_pure_builtin_forks_and_registers_job() {
@@ -7708,7 +9273,10 @@ mod tests {
         let outcome = execute(&seq, &mut shell, "echo hi &");
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         // last_bg_pid must have been set to a real forked pid.
-        assert!(shell.last_bg_pid.is_some(), "last_bg_pid should be set after pure-builtin &");
+        assert!(
+            shell.last_bg_pid.is_some(),
+            "last_bg_pid should be set after pure-builtin &"
+        );
         let pid = shell.last_bg_pid.unwrap();
         assert!(pid > 0, "pid should be positive, got {pid}");
     }
@@ -7720,9 +9288,10 @@ mod tests {
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
                 negate: false,
-                commands: vec![Command::Simple(SimpleCommand::Assign(vec![
-                    bare_assign("HUCK_TEST_BG_ASSIGN", lit_word("v")),
-                ], 0))],
+                commands: vec![Command::Simple(SimpleCommand::Assign(
+                    vec![bare_assign("HUCK_TEST_BG_ASSIGN", lit_word("v"))],
+                    0,
+                ))],
             }),
             rest: vec![],
             background: true,
@@ -7766,7 +9335,12 @@ mod tests {
         // bash returns 0, not 1, for break/continue outside a loop).
         use crate::command::{ExecCommand, Pipeline};
         use crate::lexer::{Word, WordPart};
-        let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
+        let ww = |s: &str| {
+            Word(vec![WordPart::Literal {
+                text: s.to_string(),
+                quoted: false,
+            }])
+        };
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
                 negate: false,
@@ -7793,9 +9367,16 @@ mod tests {
         let assign = Sequence {
             first: Command::Pipeline(Pipeline {
                 negate: false,
-                commands: vec![Command::Simple(SimpleCommand::Assign(vec![
-                    bare_assign("BG_X", Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }])),
-                ], 0))],
+                commands: vec![Command::Simple(SimpleCommand::Assign(
+                    vec![bare_assign(
+                        "BG_X",
+                        Word(vec![WordPart::Literal {
+                            text: "hello".to_string(),
+                            quoted: false,
+                        }]),
+                    )],
+                    0,
+                ))],
             }),
             rest: vec![],
             background: false,
@@ -7823,9 +9404,10 @@ mod tests {
 
         // Build a redirect target word containing unquoted `*` and verify expand_single
         // returns the literal "*" (not a glob match) — proving redirects bypass globbing.
-        let word = crate::lexer::Word(vec![
-            crate::lexer::WordPart::Literal { text: "*".to_string(), quoted: false }
-        ]);
+        let word = crate::lexer::Word(vec![crate::lexer::WordPart::Literal {
+            text: "*".to_string(),
+            quoted: false,
+        }]);
         let mut shell = crate::shell_state::Shell::new();
         let result = expand_single(&word, &mut shell, &mut std::io::stderr());
 
@@ -7838,14 +9420,22 @@ mod tests {
 
     /// A Sequence wrapping a single `while`/`until` clause.
     fn while_seq(clause: WhileClause) -> Sequence {
-        Sequence { first: Command::While(Box::new(clause)), rest: vec![], background: false }
+        Sequence {
+            first: Command::While(Box::new(clause)),
+            rest: vec![],
+            background: false,
+        }
     }
 
     use crate::command::ForClause;
 
     /// A Sequence wrapping a single `for` clause.
     fn for_seq(clause: ForClause) -> Sequence {
-        Sequence { first: Command::For(Box::new(clause)), rest: vec![], background: false }
+        Sequence {
+            first: Command::For(Box::new(clause)),
+            rest: vec![],
+            background: false,
+        }
     }
 
     /// A one-pipeline Sequence running `echo $<var>` (the variable expanded).
@@ -7855,8 +9445,14 @@ mod tests {
                 negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
-                    program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
-                    args: vec![Word(vec![WordPart::Var { name: var.to_string(), quoted: false }])],
+                    program: Word(vec![WordPart::Literal {
+                        text: "echo".to_string(),
+                        quoted: false,
+                    }]),
+                    args: vec![Word(vec![WordPart::Var {
+                        name: var.to_string(),
+                        quoted: false,
+                    }])],
                     redirects: Vec::new(),
                     line: 0,
                 }))],
@@ -7873,7 +9469,10 @@ mod tests {
                 negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
-                    program: Word(vec![WordPart::Literal { text: "continue".to_string(), quoted: false }]),
+                    program: Word(vec![WordPart::Literal {
+                        text: "continue".to_string(),
+                        quoted: false,
+                    }]),
                     args: vec![],
                     redirects: Vec::new(),
                     line: 0,
@@ -7973,8 +9572,14 @@ mod tests {
             negate: false,
             commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                 inline_assignments: Vec::new(),
-                program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
-                args: vec![Word(vec![WordPart::Literal { text: "NOPE".to_string(), quoted: false }])],
+                program: Word(vec![WordPart::Literal {
+                    text: "echo".to_string(),
+                    quoted: false,
+                }]),
+                args: vec![Word(vec![WordPart::Literal {
+                    text: "NOPE".to_string(),
+                    quoted: false,
+                }])],
                 redirects: Vec::new(),
                 line: 0,
             }))],
@@ -7998,7 +9603,12 @@ mod tests {
     fn break_seq() -> Sequence {
         use crate::command::{ExecCommand, Pipeline};
         use crate::lexer::{Word, WordPart};
-        let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
+        let ww = |s: &str| {
+            Word(vec![WordPart::Literal {
+                text: s.to_string(),
+                quoted: false,
+            }])
+        };
         Sequence {
             first: Command::Pipeline(Pipeline {
                 negate: false,
@@ -8062,7 +9672,11 @@ mod tests {
 
     /// A Sequence wrapping a single `case` clause.
     fn case_seq(clause: CaseClause) -> Sequence {
-        Sequence { first: Command::Case(Box::new(clause)), rest: vec![], background: false }
+        Sequence {
+            first: Command::Case(Box::new(clause)),
+            rest: vec![],
+            background: false,
+        }
     }
 
     /// A CaseItem with a `;;` (Break) terminator.
@@ -8180,8 +9794,14 @@ mod tests {
                 negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
-                    program: Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]),
-                    args: vec![Word(vec![WordPart::Literal { text: "hi".into(), quoted: false }])],
+                    program: Word(vec![WordPart::Literal {
+                        text: "echo".into(),
+                        quoted: false,
+                    }]),
+                    args: vec![Word(vec![WordPart::Literal {
+                        text: "hi".into(),
+                        quoted: false,
+                    }])],
                     redirects: Vec::new(),
                     line: 0,
                 }))],
@@ -8206,7 +9826,10 @@ mod tests {
     #[test]
     fn case_quoted_metacharacter_matches_literally() {
         // pattern is a quoted `*` — matches the literal string "*", not "abc"
-        let star_pattern = Word(vec![WordPart::Literal { text: "*".to_string(), quoted: true }]);
+        let star_pattern = Word(vec![WordPart::Literal {
+            text: "*".to_string(),
+            quoted: true,
+        }]);
         let make = |subj: &str| CaseClause {
             subject: lit_word(subj),
             items: vec![CaseItem {
@@ -8217,7 +9840,11 @@ mod tests {
         };
         let mut shell = Shell::new();
         let (out_star, _) = execute_capturing(&case_seq(make("*")), &mut shell);
-        assert_eq!(out_star.trim(), "hit", "literal * should match the string \"*\"");
+        assert_eq!(
+            out_star.trim(),
+            "hit",
+            "literal * should match the string \"*\""
+        );
         let (out_abc, _) = execute_capturing(&case_seq(make("abc")), &mut shell);
         assert_eq!(out_abc.trim(), "", "quoted * must not act as a wildcard");
     }
@@ -8230,9 +9857,20 @@ mod tests {
         shell.export_set("HOME", "/home/test".to_string());
         let assigns = vec![
             bare_assign("A", lit_word("1")),
-            bare_assign("B", Word(vec![WordPart::Var { name: "A".to_string(), quoted: false }])),
+            bare_assign(
+                "B",
+                Word(vec![WordPart::Var {
+                    name: "A".to_string(),
+                    quoted: false,
+                }]),
+            ),
         ];
-        let snap = { let mut sink = StdoutSink::Terminal; let mut err_sink = StderrSink::Terminal; apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink) }.expect("ok");
+        let snap = {
+            let mut sink = StdoutSink::Terminal;
+            let mut err_sink = StderrSink::Terminal;
+            apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink)
+        }
+        .expect("ok");
         assert_eq!(shell.get("A"), Some("1"));
         assert_eq!(shell.get("B"), Some("1"));
         assert!(shell.is_exported("A"));
@@ -8244,7 +9882,12 @@ mod tests {
     fn restore_inline_assignments_restores_prior_unset_state() {
         let mut shell = Shell::new();
         let assigns = vec![bare_assign("FOO", lit_word("bar"))];
-        let snap = { let mut sink = StdoutSink::Terminal; let mut err_sink = StderrSink::Terminal; apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink) }.expect("ok");
+        let snap = {
+            let mut sink = StdoutSink::Terminal;
+            let mut err_sink = StderrSink::Terminal;
+            apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink)
+        }
+        .expect("ok");
         assert_eq!(shell.get("FOO"), Some("bar"));
         restore_inline_assignments(snap, &mut shell);
         assert_eq!(shell.get("FOO"), None);
@@ -8256,7 +9899,12 @@ mod tests {
         shell.set("FOO", "outer".to_string());
         assert!(!shell.is_exported("FOO"));
         let assigns = vec![bare_assign("FOO", lit_word("inner"))];
-        let snap = { let mut sink = StdoutSink::Terminal; let mut err_sink = StderrSink::Terminal; apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink) }.expect("ok");
+        let snap = {
+            let mut sink = StdoutSink::Terminal;
+            let mut err_sink = StderrSink::Terminal;
+            apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink)
+        }
+        .expect("ok");
         assert_eq!(shell.get("FOO"), Some("inner"));
         assert!(shell.is_exported("FOO"));
         restore_inline_assignments(snap, &mut shell);
@@ -8269,7 +9917,12 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("FOO", "outer".to_string());
         let assigns = vec![bare_assign("FOO", lit_word("inner"))];
-        let snap = { let mut sink = StdoutSink::Terminal; let mut err_sink = StderrSink::Terminal; apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink) }.expect("ok");
+        let snap = {
+            let mut sink = StdoutSink::Terminal;
+            let mut err_sink = StderrSink::Terminal;
+            apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink)
+        }
+        .expect("ok");
         restore_inline_assignments(snap, &mut shell);
         assert_eq!(shell.get("FOO"), Some("outer"));
         assert!(shell.is_exported("FOO"));
@@ -8283,7 +9936,12 @@ mod tests {
             bare_assign("FOO", lit_word("a")),
             bare_assign("FOO", lit_word("b")),
         ];
-        let snap = { let mut sink = StdoutSink::Terminal; let mut err_sink = StderrSink::Terminal; apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink) }.expect("ok");
+        let snap = {
+            let mut sink = StdoutSink::Terminal;
+            let mut err_sink = StderrSink::Terminal;
+            apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink)
+        }
+        .expect("ok");
         assert_eq!(shell.get("FOO"), Some("b"));
         restore_inline_assignments(snap, &mut shell);
         assert_eq!(shell.get("FOO"), Some("outer"));
@@ -8303,8 +9961,15 @@ mod tests {
             redirects: Vec::new(),
             line: 0,
         });
-        let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
-        let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
+        let pipeline = Pipeline {
+            negate: false,
+            commands: vec![Command::Simple(cmd)],
+        };
+        let seq = Sequence {
+            first: Command::Pipeline(pipeline),
+            rest: vec![],
+            background: false,
+        };
         let _ = execute(&seq, &mut shell, "FOO=inner true");
         assert_eq!(shell.get("FOO"), Some("outer"));
         assert!(!shell.is_exported("FOO"));
@@ -8314,7 +9979,12 @@ mod tests {
     fn run_exec_single_function_call_inline_assignment_does_not_persist() {
         let mut shell = Shell::new();
         // Define a no-op function via the parser.
-        if let Ok(Some(seq)) = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms("myfunc() { echo ok; }", &Default::default(), crate::lexer::LexerOptions::default()))
+        if let Ok(Some(seq)) =
+            crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+                "myfunc() { echo ok; }",
+                &Default::default(),
+                crate::lexer::LexerOptions::default(),
+            ))
         {
             let _ = execute(&seq, &mut shell, "myfunc() { echo ok; }");
         }
@@ -8325,8 +9995,15 @@ mod tests {
             redirects: Vec::new(),
             line: 0,
         });
-        let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
-        let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
+        let pipeline = Pipeline {
+            negate: false,
+            commands: vec![Command::Simple(cmd)],
+        };
+        let seq = Sequence {
+            first: Command::Pipeline(pipeline),
+            rest: vec![],
+            background: false,
+        };
         let _ = execute(&seq, &mut shell, "FOO=val myfunc");
         // bash: a prefix assignment does NOT persist across a function call.
         assert_eq!(shell.get("FOO"), None);
@@ -8381,10 +10058,7 @@ mod tests {
         // persist must NOT propagate through an enclosing same-name prefix-restore.
         // bash 5.2.21: FOO=30 f restores FOO to 0 even though f did `FOO=20 export FOO`.
         let mut shell = Shell::new();
-        exec_script(
-            "FOO=0\nf(){ FOO=20 export FOO; }\nFOO=30 f\n",
-            &mut shell,
-        );
+        exec_script("FOO=0\nf(){ FOO=20 export FOO; }\nFOO=30 f\n", &mut shell);
         assert_eq!(shell.get("FOO"), Some("0"));
         assert!(shell.inline_scopes.is_empty());
     }
@@ -8406,16 +10080,16 @@ mod tests {
         // below the exec block so exec never pushes (else it leaks an entry).
         let mut shell = Shell::new();
         exec_script("FOO=bar exec 3>&1\n", &mut shell);
-        assert!(shell.inline_scopes.is_empty(), "exec must not leak an inline scope");
+        assert!(
+            shell.inline_scopes.is_empty(),
+            "exec must not leak an inline scope"
+        );
     }
 
     #[test]
     fn default_special_persist_does_not_survive_enclosing_prefix() {
         let mut shell = Shell::new();
-        exec_script(
-            "var=0\nf(){ var=20 return 5; }\nvar=30 f\n",
-            &mut shell,
-        );
+        exec_script("var=0\nf(){ var=20 return 5; }\nvar=30 f\n", &mut shell);
         assert_eq!(shell.get("var"), Some("0"));
         assert!(shell.inline_scopes.is_empty());
     }
@@ -8441,8 +10115,15 @@ mod tests {
             redirects: Vec::new(),
             line: 0,
         });
-        let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
-        let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
+        let pipeline = Pipeline {
+            negate: false,
+            commands: vec![Command::Simple(cmd)],
+        };
+        let seq = Sequence {
+            first: Command::Pipeline(pipeline),
+            rest: vec![],
+            background: false,
+        };
         let _ = execute(&seq, &mut shell, "FOO=val export FOO");
         assert_eq!(shell.get("FOO"), Some("val"));
         assert!(shell.is_exported("FOO"));
@@ -8453,14 +10134,22 @@ mod tests {
         // `:` is a special builtin; in DEFAULT mode the prefix is temporary.
         let mut shell = Shell::new();
         exec_script("var=0\nvar=20 :\n", &mut shell);
-        assert_eq!(shell.get("var"), Some("0"), "default mode restores the prefix");
+        assert_eq!(
+            shell.get("var"),
+            Some("0"),
+            "default mode restores the prefix"
+        );
     }
 
     #[test]
     fn special_builtin_prefix_persists_in_posix_mode() {
         let mut shell = Shell::new();
         exec_script("set -o posix\nvar=0\nvar=20 :\n", &mut shell);
-        assert_eq!(shell.get("var"), Some("20"), "posix mode persists the prefix");
+        assert_eq!(
+            shell.get("var"),
+            Some("20"),
+            "posix mode persists the prefix"
+        );
     }
 
     #[test]
@@ -8513,7 +10202,11 @@ mod tests {
         let mut total = 0usize;
         loop {
             let n = unsafe {
-                libc::read(read_fd, buf.as_mut_ptr().add(total).cast(), buf.len() - total)
+                libc::read(
+                    read_fd,
+                    buf.as_mut_ptr().add(total).cast(),
+                    buf.len() - total,
+                )
             };
             if n <= 0 {
                 break;
@@ -8521,7 +10214,9 @@ mod tests {
             total += n as usize;
         }
         unsafe { libc::close(read_fd) };
-        let output = std::str::from_utf8(&buf[..total]).expect("utf8").to_string();
+        let output = std::str::from_utf8(&buf[..total])
+            .expect("utf8")
+            .to_string();
 
         // 6. Reap the child.
         let mut raw_status: libc::c_int = 0;
@@ -8551,7 +10246,13 @@ mod tests {
             {
                 let mut out = StdoutSink::Capture(&mut buf);
                 let mut err = StderrSink::Capture(&mut Vec::new());
-                let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(src, &Default::default(), crate::lexer::LexerOptions::default())).expect("parse").expect("seq");
+                let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+                    src,
+                    &Default::default(),
+                    crate::lexer::LexerOptions::default(),
+                ))
+                .expect("parse")
+                .expect("seq");
                 execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
             }
             String::from_utf8_lossy(&buf).into_owned()
@@ -8566,7 +10267,10 @@ mod tests {
             "2\n"
         );
         // Nested brace-body loops.
-        assert_eq!(run("for x in 1 2; { for y in a b; { echo $x$y; } }"), "1a\n1b\n2a\n2b\n");
+        assert_eq!(
+            run("for x in 1 2; { for y in a b; { echo $x$y; } }"),
+            "1a\n1b\n2a\n2b\n"
+        );
     }
 
     // ----- external-process stderr capture / Merged --------------------------
@@ -8586,7 +10290,13 @@ mod tests {
             let mut out = StdoutSink::Capture(&mut buf_out);
             let mut err = StderrSink::Capture(&mut buf_err);
             let src = "/bin/sh -c 'echo out; echo err >&2'";
-            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(src, &Default::default(), crate::lexer::LexerOptions::default())).expect("parse").expect("seq");
+            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+                src,
+                &Default::default(),
+                crate::lexer::LexerOptions::default(),
+            ))
+            .expect("parse")
+            .expect("seq");
             execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
         }
         assert_eq!(String::from_utf8_lossy(&buf_out), "out\n");
@@ -8608,7 +10318,13 @@ mod tests {
             let mut out = StdoutSink::Capture(&mut buf);
             let mut err = StderrSink::Merged;
             let src = "/bin/sh -c 'printf out; printf err 1>&2; printf out2'";
-            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(src, &Default::default(), crate::lexer::LexerOptions::default())).expect("parse").expect("seq");
+            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+                src,
+                &Default::default(),
+                crate::lexer::LexerOptions::default(),
+            ))
+            .expect("parse")
+            .expect("seq");
             execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
         }
         assert_eq!(String::from_utf8_lossy(&buf), "outerrout2");
@@ -8631,7 +10347,13 @@ mod tests {
             // First stage prints to stderr (visible in err buf), pipes nothing.
             // Second stage `cat` reads (empty) and writes nothing → stdout empty.
             let src = "/bin/sh -c 'echo err >&2' | cat";
-            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(src, &Default::default(), crate::lexer::LexerOptions::default())).expect("parse").expect("seq");
+            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+                src,
+                &Default::default(),
+                crate::lexer::LexerOptions::default(),
+            ))
+            .expect("parse")
+            .expect("seq");
             execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
         }
         assert_eq!(String::from_utf8_lossy(&buf_out), "");
@@ -8653,7 +10375,13 @@ mod tests {
             let mut out = StdoutSink::Capture(&mut buf_out);
             let mut err = StderrSink::Capture(&mut buf_err);
             let src = "( echo out; echo err >&2 )";
-            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(src, &Default::default(), crate::lexer::LexerOptions::default())).expect("parse").expect("seq");
+            let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+                src,
+                &Default::default(),
+                crate::lexer::LexerOptions::default(),
+            ))
+            .expect("parse")
+            .expect("seq");
             execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
         }
         assert_eq!(String::from_utf8_lossy(&buf_out), "out\n");
@@ -8679,7 +10407,10 @@ mod tests {
         use crate::lexer::WordPart;
         Command::Simple(SimpleCommand::Exec(ExecCommand {
             inline_assignments: Vec::new(),
-            program: Word(vec![WordPart::Var { name: "cmd".to_string(), quoted: false }]),
+            program: Word(vec![WordPart::Var {
+                name: "cmd".to_string(),
+                quoted: false,
+            }]),
             args: vec![],
             redirects: Vec::new(),
             line: 0,
@@ -8691,7 +10422,10 @@ mod tests {
         // `cat` is not a builtin and not in functions → External.
         let shell = Shell::new();
         let cmd = simple_exec_cmd("cat");
-        assert!(matches!(classify_stage(&cmd, &shell), StageKind::External(_)));
+        assert!(matches!(
+            classify_stage(&cmd, &shell),
+            StageKind::External(_)
+        ));
     }
 
     #[test]
@@ -8699,7 +10433,10 @@ mod tests {
         // `cd` is a builtin → InProcess.
         let shell = Shell::new();
         let cmd = simple_exec_cmd("cd");
-        assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
+        assert!(matches!(
+            classify_stage(&cmd, &shell),
+            StageKind::InProcess(_)
+        ));
     }
 
     #[test]
@@ -8707,7 +10444,10 @@ mod tests {
         // `echo` is a builtin → InProcess.
         let shell = Shell::new();
         let cmd = simple_exec_cmd("echo");
-        assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
+        assert!(matches!(
+            classify_stage(&cmd, &shell),
+            StageKind::InProcess(_)
+        ));
     }
 
     #[test]
@@ -8715,12 +10455,20 @@ mod tests {
         // A function named `myfunc` exists in shell.functions → InProcess.
         let mut shell = Shell::new();
         // Register myfunc in the function table via the parser.
-        if let Ok(Some(seq)) = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms("myfunc() { :; }", &Default::default(), crate::lexer::LexerOptions::default()))
+        if let Ok(Some(seq)) =
+            crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+                "myfunc() { :; }",
+                &Default::default(),
+                crate::lexer::LexerOptions::default(),
+            ))
         {
             let _ = execute(&seq, &mut shell, "myfunc() { :; }");
         }
         let cmd = simple_exec_cmd("myfunc");
-        assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
+        assert!(matches!(
+            classify_stage(&cmd, &shell),
+            StageKind::InProcess(_)
+        ));
     }
 
     #[test]
@@ -8734,17 +10482,24 @@ mod tests {
             elif_branches: vec![],
             else_body: None,
         }));
-        assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
+        assert!(matches!(
+            classify_stage(&cmd, &shell),
+            StageKind::InProcess(_)
+        ));
     }
 
     #[test]
     fn classify_stage_inprocess_for_assign_only_stage() {
         // Assignment-only stage (SimpleCommand::Assign) → InProcess.
         let shell = Shell::new();
-        let cmd = Command::Simple(SimpleCommand::Assign(vec![
-            bare_assign("FOO", lit_word("bar")),
-        ], 0));
-        assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
+        let cmd = Command::Simple(SimpleCommand::Assign(
+            vec![bare_assign("FOO", lit_word("bar"))],
+            0,
+        ));
+        assert!(matches!(
+            classify_stage(&cmd, &shell),
+            StageKind::InProcess(_)
+        ));
     }
 
     #[test]
@@ -8752,7 +10507,10 @@ mod tests {
         // `$cmd args` — program word is a Var → static text resolution fails → InProcess.
         let shell = Shell::new();
         let cmd = dynamic_exec_cmd();
-        assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
+        assert!(matches!(
+            classify_stage(&cmd, &shell),
+            StageKind::InProcess(_)
+        ));
     }
 
     // ----- resolve_fd_target unit tests (Task 2 / v29) -------------------------
@@ -8792,7 +10550,10 @@ mod tests {
         use crate::lexer::WordPart;
         let exec = ExecCommand {
             inline_assignments: Vec::new(),
-            program: Word(vec![WordPart::Literal { text: "cat".to_string(), quoted: true }]),
+            program: Word(vec![WordPart::Literal {
+                text: "cat".to_string(),
+                quoted: true,
+            }]),
             args: vec![],
             redirects: Vec::new(),
             line: 0,
@@ -8807,7 +10568,10 @@ mod tests {
         use crate::lexer::WordPart;
         let exec = ExecCommand {
             inline_assignments: Vec::new(),
-            program: Word(vec![WordPart::Var { name: "cmd".to_string(), quoted: false }]),
+            program: Word(vec![WordPart::Var {
+                name: "cmd".to_string(),
+                quoted: false,
+            }]),
             args: vec![],
             redirects: Vec::new(),
             line: 0,
@@ -8823,8 +10587,14 @@ mod tests {
         let exec = ExecCommand {
             inline_assignments: Vec::new(),
             program: Word(vec![
-                WordPart::Literal { text: "ca".to_string(), quoted: false },
-                WordPart::Literal { text: "t".to_string(), quoted: false },
+                WordPart::Literal {
+                    text: "ca".to_string(),
+                    quoted: false,
+                },
+                WordPart::Literal {
+                    text: "t".to_string(),
+                    quoted: false,
+                },
             ]),
             args: vec![],
             redirects: Vec::new(),
@@ -8846,7 +10616,11 @@ mod tests {
         for line in src.lines() {
             buf.push_str(line);
             buf.push('\n');
-            match crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(&buf, &Default::default(), crate::lexer::LexerOptions::default())) {
+            match crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+                &buf,
+                &Default::default(),
+                crate::lexer::LexerOptions::default(),
+            )) {
                 Ok(Some(seq)) => {
                     let outcome = execute(&seq, shell, &buf);
                     buf.clear();
@@ -8865,7 +10639,12 @@ mod tests {
         }
         // Execute any remaining buffered content.
         if !buf.is_empty()
-            && let Ok(Some(seq)) = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(&buf, &Default::default(), crate::lexer::LexerOptions::default()))
+            && let Ok(Some(seq)) =
+                crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+                    &buf,
+                    &Default::default(),
+                    crate::lexer::LexerOptions::default(),
+                ))
         {
             let _ = execute(&seq, shell, &buf);
         }
@@ -8888,7 +10667,10 @@ mod tests {
         let mut shell = Shell::new();
         exec_script("set -o posix\neval() { :; }\n", &mut shell);
         assert_eq!(shell.pending_fatal_status, Some(2));
-        assert!(!shell.functions.contains_key("eval"), "function not defined");
+        assert!(
+            !shell.functions.contains_key("eval"),
+            "function not defined"
+        );
     }
     #[test]
     fn default_function_named_special_builtin_is_allowed() {
@@ -8900,7 +10682,10 @@ mod tests {
     #[test]
     fn posix_readonly_for_var_is_fatal() {
         let mut shell = Shell::new();
-        exec_script("set -o posix\nreadonly i=1\nfor i in a b; do :; done\n", &mut shell);
+        exec_script(
+            "set -o posix\nreadonly i=1\nfor i in a b; do :; done\n",
+            &mut shell,
+        );
         assert_eq!(shell.pending_fatal_status, Some(127));
     }
     #[test]
@@ -8946,8 +10731,16 @@ mod tests {
         assert_eq!(posix_run("set -o nosuchopt"), Some(2), "set bad option");
         assert_eq!(posix_run("unset -z"), Some(2), "unset bad option");
         assert_eq!(posix_run("export -z"), Some(2), "export bad option");
-        assert_eq!(posix_run("export AA[4]=1"), Some(1), "export bad assignment");
-        assert_eq!(posix_run("readonly AA[4]=1"), Some(1), "readonly bad assignment");
+        assert_eq!(
+            posix_run("export AA[4]=1"),
+            Some(1),
+            "export bad assignment"
+        );
+        assert_eq!(
+            posix_run("readonly AA[4]=1"),
+            Some(1),
+            "readonly bad assignment"
+        );
         assert_eq!(posix_run("return 2"), Some(2), "return outside function");
         assert_eq!(posix_run("exec -z"), Some(2), "exec bad option");
     }
@@ -8960,15 +10753,27 @@ mod tests {
     }
     #[test]
     fn posix_set_invalid_option_name_exits() {
-        assert_eq!(posix_run("set -o nosuchopt"), Some(2), "genuinely invalid -o name");
+        assert_eq!(
+            posix_run("set -o nosuchopt"),
+            Some(2),
+            "genuinely invalid -o name"
+        );
     }
     #[test]
     fn posix_special_builtin_runtime_errors_do_not_exit() {
         assert_eq!(posix_run("shift 99"), None, "shift out of range");
         assert_eq!(posix_run("shift -z"), None, "shift bad option");
         assert_eq!(posix_run("break"), None, "break outside loop");
-        assert_eq!(posix_run("unset RO; readonly RO=1; unset RO"), None, "unset readonly var");
-        assert_eq!(posix_run("eval false"), None, "eval propagates child status");
+        assert_eq!(
+            posix_run("unset RO; readonly RO=1; unset RO"),
+            None,
+            "unset readonly var"
+        );
+        assert_eq!(
+            posix_run("eval false"),
+            None,
+            "eval propagates child status"
+        );
         assert_eq!(posix_run("f(){ return 2; }; f"), None, "legit return 2");
         assert_eq!(posix_run("trap x NOSUCHSIG"), None, "trap bad signal");
         assert_eq!(posix_run("export \"AA[4]\""), None, "export bad name no =");
@@ -8977,7 +10782,11 @@ mod tests {
     fn posix_command_builtin_wrappers_strip_fatal() {
         assert_eq!(posix_run("command set -o bad"), None, "command strips");
         assert_eq!(posix_run("builtin set -o bad"), None, "builtin strips");
-        assert_eq!(posix_run("command export AA[4]=1"), None, "command strips assignment");
+        assert_eq!(
+            posix_run("command export AA[4]=1"),
+            None,
+            "command strips assignment"
+        );
     }
 
     #[test]
@@ -9003,7 +10812,10 @@ mod tests {
     fn funcnest_unlimited_allows_bounded_recursion() {
         let mut shell = Shell::new();
         // No FUNCNEST: a bounded 50-deep recursion completes without error.
-        exec_script("n=0\nf(){ n=$((n+1)); if (( n >= 50 )); then return 7; fi; f; }\nf\n", &mut shell);
+        exec_script(
+            "n=0\nf(){ n=$((n+1)); if (( n >= 50 )); then return 7; fi; f; }\nf\n",
+            &mut shell,
+        );
         assert_eq!(shell.get("n"), Some("50"));
         assert_eq!(shell.last_status(), 7);
     }
@@ -9022,9 +10834,11 @@ mod tests {
     fn call_function_pops_arg0_after_return() {
         let mut shell = Shell::new();
         exec_script("myfunc() { :; }\nmyfunc\n", &mut shell);
-        assert!(shell.call_stack.is_empty(),
+        assert!(
+            shell.call_stack.is_empty(),
             "call_stack should be empty after function returns, got: {:?}",
-            shell.call_stack);
+            shell.call_stack
+        );
     }
 
     #[test]
@@ -9059,11 +10873,16 @@ mod tests {
         // Background an external command and check that last_bg_pid is set.
         let mut shell = Shell::new();
         exec_script("/usr/bin/true &\n", &mut shell);
-        assert!(shell.last_bg_pid.is_some(), "last_bg_pid should be set after background command");
+        assert!(
+            shell.last_bg_pid.is_some(),
+            "last_bg_pid should be set after background command"
+        );
         // Reap the child to avoid zombies.
         if let Some(pid) = shell.last_bg_pid {
             let mut status: libc::c_int = 0;
-            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG); }
+            unsafe {
+                libc::waitpid(pid, &mut status, libc::WNOHANG);
+            }
         }
     }
 
@@ -9073,12 +10892,20 @@ mod tests {
         // waiting for the child.
         use crate::shell_state::Shell;
         let mut shell = Shell::new();
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms("true && true &", &Default::default(), crate::lexer::LexerOptions::default())).unwrap().unwrap();
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            "true && true &",
+            &Default::default(),
+            crate::lexer::LexerOptions::default(),
+        ))
+        .unwrap()
+        .unwrap();
         let outcome = execute(&seq, &mut shell, "true && true &");
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         // Cleanup: SIGTERM any bg job so the test doesn't leak.
         for job in shell.jobs.iter() {
-            unsafe { libc::kill(job.pgid, libc::SIGTERM); }
+            unsafe {
+                libc::kill(job.pgid, libc::SIGTERM);
+            }
         }
     }
 
@@ -9089,12 +10916,20 @@ mod tests {
         // enough to observe.
         use crate::shell_state::Shell;
         let mut shell = Shell::new();
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms("sleep 30 && true &", &Default::default(), crate::lexer::LexerOptions::default())).unwrap().unwrap();
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            "sleep 30 && true &",
+            &Default::default(),
+            crate::lexer::LexerOptions::default(),
+        ))
+        .unwrap()
+        .unwrap();
         let _ = execute(&seq, &mut shell, "sleep 30 && true &");
         assert_eq!(shell.jobs.iter().count(), 1, "expected exactly one job");
         // Cleanup.
         for job in shell.jobs.iter() {
-            unsafe { libc::kill(job.pgid, libc::SIGTERM); }
+            unsafe {
+                libc::kill(job.pgid, libc::SIGTERM);
+            }
         }
     }
 
@@ -9129,10 +10964,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("X", "outer".to_string());
         shell.mark_readonly("X");
-        exec_script(
-            "for X in a b c; do echo got=$X; done\n",
-            &mut shell,
-        );
+        exec_script("for X in a b c; do echo got=$X; done\n", &mut shell);
         // X unchanged; status 1; body should not have executed.
         assert_eq!(shell.lookup_var("X").as_deref(), Some("outer"));
         assert_eq!(shell.last_status(), 1);
@@ -9169,10 +11001,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("X", "outer".to_string());
         shell.mark_readonly("X");
-        exec_script(
-            "f() { local X=inner; }\nf\n",
-            &mut shell,
-        );
+        exec_script("f() { local X=inner; }\nf\n", &mut shell);
         // local should have errored; X unchanged.
         assert_eq!(shell.lookup_var("X").as_deref(), Some("outer"));
         assert_eq!(shell.last_status(), 1);
@@ -9194,20 +11023,15 @@ mod tests {
     /// window; the noise is a `cargo test` artifact only.)
     #[test]
     fn compound_stdout_redirect_writes_to_file() {
-        let dir = std::env::temp_dir()
-            .join(format!("huck_redir_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("huck_redir_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join("out.txt");
         let _ = std::fs::remove_file(&p);
 
         let mut shell = Shell::new();
-        exec_script(
-            &format!("{{ echo HI; }} > {}\n", p.display()),
-            &mut shell,
-        );
+        exec_script(&format!("{{ echo HI; }} > {}\n", p.display()), &mut shell);
 
-        let content = std::fs::read_to_string(&p)
-            .expect("redirect target file should exist");
+        let content = std::fs::read_to_string(&p).expect("redirect target file should exist");
         assert!(
             content.lines().any(|l| l == "HI"),
             "redirected `echo HI` should appear as a line in the file, got {content:?}",
@@ -9239,9 +11063,13 @@ mod array_assign_tests {
         if !src.ends_with('\n') {
             src.push('\n');
         }
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(&src, &Default::default(), crate::lexer::LexerOptions::default()))
-            .expect("parse ok")
-            .expect("non-empty parse");
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            &src,
+            &Default::default(),
+            crate::lexer::LexerOptions::default(),
+        ))
+        .expect("parse ok")
+        .expect("non-empty parse");
         execute(&seq, shell, &src);
     }
 
@@ -9500,7 +11328,10 @@ mod assoc_assign_tests {
         // `a+=([one]+=more)` on existing [one]=one → "onemore".
         let mut s = Shell::new();
         run(&mut s, "declare -A a=([one]=one); a+=([one]+=more)");
-        assert_eq!(s.lookup_associative_element("a", "one"), Some("onemore".into()));
+        assert_eq!(
+            s.lookup_associative_element("a", "one"),
+            Some("onemore".into())
+        );
     }
 
     #[test]
@@ -9643,7 +11474,10 @@ mod coproc_name_tests {
         run(&mut s, "coproc @ { :; }");
         assert_eq!(s.last_status(), 1, "invalid coproc name → exit status 1");
         assert!(s.coprocs.is_empty(), "no coproc should be created");
-        assert!(s.get("@_PID").is_none(), "no NAME_PID for a rejected coproc");
+        assert!(
+            s.get("@_PID").is_none(),
+            "no NAME_PID for a rejected coproc"
+        );
     }
 
     #[test]
@@ -9669,31 +11503,36 @@ mod arith_for_tests {
     fn arith_command_nonzero_exits_0() {
         let mut sh = Shell::new();
         let outcome = crate::shell::process_line("((1+2))", &mut sh, false);
-        assert!(matches!(outcome, ExecOutcome::Continue(0)), "got {outcome:?}");
+        assert!(
+            matches!(outcome, ExecOutcome::Continue(0)),
+            "got {outcome:?}"
+        );
     }
 
     #[test]
     fn arith_command_zero_exits_1() {
         let mut sh = Shell::new();
         let outcome = crate::shell::process_line("((0))", &mut sh, false);
-        assert!(matches!(outcome, ExecOutcome::Continue(1)), "got {outcome:?}");
+        assert!(
+            matches!(outcome, ExecOutcome::Continue(1)),
+            "got {outcome:?}"
+        );
     }
 
     #[test]
     fn arith_command_division_by_zero_exits_1() {
         let mut sh = Shell::new();
         let outcome = crate::shell::process_line("((1/0))", &mut sh, false);
-        assert!(matches!(outcome, ExecOutcome::Continue(1)), "got {outcome:?}");
+        assert!(
+            matches!(outcome, ExecOutcome::Continue(1)),
+            "got {outcome:?}"
+        );
     }
 
     #[test]
     fn arith_for_counter_loop_sets_var() {
         let mut sh = Shell::new();
-        let _ = crate::shell::process_line(
-            "for ((i=0;i<3;i++)) do :; done",
-            &mut sh,
-            false,
-        );
+        let _ = crate::shell::process_line("for ((i=0;i<3;i++)) do :; done", &mut sh, false);
         // After the loop, i should be 3 (the value at which cond failed).
         assert_eq!(sh.lookup_var("i").as_deref(), Some("3"));
     }
@@ -9713,11 +11552,7 @@ mod arith_for_tests {
     #[test]
     fn arith_for_continue_evaluates_step() {
         let mut sh = Shell::new();
-        let _ = crate::shell::process_line(
-            "for ((i=0;i<5;i++)) do continue; done",
-            &mut sh,
-            false,
-        );
+        let _ = crate::shell::process_line("for ((i=0;i<5;i++)) do continue; done", &mut sh, false);
         // i should reach 5 (cond fails) — step runs after continue.
         assert_eq!(sh.lookup_var("i").as_deref(), Some("5"));
     }
@@ -9736,8 +11571,15 @@ mod loop_levels_executor_tests {
             false,
         );
         // Outer loop ran both i=1 and i=2 (inner break only exits inner).
-        assert_eq!(sh.lookup_var("x").as_deref(), Some("2"), "outer loop should run twice");
-        assert_eq!(sh.loop_depth, 0, "loop_depth not restored after nested-for break");
+        assert_eq!(
+            sh.lookup_var("x").as_deref(),
+            Some("2"),
+            "outer loop should run twice"
+        );
+        assert_eq!(
+            sh.loop_depth, 0,
+            "loop_depth not restored after nested-for break"
+        );
     }
 
     #[test]
@@ -9794,11 +11636,7 @@ mod loop_levels_executor_tests {
     #[test]
     fn loop_depth_zero_after_loop_exits() {
         let mut sh = Shell::new();
-        let _ = crate::shell::process_line(
-            "for i in 1 2 3; do :; done",
-            &mut sh,
-            false,
-        );
+        let _ = crate::shell::process_line("for i in 1 2 3; do :; done", &mut sh, false);
         assert_eq!(sh.loop_depth, 0);
     }
 
@@ -9838,8 +11676,16 @@ mod loop_levels_executor_tests {
         );
         // break 0 breaks ALL loops: neither the inner body after it (x) nor the
         // outer body after the inner loop (o) runs again.
-        assert_eq!(sh.lookup_var("x").as_deref(), Some("0"), "inner body must not run after break 0");
-        assert_eq!(sh.lookup_var("o").as_deref(), Some("0"), "outer body must not run after break 0");
+        assert_eq!(
+            sh.lookup_var("x").as_deref(),
+            Some("0"),
+            "inner body must not run after break 0"
+        );
+        assert_eq!(
+            sh.lookup_var("o").as_deref(),
+            Some("0"),
+            "outer body must not run after break 0"
+        );
         // The loop nest leaves $? = 1.
         assert_eq!(sh.last_status(), 1, "break 0 leaves $? = 1");
     }
@@ -9868,17 +11714,17 @@ mod loop_levels_executor_tests {
         );
         assert_eq!(sh.lookup_var("x").as_deref(), Some("0"));
         assert_eq!(sh.lookup_var("o").as_deref(), Some("0"));
-        assert_eq!(sh.last_status(), 1, "break with too many args leaves $? = 1");
+        assert_eq!(
+            sh.last_status(),
+            1,
+            "break with too many args leaves $? = 1"
+        );
     }
 
     #[test]
     fn normal_break_leaves_status_0() {
         let mut sh = Shell::new();
-        let _ = crate::shell::process_line(
-            "for i in 1 2; do break; done",
-            &mut sh,
-            false,
-        );
+        let _ = crate::shell::process_line("for i in 1 2; do break; done", &mut sh, false);
         // Normal break leaves $? = 0 (no regression from the status-carrying change).
         assert_eq!(sh.last_status(), 0);
     }
@@ -9931,8 +11777,9 @@ mod select_menu_tests {
     #[test]
     fn ten_items_cols80_multicolumn() {
         let got = format_select_menu(
-            &items(&["one", "two", "three", "four", "five",
-                     "six", "seven", "eight", "nine", "ten"]),
+            &items(&[
+                "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+            ]),
             80,
         );
         // Verified byte-for-byte against bash 5.2 (COLUMNS=80, cat -A):
@@ -9944,8 +11791,9 @@ mod select_menu_tests {
     #[test]
     fn ten_items_cols40() {
         let got = format_select_menu(
-            &items(&["one", "two", "three", "four", "five",
-                     "six", "seven", "eight", "nine", "ten"]),
+            &items(&[
+                "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+            ]),
             40,
         );
         let expected = "1) one\t    5) five    9) nine\n\
@@ -9958,8 +11806,9 @@ mod select_menu_tests {
     #[test]
     fn ten_items_cols110_single_column_flip() {
         let got = format_select_menu(
-            &items(&["one", "two", "three", "four", "five",
-                     "six", "seven", "eight", "nine", "ten"]),
+            &items(&[
+                "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+            ]),
             110,
         );
         // Wide COLS → rows==1 flip → single column, numbers right-justified to 2.
@@ -9997,9 +11846,9 @@ mod g3_dbracket_extglob_noshopt_tests {
     #[test]
     fn eq_extglob_matches_with_extglob_off() {
         assert_eq!(status_of("[[ record == @(record|top) ]]"), 0); // match
-        assert_eq!(status_of("[[ nope == @(record|top) ]]"), 1);   // no match
+        assert_eq!(status_of("[[ nope == @(record|top) ]]"), 1); // no match
         assert_eq!(status_of("[[ aab == +(a|b) ]]"), 0);
-        assert_eq!(status_of("[[ ac == a*(b)c ]]"), 0);            // glued, empty *
+        assert_eq!(status_of("[[ ac == a*(b)c ]]"), 0); // glued, empty *
         assert_eq!(status_of("[[ ab == a?(b) ]]"), 0);
     }
 
@@ -10007,7 +11856,7 @@ mod g3_dbracket_extglob_noshopt_tests {
     fn neg_group_and_ne_operator_with_extglob_off() {
         assert_eq!(status_of("[[ foo == !(bar) ]]"), 0); // foo is not bar → matches
         assert_eq!(status_of("[[ bar == !(bar) ]]"), 1);
-        assert_eq!(status_of("[[ x != @(a|b) ]]"), 0);   // x not in {a,b} → != true
+        assert_eq!(status_of("[[ x != @(a|b) ]]"), 0); // x not in {a,b} → != true
         assert_eq!(status_of("[[ a != @(a|b) ]]"), 1);
     }
 
@@ -10054,21 +11903,45 @@ mod errexit_andor_tests {
         // A failing command that is NOT the syntactically last in an and-or
         // list does not trigger errexit — whether the next connector is `&&`
         // or `||`.
-        assert!(!errexit_fired("false && echo x"), "false && echo x must not exit");
-        assert!(!errexit_fired("false && true"), "false && true must not exit");
-        assert!(!errexit_fired("false && false"), "false && false must not exit");
-        assert!(!errexit_fired("true && false && echo x"), "middle-fail must not exit");
-        assert!(!errexit_fired("false && echo x && echo y"), "non-last && must not exit");
-        assert!(!errexit_fired("false && echo a || echo b"), "false && a || b must not exit");
+        assert!(
+            !errexit_fired("false && echo x"),
+            "false && echo x must not exit"
+        );
+        assert!(
+            !errexit_fired("false && true"),
+            "false && true must not exit"
+        );
+        assert!(
+            !errexit_fired("false && false"),
+            "false && false must not exit"
+        );
+        assert!(
+            !errexit_fired("true && false && echo x"),
+            "middle-fail must not exit"
+        );
+        assert!(
+            !errexit_fired("false && echo x && echo y"),
+            "non-last && must not exit"
+        );
+        assert!(
+            !errexit_fired("false && echo a || echo b"),
+            "false && a || b must not exit"
+        );
     }
 
     #[test]
     fn last_andor_failure_triggers_errexit() {
         // The syntactically last command failing DOES trigger errexit.
-        assert!(errexit_fired("echo a && false"), "echo a && false must exit");
+        assert!(
+            errexit_fired("echo a && false"),
+            "echo a && false must exit"
+        );
         assert!(errexit_fired("true && false"), "true && false must exit");
         assert!(errexit_fired("false || false"), "false || false must exit");
-        assert!(errexit_fired("echo a && echo b && false"), "trailing false must exit");
+        assert!(
+            errexit_fired("echo a && echo b && false"),
+            "trailing false must exit"
+        );
         assert!(errexit_fired("false"), "bare false must exit");
     }
 
@@ -10077,7 +11950,13 @@ mod errexit_andor_tests {
         // `||` short-circuit behavior is unchanged: a leading false handled by
         // a following `||` clause is exempt (regression guard for the fix,
         // which generalized `!next_is_or` to `is_last`).
-        assert!(!errexit_fired("false || echo x"), "false || echo x must not exit");
-        assert!(!errexit_fired("true || false"), "true || false must not exit");
+        assert!(
+            !errexit_fired("false || echo x"),
+            "false || echo x must not exit"
+        );
+        assert!(
+            !errexit_fired("true || false"),
+            "true || false must not exit"
+        );
     }
 }

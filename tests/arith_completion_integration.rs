@@ -12,7 +12,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -83,7 +88,10 @@ fn arith_assignment_persists_to_var() {
     assert!(lines.iter().any(|l| **l == *"5"), "stdout: {out}");
     // Both 5's appear.
     let count = lines.iter().filter(|l| ***l == *"5").count();
-    assert_eq!(count, 2, "expected two '5' lines, got {count}; stdout: {out}");
+    assert_eq!(
+        count, 2,
+        "expected two '5' lines, got {count}; stdout: {out}"
+    );
 }
 
 #[test]

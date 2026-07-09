@@ -15,7 +15,12 @@ fn run(script: &str) -> (String, String, std::process::ExitStatus) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -34,7 +39,12 @@ fn spawn(script: &str) -> (std::process::Child, i32) {
         .spawn()
         .expect("spawn huck");
     let pid = child.id() as i32;
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     // No — we want huck to KEEP running until we send the signal.
     // Don't drop; the caller will manage.
     (child, pid)
@@ -122,17 +132,25 @@ fn trap_kill_accepted_silently_and_listed() {
     // bash does NOT reject `trap … KILL`: it silently accepts (no error) and
     // stores the disposition (visible via `trap -p`), though it never fires.
     let (_out, err, _) = run("trap 'echo nope' KILL\nexit 0\n");
-    assert!(!err.contains("cannot trap"), "should not error; stderr: {err}");
+    assert!(
+        !err.contains("cannot trap"),
+        "should not error; stderr: {err}"
+    );
     assert!(err.is_empty(), "no stderr expected; got: {err}");
     let (out, _err, _) = run("trap 'echo nope' KILL\ntrap -p KILL\n");
-    assert!(out.contains("echo nope") && out.contains("KILL"),
-        "trap -p should list the KILL disposition; stdout: {out}");
+    assert!(
+        out.contains("echo nope") && out.contains("KILL"),
+        "trap -p should list the KILL disposition; stdout: {out}"
+    );
 }
 
 #[test]
 fn trap_unknown_signal_errors_exit_1() {
     let (_out, err, _) = run("trap 'echo nope' NOPE\nexit 0\n");
-    assert!(err.contains("invalid signal specification"), "stderr: {err}");
+    assert!(
+        err.contains("invalid signal specification"),
+        "stderr: {err}"
+    );
 }
 
 #[test]

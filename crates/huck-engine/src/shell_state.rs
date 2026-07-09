@@ -315,63 +315,234 @@ pub struct ShoptInfo {
 /// order. Only `nullglob`/`dotglob`/`nocaseglob`/`failglob`/`nocasematch`
 /// change huck's behavior; the rest are faithful inert toggles.
 pub const SHOPT_TABLE: &[ShoptInfo] = &[
-    ShoptInfo { name: "autocd", default: false },
-    ShoptInfo { name: "assoc_expand_once", default: false },
-    ShoptInfo { name: "cdable_vars", default: false },
-    ShoptInfo { name: "cdspell", default: false },
-    ShoptInfo { name: "checkhash", default: false },
-    ShoptInfo { name: "checkjobs", default: false },
-    ShoptInfo { name: "checkwinsize", default: true },
-    ShoptInfo { name: "cmdhist", default: true },
-    ShoptInfo { name: "compat31", default: false },
-    ShoptInfo { name: "compat32", default: false },
-    ShoptInfo { name: "compat40", default: false },
-    ShoptInfo { name: "compat41", default: false },
-    ShoptInfo { name: "compat42", default: false },
-    ShoptInfo { name: "compat43", default: false },
-    ShoptInfo { name: "compat44", default: false },
-    ShoptInfo { name: "complete_fullquote", default: true },
-    ShoptInfo { name: "direxpand", default: false },
-    ShoptInfo { name: "dirspell", default: false },
-    ShoptInfo { name: "dotglob", default: false },
-    ShoptInfo { name: "execfail", default: false },
-    ShoptInfo { name: "expand_aliases", default: false },
-    ShoptInfo { name: "extdebug", default: false },
-    ShoptInfo { name: "extglob", default: false },
-    ShoptInfo { name: "extquote", default: true },
-    ShoptInfo { name: "failglob", default: false },
-    ShoptInfo { name: "force_fignore", default: true },
-    ShoptInfo { name: "globasciiranges", default: true },
-    ShoptInfo { name: "globskipdots", default: true },
-    ShoptInfo { name: "globstar", default: false },
-    ShoptInfo { name: "gnu_errfmt", default: false },
-    ShoptInfo { name: "histappend", default: false },
-    ShoptInfo { name: "histreedit", default: false },
-    ShoptInfo { name: "histverify", default: false },
-    ShoptInfo { name: "hostcomplete", default: true },
-    ShoptInfo { name: "huponexit", default: false },
-    ShoptInfo { name: "inherit_errexit", default: false },
-    ShoptInfo { name: "interactive_comments", default: true },
-    ShoptInfo { name: "lastpipe", default: false },
-    ShoptInfo { name: "lithist", default: false },
-    ShoptInfo { name: "localvar_inherit", default: false },
-    ShoptInfo { name: "localvar_unset", default: false },
-    ShoptInfo { name: "login_shell", default: false },
-    ShoptInfo { name: "mailwarn", default: false },
-    ShoptInfo { name: "no_empty_cmd_completion", default: false },
-    ShoptInfo { name: "nocaseglob", default: false },
-    ShoptInfo { name: "nocasematch", default: false },
-    ShoptInfo { name: "noexpand_translation", default: false },
-    ShoptInfo { name: "nullglob", default: false },
-    ShoptInfo { name: "patsub_replacement", default: true },
-    ShoptInfo { name: "progcomp", default: true },
-    ShoptInfo { name: "progcomp_alias", default: false },
-    ShoptInfo { name: "promptvars", default: true },
-    ShoptInfo { name: "restricted_shell", default: false },
-    ShoptInfo { name: "shift_verbose", default: false },
-    ShoptInfo { name: "sourcepath", default: true },
-    ShoptInfo { name: "varredir_close", default: false },
-    ShoptInfo { name: "xpg_echo", default: false },
+    ShoptInfo {
+        name: "autocd",
+        default: false,
+    },
+    ShoptInfo {
+        name: "assoc_expand_once",
+        default: false,
+    },
+    ShoptInfo {
+        name: "cdable_vars",
+        default: false,
+    },
+    ShoptInfo {
+        name: "cdspell",
+        default: false,
+    },
+    ShoptInfo {
+        name: "checkhash",
+        default: false,
+    },
+    ShoptInfo {
+        name: "checkjobs",
+        default: false,
+    },
+    ShoptInfo {
+        name: "checkwinsize",
+        default: true,
+    },
+    ShoptInfo {
+        name: "cmdhist",
+        default: true,
+    },
+    ShoptInfo {
+        name: "compat31",
+        default: false,
+    },
+    ShoptInfo {
+        name: "compat32",
+        default: false,
+    },
+    ShoptInfo {
+        name: "compat40",
+        default: false,
+    },
+    ShoptInfo {
+        name: "compat41",
+        default: false,
+    },
+    ShoptInfo {
+        name: "compat42",
+        default: false,
+    },
+    ShoptInfo {
+        name: "compat43",
+        default: false,
+    },
+    ShoptInfo {
+        name: "compat44",
+        default: false,
+    },
+    ShoptInfo {
+        name: "complete_fullquote",
+        default: true,
+    },
+    ShoptInfo {
+        name: "direxpand",
+        default: false,
+    },
+    ShoptInfo {
+        name: "dirspell",
+        default: false,
+    },
+    ShoptInfo {
+        name: "dotglob",
+        default: false,
+    },
+    ShoptInfo {
+        name: "execfail",
+        default: false,
+    },
+    ShoptInfo {
+        name: "expand_aliases",
+        default: false,
+    },
+    ShoptInfo {
+        name: "extdebug",
+        default: false,
+    },
+    ShoptInfo {
+        name: "extglob",
+        default: false,
+    },
+    ShoptInfo {
+        name: "extquote",
+        default: true,
+    },
+    ShoptInfo {
+        name: "failglob",
+        default: false,
+    },
+    ShoptInfo {
+        name: "force_fignore",
+        default: true,
+    },
+    ShoptInfo {
+        name: "globasciiranges",
+        default: true,
+    },
+    ShoptInfo {
+        name: "globskipdots",
+        default: true,
+    },
+    ShoptInfo {
+        name: "globstar",
+        default: false,
+    },
+    ShoptInfo {
+        name: "gnu_errfmt",
+        default: false,
+    },
+    ShoptInfo {
+        name: "histappend",
+        default: false,
+    },
+    ShoptInfo {
+        name: "histreedit",
+        default: false,
+    },
+    ShoptInfo {
+        name: "histverify",
+        default: false,
+    },
+    ShoptInfo {
+        name: "hostcomplete",
+        default: true,
+    },
+    ShoptInfo {
+        name: "huponexit",
+        default: false,
+    },
+    ShoptInfo {
+        name: "inherit_errexit",
+        default: false,
+    },
+    ShoptInfo {
+        name: "interactive_comments",
+        default: true,
+    },
+    ShoptInfo {
+        name: "lastpipe",
+        default: false,
+    },
+    ShoptInfo {
+        name: "lithist",
+        default: false,
+    },
+    ShoptInfo {
+        name: "localvar_inherit",
+        default: false,
+    },
+    ShoptInfo {
+        name: "localvar_unset",
+        default: false,
+    },
+    ShoptInfo {
+        name: "login_shell",
+        default: false,
+    },
+    ShoptInfo {
+        name: "mailwarn",
+        default: false,
+    },
+    ShoptInfo {
+        name: "no_empty_cmd_completion",
+        default: false,
+    },
+    ShoptInfo {
+        name: "nocaseglob",
+        default: false,
+    },
+    ShoptInfo {
+        name: "nocasematch",
+        default: false,
+    },
+    ShoptInfo {
+        name: "noexpand_translation",
+        default: false,
+    },
+    ShoptInfo {
+        name: "nullglob",
+        default: false,
+    },
+    ShoptInfo {
+        name: "patsub_replacement",
+        default: true,
+    },
+    ShoptInfo {
+        name: "progcomp",
+        default: true,
+    },
+    ShoptInfo {
+        name: "progcomp_alias",
+        default: false,
+    },
+    ShoptInfo {
+        name: "promptvars",
+        default: true,
+    },
+    ShoptInfo {
+        name: "restricted_shell",
+        default: false,
+    },
+    ShoptInfo {
+        name: "shift_verbose",
+        default: false,
+    },
+    ShoptInfo {
+        name: "sourcepath",
+        default: true,
+    },
+    ShoptInfo {
+        name: "varredir_close",
+        default: false,
+    },
+    ShoptInfo {
+        name: "xpg_echo",
+        default: false,
+    },
 ];
 
 /// Number of `shopt` options (length of `SHOPT_TABLE`).
@@ -409,7 +580,10 @@ impl ShoptOptions {
     /// Sets a known option; returns `false` (no-op) for an unknown name.
     pub fn set(&mut self, name: &str, value: bool) -> bool {
         match Self::idx(name) {
-            Some(i) => { self.state[i] = value; true }
+            Some(i) => {
+                self.state[i] = value;
+                true
+            }
             None => false,
         }
     }
@@ -722,20 +896,30 @@ const BUILTIN_OSTYPE: &str = "unknown";
 fn builtin_machtype() -> String {
     let arch = std::env::consts::ARCH;
     #[cfg(target_os = "linux")]
-    { format!("{arch}-pc-linux-gnu") }
+    {
+        format!("{arch}-pc-linux-gnu")
+    }
     #[cfg(target_os = "macos")]
-    { format!("{arch}-apple-darwin") }
+    {
+        format!("{arch}-apple-darwin")
+    }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    { format!("{arch}-unknown") }
+    {
+        format!("{arch}-unknown")
+    }
 }
 
 fn builtin_current_groups() -> Vec<u32> {
     unsafe {
         let n = libc::getgroups(0, std::ptr::null_mut());
-        if n <= 0 { return Vec::new(); }
+        if n <= 0 {
+            return Vec::new();
+        }
         let mut buf = vec![0 as libc::gid_t; n as usize];
         let m = libc::getgroups(n, buf.as_mut_ptr());
-        if m < 0 { return Vec::new(); }
+        if m < 0 {
+            return Vec::new();
+        }
         buf.truncate(m as usize);
         buf.into_iter().collect()
     }
@@ -787,7 +971,8 @@ fn parse_imported_function(name: &str, value: &str) -> Option<Box<crate::command
 
 /// Advance the LCG and return the next RANDOM value (0..=32767).
 fn random_next(state: &std::cell::Cell<u64>) -> u32 {
-    let s = state.get()
+    let s = state
+        .get()
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
     state.set(s);
@@ -804,8 +989,15 @@ fn is_write_protected_var(name: &str) -> bool {
 /// Special variables that are valid/known but not always present in the vars table
 /// (computed dynamics + the sometimes-unset call-stack arrays). Surfaced in variable-name
 /// completion and `compgen -v` so they complete like bash even when unset.
-pub const DYNAMIC_SPECIAL_VARS: &[&str] =
-    &["RANDOM", "SECONDS", "EPOCHSECONDS", "BASHPID", "LINENO", "BASH_SOURCE", "BASH_LINENO"];
+pub const DYNAMIC_SPECIAL_VARS: &[&str] = &[
+    "RANDOM",
+    "SECONDS",
+    "EPOCHSECONDS",
+    "BASHPID",
+    "LINENO",
+    "BASH_SOURCE",
+    "BASH_LINENO",
+];
 
 impl Shell {
     pub fn new() -> Self {
@@ -830,17 +1022,22 @@ impl Shell {
             if matches!(key.as_str(), "PS1" | "PS2") {
                 continue;
             }
-            vars.insert(key, Variable {
-                value: VarValue::Scalar(value),
-                exported: true,
-                readonly: false,
-                integer: false,
-                case_fold: None,
-                nameref: false,
-            });
+            vars.insert(
+                key,
+                Variable {
+                    value: VarValue::Scalar(value),
+                    exported: true,
+                    readonly: false,
+                    integer: false,
+                    case_fold: None,
+                    nameref: false,
+                },
+            );
         }
         let shell_pid = unsafe { libc::getpid() };
-        let shell_argv0 = std::env::args().next().unwrap_or_else(|| "huck".to_string());
+        let shell_argv0 = std::env::args()
+            .next()
+            .unwrap_or_else(|| "huck".to_string());
         let mut shell = Self {
             vars,
             last_status: 0,
@@ -942,13 +1139,27 @@ impl Shell {
     /// `C` (noclobber).
     pub fn dollar_dash_value(&self) -> String {
         let mut out = String::new();
-        if self.shell_options.errexit { out.push('e'); }
-        if self.shell_options.noglob { out.push('f'); }
-        if self.is_interactive { out.push('i'); }
-        if self.shell_options.nounset { out.push('u'); }
-        if self.shell_options.verbose { out.push('v'); }
-        if self.shell_options.xtrace { out.push('x'); }
-        if self.shell_options.noclobber { out.push('C'); }
+        if self.shell_options.errexit {
+            out.push('e');
+        }
+        if self.shell_options.noglob {
+            out.push('f');
+        }
+        if self.is_interactive {
+            out.push('i');
+        }
+        if self.shell_options.nounset {
+            out.push('u');
+        }
+        if self.shell_options.verbose {
+            out.push('v');
+        }
+        if self.shell_options.xtrace {
+            out.push('x');
+        }
+        if self.shell_options.noclobber {
+            out.push('C');
+        }
         out
     }
 
@@ -1026,23 +1237,27 @@ impl Shell {
             "0" => return Some(self.shell_argv0.clone()),
             "_" => return Some(self.last_arg.clone()),
             "$" => return Some(self.shell_pid.to_string()),
-            "!" => return Some(
-                // Returns "" not None when unset: bash expands $! to empty before
-                // any background has happened (v26 spec §lookup_var changes).
-                self.last_bg_pid.map(|p| p.to_string()).unwrap_or_default()
-            ),
+            "!" => {
+                return Some(
+                    // Returns "" not None when unset: bash expands $! to empty before
+                    // any background has happened (v26 spec §lookup_var changes).
+                    self.last_bg_pid.map(|p| p.to_string()).unwrap_or_default(),
+                );
+            }
             "-" => return Some(self.dollar_dash_value()),
             "?" => return Some(self.last_status().to_string()),
             "LINENO" => return Some(self.current_lineno.to_string()),
             "RANDOM" => return Some(random_next(&self.random_state).to_string()),
             "SECONDS" => return Some(self.seconds_base.elapsed().as_secs().to_string()),
-            "EPOCHSECONDS" => return Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-                    .to_string()
-            ),
+            "EPOCHSECONDS" => {
+                return Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                        .to_string(),
+                );
+            }
             "BASHPID" => return Some((unsafe { libc::getpid() }).to_string()),
             _ => {}
         }
@@ -1062,14 +1277,19 @@ impl Shell {
         if self.is_nameref(name) {
             match self.resolve_nameref(name) {
                 ResolvedName::Name(n) if n != name => return self.lookup_var(&n),
-                ResolvedName::Element { name: arr, subscript } => {
+                ResolvedName::Element {
+                    name: arr,
+                    subscript,
+                } => {
                     return self.lookup_nameref_element(&arr, &subscript);
                 }
                 ResolvedName::Unbound(_) | ResolvedName::Cycle => return None,
                 ResolvedName::Name(_) => {} // not a nameref → fall through to normal read
             }
         }
-        self.vars.get(name).map(|v| v.value.scalar_view().to_string())
+        self.vars
+            .get(name)
+            .map(|v| v.value.scalar_view().to_string())
     }
 
     /// Parse $FUNCNEST. Some(n) for a positive integer limit; None (unlimited)
@@ -1111,7 +1331,8 @@ impl Shell {
     /// Centralized so the unset-vs-empty boundary is explicit at every
     /// expansion-site call.
     pub fn ifs(&self) -> String {
-        self.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string())
+        self.lookup_var("IFS")
+            .unwrap_or_else(|| " \t\n".to_string())
     }
 
     /// If `name` is a reseed/reset-on-assignment dynamic special (`RANDOM`/`SECONDS`),
@@ -1121,9 +1342,8 @@ impl Shell {
         match name {
             "RANDOM" => {
                 if let Ok(n) = value.parse::<u64>() {
-                    self.random_state.set(
-                        n.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0x1234) | 1,
-                    );
+                    self.random_state
+                        .set(n.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0x1234) | 1);
                 }
                 true
             }
@@ -1230,7 +1450,10 @@ impl Shell {
         if self.is_nameref(name) {
             match self.resolve_nameref(name) {
                 ResolvedName::Name(n) if n != name => return self.is_set(&n),
-                ResolvedName::Element { name: arr, subscript } => {
+                ResolvedName::Element {
+                    name: arr,
+                    subscript,
+                } => {
                     return self.lookup_nameref_element(&arr, &subscript).is_some();
                 }
                 ResolvedName::Unbound(_) | ResolvedName::Cycle => return false,
@@ -1316,18 +1539,28 @@ impl Shell {
                         raw.parse::<i64>().ok()?
                     }
                 }
-                E::Index { name, subscript, subscript_raw } => {
+                E::Index {
+                    name,
+                    subscript,
+                    subscript_raw,
+                } => {
                     // Array-element read: associative uses the raw key, indexed
                     // arith-evaluates the subscript. An unset element reads as 0.
                     let raw = if sh.get_associative(name).is_some() {
                         sh.lookup_associative_element(name, subscript_raw)
                     } else {
                         let idx = ev(subscript, sh)?;
-                        if idx < 0 { return None; }
+                        if idx < 0 {
+                            return None;
+                        }
                         sh.lookup_indexed_element(name, idx as usize)
                     };
                     let raw = raw.unwrap_or_default();
-                    if raw.is_empty() { 0 } else { raw.parse::<i64>().ok()? }
+                    if raw.is_empty() {
+                        0
+                    } else {
+                        raw.parse::<i64>().ok()?
+                    }
                 }
                 E::Neg(a) => ev(a, sh)?.wrapping_neg(),
                 E::Not(a) => i64::from(ev(a, sh)? == 0),
@@ -1337,12 +1570,16 @@ impl Shell {
                 E::Mul(a, b) => ev(a, sh)?.wrapping_mul(ev(b, sh)?),
                 E::Div(a, b, _) => {
                     let r = ev(b, sh)?;
-                    if r == 0 { return None; }
+                    if r == 0 {
+                        return None;
+                    }
                     ev(a, sh)?.wrapping_div(r)
                 }
                 E::Mod(a, b, _) => {
                     let r = ev(b, sh)?;
-                    if r == 0 { return None; }
+                    if r == 0 {
+                        return None;
+                    }
                     ev(a, sh)?.wrapping_rem(r)
                 }
                 E::Eq(a, b) => i64::from(ev(a, sh)? == ev(b, sh)?),
@@ -1354,7 +1591,11 @@ impl Shell {
                 E::And(a, b) => i64::from(ev(a, sh)? != 0 && ev(b, sh)? != 0),
                 E::Or(a, b) => i64::from(ev(a, sh)? != 0 || ev(b, sh)? != 0),
                 E::Ternary(c, t, f) => {
-                    if ev(c, sh)? != 0 { ev(t, sh)? } else { ev(f, sh)? }
+                    if ev(c, sh)? != 0 {
+                        ev(t, sh)?
+                    } else {
+                        ev(f, sh)?
+                    }
                 }
                 E::Comma(a, b) => {
                     ev(a, sh)?;
@@ -1367,25 +1608,29 @@ impl Shell {
                 // errors here; for a `-v` subscript that means "not set").
                 E::Shl(a, b) => {
                     let (l, r) = (ev(a, sh)?, ev(b, sh)?);
-                    if !(0..64).contains(&r) { return None; }
+                    if !(0..64).contains(&r) {
+                        return None;
+                    }
                     l.wrapping_shl(r as u32)
                 }
                 E::Shr(a, b) => {
                     let (l, r) = (ev(a, sh)?, ev(b, sh)?);
-                    if !(0..64).contains(&r) { return None; }
+                    if !(0..64).contains(&r) {
+                        return None;
+                    }
                     l.wrapping_shr(r as u32)
                 }
                 E::Pow(a, b) => {
                     let exp = ev(b, sh)?;
-                    if exp < 0 { return None; }
+                    if exp < 0 {
+                        return None;
+                    }
                     ev(a, sh)?.wrapping_pow(exp as u32)
                 }
                 // Side-effecting / unsupported in a read-only subscript.
-                E::Assign { .. }
-                | E::PreInc(_)
-                | E::PreDec(_)
-                | E::PostInc(_)
-                | E::PostDec(_) => return None,
+                E::Assign { .. } | E::PreInc(_) | E::PreDec(_) | E::PostInc(_) | E::PostDec(_) => {
+                    return None;
+                }
             })
         }
         let expr = crate::arith::parse(sub).ok()?;
@@ -1413,13 +1658,19 @@ impl Shell {
     /// reject writes to readonly vars must check `is_readonly` first
     /// (see `builtin_export` and `apply_inline_assignments`).
     pub fn export_set(&mut self, name: &str, value: String) {
-        if self.reseed_special_on_assign(name, &value) { return; }
+        if self.reseed_special_on_assign(name, &value) {
+            return;
+        }
         match self.vars.get_mut(name) {
             Some(existing) => {
                 let assoc_mismatch = install_scalar_value(existing, value);
                 existing.exported = true;
                 if assoc_mismatch {
-                    crate::sh_error!(self, None, "internal: install_scalar_value on associative array");
+                    crate::sh_error!(
+                        self,
+                        None,
+                        "internal: install_scalar_value on associative array"
+                    );
                 }
             }
             None => {
@@ -1460,14 +1711,16 @@ impl Shell {
     /// coproc, close its held fds, unset NAME + NAME_PID, and drop the record.
     /// bash unsets the coproc variables once the coprocess is reaped.
     pub fn reap_coproc(&mut self, pid: libc::pid_t) {
-        let Some(idx) = self.coprocs.iter().position(|c| c.pid == pid) else { return; };
+        let Some(idx) = self.coprocs.iter().position(|c| c.pid == pid) else {
+            return;
+        };
         let c = self.coprocs.remove(idx);
         unsafe {
             libc::close(c.read_fd);
             libc::close(c.write_fd);
         }
-        self.unset(&c.name);                       // the NAME array
-        self.unset(&format!("{}_PID", c.name));    // NAME_PID
+        self.unset(&c.name); // the NAME array
+        self.unset(&format!("{}_PID", c.name)); // NAME_PID
     }
 
     /// Scope-aware variable unset for the `unset` builtin's `-v`/default path
@@ -1569,7 +1822,10 @@ impl Shell {
                 AssignDest::Whole(_) => AssignDest::Whole(n),
                 AssignDest::Element { sub, .. } => AssignDest::Element { name: n, sub },
             }),
-            ResolvedName::Element { name: arr, subscript } => {
+            ResolvedName::Element {
+                name: arr,
+                subscript,
+            } => {
                 let sub = self.eval_nameref_subscript(&arr, &subscript);
                 Some(AssignDest::Element { name: arr, sub })
             }
@@ -1610,7 +1866,11 @@ impl Shell {
         match self.vars.get_mut(name) {
             Some(existing) => {
                 if install_scalar_value(existing, value) {
-                    crate::sh_error!(self, None, "internal: install_scalar_value on associative array");
+                    crate::sh_error!(
+                        self,
+                        None,
+                        "internal: install_scalar_value on associative array"
+                    );
                 }
             }
             None => {
@@ -1621,10 +1881,17 @@ impl Shell {
 
     /// Storage only: insert `value` at `idx`, promoting a scalar to indexed
     /// (element-0 rule). Caller has done readonly + fold.
-    fn store_indexed_element(&mut self, name: &str, idx: usize, value: String) -> Result<(), AssignErr> {
+    fn store_indexed_element(
+        &mut self,
+        name: &str,
+        idx: usize,
+        value: String,
+    ) -> Result<(), AssignErr> {
         match self.vars.get_mut(name) {
             Some(v) => match &mut v.value {
-                VarValue::Indexed(m) => { m.insert(idx, value); }
+                VarValue::Indexed(m) => {
+                    m.insert(idx, value);
+                }
                 VarValue::Scalar(s) => {
                     let mut m = BTreeMap::new();
                     if idx == 0 {
@@ -1636,17 +1903,28 @@ impl Shell {
                     v.value = VarValue::Indexed(m);
                 }
                 VarValue::Associative(_) => {
-                    crate::sh_error!(self, None, "{name}: set_indexed_element on associative variable");
+                    crate::sh_error!(
+                        self,
+                        None,
+                        "{name}: set_indexed_element on associative variable"
+                    );
                     return Err(AssignErr::TypeMismatch);
                 }
             },
             None => {
                 let mut m = BTreeMap::new();
                 m.insert(idx, value);
-                self.vars.insert(name.to_string(), Variable {
-                    value: VarValue::Indexed(m),
-                    exported: false, readonly: false, integer: false, case_fold: None, nameref: false,
-                });
+                self.vars.insert(
+                    name.to_string(),
+                    Variable {
+                        value: VarValue::Indexed(m),
+                        exported: false,
+                        readonly: false,
+                        integer: false,
+                        case_fold: None,
+                        nameref: false,
+                    },
+                );
             }
         }
         Ok(())
@@ -1654,23 +1932,40 @@ impl Shell {
 
     /// Storage only: replace the whole variable with an indexed array of the
     /// given (already-folded) elements, preserving exported/integer/case_fold.
-    fn store_indexed_replace(&mut self, name: &str, elements: BTreeMap<usize, String>) -> Result<(), AssignErr> {
+    fn store_indexed_replace(
+        &mut self,
+        name: &str,
+        elements: BTreeMap<usize, String>,
+    ) -> Result<(), AssignErr> {
         let (exported, integer, case_fold) = match self.vars.get(name) {
             Some(v) => (v.exported, v.integer, v.case_fold),
             None => (false, false, None),
         };
-        self.vars.insert(name.to_string(), Variable {
-            value: VarValue::Indexed(elements),
-            exported, readonly: false, integer, case_fold, nameref: false,
-        });
+        self.vars.insert(
+            name.to_string(),
+            Variable {
+                value: VarValue::Indexed(elements),
+                exported,
+                readonly: false,
+                integer,
+                case_fold,
+                nameref: false,
+            },
+        );
         Ok(())
     }
 
     /// Storage only: merge (already-folded) entries into the indexed array,
     /// promoting a scalar to element 0 and creating if absent.
-    fn store_indexed_extend(&mut self, name: &str, entries: BTreeMap<usize, String>) -> Result<(), AssignErr> {
-        if matches!(self.vars.get(name).map(|v| &v.value), Some(VarValue::Scalar(_)))
-            && let Some(v) = self.vars.get_mut(name)
+    fn store_indexed_extend(
+        &mut self,
+        name: &str,
+        entries: BTreeMap<usize, String>,
+    ) -> Result<(), AssignErr> {
+        if matches!(
+            self.vars.get(name).map(|v| &v.value),
+            Some(VarValue::Scalar(_))
+        ) && let Some(v) = self.vars.get_mut(name)
             && let VarValue::Scalar(s) = &mut v.value
         {
             let mut m = BTreeMap::new();
@@ -1678,25 +1973,43 @@ impl Shell {
             v.value = VarValue::Indexed(m);
         }
         if !self.vars.contains_key(name) {
-            self.vars.insert(name.to_string(), Variable {
-                value: VarValue::Indexed(BTreeMap::new()),
-                exported: false, readonly: false, integer: false, case_fold: None, nameref: false,
-            });
+            self.vars.insert(
+                name.to_string(),
+                Variable {
+                    value: VarValue::Indexed(BTreeMap::new()),
+                    exported: false,
+                    readonly: false,
+                    integer: false,
+                    case_fold: None,
+                    nameref: false,
+                },
+            );
         }
         if let Some(v) = self.vars.get_mut(name)
             && let VarValue::Indexed(m) = &mut v.value
         {
-            for (idx, val) in entries { m.insert(idx, val); }
+            for (idx, val) in entries {
+                m.insert(idx, val);
+            }
             Ok(())
         } else {
-            crate::sh_error!(self, None, "{name}: cannot append array literal to associative array");
+            crate::sh_error!(
+                self,
+                None,
+                "{name}: cannot append array literal to associative array"
+            );
             Err(AssignErr::TypeMismatch)
         }
     }
 
     /// Storage only: set `key`=`value` (already folded) in the associative
     /// array, preserving insertion order; type-error if non-associative/unset.
-    fn store_assoc_element(&mut self, name: &str, key: String, value: String) -> Result<(), AssignErr> {
+    fn store_assoc_element(
+        &mut self,
+        name: &str,
+        key: String,
+        value: String,
+    ) -> Result<(), AssignErr> {
         match self.vars.get_mut(name) {
             Some(v) => match &mut v.value {
                 VarValue::Associative(pairs) => {
@@ -1707,12 +2020,20 @@ impl Shell {
                     }
                 }
                 _ => {
-                    crate::sh_error!(self, None, "{name}: set_associative_element on non-associative variable");
+                    crate::sh_error!(
+                        self,
+                        None,
+                        "{name}: set_associative_element on non-associative variable"
+                    );
                     return Err(AssignErr::TypeMismatch);
                 }
             },
             None => {
-                crate::sh_error!(self, None, "{name}: set_associative_element on unset variable");
+                crate::sh_error!(
+                    self,
+                    None,
+                    "{name}: set_associative_element on unset variable"
+                );
                 return Err(AssignErr::TypeMismatch);
             }
         }
@@ -1721,7 +2042,11 @@ impl Shell {
 
     /// Storage only: replace the whole variable with an associative array of the
     /// given (already-folded) pairs, preserving exported/case_fold.
-    fn store_assoc_replace(&mut self, name: &str, pairs: Vec<(String, String)>) -> Result<(), AssignErr> {
+    fn store_assoc_replace(
+        &mut self,
+        name: &str,
+        pairs: Vec<(String, String)>,
+    ) -> Result<(), AssignErr> {
         let (exported, integer, case_fold) = match self.vars.get(name) {
             Some(v) => (v.exported, v.integer, v.case_fold),
             None => (false, false, None),
@@ -1802,27 +2127,55 @@ impl Shell {
                 Ok(())
             }
             // ── Element + Scalar (indexed): apply fold then call primitive ──
-            (AssignDest::Element { name: n, sub: Subscript::Index(idx) }, _, AssignSource::Scalar(v)) => {
+            (
+                AssignDest::Element {
+                    name: n,
+                    sub: Subscript::Index(idx),
+                },
+                _,
+                AssignSource::Scalar(v),
+            ) => {
                 let n = n.clone();
                 let idx = *idx;
                 let v = if op == AssignKind::Append {
                     self.lookup_indexed_element(&n, idx).unwrap_or_default() + &v
-                } else { v };
+                } else {
+                    v
+                };
                 // Integer arrays (v-L49) coerce each element value via arith
                 // before case-fold, mirroring the scalar attribute order in
                 // `value_with_scalar_attrs`. Non-integer arrays are untouched.
-                let v = if self.is_integer(&n) { eval_integer_coerce(self, &v) } else { v };
+                let v = if self.is_integer(&n) {
+                    eval_integer_coerce(self, &v)
+                } else {
+                    v
+                };
                 let v = apply_case_fold(self.case_fold_of(&n), v);
                 self.store_indexed_element(&n, idx, v)
             }
-            (AssignDest::Element { name: n, sub: Subscript::Key(key) }, _, AssignSource::Scalar(v)) => {
+            (
+                AssignDest::Element {
+                    name: n,
+                    sub: Subscript::Key(key),
+                },
+                _,
+                AssignSource::Scalar(v),
+            ) => {
                 let n = n.clone();
                 let key = key.clone();
                 let v = if op == AssignKind::Append {
-                    self.lookup_associative_element(&n, &key).unwrap_or_default() + &v
-                } else { v };
+                    self.lookup_associative_element(&n, &key)
+                        .unwrap_or_default()
+                        + &v
+                } else {
+                    v
+                };
                 // Integer associative arrays coerce the VALUE (never the key).
-                let v = if self.is_integer(&n) { eval_integer_coerce(self, &v) } else { v };
+                let v = if self.is_integer(&n) {
+                    eval_integer_coerce(self, &v)
+                } else {
+                    v
+                };
                 let v = apply_case_fold(self.case_fold_of(&n), v);
                 self.store_assoc_element(&n, key, v)
             }
@@ -1839,7 +2192,9 @@ impl Shell {
                     }
                     out
                 } else {
-                    m.into_iter().map(|(k, v)| (k, apply_case_fold(fold, v))).collect()
+                    m.into_iter()
+                        .map(|(k, v)| (k, apply_case_fold(fold, v)))
+                        .collect()
                 };
                 match op {
                     AssignKind::Set => self.store_indexed_replace(&n, m),
@@ -1857,7 +2212,9 @@ impl Shell {
                     }
                     out
                 } else {
-                    p.into_iter().map(|(k, v)| (k, apply_case_fold(fold, v))).collect()
+                    p.into_iter()
+                        .map(|(k, v)| (k, apply_case_fold(fold, v)))
+                        .collect()
                 };
                 self.store_assoc_replace(&n, p)
             }
@@ -1903,8 +2260,12 @@ impl Shell {
     // refused; the caller prints its own diagnostic) — not a discarded error.
     #[allow(clippy::result_unit_err)]
     pub fn try_set(&mut self, name: &str, value: String) -> Result<(), ()> {
-        self.assign(AssignDest::Whole(name.to_string()), AssignKind::Set, AssignSource::Scalar(value))
-            .map_err(|_| ())
+        self.assign(
+            AssignDest::Whole(name.to_string()),
+            AssignKind::Set,
+            AssignSource::Scalar(value),
+        )
+        .map_err(|_| ())
     }
 
     /// Checked unset: refuses to remove a readonly variable. Returns
@@ -2011,7 +2372,9 @@ impl Shell {
                                 subscript: sub.to_string(),
                             };
                         }
-                        _ => { current = target; } // plain name → follow the chain
+                        _ => {
+                            current = target;
+                        } // plain name → follow the chain
                     }
                 }
                 _ => return ResolvedName::Name(current),
@@ -2022,7 +2385,10 @@ impl Shell {
     /// The raw target-name value of a nameref (its stored scalar), WITHOUT
     /// dereferencing. `None` if `name` is not a nameref.
     pub fn nameref_raw_target(&self, name: &str) -> Option<String> {
-        self.vars.get(name).filter(|v| v.nameref).map(|v| v.value.scalar_view().to_string())
+        self.vars
+            .get(name)
+            .filter(|v| v.nameref)
+            .map(|v| v.value.scalar_view().to_string())
     }
 
     /// Reads `arr[subscript-text]` as a scalar, evaluating the subscript in
@@ -2046,7 +2412,11 @@ impl Shell {
                     // Negative index: wrap from end.
                     self.array_max_index(arr).and_then(|max| {
                         let wrapped = max as i64 + 1 + n;
-                        if wrapped >= 0 { Some(wrapped as usize) } else { None }
+                        if wrapped >= 0 {
+                            Some(wrapped as usize)
+                        } else {
+                            None
+                        }
                     })
                 }
             } else {
@@ -2072,27 +2442,33 @@ impl Shell {
 
     /// Install a scalar builtin variable, overwriting any inherited env value.
     fn install_var(&mut self, name: &str, value: String, readonly: bool) {
-        self.vars.insert(name.to_string(), Variable {
-            value: VarValue::Scalar(value),
-            exported: false,
-            readonly,
-            integer: false,
-            case_fold: None,
-            nameref: false,
-        });
+        self.vars.insert(
+            name.to_string(),
+            Variable {
+                value: VarValue::Scalar(value),
+                exported: false,
+                readonly,
+                integer: false,
+                case_fold: None,
+                nameref: false,
+            },
+        );
     }
 
     /// Install an indexed array builtin variable.
     fn install_indexed(&mut self, name: &str, elems: Vec<String>, readonly: bool) {
         let map: BTreeMap<usize, String> = elems.into_iter().enumerate().collect();
-        self.vars.insert(name.to_string(), Variable {
-            value: VarValue::Indexed(map),
-            exported: false,
-            readonly,
-            integer: false,
-            case_fold: None,
-            nameref: false,
-        });
+        self.vars.insert(
+            name.to_string(),
+            Variable {
+                value: VarValue::Indexed(map),
+                exported: false,
+                readonly,
+                integer: false,
+                case_fold: None,
+                nameref: false,
+            },
+        );
     }
 
     /// Called once from `Shell::new` (after env-load + BASH_FUNC import) to
@@ -2100,20 +2476,23 @@ impl Shell {
     fn install_builtin_vars(&mut self) {
         // IDs (readonly)
         unsafe {
-            self.install_var("UID",  libc::getuid().to_string(),  true);
+            self.install_var("UID", libc::getuid().to_string(), true);
             self.install_var("EUID", libc::geteuid().to_string(), true);
             self.install_var("PPID", libc::getppid().to_string(), true);
         }
         // Groups (readonly indexed array)
         self.install_indexed(
             "GROUPS",
-            builtin_current_groups().iter().map(|g| g.to_string()).collect(),
+            builtin_current_groups()
+                .iter()
+                .map(|g| g.to_string())
+                .collect(),
             true,
         );
         // Host / platform strings
         self.install_var("HOSTNAME", builtin_hostname(), false);
         self.install_var("HOSTTYPE", std::env::consts::ARCH.to_string(), false);
-        self.install_var("OSTYPE",   BUILTIN_OSTYPE.to_string(), false);
+        self.install_var("OSTYPE", BUILTIN_OSTYPE.to_string(), false);
         self.install_var("MACHTYPE", builtin_machtype(), false);
         // huck / bash identity
         self.install_var(
@@ -2132,8 +2511,12 @@ impl Shell {
         self.install_indexed(
             "BASH_VERSINFO",
             vec![
-                "5".into(), "2".into(), "0".into(), "1".into(),
-                "release".into(), builtin_machtype(),
+                "5".into(),
+                "2".into(),
+                "0".into(),
+                "1".into(),
+                "release".into(),
+                builtin_machtype(),
             ],
             true,
         );
@@ -2146,27 +2529,34 @@ impl Shell {
         // Preserve an inherited export flag: bash resets an env-inherited
         // OPTIND's value to 1 but keeps its `-x` attribute (`declare -ix`).
         let optind_exported = self.vars.get("OPTIND").map(|v| v.exported).unwrap_or(false);
-        self.vars.insert("OPTIND".to_string(), Variable {
-            value: VarValue::Scalar("1".to_string()),
-            exported: optind_exported,
-            readonly: false,
-            integer: true,
-            case_fold: None,
-            nameref: false,
-        });
+        self.vars.insert(
+            "OPTIND".to_string(),
+            Variable {
+                value: VarValue::Scalar("1".to_string()),
+                exported: optind_exported,
+                readonly: false,
+                integer: true,
+                case_fold: None,
+                nameref: false,
+            },
+        );
         // SHLVL: read inherited value (already in vars from env-load), add 1.
-        let lvl = self.vars
+        let lvl = self
+            .vars
             .get("SHLVL")
             .and_then(|v| v.value.scalar_view().parse::<i64>().ok())
             .unwrap_or(0);
-        self.vars.insert("SHLVL".to_string(), Variable {
-            value: VarValue::Scalar((lvl + 1).max(1).to_string()),
-            exported: true,
-            readonly: false,
-            integer: false,
-            case_fold: None,
-            nameref: false,
-        });
+        self.vars.insert(
+            "SHLVL".to_string(),
+            Variable {
+                value: VarValue::Scalar((lvl + 1).max(1).to_string()),
+                exported: true,
+                readonly: false,
+                integer: false,
+                case_fold: None,
+                nameref: false,
+            },
+        );
     }
 
     // ---- (end static builtin vars) -----------------------------------------
@@ -2240,14 +2630,17 @@ impl Shell {
 
     /// Insert an indexed array variable into `vars`.
     fn set_indexed_var(&mut self, name: &str, elements: BTreeMap<usize, String>) {
-        self.vars.insert(name.to_string(), Variable {
-            value: VarValue::Indexed(elements),
-            exported: false,
-            readonly: false,
-            integer: false,
-            case_fold: None,
-            nameref: false,
-        });
+        self.vars.insert(
+            name.to_string(),
+            Variable {
+                value: VarValue::Indexed(elements),
+                exported: false,
+                readonly: false,
+                integer: false,
+                case_fold: None,
+                nameref: false,
+            },
+        );
     }
 
     /// Rebuild FUNCNAME/BASH_SOURCE/BASH_LINENO from `call_stack`.
@@ -2291,7 +2684,10 @@ impl Shell {
     /// table is shared (e.g. with a command-substitution clone), this copies it
     /// first so the mutation does not leak across the isolation boundary.
     pub(crate) fn define_function(&mut self, name: String, body: Box<crate::command::Command>) {
-        let def_src = self.call_stack.last().map(|f| f.source.clone())
+        let def_src = self
+            .call_stack
+            .last()
+            .map(|f| f.source.clone())
             .unwrap_or_else(|| "environment".to_string());
         self.function_source.insert(name.clone(), def_src);
         Rc::make_mut(&mut self.functions).insert(name, body);
@@ -2352,7 +2748,11 @@ impl Shell {
         name: &str,
         elements: BTreeMap<usize, String>,
     ) -> Result<(), AssignErr> {
-        self.assign(AssignDest::Whole(name.to_string()), AssignKind::Set, AssignSource::Indexed(elements))
+        self.assign(
+            AssignDest::Whole(name.to_string()),
+            AssignKind::Set,
+            AssignSource::Indexed(elements),
+        )
     }
 
     /// Sets a single element. Promotes a scalar variable to indexed
@@ -2364,7 +2764,14 @@ impl Shell {
         idx: usize,
         value: String,
     ) -> Result<(), AssignErr> {
-        self.assign(AssignDest::Element { name: name.to_string(), sub: Subscript::Index(idx) }, AssignKind::Set, AssignSource::Scalar(value))
+        self.assign(
+            AssignDest::Element {
+                name: name.to_string(),
+                sub: Subscript::Index(idx),
+            },
+            AssignKind::Set,
+            AssignSource::Scalar(value),
+        )
     }
 
     /// Merges explicit `(index → value)` entries into the named indexed
@@ -2378,7 +2785,11 @@ impl Shell {
         name: &str,
         entries: BTreeMap<usize, String>,
     ) -> Result<(), AssignErr> {
-        self.assign(AssignDest::Whole(name.to_string()), AssignKind::Append, AssignSource::Indexed(entries))
+        self.assign(
+            AssignDest::Whole(name.to_string()),
+            AssignKind::Append,
+            AssignSource::Indexed(entries),
+        )
     }
 
     /// Appends `value` to the existing element at `idx` (concatenation).
@@ -2390,7 +2801,14 @@ impl Shell {
         idx: usize,
         value: &str,
     ) -> Result<(), AssignErr> {
-        self.assign(AssignDest::Element { name: name.to_string(), sub: Subscript::Index(idx) }, AssignKind::Append, AssignSource::Scalar(value.to_string()))
+        self.assign(
+            AssignDest::Element {
+                name: name.to_string(),
+                sub: Subscript::Index(idx),
+            },
+            AssignKind::Append,
+            AssignSource::Scalar(value.to_string()),
+        )
     }
 
     /// Removes a single element from an indexed array. No-op if the
@@ -2437,9 +2855,8 @@ impl Shell {
     /// Returns the value at string key `key` for the associative array `name`.
     /// `None` if the variable is unset, not associative, or has no such key.
     pub fn lookup_associative_element(&self, name: &str, key: &str) -> Option<String> {
-        self.get_associative(name).and_then(|pairs| {
-            pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
-        })
+        self.get_associative(name)
+            .and_then(|pairs| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
     }
 
     /// Sets `key` to `value` in the associative array `name`. Preserves
@@ -2454,7 +2871,14 @@ impl Shell {
         key: String,
         value: String,
     ) -> Result<(), AssignErr> {
-        self.assign(AssignDest::Element { name: name.to_string(), sub: Subscript::Key(key) }, AssignKind::Set, AssignSource::Scalar(value))
+        self.assign(
+            AssignDest::Element {
+                name: name.to_string(),
+                sub: Subscript::Key(key),
+            },
+            AssignKind::Set,
+            AssignSource::Scalar(value),
+        )
     }
 
     /// `m[k]+=v` — concatenate `value` to the existing element at `key`,
@@ -2465,7 +2889,14 @@ impl Shell {
         key: &str,
         value: &str,
     ) -> Result<(), AssignErr> {
-        self.assign(AssignDest::Element { name: name.to_string(), sub: Subscript::Key(key.to_string()) }, AssignKind::Append, AssignSource::Scalar(value.to_string()))
+        self.assign(
+            AssignDest::Element {
+                name: name.to_string(),
+                sub: Subscript::Key(key.to_string()),
+            },
+            AssignKind::Append,
+            AssignSource::Scalar(value.to_string()),
+        )
     }
 
     /// Removes the entry at `key` from the associative array `name`.
@@ -2473,11 +2904,7 @@ impl Shell {
     /// Reached from `builtin_unset` when the target is an associative
     /// array (see `src/builtins.rs`, the `get_associative(name).is_some()`
     /// branch).
-    pub fn unset_associative_element(
-        &mut self,
-        name: &str,
-        key: &str,
-    ) -> Result<(), AssignErr> {
+    pub fn unset_associative_element(&mut self, name: &str, key: &str) -> Result<(), AssignErr> {
         if let Some(existing) = self.vars.get(name)
             && existing.readonly
         {
@@ -2500,7 +2927,11 @@ impl Shell {
         name: &str,
         pairs: Vec<(String, String)>,
     ) -> Result<(), AssignErr> {
-        self.assign(AssignDest::Whole(name.to_string()), AssignKind::Set, AssignSource::Associative(pairs))
+        self.assign(
+            AssignDest::Whole(name.to_string()),
+            AssignKind::Set,
+            AssignSource::Associative(pairs),
+        )
     }
 
     /// Creates an empty associative array under `name`. Enforces bash rules:
@@ -2642,7 +3073,11 @@ fn should_hangup(job: &crate::jobs::Job) -> bool {
 /// Wraps a `bind` key sequence in double quotes for `bind -p`/`-P` output if
 /// the user didn't already supply them (bash always double-quotes the keyseq).
 fn quote_keyseq(k: &str) -> String {
-    if k.starts_with('"') { k.to_string() } else { format!("\"{k}\"") }
+    if k.starts_with('"') {
+        k.to_string()
+    } else {
+        format!("\"{k}\"")
+    }
 }
 
 /// Installs `value` as the scalar value of `existing`, preserving the
@@ -2675,31 +3110,45 @@ impl Shell {
     /// Records a `set VAR value` (sets `dirty`). The run loop applies the
     /// editor-mapped ones; others are recorded for `bind -v` round-trip.
     pub fn set_readline_var(&mut self, name: &str, value: &str) {
-        self.readline_settings.vars.insert(name.to_string(), value.to_string());
+        self.readline_settings
+            .vars
+            .insert(name.to_string(), value.to_string());
         self.readline_settings.dirty = true;
     }
 
     /// Queues a key binding (keyseq -> function) for the loop to apply.
     pub fn add_bind(&mut self, keyseq: &str, function: &str) {
-        self.readline_settings.pending_binds.push((keyseq.to_string(), function.to_string()));
+        self.readline_settings
+            .pending_binds
+            .push((keyseq.to_string(), function.to_string()));
         self.readline_settings.dirty = true;
     }
 
     /// Queues an unbind (keyseq) for the loop to apply.
     pub fn add_unbind(&mut self, keyseq: &str) {
-        self.readline_settings.pending_unbinds.push(keyseq.to_string());
+        self.readline_settings
+            .pending_unbinds
+            .push(keyseq.to_string());
         self.readline_settings.unbound.insert(keyseq.to_string());
         self.readline_settings.dirty = true;
     }
 
     /// `bind -v` lines: `set NAME VALUE`, sorted by name (BTreeMap iterates sorted).
     pub fn readline_var_lines(&self) -> Vec<String> {
-        self.readline_settings.vars.iter().map(|(k, v)| format!("set {k} {v}")).collect()
+        self.readline_settings
+            .vars
+            .iter()
+            .map(|(k, v)| format!("set {k} {v}"))
+            .collect()
     }
 
     /// `bind -V` lines: `` NAME is set to `VALUE' ``.
     pub fn readline_var_lines_verbose(&self) -> Vec<String> {
-        self.readline_settings.vars.iter().map(|(k, v)| format!("{k} is set to `{v}'")).collect()
+        self.readline_settings
+            .vars
+            .iter()
+            .map(|(k, v)| format!("{k} is set to `{v}'"))
+            .collect()
     }
 
     // (quote_keyseq helper is a module-level free fn below.)
@@ -2845,26 +3294,34 @@ mod tests {
         let mut sh = Shell::new();
         // `set` path (used by `for`, internal writers).
         sh.set("FUNCNAME", "7".to_string());
-        assert_eq!(sh.lookup_var("FUNCNAME"), None, "set must not write FUNCNAME");
+        assert_eq!(
+            sh.lookup_var("FUNCNAME"),
+            None,
+            "set must not write FUNCNAME"
+        );
         // `assign` path (used by `FOO=v`, inline, declare, read via try_set).
         let _ = sh.try_set("FUNCNAME", "9".to_string());
-        assert_eq!(sh.lookup_var("FUNCNAME"), None, "assign must not write FUNCNAME");
+        assert_eq!(
+            sh.lookup_var("FUNCNAME"),
+            None,
+            "assign must not write FUNCNAME"
+        );
     }
 
     #[test]
     fn funcnest_limit_parses_positive_else_none() {
         let mut sh = Shell::new();
-        assert_eq!(sh.funcnest_limit(), None);                 // unset
+        assert_eq!(sh.funcnest_limit(), None); // unset
         sh.set("FUNCNEST", "0".to_string());
-        assert_eq!(sh.funcnest_limit(), None);                 // 0 = unlimited
+        assert_eq!(sh.funcnest_limit(), None); // 0 = unlimited
         sh.set("FUNCNEST", "-3".to_string());
-        assert_eq!(sh.funcnest_limit(), None);                 // negative = unlimited
+        assert_eq!(sh.funcnest_limit(), None); // negative = unlimited
         sh.set("FUNCNEST", "abc".to_string());
-        assert_eq!(sh.funcnest_limit(), None);                 // non-numeric = unlimited
+        assert_eq!(sh.funcnest_limit(), None); // non-numeric = unlimited
         sh.set("FUNCNEST", "5".to_string());
         assert_eq!(sh.funcnest_limit(), Some(5));
         sh.set("FUNCNEST", " 5 ".to_string());
-        assert_eq!(sh.funcnest_limit(), Some(5));              // trimmed
+        assert_eq!(sh.funcnest_limit(), Some(5)); // trimmed
     }
 
     #[test]
@@ -2889,22 +3346,45 @@ mod tests {
         let mut sh = Shell::new();
         // default present
         let p = sh.active_bind_lines();
-        assert!(p.iter().any(|l| l == "\"\\C-a\": beginning-of-line"), "missing default C-a: {p:?}");
-        assert!(p.iter().any(|l| l == "# backward-kill-line (not bound)"), "missing not-bound line: {p:?}");
+        assert!(
+            p.iter().any(|l| l == "\"\\C-a\": beginning-of-line"),
+            "missing default C-a: {p:?}"
+        );
+        assert!(
+            p.iter().any(|l| l == "# backward-kill-line (not bound)"),
+            "missing not-bound line: {p:?}"
+        );
         // -P format
         let pv = sh.active_bind_lines_verbose();
-        assert!(pv.iter().any(|l| l == "beginning-of-line can be found on \"\\C-a\"."), "{pv:?}");
-        assert!(pv.iter().any(|l| l == "backward-kill-line is not bound to any keys"), "{pv:?}");
+        assert!(
+            pv.iter()
+                .any(|l| l == "beginning-of-line can be found on \"\\C-a\"."),
+            "{pv:?}"
+        );
+        assert!(
+            pv.iter()
+                .any(|l| l == "backward-kill-line is not bound to any keys"),
+            "{pv:?}"
+        );
         // user override via pending_binds (the -c-mode path)
         sh.add_bind("\"\\C-a\"", "kill-line");
         let p2 = sh.active_bind_lines();
-        assert!(p2.iter().any(|l| l == "\"\\C-a\": kill-line"), "override not applied: {p2:?}");
-        assert!(!p2.iter().any(|l| l == "\"\\C-a\": beginning-of-line"), "default not overridden: {p2:?}");
+        assert!(
+            p2.iter().any(|l| l == "\"\\C-a\": kill-line"),
+            "override not applied: {p2:?}"
+        );
+        assert!(
+            !p2.iter().any(|l| l == "\"\\C-a\": beginning-of-line"),
+            "default not overridden: {p2:?}"
+        );
         // unbind a default
         let mut sh2 = Shell::new();
         sh2.add_unbind("\\C-e");
         let p3 = sh2.active_bind_lines();
-        assert!(!p3.iter().any(|l| l.contains("\\C-e")), "C-e still shown after unbind: {p3:?}");
+        assert!(
+            !p3.iter().any(|l| l.contains("\\C-e")),
+            "C-e still shown after unbind: {p3:?}"
+        );
     }
 
     #[test]
@@ -2912,21 +3392,32 @@ mod tests {
         let sh = Shell::new();
         // accept-line is bound to both C-j and C-m by default.
         let p = sh.active_bind_lines();
-        assert!(p.iter().any(|l| l == "\"\\C-j\": accept-line"), "missing C-j: {p:?}");
-        assert!(p.iter().any(|l| l == "\"\\C-m\": accept-line"), "missing C-m: {p:?}");
+        assert!(
+            p.iter().any(|l| l == "\"\\C-j\": accept-line"),
+            "missing C-j: {p:?}"
+        );
+        assert!(
+            p.iter().any(|l| l == "\"\\C-m\": accept-line"),
+            "missing C-m: {p:?}"
+        );
         // -P joins both keyseqs on one line (sorted): C-j before C-m.
         let pv = sh.active_bind_lines_verbose();
         assert!(
-            pv.iter().any(|l| l == "accept-line can be found on \"\\C-j\", \"\\C-m\"."),
+            pv.iter()
+                .any(|l| l == "accept-line can be found on \"\\C-j\", \"\\C-m\"."),
             "multi-keyseq -P join wrong: {pv:?}"
         );
     }
 
     #[cfg(test)]
     fn test_fn_body() -> Box<crate::command::Command> {
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms("f(){ echo hi; }", &Default::default(), crate::lexer::LexerOptions::default()))
-            .unwrap()
-            .unwrap();
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+            "f(){ echo hi; }",
+            &Default::default(),
+            crate::lexer::LexerOptions::default(),
+        ))
+        .unwrap()
+        .unwrap();
         match seq.first {
             crate::command::Command::FunctionDef { body, .. } => body,
             other => panic!("expected FunctionDef, got {other:?}"),
@@ -3082,7 +3573,10 @@ mod tests {
         assert!(sh.get_indexed("FUNCNAME").is_some());
         sh.call_stack.pop();
         sh.sync_call_arrays();
-        assert!(sh.get_indexed("FUNCNAME").is_none(), "empty stack unsets FUNCNAME");
+        assert!(
+            sh.get_indexed("FUNCNAME").is_none(),
+            "empty stack unsets FUNCNAME"
+        );
         assert_eq!(sh.lookup_var("FUNCNAME"), None);
     }
 
@@ -3125,12 +3619,13 @@ mod tests {
         assert_eq!(Rc::strong_count(&a.completion_specs), 2);
 
         // COW: a mutation on `a` must not affect `b`.
-        Rc::make_mut(&mut a.command_hash).insert(
-            "myls".to_string(),
-            (std::path::PathBuf::from("/bin/ls"), 0),
-        );
+        Rc::make_mut(&mut a.command_hash)
+            .insert("myls".to_string(), (std::path::PathBuf::from("/bin/ls"), 0));
         assert!(a.command_hash.contains_key("myls"), "a should have myls");
-        assert!(!b.command_hash.contains_key("myls"), "b must not see a's mutation");
+        assert!(
+            !b.command_hash.contains_key("myls"),
+            "b must not see a's mutation"
+        );
         // After make_mut the two command_hash Rcs are now independent.
         assert_eq!(Rc::strong_count(&a.command_hash), 1);
         assert_eq!(Rc::strong_count(&b.command_hash), 1);
@@ -3204,7 +3699,7 @@ mod tests {
         s.local_scopes.push(mid);
         s.local_scopes.push(std::collections::HashMap::new()); // top frame (inner): no local x
         s.unset_var("x");
-        assert_eq!(s.get("x"), Some("orig"));         // mid's snapshot revealed
+        assert_eq!(s.get("x"), Some("orig")); // mid's snapshot revealed
         assert!(!s.local_scopes[1].contains_key("x")); // mid's snapshot popped
     }
 
@@ -3216,7 +3711,7 @@ mod tests {
         top.insert("x".to_string(), Some(Variable::scalar("orig".into())));
         s.local_scopes.push(top);
         s.unset_var("x");
-        assert_eq!(s.get("x"), None);                 // value removed
+        assert_eq!(s.get("x"), None); // value removed
         assert!(s.local_scopes[0].contains_key("x")); // snapshot KEPT (restores on return)
     }
 
@@ -3308,7 +3803,10 @@ mod tests {
     fn shell_new_caches_pid_and_argv0() {
         let shell = Shell::new();
         assert!(shell.shell_pid > 0, "shell_pid should be positive");
-        assert!(!shell.shell_argv0.is_empty(), "shell_argv0 should be non-empty");
+        assert!(
+            !shell.shell_argv0.is_empty(),
+            "shell_argv0 should be non-empty"
+        );
         assert_eq!(shell.last_bg_pid, None);
         assert!(shell.call_stack.is_empty());
     }
@@ -3555,7 +4053,9 @@ mod assoc_value_tests {
     fn declare_associative_on_existing_associative_is_noop() {
         let mut shell = Shell::new();
         shell.declare_associative("m").unwrap();
-        shell.set_associative_element("m", "k".into(), "v".into()).unwrap();
+        shell
+            .set_associative_element("m", "k".into(), "v".into())
+            .unwrap();
         assert!(shell.declare_associative("m").is_ok());
         assert_eq!(shell.lookup_associative_element("m", "k"), Some("v".into()));
     }
@@ -3565,18 +4065,31 @@ mod assoc_value_tests {
         let mut shell = Shell::new();
         let mut m = BTreeMap::new();
         m.insert(0, "x".into());
-        shell.vars.insert("a".into(), Variable {
-            value: VarValue::Indexed(m),
-            exported: false, readonly: false, integer: false, case_fold: None, nameref: false,
-        });
-        assert!(matches!(shell.declare_associative("a"), Err(DeclareErr::IndexedExists)));
+        shell.vars.insert(
+            "a".into(),
+            Variable {
+                value: VarValue::Indexed(m),
+                exported: false,
+                readonly: false,
+                integer: false,
+                case_fold: None,
+                nameref: false,
+            },
+        );
+        assert!(matches!(
+            shell.declare_associative("a"),
+            Err(DeclareErr::IndexedExists)
+        ));
     }
 
     #[test]
     fn declare_associative_on_scalar_errors() {
         let mut shell = Shell::new();
         shell.set("s", "hello".into());
-        assert!(matches!(shell.declare_associative("s"), Err(DeclareErr::ScalarExists)));
+        assert!(matches!(
+            shell.declare_associative("s"),
+            Err(DeclareErr::ScalarExists)
+        ));
     }
 
     #[test]
@@ -3600,10 +4113,18 @@ mod assoc_value_tests {
     fn set_associative_element_preserves_insertion_order_on_update() {
         let mut shell = Shell::new();
         shell.declare_associative("m").unwrap();
-        shell.set_associative_element("m", "a".into(), "1".into()).unwrap();
-        shell.set_associative_element("m", "b".into(), "2".into()).unwrap();
-        shell.set_associative_element("m", "c".into(), "3".into()).unwrap();
-        shell.set_associative_element("m", "a".into(), "999".into()).unwrap();
+        shell
+            .set_associative_element("m", "a".into(), "1".into())
+            .unwrap();
+        shell
+            .set_associative_element("m", "b".into(), "2".into())
+            .unwrap();
+        shell
+            .set_associative_element("m", "c".into(), "3".into())
+            .unwrap();
+        shell
+            .set_associative_element("m", "a".into(), "999".into())
+            .unwrap();
         let pairs = shell.get_associative("m").unwrap();
         assert_eq!(pairs[0], ("a".into(), "999".into()));
         assert_eq!(pairs[1], ("b".into(), "2".into()));
@@ -3614,26 +4135,44 @@ mod assoc_value_tests {
     fn append_associative_element_concatenates() {
         let mut shell = Shell::new();
         shell.declare_associative("m").unwrap();
-        shell.set_associative_element("m", "k".into(), "hello".into()).unwrap();
-        shell.append_associative_element("m", "k", "_world").unwrap();
-        assert_eq!(shell.lookup_associative_element("m", "k"), Some("hello_world".into()));
+        shell
+            .set_associative_element("m", "k".into(), "hello".into())
+            .unwrap();
+        shell
+            .append_associative_element("m", "k", "_world")
+            .unwrap();
+        assert_eq!(
+            shell.lookup_associative_element("m", "k"),
+            Some("hello_world".into())
+        );
     }
 
     #[test]
     fn append_associative_element_creates_when_missing() {
         let mut shell = Shell::new();
         shell.declare_associative("m").unwrap();
-        shell.append_associative_element("m", "new", "value").unwrap();
-        assert_eq!(shell.lookup_associative_element("m", "new"), Some("value".into()));
+        shell
+            .append_associative_element("m", "new", "value")
+            .unwrap();
+        assert_eq!(
+            shell.lookup_associative_element("m", "new"),
+            Some("value".into())
+        );
     }
 
     #[test]
     fn unset_associative_element_removes_one_key() {
         let mut shell = Shell::new();
         shell.declare_associative("m").unwrap();
-        shell.set_associative_element("m", "a".into(), "1".into()).unwrap();
-        shell.set_associative_element("m", "b".into(), "2".into()).unwrap();
-        shell.set_associative_element("m", "c".into(), "3".into()).unwrap();
+        shell
+            .set_associative_element("m", "a".into(), "1".into())
+            .unwrap();
+        shell
+            .set_associative_element("m", "b".into(), "2".into())
+            .unwrap();
+        shell
+            .set_associative_element("m", "c".into(), "3".into())
+            .unwrap();
         shell.unset_associative_element("m", "b").unwrap();
         let pairs = shell.get_associative("m").unwrap();
         assert_eq!(pairs.len(), 2);
@@ -3645,7 +4184,9 @@ mod assoc_value_tests {
     fn unset_associative_element_on_missing_key_is_noop() {
         let mut shell = Shell::new();
         shell.declare_associative("m").unwrap();
-        shell.set_associative_element("m", "a".into(), "1".into()).unwrap();
+        shell
+            .set_associative_element("m", "a".into(), "1".into())
+            .unwrap();
         assert!(shell.unset_associative_element("m", "nope").is_ok());
         assert_eq!(shell.lookup_associative_element("m", "a"), Some("1".into()));
     }
@@ -3663,22 +4204,32 @@ mod assoc_value_tests {
     fn replace_associative_overwrites() {
         let mut shell = Shell::new();
         shell.declare_associative("m").unwrap();
-        shell.set_associative_element("m", "old".into(), "1".into()).unwrap();
+        shell
+            .set_associative_element("m", "old".into(), "1".into())
+            .unwrap();
         let new_pairs = vec![
             ("x".to_string(), "10".to_string()),
             ("y".to_string(), "20".to_string()),
         ];
         shell.replace_associative("m", new_pairs).unwrap();
         assert!(shell.lookup_associative_element("m", "old").is_none());
-        assert_eq!(shell.lookup_associative_element("m", "x"), Some("10".into()));
-        assert_eq!(shell.lookup_associative_element("m", "y"), Some("20".into()));
+        assert_eq!(
+            shell.lookup_associative_element("m", "x"),
+            Some("10".into())
+        );
+        assert_eq!(
+            shell.lookup_associative_element("m", "y"),
+            Some("20".into())
+        );
     }
 
     #[test]
     fn readonly_blocks_set_associative_element() {
         let mut shell = Shell::new();
         shell.declare_associative("m").unwrap();
-        shell.set_associative_element("m", "k".into(), "v".into()).unwrap();
+        shell
+            .set_associative_element("m", "k".into(), "v".into())
+            .unwrap();
         shell.mark_readonly("m");
         assert!(matches!(
             shell.set_associative_element("m", "k2".into(), "v2".into()),
@@ -3855,10 +4406,19 @@ mod shopt_tests {
     #[test]
     fn apply_case_fold_lower_upper_and_none() {
         assert_eq!(apply_case_fold(None, "AbC".to_string()), "AbC");
-        assert_eq!(apply_case_fold(Some(CaseFold::Lower), "AbC".to_string()), "abc");
-        assert_eq!(apply_case_fold(Some(CaseFold::Upper), "AbC".to_string()), "ABC");
+        assert_eq!(
+            apply_case_fold(Some(CaseFold::Lower), "AbC".to_string()),
+            "abc"
+        );
+        assert_eq!(
+            apply_case_fold(Some(CaseFold::Upper), "AbC".to_string()),
+            "ABC"
+        );
         // idempotent
-        assert_eq!(apply_case_fold(Some(CaseFold::Lower), "abc".to_string()), "abc");
+        assert_eq!(
+            apply_case_fold(Some(CaseFold::Lower), "abc".to_string()),
+            "abc"
+        );
     }
 
     #[test]
@@ -3876,16 +4436,30 @@ mod shopt_tests {
 
         // indexed element
         shell.set_case_fold("arr", Some(CaseFold::Lower));
-        shell.set_indexed_element("arr", 1, "XYZ".to_string()).unwrap();
-        assert_eq!(shell.lookup_indexed_element("arr", 1).as_deref(), Some("xyz"));
+        shell
+            .set_indexed_element("arr", 1, "XYZ".to_string())
+            .unwrap();
+        assert_eq!(
+            shell.lookup_indexed_element("arr", 1).as_deref(),
+            Some("xyz")
+        );
 
         // associative value folded, key NOT folded
         // must declare as associative first (set_case_fold creates a Scalar)
         shell.declare_associative("m").unwrap();
         shell.set_case_fold("m", Some(CaseFold::Lower));
-        shell.set_associative_element("m", "Key".to_string(), "VALUE".to_string()).unwrap();
-        assert_eq!(shell.get_associative("m").unwrap().iter()
-            .find(|(k, _)| k == "Key").map(|(_, v)| v.as_str()), Some("value"));
+        shell
+            .set_associative_element("m", "Key".to_string(), "VALUE".to_string())
+            .unwrap();
+        assert_eq!(
+            shell
+                .get_associative("m")
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k == "Key")
+                .map(|(_, v)| v.as_str()),
+            Some("value")
+        );
 
         // whole-array literal via replace_indexed, attribute preserved
         shell.set_case_fold("lit", Some(CaseFold::Lower));
@@ -3893,8 +4467,14 @@ mod shopt_tests {
         map.insert(0usize, "ABC".to_string());
         map.insert(1usize, "DeF".to_string());
         shell.replace_indexed("lit", map).unwrap();
-        assert_eq!(shell.lookup_indexed_element("lit", 0).as_deref(), Some("abc"));
-        assert_eq!(shell.lookup_indexed_element("lit", 1).as_deref(), Some("def"));
+        assert_eq!(
+            shell.lookup_indexed_element("lit", 0).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            shell.lookup_indexed_element("lit", 1).as_deref(),
+            Some("def")
+        );
         assert_eq!(shell.case_fold_of("lit"), Some(CaseFold::Lower)); // preserved
 
         // upper attribute through array append (extend_indexed)
@@ -3902,15 +4482,24 @@ mod shopt_tests {
         let mut em = std::collections::BTreeMap::new();
         em.insert(0usize, "abc".to_string());
         shell.extend_indexed("app", em).unwrap();
-        assert_eq!(shell.lookup_indexed_element("app", 0).as_deref(), Some("ABC"));
+        assert_eq!(
+            shell.lookup_indexed_element("app", 0).as_deref(),
+            Some("ABC")
+        );
 
         // whole associative-array literal via replace_associative, attribute preserved
         shell.declare_associative("am").unwrap();
         shell.set_case_fold("am", Some(CaseFold::Upper));
-        shell.replace_associative("am", vec![("k".to_string(), "abc".to_string())]).unwrap();
+        shell
+            .replace_associative("am", vec![("k".to_string(), "abc".to_string())])
+            .unwrap();
         assert_eq!(
-            shell.get_associative("am").unwrap().iter()
-                .find(|(k, _)| k == "k").map(|(_, v)| v.as_str()),
+            shell
+                .get_associative("am")
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k == "k")
+                .map(|(_, v)| v.as_str()),
             Some("ABC")
         );
         assert_eq!(shell.case_fold_of("am"), Some(CaseFold::Upper)); // preserved
@@ -3942,31 +4531,40 @@ mod shopt_tests {
 
         // scalar whole-variable path
         shell.set_case_fold("s", Some(CaseFold::Upper));
-        shell.assign(
-            AssignDest::Whole("s".into()),
-            AssignKind::Set,
-            AssignSource::Scalar("abc".into()),
-        ).unwrap();
+        shell
+            .assign(
+                AssignDest::Whole("s".into()),
+                AssignKind::Set,
+                AssignSource::Scalar("abc".into()),
+            )
+            .unwrap();
         assert_eq!(shell.get("s"), Some("ABC"));
 
         // indexed element path
         shell.set_case_fold("a", Some(CaseFold::Upper));
-        shell.assign(
-            AssignDest::Element { name: "a".into(), sub: Subscript::Index(2) },
-            AssignKind::Set,
-            AssignSource::Scalar("xy".into()),
-        ).unwrap();
+        shell
+            .assign(
+                AssignDest::Element {
+                    name: "a".into(),
+                    sub: Subscript::Index(2),
+                },
+                AssignKind::Set,
+                AssignSource::Scalar("xy".into()),
+            )
+            .unwrap();
         assert_eq!(shell.lookup_indexed_element("a", 2).as_deref(), Some("XY"));
 
         // whole indexed-array literal path
         let mut m = std::collections::BTreeMap::new();
         m.insert(0usize, "lo".to_string());
         shell.set_case_fold("b", Some(CaseFold::Upper));
-        shell.assign(
-            AssignDest::Whole("b".into()),
-            AssignKind::Set,
-            AssignSource::Indexed(m),
-        ).unwrap();
+        shell
+            .assign(
+                AssignDest::Whole("b".into()),
+                AssignKind::Set,
+                AssignSource::Indexed(m),
+            )
+            .unwrap();
         assert_eq!(shell.lookup_indexed_element("b", 0).as_deref(), Some("LO"));
     }
 
@@ -3982,59 +4580,86 @@ mod shopt_tests {
         let mut m = std::collections::BTreeMap::new();
         m.insert(0usize, "2+3".to_string());
         m.insert(1usize, "4*5".to_string());
-        shell.assign(
-            AssignDest::Whole("a".into()),
-            AssignKind::Set,
-            AssignSource::Indexed(m),
-        ).unwrap();
+        shell
+            .assign(
+                AssignDest::Whole("a".into()),
+                AssignKind::Set,
+                AssignSource::Indexed(m),
+            )
+            .unwrap();
         assert_eq!(shell.lookup_indexed_element("a", 0).as_deref(), Some("5"));
         assert_eq!(shell.lookup_indexed_element("a", 1).as_deref(), Some("20"));
         assert!(shell.is_integer("a")); // flag survives the replace
 
         // indexed element coerces
-        shell.assign(
-            AssignDest::Element { name: "a".into(), sub: Subscript::Index(2) },
-            AssignKind::Set,
-            AssignSource::Scalar("6/2".into()),
-        ).unwrap();
+        shell
+            .assign(
+                AssignDest::Element {
+                    name: "a".into(),
+                    sub: Subscript::Index(2),
+                },
+                AssignKind::Set,
+                AssignSource::Scalar("6/2".into()),
+            )
+            .unwrap();
         assert_eq!(shell.lookup_indexed_element("a", 2).as_deref(), Some("3"));
 
         // whole associative literal coerces VALUES (not keys)
         shell.declare_associative("m").unwrap();
         shell.mark_integer("m");
-        shell.assign(
-            AssignDest::Whole("m".into()),
-            AssignKind::Set,
-            AssignSource::Associative(vec![("x".into(), "2+3".into())]),
-        ).unwrap();
+        shell
+            .assign(
+                AssignDest::Whole("m".into()),
+                AssignKind::Set,
+                AssignSource::Associative(vec![("x".into(), "2+3".into())]),
+            )
+            .unwrap();
         assert_eq!(
-            shell.get_associative("m").unwrap().iter()
-                .find(|(k, _)| k == "x").map(|(_, v)| v.as_str()),
+            shell
+                .get_associative("m")
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k == "x")
+                .map(|(_, v)| v.as_str()),
             Some("5")
         );
         assert!(shell.is_integer("m")); // flag survives the assoc replace
 
         // associative element coerces
-        shell.assign(
-            AssignDest::Element { name: "m".into(), sub: Subscript::Key("k".into()) },
-            AssignKind::Set,
-            AssignSource::Scalar("10-1".into()),
-        ).unwrap();
+        shell
+            .assign(
+                AssignDest::Element {
+                    name: "m".into(),
+                    sub: Subscript::Key("k".into()),
+                },
+                AssignKind::Set,
+                AssignSource::Scalar("10-1".into()),
+            )
+            .unwrap();
         assert_eq!(
-            shell.get_associative("m").unwrap().iter()
-                .find(|(k, _)| k == "k").map(|(_, v)| v.as_str()),
+            shell
+                .get_associative("m")
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k == "k")
+                .map(|(_, v)| v.as_str()),
             Some("9")
         );
 
         // non-integer array stays literal
         let mut m2 = std::collections::BTreeMap::new();
         m2.insert(0usize, "2+3".to_string());
-        shell.assign(
-            AssignDest::Whole("plain".into()),
-            AssignKind::Set,
-            AssignSource::Indexed(m2),
-        ).unwrap();
-        assert_eq!(shell.lookup_indexed_element("plain", 0).as_deref(), Some("2+3"));
+        shell
+            .assign(
+                AssignDest::Whole("plain".into()),
+                AssignKind::Set,
+                AssignSource::Indexed(m2),
+            )
+            .unwrap();
+        assert_eq!(
+            shell.lookup_indexed_element("plain", 0).as_deref(),
+            Some("2+3")
+        );
     }
 
     /// Proves that assign() enforces readonly on every write path (scalar).
@@ -4044,11 +4669,13 @@ mod shopt_tests {
         shell.try_set("r", "init".into()).unwrap();
         shell.mark_readonly("r");
         assert!(
-            shell.assign(
-                AssignDest::Whole("r".into()),
-                AssignKind::Set,
-                AssignSource::Scalar("x".into()),
-            ).is_err()
+            shell
+                .assign(
+                    AssignDest::Whole("r".into()),
+                    AssignKind::Set,
+                    AssignSource::Scalar("x".into()),
+                )
+                .is_err()
         );
         assert_eq!(shell.get("r"), Some("init")); // value unchanged
     }
@@ -4063,18 +4690,32 @@ mod shopt_tests {
         shell.set("r", "x".into()); // store target name
         assert_eq!(shell.resolve_nameref("r"), ResolvedName::Name("x".into()));
         // chain a -> b -> c
-        shell.set_nameref("a", true); shell.set("a", "b".into());
-        shell.set_nameref("b", true); shell.set("b", "c".into());
+        shell.set_nameref("a", true);
+        shell.set("a", "b".into());
+        shell.set_nameref("b", true);
+        shell.set("b", "c".into());
         assert_eq!(shell.resolve_nameref("a"), ResolvedName::Name("c".into()));
         // element target e -> arr[2]
-        shell.set_nameref("e", true); shell.set("e", "arr[2]".into());
-        assert_eq!(shell.resolve_nameref("e"), ResolvedName::Element { name: "arr".into(), subscript: "2".into() });
+        shell.set_nameref("e", true);
+        shell.set("e", "arr[2]".into());
+        assert_eq!(
+            shell.resolve_nameref("e"),
+            ResolvedName::Element {
+                name: "arr".into(),
+                subscript: "2".into()
+            }
+        );
         // unbound u (attribute set, empty value)
         shell.set_nameref("u", true);
-        assert_eq!(shell.resolve_nameref("u"), ResolvedName::Unbound("u".into()));
+        assert_eq!(
+            shell.resolve_nameref("u"),
+            ResolvedName::Unbound("u".into())
+        );
         // cycle p -> q -> p
-        shell.set_nameref("p", true); shell.set("p", "q".into());
-        shell.set_nameref("q", true); shell.set("q", "p".into());
+        shell.set_nameref("p", true);
+        shell.set("p", "q".into());
+        shell.set_nameref("q", true);
+        shell.set("q", "p".into());
         assert_eq!(shell.resolve_nameref("p"), ResolvedName::Cycle);
     }
 
@@ -4082,10 +4723,24 @@ mod shopt_tests {
     fn readline_settings_set_and_list() {
         let mut shell = Shell::new();
         // default seeded vars present
-        assert_eq!(shell.readline_settings.vars.get("editing-mode").map(String::as_str), Some("emacs"));
+        assert_eq!(
+            shell
+                .readline_settings
+                .vars
+                .get("editing-mode")
+                .map(String::as_str),
+            Some("emacs")
+        );
         // set a mapped var
         shell.set_readline_var("editing-mode", "vi");
-        assert_eq!(shell.readline_settings.vars.get("editing-mode").map(String::as_str), Some("vi"));
+        assert_eq!(
+            shell
+                .readline_settings
+                .vars
+                .get("editing-mode")
+                .map(String::as_str),
+            Some("vi")
+        );
         assert!(shell.readline_settings.dirty);
         // -v listing form
         let lines = shell.readline_var_lines();
@@ -4093,7 +4748,10 @@ mod shopt_tests {
         assert!(lines.iter().any(|l| l == "set bell-style audible"));
         // record a binding + list it
         shell.add_bind("\"\\C-x\"", "kill-line");
-        assert_eq!(shell.readline_settings.pending_binds, vec![("\"\\C-x\"".to_string(), "kill-line".to_string())]);
+        assert_eq!(
+            shell.readline_settings.pending_binds,
+            vec![("\"\\C-x\"".to_string(), "kill-line".to_string())]
+        );
     }
 
     #[test]
@@ -4102,9 +4760,18 @@ mod shopt_tests {
         sh.is_interactive = false;
         sh.shell_argv0 = "./arith.tests".to_string();
         sh.current_lineno = 168;
-        assert_eq!(sh.error_prefix(Diag::Runtime(None)), "./arith.tests: line 168: ");
-        assert_eq!(sh.error_prefix(Diag::Runtime(Some("let"))), "./arith.tests: line 168: let: ");
-        assert_eq!(sh.error_prefix(Diag::Runtime(Some("(("))), "./arith.tests: line 168: ((: ");
+        assert_eq!(
+            sh.error_prefix(Diag::Runtime(None)),
+            "./arith.tests: line 168: "
+        );
+        assert_eq!(
+            sh.error_prefix(Diag::Runtime(Some("let"))),
+            "./arith.tests: line 168: let: "
+        );
+        assert_eq!(
+            sh.error_prefix(Diag::Runtime(Some("(("))),
+            "./arith.tests: line 168: ((: "
+        );
     }
 
     #[test]
@@ -4124,7 +4791,10 @@ mod shopt_tests {
         sh.shell_argv0 = "huck".to_string();
         sh.current_lineno = 3;
         sh.seed_array_for_tests("BASH_SOURCE", &[(0, "./sourced.sh")]);
-        assert_eq!(sh.error_prefix(Diag::Runtime(None)), "./sourced.sh: line 3: ");
+        assert_eq!(
+            sh.error_prefix(Diag::Runtime(None)),
+            "./sourced.sh: line 3: "
+        );
     }
 
     #[test]
@@ -4134,7 +4804,10 @@ mod shopt_tests {
         sh.shell_argv0 = "s.sh".into();
         sh.current_lineno = 5;
         assert_eq!(sh.error_prefix(Diag::Runtime(None)), "s.sh: line 5: ");
-        assert_eq!(sh.error_prefix(Diag::Runtime(Some("cd"))), "s.sh: line 5: cd: ");
+        assert_eq!(
+            sh.error_prefix(Diag::Runtime(Some("cd"))),
+            "s.sh: line 5: cd: "
+        );
         sh.is_interactive = true;
         assert_eq!(sh.error_prefix(Diag::Runtime(None)), "huck: ");
     }
@@ -4150,7 +4823,10 @@ mod shopt_tests {
         // -c mode: -c: present
         sh.is_command_string = true;
         sh.shell_argv0 = "bash5".into();
-        assert_eq!(sh.error_prefix(Diag::Syntax { line: 1 }), "bash5: -c: line 1: ");
+        assert_eq!(
+            sh.error_prefix(Diag::Syntax { line: 1 }),
+            "bash5: -c: line 1: "
+        );
     }
 
     #[test]
@@ -4174,8 +4850,14 @@ mod shopt_tests {
         sh.is_command_string = true;
         sh.shell_argv0 = "badfile".into();
         sh.source_depth = 1;
-        assert_eq!(sh.error_prefix(Diag::Syntax { line: 2 }), "badfile: line 2: ");
+        assert_eq!(
+            sh.error_prefix(Diag::Syntax { line: 2 }),
+            "badfile: line 2: "
+        );
         sh.source_depth = 0;
-        assert_eq!(sh.error_prefix(Diag::Syntax { line: 2 }), "badfile: -c: line 2: ");
+        assert_eq!(
+            sh.error_prefix(Diag::Syntax { line: 2 }),
+            "badfile: -c: line 2: "
+        );
     }
 }

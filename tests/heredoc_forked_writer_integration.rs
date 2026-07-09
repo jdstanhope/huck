@@ -6,7 +6,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 /// SIGKILL the entire descendant tree rooted at `root` (BFS via `pgrep -P`),
 /// then `root` itself. A hung huck spawns its pipeline stages in their OWN
@@ -19,7 +21,11 @@ fn kill_process_tree(root: u32) {
     while i < pids.len() {
         let pid = pids[i];
         i += 1;
-        if let Ok(o) = Command::new("pgrep").arg("-P").arg(pid.to_string()).output() {
+        if let Ok(o) = Command::new("pgrep")
+            .arg("-P")
+            .arg(pid.to_string())
+            .output()
+        {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
                 if let Ok(child) = line.trim().parse::<u32>() {
                     pids.push(child);
@@ -30,29 +36,45 @@ fn kill_process_tree(root: u32) {
     for pid in pids {
         // SAFETY: `kill(pid, SIGKILL)` is an always-safe syscall; an already-dead
         // or reparented pid just yields ESRCH, which we ignore.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
     }
 }
 
 fn run_guarded(script: &str, secs: u64) -> Option<(String, String, i32)> {
     let mut child = Command::new(huck_bin())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().expect("spawn huck");
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn huck");
     let pid = child.id();
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let (tx, rx) = mpsc::channel::<()>();
     let wd = thread::spawn(move || -> bool {
         if rx.recv_timeout(Duration::from_secs(secs)).is_err() {
             kill_process_tree(pid);
             true
-        } else { false }
+        } else {
+            false
+        }
     });
     let out = child.wait_with_output().unwrap();
     let _ = tx.send(());
-    if wd.join().unwrap() { None } else {
-        Some((String::from_utf8_lossy(&out.stdout).into_owned(),
-              String::from_utf8_lossy(&out.stderr).into_owned(),
-              out.status.code().unwrap_or(-1)))
+    if wd.join().unwrap() {
+        None
+    } else {
+        Some((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code().unwrap_or(-1),
+        ))
     }
 }
 fn with_big_v(frag: &str) -> String {
@@ -67,8 +89,11 @@ fn compound_heredoc_large_body() {
 }
 #[test]
 fn compound_awk_while_heredoc_nvm_shape() {
-    let (o, _e, _c) = run_guarded(&with_big_v("{ command awk '{print}' | wc -l; } << EOF\n$V\nEOF"), 10)
-        .expect("HUNG: awk|while compound heredoc deadlocked");
+    let (o, _e, _c) = run_guarded(
+        &with_big_v("{ command awk '{print}' | wc -l; } << EOF\n$V\nEOF"),
+        10,
+    )
+    .expect("HUNG: awk|while compound heredoc deadlocked");
     assert_eq!(o.trim(), "1", "o: {o:?}");
 }
 #[test]
@@ -102,7 +127,11 @@ fn small_pipeline_heredoc_no_regression() {
 }
 #[test]
 fn dollar_bang_unaffected_by_heredoc() {
-    let (o, _e, _c) = run_guarded("sleep 0.2 & p=$!; cat << EOF >/dev/null\nx\nEOF\necho \"$p $!\"\n", 10).expect("hung");
+    let (o, _e, _c) = run_guarded(
+        "sleep 0.2 & p=$!; cat << EOF >/dev/null\nx\nEOF\necho \"$p $!\"\n",
+        10,
+    )
+    .expect("hung");
     let parts: Vec<&str> = o.split_whitespace().collect();
     assert_eq!(parts.len(), 2, "o: {o:?}");
     assert_eq!(parts[0], parts[1], "heredoc writer changed $!; o: {o:?}");

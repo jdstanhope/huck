@@ -50,8 +50,15 @@ fn bashpid_top_level_equals_dollar_and_differs_in_subshell() {
 fn ids_match_bash() {
     for v in ["UID", "EUID", "PPID"] {
         let frag = format!("echo ${}", v);
-        let b = std::process::Command::new("bash").args(["-c", &frag]).output().unwrap();
-        assert_eq!(huck(&frag).trim(), String::from_utf8_lossy(&b.stdout).trim(), "{v}");
+        let b = std::process::Command::new("bash")
+            .args(["-c", &frag])
+            .output()
+            .unwrap();
+        assert_eq!(
+            huck(&frag).trim(),
+            String::from_utf8_lossy(&b.stdout).trim(),
+            "{v}"
+        );
     }
 }
 
@@ -65,7 +72,10 @@ fn bash_version_and_huck_version() {
 #[test]
 fn platform_and_host_present() {
     for v in ["HOSTNAME", "HOSTTYPE", "OSTYPE", "MACHTYPE", "BASH"] {
-        assert!(!huck(&format!("echo ${}", v)).trim().is_empty(), "{v} empty");
+        assert!(
+            !huck(&format!("echo ${}", v)).trim().is_empty(),
+            "{v} empty"
+        );
     }
     assert!(!huck("echo ${GROUPS[0]}").trim().is_empty());
 }
@@ -74,21 +84,39 @@ fn platform_and_host_present() {
 fn uid_is_readonly() {
     let real = huck("echo $UID");
     let after = huck("UID=99999 2>/dev/null; echo $UID");
-    assert_eq!(after.trim(), real.trim(), "UID must be readonly (unchanged)");
+    assert_eq!(
+        after.trim(),
+        real.trim(),
+        "UID must be readonly (unchanged)"
+    );
 }
 
 #[test]
 fn shlvl_increments_from_env() {
     let o = std::process::Command::new(env!("CARGO_BIN_EXE_huck"))
-        .args(["-c", "echo $SHLVL"]).env("SHLVL", "5").output().unwrap();
+        .args(["-c", "echo $SHLVL"])
+        .env("SHLVL", "5")
+        .output()
+        .unwrap();
     assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "6");
 }
 
 #[test]
 fn compgen_v_lists_dynamic_specials() {
     let out = huck("compgen -v");
-    for v in ["RANDOM", "SECONDS", "LINENO", "BASHPID", "UID", "BASH_VERSION", "BASH_SOURCE"] {
-        assert!(out.lines().any(|l| l == v), "compgen -v should list {v}; got:\n{out}");
+    for v in [
+        "RANDOM",
+        "SECONDS",
+        "LINENO",
+        "BASHPID",
+        "UID",
+        "BASH_VERSION",
+        "BASH_SOURCE",
+    ] {
+        assert!(
+            out.lines().any(|l| l == v),
+            "compgen -v should list {v}; got:\n{out}"
+        );
     }
 }
 
@@ -96,7 +124,10 @@ fn compgen_v_lists_dynamic_specials() {
 fn compgen_v_omits_funcname_at_top_level() {
     // bash omits FUNCNAME from top-level compgen -v; huck should too (not in registry, unset at top level)
     let out = huck("compgen -v");
-    assert!(!out.lines().any(|l| l == "FUNCNAME"), "FUNCNAME should NOT be listed at top level");
+    assert!(
+        !out.lines().any(|l| l == "FUNCNAME"),
+        "FUNCNAME should NOT be listed at top level"
+    );
 }
 
 #[test]
@@ -107,6 +138,8 @@ fn export_random_reseeds_and_stores_no_ghost() {
     assert_eq!(a, b, "export RANDOM=7 must reseed deterministically");
     // no ghost: declare -p RANDOM must NOT print a stored value of 7
     let dp = huck(r#"export "RANDOM=7"; declare -p RANDOM 2>&1"#);
-    assert!(!dp.contains("RANDOM=\"7\"") && !dp.contains("RANDOM='7'"),
-        "RANDOM must not be stored as a ghost var; got: {dp}");
+    assert!(
+        !dp.contains("RANDOM=\"7\"") && !dp.contains("RANDOM='7'"),
+        "RANDOM must not be stored as a ghost var; got: {dp}"
+    );
 }

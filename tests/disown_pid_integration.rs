@@ -59,5 +59,8 @@ fn disown_h_with_bare_pid_lets_bg_survive() {
     thread::sleep(Duration::from_millis(200));
     let alive = pid_alive(pid);
     cleanup_kill(pid);
-    assert!(alive, "bg job (pid {pid}) was killed despite disown -h <pid>");
+    assert!(
+        alive,
+        "bg job (pid {pid}) was killed despite disown -h <pid>"
+    );
 }

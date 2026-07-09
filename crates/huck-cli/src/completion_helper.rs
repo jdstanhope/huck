@@ -74,12 +74,13 @@ mod tests {
         shell.borrow_mut().set("MY_VAR", "hello".to_string());
         let history = rustyline::history::FileHistory::new();
         let ctx = rustyline::Context::new(&history);
-        let (start, pairs) = rustyline::completion::Completer::complete(
-            &helper, "echo $MY_V", 10, &ctx,
-        ).unwrap();
+        let (start, pairs) =
+            rustyline::completion::Completer::complete(&helper, "echo $MY_V", 10, &ctx).unwrap();
         assert_eq!(start, 6);
         let replacements: Vec<&str> = pairs.iter().map(|p| p.replacement.as_str()).collect();
-        assert!(pairs.iter().any(|p| p.replacement == "MY_VAR"),
-                "live var not visible to helper: {replacements:?}");
+        assert!(
+            pairs.iter().any(|p| p.replacement == "MY_VAR"),
+            "live var not visible to helper: {replacements:?}"
+        );
     }
 }

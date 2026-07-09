@@ -4,16 +4,15 @@
 //! oracle is deleted): `parse_sequence` is the entry point.
 
 use crate::command::{
-    Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
-    AssignTarget,
-    Redirection, RedirOp, word_literal_text, IfClause, ElifBranch, WhileClause,
-    ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator, ArithForClause,
-    TestExpr, TestUnaryOp, TestBinaryOp, try_unary_op, skip_test_newlines, is_compound_opener,
+    ArithForClause, AssignTarget, Assignment, CaseClause, CaseItem, CaseTerminator, Command,
+    Connector, ElifBranch, ExecCommand, ForClause, IfClause, ParseError, Pipeline, RedirOp,
+    Redirection, SelectClause, Sequence, SimpleCommand, TestBinaryOp, TestExpr, TestUnaryOp,
+    WhileClause, is_compound_opener, skip_test_newlines, try_unary_op, word_literal_text,
 };
 use crate::lexer::{
-    brace_expand_parts, ArithDelim, ArrayLiteralElement, Lexer, Mode, Operator,
-    ParamModifier, ParamOpKind, ProcDir, QuoteStyle, SubstAnchor, SubstKind, SubscriptKind,
-    TokenKind, Word, WordPart,
+    ArithDelim, ArrayLiteralElement, Lexer, Mode, Operator, ParamModifier, ParamOpKind, ProcDir,
+    QuoteStyle, SubscriptKind, SubstAnchor, SubstKind, TokenKind, Word, WordPart,
+    brace_expand_parts,
 };
 
 /// Assemble a `Word` (Vec<WordPart>) from atoms in the CURRENT mode, stopping
@@ -30,9 +29,7 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
         // ── boundary: stop without consuming ─────────────────────────────────
         if matches!(
             iter.peek_kind()?,
-            None | Some(
-                TokenKind::ParamClose | TokenKind::RBracket | TokenKind::ParamSep,
-            )
+            None | Some(TokenKind::ParamClose | TokenKind::RBracket | TokenKind::ParamSep,)
         ) {
             break;
         }
@@ -56,18 +53,36 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
         // ── all other atoms ───────────────────────────────────────────────────
         let kind = iter.next_kind()?.expect("non-boundary atom after peek");
         match kind {
-            TokenKind::Lit { text, quoted: atom_q } => {
-                parts.push(WordPart::Literal { text, quoted: atom_q || quoted });
+            TokenKind::Lit {
+                text,
+                quoted: atom_q,
+            } => {
+                parts.push(WordPart::Literal {
+                    text,
+                    quoted: atom_q || quoted,
+                });
             }
-            TokenKind::DollarName { name: n, quoted: atom_q } => {
+            TokenKind::DollarName {
+                name: n,
+                quoted: atom_q,
+            } => {
                 // The atom carries its own `quoted` context (set by the lexer
                 // from its per-frame `in_dquote` flag); OR with enclosing.
                 let eff = quoted || atom_q;
                 let part = match n.as_str() {
-                    "@" => WordPart::AllArgs   { quoted: eff, joined: false },
-                    "*" => WordPart::AllArgs   { quoted: eff, joined: true  },
+                    "@" => WordPart::AllArgs {
+                        quoted: eff,
+                        joined: false,
+                    },
+                    "*" => WordPart::AllArgs {
+                        quoted: eff,
+                        joined: true,
+                    },
                     "?" => WordPart::LastStatus { quoted: eff },
-                    _   => WordPart::Var       { name: n, quoted: eff },
+                    _ => WordPart::Var {
+                        name: n,
+                        quoted: eff,
+                    },
                 };
                 parts.push(part);
             }
@@ -131,7 +146,8 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
             // Distinguish via the enclosing mode (captured before `parse_dquote`
             // pushes its own `Mode::DoubleQuote` frame).
             TokenKind::BeginDquote => {
-                let in_subscript = matches!(iter.current_mode(), Mode::ParamSubscriptOperand { .. });
+                let in_subscript =
+                    matches!(iter.current_mode(), Mode::ParamSubscriptOperand { .. });
                 let dq = parse_dquote(iter, quoted)?;
                 if in_subscript {
                     parts.push(dq);
@@ -147,7 +163,10 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
             // match the oracle's scan_subscript. QuoteRun reaches parse_word solely
             // from Mode::ParamSubscriptOperand; value families keep emitting flat Lit.
             TokenKind::QuoteRun { style, text } => {
-                parts.push(WordPart::Quoted { style, parts: vec![WordPart::Literal { text, quoted: true }] });
+                parts.push(WordPart::Quoted {
+                    style,
+                    parts: vec![WordPart::Literal { text, quoted: true }],
+                });
             }
             _ => {
                 // Unexpected atom in operand context.
@@ -464,23 +483,40 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
 /// Mirrors `parse_word_command`'s part-assembly arms — the lexer emitted the
 /// regex metacharacters as `Lit` (not `Op`), so the same arms apply.
 fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
-    iter.push_mode(Mode::Regex { paren_depth: 0, body_started: false });
+    iter.push_mode(Mode::Regex {
+        paren_depth: 0,
+        body_started: false,
+    });
     // Drop any already-buffered leading Blank/Newline (the `next_is_test_binary_
     // operator_atom` peek2 buffered exactly one boundary atom after `=~`). The
     // lexer's own leading-skip handles the rest (spaces after a newline, `\<NL>`).
-    while matches!(iter.peek_kind()?, Some(TokenKind::Blank) | Some(TokenKind::Newline)) {
+    while matches!(
+        iter.peek_kind()?,
+        Some(TokenKind::Blank) | Some(TokenKind::Newline)
+    ) {
         iter.next_kind()?;
     }
     let mut parts: Vec<WordPart> = Vec::new();
     let mut acc: Option<(String, bool)> = None;
     loop {
         match iter.peek_kind()? {
-            Some(TokenKind::RegexEnd) => { iter.next_kind()?; break; }
+            Some(TokenKind::RegexEnd) => {
+                iter.next_kind()?;
+                break;
+            }
             Some(TokenKind::Lit { .. }) => {
-                if let Some(TokenKind::Lit { text, quoted: q }) = iter.next_kind()? { push_lit(&mut acc, &mut parts, text, q); }
+                if let Some(TokenKind::Lit { text, quoted: q }) = iter.next_kind()? {
+                    push_lit(&mut acc, &mut parts, text, q);
+                }
             }
             Some(TokenKind::DollarLit { .. }) => {
-                if let Some(TokenKind::DollarLit { quoted: q }) = iter.next_kind()? { flush_lit(&mut acc, &mut parts); parts.push(WordPart::Literal { text: "$".into(), quoted: q }); }
+                if let Some(TokenKind::DollarLit { quoted: q }) = iter.next_kind()? {
+                    flush_lit(&mut acc, &mut parts);
+                    parts.push(WordPart::Literal {
+                        text: "$".into(),
+                        quoted: q,
+                    });
+                }
             }
             Some(TokenKind::QuoteRun { .. }) => {
                 if let Some(TokenKind::QuoteRun { style, text }) = iter.next_kind()? {
@@ -492,15 +528,37 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
                     // reach here (handled in the lexer's literal run / BeginDquote).
                     match style {
                         QuoteStyle::Single => parts.push(WordPart::Literal { text, quoted: true }),
-                        _ => parts.push(WordPart::Quoted { style, parts: vec![WordPart::Literal { text, quoted: true }] }),
+                        _ => parts.push(WordPart::Quoted {
+                            style,
+                            parts: vec![WordPart::Literal { text, quoted: true }],
+                        }),
                     }
                 }
             }
-            Some(TokenKind::ParamOpen { .. }) => { flush_lit(&mut acc, &mut parts); parts.push(parse_param_expansion(iter, false)?); }
-            Some(TokenKind::CmdSubOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_command_sub(iter, false)?); }
-            Some(TokenKind::ArithOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_arith_expansion(iter, false)?); }
-            Some(TokenKind::LegacyArithOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_legacy_arith_expansion(iter, false)?); }
-            Some(TokenKind::BeginBacktick) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_backtick_sub(iter, false)?); }
+            Some(TokenKind::ParamOpen { .. }) => {
+                flush_lit(&mut acc, &mut parts);
+                parts.push(parse_param_expansion(iter, false)?);
+            }
+            Some(TokenKind::CmdSubOpen) => {
+                iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
+                parts.push(parse_command_sub(iter, false)?);
+            }
+            Some(TokenKind::ArithOpen) => {
+                iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
+                parts.push(parse_arith_expansion(iter, false)?);
+            }
+            Some(TokenKind::LegacyArithOpen) => {
+                iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
+                parts.push(parse_legacy_arith_expansion(iter, false)?);
+            }
+            Some(TokenKind::BeginBacktick) => {
+                iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
+                parts.push(parse_backtick_sub(iter, false)?);
+            }
             // The oracle inlines the `"…"` body parts FLAT (each quoted:true) — it
             // calls `scan_dquote_expansion_body`, which pushes directly into the
             // operand's part list, NOT a `Quoted{Double,…}` wrapper, and whose
@@ -512,12 +570,15 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
             // reproduces the oracle's `Err(TestExprMissingOperand)` for
             // `[[ $x =~ "" ]]`, and drops the middle part in `a""b`.
             Some(TokenKind::BeginDquote) => {
-                iter.next_kind()?; flush_lit(&mut acc, &mut parts);
+                iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
                 match parse_dquote(iter, false)? {
                     WordPart::Quoted { parts: inner, .. } => {
                         let is_empty_marker = inner.len() == 1
                             && matches!(&inner[0], WordPart::Literal { text, quoted: true } if text.is_empty());
-                        if !is_empty_marker { parts.extend(inner); }
+                        if !is_empty_marker {
+                            parts.extend(inner);
+                        }
                     }
                     other => parts.push(other),
                 }
@@ -526,10 +587,16 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
                 if let Some(TokenKind::DollarName { name, quoted: q }) = iter.next_kind()? {
                     flush_lit(&mut acc, &mut parts);
                     parts.push(match name.as_str() {
-                        "@" => WordPart::AllArgs { quoted: q, joined: false },
-                        "*" => WordPart::AllArgs { quoted: q, joined: true },
+                        "@" => WordPart::AllArgs {
+                            quoted: q,
+                            joined: false,
+                        },
+                        "*" => WordPart::AllArgs {
+                            quoted: q,
+                            joined: true,
+                        },
                         "?" => WordPart::LastStatus { quoted: q },
-                        _   => WordPart::Var { name, quoted: q },
+                        _ => WordPart::Var { name, quoted: q },
                     });
                 }
             }
@@ -537,7 +604,11 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
             // arm above, not this catch-all. Other still-deferred constructs
             // inside a regex operand fall through here (v247).
             Some(TokenKind::DeferredExpansion) => return Err(ParseError::UnsupportedCommand),
-            other => return Err(ParseError::TestExprBadOperator(format!("regex operand: {other:?}"))),
+            other => {
+                return Err(ParseError::TestExprBadOperator(format!(
+                    "regex operand: {other:?}"
+                )));
+            }
         }
         // v254 T1 fix: after every NON-`RegexEnd` atom, tell the lexer whether the
         // operand has produced any content yet — `Mode::Regex.body_started` then
@@ -568,12 +639,23 @@ fn parse_extglob_group(iter: &mut Lexer) -> Result<Vec<WordPart>, ParseError> {
     let mut acc: Option<(String, bool)> = None;
     loop {
         match iter.peek_kind()? {
-            Some(TokenKind::ExtglobEnd) => { iter.next_kind()?; break; }
+            Some(TokenKind::ExtglobEnd) => {
+                iter.next_kind()?;
+                break;
+            }
             Some(TokenKind::Lit { .. }) => {
-                if let Some(TokenKind::Lit { text, quoted: q }) = iter.next_kind()? { push_lit(&mut acc, &mut parts, text, q); }
+                if let Some(TokenKind::Lit { text, quoted: q }) = iter.next_kind()? {
+                    push_lit(&mut acc, &mut parts, text, q);
+                }
             }
             Some(TokenKind::DollarLit { .. }) => {
-                if let Some(TokenKind::DollarLit { quoted: q }) = iter.next_kind()? { flush_lit(&mut acc, &mut parts); parts.push(WordPart::Literal { text: "$".into(), quoted: q }); }
+                if let Some(TokenKind::DollarLit { quoted: q }) = iter.next_kind()? {
+                    flush_lit(&mut acc, &mut parts);
+                    parts.push(WordPart::Literal {
+                        text: "$".into(),
+                        quoted: q,
+                    });
+                }
             }
             Some(TokenKind::QuoteRun { .. }) => {
                 if let Some(TokenKind::QuoteRun { style, text }) = iter.next_kind()? {
@@ -585,15 +667,37 @@ fn parse_extglob_group(iter: &mut Lexer) -> Result<Vec<WordPart>, ParseError> {
                     // makes — Backslash/Double never reach here).
                     match style {
                         QuoteStyle::Single => parts.push(WordPart::Literal { text, quoted: true }),
-                        _ => parts.push(WordPart::Quoted { style, parts: vec![WordPart::Literal { text, quoted: true }] }),
+                        _ => parts.push(WordPart::Quoted {
+                            style,
+                            parts: vec![WordPart::Literal { text, quoted: true }],
+                        }),
                     }
                 }
             }
-            Some(TokenKind::ParamOpen { .. }) => { flush_lit(&mut acc, &mut parts); parts.push(parse_param_expansion(iter, false)?); }
-            Some(TokenKind::CmdSubOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_command_sub(iter, false)?); }
-            Some(TokenKind::ArithOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_arith_expansion(iter, false)?); }
-            Some(TokenKind::LegacyArithOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_legacy_arith_expansion(iter, false)?); }
-            Some(TokenKind::BeginBacktick) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_backtick_sub(iter, false)?); }
+            Some(TokenKind::ParamOpen { .. }) => {
+                flush_lit(&mut acc, &mut parts);
+                parts.push(parse_param_expansion(iter, false)?);
+            }
+            Some(TokenKind::CmdSubOpen) => {
+                iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
+                parts.push(parse_command_sub(iter, false)?);
+            }
+            Some(TokenKind::ArithOpen) => {
+                iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
+                parts.push(parse_arith_expansion(iter, false)?);
+            }
+            Some(TokenKind::LegacyArithOpen) => {
+                iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
+                parts.push(parse_legacy_arith_expansion(iter, false)?);
+            }
+            Some(TokenKind::BeginBacktick) => {
+                iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
+                parts.push(parse_backtick_sub(iter, false)?);
+            }
             // Mirrors the oracle's `scan_extglob_group` `"` arm (delegates to
             // `scan_dquote_expansion_body`, which inlines FLAT, not a `Quoted`
             // wrapper — same as `parse_regex_operand`'s non-subscript case).
@@ -601,12 +705,15 @@ fn parse_extglob_group(iter: &mut Lexer) -> Result<Vec<WordPart>, ParseError> {
             // (`[Literal{"",true}]`) so an empty `""` contributes no part,
             // matching `scan_dquote_expansion_body`'s empty-body no-op.
             Some(TokenKind::BeginDquote) => {
-                iter.next_kind()?; flush_lit(&mut acc, &mut parts);
+                iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
                 match parse_dquote(iter, false)? {
                     WordPart::Quoted { parts: inner, .. } => {
                         let is_empty_marker = inner.len() == 1
                             && matches!(&inner[0], WordPart::Literal { text, quoted: true } if text.is_empty());
-                        if !is_empty_marker { parts.extend(inner); }
+                        if !is_empty_marker {
+                            parts.extend(inner);
+                        }
                     }
                     other => parts.push(other),
                 }
@@ -615,15 +722,25 @@ fn parse_extglob_group(iter: &mut Lexer) -> Result<Vec<WordPart>, ParseError> {
                 if let Some(TokenKind::DollarName { name, quoted: q }) = iter.next_kind()? {
                     flush_lit(&mut acc, &mut parts);
                     parts.push(match name.as_str() {
-                        "@" => WordPart::AllArgs { quoted: q, joined: false },
-                        "*" => WordPart::AllArgs { quoted: q, joined: true },
+                        "@" => WordPart::AllArgs {
+                            quoted: q,
+                            joined: false,
+                        },
+                        "*" => WordPart::AllArgs {
+                            quoted: q,
+                            joined: true,
+                        },
                         "?" => WordPart::LastStatus { quoted: q },
-                        _   => WordPart::Var { name, quoted: q },
+                        _ => WordPart::Var { name, quoted: q },
                     });
                 }
             }
             Some(TokenKind::DeferredExpansion) => return Err(ParseError::UnsupportedCommand),
-            other => return Err(ParseError::TestExprBadOperator(format!("extglob group: {other:?}"))),
+            other => {
+                return Err(ParseError::TestExprBadOperator(format!(
+                    "extglob group: {other:?}"
+                )));
+            }
         }
     }
     flush_lit(&mut acc, &mut parts);
@@ -666,7 +783,9 @@ fn flush_lit(acc: &mut Option<(String, bool)>, out: &mut Vec<WordPart>) {
 /// Owns the full push/pop lifecycle of its `DoubleQuote` frame; pops on ALL
 /// exit paths.
 fn parse_dquote(iter: &mut Lexer, _outer_quoted: bool) -> Result<WordPart, ParseError> {
-    iter.push_mode(Mode::DoubleQuote { body_started: false });
+    iter.push_mode(Mode::DoubleQuote {
+        body_started: false,
+    });
     let result = (|| -> Result<Vec<WordPart>, ParseError> {
         let mut parts: Vec<WordPart> = Vec::new();
         // Pending coalescible literal chunk (see `push_lit`/`flush_lit`); a
@@ -675,7 +794,10 @@ fn parse_dquote(iter: &mut Lexer, _outer_quoted: bool) -> Result<WordPart, Parse
         loop {
             match iter.peek_kind()? {
                 // Closing `"` — consume and finish.
-                Some(TokenKind::EndDquote) => { iter.next_kind()?; break; }
+                Some(TokenKind::EndDquote) => {
+                    iter.next_kind()?;
+                    break;
+                }
                 // EOF before the closing `"` — unterminated (matches the oracle,
                 // whose fat dquote scanner errors on EOF).
                 None => return Err(ParseError::UnterminatedSubshell),
@@ -707,17 +829,26 @@ fn parse_dquote(iter: &mut Lexer, _outer_quoted: bool) -> Result<WordPart, Parse
                     if let Some(TokenKind::DollarName { name, quoted: _ }) = iter.next_kind()? {
                         flush_lit(&mut acc, &mut parts);
                         parts.push(match name.as_str() {
-                            "@" => WordPart::AllArgs { quoted: true, joined: false },
-                            "*" => WordPart::AllArgs { quoted: true, joined: true },
+                            "@" => WordPart::AllArgs {
+                                quoted: true,
+                                joined: false,
+                            },
+                            "*" => WordPart::AllArgs {
+                                quoted: true,
+                                joined: true,
+                            },
                             "?" => WordPart::LastStatus { quoted: true },
-                            _   => WordPart::Var { name, quoted: true },
+                            _ => WordPart::Var { name, quoted: true },
                         });
                     }
                 }
                 Some(TokenKind::DollarLit { .. }) => {
                     if let Some(TokenKind::DollarLit { quoted: _ }) = iter.next_kind()? {
                         flush_lit(&mut acc, &mut parts);
-                        parts.push(WordPart::Literal { text: "$".into(), quoted: true });
+                        parts.push(WordPart::Literal {
+                            text: "$".into(),
+                            quoted: true,
+                        });
                     }
                 }
                 Some(TokenKind::Lit { .. }) => {
@@ -735,9 +866,15 @@ fn parse_dquote(iter: &mut Lexer, _outer_quoted: bool) -> Result<WordPart, Parse
     let mut parts = result?;
     if parts.is_empty() {
         // Empty `""` — preserve the empty-token contract (matches the oracle).
-        parts.push(WordPart::Literal { text: String::new(), quoted: true });
+        parts.push(WordPart::Literal {
+            text: String::new(),
+            quoted: true,
+        });
     }
-    Ok(WordPart::Quoted { style: crate::lexer::QuoteStyle::Double, parts })
+    Ok(WordPart::Quoted {
+        style: crate::lexer::QuoteStyle::Double,
+        parts,
+    })
 }
 
 /// Convert the subscript word assembled by `parse_word` into a `SubscriptKind`.
@@ -746,8 +883,18 @@ fn parse_dquote(iter: &mut Lexer, _outer_quoted: bool) -> Result<WordPart, Parse
 /// production lexer.
 fn subscript_kind_from(w: Word) -> SubscriptKind {
     match w.0.as_slice() {
-        [WordPart::Literal { text, quoted: false }] if text == "@" => SubscriptKind::All,
-        [WordPart::Literal { text, quoted: false }] if text == "*" => SubscriptKind::Star,
+        [
+            WordPart::Literal {
+                text,
+                quoted: false,
+            },
+        ] if text == "@" => SubscriptKind::All,
+        [
+            WordPart::Literal {
+                text,
+                quoted: false,
+            },
+        ] if text == "*" => SubscriptKind::Star,
         _ => SubscriptKind::Index(w),
     }
 }
@@ -759,9 +906,16 @@ fn subscript_kind_from(w: Word) -> SubscriptKind {
 ///
 /// Owns the full push/pop lifecycle of its `ParamExpansion` frame and consumes
 /// the `ParamOpen` token at entry.
-pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
+pub(crate) fn parse_param_expansion(
+    iter: &mut Lexer,
+    quoted: bool,
+) -> Result<WordPart, ParseError> {
     // 1. Push the mode and consume the `ParamOpen` (`${`) token.
-    iter.push_mode(Mode::ParamExpansion { seen_name: false, indirect: false, start_off: 0 });
+    iter.push_mode(Mode::ParamExpansion {
+        seen_name: false,
+        indirect: false,
+        start_off: 0,
+    });
 
     // v264 (M-156): seed the head scanner's extquote double-quote gate. The
     // oracle gates a `$'…'`-decoded NAME on `quoted || opts.in_dquote`; fold our
@@ -777,7 +931,9 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
 
     // Restore-on-exit helper for the M-156 gate flag.
     macro_rules! restore_dq {
-        () => { iter.set_in_dquote(saved_dq); };
+        () => {
+            iter.set_in_dquote(saved_dq);
+        };
     }
 
     match iter.next_kind()? {
@@ -812,7 +968,10 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     let mut name_decoded = false;
     let name = match iter.next_kind()? {
         Some(TokenKind::ParamName(n)) => n,
-        Some(TokenKind::ParamNameDecoded(n)) => { name_decoded = true; n }
+        Some(TokenKind::ParamNameDecoded(n)) => {
+            name_decoded = true;
+            n
+        }
         Some(TokenKind::ParamBadSubst { raw }) => {
             restore_dq!();
             iter.pop_mode();
@@ -840,7 +999,10 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     let mut subscript: Option<SubscriptKind> = None;
     if matches!(iter.peek_kind()?, Some(TokenKind::LBracket)) {
         iter.next_kind()?; // consume LBracket
-        iter.push_mode(Mode::ParamSubscriptOperand { in_dquote: false, enclosing_dquote: false });
+        iter.push_mode(Mode::ParamSubscriptOperand {
+            in_dquote: false,
+            enclosing_dquote: false,
+        });
         let sub_word = match parse_word(iter, false) {
             Ok(w) => w,
             Err(e) => {
@@ -867,7 +1029,12 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     let result = match iter.next_kind()? {
         // ── Bare close: ${name}, ${#name}, ${!name}, ${name[sub]}, ${@}, ${*}, ${}
         Some(TokenKind::ParamClose) => {
-            if indirect && matches!(subscript, Some(SubscriptKind::All) | Some(SubscriptKind::Star)) {
+            if indirect
+                && matches!(
+                    subscript,
+                    Some(SubscriptKind::All) | Some(SubscriptKind::Star)
+                )
+            {
                 // `${!arr[@]}` / `${!arr[*]}` — indirect array-keys form.
                 // Mirrors the production: IndirectKeys modifier, indirect:false.
                 WordPart::ParamExpansion {
@@ -885,7 +1052,11 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 // here so a `#`+subscript is not dropped to `None` (v263).
                 WordPart::ParamExpansion {
                     name,
-                    modifier: if length_form { ParamModifier::Length } else { ParamModifier::None },
+                    modifier: if length_form {
+                        ParamModifier::Length
+                    } else {
+                        ParamModifier::None
+                    },
                     quoted,
                     subscript,
                     indirect,
@@ -911,15 +1082,23 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
             } else if name == "@" {
                 // `${@}` — all positional args (joined=false).
                 // Mirrors `scan_braced_param_expansion`'s `Some('@')` early-return.
-                WordPart::AllArgs { quoted, joined: false }
+                WordPart::AllArgs {
+                    quoted,
+                    joined: false,
+                }
             } else if name == "*" {
                 // `${*}` — all positional args (joined=true).
-                WordPart::AllArgs { quoted, joined: true }
+                WordPart::AllArgs {
+                    quoted,
+                    joined: true,
+                }
             } else if name.is_empty() {
                 // `${}` — bad substitution at runtime.
                 WordPart::ParamExpansion {
                     name: String::new(),
-                    modifier: ParamModifier::BadSubst { raw: "${}".to_string() },
+                    modifier: ParamModifier::BadSubst {
+                        raw: "${}".to_string(),
+                    },
                     quoted,
                     subscript: None,
                     indirect: false,
@@ -942,26 +1121,22 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
         }
 
         // ── Prefix-name expansion: `${!pfx*}` / `${!pfx@}` (indirect:false).
-        Some(TokenKind::ParamPrefixClose { at }) => {
-            WordPart::ParamExpansion {
-                name,
-                modifier: ParamModifier::PrefixNames { at },
-                quoted,
-                subscript: None,
-                indirect: false,
-            }
-        }
+        Some(TokenKind::ParamPrefixClose { at }) => WordPart::ParamExpansion {
+            name,
+            modifier: ParamModifier::PrefixNames { at },
+            quoted,
+            subscript: None,
+            indirect: false,
+        },
 
         // ── Post-name bad substitution (`${x!}`, `${V@}`, `${-3}`, `${x@Z}`).
-        Some(TokenKind::ParamBadSubst { raw }) => {
-            WordPart::ParamExpansion {
-                name: String::new(),
-                modifier: ParamModifier::BadSubst { raw },
-                quoted,
-                subscript: None,
-                indirect: false,
-            }
-        }
+        Some(TokenKind::ParamBadSubst { raw }) => WordPart::ParamExpansion {
+            name: String::new(),
+            modifier: ParamModifier::BadSubst { raw },
+            quoted,
+            subscript: None,
+            indirect: false,
+        },
 
         // ── Operator: pattern removal, substitute, case, transform, substring
         Some(TokenKind::ParamOp(op_kind)) => {
@@ -970,10 +1145,13 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
             // (mirrors the oracle's `opts.with_in_dquote(quoted || opts.in_dquote)`).
             // Value/error/substring operands keep the inherited value (`saved_dq`,
             // already restored above).
-            if matches!(op_kind,
-                ParamOpKind::RemovePrefix(_) | ParamOpKind::RemoveSuffix(_)
-                | ParamOpKind::Substitute(_) | ParamOpKind::Case(_, _))
-            {
+            if matches!(
+                op_kind,
+                ParamOpKind::RemovePrefix(_)
+                    | ParamOpKind::RemoveSuffix(_)
+                    | ParamOpKind::Substitute(_)
+                    | ParamOpKind::Case(_, _)
+            ) {
                 iter.set_in_dquote(m156_dq);
             }
             // Macro: push a mode, parse_word, pop mode. On error pops ParamExpansion too.
@@ -1012,55 +1190,109 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 // Production: `modifier_with_operand(chars, quoted/false, ...)`.
                 // `ErrorIfUnset` uses `enclosing_dquote=false`; others use `quoted`.
                 ParamOpKind::UseDefault(colon) => {
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: quoted }, quoted);
+                    let word = word_in_mode!(
+                        Mode::ParamWordOperand {
+                            in_dquote: false,
+                            enclosing_dquote: quoted
+                        },
+                        quoted
+                    );
                     expect_close!();
                     WordPart::ParamExpansion {
-                        name, modifier: ParamModifier::UseDefault { word, colon },
-                        quoted, subscript, indirect,
+                        name,
+                        modifier: ParamModifier::UseDefault { word, colon },
+                        quoted,
+                        subscript,
+                        indirect,
                     }
                 }
                 ParamOpKind::AssignDefault(colon) => {
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: quoted }, quoted);
+                    let word = word_in_mode!(
+                        Mode::ParamWordOperand {
+                            in_dquote: false,
+                            enclosing_dquote: quoted
+                        },
+                        quoted
+                    );
                     expect_close!();
                     WordPart::ParamExpansion {
-                        name, modifier: ParamModifier::AssignDefault { word, colon },
-                        quoted, subscript, indirect,
+                        name,
+                        modifier: ParamModifier::AssignDefault { word, colon },
+                        quoted,
+                        subscript,
+                        indirect,
                     }
                 }
                 ParamOpKind::ErrorIfUnset(colon) => {
                     // Production: `modifier_with_operand(chars, false, ...)` — NOT `quoted`.
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false);
+                    let word = word_in_mode!(
+                        Mode::ParamWordOperand {
+                            in_dquote: false,
+                            enclosing_dquote: false
+                        },
+                        false
+                    );
                     expect_close!();
                     WordPart::ParamExpansion {
-                        name, modifier: ParamModifier::ErrorIfUnset { word, colon },
-                        quoted, subscript, indirect,
+                        name,
+                        modifier: ParamModifier::ErrorIfUnset { word, colon },
+                        quoted,
+                        subscript,
+                        indirect,
                     }
                 }
                 ParamOpKind::UseAlternate(colon) => {
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: quoted }, quoted);
+                    let word = word_in_mode!(
+                        Mode::ParamWordOperand {
+                            in_dquote: false,
+                            enclosing_dquote: quoted
+                        },
+                        quoted
+                    );
                     expect_close!();
                     WordPart::ParamExpansion {
-                        name, modifier: ParamModifier::UseAlternate { word, colon },
-                        quoted, subscript, indirect,
+                        name,
+                        modifier: ParamModifier::UseAlternate { word, colon },
+                        quoted,
+                        subscript,
+                        indirect,
                     }
                 }
 
                 // ── Pattern removal: RemovePrefix / RemoveSuffix
                 // Production: `modifier_with_operand(chars, false, ...)` — enclosing_dquote=false.
                 ParamOpKind::RemovePrefix(longest) => {
-                    let pattern = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false);
+                    let pattern = word_in_mode!(
+                        Mode::ParamWordOperand {
+                            in_dquote: false,
+                            enclosing_dquote: false
+                        },
+                        false
+                    );
                     expect_close!();
                     WordPart::ParamExpansion {
-                        name, modifier: ParamModifier::RemovePrefix { pattern, longest },
-                        quoted, subscript, indirect,
+                        name,
+                        modifier: ParamModifier::RemovePrefix { pattern, longest },
+                        quoted,
+                        subscript,
+                        indirect,
                     }
                 }
                 ParamOpKind::RemoveSuffix(longest) => {
-                    let pattern = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false);
+                    let pattern = word_in_mode!(
+                        Mode::ParamWordOperand {
+                            in_dquote: false,
+                            enclosing_dquote: false
+                        },
+                        false
+                    );
                     expect_close!();
                     WordPart::ParamExpansion {
-                        name, modifier: ParamModifier::RemoveSuffix { pattern, longest },
-                        quoted, subscript, indirect,
+                        name,
+                        modifier: ParamModifier::RemoveSuffix { pattern, longest },
+                        quoted,
+                        subscript,
+                        indirect,
                     }
                 }
 
@@ -1070,45 +1302,80 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 // Absent replacement (no ParamSep) → empty Word, matching bash ${var/pat}.
                 ParamOpKind::Substitute(subst_kind) => {
                     let (anchor, all) = match subst_kind {
-                        SubstKind::First  => (SubstAnchor::None,   false),
-                        SubstKind::All    => (SubstAnchor::None,   true),
+                        SubstKind::First => (SubstAnchor::None, false),
+                        SubstKind::All => (SubstAnchor::None, true),
                         SubstKind::Prefix => (SubstAnchor::Prefix, false),
                         SubstKind::Suffix => (SubstAnchor::Suffix, false),
                     };
 
                     // Pattern in subst-pattern mode (sep = `/`).
-                    iter.push_mode(Mode::ParamSubstPatternOperand { in_dquote: false, enclosing_dquote: false });
+                    iter.push_mode(Mode::ParamSubstPatternOperand {
+                        in_dquote: false,
+                        enclosing_dquote: false,
+                    });
                     let pattern = match parse_word(iter, false) {
-                        Ok(w) => { iter.pop_mode(); w }
-                        Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(e); }
+                        Ok(w) => {
+                            iter.pop_mode();
+                            w
+                        }
+                        Err(e) => {
+                            iter.pop_mode();
+                            iter.pop_mode();
+                            return Err(e);
+                        }
                     };
 
                     // Optional `/replacement`.
-                    let replacement =
-                        if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep)) {
-                            iter.next_kind()?; // consume `/`
-                            word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false)
-                        } else {
-                            Word(vec![])
-                        };
+                    let replacement = if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep)) {
+                        iter.next_kind()?; // consume `/`
+                        word_in_mode!(
+                            Mode::ParamWordOperand {
+                                in_dquote: false,
+                                enclosing_dquote: false
+                            },
+                            false
+                        )
+                    } else {
+                        Word(vec![])
+                    };
 
                     expect_close!();
                     WordPart::ParamExpansion {
                         name,
-                        modifier: ParamModifier::Substitute { pattern, replacement, anchor, all },
-                        quoted, subscript, indirect,
+                        modifier: ParamModifier::Substitute {
+                            pattern,
+                            replacement,
+                            anchor,
+                            all,
+                        },
+                        quoted,
+                        subscript,
+                        indirect,
                     }
                 }
 
                 // ── Case conversion: ${var^pat} / ${var^^} / ${var,pat} / ${var,,}
                 // Production: `scan_optional_braced_operand` — empty body → None.
                 ParamOpKind::Case(direction, all) => {
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false);
+                    let word = word_in_mode!(
+                        Mode::ParamWordOperand {
+                            in_dquote: false,
+                            enclosing_dquote: false
+                        },
+                        false
+                    );
                     expect_close!();
                     let pattern = if word.0.is_empty() { None } else { Some(word) };
                     WordPart::ParamExpansion {
-                        name, modifier: ParamModifier::Case { direction, all, pattern },
-                        quoted, subscript, indirect,
+                        name,
+                        modifier: ParamModifier::Case {
+                            direction,
+                            all,
+                            pattern,
+                        },
+                        quoted,
+                        subscript,
+                        indirect,
                     }
                 }
 
@@ -1118,8 +1385,11 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 ParamOpKind::Transform(op) => {
                     expect_close!();
                     WordPart::ParamExpansion {
-                        name, modifier: ParamModifier::Transform { op },
-                        quoted, subscript, indirect,
+                        name,
+                        modifier: ParamModifier::Transform { op },
+                        quoted,
+                        subscript,
+                        indirect,
                     }
                 }
 
@@ -1129,20 +1399,35 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 // `Some(':') / Some('}') → recover_bad_subst` branch.
                 ParamOpKind::Substring => {
                     // Offset in substring-offset mode (sep = `:`).
-                    iter.push_mode(Mode::ParamSubstringOffsetOperand { in_dquote: false, enclosing_dquote: false });
+                    iter.push_mode(Mode::ParamSubstringOffsetOperand {
+                        in_dquote: false,
+                        enclosing_dquote: false,
+                    });
                     let offset = match parse_word(iter, false) {
-                        Ok(w) => { iter.pop_mode(); w }
-                        Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(e); }
+                        Ok(w) => {
+                            iter.pop_mode();
+                            w
+                        }
+                        Err(e) => {
+                            iter.pop_mode();
+                            iter.pop_mode();
+                            return Err(e);
+                        }
                     };
 
                     // Optional `:length`.
-                    let length =
-                        if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep)) {
-                            iter.next_kind()?; // consume `:`
-                            Some(word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false))
-                        } else {
-                            None
-                        };
+                    let length = if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep)) {
+                        iter.next_kind()?; // consume `:`
+                        Some(word_in_mode!(
+                            Mode::ParamWordOperand {
+                                in_dquote: false,
+                                enclosing_dquote: false
+                            },
+                            false
+                        ))
+                    } else {
+                        None
+                    };
 
                     expect_close!();
 
@@ -1160,7 +1445,9 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                         WordPart::ParamExpansion {
                             name,
                             modifier: ParamModifier::Substring { offset, length },
-                            quoted, subscript, indirect,
+                            quoted,
+                            subscript,
+                            indirect,
                         }
                     }
                 }
@@ -1199,7 +1486,9 @@ fn zero_lines_in_command(cmd: &mut Command) {
     match cmd {
         Command::Simple(sc) => zero_lines_in_simple(sc),
         Command::Pipeline(p) => {
-            for c in &mut p.commands { zero_lines_in_command(c); }
+            for c in &mut p.commands {
+                zero_lines_in_command(c);
+            }
         }
         Command::BraceGroup(seq) => zero_lines_in_sequence(seq),
         Command::Subshell { body } => zero_lines_in_sequence(body),
@@ -1210,7 +1499,9 @@ fn zero_lines_in_command(cmd: &mut Command) {
                 zero_lines_in_sequence(&mut branch.condition);
                 zero_lines_in_sequence(&mut branch.body);
             }
-            if let Some(b) = &mut clause.else_body { zero_lines_in_sequence(b); }
+            if let Some(b) = &mut clause.else_body {
+                zero_lines_in_sequence(b);
+            }
         }
         Command::While(clause) => {
             zero_lines_in_sequence(&mut clause.condition);
@@ -1220,7 +1511,9 @@ fn zero_lines_in_command(cmd: &mut Command) {
         Command::Select(clause) => zero_lines_in_sequence(&mut clause.body),
         Command::Case(clause) => {
             for item in &mut clause.items {
-                if let Some(b) = &mut item.body { zero_lines_in_sequence(b); }
+                if let Some(b) = &mut item.body {
+                    zero_lines_in_sequence(b);
+                }
             }
         }
         Command::FunctionDef { body, .. } => zero_lines_in_command(body),
@@ -1249,7 +1542,9 @@ fn zero_lines_in_simple(sc: &mut SimpleCommand) {
 /// closing `)` token.
 pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
     // 1. Push the mode and pull the opening atom.
-    iter.push_mode(Mode::CommandSub { body_started: false });
+    iter.push_mode(Mode::CommandSub {
+        body_started: false,
+    });
     match iter.next_kind()? {
         Some(TokenKind::DeferredExpansion) => {
             // `$((` — arithmetic; defer to runtime.
@@ -1269,7 +1564,10 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
     // an explicit subshell (`( )`/`(\n)` are syntax errors there; see the
     // `parse_subshell` caller above, which only skips `Blank`, not
     // `Newline`, before its own empty check).
-    while matches!(iter.peek_kind()?, Some(TokenKind::Blank) | Some(TokenKind::Newline)) {
+    while matches!(
+        iter.peek_kind()?,
+        Some(TokenKind::Blank) | Some(TokenKind::Newline)
+    ) {
         iter.next_kind()?;
     }
     let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
@@ -1278,7 +1576,10 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
         // yields via `parse_substitution_body("")` → `unwrap_or_else(empty_sequence)`.
         iter.next_kind()?; // consume `)`
         Sequence {
-            first: Command::Pipeline(Pipeline { negate: false, commands: Vec::new() }),
+            first: Command::Pipeline(Pipeline {
+                negate: false,
+                commands: Vec::new(),
+            }),
             rest: Vec::new(),
             background: false,
         }
@@ -1319,28 +1620,42 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
 /// path; the word-mode `ProcSubOpen` signal was already consumed by the caller).
 /// `dir` comes from that signal.
 pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPart, ParseError> {
-    iter.push_mode(Mode::CommandSub { body_started: false });
+    iter.push_mode(Mode::CommandSub {
+        body_started: false,
+    });
     match iter.next_kind()? {
         Some(TokenKind::CmdSubOpen) => {} // the real opener, scanned under CommandSub mode
-        _ => { iter.pop_mode(); return Err(ParseError::UnsupportedExpansion); }
+        _ => {
+            iter.pop_mode();
+            return Err(ParseError::UnsupportedExpansion);
+        }
     }
     // Skip a leading run of Blank/Newline atoms before checking for an empty
     // body — same whitespace/newline-only-body rule as `parse_command_sub`
     // (`<( )`/`<(\n)` are empty process substitutions in bash, unlike an
     // explicit subshell).
-    while matches!(iter.peek_kind()?, Some(TokenKind::Blank) | Some(TokenKind::Newline)) {
+    while matches!(
+        iter.peek_kind()?,
+        Some(TokenKind::Blank) | Some(TokenKind::Newline)
+    ) {
         iter.next_kind()?;
     }
     let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
         iter.next_kind()?; // consume `)`
         Sequence {
-            first: Command::Pipeline(Pipeline { negate: false, commands: Vec::new() }),
+            first: Command::Pipeline(Pipeline {
+                negate: false,
+                commands: Vec::new(),
+            }),
             rest: Vec::new(),
             background: false,
         }
     } else {
         match parse_subshell_sequence(iter) {
-            Ok(mut seq) => { zero_lines_in_sequence(&mut seq); seq }
+            Ok(mut seq) => {
+                zero_lines_in_sequence(&mut seq);
+                seq
+            }
             Err(e) => {
                 iter.pop_mode();
                 let mapped = match e {
@@ -1380,12 +1695,22 @@ fn word_has_array_literal(w: &Word) -> bool {
 }
 
 pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseError> {
-    iter.push_mode(Mode::ArrayLiteral { body_started: false, expect_subscript_eq: false, at_element_start: true, subscript_append: false });
+    iter.push_mode(Mode::ArrayLiteral {
+        body_started: false,
+        expect_subscript_eq: false,
+        at_element_start: true,
+        subscript_append: false,
+    });
     let mut elements: Vec<ArrayLiteralElement> = Vec::new();
     loop {
         match iter.peek_kind()? {
-            Some(TokenKind::Blank) | Some(TokenKind::Newline) => { iter.next_kind()?; }
-            Some(TokenKind::ArrayClose) => { iter.next_kind()?; break; }
+            Some(TokenKind::Blank) | Some(TokenKind::Newline) => {
+                iter.next_kind()?;
+            }
+            Some(TokenKind::ArrayClose) => {
+                iter.next_kind()?;
+                break;
+            }
             // v252 T3: an explicit `[expr]=value` element. The lexer emitted a
             // zero-width `LBracket` at element start; assemble the subscript Word
             // under `Mode::ParamSubscriptOperand` (identical to the `${a[i]}`
@@ -1395,22 +1720,40 @@ pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseErr
             // expansion (matches `scan_array_literal`).
             Some(TokenKind::LBracket) => {
                 iter.next_kind()?; // consume LBracket
-                iter.push_mode(Mode::ParamSubscriptOperand { in_dquote: false, enclosing_dquote: false });
+                iter.push_mode(Mode::ParamSubscriptOperand {
+                    in_dquote: false,
+                    enclosing_dquote: false,
+                });
                 let sub_word = match parse_word(iter, false) {
                     Ok(w) => w,
-                    Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(e); }
+                    Err(e) => {
+                        iter.pop_mode();
+                        iter.pop_mode();
+                        return Err(e);
+                    }
                 };
                 match iter.next_kind() {
                     Ok(Some(TokenKind::RBracket)) => {}
-                    Ok(_) => { iter.pop_mode(); iter.pop_mode(); return Err(ParseError::UnsupportedExpansion); }
-                    Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(ParseError::Lex(Box::new(e))); }
+                    Ok(_) => {
+                        iter.pop_mode();
+                        iter.pop_mode();
+                        return Err(ParseError::UnsupportedExpansion);
+                    }
+                    Err(e) => {
+                        iter.pop_mode();
+                        iter.pop_mode();
+                        return Err(ParseError::Lex(Box::new(e)));
+                    }
                 }
                 iter.pop_mode(); // ParamSubscriptOperand
                 // The lexer consumes the required `=` / `+=` (or errors
                 // ArrayLiteralMissingEquals) as `parse_word_command` scans on.
                 let value = match parse_word_command(iter, false) {
                     Ok(v) => v,
-                    Err(e) => { iter.pop_mode(); return Err(e); }
+                    Err(e) => {
+                        iter.pop_mode();
+                        return Err(e);
+                    }
                 };
                 // The lexer recorded whether the operator was `+=` (append) on
                 // the ArrayLiteral mode; read it now, before the next element's
@@ -1418,17 +1761,27 @@ pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseErr
                 // here touches this flag.
                 let append = matches!(
                     iter.current_mode(),
-                    Mode::ArrayLiteral { subscript_append: true, .. }
+                    Mode::ArrayLiteral {
+                        subscript_append: true,
+                        ..
+                    }
                 );
                 // An empty value (`[i]= ` / `[i]=)`) re-tokenizes to a single
                 // empty literal in the oracle (`scan_array_element_word`'s
                 // `words.is_empty()` fallback), NOT an empty Word.
                 let value = if value.0.is_empty() {
-                    Word(vec![WordPart::Literal { text: String::new(), quoted: false }])
+                    Word(vec![WordPart::Literal {
+                        text: String::new(),
+                        quoted: false,
+                    }])
                 } else {
                     value
                 };
-                elements.push(ArrayLiteralElement { subscript: Some(sub_word), value, append });
+                elements.push(ArrayLiteralElement {
+                    subscript: Some(sub_word),
+                    value,
+                    append,
+                });
             }
             Some(_) => {
                 // A positional value: parse_word_command stops at the next
@@ -1437,15 +1790,25 @@ pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseErr
                 // comment). Then brace-expand (bare elements only).
                 let value = match parse_word_command(iter, false) {
                     Ok(v) => v,
-                    Err(e) => { iter.pop_mode(); return Err(e); }
+                    Err(e) => {
+                        iter.pop_mode();
+                        return Err(e);
+                    }
                 };
                 match brace_expand_parts(value.0) {
                     Ok(expansions) => {
                         for p in expansions {
-                            elements.push(ArrayLiteralElement { subscript: None, value: Word(p), append: false });
+                            elements.push(ArrayLiteralElement {
+                                subscript: None,
+                                value: Word(p),
+                                append: false,
+                            });
                         }
                     }
-                    Err(e) => { iter.pop_mode(); return Err(ParseError::Lex(Box::new(e))); }
+                    Err(e) => {
+                        iter.pop_mode();
+                        return Err(ParseError::Lex(Box::new(e)));
+                    }
                 }
             }
             // Unreachable: `scan_step_array_literal` errors with
@@ -1463,7 +1826,10 @@ pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseErr
 /// yields — a `Pipeline` with no commands.
 fn empty_sequence() -> Sequence {
     Sequence {
-        first: Command::Pipeline(Pipeline { negate: false, commands: Vec::new() }),
+        first: Command::Pipeline(Pipeline {
+            negate: false,
+            commands: Vec::new(),
+        }),
         rest: Vec::new(),
         background: false,
     }
@@ -1534,7 +1900,10 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
 /// `ArithClose`, and on `ArithBail` rewinds to the `$((` start and re-drives as a
 /// command substitution of a subshell (`$( (…) )`).  Owns the push/pop lifecycle;
 /// pops the `Arith` frame on ALL exit paths.
-enum ArithBodyOutcome { Closed(Word), Bail }
+enum ArithBodyOutcome {
+    Closed(Word),
+    Bail,
+}
 
 /// Assemble the arith body `Word` by pulling atoms until `ArithClose` (→ `Closed`)
 /// or `ArithBail` (→ `Bail`, consumed here so the parser can rewind cleanly).
@@ -1566,11 +1935,24 @@ fn parse_arith_body(iter: &mut Lexer, _in_dquote: bool) -> Result<ArithBodyOutco
     let mut parts: Vec<WordPart> = Vec::new();
     loop {
         match iter.peek_kind()? {
-            Some(TokenKind::ArithClose) => { iter.next_kind()?; return Ok(ArithBodyOutcome::Closed(Word(parts))); }
-            Some(TokenKind::ArithBail)  => { return Ok(ArithBodyOutcome::Bail); } // Task 5 consumes/rewinds
-            Some(TokenKind::ParamOpen { .. })  => { parts.push(parse_param_expansion(iter, true)?); }
-            Some(TokenKind::CmdSubOpen)        => { iter.next_kind()?; parts.push(parse_command_sub(iter, true)?); }
-            Some(TokenKind::BeginBacktick)     => { iter.next_kind()?; parts.push(parse_backtick_sub(iter, true)?); }
+            Some(TokenKind::ArithClose) => {
+                iter.next_kind()?;
+                return Ok(ArithBodyOutcome::Closed(Word(parts)));
+            }
+            Some(TokenKind::ArithBail) => {
+                return Ok(ArithBodyOutcome::Bail);
+            } // Task 5 consumes/rewinds
+            Some(TokenKind::ParamOpen { .. }) => {
+                parts.push(parse_param_expansion(iter, true)?);
+            }
+            Some(TokenKind::CmdSubOpen) => {
+                iter.next_kind()?;
+                parts.push(parse_command_sub(iter, true)?);
+            }
+            Some(TokenKind::BeginBacktick) => {
+                iter.next_kind()?;
+                parts.push(parse_backtick_sub(iter, true)?);
+            }
             // Nested `$((` — mirrors the `CmdSubOpen`/`BeginBacktick` arms above: the
             // atom peeked here is the zero-width SIGNAL `scan_step_arith` emits without
             // consuming `$((` (cursor stays at `$`), so it must be discarded via
@@ -1583,9 +1965,15 @@ fn parse_arith_body(iter: &mut Lexer, _in_dquote: bool) -> Result<ArithBodyOutco
             // `quoted: true` regardless of the outer body's own quoted flag (see the
             // doc comment above this function; matches the production oracle
             // `arith_string_to_word`/`scan_dollar_expansion`, which hardcodes `true`).
-            Some(TokenKind::ArithOpen)         => { iter.next_kind()?; parts.push(parse_arith_expansion(iter, true)?); }
-            Some(TokenKind::LegacyArithOpen)   => { iter.next_kind()?; parts.push(parse_legacy_arith_expansion(iter, true)?); }
-            Some(TokenKind::Lit { .. })        => {
+            Some(TokenKind::ArithOpen) => {
+                iter.next_kind()?;
+                parts.push(parse_arith_expansion(iter, true)?);
+            }
+            Some(TokenKind::LegacyArithOpen) => {
+                iter.next_kind()?;
+                parts.push(parse_legacy_arith_expansion(iter, true)?);
+            }
+            Some(TokenKind::Lit { .. }) => {
                 if let Some(TokenKind::Lit { text, quoted }) = iter.next_kind()? {
                     parts.push(WordPart::Literal { text, quoted });
                 }
@@ -1593,10 +1981,16 @@ fn parse_arith_body(iter: &mut Lexer, _in_dquote: bool) -> Result<ArithBodyOutco
             Some(TokenKind::DollarName { .. }) => {
                 if let Some(TokenKind::DollarName { name, quoted }) = iter.next_kind()? {
                     let part = match name.as_str() {
-                        "@" => WordPart::AllArgs { quoted, joined: false },
-                        "*" => WordPart::AllArgs { quoted, joined: true },
+                        "@" => WordPart::AllArgs {
+                            quoted,
+                            joined: false,
+                        },
+                        "*" => WordPart::AllArgs {
+                            quoted,
+                            joined: true,
+                        },
                         "?" => WordPart::LastStatus { quoted },
-                        _   => WordPart::Var { name, quoted },
+                        _ => WordPart::Var { name, quoted },
                     };
                     parts.push(part);
                 }
@@ -1606,14 +2000,24 @@ fn parse_arith_body(iter: &mut Lexer, _in_dquote: bool) -> Result<ArithBodyOutco
     }
 }
 
-pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
+pub(crate) fn parse_arith_expansion(
+    iter: &mut Lexer,
+    quoted: bool,
+) -> Result<WordPart, ParseError> {
     // Mark BEFORE pushing the Arith mode / consuming the `$((` opener, so an
     // `ArithBail` rewind returns to the `$((` start with the pre-push mode stack
     // (mark captures `self.modes`). `parse_arith_expansion` is always called at a
     // pull boundary (the parser dispatches on a peeked opener), so mark/rewind's
     // pull-boundary assert holds.
     let mark = iter.mark();
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
+    iter.push_mode(Mode::Arith {
+        paren_depth: 0,
+        in_squote: false,
+        in_dquote: false,
+        body_started: false,
+        for_header: false,
+        delim: ArithDelim::Paren,
+    });
     let result = (|| -> Result<ArithBodyOutcome, ParseError> {
         match iter.next_kind()? {
             Some(TokenKind::ArithOpen) => {}
@@ -1643,8 +2047,18 @@ pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
 /// so no `mark`/`rewind`. The mode's first scan consumes `$[` and emits
 /// `LegacyArithOpen`; `parse_arith_body` assembles the body and returns `Closed` on
 /// `ArithClose`.
-pub(crate) fn parse_legacy_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Bracket });
+pub(crate) fn parse_legacy_arith_expansion(
+    iter: &mut Lexer,
+    quoted: bool,
+) -> Result<WordPart, ParseError> {
+    iter.push_mode(Mode::Arith {
+        paren_depth: 0,
+        in_squote: false,
+        in_dquote: false,
+        body_started: false,
+        for_header: false,
+        delim: ArithDelim::Bracket,
+    });
     let result = (|| -> Result<ArithBodyOutcome, ParseError> {
         match iter.next_kind()? {
             Some(TokenKind::LegacyArithOpen) => {}
@@ -1692,7 +2106,14 @@ fn parse_arith_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     let mark = iter.mark();
     iter.next_kind()?; // consume first `(` (buffered Op(LParen))
     iter.next_kind()?; // consume second `(`
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: true, for_header: false, delim: ArithDelim::Paren });
+    iter.push_mode(Mode::Arith {
+        paren_depth: 0,
+        in_squote: false,
+        in_dquote: false,
+        body_started: true,
+        for_header: false,
+        delim: ArithDelim::Paren,
+    });
     let result = parse_arith_body(iter, false);
     iter.pop_mode();
     match result? {
@@ -1726,7 +2147,9 @@ fn parse_arith_command(iter: &mut Lexer) -> Result<Command, ParseError> {
 fn skip_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
     loop {
         match iter.peek_kind()? {
-            Some(TokenKind::Newline | TokenKind::Blank) => { iter.next_kind()?; }
+            Some(TokenKind::Newline | TokenKind::Blank) => {
+                iter.next_kind()?;
+            }
             Some(TokenKind::HeredocBodyBegin { .. }) => {
                 let body = parse_heredoc_body(iter)?;
                 iter.push_heredoc_body(body);
@@ -1774,7 +2197,9 @@ fn collect_heredoc_bodies_after_newline(iter: &mut Lexer) -> Result<(), ParseErr
 fn parse_heredoc_body(iter: &mut Lexer) -> Result<Word, ParseError> {
     let expand = match iter.next_kind()? {
         Some(TokenKind::HeredocBodyBegin { expand }) => expand,
-        _ => unreachable!("lexer emits a complete heredoc body group beginning with HeredocBodyBegin"),
+        _ => unreachable!(
+            "lexer emits a complete heredoc body group beginning with HeredocBodyBegin"
+        ),
     };
     if expand {
         parse_heredoc_body_expanding(iter)
@@ -1791,13 +2216,18 @@ fn parse_heredoc_body_literal(iter: &mut Lexer) -> Result<Word, ParseError> {
     let mut parts: Vec<WordPart> = Vec::new();
     loop {
         match iter.peek_kind()? {
-            Some(TokenKind::HeredocBodyEnd) => { iter.next_kind()?; break; }
+            Some(TokenKind::HeredocBodyEnd) => {
+                iter.next_kind()?;
+                break;
+            }
             Some(TokenKind::Lit { .. }) => {
                 if let Some(TokenKind::Lit { text, quoted }) = iter.next_kind()? {
                     push_heredoc_literal_lines(&mut parts, &text, quoted);
                 }
             }
-            _ => unreachable!("lexer emits a complete literal heredoc body group (one Lit then End)"),
+            _ => {
+                unreachable!("lexer emits a complete literal heredoc body group (one Lit then End)")
+            }
         }
     }
     Ok(Word(parts))
@@ -1817,7 +2247,10 @@ fn parse_heredoc_body_expanding(iter: &mut Lexer) -> Result<Word, ParseError> {
     let mut acc: Option<(String, bool)> = None;
     loop {
         match iter.peek_kind()? {
-            Some(TokenKind::HeredocBodyEnd) => { iter.next_kind()?; break; }
+            Some(TokenKind::HeredocBodyEnd) => {
+                iter.next_kind()?;
+                break;
+            }
             Some(TokenKind::Lit { quoted: false, .. }) => {
                 if let Some(TokenKind::Lit { text, .. }) = iter.next_kind()? {
                     push_lit(&mut acc, &mut parts, text, false);
@@ -1859,17 +2292,26 @@ fn parse_heredoc_body_expanding(iter: &mut Lexer) -> Result<Word, ParseError> {
                 if let Some(TokenKind::DollarName { name, quoted: _ }) = iter.next_kind()? {
                     flush_lit(&mut acc, &mut parts);
                     parts.push(match name.as_str() {
-                        "@" => WordPart::AllArgs { quoted: true, joined: false },
-                        "*" => WordPart::AllArgs { quoted: true, joined: true },
+                        "@" => WordPart::AllArgs {
+                            quoted: true,
+                            joined: false,
+                        },
+                        "*" => WordPart::AllArgs {
+                            quoted: true,
+                            joined: true,
+                        },
                         "?" => WordPart::LastStatus { quoted: true },
-                        _   => WordPart::Var { name, quoted: true },
+                        _ => WordPart::Var { name, quoted: true },
                     });
                 }
             }
             Some(TokenKind::DollarLit { .. }) => {
                 iter.next_kind()?;
                 flush_lit(&mut acc, &mut parts);
-                parts.push(WordPart::Literal { text: "$".into(), quoted: true });
+                parts.push(WordPart::Literal {
+                    text: "$".into(),
+                    quoted: true,
+                });
             }
             // v258: `$[expr]` legacy arith inside the body is handled by the
             // `LegacyArithOpen` arm above, not this catch-all. Other still-deferred
@@ -1879,7 +2321,11 @@ fn parse_heredoc_body_expanding(iter: &mut Lexer) -> Result<Word, ParseError> {
             // between `HeredocBodyBegin` and `HeredocBodyEnd`, but a malformed
             // heredoc-in-comsub/backtick construct must NEVER panic. Surface a clean
             // parse error instead of `unreachable!`.
-            _ => return Err(ParseError::Lex(Box::new(crate::lexer::LexError::UnterminatedHeredoc))),
+            _ => {
+                return Err(ParseError::Lex(Box::new(
+                    crate::lexer::LexError::UnterminatedHeredoc,
+                )));
+            }
         }
     }
     flush_lit(&mut acc, &mut parts);
@@ -1896,15 +2342,24 @@ fn push_heredoc_literal_lines(parts: &mut Vec<WordPart>, text: &str, quoted: boo
     let mut rest = text;
     while let Some(idx) = rest.find('\n') {
         let (line, tail) = rest.split_at(idx);
-        parts.push(WordPart::Literal { text: line.to_string(), quoted });
-        parts.push(WordPart::Literal { text: "\n".to_string(), quoted });
+        parts.push(WordPart::Literal {
+            text: line.to_string(),
+            quoted,
+        });
+        parts.push(WordPart::Literal {
+            text: "\n".to_string(),
+            quoted,
+        });
         rest = &tail[1..];
     }
     // A trailing fragment with no newline shouldn't occur for a literal
     // heredoc body (the lexer always appends '\n' after every content line),
     // but guard defensively rather than silently drop trailing text.
     if !rest.is_empty() {
-        parts.push(WordPart::Literal { text: rest.to_string(), quoted });
+        parts.push(WordPart::Literal {
+            text: rest.to_string(),
+            quoted,
+        });
     }
 }
 
@@ -1916,7 +2371,10 @@ fn is_bang_word(tok: &TokenKind) -> bool {
         // v247 T5: under the atom command scanner a standalone `!` is a single
         // unquoted `Lit` atom (`! cmd` → `Lit "!"`, then a `Blank`). A glued
         // `!foo` is `Lit "!foo"` (text != "!") — correctly NOT a bang.
-        TokenKind::Lit { text, quoted: false } => text == "!",
+        TokenKind::Lit {
+            text,
+            quoted: false,
+        } => text == "!",
         _ => false,
     }
 }
@@ -1925,38 +2383,51 @@ fn is_bang_word(tok: &TokenKind) -> bool {
 /// Tasks 2–7 can share the same stop-at sets and function signatures.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Keyword {
-    If, Then, Elif, Else, Fi,
-    While, Until, Do, Done,
-    For, In, Case, Esac,
-    LBrace, RBrace,
-    DoubleBracketOpen,   // `[[`
-    DoubleBracketClose,  // `]]`
-    Function, Select, Coproc,
+    If,
+    Then,
+    Elif,
+    Else,
+    Fi,
+    While,
+    Until,
+    Do,
+    Done,
+    For,
+    In,
+    Case,
+    Esac,
+    LBrace,
+    RBrace,
+    DoubleBracketOpen,  // `[[`
+    DoubleBracketClose, // `]]`
+    Function,
+    Select,
+    Coproc,
 }
 
 impl Keyword {
     fn name(self) -> &'static str {
         match self {
-            Keyword::If       => "if",
-            Keyword::Then     => "then",
-            Keyword::Elif     => "elif",
-            Keyword::Else     => "else",
-            Keyword::Fi       => "fi",
-            Keyword::While    => "while",
-            Keyword::Until    => "until",
-            Keyword::Do       => "do",
-            Keyword::Done     => "done",
-            Keyword::For      => "for",
-            Keyword::In       => "in",
-            Keyword::Case     => "case",
-            Keyword::Esac     => "esac",
-            Keyword::LBrace   => "{",
-            Keyword::RBrace   => "}",
-            Keyword::DoubleBracketOpen  => "[[",
+            Keyword::If => "if",
+            Keyword::Then => "then",
+            Keyword::Elif => "elif",
+            Keyword::Else => "else",
+            Keyword::Fi => "fi",
+            Keyword::While => "while",
+            Keyword::Until => "until",
+            Keyword::Do => "do",
+            Keyword::Done => "done",
+            Keyword::For => "for",
+            Keyword::In => "in",
+            Keyword::Case => "case",
+            Keyword::Esac => "esac",
+            Keyword::LBrace => "{",
+            Keyword::RBrace => "}",
+            Keyword::DoubleBracketOpen => "[[",
             Keyword::DoubleBracketClose => "]]",
             Keyword::Function => "function",
-            Keyword::Select   => "select",
-            Keyword::Coproc   => "coproc",
+            Keyword::Select => "select",
+            Keyword::Coproc => "coproc",
         }
     }
 }
@@ -1966,9 +2437,19 @@ impl Keyword {
 /// `Literal` whose text equals the keyword.  Mirrors `keyword_of` in
 /// `command.rs`.
 pub(crate) fn keyword_kind(token: &TokenKind) -> Option<Keyword> {
-    let TokenKind::Word(Word(parts)) = token else { return None };
-    if parts.len() != 1 { return None; }
-    let WordPart::Literal { text, quoted: false } = &parts[0] else { return None; };
+    let TokenKind::Word(Word(parts)) = token else {
+        return None;
+    };
+    if parts.len() != 1 {
+        return None;
+    }
+    let WordPart::Literal {
+        text,
+        quoted: false,
+    } = &parts[0]
+    else {
+        return None;
+    };
     keyword_from_str(text)
 }
 
@@ -1978,27 +2459,27 @@ pub(crate) fn keyword_kind(token: &TokenKind) -> Option<Keyword> {
 /// truth.  Mirrors `command.rs`'s `keyword_of` text match.
 pub(crate) fn keyword_from_str(text: &str) -> Option<Keyword> {
     match text {
-        "if"       => Some(Keyword::If),
-        "then"     => Some(Keyword::Then),
-        "elif"     => Some(Keyword::Elif),
-        "else"     => Some(Keyword::Else),
-        "fi"       => Some(Keyword::Fi),
-        "while"    => Some(Keyword::While),
-        "until"    => Some(Keyword::Until),
-        "do"       => Some(Keyword::Do),
-        "done"     => Some(Keyword::Done),
-        "for"      => Some(Keyword::For),
-        "in"       => Some(Keyword::In),
-        "case"     => Some(Keyword::Case),
-        "esac"     => Some(Keyword::Esac),
-        "{"        => Some(Keyword::LBrace),
-        "}"        => Some(Keyword::RBrace),
-        "[["       => Some(Keyword::DoubleBracketOpen),
-        "]]"       => Some(Keyword::DoubleBracketClose),
+        "if" => Some(Keyword::If),
+        "then" => Some(Keyword::Then),
+        "elif" => Some(Keyword::Elif),
+        "else" => Some(Keyword::Else),
+        "fi" => Some(Keyword::Fi),
+        "while" => Some(Keyword::While),
+        "until" => Some(Keyword::Until),
+        "do" => Some(Keyword::Do),
+        "done" => Some(Keyword::Done),
+        "for" => Some(Keyword::For),
+        "in" => Some(Keyword::In),
+        "case" => Some(Keyword::Case),
+        "esac" => Some(Keyword::Esac),
+        "{" => Some(Keyword::LBrace),
+        "}" => Some(Keyword::RBrace),
+        "[[" => Some(Keyword::DoubleBracketOpen),
+        "]]" => Some(Keyword::DoubleBracketClose),
         "function" => Some(Keyword::Function),
-        "select"   => Some(Keyword::Select),
-        "coproc"   => Some(Keyword::Coproc),
-        _          => None,
+        "select" => Some(Keyword::Select),
+        "coproc" => Some(Keyword::Coproc),
+        _ => None,
     }
 }
 
@@ -2020,7 +2501,10 @@ fn peek_leading_keyword(iter: &mut Lexer) -> Result<Option<Keyword>, ParseError>
     let kw = match iter.peek_kind()? {
         // Legacy Word token: delegate directly (it already carries its parts).
         Some(w @ TokenKind::Word(_)) => return Ok(keyword_kind(w)),
-        Some(TokenKind::Lit { text, quoted: false }) => keyword_from_str(text),
+        Some(TokenKind::Lit {
+            text,
+            quoted: false,
+        }) => keyword_from_str(text),
         _ => None,
     };
     let Some(kw) = kw else { return Ok(None) };
@@ -2059,7 +2543,10 @@ fn consume_command_word(iter: &mut Lexer) -> Result<Word, ParseError> {
 fn keyword_of_consumed(token: &TokenKind) -> Option<Keyword> {
     match token {
         TokenKind::Word(_) => keyword_kind(token),
-        TokenKind::Lit { text, quoted: false } => keyword_from_str(text),
+        TokenKind::Lit {
+            text,
+            quoted: false,
+        } => keyword_from_str(text),
         _ => None,
     }
 }
@@ -2067,12 +2554,21 @@ fn keyword_of_consumed(token: &TokenKind) -> Option<Keyword> {
 /// Extract a `for`/`select` loop-variable name from an assembled `Word`: it must
 /// be a single unquoted `Literal`.
 fn for_variable_name_word(w: &Word) -> Option<String> {
-    if w.0.len() != 1 { return None; }
-    let WordPart::Literal { text, quoted: false } = &w.0[0] else { return None; };
-    if text.is_empty() { return None; }
+    if w.0.len() != 1 {
+        return None;
+    }
+    let WordPart::Literal {
+        text,
+        quoted: false,
+    } = &w.0[0]
+    else {
+        return None;
+    };
+    if text.is_empty() {
+        return None;
+    }
     Some(text.clone())
 }
-
 
 /// Parses a SINGLE redirect token group (optional `RedirFd` prefix + redirect
 /// operator + target word) from `iter`.  Mirrors one iteration of
@@ -2098,12 +2594,18 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
             // source order by the final `attach_heredoc_bodies` walk
             // (`parse_sequence`). Build a provisional empty-body redirect now.
             let (expand, strip_tabs) = match iter.next_kind()? {
-                Some(TokenKind::Heredoc { expand, strip_tabs, .. }) => (expand, strip_tabs),
+                Some(TokenKind::Heredoc {
+                    expand, strip_tabs, ..
+                }) => (expand, strip_tabs),
                 _ => unreachable!("peek confirmed Heredoc"),
             };
             Ok(vec![Redirection {
                 fd: fd_prefix.unwrap_or(crate::command::RedirFd::Number(0)),
-                op: crate::command::RedirOp::Heredoc { body: Word(vec![]), expand, strip_tabs },
+                op: crate::command::RedirOp::Heredoc {
+                    body: Word(vec![]),
+                    expand,
+                    strip_tabs,
+                },
             }])
         }
         Some(TokenKind::Op(op)) if crate::command::is_redirect_op(op) => {
@@ -2131,9 +2633,13 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
             let target = match iter.peek_kind()? {
                 Some(TokenKind::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
                 Some(TokenKind::Newline) | None => return Err(ParseError::MissingRedirectTarget),
-                Some(TokenKind::Heredoc { .. }) => return Err(ParseError::RedirectTargetIsOperator),
+                Some(TokenKind::Heredoc { .. }) => {
+                    return Err(ParseError::RedirectTargetIsOperator);
+                }
                 Some(TokenKind::RedirFd(_)) => return Err(ParseError::RedirectTargetIsOperator),
-                Some(TokenKind::ArithBlock(..)) => return Err(ParseError::RedirectTargetIsOperator),
+                Some(TokenKind::ArithBlock(..)) => {
+                    return Err(ParseError::RedirectTargetIsOperator);
+                }
                 Some(TokenKind::Word(_)) => match iter.next_kind()? {
                     Some(TokenKind::Word(word)) => word,
                     _ => unreachable!("peek confirmed Word"),
@@ -2265,7 +2771,9 @@ fn parse_simple_with_leading_word(
         if !at_blank && iter.take_trailing_eligible() {
             iter.expand_command_alias()?;
         }
-        let Some(token) = iter.peek_kind()? else { break };
+        let Some(token) = iter.peek_kind()? else {
+            break;
+        };
         // Stage/list terminators — stop without consuming.
         if matches!(
             token,
@@ -2398,7 +2906,10 @@ fn parse_simple_with_leading_word(
             // assignment check for `a=b`, a shape the atom path doesn't
             // reconcile).
             TokenKind::Op(Operator::LParen) => {
-                if all_words.last().is_some_and(crate::command::is_assignment_word) {
+                if all_words
+                    .last()
+                    .is_some_and(crate::command::is_assignment_word)
+                {
                     return Err(ParseError::UnsupportedCommand);
                 }
                 return Err(ParseError::UnexpectedToken);
@@ -2430,8 +2941,9 @@ fn parse_simple_with_leading_word(
         if !word_has_array_literal(w) {
             continue;
         }
-        let in_leading_prefix =
-            all_words[..i].iter().all(crate::command::is_assignment_word);
+        let in_leading_prefix = all_words[..i]
+            .iter()
+            .all(crate::command::is_assignment_word);
         if !in_leading_prefix && !command_word_is_decl_builtin {
             return Err(ParseError::UnexpectedToken);
         }
@@ -2458,7 +2970,10 @@ fn parse_simple_with_leading_word(
     // AND no redirects.  Mirrors `finalize_stage`'s guard exactly:
     //   `remaining.is_empty() && redirects.is_empty() && !inline.is_empty()`.
     if remaining.is_empty() && redirects.is_empty() && !inline_assignments.is_empty() {
-        return Ok(Command::Simple(SimpleCommand::Assign(inline_assignments, line)));
+        return Ok(Command::Simple(SimpleCommand::Assign(
+            inline_assignments,
+            line,
+        )));
     }
 
     // Empty-program case: redirect-only or assignment+redirect commands
@@ -2542,11 +3057,11 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     // goes through `peek_leading_keyword` (which handles both paths).
     match peek_leading_keyword(iter)? {
         Some(Keyword::LBrace) => return parse_brace_group(iter),
-        Some(Keyword::If)     => return parse_if(iter),
+        Some(Keyword::If) => return parse_if(iter),
         Some(Keyword::While) | Some(Keyword::Until) => return parse_while(iter),
-        Some(Keyword::For)    => return parse_for(iter),
+        Some(Keyword::For) => return parse_for(iter),
         Some(Keyword::Select) => return parse_select(iter),
-        Some(Keyword::Case)   => return parse_case(iter),
+        Some(Keyword::Case) => return parse_case(iter),
         Some(Keyword::Function) => return parse_function_keyword_def(iter),
         // v253 T3-fix: wrap a trailing redirect on a command-position
         // `[[ … ]]` (`[[ -f a ]] >out` → `Redirected{DoubleBracket, [>out]}`),
@@ -2622,7 +3137,9 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     ) {
         let line = iter.current_line()?;
         let name_word = consume_command_word(iter)?;
-        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+            iter.next_kind()?;
+        }
         // A `(` glued right after `name=`/`name+=` (the real array-literal
         // case, `a=(1 2 3)`) never reaches this check at all — the
         // assignment-prefix scan already emitted the zero-width `ArrayOpen`
@@ -2680,7 +3197,10 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
 /// A `Word` consisting of a single unquoted `Literal` — used to run
 /// `valid_identifier_text` against a peeked bare `Lit` atom without consuming it.
 fn single_lit_word(text: &str) -> Word {
-    Word(vec![WordPart::Literal { text: text.to_string(), quoted: false }])
+    Word(vec![WordPart::Literal {
+        text: text.to_string(),
+        quoted: false,
+    }])
 }
 
 /// True if `k` is a compound-command opener keyword (the keyword half of the
@@ -2739,7 +3259,10 @@ fn peek_coproc_named(iter: &mut Lexer) -> Result<bool, ParseError> {
             }
             return Ok(is_compound_opener(iter.peek2_kind()?));
         }
-        Some(TokenKind::Lit { text, quoted: false }) => text.clone(),
+        Some(TokenKind::Lit {
+            text,
+            quoted: false,
+        }) => text.clone(),
         _ => return Ok(false),
     };
     // Any single non-keyword word is a NAME candidate (identifier validity is a
@@ -2757,7 +3280,10 @@ fn peek_coproc_named(iter: &mut Lexer) -> Result<bool, ParseError> {
             // peek_nth_kind(2): `(`/`((` or a compound keyword.
             let two = match iter.peek_nth_kind(2)? {
                 Some(TokenKind::Op(Operator::LParen)) => return Ok(true),
-                Some(TokenKind::Lit { text, quoted: false }) => text.clone(),
+                Some(TokenKind::Lit {
+                    text,
+                    quoted: false,
+                }) => text.clone(),
                 _ => return Ok(false),
             };
             match keyword_from_str(&two) {
@@ -2807,10 +3333,16 @@ fn parse_coproc(iter: &mut Lexer) -> Result<Command, ParseError> {
             .expect("peek_coproc_named verified a single non-keyword word");
         skip_test_blanks(iter)?;
         let body = parse_coproc_body(iter)?;
-        Ok(Command::Coproc { name, body: Box::new(body) })
+        Ok(Command::Coproc {
+            name,
+            body: Box::new(body),
+        })
     } else {
         let body = parse_coproc_body(iter)?;
-        Ok(Command::Coproc { name: "COPROC".to_string(), body: Box::new(body) })
+        Ok(Command::Coproc {
+            name: "COPROC".to_string(),
+            body: Box::new(body),
+        })
     }
 }
 
@@ -2879,9 +3411,15 @@ fn finish_pipeline(
     //   compound, any leading `!` → wrap (negate may be false on an even count, v259 CF3)
     if !matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Pipe))) {
         return Ok(match first {
-            Command::Simple(_)         => Command::Pipeline(Pipeline { negate, commands: vec![first] }),
-            cmd if negate || had_bangs => Command::Pipeline(Pipeline { negate, commands: vec![cmd] }),
-            cmd                        => cmd,
+            Command::Simple(_) => Command::Pipeline(Pipeline {
+                negate,
+                commands: vec![first],
+            }),
+            cmd if negate || had_bangs => Command::Pipeline(Pipeline {
+                negate,
+                commands: vec![cmd],
+            }),
+            cmd => cmd,
         });
     }
 
@@ -2893,9 +3431,12 @@ fn finish_pipeline(
     // first stage. Odd-bang hoists (negate is the outer flag here, `first` is
     // raw) → stays flat; zero-bang / simple → unchanged.
     let first_stage = match first {
-        Command::Simple(_)          => first,
-        cmd if had_bangs && !negate => Command::Pipeline(Pipeline { negate: false, commands: vec![cmd] }),
-        other                       => other,
+        Command::Simple(_) => first,
+        cmd if had_bangs && !negate => Command::Pipeline(Pipeline {
+            negate: false,
+            commands: vec![cmd],
+        }),
+        other => other,
     };
     let mut stages = vec![first_stage];
     iter.next_kind()?; // consume `|`
@@ -2919,7 +3460,10 @@ fn finish_pipeline(
         }
     }
 
-    Ok(Command::Pipeline(Pipeline { negate, commands: stages }))
+    Ok(Command::Pipeline(Pipeline {
+        negate,
+        commands: stages,
+    }))
 }
 
 /// Mirrors `parse_command_then_pipeline` in `command.rs`.
@@ -2983,7 +3527,10 @@ fn parse_and_or_opts(
         iter.maybe_prune_history();
         // ── Stop check 1: before consuming any connector (mirrors ~890) ──────
         // Atom-aware keyword recognition (a bare `Lit` keyword, not a `Word`).
-        if peek_leading_keyword(iter)?.map(|k| stop_at.contains(&k)).unwrap_or(false) {
+        if peek_leading_keyword(iter)?
+            .map(|k| stop_at.contains(&k))
+            .unwrap_or(false)
+        {
             break;
         }
         match iter.peek_kind()? {
@@ -3011,8 +3558,9 @@ fn parse_and_or_opts(
                 skip_newlines(iter)?;
                 // ── Stop check 2: stop_at keyword after `&` (~917) ────────
                 // Atom-aware: compute before the borrow-holding match below.
-                let stop_kw =
-                    peek_leading_keyword(iter)?.map(|k| stop_at.contains(&k)).unwrap_or(false);
+                let stop_kw = peek_leading_keyword(iter)?
+                    .map(|k| stop_at.contains(&k))
+                    .unwrap_or(false);
                 match iter.peek_kind()? {
                     // Nothing follows → trailing `&`: background the whole sequence.
                     None => {
@@ -3057,7 +3605,10 @@ fn parse_and_or_opts(
                 }
                 skip_newlines(iter)?;
                 // ── Stop check 3: stop_at keyword after `;`/newline (~958) ───
-                if peek_leading_keyword(iter)?.map(|k| stop_at.contains(&k)).unwrap_or(false) {
+                if peek_leading_keyword(iter)?
+                    .map(|k| stop_at.contains(&k))
+                    .unwrap_or(false)
+                {
                     break;
                 }
                 match iter.peek_kind()? {
@@ -3092,7 +3643,11 @@ fn parse_and_or_opts(
         }
     }
 
-    Ok(Sequence { first, rest, background })
+    Ok(Sequence {
+        first,
+        rest,
+        background,
+    })
 }
 
 /// v250 T3 + v260 CF1: walk every redirect in `redirects` (in source order),
@@ -3138,7 +3693,11 @@ fn fill_word_parts(parts: &mut [WordPart], bodies: &mut impl Iterator<Item = Wor
             WordPart::ProcessSub { sequence, .. } => fill_sequence(sequence, bodies),
             WordPart::Arith { body, .. } => fill_word(body, bodies),
             WordPart::Quoted { parts, .. } => fill_word_parts(parts, bodies),
-            WordPart::ParamExpansion { subscript, modifier, .. } => {
+            WordPart::ParamExpansion {
+                subscript,
+                modifier,
+                ..
+            } => {
                 // Source order: `${a[i]:-word}` — subscript before the modifier.
                 if let Some(SubscriptKind::Index(w)) = subscript {
                     fill_word(w, bodies);
@@ -3174,17 +3733,23 @@ fn fill_param_modifier(modifier: &mut ParamModifier, bodies: &mut impl Iterator<
         | ParamModifier::UseAlternate { word, .. } => fill_word(word, bodies),
         ParamModifier::RemovePrefix { pattern, .. }
         | ParamModifier::RemoveSuffix { pattern, .. } => fill_word(pattern, bodies),
-        ParamModifier::Substitute { pattern, replacement, .. } => {
-            fill_word(pattern, bodies);      // `${x/pat/rep}` — pattern before replacement
+        ParamModifier::Substitute {
+            pattern,
+            replacement,
+            ..
+        } => {
+            fill_word(pattern, bodies); // `${x/pat/rep}` — pattern before replacement
             fill_word(replacement, bodies);
         }
         ParamModifier::Substring { offset, length } => {
-            fill_word(offset, bodies);       // `${x:off:len}` — offset before length
+            fill_word(offset, bodies); // `${x:off:len}` — offset before length
             if let Some(l) = length.as_mut() {
                 fill_word(l, bodies);
             }
         }
-        ParamModifier::Case { pattern: Some(p), .. } => fill_word(p, bodies),
+        ParamModifier::Case {
+            pattern: Some(p), ..
+        } => fill_word(p, bodies),
         // No Word to fill.
         ParamModifier::Case { pattern: None, .. }
         | ParamModifier::None
@@ -3300,7 +3865,10 @@ fn fill_command(cmd: &mut Command, bodies: &mut impl Iterator<Item = Word>) {
         // any trailing redirects on it are on the enclosing `Redirected`
         // wrapper, handled there. v260 CF1: any inline assignment prefixes
         // (`FOO=hi [[ … ]]`) precede the test expression itself.
-        Command::DoubleBracket { expr, inline_assignments } => {
+        Command::DoubleBracket {
+            expr,
+            inline_assignments,
+        } => {
             for a in inline_assignments.iter_mut() {
                 if let AssignTarget::Indexed { subscript, .. } = &mut a.target {
                     fill_word(subscript, bodies);
@@ -3453,10 +4021,7 @@ pub(crate) fn parse_compound_section(
 /// Wraps a freshly-parsed compound command in `Command::Redirected` when one
 /// or more redirects immediately follow its terminator; otherwise returns the
 /// command unchanged.  Mirrors `maybe_wrap_redirects` in `command.rs`.
-pub(crate) fn maybe_wrap_redirects(
-    cmd: Command,
-    iter: &mut Lexer,
-) -> Result<Command, ParseError> {
+pub(crate) fn maybe_wrap_redirects(cmd: Command, iter: &mut Lexer) -> Result<Command, ParseError> {
     let mut redirects: Vec<Redirection> = Vec::new();
     loop {
         // A trailing inter-token `Blank` may sit between the compound's
@@ -3471,7 +4036,10 @@ pub(crate) fn maybe_wrap_redirects(
         redirects.extend(parse_one_redirect(iter)?);
     }
     if !redirects.is_empty() {
-        Ok(Command::Redirected { inner: Box::new(cmd), redirects })
+        Ok(Command::Redirected {
+            inner: Box::new(cmd),
+            redirects,
+        })
     } else {
         Ok(cmd)
     }
@@ -3484,8 +4052,7 @@ pub(crate) fn maybe_wrap_redirects(
 /// `parse_command` returns `Command` rather than a bare `Sequence`).
 fn parse_brace_group(iter: &mut Lexer) -> Result<Command, ParseError> {
     expect_keyword(iter, Keyword::LBrace, ParseError::UnterminatedBrace)?;
-    let body =
-        parse_compound_section(iter, &[Keyword::RBrace], ParseError::UnterminatedBrace)?;
+    let body = parse_compound_section(iter, &[Keyword::RBrace], ParseError::UnterminatedBrace)?;
     expect_keyword(iter, Keyword::RBrace, ParseError::UnterminatedBrace)?;
     maybe_wrap_redirects(Command::BraceGroup(Box::new(body)), iter)
 }
@@ -3510,8 +4077,7 @@ fn parse_if(iter: &mut Lexer) -> Result<Command, ParseError> {
     let mut elif_branches = Vec::new();
     while peek_leading_keyword(iter)? == Some(Keyword::Elif) {
         consume_command_word(iter)?; // consume `elif`
-        let condition =
-            parse_compound_section(iter, &[Keyword::Then], ParseError::UnterminatedIf)?;
+        let condition = parse_compound_section(iter, &[Keyword::Then], ParseError::UnterminatedIf)?;
         expect_keyword(iter, Keyword::Then, ParseError::UnterminatedIf)?;
         let body = parse_compound_section(
             iter,
@@ -3523,13 +4089,22 @@ fn parse_if(iter: &mut Lexer) -> Result<Command, ParseError> {
 
     let else_body = if peek_leading_keyword(iter)? == Some(Keyword::Else) {
         consume_command_word(iter)?; // consume `else`
-        Some(parse_compound_section(iter, &[Keyword::Fi], ParseError::UnterminatedIf)?)
+        Some(parse_compound_section(
+            iter,
+            &[Keyword::Fi],
+            ParseError::UnterminatedIf,
+        )?)
     } else {
         None
     };
 
     expect_keyword(iter, Keyword::Fi, ParseError::UnterminatedIf)?;
-    let clause = IfClause { condition, then_body, elif_branches, else_body };
+    let clause = IfClause {
+        condition,
+        then_body,
+        elif_branches,
+        else_body,
+    };
     maybe_wrap_redirects(Command::If(Box::new(clause)), iter)
 }
 
@@ -3547,8 +4122,13 @@ fn parse_do_body_done(iter: &mut Lexer) -> Result<Sequence, ParseError> {
             // (`)) ; do`, `for ((…)) ; do …`) reaches the keyword — the atom
             // scanner emits a `Blank` between the `))`/word and the `;`, and a
             // bare `Blank` here would otherwise stop the skip early.
-            Some(TokenKind::Blank) => { iter.next_kind()?; }
-            Some(TokenKind::Op(Operator::Semi)) if !saw_semi => { iter.next_kind()?; saw_semi = true; }
+            Some(TokenKind::Blank) => {
+                iter.next_kind()?;
+            }
+            Some(TokenKind::Op(Operator::Semi)) if !saw_semi => {
+                iter.next_kind()?;
+                saw_semi = true;
+            }
             // v250 T3: a `Newline` consumed here may be immediately followed
             // by a heredoc-body atom group the lexer emitted for the line —
             // drain it before continuing, or the next `peek_kind` would see a
@@ -3570,8 +4150,7 @@ fn parse_do_body_done(iter: &mut Lexer) -> Result<Sequence, ParseError> {
     // `maybe_wrap_redirects`, exactly as with the `done` form).
     if peek_leading_keyword(iter)? == Some(Keyword::LBrace) {
         expect_keyword(iter, Keyword::LBrace, ParseError::UnterminatedBrace)?;
-        let body =
-            parse_compound_section(iter, &[Keyword::RBrace], ParseError::UnterminatedBrace)?;
+        let body = parse_compound_section(iter, &[Keyword::RBrace], ParseError::UnterminatedBrace)?;
         expect_keyword(iter, Keyword::RBrace, ParseError::UnterminatedBrace)?;
         return Ok(body);
     }
@@ -3589,15 +4168,33 @@ fn trim_section(word: &Word) -> Option<Word> {
     // Trim the leading Literal.
     if let Some(WordPart::Literal { text, quoted }) = parts.first().cloned() {
         let trimmed = text.trim_start().to_string();
-        if trimmed.is_empty() { parts.remove(0); } else { parts[0] = WordPart::Literal { text: trimmed, quoted }; }
+        if trimmed.is_empty() {
+            parts.remove(0);
+        } else {
+            parts[0] = WordPart::Literal {
+                text: trimmed,
+                quoted,
+            };
+        }
     }
     // Trim the trailing Literal.
     if let Some(WordPart::Literal { text, quoted }) = parts.last().cloned() {
         let trimmed = text.trim_end().to_string();
         let last = parts.len() - 1;
-        if trimmed.is_empty() { parts.pop(); } else { parts[last] = WordPart::Literal { text: trimmed, quoted }; }
+        if trimmed.is_empty() {
+            parts.pop();
+        } else {
+            parts[last] = WordPart::Literal {
+                text: trimmed,
+                quoted,
+            };
+        }
     }
-    if parts.is_empty() { None } else { Some(Word(parts)) }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(Word(parts))
+    }
 }
 
 /// Assemble the for-header sections by pulling atoms until `ArithClose`, splitting on
@@ -3609,14 +4206,37 @@ fn parse_arith_for_body(iter: &mut Lexer) -> Result<Vec<Word>, ParseError> {
     let mut cur: Vec<WordPart> = Vec::new();
     loop {
         match iter.peek_kind()? {
-            Some(TokenKind::ArithClose) => { iter.next_kind()?; sections.push(Word(cur)); return Ok(sections); }
-            Some(TokenKind::ArithSemi)  => { iter.next_kind()?; sections.push(Word(std::mem::take(&mut cur))); }
-            Some(TokenKind::ArithBail)  => { return Err(ParseError::UnterminatedLoop); }
-            Some(TokenKind::ParamOpen { .. }) => { cur.push(parse_param_expansion(iter, true)?); }
-            Some(TokenKind::CmdSubOpen)       => { iter.next_kind()?; cur.push(parse_command_sub(iter, true)?); }
-            Some(TokenKind::BeginBacktick)    => { iter.next_kind()?; cur.push(parse_backtick_sub(iter, true)?); }
-            Some(TokenKind::ArithOpen)        => { iter.next_kind()?; cur.push(parse_arith_expansion(iter, true)?); }
-            Some(TokenKind::LegacyArithOpen) => { iter.next_kind()?; cur.push(parse_legacy_arith_expansion(iter, true)?); }
+            Some(TokenKind::ArithClose) => {
+                iter.next_kind()?;
+                sections.push(Word(cur));
+                return Ok(sections);
+            }
+            Some(TokenKind::ArithSemi) => {
+                iter.next_kind()?;
+                sections.push(Word(std::mem::take(&mut cur)));
+            }
+            Some(TokenKind::ArithBail) => {
+                return Err(ParseError::UnterminatedLoop);
+            }
+            Some(TokenKind::ParamOpen { .. }) => {
+                cur.push(parse_param_expansion(iter, true)?);
+            }
+            Some(TokenKind::CmdSubOpen) => {
+                iter.next_kind()?;
+                cur.push(parse_command_sub(iter, true)?);
+            }
+            Some(TokenKind::BeginBacktick) => {
+                iter.next_kind()?;
+                cur.push(parse_backtick_sub(iter, true)?);
+            }
+            Some(TokenKind::ArithOpen) => {
+                iter.next_kind()?;
+                cur.push(parse_arith_expansion(iter, true)?);
+            }
+            Some(TokenKind::LegacyArithOpen) => {
+                iter.next_kind()?;
+                cur.push(parse_legacy_arith_expansion(iter, true)?);
+            }
             Some(TokenKind::Lit { .. }) => {
                 if let Some(TokenKind::Lit { text, quoted }) = iter.next_kind()? {
                     cur.push(WordPart::Literal { text, quoted });
@@ -3625,10 +4245,16 @@ fn parse_arith_for_body(iter: &mut Lexer) -> Result<Vec<Word>, ParseError> {
             Some(TokenKind::DollarName { .. }) => {
                 if let Some(TokenKind::DollarName { name, quoted }) = iter.next_kind()? {
                     let part = match name.as_str() {
-                        "@" => WordPart::AllArgs { quoted, joined: false },
-                        "*" => WordPart::AllArgs { quoted, joined: true },
+                        "@" => WordPart::AllArgs {
+                            quoted,
+                            joined: false,
+                        },
+                        "*" => WordPart::AllArgs {
+                            quoted,
+                            joined: true,
+                        },
                         "?" => WordPart::LastStatus { quoted },
-                        _   => WordPart::Var { name, quoted },
+                        _ => WordPart::Var { name, quoted },
                     };
                     cur.push(part);
                 }
@@ -3647,7 +4273,14 @@ fn parse_arith_for_body(iter: &mut Lexer) -> Result<Vec<Word>, ParseError> {
 fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
     iter.next_kind()?; // first `(`
     iter.next_kind()?; // second `(`
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
+    iter.push_mode(Mode::Arith {
+        paren_depth: 0,
+        in_squote: false,
+        in_dquote: false,
+        body_started: true,
+        for_header: true,
+        delim: ArithDelim::Paren,
+    });
     let result = parse_arith_for_body(iter);
     iter.pop_mode();
     let sections = match result {
@@ -3657,13 +4290,23 @@ fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
     };
     if sections.len() != 3 {
         return Err(ParseError::ArithForHeader(format!(
-            "expected 3 sections separated by `;`, got {}", sections.len())));
+            "expected 3 sections separated by `;`, got {}",
+            sections.len()
+        )));
     }
     let init = trim_section(&sections[0]);
     let cond = trim_section(&sections[1]);
     let step = trim_section(&sections[2]);
     let body = parse_do_body_done(iter)?;
-    maybe_wrap_redirects(Command::ArithFor(Box::new(ArithForClause { init, cond, step, body })), iter)
+    maybe_wrap_redirects(
+        Command::ArithFor(Box::new(ArithForClause {
+            init,
+            cond,
+            step,
+            body,
+        })),
+        iter,
+    )
 }
 
 /// Parses `for NAME [in WORD...]; do LIST; done`.  Mirrors
@@ -3719,7 +4362,9 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
                     iter.peek_kind()?,
                     None | Some(TokenKind::Newline) | Some(TokenKind::Op(Operator::Semi))
                 );
-            if stop { break; }
+            if stop {
+                break;
+            }
             match iter.peek_kind()? {
                 Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
                 // v264 flip-fix (Finding 1): for-loop in-list words brace-expand
@@ -3736,7 +4381,15 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
     };
 
     let body = parse_do_body_done(iter)?;
-    maybe_wrap_redirects(Command::For(Box::new(ForClause { var, words, has_in, body })), iter)
+    maybe_wrap_redirects(
+        Command::For(Box::new(ForClause {
+            var,
+            words,
+            has_in,
+            body,
+        })),
+        iter,
+    )
 }
 
 /// Parses `select NAME [in WORD...]; do LIST; done`.  Mirrors
@@ -3773,7 +4426,9 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
                     iter.peek_kind()?,
                     None | Some(TokenKind::Newline) | Some(TokenKind::Op(Operator::Semi))
                 );
-            if stop { break; }
+            if stop {
+                break;
+            }
             match iter.peek_kind()? {
                 Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
                 // v264 flip-fix (Finding 1): select in-list words brace-expand too.
@@ -3789,7 +4444,10 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
     };
 
     let body = parse_do_body_done(iter)?;
-    maybe_wrap_redirects(Command::Select(Box::new(SelectClause { var, words, body })), iter)
+    maybe_wrap_redirects(
+        Command::Select(Box::new(SelectClause { var, words, body })),
+        iter,
+    )
 }
 
 /// Parses `case WORD in [clause]... esac`.  Mirrors `parse_case` (~1673) in
@@ -3896,7 +4554,11 @@ fn parse_case_item(iter: &mut Lexer) -> Result<CaseItem, ParseError> {
         _ => CaseTerminator::Break,
     };
 
-    Ok(CaseItem { patterns, body, terminator })
+    Ok(CaseItem {
+        patterns,
+        body,
+        terminator,
+    })
 }
 
 /// Parses `while LIST; do LIST; done` or `until LIST; do LIST; done`.
@@ -3914,7 +4576,14 @@ fn parse_while(iter: &mut Lexer) -> Result<Command, ParseError> {
     expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
     let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
     expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
-    maybe_wrap_redirects(Command::While(Box::new(WhileClause { condition, body, until })), iter)
+    maybe_wrap_redirects(
+        Command::While(Box::new(WhileClause {
+            condition,
+            body,
+            until,
+        })),
+        iter,
+    )
 }
 
 /// Parses a `( LIST )` subshell.  Mirrors `parse_subshell` (~1780) in
@@ -3946,7 +4615,12 @@ fn parse_subshell(iter: &mut Lexer) -> Result<Command, ParseError> {
     }
 
     let body = parse_subshell_sequence(iter)?;
-    maybe_wrap_redirects(Command::Subshell { body: Box::new(body) }, iter)
+    maybe_wrap_redirects(
+        Command::Subshell {
+            body: Box::new(body),
+        },
+        iter,
+    )
 }
 
 /// Parses a sequence of commands terminated by `)`.  Mirrors
@@ -4006,7 +4680,11 @@ fn parse_subshell_sequence(iter: &mut Lexer) -> Result<Sequence, ParseError> {
                 // whole body as a backgrounded sequence.
                 if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
                     iter.next_kind()?; // consume `)`
-                    return Ok(Sequence { first, rest, background: true });
+                    return Ok(Sequence {
+                        first,
+                        rest,
+                        background: true,
+                    });
                 }
                 if iter.peek_kind()?.is_none() {
                     return Err(ParseError::UnterminatedSubshell);
@@ -4032,7 +4710,11 @@ fn parse_subshell_sequence(iter: &mut Lexer) -> Result<Sequence, ParseError> {
         }
     }
 
-    Ok(Sequence { first, rest, background: false })
+    Ok(Sequence {
+        first,
+        rest,
+        background: false,
+    })
 }
 
 /// Shared tail of both funcdef forms (mirrors `command.rs`'s
@@ -4049,7 +4731,10 @@ fn finish_function_body(name: String, iter: &mut Lexer) -> Result<Command, Parse
     if !crate::command::is_function_body_shape(&body) {
         return Err(ParseError::FunctionBody);
     }
-    Ok(Command::FunctionDef { name, body: Box::new(body) })
+    Ok(Command::FunctionDef {
+        name,
+        body: Box::new(body),
+    })
 }
 
 /// `function NAME [()] compound` (mirrors `command.rs`'s
@@ -4058,16 +4743,22 @@ fn finish_function_body(name: String, iter: &mut Lexer) -> Result<Command, Parse
 /// Word-lexer never emitted.
 fn parse_function_keyword_def(iter: &mut Lexer) -> Result<Command, ParseError> {
     consume_command_word(iter)?; // consume the `function` keyword word
-    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+        iter.next_kind()?;
+    }
     // Name: a single valid identifier word.
     let name_word = consume_command_word(iter)?;
-    let name = crate::command::valid_function_name_text(&name_word)
-        .ok_or(ParseError::FunctionName)?;
+    let name =
+        crate::command::valid_function_name_text(&name_word).ok_or(ParseError::FunctionName)?;
     // Optional `()` (blanks may sit between name/`(`/`)` in the atom stream).
-    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+        iter.next_kind()?;
+    }
     if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
         iter.next_kind()?; // `(`
-        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+            iter.next_kind()?;
+        }
         match iter.next_kind()? {
             Some(TokenKind::Op(Operator::RParen)) => {}
             _ => return Err(ParseError::FunctionBody),
@@ -4080,10 +4771,12 @@ fn parse_function_keyword_def(iter: &mut Lexer) -> Result<Command, ParseError> {
 /// consumed the name (`name_word`) and confirmed the next non-`Blank` token is
 /// `Op(LParen)`. Skips atom-stream `Blank`s inside `( )`.
 fn parse_function_def(name_word: Word, iter: &mut Lexer) -> Result<Command, ParseError> {
-    let name = crate::command::valid_function_name_text(&name_word)
-        .ok_or(ParseError::FunctionName)?;
+    let name =
+        crate::command::valid_function_name_text(&name_word).ok_or(ParseError::FunctionName)?;
     iter.next_kind()?; // `(`
-    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+        iter.next_kind()?;
+    }
     match iter.next_kind()? {
         Some(TokenKind::Op(Operator::RParen)) => {}
         _ => return Err(ParseError::FunctionBody),
@@ -4102,7 +4795,9 @@ fn parse_function_def(name_word: Word, iter: &mut Lexer) -> Result<Command, Pars
 /// that position without being consumed by anything else.
 fn skip_test_ws(iter: &mut Lexer) -> Result<(), ParseError> {
     loop {
-        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+            iter.next_kind()?;
+        }
         if matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
             skip_test_newlines(iter)?;
             continue;
@@ -4121,7 +4816,9 @@ fn skip_test_ws(iter: &mut Lexer) -> Result<(), ParseError> {
 /// where the oracle calls `skip_test_newlines` (after `[[`, the `||`/`&&`
 /// loops, before `]]`).
 fn skip_test_blanks(iter: &mut Lexer) -> Result<(), ParseError> {
-    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+        iter.next_kind()?;
+    }
     Ok(())
 }
 
@@ -4130,7 +4827,10 @@ fn skip_test_blanks(iter: &mut Lexer) -> Result<(), ParseError> {
 /// `parse_word_command` (the atom stream has `Lit` atoms, not pre-lexed `Word`
 /// tokens). `=~` is DEFERRED to a later iteration (returns `UnsupportedCommand`
 /// without pulling the regex RHS — see `parse_test_atom` below).
-fn parse_double_bracket(iter: &mut Lexer, inline_assignments: Vec<Assignment>) -> Result<Command, ParseError> {
+fn parse_double_bracket(
+    iter: &mut Lexer,
+    inline_assignments: Vec<Assignment>,
+) -> Result<Command, ParseError> {
     iter.next_kind()?; // consume `[[`
     skip_test_ws(iter)?;
     if iter.peek_kind()?.and_then(keyword_of_consumed) == Some(Keyword::DoubleBracketClose) {
@@ -4145,7 +4845,10 @@ fn parse_double_bracket(iter: &mut Lexer, inline_assignments: Vec<Assignment>) -
         Some(tok) if keyword_of_consumed(&tok) == Some(Keyword::DoubleBracketClose) => {}
         _ => return Err(ParseError::UnterminatedDoubleBracket),
     }
-    Ok(Command::DoubleBracket { expr: Box::new(expr), inline_assignments })
+    Ok(Command::DoubleBracket {
+        expr: Box::new(expr),
+        inline_assignments,
+    })
 }
 
 /// Lowest precedence: `||`.
@@ -4288,11 +4991,24 @@ fn parse_pattern_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
 fn next_is_test_binary_operator_atom(iter: &mut Lexer) -> Result<bool, ParseError> {
     Ok(match iter.peek_kind()? {
         Some(TokenKind::Op(Operator::RedirIn)) | Some(TokenKind::Op(Operator::RedirOut)) => true,
-        Some(TokenKind::Lit { text, quoted: false }) => {
+        Some(TokenKind::Lit {
+            text,
+            quoted: false,
+        }) => {
             let in_set = matches!(
                 text.as_str(),
-                "==" | "=" | "!=" | "=~" | "-eq" | "-ne" | "-lt" | "-gt"
-                    | "-le" | "-ge" | "-nt" | "-ot" | "-ef"
+                "==" | "="
+                    | "!="
+                    | "=~"
+                    | "-eq"
+                    | "-ne"
+                    | "-lt"
+                    | "-gt"
+                    | "-le"
+                    | "-ge"
+                    | "-nt"
+                    | "-ot"
+                    | "-ef"
             );
             // (b) the operator word must END here: the next atom is a word
             // boundary, not a glued continuation (`Lit`/`DollarName`/`Var`/
@@ -4319,8 +5035,10 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
     }
     // Present terminator with nothing before it → empty body.
     match iter.peek_kind()? {
-        Some(tok) if keyword_of_consumed(tok) == Some(Keyword::DoubleBracketClose)
-            || matches!(tok, TokenKind::Op(Operator::RParen)) => {
+        Some(tok)
+            if keyword_of_consumed(tok) == Some(Keyword::DoubleBracketClose)
+                || matches!(tok, TokenKind::Op(Operator::RParen)) =>
+        {
             return Err(ParseError::EmptyDoubleBracket);
         }
         _ => {}
@@ -4361,13 +5079,32 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
     // would wrongly glue an operator on the next line (`[[ a\n== b ]]`).
     skip_test_blanks(iter)?;
     if !next_is_test_binary_operator_atom(iter)? {
-        return Ok(TestExpr::Unary { op: TestUnaryOp::StringNonEmpty, operand: lhs });
+        return Ok(TestExpr::Unary {
+            op: TestUnaryOp::StringNonEmpty,
+            operand: lhs,
+        });
     }
 
     // Consume the operator.
     match iter.peek_kind()? {
-        Some(TokenKind::Op(Operator::RedirIn)) => { iter.next_kind()?; let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringLt, lhs, rhs }) }
-        Some(TokenKind::Op(Operator::RedirOut)) => { iter.next_kind()?; let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringGt, lhs, rhs }) }
+        Some(TokenKind::Op(Operator::RedirIn)) => {
+            iter.next_kind()?;
+            let rhs = next_test_word_atom(iter)?;
+            Ok(TestExpr::Binary {
+                op: TestBinaryOp::StringLt,
+                lhs,
+                rhs,
+            })
+        }
+        Some(TokenKind::Op(Operator::RedirOut)) => {
+            iter.next_kind()?;
+            let rhs = next_test_word_atom(iter)?;
+            Ok(TestExpr::Binary {
+                op: TestBinaryOp::StringGt,
+                lhs,
+                rhs,
+            })
+        }
         _ => {
             let op_word = parse_word_command(iter, false)?;
             let op_text = match word_literal_text(&op_word) {
@@ -4375,8 +5112,22 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
                 None => return Err(ParseError::TestExprBadOperator(format!("{op_word:?}"))),
             };
             match op_text.as_str() {
-                "==" | "=" => { let rhs = parse_pattern_operand(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringEq, lhs, rhs }) }
-                "!=" => { let rhs = parse_pattern_operand(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringNe, lhs, rhs }) }
+                "==" | "=" => {
+                    let rhs = parse_pattern_operand(iter)?;
+                    Ok(TestExpr::Binary {
+                        op: TestBinaryOp::StringEq,
+                        lhs,
+                        rhs,
+                    })
+                }
+                "!=" => {
+                    let rhs = parse_pattern_operand(iter)?;
+                    Ok(TestExpr::Binary {
+                        op: TestBinaryOp::StringNe,
+                        lhs,
+                        rhs,
+                    })
+                }
                 "=~" => {
                     let pattern = parse_regex_operand(iter)?;
                     // The oracle lexes the regex operand EAGERLY as one Word, then
@@ -4391,17 +5142,94 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
                     }
                     Ok(TestExpr::Regex { lhs, pattern })
                 }
-                "<" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringLt, lhs, rhs }) }
-                ">" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringGt, lhs, rhs }) }
-                "-eq" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntEq, lhs, rhs }) }
-                "-ne" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntNe, lhs, rhs }) }
-                "-lt" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntLt, lhs, rhs }) }
-                "-gt" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntGt, lhs, rhs }) }
-                "-le" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntLe, lhs, rhs }) }
-                "-ge" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntGe, lhs, rhs }) }
-                "-nt" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::NewerThan, lhs, rhs }) }
-                "-ot" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::OlderThan, lhs, rhs }) }
-                "-ef" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::SameFile, lhs, rhs }) }
+                "<" => {
+                    let rhs = next_test_word_atom(iter)?;
+                    Ok(TestExpr::Binary {
+                        op: TestBinaryOp::StringLt,
+                        lhs,
+                        rhs,
+                    })
+                }
+                ">" => {
+                    let rhs = next_test_word_atom(iter)?;
+                    Ok(TestExpr::Binary {
+                        op: TestBinaryOp::StringGt,
+                        lhs,
+                        rhs,
+                    })
+                }
+                "-eq" => {
+                    let rhs = next_test_word_atom(iter)?;
+                    Ok(TestExpr::Binary {
+                        op: TestBinaryOp::IntEq,
+                        lhs,
+                        rhs,
+                    })
+                }
+                "-ne" => {
+                    let rhs = next_test_word_atom(iter)?;
+                    Ok(TestExpr::Binary {
+                        op: TestBinaryOp::IntNe,
+                        lhs,
+                        rhs,
+                    })
+                }
+                "-lt" => {
+                    let rhs = next_test_word_atom(iter)?;
+                    Ok(TestExpr::Binary {
+                        op: TestBinaryOp::IntLt,
+                        lhs,
+                        rhs,
+                    })
+                }
+                "-gt" => {
+                    let rhs = next_test_word_atom(iter)?;
+                    Ok(TestExpr::Binary {
+                        op: TestBinaryOp::IntGt,
+                        lhs,
+                        rhs,
+                    })
+                }
+                "-le" => {
+                    let rhs = next_test_word_atom(iter)?;
+                    Ok(TestExpr::Binary {
+                        op: TestBinaryOp::IntLe,
+                        lhs,
+                        rhs,
+                    })
+                }
+                "-ge" => {
+                    let rhs = next_test_word_atom(iter)?;
+                    Ok(TestExpr::Binary {
+                        op: TestBinaryOp::IntGe,
+                        lhs,
+                        rhs,
+                    })
+                }
+                "-nt" => {
+                    let rhs = next_test_word_atom(iter)?;
+                    Ok(TestExpr::Binary {
+                        op: TestBinaryOp::NewerThan,
+                        lhs,
+                        rhs,
+                    })
+                }
+                "-ot" => {
+                    let rhs = next_test_word_atom(iter)?;
+                    Ok(TestExpr::Binary {
+                        op: TestBinaryOp::OlderThan,
+                        lhs,
+                        rhs,
+                    })
+                }
+                "-ef" => {
+                    let rhs = next_test_word_atom(iter)?;
+                    Ok(TestExpr::Binary {
+                        op: TestBinaryOp::SameFile,
+                        lhs,
+                        rhs,
+                    })
+                }
                 other => Err(ParseError::TestExprBadOperator(other.to_string())),
             }
         }
@@ -4411,17 +5239,16 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::ParseError;
     use crate::lexer::{
         HISTORY_PRUNE_THRESHOLD, Lexer, LexerOptions, Mode, ParamOpKind, SubstKind, TokenKind,
         Word, WordPart,
     };
-    use crate::command::ParseError;
 
     // ── Differential helpers ─────────────────────────────────────────────────
     //
     // THE PRODUCTION LEXER IS THE ORACLE.  When `new_part` ≠ `old_part`, fix
     // the new path to match — never weaken or skip the comparison.
-
 
     /// Build the expected `WordPart` using the NEW parser-driven path.
     fn new_part(s: &str, quoted: bool) -> WordPart {
@@ -4443,9 +5270,15 @@ mod tests {
     #[test]
     fn scaffolding_types_exist() {
         let _ = TokenKind::ParamOpen { quoted: false };
-        let _ = TokenKind::Lit { text: "x".into(), quoted: false };
+        let _ = TokenKind::Lit {
+            text: "x".into(),
+            quoted: false,
+        };
         let _ = ParamOpKind::Substitute(SubstKind::All);
-        let _ = Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false };
+        let _ = Mode::ParamWordOperand {
+            in_dquote: false,
+            enclosing_dquote: false,
+        };
         let _ = ParseError::UnsupportedExpansion;
     }
 
@@ -4493,9 +5326,16 @@ mod tests {
     #[test]
     fn diff_removal_and_case() {
         for s in [
-            "${x#p}", "${x##p}", "${x%p}", "${x%%p}",
-            "${x^p}", "${x^^}", "${x,p}", "${x,,}",
-            "${x#$a}", "${x##${p}}",
+            "${x#p}",
+            "${x##p}",
+            "${x%p}",
+            "${x%%p}",
+            "${x^p}",
+            "${x^^}",
+            "${x,p}",
+            "${x,,}",
+            "${x#$a}",
+            "${x##${p}}",
         ] {
             diff_ok(s);
         }
@@ -4504,8 +5344,14 @@ mod tests {
     #[test]
     fn diff_substitute() {
         for s in [
-            "${x/p/r}", "${x//p/r}", "${x/#p/r}", "${x/%p/r}",
-            "${x/p}", "${x//p}", "${x/$a/$b}", "${x/p/}",
+            "${x/p/r}",
+            "${x//p/r}",
+            "${x/#p/r}",
+            "${x/%p/r}",
+            "${x/p}",
+            "${x//p}",
+            "${x/$a/$b}",
+            "${x/p/}",
         ] {
             diff_ok(s);
         }
@@ -4513,9 +5359,7 @@ mod tests {
 
     #[test]
     fn diff_substring() {
-        for s in [
-            "${x:1}", "${x:1:2}", "${x:$o}", "${x:$o:$l}", "${x: -1}",
-        ] {
+        for s in ["${x:1}", "${x:1:2}", "${x:$o}", "${x:$o:$l}", "${x: -1}"] {
             diff_ok(s);
         }
     }
@@ -4523,8 +5367,8 @@ mod tests {
     #[test]
     fn diff_transform() {
         for s in [
-            "${x@Q}", "${x@P}", "${x@U}", "${x@L}", "${x@u}",
-            "${x@E}", "${x@A}", "${x@K}", "${x@k}", "${x@a}",
+            "${x@Q}", "${x@P}", "${x@U}", "${x@L}", "${x@u}", "${x@E}", "${x@A}", "${x@K}",
+            "${x@k}", "${x@a}",
         ] {
             diff_ok(s);
         }
@@ -4539,8 +5383,7 @@ mod tests {
         // limitation; fixing it requires the head mode to emit a distinct marker
         // for `*`/`@` in indirect-prefix context.  Deferred to a follow-up task.
         for s in [
-            "${!x}", "${!x[@]}", "${!x[*]}",
-            "${@}", "${*}", "${#}", "${?}", "${$}", "${!}", "${-}",
+            "${!x}", "${!x[@]}", "${!x[*]}", "${@}", "${*}", "${#}", "${?}", "${$}", "${!}", "${-}",
         ] {
             diff_ok(s);
         }
@@ -4553,7 +5396,7 @@ mod tests {
         // stream for `${x@}` identical to `${x}`.  The parser cannot distinguish
         // them without a dedicated bad-subst atom from the head mode.
         // Deferred to a T2/T3 head-mode fix.
-        let _ = new_part("${}", false);   // badsubst ${{}} parses (no panic)
+        let _ = new_part("${}", false); // badsubst ${{}} parses (no panic)
         let _ = new_part("${x:}", false); // badsubst ${{x:}} parses (no panic)
     }
 
@@ -4628,18 +5471,36 @@ mod tests {
     fn t6_ast_simple_command() {
         let c = t6_first("echo hi");
         let e = t6_exec(&c);
-        assert_eq!(e.program, Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]));
-        assert_eq!(e.args, vec![Word(vec![WordPart::Literal { text: "hi".into(), quoted: false }])]);
+        assert_eq!(
+            e.program,
+            Word(vec![WordPart::Literal {
+                text: "echo".into(),
+                quoted: false
+            }])
+        );
+        assert_eq!(
+            e.args,
+            vec![Word(vec![WordPart::Literal {
+                text: "hi".into(),
+                quoted: false
+            }])]
+        );
     }
 
     #[test]
     fn t6_ast_pipeline_and_negation() {
         match t6_first("a | b") {
-            Command::Pipeline(p) => { assert!(!p.negate); assert_eq!(p.commands.len(), 2); }
+            Command::Pipeline(p) => {
+                assert!(!p.negate);
+                assert_eq!(p.commands.len(), 2);
+            }
             o => panic!("{o:?}"),
         }
         match t6_first("! a") {
-            Command::Pipeline(p) => { assert!(p.negate); assert_eq!(p.commands.len(), 1); }
+            Command::Pipeline(p) => {
+                assert!(p.negate);
+                assert_eq!(p.commands.len(), 1);
+            }
             o => panic!("{o:?}"),
         }
     }
@@ -4670,10 +5531,22 @@ mod tests {
         assert!(matches!(t6_first("while x; do y; done"), Command::While(_)));
         // `until` reuses the While variant (with the loop sense flipped internally).
         assert!(matches!(t6_first("until x; do y; done"), Command::While(_)));
-        assert!(matches!(t6_first("for i in a b; do :; done"), Command::For(_)));
-        assert!(matches!(t6_first("select n in a; do :; done"), Command::Select(_)));
-        assert!(matches!(t6_first("case x in a) y;; esac"), Command::Case(_)));
-        assert!(matches!(t6_first("for ((i=0;i<3;i++)); do :; done"), Command::ArithFor(_)));
+        assert!(matches!(
+            t6_first("for i in a b; do :; done"),
+            Command::For(_)
+        ));
+        assert!(matches!(
+            t6_first("select n in a; do :; done"),
+            Command::Select(_)
+        ));
+        assert!(matches!(
+            t6_first("case x in a) y;; esac"),
+            Command::Case(_)
+        ));
+        assert!(matches!(
+            t6_first("for ((i=0;i<3;i++)); do :; done"),
+            Command::ArithFor(_)
+        ));
         assert!(matches!(t6_first("(( 1+2 ))"), Command::Arith(_)));
     }
 
@@ -4741,9 +5614,18 @@ mod tests {
 
     #[test]
     fn t6_ast_function_defs_and_coproc() {
-        assert!(matches!(t6_first("f() { :; }"), Command::FunctionDef { .. }));
-        assert!(matches!(t6_first("function g { :; }"), Command::FunctionDef { .. }));
-        assert!(matches!(t6_first("coproc c { :; }"), Command::Coproc { .. }));
+        assert!(matches!(
+            t6_first("f() { :; }"),
+            Command::FunctionDef { .. }
+        ));
+        assert!(matches!(
+            t6_first("function g { :; }"),
+            Command::FunctionDef { .. }
+        ));
+        assert!(matches!(
+            t6_first("coproc c { :; }"),
+            Command::Coproc { .. }
+        ));
     }
 
     #[test]
@@ -4752,8 +5634,15 @@ mod tests {
             Command::Pipeline(p) => match &p.commands[0] {
                 Command::Simple(SimpleCommand::Assign(assigns, _)) => {
                     assert_eq!(assigns.len(), 1);
-                    assert!(assigns[0].value.0.iter().any(|wp| matches!(wp, WordPart::ArrayLiteral(_))),
-                        "expected an ArrayLiteral WordPart: {:?}", assigns[0].value);
+                    assert!(
+                        assigns[0]
+                            .value
+                            .0
+                            .iter()
+                            .any(|wp| matches!(wp, WordPart::ArrayLiteral(_))),
+                        "expected an ArrayLiteral WordPart: {:?}",
+                        assigns[0].value
+                    );
                 }
                 o => panic!("{o:?}"),
             },
@@ -4765,11 +5654,22 @@ mod tests {
     fn t6_ast_word_part_nesting() {
         // `$(…)` and `` `…` `` → CommandSub; `$((…))` → Arith.
         let cs = t6_exec(&t6_first("echo $(x)")).args[0].0.clone();
-        assert!(cs.iter().any(|wp| matches!(wp, WordPart::CommandSub { .. })), "{cs:?}");
+        assert!(
+            cs.iter()
+                .any(|wp| matches!(wp, WordPart::CommandSub { .. })),
+            "{cs:?}"
+        );
         let bt = t6_exec(&t6_first("echo `x`")).args[0].0.clone();
-        assert!(bt.iter().any(|wp| matches!(wp, WordPart::CommandSub { .. })), "{bt:?}");
+        assert!(
+            bt.iter()
+                .any(|wp| matches!(wp, WordPart::CommandSub { .. })),
+            "{bt:?}"
+        );
         let ar = t6_exec(&t6_first("echo $((1+2))")).args[0].0.clone();
-        assert!(ar.iter().any(|wp| matches!(wp, WordPart::Arith { .. })), "{ar:?}");
+        assert!(
+            ar.iter().any(|wp| matches!(wp, WordPart::Arith { .. })),
+            "{ar:?}"
+        );
     }
 
     // G1/v270: a `$(…)`/`$((…))`/`` `…` `` inside a `"…"` span within a `${…}`
@@ -4782,8 +5682,9 @@ mod tests {
         fn expansion_quoted(parts: &[WordPart]) -> bool {
             for wp in parts {
                 match wp {
-                    WordPart::CommandSub { quoted, .. }
-                    | WordPart::Arith { quoted, .. } => return *quoted,
+                    WordPart::CommandSub { quoted, .. } | WordPart::Arith { quoted, .. } => {
+                        return *quoted;
+                    }
                     _ => {}
                 }
             }
@@ -4792,10 +5693,13 @@ mod tests {
         // Dig the operand `Word`'s parts out of the sole ParamExpansion arg.
         fn operand_of(src: &str) -> Vec<WordPart> {
             let arg = t6_exec(&t6_first(src)).args[0].0.clone();
-            let pe = arg.into_iter().find_map(|wp| match wp {
-                WordPart::ParamExpansion { modifier, .. } => Some(modifier),
-                _ => None,
-            }).expect("ParamExpansion");
+            let pe = arg
+                .into_iter()
+                .find_map(|wp| match wp {
+                    WordPart::ParamExpansion { modifier, .. } => Some(modifier),
+                    _ => None,
+                })
+                .expect("ParamExpansion");
             let word = match pe {
                 ParamModifier::UseDefault { word, .. }
                 | ParamModifier::AssignDefault { word, .. }
@@ -4830,43 +5734,60 @@ mod tests {
     // `.unwrap()`ed to Ok before, `diff_err` inputs all errored before.
     /// In-scope: the parser accepts this input.
     fn diff_cmd(s: &str) {
-        assert!(new_seq(s).is_ok(), "expected Ok for {s:?}, got {:?}", new_seq(s));
+        assert!(
+            new_seq(s).is_ok(),
+            "expected Ok for {s:?}, got {:?}",
+            new_seq(s)
+        );
     }
     /// Error: the parser rejects this input.
     fn diff_err(s: &str) {
-        assert!(new_seq(s).is_err(), "expected Err for {s:?}, got {:?}", new_seq(s));
+        assert!(
+            new_seq(s).is_err(),
+            "expected Err for {s:?}, got {:?}",
+            new_seq(s)
+        );
     }
 
     // ── v264 alias differential harness ─────────────────────────────────────
 
     fn new_seq_al(s: &str, pairs: &[(&str, &str)]) -> Result<Option<Sequence>, ParseError> {
         let mut al = std::collections::HashMap::new();
-        for (k, v) in pairs { al.insert(k.to_string(), v.to_string()); }
+        for (k, v) in pairs {
+            al.insert(k.to_string(), v.to_string());
+        }
         let mut lx = Lexer::new_live_atoms(s, &al, LexerOptions::default());
         super::parse_sequence(&mut lx)
     }
     fn diff_al(s: &str, pairs: &[(&str, &str)]) {
-        assert!(new_seq_al(s, pairs).is_ok(), "expected Ok for {s:?} with {pairs:?}, got {:?}", new_seq_al(s, pairs));
+        assert!(
+            new_seq_al(s, pairs).is_ok(),
+            "expected Ok for {s:?} with {pairs:?}, got {:?}",
+            new_seq_al(s, pairs)
+        );
     }
 
     #[test]
     fn atoms_alias_expansion_matches_oracle() {
-        diff_al("foo", &[("foo", "echo hi")]);                       // basic
-        diff_al("foo bar", &[("foo", "echo")]);                      // alias + arg
+        diff_al("foo", &[("foo", "echo hi")]); // basic
+        diff_al("foo bar", &[("foo", "echo")]); // alias + arg
         // alias→keyword: `x`→`if`, so `x true` becomes the INCOMPLETE `if true`.
-        assert!(new_seq_al("x true", &[("x", "if")]).is_err(),
-            "alias→`if` keyword makes `if true` incomplete: {:?}", new_seq_al("x true", &[("x", "if")]));
+        assert!(
+            new_seq_al("x true", &[("x", "if")]).is_err(),
+            "alias→`if` keyword makes `if true` incomplete: {:?}",
+            new_seq_al("x true", &[("x", "if")])
+        );
         diff_al("a c", &[("a", "b "), ("b", "echo"), ("c", "hello")]); // trailing-blank chains to arg
-        diff_al("a hi", &[("a", "b "), ("b", "echo")]);              // trailing-blank, arg not alias
-        diff_al("a c", &[("a", "echo"), ("c", "hello")]);            // NO trailing blank: arg NOT expanded
+        diff_al("a hi", &[("a", "b "), ("b", "echo")]); // trailing-blank, arg not alias
+        diff_al("a c", &[("a", "echo"), ("c", "hello")]); // NO trailing blank: arg NOT expanded
         diff_al("a x y", &[("a", "echo "), ("x", "X"), ("y", "Y")]); // trailing-blank stops at 2nd arg
-        diff_al("ls /dev/null", &[("ls", "ls -a")]);                 // recursion guard
-        diff_al("greet", &[("greet", "echo hi")]);                   // simple
-        diff_al("printf x", &[("printf", "echo ALIAS")]);            // unquoted expands
-        diff_al("'printf' x", &[("printf", "echo ALIAS")]);          // quoted does NOT expand
+        diff_al("ls /dev/null", &[("ls", "ls -a")]); // recursion guard
+        diff_al("greet", &[("greet", "echo hi")]); // simple
+        diff_al("printf x", &[("printf", "echo ALIAS")]); // unquoted expands
+        diff_al("'printf' x", &[("printf", "echo ALIAS")]); // quoted does NOT expand
         diff_al("foo | bar", &[("foo", "echo hi"), ("bar", "cat")]); // pipeline stages both expand
-        diff_al("notanalias", &[("foo", "echo")]);                   // non-alias unchanged
-        diff_al("foo$x", &[("foo", "echo")]);                        // glued expansion: NOT a bare name → no expand
+        diff_al("notanalias", &[("foo", "echo")]); // non-alias unchanged
+        diff_al("foo$x", &[("foo", "echo")]); // glued expansion: NOT a bare name → no expand
     }
 
     #[test]
@@ -4876,7 +5797,7 @@ mod tests {
         diff_cmd("echo a{1,2,3}z");
         diff_cmd("echo {1..4}");
         diff_cmd("cp x{,.bak}");
-        diff_cmd("{echo,ls} x");                 // program word expands
+        diff_cmd("{echo,ls} x"); // program word expands
         diff_cmd("for i in {1..3}; do echo $i; done");
         // must NOT expand / stay literal (oracle parity):
         diff_cmd("echo \"{a,b}\"");
@@ -4898,14 +5819,18 @@ mod tests {
         // correct behavior and PIN the divergence rather than reproduce the
         // oracle's bug. Auto-resolves in the atom's favor when the oracle scanner
         // is deleted at the flip.
-        assert!(new_seq("case x in {a,b}) echo m;; esac").is_ok(),
+        assert!(
+            new_seq("case x in {a,b}) echo m;; esac").is_ok(),
             "atom parses `case … {{a,b}} …` literally (bash-correct); was a PINNED \
              divergence vs the now-deleted oracle (which brace-expanded + errored). atom={:?}",
-            new_seq("case x in {a,b}) echo m;; esac"));
-        assert!(new_seq("[[ {a,b} == x ]] && echo y || echo n").is_ok(),
+            new_seq("case x in {a,b}) echo m;; esac")
+        );
+        assert!(
+            new_seq("[[ {a,b} == x ]] && echo y || echo n").is_ok(),
             "atom parses `[[ {{a,b}} == x ]]` literally (bash-correct); was a PINNED \
              divergence vs the now-deleted oracle (which brace-expanded + errored). atom={:?}",
-            new_seq("[[ {a,b} == x ]] && echo y || echo n"));
+            new_seq("[[ {a,b} == x ]] && echo y || echo n")
+        );
         // sanity: the NON-comma brace form (which does not expand) IS oracle-parity
         // in these positions, confirming the divergence is brace-expansion-driven.
         diff_cmd("case x in {a}) echo m;; esac");
@@ -4914,8 +5839,8 @@ mod tests {
         diff_cmd("echo a$(true)#b");
         diff_cmd("echo $(true)#b");
         diff_cmd("echo $(echo X)~root");
-        diff_cmd("echo $(echo X) #comment");     // spaced: # IS a comment — stays correct
-        diff_cmd("(echo a); echo b");            // subshell close must still arm word-start
+        diff_cmd("echo $(echo X) #comment"); // spaced: # IS a comment — stays correct
+        diff_cmd("(echo a); echo b"); // subshell close must still arm word-start
     }
 
     #[test]
@@ -4924,17 +5849,17 @@ mod tests {
         diff_cmd(r#"x1=not; echo "${$'x1'}""#);
         diff_cmd(r#"ab=Z; echo "${a$'b'}""#);
         diff_cmd(r#"x=notOK; x1=not; echo "${x#${$'x1'%$'t'}}""#);
-        diff_cmd(r#"x=foo; echo "${x#$'f'}""#);   // ANSI-C in operand
+        diff_cmd(r#"x=foo; echo "${x#$'f'}""#); // ANSI-C in operand
         diff_cmd(r#"x=aXb; echo "${x#$'a'}""#);
         // M-156 gate + invalid names → bad-subst:
         diff_cmd(r#"echo "${'x1'}""#);
         diff_cmd(r#"echo "${"x1"}""#);
-        diff_cmd(r#"echo ${$'x1'}"#);             // decoded name UNQUOTED → oracle's call
+        diff_cmd(r#"echo ${$'x1'}"#); // decoded name UNQUOTED → oracle's call
         // (3) prefix-name expansion:
         diff_cmd("echo ${!_Q*}");
         diff_cmd("echo ${!_Q@}");
         diff_cmd("echo ${!NOSUCHPFX_ZZ*}");
-        diff_cmd("echo ${!x@Q}");                 // transform on indirect, NOT prefix
+        diff_cmd("echo ${!x@Q}"); // transform on indirect, NOT prefix
         // (4) bad-subst forms:
         diff_cmd("echo ${$x}");
         diff_cmd("echo ${V@}");
@@ -4942,9 +5867,12 @@ mod tests {
         // regression guards — these must stay UNCHANGED:
         diff_cmd("echo ${x}");
         diff_cmd("echo ${#x}");
-        diff_cmd("echo ${!x}");                   // plain indirect
-        diff_cmd("echo ${x@Q}");                  // valid transform
-        diff_cmd("echo ${@}"); diff_cmd("echo ${*}"); diff_cmd("echo ${$}"); diff_cmd("echo ${-}");
+        diff_cmd("echo ${!x}"); // plain indirect
+        diff_cmd("echo ${x@Q}"); // valid transform
+        diff_cmd("echo ${@}");
+        diff_cmd("echo ${*}");
+        diff_cmd("echo ${$}");
+        diff_cmd("echo ${-}");
         diff_cmd("echo ${x:-y}");
     }
 
@@ -4954,12 +5882,12 @@ mod tests {
     fn atoms_plain_words() {
         diff_cmd("echo");
         diff_cmd("echo hi");
-        diff_cmd("echo   hi    there");     // multiple blanks collapse
-        diff_cmd("  echo hi  ");            // leading/trailing blanks
-        diff_cmd("echo 'a b' \"c d\" e");   // quoted runs stay one word
-        diff_cmd("echo a'b'c\"d\"");        // glued quotes = one word
-        diff_cmd("echo a\\ b");             // escaped space = one word
-        diff_cmd("echo $'x\\ty'");          // $'…' ANSI-C
+        diff_cmd("echo   hi    there"); // multiple blanks collapse
+        diff_cmd("  echo hi  "); // leading/trailing blanks
+        diff_cmd("echo 'a b' \"c d\" e"); // quoted runs stay one word
+        diff_cmd("echo a'b'c\"d\""); // glued quotes = one word
+        diff_cmd("echo a\\ b"); // escaped space = one word
+        diff_cmd("echo $'x\\ty'"); // $'…' ANSI-C
     }
 
     #[test]
@@ -4967,7 +5895,7 @@ mod tests {
         diff_cmd("echo a\\");
         diff_cmd("echo \\");
         diff_cmd("echo ab\\");
-        diff_cmd("echo a\\ b");   // escaped space mid-word stays Quoted{Backslash} — must still match
+        diff_cmd("echo a\\ b"); // escaped space mid-word stays Quoted{Backslash} — must still match
         diff_cmd("echo a b\\");
     }
 
@@ -5000,7 +5928,7 @@ mod tests {
         diff_cmd("echo \"a$\"");
         diff_cmd("echo \"$'x'\"");
         // merges that MUST still work (regression guard for the accumulator)
-        diff_cmd("echo a\\");        // trailing backslash folds into preceding literal
+        diff_cmd("echo a\\"); // trailing backslash folds into preceding literal
         diff_cmd("echo ab\\");
         diff_cmd("echo a b\\");
     }
@@ -5016,12 +5944,12 @@ mod tests {
         diff_cmd("a[$i]=v");
         diff_cmd("x=$y\"z\"");
         diff_cmd("PATH=/bin:/usr/bin cmd arg");
-        diff_cmd("x=");                  // empty value
-        diff_cmd("a[i]+=v");             // subscript append
-        diff_cmd("x=~/foo");             // assignment-value tilde
-        diff_cmd("x=a:~/b:~/c");         // tilde after unquoted ':'
+        diff_cmd("x="); // empty value
+        diff_cmd("a[i]+=v"); // subscript append
+        diff_cmd("x=~/foo"); // assignment-value tilde
+        diff_cmd("x=a:~/b:~/c"); // tilde after unquoted ':'
         diff_cmd("PATH=~/bin:/usr/bin"); // value-start tilde + literal
-        diff_cmd("cmd x=1 arg");         // prefix assignment before argv
+        diff_cmd("cmd x=1 arg"); // prefix assignment before argv
     }
 
     #[test]
@@ -5036,8 +5964,8 @@ mod tests {
         diff_cmd("a[${y}]");
         diff_cmd("a[$x]y");
         diff_cmd("pre a[$i] post");
-        diff_cmd("a[$x");            // unclosed
-        diff_cmd("ls [abc]*");        // standalone glob (no identifier) — still literal
+        diff_cmd("a[$x"); // unclosed
+        diff_cmd("ls [abc]*"); // standalone glob (no identifier) — still literal
         diff_cmd("echo a[b]");
         // real assignments must STILL work
         diff_cmd("a[0]=v");
@@ -5051,27 +5979,62 @@ mod tests {
     fn atoms_structure() {
         for s in [
             // pipelines / and-or / separators
-            "a | b | c", "a && b || c", "a; b; c", "a &", "a&&b", "a||b", "a|b",
+            "a | b | c",
+            "a && b || c",
+            "a; b; c",
+            "a &",
+            "a&&b",
+            "a||b",
+            "a|b",
             // redirects
-            "echo hi > out", "echo hi >> out 2>&1", "cat < in", "cat <> f",
-            "3< in 4> out cmd", "{fd}> out cmd", "cmd 2>&1 >file", "cmd >&2",
-            "echo a >| f", "echo a &> f", "echo a &>> f", "ls</dev/null",
+            "echo hi > out",
+            "echo hi >> out 2>&1",
+            "cat < in",
+            "cat <> f",
+            "3< in 4> out cmd",
+            "{fd}> out cmd",
+            "cmd 2>&1 >file",
+            "cmd >&2",
+            "echo a >| f",
+            "echo a &> f",
+            "echo a &>> f",
+            "ls</dev/null",
             // comments
-            "echo a  # trailing comment", "# whole line comment", "a#b",
+            "echo a  # trailing comment",
+            "# whole line comment",
+            "a#b",
             // line continuations
-            "echo a \\\n  b", "a\\\n&&\\\nb",
+            "echo a \\\n  b",
+            "a\\\n&&\\\nb",
             // separators glued / spaced
-            "echo a;", "echo a ;b", "a| b |c",
+            "echo a;",
+            "echo a ;b",
+            "a| b |c",
             // adversarial extensions
-            "3>out", "{fd}>out cmd", "2>&1", "1>&2", "cmd 3>&1 4>&2",
-            "a>b", "x=2>out", "a3>out", "echo>out",           // fd-prefix boundaries
-            "cmd</in>out", "echo hi>>log 2>>err",             // glued redirects
-            "a  ;  b  &&  c", "a|&b",                          // spaced ops + |& desugar
-            "echo '|' \"&&\" \\;",                             // quoted/escaped metachars stay literal
-            "x=1 y=2 cmd >o", ">o", "<i >o",                   // assignments + bare redirects
-            "echo a# still one word", "a#b>c",                 // mid-word # then redirect
-            "echo\ta\tb", "a\r b",                             // tab / CR whitespace
-        ] { diff_cmd(s); }
+            "3>out",
+            "{fd}>out cmd",
+            "2>&1",
+            "1>&2",
+            "cmd 3>&1 4>&2",
+            "a>b",
+            "x=2>out",
+            "a3>out",
+            "echo>out", // fd-prefix boundaries
+            "cmd</in>out",
+            "echo hi>>log 2>>err", // glued redirects
+            "a  ;  b  &&  c",
+            "a|&b",                // spaced ops + |& desugar
+            "echo '|' \"&&\" \\;", // quoted/escaped metachars stay literal
+            "x=1 y=2 cmd >o",
+            ">o",
+            "<i >o", // assignments + bare redirects
+            "echo a# still one word",
+            "a#b>c", // mid-word # then redirect
+            "echo\ta\tb",
+            "a\r b", // tab / CR whitespace
+        ] {
+            diff_cmd(s);
+        }
     }
 
     // v247 T6 tests: in-scope compounds on the atom path
@@ -5084,18 +6047,20 @@ mod tests {
             "until false; do echo a; done",
             "for i in a b c; do echo $i; done",
             "for i in $list; do :; done",
-            "for i; do echo $i; done",                     // no `in` list
+            "for i; do echo $i; done", // no `in` list
             "case $x in a) echo a;; b|c) echo bc;; *) echo d;; esac",
-            "case $x in (a) echo a;; esac",                // parenthesized pattern
+            "case $x in (a) echo a;; esac", // parenthesized pattern
             "select x in a b; do echo $x; break; done",
             "( cd /tmp && ls )",
             "{ echo a; echo b; }",
-            "if true; then echo a; fi | wc -l",            // compound in a pipeline
+            "if true; then echo a; fi | wc -l", // compound in a pipeline
             "for i in a b; do if $i; then echo y; fi; done", // nested compounds
-            "{echo",                                        // NOT a brace group — literal word
-            "iffy --opt",                                   // NOT a keyword
-            "echo if then fi",                              // keywords as args (mid-command) stay literal
-        ] { diff_cmd(s); }
+            "{echo",                            // NOT a brace group — literal word
+            "iffy --opt",                       // NOT a keyword
+            "echo if then fi",                  // keywords as args (mid-command) stay literal
+        ] {
+            diff_cmd(s);
+        }
     }
     #[test]
     fn atoms_compounds_deferred() {
@@ -5116,9 +6081,33 @@ mod tests {
     #[test]
     fn atoms_blank_boundaries() {
         // C1: bang after connectors
-        for s in ["foo && ! bar", "a && ! b", "a || ! b", "a; ! b", "foo &&   ! bar", "! a", "!a", "a && b"] { diff_cmd(s); }
+        for s in [
+            "foo && ! bar",
+            "a && ! b",
+            "a || ! b",
+            "a; ! b",
+            "foo &&   ! bar",
+            "! a",
+            "!a",
+            "a && b",
+        ] {
+            diff_cmd(s);
+        }
         // C2: leading/trailing/only blanks + blank/comment lines at boundaries
-        for s in ["   ", "\t", " ", "  \n  ", "   # indented", " #c", "a; ", "echo hi;  ", "a; #c", "", "\n", "  \n\n  "] {
+        for s in [
+            "   ",
+            "\t",
+            " ",
+            "  \n  ",
+            "   # indented",
+            " #c",
+            "a; ",
+            "echo hi;  ",
+            "a; #c",
+            "",
+            "\n",
+            "  \n\n  ",
+        ] {
             assert!(new_seq(s).is_ok(), "boundary case {s:?}: {:?}", new_seq(s));
         }
     }
@@ -5126,10 +6115,10 @@ mod tests {
     fn atoms_procsub_core() {
         diff_cmd("cat <(echo hi)");
         diff_cmd("tee >(cat)");
-        diff_cmd("echo <(a) >(b)");        // multiple, both dirs
+        diff_cmd("echo <(a) >(b)"); // multiple, both dirs
         diff_cmd("diff <(sort x) <(sort y)");
-        diff_cmd("x<(y)");                  // glued to leading literal
-        diff_cmd("wc < <(sort f)");         // procsub as a redirect TARGET
+        diff_cmd("x<(y)"); // glued to leading literal
+        diff_cmd("wc < <(sort f)"); // procsub as a redirect TARGET
         diff_cmd("sort > >(uniq)");
     }
 
@@ -5158,7 +6147,7 @@ mod tests {
         diff_cmd("cat <( f() { :; } )");
         // adjacency with other word parts
         diff_cmd("echo pre$(c)<(d)post");
-        diff_cmd("cat <(a)<(b)");            // two procsubs glued into one word
+        diff_cmd("cat <(a)<(b)"); // two procsubs glued into one word
         // empty body
         diff_cmd("cat <()");
         diff_cmd("tee >()");
@@ -5179,7 +6168,11 @@ mod tests {
         // `UnexpectedToken` (command.rs's generic "stray `(` where a word was
         // expected" outcome; see e.g. the `w_tok("hi"), Op(LParen)` case at
         // command.rs ~4556). So this is error-parity, not a `diff_cmd` case.
-        assert!(new_seq("echo \\<(x)").is_err(), "escaped `<(` error: {:?}", new_seq("echo \\<(x)"));
+        assert!(
+            new_seq("echo \\<(x)").is_err(),
+            "escaped `<(` error: {:?}",
+            new_seq("echo \\<(x)")
+        );
     }
 
     #[test]
@@ -5204,7 +6197,10 @@ mod tests {
         // atom path (incremental live lexer) rejects the same input at PARSE
         // time. Both REJECT; assert parity of rejection (mirrors
         // `atoms_error_parity`'s `echo $(`/`echo ${` treatment).
-        assert!(new_seq("cat <(").is_err(), "atom path must reject unterminated `cat <(`");
+        assert!(
+            new_seq("cat <(").is_err(),
+            "atom path must reject unterminated `cat <(`"
+        );
 
         // `[[ … ]]` inside a procsub body is NO LONGER deferred — v253 T1
         // implements `[[ … ]]` everywhere `parse_command` is reached, including
@@ -5214,31 +6210,30 @@ mod tests {
 
     // ── v252 T1: positional array literals ───────────────────────────────────
 
-
     // ── v252 merge-gate fix: `\<NL>` line continuation is GLUE, not a
     // separator, when it abuts element text with no surrounding whitespace.
     #[test]
     fn atoms_array_literal_line_continuation() {
-        diff_cmd("a=(1\\\n2)");           // glued: one element `12`
-        diff_cmd("a=(1 \\\n2)");          // space then continuation
-        diff_cmd("a=(1\\\n 2)");          // continuation then space
-        diff_cmd("a=(\\\n1)");            // leading continuation
-        diff_cmd("a=(1\\\n2\\\n3)");      // multiple glued continuations
-        diff_cmd("a=([0]=a\\\nb)");       // glued continuation inside a subscripted value
-        diff_cmd("a=(a\\\nb c)");         // glued then a real (space) separator
+        diff_cmd("a=(1\\\n2)"); // glued: one element `12`
+        diff_cmd("a=(1 \\\n2)"); // space then continuation
+        diff_cmd("a=(1\\\n 2)"); // continuation then space
+        diff_cmd("a=(\\\n1)"); // leading continuation
+        diff_cmd("a=(1\\\n2\\\n3)"); // multiple glued continuations
+        diff_cmd("a=([0]=a\\\nb)"); // glued continuation inside a subscripted value
+        diff_cmd("a=(a\\\nb c)"); // glued then a real (space) separator
     }
 
     #[test]
     fn atoms_array_literal_positional() {
         diff_cmd("a=(1 2 3)");
-        diff_cmd("a=()");                 // empty
-        diff_cmd("a=(x)");                // single
-        diff_cmd("a=(  1   2  )");        // extra spaces
-        diff_cmd("arr+=(4 5)");           // append form
-        diff_cmd("a=(a|b c;d e<f)");      // |;&<> literal inside values
-        diff_cmd("a=({1..3})");           // brace-expanded bare element -> 1 2 3
-        diff_cmd("a=(x{a,b}y)");          // brace expansion with prefix/suffix
-        diff_err("pre a=(1 2) post");     // array literal in ARG position → bash rejects (rc 2)
+        diff_cmd("a=()"); // empty
+        diff_cmd("a=(x)"); // single
+        diff_cmd("a=(  1   2  )"); // extra spaces
+        diff_cmd("arr+=(4 5)"); // append form
+        diff_cmd("a=(a|b c;d e<f)"); // |;&<> literal inside values
+        diff_cmd("a=({1..3})"); // brace-expanded bare element -> 1 2 3
+        diff_cmd("a=(x{a,b}y)"); // brace expansion with prefix/suffix
+        diff_err("pre a=(1 2) post"); // array literal in ARG position → bash rejects (rc 2)
     }
 
     #[test]
@@ -5247,16 +6242,16 @@ mod tests {
         // assignment or as an argument to a declaration builtin; elsewhere bash
         // rejects the unexpected `(` (rc 2). Mirror that.
         diff_err("printf \"%s\\n\" -a a=(a b)"); // array1.sub line 1
-        diff_err("echo a=(x)");                  // plain command arg
-        diff_err("echo a+=(3)");                 // append form as arg
-        diff_err("foo a=(1) b=(2)");             // non-decl command, two array args
-        diff_err("command declare a=(1 2)");     // `command` is not a decl builtin
+        diff_err("echo a=(x)"); // plain command arg
+        diff_err("echo a+=(3)"); // append form as arg
+        diff_err("foo a=(1) b=(2)"); // non-decl command, two array args
+        diff_err("command declare a=(1 2)"); // `command` is not a decl builtin
         // Valid positions still parse:
-        diff_cmd("a=(1 2)");                     // sole leading assignment
-        diff_cmd("a=(1) b=(2)");                 // consecutive leading assignments
-        diff_cmd("x=1 a=(1 2)");                 // scalar + array leading prefix
-        diff_cmd("declare -a a=(1 2)");          // declaration builtin argument
-        diff_cmd("declare a=(1 2) b=(3 4)");     // two array args to declare
+        diff_cmd("a=(1 2)"); // sole leading assignment
+        diff_cmd("a=(1) b=(2)"); // consecutive leading assignments
+        diff_cmd("x=1 a=(1 2)"); // scalar + array leading prefix
+        diff_cmd("declare -a a=(1 2)"); // declaration builtin argument
+        diff_cmd("declare a=(1 2) b=(3 4)"); // two array args to declare
         diff_cmd("local a=(1 2)");
         diff_cmd("export a=(1 2)");
         diff_cmd("readonly a=(1 2)");
@@ -5264,38 +6259,38 @@ mod tests {
         diff_cmd("alias a=(1 2)");
         diff_cmd("eval a=(1 2)");
         diff_cmd("let a=(1 2)");
-        diff_cmd("x=1 declare a=(1 2)");          // decl builtin after leading assign
+        diff_cmd("x=1 declare a=(1 2)"); // decl builtin after leading assign
         // Unaffected shapes: element assign, append scalar, quoted `=(`.
         diff_cmd("a[0]=x");
-        diff_cmd("a+=(3)");                       // leading append array
-        diff_cmd("echo \"a=(x)\"");               // quoted, not an array literal
+        diff_cmd("a+=(3)"); // leading append array
+        diff_cmd("echo \"a=(x)\""); // quoted, not an array literal
     }
 
     #[test]
     fn atoms_array_literal_subscripts() {
-        diff_cmd("a=([0]=x [1]=y)");             // explicit subscripts
-        diff_cmd("a=([2]=two 1 [0]=zero)");      // mixed positional + subscripted
-        diff_cmd("a=([i+1]=v)");                 // arithmetic subscript expr
-        diff_cmd("a=([k]={a,b})");               // subscripted: brace stays LITERAL (no expansion)
-        diff_cmd("m[k]=(1 2)");                  // name[sub]=(…) prefix form
-        diff_cmd("m[k]+=(3)");                   // name[sub]+=(…) prefix form
-        diff_cmd("a=([0]= [1]=y)");              // empty subscripted value
-        diff_cmd("a=([$i]=v [x]=$y)");           // expansion in subscript and value
-        diff_cmd("a=([0]=x[1]y)");               // `[` MID-value stays literal
+        diff_cmd("a=([0]=x [1]=y)"); // explicit subscripts
+        diff_cmd("a=([2]=two 1 [0]=zero)"); // mixed positional + subscripted
+        diff_cmd("a=([i+1]=v)"); // arithmetic subscript expr
+        diff_cmd("a=([k]={a,b})"); // subscripted: brace stays LITERAL (no expansion)
+        diff_cmd("m[k]=(1 2)"); // name[sub]=(…) prefix form
+        diff_cmd("m[k]+=(3)"); // name[sub]+=(…) prefix form
+        diff_cmd("a=([0]= [1]=y)"); // empty subscripted value
+        diff_cmd("a=([$i]=v [x]=$y)"); // expansion in subscript and value
+        diff_cmd("a=([0]=x[1]y)"); // `[` MID-value stays literal
     }
 
     #[test]
     fn atoms_array_literal_subscript_regressions() {
         // BUG 1 (regression of T1/T2): a `[` MID-value, AFTER a non-literal atom
         // that ended its own scan_step, must stay LITERAL — not open a subscript.
-        diff_cmd("a=($x[0])");                   // positional value $x[0]
-        diff_cmd("a=(pre$x[0]post)");            // positional, glued around `$x`
-        diff_cmd("a=([0]=$y[1]z)");              // subscripted value $y[1]z
-        diff_cmd("a=([0]=\"x\"[1]z)");           // subscripted value "x"[1]z (after a quote)
+        diff_cmd("a=($x[0])"); // positional value $x[0]
+        diff_cmd("a=(pre$x[0]post)"); // positional, glued around `$x`
+        diff_cmd("a=([0]=$y[1]z)"); // subscripted value $y[1]z
+        diff_cmd("a=([0]=\"x\"[1]z)"); // subscripted value "x"[1]z (after a quote)
         // BUG 2: a subscripted EMPTY value immediately before `)` → empty element,
         // not an UnexpectedToken error.
-        diff_cmd("a=([0]=)");                    // sole empty subscripted value
-        diff_cmd("a=([2]=two [0]=)");            // empty value as the LAST element
+        diff_cmd("a=([0]=)"); // sole empty subscripted value
+        diff_cmd("a=([2]=two [0]=)"); // empty value as the LAST element
     }
 
     #[test]
@@ -5319,19 +6314,31 @@ mod tests {
         };
         assert_eq!(elems.len(), 3);
         // [2]+=7 — subscripted, append.
-        assert!(elems[0].subscript.is_some() && elems[0].append, "[2]+=7 append: {:?}", elems[0]);
+        assert!(
+            elems[0].subscript.is_some() && elems[0].append,
+            "[2]+=7 append: {:?}",
+            elems[0]
+        );
         // [0]=x — subscripted, NOT append.
-        assert!(elems[1].subscript.is_some() && !elems[1].append, "[0]=x set: {:?}", elems[1]);
+        assert!(
+            elems[1].subscript.is_some() && !elems[1].append,
+            "[0]=x set: {:?}",
+            elems[1]
+        );
         // 9 — positional, never append.
-        assert!(elems[2].subscript.is_none() && !elems[2].append, "positional: {:?}", elems[2]);
+        assert!(
+            elems[2].subscript.is_none() && !elems[2].append,
+            "positional: {:?}",
+            elems[2]
+        );
     }
 
     #[test]
     fn atoms_array_literal_append_element_parses() {
-        diff_cmd("x=(1 2 [2]+=7 4)");        // the appendop.tests spelling
-        diff_cmd("a=([one]+=more)");          // assoc-style append element
-        diff_cmd("n=(5 [0]+=3)");             // numeric-append element
-        diff_cmd("a=([i+1]+=v)");             // arithmetic subscript + append
+        diff_cmd("x=(1 2 [2]+=7 4)"); // the appendop.tests spelling
+        diff_cmd("a=([one]+=more)"); // assoc-style append element
+        diff_cmd("n=(5 [0]+=3)"); // numeric-append element
+        diff_cmd("a=([i+1]+=v)"); // arithmetic subscript + append
         // `[i]` followed by `+` that is NOT `+=` is still the missing-`=` error.
         diff_err("a=([2]+7)");
     }
@@ -5361,27 +6368,42 @@ mod tests {
         // funcdef attempt and gets `FunctionName` parity (a multi-part /
         // non-Literal word is not a valid function name). Error-parity (both
         // sides `Err(FunctionName)`), not `diff_cmd` (which requires `Ok`).
-        assert!(new_seq("a+=(1)(2)").is_err(), "error parity for \"a+=(1)(2)\"");
-        assert!(new_seq("a[0]=(1)(2)").is_err(), "error parity for \"a[0]=(1)(2)\"");
-        assert!(matches!(new_seq("a+=(1)(2)"), Err(ParseError::FunctionName)),
-            "a+=(1)(2) → FunctionName, got {:?}", new_seq("a+=(1)(2)"));
-        assert!(matches!(new_seq("a[0]=(1)(2)"), Err(ParseError::FunctionName)),
-            "a[0]=(1)(2) → FunctionName, got {:?}", new_seq("a[0]=(1)(2)"));
+        assert!(
+            new_seq("a+=(1)(2)").is_err(),
+            "error parity for \"a+=(1)(2)\""
+        );
+        assert!(
+            new_seq("a[0]=(1)(2)").is_err(),
+            "error parity for \"a[0]=(1)(2)\""
+        );
+        assert!(
+            matches!(new_seq("a+=(1)(2)"), Err(ParseError::FunctionName)),
+            "a+=(1)(2) → FunctionName, got {:?}",
+            new_seq("a+=(1)(2)")
+        );
+        assert!(
+            matches!(new_seq("a[0]=(1)(2)"), Err(ParseError::FunctionName)),
+            "a[0]=(1)(2) → FunctionName, got {:?}",
+            new_seq("a[0]=(1)(2)")
+        );
         // Bonus reconciliation (same root cause): a single-part `AssignPrefix`
         // word (empty value) followed by `(` is NOT a valid function name on
         // the oracle either (`AssignPrefix` is not a `Literal`), so both give
         // `FunctionName` — unlike the v248-pinned single-`Literal` `a=b ()`
         // shape, which the oracle accepts as `FunctionDef` (still deferred).
-        assert!(new_seq("a+= (echo hi)").is_err(), "error parity for \"a+= (echo hi)\"");
+        assert!(
+            new_seq("a+= (echo hi)").is_err(),
+            "error parity for \"a+= (echo hi)\""
+        );
 
         // REGRESSION GUARD: ordinary append/subscript assignments (no following
         // second `(`) must still parse as normal assignment simple-commands —
         // the funcdef attempt must never be entered for these.
-        diff_cmd("a+=(1 2)");     // append array literal
-        diff_cmd("a+=(1)");       // append single-element array literal
-        diff_cmd("a[0]=(1 2)");   // subscripted array literal
-        diff_cmd("a[i]=x");       // subscripted SCALAR assignment
-        diff_cmd("a=(1 2)");      // plain (Literal-prefixed) array literal, unchanged
+        diff_cmd("a+=(1 2)"); // append array literal
+        diff_cmd("a+=(1)"); // append single-element array literal
+        diff_cmd("a[0]=(1 2)"); // subscripted array literal
+        diff_cmd("a[i]=x"); // subscripted SCALAR assignment
+        diff_cmd("a=(1 2)"); // plain (Literal-prefixed) array literal, unchanged
     }
 
     #[test]
@@ -5398,9 +6420,9 @@ mod tests {
 
     #[test]
     fn atoms_array_literal_corpus() {
-        diff_cmd("a=(${arr[@]} ${arr[*]})");        // array expansions as values
-        diff_cmd("a=(x=y z=w)");                     // `=`-containing values (NOT subscripts)
-        diff_cmd("a=(=leading)");                    // value starting with `=`
+        diff_cmd("a=(${arr[@]} ${arr[*]})"); // array expansions as values
+        diff_cmd("a=(x=y z=w)"); // `=`-containing values (NOT subscripts)
+        diff_cmd("a=(=leading)"); // value starting with `=`
         // `)(` — a `(` glued right after a CLOSED array literal is NOT array
         // glue (that only happens for the FIRST `(` immediately after `name=`/
         // `name+=`, captured as the zero-width `ArrayOpen` atom). The oracle
@@ -5417,11 +6439,14 @@ mod tests {
         // `atoms_function_assignment_name_divergence`), so a closed array
         // literal (and the `AssignPrefix`-led `a+=(..)`/`a[i]=(..)` shapes) now
         // falls through to the SAME `FunctionName` error as the oracle.
-        assert!(new_seq("a=(one)(two)").is_err(), "error parity for \"a=(one)(two)\"");
-        diff_cmd("a=(a)b");                          // text glued after the close paren
-        diff_err("cmd a=(1 2) b=(3 4)");             // array literals in ARG position (cmd not a decl builtin) → bash rejects (rc 2)
-        diff_cmd("a=(   )");                         // whitespace-only body == empty
-        diff_cmd("a=(\n)");                          // newline-only body == empty
+        assert!(
+            new_seq("a=(one)(two)").is_err(),
+            "error parity for \"a=(one)(two)\""
+        );
+        diff_cmd("a=(a)b"); // text glued after the close paren
+        diff_err("cmd a=(1 2) b=(3 4)"); // array literals in ARG position (cmd not a decl builtin) → bash rejects (rc 2)
+        diff_cmd("a=(   )"); // whitespace-only body == empty
+        diff_cmd("a=(\n)"); // newline-only body == empty
         // "nots a =(1 2)" — space before `=` means `a` and `=(1` are SEPARATE
         // words (`=(1` is not assignment-shaped, so no array literal is even
         // attempted); both paths reject the same way, but neither actually
@@ -5431,7 +6456,10 @@ mod tests {
         // operator tokens at word-start, which is unexpected in argument
         // position) — use error-PARITY, not `diff_cmd` (which requires `Ok`
         // on both sides).
-        assert!(new_seq("nots a =(1 2)").is_err(), "error parity for \"nots a =(1 2)\"");
+        assert!(
+            new_seq("nots a =(1 2)").is_err(),
+            "error parity for \"nots a =(1 2)\""
+        );
 
         // T2 carry-forward: `a=(x=(1 2) y)` — a NESTED array literal AS AN
         // ELEMENT VALUE. NOT a `diff_cmd`: the oracle's `scan_array_element_word`
@@ -5485,9 +6513,19 @@ mod tests {
         // Adversarial word-splitting / gluing across quotes, expansions, and
         // operators — the atom-assembled Word must match the oracle byte-for-byte.
         for s in [
-            "a\"b\"$c", "a\\ b", "x=$y\"z\"", "$a$b$c", "'a'\"b\"c$d",
-            "  a   b  ", "a>b", "a>>b<c", "echo \"$(echo $x)\"", "echo ${a[$i]}",
-        ] { diff_cmd(s); }
+            "a\"b\"$c",
+            "a\\ b",
+            "x=$y\"z\"",
+            "$a$b$c",
+            "'a'\"b\"c$d",
+            "  a   b  ",
+            "a>b",
+            "a>>b<c",
+            "echo \"$(echo $x)\"",
+            "echo ${a[$i]}",
+        ] {
+            diff_cmd(s);
+        }
     }
 
     #[test]
@@ -5506,8 +6544,11 @@ mod tests {
         // same inputs at PARSE time. Both REJECT — assert parity of rejection, not
         // of the error stage.
         for s in ["echo $(", "echo ${"] {
-            assert!(new_seq(s).is_err(),
-                "atom path must reject {s:?}, got {:?}", new_seq(s));
+            assert!(
+                new_seq(s).is_err(),
+                "atom path must reject {s:?}, got {:?}",
+                new_seq(s)
+            );
         }
     }
 
@@ -5554,8 +6595,11 @@ mod tests {
             "select i in <<a; do :; done",
             "case x in <<a) ;; esac",
         ] {
-            assert!(new_seq(s).is_err(),
-                "atom path must reject (not hang on) {s:?}, got {:?}", new_seq(s));
+            assert!(
+                new_seq(s).is_err(),
+                "atom path must reject (not hang on) {s:?}, got {:?}",
+                new_seq(s)
+            );
         }
     }
 
@@ -5564,50 +6608,54 @@ mod tests {
     fn atoms_function_keyword_form() {
         diff_cmd("function f { :; }");
         diff_cmd("function f() { :; }");
-        diff_cmd("function f ()  { :; }");        // spaced ()
+        diff_cmd("function f ()  { :; }"); // spaced ()
         diff_cmd("function greet { echo hi; }");
-        diff_cmd("function f\n{ :; }");           // newline before body
-        diff_cmd("function 1 { :; }");            // numeric name is valid (AST parity, not just Ok/Ok)
+        diff_cmd("function f\n{ :; }"); // newline before body
+        diff_cmd("function 1 { :; }"); // numeric name is valid (AST parity, not just Ok/Ok)
     }
 
     #[test]
     fn atoms_function_paren_form() {
         diff_cmd("f(){ :; }");
         diff_cmd("f() { :; }");
-        diff_cmd("f ()  { :; }");                 // spaced name/()
-        diff_cmd("f() ( a; b )");                  // subshell body
-        diff_cmd("f() if x; then y; fi");          // if body
-        diff_cmd("f() while x; do y; done");       // while body
+        diff_cmd("f ()  { :; }"); // spaced name/()
+        diff_cmd("f() ( a; b )"); // subshell body
+        diff_cmd("f() if x; then y; fi"); // if body
+        diff_cmd("f() while x; do y; done"); // while body
         diff_cmd("f() for i in a b; do echo $i; done");
         diff_cmd("f() case $x in a) echo a;; esac");
         diff_cmd("f() select x in a b; do echo $x; break; done");
-        diff_cmd("f() until x; do y; done");        // until body
-        diff_cmd("f() { :; } >log");               // redirected body
+        diff_cmd("f() until x; do y; done"); // until body
+        diff_cmd("f() { :; } >log"); // redirected body
         diff_cmd("f() { :; } 2>&1");
-        diff_cmd("f() { g() { :; }; }");           // nested funcdef
-        diff_cmd("if true; then f() { :; }; fi");  // funcdef inside a compound
-        diff_cmd("f() { :; } | cat");               // funcdef as a pipeline stage
-        diff_cmd("f() { :; }; g() { :; }");          // two funcdefs, ; separated
-        diff_cmd("true && f() { :; }");              // funcdef after a connector
+        diff_cmd("f() { g() { :; }; }"); // nested funcdef
+        diff_cmd("if true; then f() { :; }; fi"); // funcdef inside a compound
+        diff_cmd("f() { :; } | cat"); // funcdef as a pipeline stage
+        diff_cmd("f() { :; }; g() { :; }"); // two funcdefs, ; separated
+        diff_cmd("true && f() { :; }"); // funcdef after a connector
     }
     #[test]
     fn atoms_function_not_a_def() {
-        diff_cmd("f");                             // bare word = plain command
-        diff_cmd("echo function");                 // `function` mid-command = arg
-        diff_cmd("func --opt");                    // prefix of `function` = plain command (mark/rewind restores)
+        diff_cmd("f"); // bare word = plain command
+        diff_cmd("echo function"); // `function` mid-command = arg
+        diff_cmd("func --opt"); // prefix of `function` = plain command (mark/rewind restores)
     }
 
     #[test]
     fn atoms_function_defs_errors() {
         for s in [
-            "f() echo",          // non-compound body → FunctionBody
-            "function",          // no name → FunctionName
+            "f() echo",           // non-compound body → FunctionBody
+            "function",           // no name → FunctionName
             "function if { :; }", // reserved word as name → FunctionName
-            "f(",                // unterminated
-            "f()",               // `()` then EOF → UnterminatedFunction/FunctionBody
-            "f ( a )",           // `(` not followed by `)` → FunctionBody (NOT a command)
+            "f(",                 // unterminated
+            "f()",                // `()` then EOF → UnterminatedFunction/FunctionBody
+            "f ( a )",            // `(` not followed by `)` → FunctionBody (NOT a command)
         ] {
-            assert!(new_seq(s).is_err(), "funcdef error for {s:?}: {:?}", new_seq(s));
+            assert!(
+                new_seq(s).is_err(),
+                "funcdef error for {s:?}: {:?}",
+                new_seq(s)
+            );
         }
     }
 
@@ -5639,8 +6687,14 @@ mod tests {
         // bash itself rejects this as a syntax error, so the atom path (defer) is
         // arguably more correct. Pinned so the Stage-2 live-flip differential gate
         // knows about it. (If a future iteration reconciles this, update here.)
-        assert!(matches!(new_seq("a=b () { :; }"), Err(ParseError::UnsupportedCommand)),
-            "atom path defers `a=b () {{...}}`, got {:?}", new_seq("a=b () { :; }"));
+        assert!(
+            matches!(
+                new_seq("a=b () { :; }"),
+                Err(ParseError::UnsupportedCommand)
+            ),
+            "atom path defers `a=b () {{...}}`, got {:?}",
+            new_seq("a=b () { :; }")
+        );
         // (The now-deleted oracle ACCEPTED `a=b () { :; }`; the atom path's
         // deferral above is the documented, bash-aligned divergence.)
     }
@@ -5649,26 +6703,26 @@ mod tests {
     #[test]
     fn atoms_here_string_redirect() {
         diff_cmd("cat <<< hello");
-        diff_cmd("wc -l <<<foo");                 // glued, no space
-        diff_cmd("cat <<< \"$x\"");                // quoted expansion target
+        diff_cmd("wc -l <<<foo"); // glued, no space
+        diff_cmd("cat <<< \"$x\""); // quoted expansion target
         diff_cmd("cat <<< 'lit'");
-        diff_cmd("cat <<< $'a\\tb'");              // ANSI-C target
+        diff_cmd("cat <<< $'a\\tb'"); // ANSI-C target
         diff_cmd("cat <<< $var");
-        diff_cmd("cat <<< a b");                    // target is `a`; `b` is an arg
-        diff_cmd("cmd <<< x > out");                // here-string + file redirect, source order
-        diff_cmd("cmd 2>&1 <<< x");                 // fd-dup + here-string
-        diff_cmd("cmd <<< a <<< b");                // two here-strings, ordered list
-        diff_cmd("{ cat; } <<< x");                 // brace-group trailing here-string
-        diff_cmd("if true; then :; fi <<< x");       // if-compound trailing here-string
+        diff_cmd("cat <<< a b"); // target is `a`; `b` is an arg
+        diff_cmd("cmd <<< x > out"); // here-string + file redirect, source order
+        diff_cmd("cmd 2>&1 <<< x"); // fd-dup + here-string
+        diff_cmd("cmd <<< a <<< b"); // two here-strings, ordered list
+        diff_cmd("{ cat; } <<< x"); // brace-group trailing here-string
+        diff_cmd("if true; then :; fi <<< x"); // if-compound trailing here-string
     }
 
     #[test]
     fn atoms_here_string_leading() {
         diff_cmd("<<< word");
-        diff_cmd("<<<foo");                         // glued
+        diff_cmd("<<<foo"); // glued
         diff_cmd("<<< \"$x\"");
-        diff_cmd("<<< word > out");                 // leading here-string + file redirect
-        diff_cmd("<<< x | cat");                    // here-string stage in a pipeline
+        diff_cmd("<<< word > out"); // leading here-string + file redirect
+        diff_cmd("<<< x | cat"); // here-string stage in a pipeline
         // Determined by observation: the oracle accepts a leading `<<<` as the
         // first pipeline stage (falls through to parse_pipeline → parse_simple_stage
         // exactly like the atom path), so this is `diff_cmd` parity, not a divergence.
@@ -5679,7 +6733,7 @@ mod tests {
         // Determined by observation: `3<<<` lexes fine on the oracle's batch
         // tokenizer (no lexer-level panic) and both paths produce the identical
         // AST, so this is ordinary `diff_cmd` parity.
-        diff_cmd("3<<< word");                      // fd-prefixed here-string
+        diff_cmd("3<<< word"); // fd-prefixed here-string
     }
 
     #[test]
@@ -5690,7 +6744,11 @@ mod tests {
         // atom-path-only bucket needed (contrast `atoms_error_parity`'s
         // `echo $(`/`echo ${` split, which DOES need one).
         for s in ["cat <<<", "<<<", "cat <<< |", "cat <<< <", "cat <<< ;"] {
-            assert!(new_seq(s).is_err(), "here-string error for {s:?}: {:?}", new_seq(s));
+            assert!(
+                new_seq(s).is_err(),
+                "here-string error for {s:?}: {:?}",
+                new_seq(s)
+            );
         }
     }
 
@@ -5711,37 +6769,37 @@ mod tests {
         diff_cmd("cat <<EOF\nhello $x\nEOF\n");
         diff_cmd("cat <<EOF\n${y:-d} and $(echo hi)\nEOF\n");
         diff_cmd("cat <<EOF\n`echo bt` $((1+2))\nEOF\n");
-        diff_cmd("cat <<EOF\nlit \\$notvar \\` \\\\ end\nEOF\n");   // heredoc backslash rules
-        diff_cmd("cat <<EOF\na \\\nb\nEOF\n");                        // \<NL> line continuation
-        diff_cmd("cat <<EOF\n\"quotes\" 'stay' literal\nEOF\n");     // quotes literal in body
+        diff_cmd("cat <<EOF\nlit \\$notvar \\` \\\\ end\nEOF\n"); // heredoc backslash rules
+        diff_cmd("cat <<EOF\na \\\nb\nEOF\n"); // \<NL> line continuation
+        diff_cmd("cat <<EOF\n\"quotes\" 'stay' literal\nEOF\n"); // quotes literal in body
     }
 
     #[test]
     fn atoms_heredoc_expanding_more() {
-        diff_cmd("cat <<EOF\nplain text\nEOF\n");                    // plain, quoted:false content
-        diff_cmd("cat <<EOF\nEOF\n");                                 // empty expanding body
-        diff_cmd("cat <<EOF\n\nEOF\n");                               // single blank line
-        diff_cmd("cat <<EOF\n$x$y${z}\nEOF\n");                       // adjacent expansions
-        diff_cmd("cat <<EOF\n$1 $@ $? $#\nEOF\n");                    // specials
-        diff_cmd("cat <<-EOF\n\tindented $x\n\tEOF\n");               // <<- tab strip + expand
-        diff_cmd("cat <<EOF\nline one\nline two $x\nEOF\n");          // multi-line
-        diff_cmd("cat <<EOF\ntrailing $\nEOF\n");                     // lone $ at line end
-        diff_cmd("cat <<EOF && echo ok\nhi $x\nEOF\n");               // sequence continues
-        diff_cmd("cat <<EOF | wc -l\nhi $x\nEOF\n");                  // pipeline stage
-        diff_cmd("<<EOF\nx $y\nEOF\n");                                // leading expanding heredoc
+        diff_cmd("cat <<EOF\nplain text\nEOF\n"); // plain, quoted:false content
+        diff_cmd("cat <<EOF\nEOF\n"); // empty expanding body
+        diff_cmd("cat <<EOF\n\nEOF\n"); // single blank line
+        diff_cmd("cat <<EOF\n$x$y${z}\nEOF\n"); // adjacent expansions
+        diff_cmd("cat <<EOF\n$1 $@ $? $#\nEOF\n"); // specials
+        diff_cmd("cat <<-EOF\n\tindented $x\n\tEOF\n"); // <<- tab strip + expand
+        diff_cmd("cat <<EOF\nline one\nline two $x\nEOF\n"); // multi-line
+        diff_cmd("cat <<EOF\ntrailing $\nEOF\n"); // lone $ at line end
+        diff_cmd("cat <<EOF && echo ok\nhi $x\nEOF\n"); // sequence continues
+        diff_cmd("cat <<EOF | wc -l\nhi $x\nEOF\n"); // pipeline stage
+        diff_cmd("<<EOF\nx $y\nEOF\n"); // leading expanding heredoc
     }
 
     #[test]
     fn atoms_heredoc_expanding_edges() {
-        diff_cmd("cat <<EOF\nend \\$\nEOF\n");                        // escaped $ right before newline sep
-        diff_cmd("cat <<EOF\n\\$\\`\\\\\nEOF\n");                     // all three escapes, adjacent
-        diff_cmd("cat <<EOF\nx\\\nEOF\nEOF\n");                       // `x\` continues onto `EOF`, NOT delim
-        diff_cmd("cat <<EOF\n`echo $x`\nEOF\n");                      // var inside backtick in body
-        diff_cmd("cat <<EOF\n${x:-`echo hi`}\nEOF\n");                // backtick inside ${…} in body
-        diff_cmd("cat <<EOF\nouter $(echo $inner) tail\nEOF\n");      // nested $() with var
-        diff_cmd("cat <<'A' <<B\nlit $x\nA\nexp $y\nB\n");            // literal + expanding, ordered
-        diff_cmd("cat <<B <<'A'\nexp $y\nB\nlit $x\nA\n");            // expanding + literal, ordered
-        diff_cmd("cat <<EOF\na\\zb\nEOF\n");                          // lone backslash (ordinary) stays literal
+        diff_cmd("cat <<EOF\nend \\$\nEOF\n"); // escaped $ right before newline sep
+        diff_cmd("cat <<EOF\n\\$\\`\\\\\nEOF\n"); // all three escapes, adjacent
+        diff_cmd("cat <<EOF\nx\\\nEOF\nEOF\n"); // `x\` continues onto `EOF`, NOT delim
+        diff_cmd("cat <<EOF\n`echo $x`\nEOF\n"); // var inside backtick in body
+        diff_cmd("cat <<EOF\n${x:-`echo hi`}\nEOF\n"); // backtick inside ${…} in body
+        diff_cmd("cat <<EOF\nouter $(echo $inner) tail\nEOF\n"); // nested $() with var
+        diff_cmd("cat <<'A' <<B\nlit $x\nA\nexp $y\nB\n"); // literal + expanding, ordered
+        diff_cmd("cat <<B <<'A'\nexp $y\nB\nlit $x\nA\n"); // expanding + literal, ordered
+        diff_cmd("cat <<EOF\na\\zb\nEOF\n"); // lone backslash (ordinary) stays literal
     }
 
     #[test]
@@ -5752,12 +6810,12 @@ mod tests {
         // cursor by that whole span — consuming only one physical line would leak
         // the remainder as a spurious command. bash: `EO\<NL>F` joins to `EOF` =
         // the delimiter, body empty, then runs `echo after`.
-        diff_cmd("cat <<EOF\nEO\\\nF\necho after\n");        // `EO\<NL>F` == EOF (empty body)
-        diff_cmd("cat <<-EOF\n\tEO\\\nF\necho after\n");     // <<- variant: `\tEO\<NL>F` strips to EOF
+        diff_cmd("cat <<EOF\nEO\\\nF\necho after\n"); // `EO\<NL>F` == EOF (empty body)
+        diff_cmd("cat <<-EOF\n\tEO\\\nF\necho after\n"); // <<- variant: `\tEO\<NL>F` strips to EOF
         // Guard the other direction (no over-consumption): a continuation-joined
         // BODY line that is NOT the delimiter must stay a body line, with the real
         // `EOF` line still closing it and `echo after` following.
-        diff_cmd("cat <<EOF\nab\\\ncd\nEOF\necho after\n");  // `ab\<NL>cd` == abcd (body, not delim)
+        diff_cmd("cat <<EOF\nab\\\ncd\nEOF\necho after\n"); // `ab\<NL>cd` == abcd (body, not delim)
     }
 
     #[test]
@@ -5775,8 +6833,11 @@ mod tests {
         // an unclosed `$(` on its own line is an error there. This is an accepted
         // atom-vs-oracle divergence; the atom path is correct. Do NOT use `diff_cmd`.
         let s = "cat <<EOF\n$(echo hi\necho bye)\nEOF\n";
-        assert!(new_seq(s).is_ok(),
-            "atom path must parse multi-line $() in heredoc (matches bash): {:?}", new_seq(s));
+        assert!(
+            new_seq(s).is_ok(),
+            "atom path must parse multi-line $() in heredoc (matches bash): {:?}",
+            new_seq(s)
+        );
         // (The now-deleted oracle lexer diverged here — its line-local heredoc-body
         // scan errored on the split `$(`; the atom path parses it, matching bash.)
     }
@@ -5793,15 +6854,15 @@ mod tests {
     #[test]
     fn atoms_heredoc_in_word_fill() {
         // v260 CF1: a heredoc nested inside a Word is filled, not dropped.
-        diff_cmd("echo $(cat <<X\nhi\nX\n)");                 // arg command-sub
-        diff_cmd("x=$(cat <<X\nhi\nX\n)");                    // assignment RHS
-        diff_cmd("a=($(cat <<X\nhi\nX\n))");                  // array-literal element value
-        diff_cmd("echo ${y:-$(cat <<X\nhi\nX\n)}");           // param-expansion operand
-        diff_cmd("echo $(( $(cat <<X\n1\nX\n) + 2 ))");       // arith body
-        diff_cmd("echo `cat <<X\nhi\nX\n`");                  // backtick (→ CommandSub)
-        diff_cmd("echo \"$(cat <<X\nhi\nX\n)\"");             // inside a quoted span
-        diff_cmd("echo $(a <<X\nxx\nX\n)$(b <<Y\nyy\nY\n)");  // two Word-nested (queue order)
-        diff_cmd("FOO=$(cat <<X\nhi\nX\n) echo hi");          // inline assignment value
+        diff_cmd("echo $(cat <<X\nhi\nX\n)"); // arg command-sub
+        diff_cmd("x=$(cat <<X\nhi\nX\n)"); // assignment RHS
+        diff_cmd("a=($(cat <<X\nhi\nX\n))"); // array-literal element value
+        diff_cmd("echo ${y:-$(cat <<X\nhi\nX\n)}"); // param-expansion operand
+        diff_cmd("echo $(( $(cat <<X\n1\nX\n) + 2 ))"); // arith body
+        diff_cmd("echo `cat <<X\nhi\nX\n`"); // backtick (→ CommandSub)
+        diff_cmd("echo \"$(cat <<X\nhi\nX\n)\""); // inside a quoted span
+        diff_cmd("echo $(a <<X\nxx\nX\n)$(b <<Y\nyy\nY\n)"); // two Word-nested (queue order)
+        diff_cmd("FOO=$(cat <<X\nhi\nX\n) echo hi"); // inline assignment value
     }
 
     #[test]
@@ -5869,7 +6930,11 @@ mod tests {
         // Was an `assert_ne!` vs the (now-deleted) oracle documenting the
         // args-vs-redirects fill-order divergence; the atom path's order is now
         // simply production behavior. Smoke-level: it parses.
-        assert!(new_seq(s).is_ok(), "expected Ok for {s:?}, got {:?}", new_seq(s));
+        assert!(
+            new_seq(s).is_ok(),
+            "expected Ok for {s:?}, got {:?}",
+            new_seq(s)
+        );
         // Case 2 — an outer command's own heredoc redirect (`<<A`) combined with
         // a heredoc nested in a LATER redirect-TARGET word (`>$(f <<Y)`): the
         // nested Y emits first (inner-newline), but fill_redirects walks the
@@ -5880,7 +6945,11 @@ mod tests {
         let s2 = "echo <<A $(:) >$(f <<Y\nyy\nY\n)\naa\nA\n";
         // Was an `assert_ne!` vs the (now-deleted) oracle documenting the
         // redirect-list fill-order divergence; now just production behavior.
-        assert!(new_seq(s2).is_ok(), "expected Ok for {s2:?}, got {:?}", new_seq(s2));
+        assert!(
+            new_seq(s2).is_ok(),
+            "expected Ok for {s2:?}, got {:?}",
+            new_seq(s2)
+        );
     }
 
     #[test]
@@ -5889,10 +6958,10 @@ mod tests {
         // both interleavings, fill in correct source order (byte-identical to
         // the oracle — no pin needed; the lexer bridge collects nested-Word
         // bodies at the inner newline, before the outer line's redirect bodies).
-        diff_cmd("cat $(sh <<B\nbb\nB\n) <<A\naa\nA\n");            // Word then trailing redirect
-        diff_cmd("cat <<A $(sh <<B\nbb\nB\n)\naa\nA\n");            // redirect then Word (ex-"pin")
+        diff_cmd("cat $(sh <<B\nbb\nB\n) <<A\naa\nA\n"); // Word then trailing redirect
+        diff_cmd("cat <<A $(sh <<B\nbb\nB\n)\naa\nA\n"); // redirect then Word (ex-"pin")
         diff_cmd("cat <<A $(sh <<B\nbb\nB\n) <<C\naa\nA\ncc\nC\n"); // redirect, Word, redirect
-        diff_cmd("echo $(cat <<X\nxx\nX\n) <<A\naa\nA\n");          // Word then redirect (echo)
+        diff_cmd("echo $(cat <<X\nxx\nX\n) <<A\naa\nA\n"); // Word then redirect (echo)
         diff_cmd("cat <<A $(a <<B\nbb\nB\n)$(c <<D\ndd\nD\n)\naa\nA\n"); // redirect then two Words
         // Regressions: plain / multiple outer-redirect heredocs still fill in order.
         diff_cmd("cat <<A\naa\nA\n");
@@ -5905,10 +6974,10 @@ mod tests {
     #[test]
     fn atoms_heredoc_literal() {
         diff_cmd("cat <<'EOF'\nhello $x\nEOF\n");
-        diff_cmd("cat <<'EOF'\nEOF\n");                 // empty body
-        diff_cmd("cat <<-'EOF'\n\ttabbed\n\tEOF\n");     // <<- strip
-        diff_cmd("cat <<\"EOF\"\nline1\nline2\nEOF\n");  // double-quoted delim = literal
-        diff_cmd("<<'EOF'\nx\nEOF\n");                    // leading heredoc (empty-words cmd)
+        diff_cmd("cat <<'EOF'\nEOF\n"); // empty body
+        diff_cmd("cat <<-'EOF'\n\ttabbed\n\tEOF\n"); // <<- strip
+        diff_cmd("cat <<\"EOF\"\nline1\nline2\nEOF\n"); // double-quoted delim = literal
+        diff_cmd("<<'EOF'\nx\nEOF\n"); // leading heredoc (empty-words cmd)
     }
 
     #[test]
@@ -5917,11 +6986,11 @@ mod tests {
         // group after the delimiter line would make the parser choke on (or
         // hang trying to parse) whatever follows — guard every shape that
         // keeps parsing PAST a literal heredoc's body.
-        diff_cmd("cat <<'EOF'\nx\nEOF\necho done\n");         // ; -like newline connector
-        diff_cmd("cat <<'EOF'\nx\nEOF\necho a; echo b\n");    // more of the sequence after
-        diff_cmd("cat <<'EOF' && echo ok\nx\nEOF\n");         // && after a heredoc-bearing stage
-        diff_cmd("cat <<'EOF' | wc -l\nx\nEOF\n");            // heredoc stage in a pipeline
-        diff_cmd("cat <<'A' <<'B'\nfirst\nA\nsecond\nB\n");   // two heredocs, ordered bodies
+        diff_cmd("cat <<'EOF'\nx\nEOF\necho done\n"); // ; -like newline connector
+        diff_cmd("cat <<'EOF'\nx\nEOF\necho a; echo b\n"); // more of the sequence after
+        diff_cmd("cat <<'EOF' && echo ok\nx\nEOF\n"); // && after a heredoc-bearing stage
+        diff_cmd("cat <<'EOF' | wc -l\nx\nEOF\n"); // heredoc stage in a pipeline
+        diff_cmd("cat <<'A' <<'B'\nfirst\nA\nsecond\nB\n"); // two heredocs, ordered bodies
         diff_cmd("if cat <<'EOF'; then echo y; fi\nx\nEOF\n"); // heredoc in a compound's condition
         diff_cmd("for i in 1; do cat <<'EOF'; done\nx\nEOF\n"); // heredoc inside a loop body
     }
@@ -5930,20 +6999,20 @@ mod tests {
 
     #[test]
     fn atoms_heredoc_positions() {
-        diff_cmd("cat <<A <<B\nbodyA\nA\nbodyB\nB\n");            // stacked, order A then B
-        diff_cmd("a <<X | b <<Y\nx\nX\ny\nY\n");                   // across a pipeline
-        diff_cmd("{ cat <<EOF\nx\nEOF\n}\n");                      // heredoc in a brace group
-        diff_cmd("if true; then cat <<EOF\nx\nEOF\nfi\n");         // heredoc in an if body
-        diff_cmd("cat <<EOF >out arg\nx\nEOF\n");                  // interleaved with redirect + word
-        diff_cmd("cat <<A; echo hi\nbodyA\nA\n");                  // heredoc then `;` then command
+        diff_cmd("cat <<A <<B\nbodyA\nA\nbodyB\nB\n"); // stacked, order A then B
+        diff_cmd("a <<X | b <<Y\nx\nX\ny\nY\n"); // across a pipeline
+        diff_cmd("{ cat <<EOF\nx\nEOF\n}\n"); // heredoc in a brace group
+        diff_cmd("if true; then cat <<EOF\nx\nEOF\nfi\n"); // heredoc in an if body
+        diff_cmd("cat <<EOF >out arg\nx\nEOF\n"); // interleaved with redirect + word
+        diff_cmd("cat <<A; echo hi\nbodyA\nA\n"); // heredoc then `;` then command
     }
 
     #[test]
     fn atoms_heredoc_positions_compound_bodies() {
-        diff_cmd("while false; do cat <<EOF; done\nx\nEOF\n");     // heredoc in a while body
-        diff_cmd("for i in 1; do cat <<EOF; done\nx\nEOF\n");      // heredoc in a for body (expanding)
-        diff_cmd("case x in a) cat <<EOF;; esac\nx\nEOF\n");       // heredoc in a case body
-        diff_cmd("( cat <<EOF\nx\nEOF\n)\n");                      // heredoc in a subshell
+        diff_cmd("while false; do cat <<EOF; done\nx\nEOF\n"); // heredoc in a while body
+        diff_cmd("for i in 1; do cat <<EOF; done\nx\nEOF\n"); // heredoc in a for body (expanding)
+        diff_cmd("case x in a) cat <<EOF;; esac\nx\nEOF\n"); // heredoc in a case body
+        diff_cmd("( cat <<EOF\nx\nEOF\n)\n"); // heredoc in a subshell
     }
 
     #[test]
@@ -5956,7 +7025,7 @@ mod tests {
 
     #[test]
     fn atoms_heredoc_positions_misc() {
-        diff_cmd("cat 2>&1 <<EOF\nx\nEOF\n");                      // heredoc after another redirect
+        diff_cmd("cat 2>&1 <<EOF\nx\nEOF\n"); // heredoc after another redirect
         // Mixed literal + expanding, stacked: proves the per-heredoc expand
         // flag routes through the attach walk to the RIGHT redirect.
         diff_cmd("cat <<'A' <<B\n$lit\nA\n$exp\nB\n");
@@ -5970,7 +7039,10 @@ mod tests {
     // erroring `UnterminatedHeredoc`.
 
     fn new_seq_eof(s: &str) -> Result<Option<Sequence>, ParseError> {
-        let opts = LexerOptions { eof_closes_heredoc: true, ..Default::default() };
+        let opts = LexerOptions {
+            eof_closes_heredoc: true,
+            ..Default::default()
+        };
         let mut lx = Lexer::new_live_atoms(s, &Default::default(), opts);
         parse_sequence(&mut lx)
     }
@@ -6012,7 +7084,10 @@ mod tests {
         // Quoted delimiter → literal body collector; EOF closes it too.
         assert_eq!(heredoc_body_text("cat <<'EOF'\nhi"), "hi\n");
         // `<<-` strips leading tabs, EOF-closed.
-        assert_eq!(heredoc_body_text("cat <<-'EOF'\n\thi\n\tthere"), "hi\nthere\n");
+        assert_eq!(
+            heredoc_body_text("cat <<-'EOF'\n\thi\n\tthere"),
+            "hi\nthere\n"
+        );
     }
 
     #[test]
@@ -6081,21 +7156,26 @@ mod tests {
         // `atoms_error_parity`'s `echo $(`/`echo ${` split). Assert only that the
         // atom path rejects too, not error-payload equality.
         for s in ["cat <<EOF\nno close\n", "cat <<", "cat <<-\n"] {
-            assert!(new_seq(s).is_err(),
-                "atom path must reject unterminated/malformed heredoc {s:?}, got {:?}", new_seq(s));
+            assert!(
+                new_seq(s).is_err(),
+                "atom path must reject unterminated/malformed heredoc {s:?}, got {:?}",
+                new_seq(s)
+            );
         }
     }
 
     #[test]
     fn atoms_heredoc_adversarial() {
         for s in [
-            "cat <<EOF\nEOFX not a close\nEOF\n",         // delimiter as substring
-            "cat <<EOF\n  EOF\nEOF\n",                     // indented non-close (no <<-)
-            "cat <<-EOF\n\t\tEOF\n",                       // <<- tabbed close
-            "cat <<'E'\n$x `no` ${expand}\nE\n",           // literal: nothing expands
-            "cat <<EOF\n$1 $@ $? $#\nEOF\n",               // special params in expanding body
-            "cat <<EOF\n\\EOF\nEOF\n",                     // escaped-looking body line
-        ] { diff_cmd(s); }
+            "cat <<EOF\nEOFX not a close\nEOF\n", // delimiter as substring
+            "cat <<EOF\n  EOF\nEOF\n",            // indented non-close (no <<-)
+            "cat <<-EOF\n\t\tEOF\n",              // <<- tabbed close
+            "cat <<'E'\n$x `no` ${expand}\nE\n",  // literal: nothing expands
+            "cat <<EOF\n$1 $@ $? $#\nEOF\n",      // special params in expanding body
+            "cat <<EOF\n\\EOF\nEOF\n",            // escaped-looking body line
+        ] {
+            diff_cmd(s);
+        }
     }
 
     #[test]
@@ -6104,10 +7184,17 @@ mod tests {
         // leaves the body in the Lexer-owned queue (early-Err path does not
         // drain). A subsequent parse_sequence on the SAME Lexer must discard
         // that leaked body at entry, so the queue is empty afterward.
-        let mut lx = Lexer::new_live_atoms("cat <<E\nx\nE\n;;", &Default::default(), LexerOptions::default());
+        let mut lx = Lexer::new_live_atoms(
+            "cat <<E\nx\nE\n;;",
+            &Default::default(),
+            LexerOptions::default(),
+        );
         let first = parse_sequence(&mut lx); // collects the heredoc body, then `;;` → Err
-        assert!(first.is_err(), "expected UnexpectedToken on the `;;`, got {first:?}");
-        let _ = parse_sequence(&mut lx);     // entry-reset must drain the leaked body
+        assert!(
+            first.is_err(),
+            "expected UnexpectedToken on the `;;`, got {first:?}"
+        );
+        let _ = parse_sequence(&mut lx); // entry-reset must drain the leaked body
         assert!(
             lx.take_heredoc_bodies().is_empty(),
             "parse_sequence entry-reset should have drained the leaked heredoc body"
@@ -6122,14 +7209,14 @@ mod tests {
         diff_cmd("( a; b )");
         diff_cmd("( a | b )");
         diff_cmd("( a && b || c )");
-        diff_cmd("( a; b; )");             // trailing ;
-        diff_cmd("( (a) )");               // nested subshell
-        diff_cmd("( { a; } )");            // brace group inside subshell
-        diff_cmd("{ ( a ); }");            // subshell inside brace group
-        diff_cmd("( a ) >f");              // trailing redirect
-        diff_cmd("( a ) | b");             // subshell as pipeline stage
-        diff_err("()");                    // EmptySubshell parity
-        diff_err("( a");                   // unterminated parity
+        diff_cmd("( a; b; )"); // trailing ;
+        diff_cmd("( (a) )"); // nested subshell
+        diff_cmd("( { a; } )"); // brace group inside subshell
+        diff_cmd("{ ( a ); }"); // subshell inside brace group
+        diff_cmd("( a ) >f"); // trailing redirect
+        diff_cmd("( a ) | b"); // subshell as pipeline stage
+        diff_err("()"); // EmptySubshell parity
+        diff_err("( a"); // unterminated parity
     }
 
     /// G2 regression guard: the whitespace/newline-only-body fix is scoped to
@@ -6140,7 +7227,11 @@ mod tests {
     #[test]
     fn cmd_subshell_whitespace_only_still_errors() {
         for s in ["( )", "(  )", "(\n)", "(\t)"] {
-            assert!(new_seq(s).is_err(), "subshell {s:?} must still error, got {:?}", new_seq(s));
+            assert!(
+                new_seq(s).is_err(),
+                "subshell {s:?} must still error, got {:?}",
+                new_seq(s)
+            );
         }
     }
 
@@ -6152,13 +7243,13 @@ mod tests {
         diff_cmd("if x; then y; else z; fi");
         diff_cmd("if a; then b; elif c; then d; fi");
         diff_cmd("if a; then b; elif c; then d; else e; fi");
-        diff_cmd("if a; then b; elif c; then d; elif e; then f; fi");   // multi-elif
-        diff_cmd("if x; then if y; then z; fi; fi");                    // nested if
-        diff_cmd("if x; then a; b; c; fi");                             // multi-command body
-        diff_cmd("if x | y; then z; fi");                               // pipeline condition
-        diff_cmd("if x; then y; fi | cat");                             // if as pipeline stage
-        diff_cmd("if x; then y; fi >f");                               // trailing redirect
-        diff_err("if x; then y");                                       // UnterminatedIf parity
+        diff_cmd("if a; then b; elif c; then d; elif e; then f; fi"); // multi-elif
+        diff_cmd("if x; then if y; then z; fi; fi"); // nested if
+        diff_cmd("if x; then a; b; c; fi"); // multi-command body
+        diff_cmd("if x | y; then z; fi"); // pipeline condition
+        diff_cmd("if x; then y; fi | cat"); // if as pipeline stage
+        diff_cmd("if x; then y; fi >f"); // trailing redirect
+        diff_err("if x; then y"); // UnterminatedIf parity
     }
 
     // v243 T5 tests
@@ -6166,19 +7257,19 @@ mod tests {
     #[test]
     fn cmd_for_select() {
         diff_cmd("for i in a b c; do echo $i; done");
-        diff_cmd("for i; do x; done");               // no-`in`
-        diff_cmd("for i in; do x; done");            // empty in-list
-        diff_cmd("for i in a; do for j in b; do x; done; done");   // nested
+        diff_cmd("for i; do x; done"); // no-`in`
+        diff_cmd("for i in; do x; done"); // empty in-list
+        diff_cmd("for i in a; do for j in b; do x; done; done"); // nested
         diff_cmd("for i in a b; do if x; then y; fi; done");
-        diff_cmd("for i in a; do x; done | cat");    // as pipeline stage
-        diff_cmd("for i in a; do x; done 2>&1");     // trailing redirect
+        diff_cmd("for i in a; do x; done | cat"); // as pipeline stage
+        diff_cmd("for i in a; do x; done 2>&1"); // trailing redirect
         diff_cmd("select x in a b; do y; done");
-        diff_cmd("select x; do y; done");            // no-`in`
+        diff_cmd("select x; do y; done"); // no-`in`
         diff_cmd("select x in a b c; do echo $x; break; done");
         // `for ((…)) …` (ArithFor) is NO LONGER deferred — v256 T2 implements it
         // (see `atoms_arith_for`).
         diff_cmd("for ((i=0;i<3;i++)); do x; done");
-        diff_err("for i in a; do x");                // unterminated parity
+        diff_err("for i in a; do x"); // unterminated parity
     }
 
     // v243 T4 tests
@@ -6188,13 +7279,13 @@ mod tests {
         diff_cmd("while x; do y; done");
         diff_cmd("until x; do y; done");
         diff_cmd("while x; do a; b; done");
-        diff_cmd("while x | y; do z; done");                       // pipeline condition
-        diff_cmd("while x; do if y; then z; fi; done");            // nested if in body
-        diff_cmd("while x; do while y; do z; done; done");         // nested loop
-        diff_cmd("until x; do ( a ); done");                       // subshell in body
-        diff_cmd("while x; do y; done | cat");                     // as pipeline stage
-        diff_cmd("while x; do y; done <f");                        // trailing redirect
-        diff_err("while x; do y");                                  // UnterminatedLoop parity
+        diff_cmd("while x | y; do z; done"); // pipeline condition
+        diff_cmd("while x; do if y; then z; fi; done"); // nested if in body
+        diff_cmd("while x; do while y; do z; done; done"); // nested loop
+        diff_cmd("until x; do ( a ); done"); // subshell in body
+        diff_cmd("while x; do y; done | cat"); // as pipeline stage
+        diff_cmd("while x; do y; done <f"); // trailing redirect
+        diff_err("while x; do y"); // UnterminatedLoop parity
     }
 
     // v242 T2 tests
@@ -6205,8 +7296,8 @@ mod tests {
         diff_cmd("echo a");
         diff_cmd("echo a b c");
         diff_cmd("echo \"$x\" 'y' z");
-        assert_eq!(new_seq("").unwrap(), None);       // empty input
-        assert_eq!(new_seq("\n\n").unwrap(), None);   // only newlines
+        assert_eq!(new_seq("").unwrap(), None); // empty input
+        assert_eq!(new_seq("\n\n").unwrap(), None); // only newlines
     }
 
     #[test]
@@ -6231,13 +7322,13 @@ mod tests {
         diff_cmd("{ a; b; }");
         diff_cmd("{ a; b; c; }");
         diff_cmd("{ echo hi; }");
-        diff_cmd("{ { a; } }");            // nested
-        diff_cmd("{ a; } >f");             // trailing redirect -> Command::Redirected
+        diff_cmd("{ { a; } }"); // nested
+        diff_cmd("{ a; } >f"); // trailing redirect -> Command::Redirected
         diff_cmd("{ a; } >f 2>&1");
-        diff_cmd("{ a; } | cat");          // brace as pipeline stage
+        diff_cmd("{ a; } | cat"); // brace as pipeline stage
         diff_cmd("a | { b; }");
-        diff_cmd("{ a; }; { b; }");        // two brace groups in a sequence
-        diff_err("{ a");                   // UnterminatedBrace parity
+        diff_cmd("{ a; }; { b; }"); // two brace groups in a sequence
+        diff_err("{ a"); // UnterminatedBrace parity
     }
 
     // T3 tests
@@ -6246,11 +7337,11 @@ mod tests {
     fn cmd_assignments() {
         diff_cmd("A=1 cmd");
         diff_cmd("A=1 B=2 cmd x y");
-        diff_cmd("A=1");                 // bare assign -> SimpleCommand::Assign
-        diff_cmd("A=1 B=2");             // bare multi-assign
+        diff_cmd("A=1"); // bare assign -> SimpleCommand::Assign
+        diff_cmd("A=1 B=2"); // bare multi-assign
         diff_cmd("A=$x cmd");
-        diff_cmd("A+=v cmd");            // append
-        diff_cmd("arr[0]=v cmd");        // subscripted (AssignPrefix)
+        diff_cmd("A+=v cmd"); // append
+        diff_cmd("arr[0]=v cmd"); // subscripted (AssignPrefix)
         diff_cmd("PATH=/x:/y cmd");
     }
 
@@ -6272,16 +7363,16 @@ mod tests {
         diff_cmd("cmd <in");
         diff_cmd("cmd 2>err");
         diff_cmd("cmd >out 2>&1");
-        diff_cmd("cmd 2>&1 >out");       // order matters
-        diff_cmd(">out cmd");            // leading redirect
-        diff_cmd("cmd a >o b <i c");     // interleaved
-        diff_cmd("3>f cmd");             // RedirFd prefix
-        diff_cmd("cmd >|f");             // clobber
-        diff_cmd("cmd <>f");             // read-write
-        diff_cmd("cmd <&3");             // dup-in
-        diff_cmd("cmd &>f");             // and-redirect
-        diff_cmd("cmd >&2");             // dup-out to stderr
-        diff_cmd("cmd 2>&-");            // close fd 2
+        diff_cmd("cmd 2>&1 >out"); // order matters
+        diff_cmd(">out cmd"); // leading redirect
+        diff_cmd("cmd a >o b <i c"); // interleaved
+        diff_cmd("3>f cmd"); // RedirFd prefix
+        diff_cmd("cmd >|f"); // clobber
+        diff_cmd("cmd <>f"); // read-write
+        diff_cmd("cmd <&3"); // dup-in
+        diff_cmd("cmd &>f"); // and-redirect
+        diff_cmd("cmd >&2"); // dup-out to stderr
+        diff_cmd("cmd 2>&-"); // close fd 2
     }
 
     #[test]
@@ -6303,10 +7394,9 @@ mod tests {
         diff_cmd("echo x | grep y | wc -l");
         diff_cmd("A=1 cmd | other");
         diff_cmd("cmd >o | other");
-        diff_cmd("! ! a");                 // double-bang cancels (negate=false)
-        diff_cmd("!\ncmd");                // newline after `!` is skipped (M1: parse_command top skip_newlines)
+        diff_cmd("! ! a"); // double-bang cancels (negate=false)
+        diff_cmd("!\ncmd"); // newline after `!` is skipped (M1: parse_command top skip_newlines)
     }
-
 
     // T6 tests
 
@@ -6318,9 +7408,9 @@ mod tests {
         diff_cmd("x || y");
         diff_cmd("x && y || z");
         diff_cmd("a | b && c | d");
-        diff_cmd("p &");                  // trailing background
-        diff_cmd("p & q");                // & as separator (Connector::Amp)
-        diff_cmd("a\nb");                 // newline as connector (parse contract)
+        diff_cmd("p &"); // trailing background
+        diff_cmd("p & q"); // & as separator (Connector::Amp)
+        diff_cmd("a\nb"); // newline as connector (parse contract)
         diff_cmd("a; b &");
         diff_cmd("! a | b && c");
     }
@@ -6347,18 +7437,18 @@ mod tests {
     fn cmd_case() {
         diff_cmd("case $x in a) 1;; esac");
         diff_cmd("case $x in a) 1;; b) 2;; esac");
-        diff_cmd("case $x in a|b|c) 1;; esac");       // pattern list
-        diff_cmd("case $x in (a) 1;; esac");          // leading paren
-        diff_cmd("case x in a) ;; esac");             // empty body
-        diff_cmd("case x in a) 1;; *) 2;; esac");     // default
-        diff_cmd("case $x in a) 1;& b) 2;; esac");    // ;& fallthrough
-        diff_cmd("case $x in a) 1;;& b) 2;; esac");   // ;;& continue-match
-        diff_cmd("case $x in a) if y; then z; fi;; esac");  // compound in body
-        diff_cmd("case $x in a) case $y in b) c;; esac;; esac");  // nested case
-        diff_cmd("case $x in a) 1;; esac | cat");    // case as pipeline stage
-        diff_cmd("case $x in a) 1;; esac >f");        // trailing redirect
-        diff_cmd("for i in a; do case $i in q) x;; esac; done");  // case in for body
-        diff_err("case x in");                         // unterminated parity
+        diff_cmd("case $x in a|b|c) 1;; esac"); // pattern list
+        diff_cmd("case $x in (a) 1;; esac"); // leading paren
+        diff_cmd("case x in a) ;; esac"); // empty body
+        diff_cmd("case x in a) 1;; *) 2;; esac"); // default
+        diff_cmd("case $x in a) 1;& b) 2;; esac"); // ;& fallthrough
+        diff_cmd("case $x in a) 1;;& b) 2;; esac"); // ;;& continue-match
+        diff_cmd("case $x in a) if y; then z; fi;; esac"); // compound in body
+        diff_cmd("case $x in a) case $y in b) c;; esac;; esac"); // nested case
+        diff_cmd("case $x in a) 1;; esac | cat"); // case as pipeline stage
+        diff_cmd("case $x in a) 1;; esac >f"); // trailing redirect
+        diff_cmd("for i in a; do case $i in q) x;; esac; done"); // case in for body
+        diff_err("case x in"); // unterminated parity
     }
 
     // v243 T7 tests
@@ -6385,7 +7475,7 @@ mod tests {
         diff_cmd("((1+2))");
         diff_cmd("(( x = 5 ))");
         diff_cmd("(( x++ ))");
-        diff_cmd("(( $x + 1 ))");        // embedded expansion — wires parse_arith_body
+        diff_cmd("(( $x + 1 ))"); // embedded expansion — wires parse_arith_body
         // Primary bail → nested subshell backoff (depth-0 `)` not followed by `)`).
         diff_cmd("((cmd); c2)");
         // Spaced `( (` is NEVER arith — regression guard for the existing subshell path.
@@ -6398,17 +7488,17 @@ mod tests {
     #[test]
     fn atoms_arith_command_disambiguation() {
         // ── Close cleanly → Command::Arith ──────────────────────────────────
-        diff_cmd("(())");                // empty body → Arith(Word([]))
-        diff_cmd("(( ))");               // single-space body → Arith([Literal " "])
-        diff_cmd("(( (1+2) * 3 ))");     // inner grouping parens: depth-tracked, NOT a bail
-        diff_cmd("(( a[0] + 1 ))");      // subscript brackets are plain body text
+        diff_cmd("(())"); // empty body → Arith(Word([]))
+        diff_cmd("(( ))"); // single-space body → Arith([Literal " "])
+        diff_cmd("(( (1+2) * 3 ))"); // inner grouping parens: depth-tracked, NOT a bail
+        diff_cmd("(( a[0] + 1 ))"); // subscript brackets are plain body text
         diff_cmd("(( a + $b + ${c} ))"); // multiple embedded expansions
-        diff_cmd("(( 1+2 ))");           // exact string freed from the old deferral tests
-        diff_cmd("(( x + $y ))");        // exact string freed from the old deferral tests
+        diff_cmd("(( 1+2 ))"); // exact string freed from the old deferral tests
+        diff_cmd("(( x + $y ))"); // exact string freed from the old deferral tests
         // ── Bail → nested subshell (depth-0 `)` not followed by `)`) ─────────
-        diff_cmd("((echo hi) )");        // glued open, inner closes with a single `)`
-        diff_cmd("(( 3*4 ) )");          // glued open, SPACED close
-        diff_cmd("((a) && (b))");        // `)` after `a` at depth 0 not followed by `)`
+        diff_cmd("((echo hi) )"); // glued open, inner closes with a single `)`
+        diff_cmd("(( 3*4 ) )"); // glued open, SPACED close
+        diff_cmd("((a) && (b))"); // `)` after `a` at depth 0 not followed by `)`
         diff_cmd("((a); (b))");
         // ── Spaced `( (` → subshell (existing path; regression guards) ───────
         diff_cmd("( (echo hi) )");
@@ -6417,14 +7507,14 @@ mod tests {
 
     #[test]
     fn atoms_arith_command_composition() {
-        diff_cmd("(( 1 )) && echo hi");   // in an && list
-        diff_cmd("(( 1 )) || echo no");   // in an || list
-        diff_cmd("(( 1 )); echo done");   // in a `;` list
-        diff_cmd("(( 1+2 )) >out");       // trailing redirect → Redirected{ inner: Arith }
-        diff_cmd("(( 1 )) | cat");        // pipeline stage
-        diff_cmd("if (( x > 0 )); then y; fi");        // arith as an if-condition
-        diff_cmd("while (( i < 3 )); do x; done");     // arith as a while-condition
-        diff_cmd("for i in a; do (( n++ )); done");    // arith in a for body
+        diff_cmd("(( 1 )) && echo hi"); // in an && list
+        diff_cmd("(( 1 )) || echo no"); // in an || list
+        diff_cmd("(( 1 )); echo done"); // in a `;` list
+        diff_cmd("(( 1+2 )) >out"); // trailing redirect → Redirected{ inner: Arith }
+        diff_cmd("(( 1 )) | cat"); // pipeline stage
+        diff_cmd("if (( x > 0 )); then y; fi"); // arith as an if-condition
+        diff_cmd("while (( i < 3 )); do x; done"); // arith as a while-condition
+        diff_cmd("for i in a; do (( n++ )); done"); // arith in a for body
     }
 
     // v256: C-style for (( … ))
@@ -6432,25 +7522,25 @@ mod tests {
     fn atoms_arith_for() {
         // Well-formed → Command::ArithFor (byte-identical to the oracle).
         diff_cmd("for ((i=0;i<3;i++)); do echo $i; done");
-        diff_cmd("for ((;;)) do :; done");                 // all sections empty → None
+        diff_cmd("for ((;;)) do :; done"); // all sections empty → None
         diff_cmd("for (( i = 0 ; i < n ; i++ )); do x; done"); // sections trimmed
-        diff_cmd("for ((i=0,j=0; i<3; i++,j++)); do :; done");  // comma is literal
-        diff_cmd("for ((i=$x; i<${n}; i++)); do :; done");  // embedded expansions
-        diff_cmd("for ((i=(1+2); i<9; i++)); do :; done");  // inner grouping parens
+        diff_cmd("for ((i=0,j=0; i<3; i++,j++)); do :; done"); // comma is literal
+        diff_cmd("for ((i=$x; i<${n}; i++)); do :; done"); // embedded expansions
+        diff_cmd("for ((i=(1+2); i<9; i++)); do :; done"); // inner grouping parens
         diff_cmd("for ((;;)); do break; done");
         // Section-count errors (both paths ArithForHeader with identical message).
-        diff_err("for ((a;b;c;d)); do :; done");            // got 4
-        diff_err("for ((a)); do :; done");                  // got 1
-        diff_err("for ((a; b)); do :; done");               // got 2
+        diff_err("for ((a;b;c;d)); do :; done"); // got 4
+        diff_err("for ((a)); do :; done"); // got 1
+        diff_err("for ((a; b)); do :; done"); // got 2
     }
 
     #[test]
     fn atoms_arith_for_composition() {
-        diff_cmd("for ((;;)); do break; done | cat");         // pipeline stage
-        diff_cmd("for ((;;)); do :; done && echo hi");        // && list
-        diff_cmd("for ((;;)); do :; done >out");              // trailing redirect (Redirected{inner:ArithFor})
-        diff_cmd("for\n((;;)); do :; done");                  // newline before header
-        diff_cmd("for (($x;;)); do :; done");                 // expansion in init only
+        diff_cmd("for ((;;)); do break; done | cat"); // pipeline stage
+        diff_cmd("for ((;;)); do :; done && echo hi"); // && list
+        diff_cmd("for ((;;)); do :; done >out"); // trailing redirect (Redirected{inner:ArithFor})
+        diff_cmd("for\n((;;)); do :; done"); // newline before header
+        diff_cmd("for (($x;;)); do :; done"); // expansion in init only
         diff_cmd("if x; then for ((i=0;i<2;i++)); do y; done; fi"); // nested in a compound body
         diff_cmd("for ((i=0;i<2;i++)); do for ((j=0;j<2;j++)); do :; done; done"); // nested arith-for
     }
@@ -6458,10 +7548,10 @@ mod tests {
     #[test]
     fn atoms_arith_for_edges() {
         // Unterminated / malformed headers → UnterminatedLoop on both paths.
-        diff_err("for ((i=0;i<3;i++)");            // single close, EOF
+        diff_err("for ((i=0;i<3;i++)"); // single close, EOF
         diff_err("for ((i=0;i<3;i++); do x; done"); // single close before `;` → bail
-        diff_err("for ((;;)) done");                // missing `do`
-        diff_err("for ((;;)); do :");               // missing `done`
+        diff_err("for ((;;)) done"); // missing `do`
+        diff_err("for ((;;)); do :"); // missing `done`
         // Suspected divergence (per the plan): a `;` inside a quote in the header.
         // The oracle's `split_top_level_semi` ignores quotes and splits inside
         // the quoted run. Observed atom-path behavior (this test) shows the
@@ -6511,7 +7601,11 @@ mod tests {
             // (The now-deleted oracle REJECTED these — its naive arith paren-counter
             // could not see the backtick/`${…}` sub-expansion's own `;`. The atom
             // path parses them; that carryforward divergence is now production.)
-            assert!(new_seq(s).is_ok(), "expected atom-path Ok for {s:?}, got {:?}", new_seq(s));
+            assert!(
+                new_seq(s).is_ok(),
+                "expected atom-path Ok for {s:?}, got {:?}",
+                new_seq(s)
+            );
         }
     }
 
@@ -6522,12 +7616,12 @@ mod tests {
         diff_cmd("coproc awk prog");
         diff_cmd("coproc foo bar");
         diff_cmd("coproc cat");
-        diff_cmd("coproc\ncat");          // newline after coproc → anonymous; body skips it
-        diff_cmd("coproc ! cat");         // `!` is the program name, NOT negation
+        diff_cmd("coproc\ncat"); // newline after coproc → anonymous; body skips it
+        diff_cmd("coproc ! cat"); // `!` is the program name, NOT negation
         // Named compound
         diff_cmd("coproc MYP { read l; }");
-        diff_cmd("coproc M (echo hi)");   // spaced subshell body
-        diff_cmd("coproc M(echo hi)");    // glued subshell body
+        diff_cmd("coproc M (echo hi)"); // spaced subshell body
+        diff_cmd("coproc M(echo hi)"); // glued subshell body
         diff_cmd("coproc M if x; then y; fi");
         // Anonymous compound
         diff_cmd("coproc { read l; }");
@@ -6553,9 +7647,9 @@ mod tests {
 
     #[test]
     fn atoms_coproc_errors() {
-        diff_err("coproc");                // MissingCommand
-        diff_err("coproc |cat");           // MissingCommand
-        diff_err("coproc a | coproc b");   // 2nd-stage coproc → UnexpectedKeyword("coproc")
+        diff_err("coproc"); // MissingCommand
+        diff_err("coproc |cat"); // MissingCommand
+        diff_err("coproc a | coproc b"); // 2nd-stage coproc → UnexpectedKeyword("coproc")
     }
 
     #[test]
@@ -6563,16 +7657,16 @@ mod tests {
         // bash parses `coproc WORD compound-command` for ANY word as the NAME and
         // defers the valid-identifier check to RUNTIME (nameref11.sub line 47:
         // `coproc @ { :; }` parses; runtime prints `` `@': not a valid identifier ``).
-        diff_cmd("coproc @ { :; }");            // non-identifier name + brace group
-        diff_cmd("coproc @ ( : )");             // non-identifier name + subshell
-        diff_cmd("coproc 123 { :; }");          // digit-leading name (was wrongly rejected)
+        diff_cmd("coproc @ { :; }"); // non-identifier name + brace group
+        diff_cmd("coproc @ ( : )"); // non-identifier name + subshell
+        diff_cmd("coproc 123 { :; }"); // digit-leading name (was wrongly rejected)
         diff_cmd("coproc 1x { :; }");
-        diff_cmd("coproc foo-bar { :; }");      // hyphen — not a valid identifier
-        diff_cmd("coproc @ if x; then y; fi");  // non-identifier name + if-compound
+        diff_cmd("coproc foo-bar { :; }"); // hyphen — not a valid identifier
+        diff_cmd("coproc @ if x; then y; fi"); // non-identifier name + if-compound
         // Valid-name and anonymous forms are unchanged.
-        diff_cmd("coproc MYCO { :; }");         // valid name (control)
-        diff_cmd("coproc { :; }");              // anonymous brace group
-        diff_cmd("coproc cat");                 // anonymous simple command
+        diff_cmd("coproc MYCO { :; }"); // valid name (control)
+        diff_cmd("coproc { :; }"); // anonymous brace group
+        diff_cmd("coproc cat"); // anonymous simple command
     }
 
     #[test]
@@ -6610,12 +7704,12 @@ mod tests {
 
     #[test]
     fn atoms_legacy_arith_base() {
-        diff_cmd("echo $[1+2]");          // == $((1+2))
+        diff_cmd("echo $[1+2]"); // == $((1+2))
         diff_cmd("echo pre$[1+2]post");
         diff_cmd("echo $[ x + 1 ]");
-        diff_cmd("echo $[a[0]]");         // inner [0] bracket-nested → body "a[0]"
-        diff_cmd("echo $[(1+2)*3]");      // parens are literal body chars
-        diff_cmd("x=$[1+2]");             // assignment value
+        diff_cmd("echo $[a[0]]"); // inner [0] bracket-nested → body "a[0]"
+        diff_cmd("echo $[(1+2)*3]"); // parens are literal body chars
+        diff_cmd("x=$[1+2]"); // assignment value
     }
 
     #[test]
@@ -6624,9 +7718,9 @@ mod tests {
         diff_cmd("echo $[${a}+1]");
         diff_cmd("echo $[$(echo 1)+2]");
         diff_cmd("echo $[`echo 1`+2]");
-        diff_cmd("echo $[$((1+2))+3]");   // nested $((
-        diff_cmd("echo $[$[1+2]+3]");     // nested $[
-        diff_cmd("echo \"$[1+2]\"");      // inside dquote → Quoted{Double,[Arith]}
+        diff_cmd("echo $[$((1+2))+3]"); // nested $((
+        diff_cmd("echo $[$[1+2]+3]"); // nested $[
+        diff_cmd("echo \"$[1+2]\""); // inside dquote → Quoted{Double,[Arith]}
         diff_cmd("echo \"pre$[1+2]post\"");
     }
 
@@ -6667,10 +7761,10 @@ mod tests {
         // counts `(`/`)`/`;` regardless of quotes (quote-removal is a separate second
         // pass), so a `(`/`)`/for-header `;` inside a `'…'` span must still fire the
         // depth/close/bail events, NOT be swallowed as a literal.
-        diff_cmd("echo $(( ')' ))");   // bails to CommandSub{Subshell{'...'}}
+        diff_cmd("echo $(( ')' ))"); // bails to CommandSub{Subshell{'...'}}
         diff_cmd("echo $(( '(' ))");
         diff_cmd("(( ')' ))");
-        diff_err("for (( '(' ; ; )); do :; done");   // both Err(UnterminatedLoop)
+        diff_err("for (( '(' ; ; )); do :; done"); // both Err(UnterminatedLoop)
     }
 
     #[test]
@@ -6685,10 +7779,14 @@ mod tests {
         // end of the (now-quoted) body and lex-errors. Same exotic two-pass-vs-one-pass
         // class as other source-position pins. `old_seq` panics on this (Ok w/ lex OK,
         // but the atom errors), so assert the atom side only.
-        assert!(new_seq("echo $[ \\' ]").is_err(),  // oracle: Ok body \" \\ \"
-                "atom one-pass runs off the unmatchable squote-after-backslash span");
-        assert!(new_seq("echo $[ \\\" ]").is_err(), // oracle: Ok body \" \\ \"
-                "atom one-pass runs off the unmatchable dquote-after-backslash span");
+        assert!(
+            new_seq("echo $[ \\' ]").is_err(), // oracle: Ok body \" \\ \"
+            "atom one-pass runs off the unmatchable squote-after-backslash span"
+        );
+        assert!(
+            new_seq("echo $[ \\\" ]").is_err(), // oracle: Ok body \" \\ \"
+            "atom one-pass runs off the unmatchable dquote-after-backslash span"
+        );
     }
 
     #[test]
@@ -6698,15 +7796,15 @@ mod tests {
         diff_cmd("echo $(( \"x\" ))");
         diff_cmd("echo $(( x=\"5\" ))");
         diff_cmd("echo $(( 1\"2\"3 ))");
-        diff_cmd("echo $(( '$x' ))");        // single-quote → literal $x, no expand
-        diff_cmd("echo $(( \"$x\" ))");      // double-quote → expands, quotes gone
-        diff_cmd("echo $(( \"a\\\"b\" ))");  // dquote \-escape → a"b
+        diff_cmd("echo $(( '$x' ))"); // single-quote → literal $x, no expand
+        diff_cmd("echo $(( \"$x\" ))"); // double-quote → expands, quotes gone
+        diff_cmd("echo $(( \"a\\\"b\" ))"); // dquote \-escape → a"b
         diff_cmd("echo $(( \"`echo 1`\" ))"); // backtick inside dquote
         diff_cmd("echo $(( \"${x:-]}\" ))"); // ${…} inside dquote
         diff_cmd("echo $(( \"a$(( 1 ))b\" ))"); // nested $(( )) inside dquote
-        diff_cmd("echo $(( \"\" ))");        // empty dquote dropped
-        diff_cmd("echo $(( \"a\"'b' ))");    // adjacent quotes concatenate
-        diff_cmd("(( \"x\" ))");             // standalone (( )) command
+        diff_cmd("echo $(( \"\" ))"); // empty dquote dropped
+        diff_cmd("echo $(( \"a\"'b' ))"); // adjacent quotes concatenate
+        diff_cmd("(( \"x\" ))"); // standalone (( )) command
     }
 
     #[test]
@@ -6714,26 +7812,26 @@ mod tests {
         // Bare `$` (not an expansion start) is its own literal part in the oracle.
         diff_cmd("echo $(( 1 $ 2 ))");
         diff_cmd("echo $(( 1 $+ 2 ))");
-        diff_cmd("echo $(( $'x' ))");   // no ANSI-C in arith: `$` literal + 'x' removed
+        diff_cmd("echo $(( $'x' ))"); // no ANSI-C in arith: `$` literal + 'x' removed
     }
 
     #[test]
     fn atoms_legacy_arith_quote_protection() {
         // CF7: `$[ … ]` — quotes and `\` protect the `]` AND are removed
         // (backslash retained literally).
-        diff_cmd("echo $[ \"]\" ]");    // was UnterminatedQuote → Arith " ] "
-        diff_cmd("echo $[']']");         // was UnterminatedQuote → Arith "]"
-        diff_cmd("echo $[ \\] ]");      // was 2 args → Arith " \\] "
-        diff_cmd("echo $[ \"$x\" ]");   // dquote expands, protects, removed
-        diff_cmd("echo $[ ${x:-]} ]");  // ${…} already protects (regression)
+        diff_cmd("echo $[ \"]\" ]"); // was UnterminatedQuote → Arith " ] "
+        diff_cmd("echo $[']']"); // was UnterminatedQuote → Arith "]"
+        diff_cmd("echo $[ \\] ]"); // was 2 args → Arith " \\] "
+        diff_cmd("echo $[ \"$x\" ]"); // dquote expands, protects, removed
+        diff_cmd("echo $[ ${x:-]} ]"); // ${…} already protects (regression)
         diff_cmd("echo $[ $(echo ]) ]"); // $(…) already protects (regression)
         // Backslash-RUN before a delimiter: the oracle pairs `\` with any next
         // char, so an EVEN run leaves the following `]` a LIVE delimiter. The
         // atom pairs `\`+`\` (and `\`+`]`/`[`) so runs are consumed correctly.
-        diff_cmd("echo $[ \\\\] ]");    // \\]  → Arith " \\\\" + arg "]"
-        diff_cmd("echo $[ \\\\\\] ]");  // \\\] → ] protected (odd run)
-        diff_cmd("echo $[ \\$x ]");     // \$x  → " \\" + Var x (re-expands)
-        diff_cmd("echo $[ \\\\$x ]");   // \\$x → " \\\\" + Var x
+        diff_cmd("echo $[ \\\\] ]"); // \\]  → Arith " \\\\" + arg "]"
+        diff_cmd("echo $[ \\\\\\] ]"); // \\\] → ] protected (odd run)
+        diff_cmd("echo $[ \\$x ]"); // \$x  → " \\" + Var x (re-expands)
+        diff_cmd("echo $[ \\\\$x ]"); // \\$x → " \\\\" + Var x
     }
 
     #[test]
@@ -6794,7 +7892,11 @@ mod tests {
         for s in ["for (( ", "for ((", "for (()"] {
             // All three are unterminated `for ((` — the atom path rejects each
             // (UnterminatedLoop, or a lexer error surfaced as ParseError::Lex).
-            assert!(new_seq(s).is_err(), "unterminated for-arith must error for {s:?}: {:?}", new_seq(s));
+            assert!(
+                new_seq(s).is_err(),
+                "unterminated for-arith must error for {s:?}: {:?}",
+                new_seq(s)
+            );
         }
     }
 
@@ -6802,7 +7904,6 @@ mod tests {
     //
     // THE PRODUCTION LEXER IS THE ORACLE.  When `new_cs` ≠ `old_cs`, fix
     // the new path to match — never weaken or skip the comparison.
-
 
     /// Build the expected `WordPart::CommandSub` using the PRODUCTION lexer (oracle).
     /// Wraps `s` in `"…"` when `quoted=true` to simulate a double-quoted context.
@@ -6816,13 +7917,24 @@ mod tests {
     /// Assert that the new and old paths produce identical results for both
     /// unquoted and quoted contexts.
     fn diff_cs(s: &str) {
-        assert!(new_cs(s, false).is_ok(), "unquoted {s:?}: {:?}", new_cs(s, false));
-        assert!(new_cs(s, true).is_ok(),  "quoted   {s:?}: {:?}", new_cs(s, true));
+        assert!(
+            new_cs(s, false).is_ok(),
+            "unquoted {s:?}: {:?}",
+            new_cs(s, false)
+        );
+        assert!(
+            new_cs(s, true).is_ok(),
+            "quoted   {s:?}: {:?}",
+            new_cs(s, true)
+        );
     }
 
     fn diff_cs_deferred(s: &str) {
-        assert!(matches!(new_cs(s, false), Err(ParseError::UnsupportedExpansion)),
-                "expected deferred for {s:?}, got {:?}", new_cs(s, false));
+        assert!(
+            matches!(new_cs(s, false), Err(ParseError::UnsupportedExpansion)),
+            "expected deferred for {s:?}, got {:?}",
+            new_cs(s, false)
+        );
     }
 
     #[test]
@@ -6830,7 +7942,7 @@ mod tests {
         diff_cs("$(echo hi)");
         diff_cs("$(echo hi there)");
         diff_cs("$(true)");
-        diff_cs("$()");            // empty -> empty Sequence (NOT EmptySubshell)
+        diff_cs("$()"); // empty -> empty Sequence (NOT EmptySubshell)
     }
 
     /// G2: a command-substitution body that is only whitespace/newlines
@@ -6844,15 +7956,33 @@ mod tests {
     fn cs_whitespace_only_body_is_empty() {
         fn empty_sequence() -> Sequence {
             Sequence {
-                first: Command::Pipeline(Pipeline { negate: false, commands: Vec::new() }),
+                first: Command::Pipeline(Pipeline {
+                    negate: false,
+                    commands: Vec::new(),
+                }),
                 rest: Vec::new(),
                 background: false,
             }
         }
-        for s in ["$()", "$( )", "$(  )", "$(\t)", "$(\n)", "$(\n\t\n)", "$( \n \t \n )"] {
+        for s in [
+            "$()",
+            "$( )",
+            "$(  )",
+            "$(\t)",
+            "$(\n)",
+            "$(\n\t\n)",
+            "$( \n \t \n )",
+        ] {
             match new_cs(s, false) {
-                Ok(WordPart::CommandSub { sequence, quoted: false }) => {
-                    assert_eq!(sequence, empty_sequence(), "body {s:?} must yield the empty Sequence");
+                Ok(WordPart::CommandSub {
+                    sequence,
+                    quoted: false,
+                }) => {
+                    assert_eq!(
+                        sequence,
+                        empty_sequence(),
+                        "body {s:?} must yield the empty Sequence"
+                    );
                 }
                 other => panic!("expected empty CommandSub for {s:?}, got {other:?}"),
             }
@@ -6871,30 +8001,30 @@ mod tests {
         diff_cs("$(a | b)");
         diff_cs("$(a | b | c)");
         diff_cs("$(a && b || c)");
-        diff_cs("$(a; b;)");                       // trailing ;
-        diff_cs("$(a &)");                          // background in body
-        diff_cs("$(if x; then y; fi)");             // compound body (v243)
+        diff_cs("$(a; b;)"); // trailing ;
+        diff_cs("$(a &)"); // background in body
+        diff_cs("$(if x; then y; fi)"); // compound body (v243)
         diff_cs("$(for i in a b; do echo $i; done)");
         diff_cs("$(while x; do y; done)");
         diff_cs("$(case $z in a) b;; esac)");
-        diff_cs("$( (echo x) )");                   // comsub of a subshell (SPACED)
-        diff_cs("$({ echo x; })");                  // comsub of a brace group
-        diff_cs("$(f() { x; })");                   // function-def body (v248 T2)
-        diff_cs("$([[ -n x ]])");                   // `[[ ]]` body (v253 T1)
-        diff_cs("$(coproc x)");                     // coproc body (v257 T2)
+        diff_cs("$( (echo x) )"); // comsub of a subshell (SPACED)
+        diff_cs("$({ echo x; })"); // comsub of a brace group
+        diff_cs("$(f() { x; })"); // function-def body (v248 T2)
+        diff_cs("$([[ -n x ]])"); // `[[ ]]` body (v253 T1)
+        diff_cs("$(coproc x)"); // coproc body (v257 T2)
     }
 
     // v244 T3 tests
 
     #[test]
     fn cs_nesting_quoting() {
-        diff_cs("$(echo $(date))");               // nested: inner fat-built, outer new-path
-        diff_cs("$(echo ${x})");                  // ${…} in a body word (fat-built, passes through)
-        diff_cs("$(a $(b) $(c))");                // two nested
-        diff_cs("$(echo \"$(date)\")");           // nested inside dquotes in the body
-        diff_cs("$(<file)");                       // body is a bare redirect
+        diff_cs("$(echo $(date))"); // nested: inner fat-built, outer new-path
+        diff_cs("$(echo ${x})"); // ${…} in a body word (fat-built, passes through)
+        diff_cs("$(a $(b) $(c))"); // two nested
+        diff_cs("$(echo \"$(date)\")"); // nested inside dquotes in the body
+        diff_cs("$(<file)"); // body is a bare redirect
         diff_cs("$(cat < in > out)");
-        diff_cs("$(echo hi\n)");                   // trailing newline in body
+        diff_cs("$(echo hi\n)"); // trailing newline in body
     }
 
     // ── v244 T4 tests ────────────────────────────────────────────────────────
@@ -6904,18 +8034,18 @@ mod tests {
         diff_ok("${x:-$(echo d)}");
         diff_ok("${x:+$(cmd)}");
         diff_ok("${x=$(a b)}");
-        diff_ok("${x:-a$(b)c}");                    // comsub between literals in an operand
-        diff_ok("${x/$(a)/$(b)}");                  // pattern + replacement operands
-        diff_ok("${x:-$(echo $(date))}");            // nested comsub inside an operand
+        diff_ok("${x:-a$(b)c}"); // comsub between literals in an operand
+        diff_ok("${x/$(a)/$(b)}"); // pattern + replacement operands
+        diff_ok("${x:-$(echo $(date))}"); // nested comsub inside an operand
     }
 
     // ── v244 T5 tests ────────────────────────────────────────────────────────
 
     #[test]
     fn cs_deferred_boundary() {
-        diff_cs_deferred("$((1+2))");               // arith expansion (WordPart::Arith, not comsub)
+        diff_cs_deferred("$((1+2))"); // arith expansion (WordPart::Arith, not comsub)
         diff_cs_deferred("$(( a + b ))");
-        diff_cs_deferred("`echo hi`");              // backtick (own iteration)
+        diff_cs_deferred("`echo hi`"); // backtick (own iteration)
         // `$(f() { x; })` removed: function-def body now parses (v248 T2);
         // see `cs_body_grammar`'s `diff_cs("$(f() { x; })")`.
         // `$([[ -n x ]])` removed: `[[ ]]` body now parses (v253 T1); see
@@ -6945,8 +8075,16 @@ mod tests {
     /// Assert that the new and old paths produce identical results for both
     /// unquoted and quoted contexts.
     fn diff_bt(s: &str) {
-        assert!(new_bt(s, false).is_ok(), "unquoted {s:?}: {:?}", new_bt(s, false));
-        assert!(new_bt(s, true).is_ok(),  "quoted   {s:?}: {:?}", new_bt(s, true));
+        assert!(
+            new_bt(s, false).is_ok(),
+            "unquoted {s:?}: {:?}",
+            new_bt(s, false)
+        );
+        assert!(
+            new_bt(s, true).is_ok(),
+            "quoted   {s:?}: {:?}",
+            new_bt(s, true)
+        );
     }
 
     // ── v245 T1 scaffolding test ─────────────────────────────────────────────
@@ -6971,34 +8109,34 @@ mod tests {
         diff_bt("`a && b || c`");
         diff_bt("`a; b`");
         diff_bt("`if x; then y; fi`");
-        diff_bt("``");                 // empty -> empty Sequence
+        diff_bt("``"); // empty -> empty Sequence
     }
 
     // ── v245 T3: body content — \$/\\ unescape, $()/${} in body, quoted ─────
 
     #[test]
     fn bt_body_content() {
-        diff_bt("`echo \\$x`");        // \$ -> variable $x
-        diff_bt("`echo \\\\`");        // \\ -> literal backslash
-        diff_bt("`echo \\n`");         // \n -> preserved (backslash + n)
-        diff_bt("`echo $(date)`");     // $() in body -> fat-built, passes through
-        diff_bt("`echo ${x}`");        // ${} in body -> fat-built
-        diff_bt("`echo $HOME`");       // bare $ expands
-        diff_bt("`echo \"quoted\"`");  // dquotes in body
-        diff_bt("`echo \\\\x`");       // \\x -> Quoted{Backslash,[Literal("x")]}
-        diff_bt("`echo \\\\ x`");      // \\ <space> -> quoted space (no word-split)
-        diff_bt("`echo \\\\$HOME`");   // \\$ -> Quoted{Backslash,[Literal("$")]}, no expand
+        diff_bt("`echo \\$x`"); // \$ -> variable $x
+        diff_bt("`echo \\\\`"); // \\ -> literal backslash
+        diff_bt("`echo \\n`"); // \n -> preserved (backslash + n)
+        diff_bt("`echo $(date)`"); // $() in body -> fat-built, passes through
+        diff_bt("`echo ${x}`"); // ${} in body -> fat-built
+        diff_bt("`echo $HOME`"); // bare $ expands
+        diff_bt("`echo \"quoted\"`"); // dquotes in body
+        diff_bt("`echo \\\\x`"); // \\x -> Quoted{Backslash,[Literal("x")]}
+        diff_bt("`echo \\\\ x`"); // \\ <space> -> quoted space (no word-split)
+        diff_bt("`echo \\\\$HOME`"); // \\$ -> Quoted{Backslash,[Literal("$")]}, no expand
     }
 
     // ── v245 T4: depth-1 nesting — `\`` opens/closes a child backtick ─────────
 
     #[test]
     fn bt_depth1_nesting() {
-        diff_bt("`echo \\`date\\``");            // `echo `date`` (nested once)
-        diff_bt("`a \\`b\\` c`");                // outer body: a `b` c
-        diff_bt("`\\`inner\\``");                // nested at the start
+        diff_bt("`echo \\`date\\``"); // `echo `date`` (nested once)
+        diff_bt("`a \\`b\\` c`"); // outer body: a `b` c
+        diff_bt("`\\`inner\\``"); // nested at the start
         diff_bt("`echo \\`echo hi\\``");
-        diff_bt("`x \\`y | z\\` w`");            // pipeline in the nested body
+        diff_bt("`x \\`y | z\\` w`"); // pipeline in the nested body
     }
 
     // ── v245 T5: depth-2 nesting — `\\\`` opens/closes a level-2 child ────────
@@ -7010,8 +8148,8 @@ mod tests {
     // below).  (Rust `\\\\\\`` == the shell's `\\\`` — three backslashes + `.)
     #[test]
     fn bt_depth2_nesting() {
-        diff_bt("`a \\`b \\\\\\`c\\\\\\` d\\` e`");   // depth-2: \\\` around c
-        diff_bt("`\\`\\\\\\`x\\\\\\`\\``");             // depth-2 at the start
+        diff_bt("`a \\`b \\\\\\`c\\\\\\` d\\` e`"); // depth-2: \\\` around c
+        diff_bt("`\\`\\\\\\`x\\\\\\`\\``"); // depth-2 at the start
         diff_bt("`echo \\`echo \\\\\\`echo hi\\\\\\`\\``");
     }
 
@@ -7068,7 +8206,6 @@ mod tests {
     // THE PRODUCTION LEXER IS THE ORACLE.  When `new_arith` ≠ `old_arith`, fix
     // the new path to match — never weaken or skip the comparison.
 
-
     /// Production oracle: the `WordPart::Arith` the batch lexer builds for `s`.
 
     /// New parser-driven path.
@@ -7079,8 +8216,16 @@ mod tests {
 
     /// Assert new == old for both unquoted and quoted contexts.
     fn diff_arith(s: &str) {
-        assert!(new_arith(s, false).is_ok(), "unquoted {s:?}: {:?}", new_arith(s, false));
-        assert!(new_arith(s, true).is_ok(),  "quoted   {s:?}: {:?}", new_arith(s, true));
+        assert!(
+            new_arith(s, false).is_ok(),
+            "unquoted {s:?}: {:?}",
+            new_arith(s, false)
+        );
+        assert!(
+            new_arith(s, true).is_ok(),
+            "quoted   {s:?}: {:?}",
+            new_arith(s, true)
+        );
     }
 
     // ── v246 T1 scaffolding test ──────────────────────────────────────────────
@@ -7093,7 +8238,10 @@ mod tests {
         // Empty arith `$(( ))` round-trips through the skeleton (body filled in Task 2+).
         // Production `$(( ))` yields Arith { body: Word([...]) }; the skeleton only
         // guarantees the harness wires up, so just assert new_arith succeeds here.
-        assert!(new_arith("$(())", false).is_ok(), "skeleton must parse $(())");
+        assert!(
+            new_arith("$(())", false).is_ok(),
+            "skeleton must parse $(())"
+        );
     }
 
     // ── v246 T2 tests ────────────────────────────────────────────────────────
@@ -7103,7 +8251,7 @@ mod tests {
         diff_arith("$((1+2))");
         diff_arith("$(( 1 + 2 ))");
         diff_arith("$((0))");
-        diff_arith("$((a+1))");   // bare identifier is literal body text
+        diff_arith("$((a+1))"); // bare identifier is literal body text
         diff_arith("$(( x * y ))");
     }
 
@@ -7155,8 +8303,16 @@ mod tests {
         // followed by `)` makes the arith scan Bail; the parser rewinds to the
         // `$((` start and re-drives as a command substitution.  Both paths agree.
         for s in ["$((cat) )", "$((echo hi) )"] {
-            assert!(new_arith(s, false).is_ok(), "wrinkle {s:?}: {:?}", new_arith(s, false));
-            assert!(new_arith(s, true).is_ok(),  "wrinkle quoted {s:?}: {:?}", new_arith(s, true));
+            assert!(
+                new_arith(s, false).is_ok(),
+                "wrinkle {s:?}: {:?}",
+                new_arith(s, false)
+            );
+            assert!(
+                new_arith(s, true).is_ok(),
+                "wrinkle quoted {s:?}: {:?}",
+                new_arith(s, true)
+            );
         }
     }
 
@@ -7166,7 +8322,10 @@ mod tests {
         // syntax error (a bare word immediately after `)`).  Production errors on
         // it; the new path must ALSO error — reaching that error via the ArithBail
         // → cmdsub retry, not by spuriously succeeding as arith.
-        assert!(new_arith("$((a)b)", false).is_err(), "new path must error on $((a)b)");
+        assert!(
+            new_arith("$((a)b)", false).is_err(),
+            "new path must error on $((a)b)"
+        );
     }
 
     // ── v246 T4 tests ────────────────────────────────────────────────────────
@@ -7189,7 +8348,10 @@ mod tests {
 
     #[test]
     fn arith_error_parity() {
-        assert!(new_arith("$((1+1", false).is_err(), "unterminated arith must Err");
+        assert!(
+            new_arith("$((1+1", false).is_err(),
+            "unterminated arith must Err"
+        );
     }
 
     // ── v246 follow-up: nested + operand wrinkle-bail tests ────────────────────
@@ -7207,10 +8369,10 @@ mod tests {
         // The inner `$((cat) )` bails to a `$( (cat) )` cmdsub-of-subshell; the
         // outer `$((...))` still closes legitimately as arith, so the WHOLE
         // expression is genuinely arith at the top level (diff_arith applies).
-        diff_arith("$(( $((cat) ) ))");             // bail alone in the outer body
-        diff_arith("$(( 1 + $((echo hi) ) ))");      // bail alongside other arith text
-        diff_arith("$(( $((cat) ) + 1 ))");           // bail followed by more arith text
-        diff_arith("$(( $(( $((cat) ) )) ))");        // bail nested two arith levels deep
+        diff_arith("$(( $((cat) ) ))"); // bail alone in the outer body
+        diff_arith("$(( 1 + $((echo hi) ) ))"); // bail alongside other arith text
+        diff_arith("$(( $((cat) ) + 1 ))"); // bail followed by more arith text
+        diff_arith("$(( $(( $((cat) ) )) ))"); // bail nested two arith levels deep
     }
 
     #[test]
@@ -7220,7 +8382,7 @@ mod tests {
         // parse_param_expansion, so diff_ok (not diff_arith) is the right harness.
         diff_ok("${x:-$((cat) )}");
         diff_ok("${x:+$((cat) )}");
-        diff_ok("${x:-a$((cat) )b}");                 // bail between literals in an operand
+        diff_ok("${x:-a$((cat) )b}"); // bail between literals in an operand
     }
 
     #[test]
@@ -7229,39 +8391,42 @@ mod tests {
         // whose body `(a)b` is itself a syntax error (bare word after `)`,
         // same shape as arith_wrinkle_cmdsub_body_error_matches but nested one
         // arith level deeper).  Both paths must error.
-        assert!(new_arith("$(( $((a)b) ))", false).is_err(), "new path must error");
+        assert!(
+            new_arith("$(( $((a)b) ))", false).is_err(),
+            "new path must error"
+        );
     }
 
     // v253 T1 tests: `[[ … ]]` grammar core
 
     #[test]
     fn atoms_double_bracket_core() {
-        diff_cmd("[[ -f /etc/passwd ]]");     // unary file test
-        diff_cmd("[[ -z $x ]]");              // unary string test w/ expansion
-        diff_cmd("[[ hello ]]");              // lone word ≡ -n hello
-        diff_cmd("[[ $x ]]");                 // lone word w/ expansion
-        diff_cmd("[[ a == b ]]");             // string eq
-        diff_cmd("[[ a = b ]]");              // string eq (single =)
-        diff_cmd("[[ a != b ]]");             // string ne
-        diff_cmd("[[ $x == a* ]]");           // glob RHS stays a pattern word
-        diff_cmd("[[ 3 -eq 3 ]]");            // int eq
-        diff_cmd("[[ 3 -lt 5 ]]");            // int lt
-        diff_cmd("[[ a < b ]]");              // string lt via Op(RedirIn)
-        diff_cmd("[[ a > b ]]");              // string gt via Op(RedirOut)
-        diff_cmd("[[ f1 -nt f2 ]]");          // file newer-than
-        diff_cmd("[[ -f a && -f b ]]");       // logical and
-        diff_cmd("[[ -f a || -f b ]]");       // logical or
-        diff_cmd("[[ ! -d c ]]");             // negation
-        diff_cmd("[[ ( a == b ) ]]");         // grouping
+        diff_cmd("[[ -f /etc/passwd ]]"); // unary file test
+        diff_cmd("[[ -z $x ]]"); // unary string test w/ expansion
+        diff_cmd("[[ hello ]]"); // lone word ≡ -n hello
+        diff_cmd("[[ $x ]]"); // lone word w/ expansion
+        diff_cmd("[[ a == b ]]"); // string eq
+        diff_cmd("[[ a = b ]]"); // string eq (single =)
+        diff_cmd("[[ a != b ]]"); // string ne
+        diff_cmd("[[ $x == a* ]]"); // glob RHS stays a pattern word
+        diff_cmd("[[ 3 -eq 3 ]]"); // int eq
+        diff_cmd("[[ 3 -lt 5 ]]"); // int lt
+        diff_cmd("[[ a < b ]]"); // string lt via Op(RedirIn)
+        diff_cmd("[[ a > b ]]"); // string gt via Op(RedirOut)
+        diff_cmd("[[ f1 -nt f2 ]]"); // file newer-than
+        diff_cmd("[[ -f a && -f b ]]"); // logical and
+        diff_cmd("[[ -f a || -f b ]]"); // logical or
+        diff_cmd("[[ ! -d c ]]"); // negation
+        diff_cmd("[[ ( a == b ) ]]"); // grouping
         diff_cmd("[[ -f a && -f b || ! -d c ]]"); // precedence
     }
 
     #[test]
     fn atoms_double_bracket_extra() {
-        diff_err("[[ ]]");                              // EmptyDoubleBracket
-        diff_err("[[");                                 // UnterminatedDoubleBracket
-        diff_err("[[ -f");                               // unary op, no operand → UnterminatedDoubleBracket
-        diff_err("[[ a == ]]");                          // binary op, no rhs → TestExprMissingOperand
+        diff_err("[[ ]]"); // EmptyDoubleBracket
+        diff_err("[["); // UnterminatedDoubleBracket
+        diff_err("[[ -f"); // unary op, no operand → UnterminatedDoubleBracket
+        diff_err("[[ a == ]]"); // binary op, no rhs → TestExprMissingOperand
         // `~~` is NOT in the operator set, so BOTH paths take the lone-word
         // branch on `a` (≡ `-n a`), leave `~~` unconsumed, and trip the
         // `]]`-consume → `UnterminatedDoubleBracket` (not `TestExprBadOperator`).
@@ -7271,12 +8436,12 @@ mod tests {
         // identical, so any word that reaches the match is already known to be
         // in the set. There is therefore no genuine `TestExprBadOperator`-parity
         // case to test; that's expected and matches the oracle.
-        diff_err("[[ a ~~ b ]]");                        // unrecognized op → both lone-word → UnterminatedDoubleBracket
-        diff_err("[[ && a ]]");                          // leading operator → TestExprMissingOperand
-        diff_cmd("if [[ -f a ]]; then echo y; fi");      // `[[ ]]` as an if-condition
-        diff_cmd("while [[ -n $x ]]; do echo y; done");  // `[[ ]]` as a while-condition
-        diff_cmd("[[\n  -f a\n  && -f b\n]]");            // Blank/Newline interleaving (skip_test_ws)
-        diff_cmd("[[ ! ( -f a && -f b ) ]]");             // negated grouping
+        diff_err("[[ a ~~ b ]]"); // unrecognized op → both lone-word → UnterminatedDoubleBracket
+        diff_err("[[ && a ]]"); // leading operator → TestExprMissingOperand
+        diff_cmd("if [[ -f a ]]; then echo y; fi"); // `[[ ]]` as an if-condition
+        diff_cmd("while [[ -n $x ]]; do echo y; done"); // `[[ ]]` as a while-condition
+        diff_cmd("[[\n  -f a\n  && -f b\n]]"); // Blank/Newline interleaving (skip_test_ws)
+        diff_cmd("[[ ! ( -f a && -f b ) ]]"); // negated grouping
     }
 
     /// Operator GLUED to an expansion with no intervening space (`==$x`,
@@ -7292,10 +8457,10 @@ mod tests {
     /// NOT-an-operator too. Regression for the T1-review bug.
     #[test]
     fn atoms_double_bracket_glued_operator() {
-        diff_err("[[ a ==$x ]]");   // string-eq glued → UnterminatedDoubleBracket on both
-        diff_err("[[ a -eq$n ]]");  // int-eq glued → same
-        diff_err("[[ a =~$x ]]");   // regex glued → same (NOT the =~ deferral: not recognized as an op)
-        diff_cmd("[[ a == $x ]]");  // SPACED == is a NORMAL StringEq binary (rhs $x) — must NOT regress
+        diff_err("[[ a ==$x ]]"); // string-eq glued → UnterminatedDoubleBracket on both
+        diff_err("[[ a -eq$n ]]"); // int-eq glued → same
+        diff_err("[[ a =~$x ]]"); // regex glued → same (NOT the =~ deferral: not recognized as an op)
+        diff_cmd("[[ a == $x ]]"); // SPACED == is a NORMAL StringEq binary (rhs $x) — must NOT regress
         diff_cmd("[[ a =~ $x ]]"); // SPACED =~ IS recognized → v254 ports the regex RHS (TestExpr::Regex)
     }
 
@@ -7314,9 +8479,9 @@ mod tests {
     #[test]
     fn atoms_double_bracket_inline_assignments() {
         diff_cmd("FOO=hi [[ -n $FOO ]]");
-        diff_cmd("A=1 B=2 [[ $A == 1 ]]");        // multiple leading assignments
+        diff_cmd("A=1 B=2 [[ $A == 1 ]]"); // multiple leading assignments
         diff_cmd("x=y [[ $x == y && -n $x ]]");
-        diff_cmd("x=1 [[ -f a ]]");                // the former T1 pin case
+        diff_cmd("x=1 [[ -f a ]]"); // the former T1 pin case
     }
 
     /// v253 T3 (OBSERVATION): `[[ ]]` used as a pipeline / logical / negated /
@@ -7325,10 +8490,10 @@ mod tests {
     /// covers these (as it does for `if`/`while`).
     #[test]
     fn atoms_double_bracket_as_stage() {
-        diff_cmd("[[ -f a ]] && echo yes");        // as && stage
-        diff_cmd("[[ -f a ]] || echo no");         // as || stage
-        diff_cmd("! [[ -f a ]]");                  // negated command
-        diff_cmd("[[ -f a ]]; echo done");         // in a sequence
+        diff_cmd("[[ -f a ]] && echo yes"); // as && stage
+        diff_cmd("[[ -f a ]] || echo no"); // as || stage
+        diff_cmd("! [[ -f a ]]"); // negated command
+        diff_cmd("[[ -f a ]]; echo done"); // in a sequence
         diff_cmd("if [[ -n $x ]]; then echo y; fi"); // as an if condition
     }
 
@@ -7342,10 +8507,10 @@ mod tests {
     /// wrapping it would make the atom path return `Ok(Redirected)` and diverge).
     #[test]
     fn atoms_double_bracket_trailing_redirect() {
-        diff_cmd("[[ -f a ]] >out");               // fixed case → Redirected
-        diff_cmd("[[ -f a ]] 2>&1");               // fd-dup redirect
-        diff_cmd("[[ -n $x ]] >f 2>&1");           // multi-redirect
-        diff_err("FOO=hi [[ -f a ]] >out");        // inline-assign site UNWRAPPED → both Err(UnexpectedToken)
+        diff_cmd("[[ -f a ]] >out"); // fixed case → Redirected
+        diff_cmd("[[ -f a ]] 2>&1"); // fd-dup redirect
+        diff_cmd("[[ -n $x ]] >f 2>&1"); // multi-redirect
+        diff_err("FOO=hi [[ -f a ]] >out"); // inline-assign site UNWRAPPED → both Err(UnexpectedToken)
     }
 
     /// `=~` is PORTED (v254): the atom path assembles the regex-pattern RHS via
@@ -7364,22 +8529,22 @@ mod tests {
 
     #[test]
     fn atoms_regex_core() {
-        diff_cmd("[[ $x =~ abc ]]");            // plain literal
-        diff_cmd("[[ $x =~ ^a.c$ ]]");          // anchors + metachar `.`
-        diff_cmd("[[ $x =~ [0-9]+ ]]");         // bracket class + quantifier
-        diff_cmd("[[ $x =~ a|b ]]");            // `|` literal
-        diff_cmd("[[ $x =~ a<b>c ]]");          // `<` `>` literal
-        diff_cmd("[[ $x =~ a;b ]]");            // `;` literal
-        diff_cmd("[[ $x =~ a&b ]]");            // `&` literal
-        diff_cmd("[[ $x =~ (a b) ]]");          // paren-depth: space kept inside ( )
-        diff_cmd("[[ $x =~ ((a) (b))+ ]]");     // nested groups
-        diff_cmd("[[ $x =~ (a b)c ]]");         // group then trailing literal
-        diff_cmd("[[ $x =~ $p ]]");             // Var
-        diff_cmd("[[ $x =~ ${p}x ]]");          // ${…} then literal
-        diff_cmd("[[ $x =~ ${a[0]} ]]");        // subscript expansion
-        diff_cmd("[[ $x =~ $(cmd) ]]");         // command-sub
-        diff_cmd("[[ $x =~ $((1+1)) ]]");       // arith
-        diff_cmd("[[ $x =~ a$b|c$(d) ]]");      // mixed literal + expansions
+        diff_cmd("[[ $x =~ abc ]]"); // plain literal
+        diff_cmd("[[ $x =~ ^a.c$ ]]"); // anchors + metachar `.`
+        diff_cmd("[[ $x =~ [0-9]+ ]]"); // bracket class + quantifier
+        diff_cmd("[[ $x =~ a|b ]]"); // `|` literal
+        diff_cmd("[[ $x =~ a<b>c ]]"); // `<` `>` literal
+        diff_cmd("[[ $x =~ a;b ]]"); // `;` literal
+        diff_cmd("[[ $x =~ a&b ]]"); // `&` literal
+        diff_cmd("[[ $x =~ (a b) ]]"); // paren-depth: space kept inside ( )
+        diff_cmd("[[ $x =~ ((a) (b))+ ]]"); // nested groups
+        diff_cmd("[[ $x =~ (a b)c ]]"); // group then trailing literal
+        diff_cmd("[[ $x =~ $p ]]"); // Var
+        diff_cmd("[[ $x =~ ${p}x ]]"); // ${…} then literal
+        diff_cmd("[[ $x =~ ${a[0]} ]]"); // subscript expansion
+        diff_cmd("[[ $x =~ $(cmd) ]]"); // command-sub
+        diff_cmd("[[ $x =~ $((1+1)) ]]"); // arith
+        diff_cmd("[[ $x =~ a$b|c$(d) ]]"); // mixed literal + expansions
     }
 
     /// v254 T1 hardening: the `\x`/quote/expansion traps of `scan_regex_operand`.
@@ -7387,22 +8552,22 @@ mod tests {
     /// single-quoted + double-quoted bodies FLAT, and wraps only `$'…'` ANSI-C.
     #[test]
     fn atoms_regex_traps() {
-        diff_cmd("[[ $x =~ a\\.b ]]");    // THE #1 TRAP: \x kept as unquoted literal `a\.b`
-        diff_cmd("[[ $x =~ a\\ b ]]");    // escaped space kept literal
-        diff_cmd("[[ $x =~ \\) ]]");      // escaped paren
-        diff_cmd("[[ $x =~ a\\\\b ]]");   // escaped backslash
-        diff_cmd("[[ $x =~ 'a b' ]]");    // single-quoted run
-        diff_cmd("[[ $x =~ \"a b\" ]]");  // double-quoted span
+        diff_cmd("[[ $x =~ a\\.b ]]"); // THE #1 TRAP: \x kept as unquoted literal `a\.b`
+        diff_cmd("[[ $x =~ a\\ b ]]"); // escaped space kept literal
+        diff_cmd("[[ $x =~ \\) ]]"); // escaped paren
+        diff_cmd("[[ $x =~ a\\\\b ]]"); // escaped backslash
+        diff_cmd("[[ $x =~ 'a b' ]]"); // single-quoted run
+        diff_cmd("[[ $x =~ \"a b\" ]]"); // double-quoted span
         diff_cmd("[[ $x =~ $'x\\ny' ]]"); // ansi-c
-        diff_cmd("[[ $x =~ ${p:-d} ]]");  // param op
+        diff_cmd("[[ $x =~ ${p:-d} ]]"); // param op
         diff_cmd("[[ $x =~ `echo a` ]]"); // backtick
         diff_cmd("[[ $x =~ pre$(c)post ]]"); // glued cmdsub
         diff_cmd("[[ $x =~ (a\\ b)c ]]"); // escaped space inside group + trailing
-        diff_cmd("[[ $x =~ $@ ]]");       // $@
-        diff_cmd("[[ $x =~ $* ]]");       // $*
-        diff_cmd("[[ $x =~ $? ]]");       // $?
-        diff_cmd("[[ $x =~ a$ ]]");       // trailing lone $
-        diff_cmd("[[ $x =~ .* ]]");       // metachars
+        diff_cmd("[[ $x =~ $@ ]]"); // $@
+        diff_cmd("[[ $x =~ $* ]]"); // $*
+        diff_cmd("[[ $x =~ $? ]]"); // $?
+        diff_cmd("[[ $x =~ a$ ]]"); // trailing lone $
+        diff_cmd("[[ $x =~ .* ]]"); // metachars
     }
 
     /// v254 T1 review fix: the oracle treats empty `''` and `""` DIFFERENTLY in a
@@ -7412,13 +8577,13 @@ mod tests {
     /// makes `body_started` parser-managed + drops the injected empty-`""` marker.
     #[test]
     fn atoms_regex_empty_quotes() {
-        diff_err("[[ $x =~ \"\" ]]");   // empty dquote → both Err(TestExprMissingOperand) (space skipped, pattern becomes `]]`, rejected as operand)
-        diff_cmd("[[ $x =~ '' ]]");     // empty squote → both Ok, pattern [Literal "" q:true], space terminates
+        diff_err("[[ $x =~ \"\" ]]"); // empty dquote → both Err(TestExprMissingOperand) (space skipped, pattern becomes `]]`, rejected as operand)
+        diff_cmd("[[ $x =~ '' ]]"); // empty squote → both Ok, pattern [Literal "" q:true], space terminates
         diff_cmd("[[ $x =~ a\"\"b ]]"); // → both [Lit "a", Lit "b"] (empty dquote adds nothing)
-        diff_cmd("[[ $x =~ a''b ]]");   // → both [Lit "a", Lit "" q:true, Lit "b"] (empty squote kept)
-        diff_cmd("[[ $x =~ \"x\" ]]");  // non-empty dquote unaffected: pattern [Lit "x" q:true]
-        diff_cmd("[[ $x =~ abc ]]");    // no regression to the started/terminator logic
-        diff_cmd("[[ $x =~ (a b) ]]");  // paren-depth space still kept, terminator still fires
+        diff_cmd("[[ $x =~ a''b ]]"); // → both [Lit "a", Lit "" q:true, Lit "b"] (empty squote kept)
+        diff_cmd("[[ $x =~ \"x\" ]]"); // non-empty dquote unaffected: pattern [Lit "x" q:true]
+        diff_cmd("[[ $x =~ abc ]]"); // no regression to the started/terminator logic
+        diff_cmd("[[ $x =~ (a b) ]]"); // paren-depth space still kept, terminator still fires
     }
 
     /// v254 T1 review MINOR — glued `=~<b`/`=~>b` live-flip carry-forward. With no
@@ -7438,7 +8603,7 @@ mod tests {
         assert!(new_seq("[[ a =~<b ]]").is_err());
         assert!(new_seq("[[ a =~>b ]]").is_err());
         // SPACED forms (the supported v254 shape) fully agree on the AST:
-        diff_cmd("[[ a =~ <b ]]");  // spaced: `<b` is the operand on both
+        diff_cmd("[[ a =~ <b ]]"); // spaced: `<b` is the operand on both
         diff_cmd("[[ a =~ >b ]]");
     }
 
@@ -7459,22 +8624,22 @@ mod tests {
     #[test]
     fn atoms_regex_quoting_escapes_terminators() {
         // Quoting
-        diff_cmd("[[ $x =~ \"a b\" ]]");         // dquote keeps the space, quoted part
-        diff_cmd("[[ $x =~ 'a.b' ]]");           // squote literal
-        diff_cmd("[[ $x =~ x\"$y\"z ]]");        // literal + dquoted expansion + literal
-        diff_cmd("[[ $x =~ \"$p\"* ]]");         // dquoted var then literal `*`
+        diff_cmd("[[ $x =~ \"a b\" ]]"); // dquote keeps the space, quoted part
+        diff_cmd("[[ $x =~ 'a.b' ]]"); // squote literal
+        diff_cmd("[[ $x =~ x\"$y\"z ]]"); // literal + dquoted expansion + literal
+        diff_cmd("[[ $x =~ \"$p\"* ]]"); // dquoted var then literal `*`
         // Escapes — backslash KEPT in the plain literal (NOT a Backslash QuoteRun)
-        diff_cmd("[[ $x =~ \\. ]]");             // `\.` → literal `\.`
-        diff_cmd("[[ $x =~ a\\.b ]]");           // `a\.b` one literal
-        diff_cmd("[[ $x =~ a\\ b ]]");           // escaped space does NOT terminate
-        diff_cmd("[[ $x =~ \\$lit ]]");          // escaped `$` → literal `$lit`
+        diff_cmd("[[ $x =~ \\. ]]"); // `\.` → literal `\.`
+        diff_cmd("[[ $x =~ a\\.b ]]"); // `a\.b` one literal
+        diff_cmd("[[ $x =~ a\\ b ]]"); // escaped space does NOT terminate
+        diff_cmd("[[ $x =~ \\$lit ]]"); // escaped `$` → literal `$lit`
         // Line continuations
-        diff_cmd("[[ $x =~ a\\\nb ]]");          // mid-pattern `\<NL>` → `ab`
-        diff_cmd("[[ $x =~ \\\n  foo ]]");       // leading `\<NL>` + indent skipped → `foo`
+        diff_cmd("[[ $x =~ a\\\nb ]]"); // mid-pattern `\<NL>` → `ab`
+        diff_cmd("[[ $x =~ \\\n  foo ]]"); // leading `\<NL>` + indent skipped → `foo`
         // Terminator edges
-        diff_err("[[ $x =~ ]]");                 // pattern `]]`, then no `]]` → Unterminated
-        diff_err("[[ $x =~ foo");                // EOF → Unterminated
-        diff_cmd("[[ $x =~ a]] ]]");             // pattern `a]]`, then space, then `]]` closes
+        diff_err("[[ $x =~ ]]"); // pattern `]]`, then no `]]` → Unterminated
+        diff_err("[[ $x =~ foo"); // EOF → Unterminated
+        diff_cmd("[[ $x =~ a]] ]]"); // pattern `a]]`, then space, then `]]` closes
     }
 
     /// v254 T3: regex as a PRIMARY in the `[[ ]]` cascade — composed with
@@ -7484,12 +8649,12 @@ mod tests {
     /// `TestExpr::Regex` byte-identically to the oracle.
     #[test]
     fn atoms_regex_composition() {
-        diff_cmd("[[ -f a && $x =~ b|c ]]");     // regex after &&
-        diff_cmd("[[ $x =~ a || $y =~ b ]]");    // regex on both sides of ||
-        diff_cmd("[[ ( $x =~ b ) ]]");           // grouped regex
-        diff_cmd("[[ ! $x =~ b ]]");             // negated regex
-        diff_cmd("[[ $x =~ a && $y == b ]]");    // regex then a normal binary
-        diff_cmd("FOO=hi [[ $FOO =~ h.* ]]");    // regex under an inline assignment
+        diff_cmd("[[ -f a && $x =~ b|c ]]"); // regex after &&
+        diff_cmd("[[ $x =~ a || $y =~ b ]]"); // regex on both sides of ||
+        diff_cmd("[[ ( $x =~ b ) ]]"); // grouped regex
+        diff_cmd("[[ ! $x =~ b ]]"); // negated regex
+        diff_cmd("[[ $x =~ a && $y == b ]]"); // regex then a normal binary
+        diff_cmd("FOO=hi [[ $FOO =~ h.* ]]"); // regex under an inline assignment
     }
 
     /// v254 T3: adversarial corpus — POSIX classes, alternation groups, escaped
@@ -7500,33 +8665,33 @@ mod tests {
     /// on both paths.
     #[test]
     fn atoms_regex_corpus() {
-        diff_cmd("[[ $x =~ a*b? ]]");                 // glob-like quantifiers (literal in ERE)
-        diff_cmd("[[ $x =~ [[:alpha:]]+ ]]");         // POSIX class (nested [] and :)
-        diff_cmd("[[ $x =~ (foo|bar)+baz ]]");        // alternation inside a group
-        diff_cmd("[[ $x =~ a\\|b ]]");                // escaped pipe → literal `\|`
-        diff_cmd("[[ $x =~ ${a:-def} ]]");            // param default inside pattern
-        diff_cmd("[[ $x =~ `echo re` ]]");            // backtick command-sub
-        diff_cmd("[[ $x =~ \"a b\"c'd e' ]]");        // dquote + literal + squote (spaces via quotes)
-        diff_cmd("[[ $x =~ pre$(cmd)post ]]");        // cmdsub glued between literals
-        diff_err("[[ $x =~ a(b ]]");                  // unbalanced `(` → depth stays >0, ` ]]` swallowed literal → EOF → Unterminated
-        diff_err("[[ $x =~ (a b ]]");                 // unbalanced open group swallows ` ]]` (depth>0 ws literal) → Unterminated
+        diff_cmd("[[ $x =~ a*b? ]]"); // glob-like quantifiers (literal in ERE)
+        diff_cmd("[[ $x =~ [[:alpha:]]+ ]]"); // POSIX class (nested [] and :)
+        diff_cmd("[[ $x =~ (foo|bar)+baz ]]"); // alternation inside a group
+        diff_cmd("[[ $x =~ a\\|b ]]"); // escaped pipe → literal `\|`
+        diff_cmd("[[ $x =~ ${a:-def} ]]"); // param default inside pattern
+        diff_cmd("[[ $x =~ `echo re` ]]"); // backtick command-sub
+        diff_cmd("[[ $x =~ \"a b\"c'd e' ]]"); // dquote + literal + squote (spaces via quotes)
+        diff_cmd("[[ $x =~ pre$(cmd)post ]]"); // cmdsub glued between literals
+        diff_err("[[ $x =~ a(b ]]"); // unbalanced `(` → depth stays >0, ` ]]` swallowed literal → EOF → Unterminated
+        diff_err("[[ $x =~ (a b ]]"); // unbalanced open group swallows ` ]]` (depth>0 ws literal) → Unterminated
     }
 
     // v253 T2: adversarial precedence/grouping/newlines corpus (hardens the
     // T1 cascade — see `parse_test_or`/`parse_test_and`/`parse_test_not`).
     #[test]
     fn atoms_double_bracket_precedence() {
-        diff_cmd("[[ a && b && c ]]");            // left-assoc &&
-        diff_cmd("[[ a || b || c ]]");             // left-assoc ||
-        diff_cmd("[[ a && b || c && d ]]");        // && binds tighter than ||
-        diff_cmd("[[ ! a && b ]]");                // ! binds tighter than &&
-        diff_cmd("[[ ! ! a ]]");                   // right-assoc double negation
-        diff_cmd("[[ ( a || b ) && c ]]");         // grouping overrides precedence
-        diff_cmd("[[ ( ( a ) ) ]]");                // nested grouping
+        diff_cmd("[[ a && b && c ]]"); // left-assoc &&
+        diff_cmd("[[ a || b || c ]]"); // left-assoc ||
+        diff_cmd("[[ a && b || c && d ]]"); // && binds tighter than ||
+        diff_cmd("[[ ! a && b ]]"); // ! binds tighter than &&
+        diff_cmd("[[ ! ! a ]]"); // right-assoc double negation
+        diff_cmd("[[ ( a || b ) && c ]]"); // grouping overrides precedence
+        diff_cmd("[[ ( ( a ) ) ]]"); // nested grouping
         diff_cmd("[[ -n a && ( -z b || -f c ) ]]");
-        diff_cmd("[[ a\n&&\nb ]]");                // newlines around &&
-        diff_cmd("[[\n  a == b\n]]");               // newlines after [[ and before ]]
-        diff_cmd("[[ a ||\n b ]]");                 // newline after ||
+        diff_cmd("[[ a\n&&\nb ]]"); // newlines around &&
+        diff_cmd("[[\n  a == b\n]]"); // newlines after [[ and before ]]
+        diff_cmd("[[ a ||\n b ]]"); // newline after ||
     }
 
     /// T1-review CRITICAL regression: a `Newline` at an operand/operator
@@ -7538,11 +8703,11 @@ mod tests {
     /// reaches the operand check → the same error the oracle raises.
     #[test]
     fn atoms_double_bracket_newline_boundaries() {
-        diff_err("[[ -f\nx ]]");    // unary operand on next line → TestExprMissingOperand (both)
-        diff_err("[[ a ==\nb ]]");  // binary rhs on next line → TestExprMissingOperand (both)
-        diff_err("[[ a\n== b ]]");  // operator on next line → lone-word then leftover → UnterminatedDoubleBracket (both)
-        diff_err("[[ (\na ) ]]");   // newline after `(` (grouping first operand) → TestExprMissingOperand (both)
-        diff_err("[[ !\nx ]]");     // newline after `!` (post-negation operand) → TestExprMissingOperand (both)
+        diff_err("[[ -f\nx ]]"); // unary operand on next line → TestExprMissingOperand (both)
+        diff_err("[[ a ==\nb ]]"); // binary rhs on next line → TestExprMissingOperand (both)
+        diff_err("[[ a\n== b ]]"); // operator on next line → lone-word then leftover → UnterminatedDoubleBracket (both)
+        diff_err("[[ (\na ) ]]"); // newline after `(` (grouping first operand) → TestExprMissingOperand (both)
+        diff_err("[[ !\nx ]]"); // newline after `!` (post-negation operand) → TestExprMissingOperand (both)
         // The LEGIT multi-line cases (newline breaks only at the four oracle
         // skip sites) still parse identically — see also
         // `atoms_double_bracket_precedence`.
@@ -7559,28 +8724,28 @@ mod tests {
     fn atoms_double_bracket_errors() {
         // Same ERROR VARIANT on both paths (full `Result` equality, not just
         // is_err()==is_err()).
-        diff_err("[[ ]]");          // EmptyDoubleBracket
-        diff_err("[[ a == b");      // UnterminatedDoubleBracket (EOF)
-        diff_err("[[ < b ]]");      // MissingOperand (leading Op)
-        diff_err("[[ == b ]]");     // `==` is a Word → lone-word then leftover `b` → Unterminated
-        diff_err("[[ -f ]]");       // unary missing operand
-        diff_err("[[ a == ]]");     // binary missing rhs
+        diff_err("[[ ]]"); // EmptyDoubleBracket
+        diff_err("[[ a == b"); // UnterminatedDoubleBracket (EOF)
+        diff_err("[[ < b ]]"); // MissingOperand (leading Op)
+        diff_err("[[ == b ]]"); // `==` is a Word → lone-word then leftover `b` → Unterminated
+        diff_err("[[ -f ]]"); // unary missing operand
+        diff_err("[[ a == ]]"); // binary missing rhs
     }
 
     // v253 T4: adversarial corpus (expansions/quotes/globs/tokenization edges).
     #[test]
     fn atoms_double_bracket_corpus() {
-        diff_cmd("[[ \"$x\" == \"$y\" ]]");          // quoted operands
-        diff_cmd("[[ ${a[0]} -gt 0 ]]");             // subscript expansion operand
-        diff_cmd("[[ $(cmd) == out ]]");             // command-sub operand
-        diff_cmd("[[ a=b ]]");                       // `a=b` is ONE word (lone-word -n), NOT an assignment
+        diff_cmd("[[ \"$x\" == \"$y\" ]]"); // quoted operands
+        diff_cmd("[[ ${a[0]} -gt 0 ]]"); // subscript expansion operand
+        diff_cmd("[[ $(cmd) == out ]]"); // command-sub operand
+        diff_cmd("[[ a=b ]]"); // `a=b` is ONE word (lone-word -n), NOT an assignment
         diff_cmd("[[ -n a=b ]]");
-        diff_cmd("[[ x != y* ]]");                   // glob pattern RHS of !=
-        diff_cmd("[[ -f 'a b' ]]");                  // quoted operand w/ space
-        diff_cmd("[[ a\\ b == c ]]");                // escaped space in operand
-        diff_cmd("[[ ! ( a == b ) || c ]]");         // ! before a group
+        diff_cmd("[[ x != y* ]]"); // glob pattern RHS of !=
+        diff_cmd("[[ -f 'a b' ]]"); // quoted operand w/ space
+        diff_cmd("[[ a\\ b == c ]]"); // escaped space in operand
+        diff_cmd("[[ ! ( a == b ) || c ]]"); // ! before a group
         diff_cmd("[[ -e / ]]");
-        diff_cmd("[[ -o errexit ]]");                // -o shell-option unary
+        diff_cmd("[[ -o errexit ]]"); // -o shell-option unary
     }
 
     /// v259 CF3 live-flip carry-forward fix: `finish_pipeline` only wrapped a
@@ -7621,8 +8786,8 @@ mod tests {
         // $"…" is locale quoting == "…"; the oracle drops the `$`. The atom path
         // used to keep a stray Literal "$".
         diff_cmd("echo $\"hi\"");
-        diff_cmd("echo $\"a\"$\"b\"");        // multiple, all drop the `$`
-        diff_cmd("[[ $x =~ $\"abc\" ]]");      // regex operand (shared classifier)
+        diff_cmd("echo $\"a\"$\"b\""); // multiple, all drop the `$`
+        diff_cmd("[[ $x =~ $\"abc\" ]]"); // regex operand (shared classifier)
         // Regression: a $" INSIDE a double-quoted span stays a literal `$` on
         // both paths — must remain unchanged.
         diff_cmd("echo \"a$\"b\"c\"");
@@ -7669,11 +8834,11 @@ mod tests {
         diff_cmd("{ ! a || b; }");
         diff_cmd("{ ! a | b; }");
         // Regression guards — already correct, must STAY byte-identical.
-        diff_cmd("! a");                       // top-level
-        diff_cmd("( ! a )");                   // subshell (bespoke path)
-        diff_cmd("case x in a) ! b;; esac");   // bespoke case-item path
-        diff_cmd("{ a; }");                    // no bang
-        diff_cmd("!a");                        // glued — not a bang word
+        diff_cmd("! a"); // top-level
+        diff_cmd("( ! a )"); // subshell (bespoke path)
+        diff_cmd("case x in a) ! b;; esac"); // bespoke case-item path
+        diff_cmd("{ a; }"); // no bang
+        diff_cmd("!a"); // glued — not a bang word
     }
 
     #[test]
@@ -7694,12 +8859,12 @@ mod tests {
         diff_cmd("${a[x\"y\"]}");
         diff_cmd("declare -A m=([\"k\"]=v)");
         // Regression guards — must STAY byte-identical.
-        diff_cmd("${x:-\"y\"}");      // value operand — FLAT (not wrapped)
-        diff_cmd("${x:-'y'}");        // value single-quote — FLAT
-        diff_cmd("a=([$\"k\"]=v)");   // v259 F3 dquote — already wraps
-        diff_cmd("${a[$\"k\"]}");     // F3 in param-expansion subscript
-        diff_cmd("a=([k]=v)");        // plain — flat quoted:false
-        diff_cmd("${a[k]}");          // plain
+        diff_cmd("${x:-\"y\"}"); // value operand — FLAT (not wrapped)
+        diff_cmd("${x:-'y'}"); // value single-quote — FLAT
+        diff_cmd("a=([$\"k\"]=v)"); // v259 F3 dquote — already wraps
+        diff_cmd("${a[$\"k\"]}"); // F3 in param-expansion subscript
+        diff_cmd("a=([k]=v)"); // plain — flat quoted:false
+        diff_cmd("${a[k]}"); // plain
     }
 
     #[test]
@@ -7709,15 +8874,15 @@ mod tests {
         // alongside the subscript. The atom's ParamClose dispatch took the
         // `subscript.is_some()` branch (modifier: None) BEFORE `length_form`,
         // silently dropping the length. Now honored.
-        diff_cmd("${#a[0]}");        // Length + subscript Index(0)
-        diff_cmd("${#a[k]}");        // Length + subscript Index(k)
-        diff_cmd("${#a[\"k\"]}");    // Length + subscript Quoted{Double} (v263 wrap too)
-        diff_cmd("${#a['k']}");      // Length + subscript Quoted{Single}
-        diff_cmd("${#a[*]}");        // Length + subscript Star
-        diff_cmd("${#a[@]}");        // Length + subscript All
+        diff_cmd("${#a[0]}"); // Length + subscript Index(0)
+        diff_cmd("${#a[k]}"); // Length + subscript Index(k)
+        diff_cmd("${#a[\"k\"]}"); // Length + subscript Quoted{Double} (v263 wrap too)
+        diff_cmd("${#a['k']}"); // Length + subscript Quoted{Single}
+        diff_cmd("${#a[*]}"); // Length + subscript Star
+        diff_cmd("${#a[@]}"); // Length + subscript All
         // Guards — must STAY byte-identical.
-        diff_cmd("${#a}");           // plain length, no subscript
-        diff_cmd("${a[0]}");         // subscript, no length → modifier None
+        diff_cmd("${#a}"); // plain length, no subscript
+        diff_cmd("${a[0]}"); // subscript, no length → modifier None
     }
 
     #[test]
@@ -7728,18 +8893,18 @@ mod tests {
         diff_cmd(r#"echo "${x:+'a|b'}""#);
         diff_cmd(r#"echo "${x-'a'}""#);
         diff_cmd(r#"echo "${x+'A'}""#);
-        diff_cmd(r#"echo "${x:-\*}""#);      // \* kept
-        diff_cmd(r#"echo "${x:-a\nb}""#);    // \n kept
-        diff_cmd(r#"echo "${x:-a\$b}""#);    // \$ -> $ (coincides; regression guard)
-        diff_cmd(r#"echo "${x:-x\"z}""#);    // \" -> " (regression guard)
-        diff_cmd(r#"echo "${x:-a\\b}""#);    // \\ -> \ (regression guard)
-        diff_cmd(r#"echo "${x:-$y}""#);      // var in dquote operand (regression guard)
+        diff_cmd(r#"echo "${x:-\*}""#); // \* kept
+        diff_cmd(r#"echo "${x:-a\nb}""#); // \n kept
+        diff_cmd(r#"echo "${x:-a\$b}""#); // \$ -> $ (coincides; regression guard)
+        diff_cmd(r#"echo "${x:-x\"z}""#); // \" -> " (regression guard)
+        diff_cmd(r#"echo "${x:-a\\b}""#); // \\ -> \ (regression guard)
+        diff_cmd(r#"echo "${x:-$y}""#); // var in dquote operand (regression guard)
         // UNQUOTED operands must be UNCHANGED (enclosing_dquote=false):
-        diff_cmd("echo ${x:-'a|b'}");        // unquoted: single-quote IS a span
-        diff_cmd(r#"echo ${x:-\*}"#);        // unquoted backslash
+        diff_cmd("echo ${x:-'a|b'}"); // unquoted: single-quote IS a span
+        diff_cmd(r#"echo ${x:-\*}"#); // unquoted backslash
         // enclosing_dquote=false operators unchanged:
-        diff_cmd(r#"echo "${x#'z'}""#);      // RemovePrefix pattern: enclosing_dquote=false
-        diff_cmd(r#"echo "${x:?'m'}""#);     // ErrorIfUnset: enclosing_dquote=false
+        diff_cmd(r#"echo "${x#'z'}""#); // RemovePrefix pattern: enclosing_dquote=false
+        diff_cmd(r#"echo "${x:?'m'}""#); // ErrorIfUnset: enclosing_dquote=false
     }
 
     // ── v264 parse_one_unit differential ─────────────────────────────────────
@@ -7758,30 +8923,36 @@ mod tests {
             let r = f(lx);
             let stop = matches!(r, Ok(None) | Err(_));
             out.push(r);
-            if stop { break; }
+            if stop {
+                break;
+            }
         }
         out
     }
     fn diff_unit(s: &str) {
-        assert!(new_unit(s).iter().all(|r| r.is_ok()), "expected all-Ok units for {s:?}, got {:?}", new_unit(s));
+        assert!(
+            new_unit(s).iter().all(|r| r.is_ok()),
+            "expected all-Ok units for {s:?}, got {:?}",
+            new_unit(s)
+        );
     }
 
     #[test]
     fn atoms_parse_one_unit_matches_oracle() {
-        diff_unit("a\nb\nc");              // three units on three lines
-        diff_unit("a; b\nc");             // `;` stays intra-unit; newline splits
-        diff_unit("a && b\nc || d");      // connectors intra-unit
-        diff_unit("a &\nb");             // background then newline
-        diff_unit("\n\na\n\nb\n");        // leading/among/trailing blank lines
-        diff_unit("a\n");                // single unit, trailing newline
-        diff_unit("");                    // empty → one Ok(None)
-        diff_unit("   \n  a  \n");        // blank-ish lines + surrounding blanks
+        diff_unit("a\nb\nc"); // three units on three lines
+        diff_unit("a; b\nc"); // `;` stays intra-unit; newline splits
+        diff_unit("a && b\nc || d"); // connectors intra-unit
+        diff_unit("a &\nb"); // background then newline
+        diff_unit("\n\na\n\nb\n"); // leading/among/trailing blank lines
+        diff_unit("a\n"); // single unit, trailing newline
+        diff_unit(""); // empty → one Ok(None)
+        diff_unit("   \n  a  \n"); // blank-ish lines + surrounding blanks
         diff_unit("if x; then y; fi\nz"); // compound spanning `;`, then next unit
-        diff_unit("f() {\n:\n}\ng");      // compound spanning NEWLINES, then next unit
+        diff_unit("f() {\n:\n}\ng"); // compound spanning NEWLINES, then next unit
         diff_unit("for i in 1 2; do echo $i; done\ndone_marker");
         diff_unit("cat <<EOF\nhi $x\nEOF\necho next"); // heredoc body drained in-unit
-        diff_unit("cat <<'EOF'\nlit\nEOF\nafter");     // literal heredoc, then next unit
-        diff_unit("a | b\nc");            // pipeline intra-unit
+        diff_unit("cat <<'EOF'\nlit\nEOF\nafter"); // literal heredoc, then next unit
+        diff_unit("a | b\nc"); // pipeline intra-unit
     }
 
     // ── v264 extglob differential (atom-native vs oracle) ───────────────────
@@ -7789,11 +8960,22 @@ mod tests {
     // turn it ON for both the oracle (`command::parse`, driven by
     // `scan_extglob_group`) and the atom path, and assert byte-identical ASTs.
     fn new_eg(s: &str) -> Result<Option<Sequence>, ParseError> {
-        let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions { extglob: true, ..Default::default() });
+        let mut lx = Lexer::new_live_atoms(
+            s,
+            &Default::default(),
+            LexerOptions {
+                extglob: true,
+                ..Default::default()
+            },
+        );
         super::parse_sequence(&mut lx)
     }
     fn diff_eg(s: &str) {
-        assert!(new_eg(s).is_ok(), "expected Ok for {s:?}, got {:?}", new_eg(s));
+        assert!(
+            new_eg(s).is_ok(),
+            "expected Ok for {s:?}, got {:?}",
+            new_eg(s)
+        );
     }
 
     #[test]
@@ -7804,13 +8986,13 @@ mod tests {
         diff_eg("echo *(a)");
         diff_eg("echo ?(abc)");
         diff_eg("echo +([a-c])");
-        diff_eg("echo zzz+(q)");            // glued prefix literal
-        diff_eg("echo +(a|b)*");            // glued trailing
+        diff_eg("echo zzz+(q)"); // glued prefix literal
+        diff_eg("echo +(a|b)*"); // glued trailing
         diff_eg("echo dir*/+(foo|bar).txt"); // multi-component glue
-        diff_eg("echo @(a*(b)c)");           // NESTED extglob group (paren depth > 1)
-        diff_eg("echo +($x)");               // inner param
-        diff_eg("echo @(a|$(echo b))");      // inner COMMAND SUB (the RULE-critical case)
-        diff_eg("echo +(${v})");             // inner ${...}
+        diff_eg("echo @(a*(b)c)"); // NESTED extglob group (paren depth > 1)
+        diff_eg("echo +($x)"); // inner param
+        diff_eg("echo @(a|$(echo b))"); // inner COMMAND SUB (the RULE-critical case)
+        diff_eg("echo +(${v})"); // inner ${...}
         diff_eg("[[ aab == +(a|b) ]] && echo y || echo n");
         diff_eg("[[ abbbc == @(a*(b)c) ]] && echo y || echo n");
         diff_eg("[[ file.txt == +([a-z]).txt ]] && echo y || echo n");
@@ -7821,7 +9003,7 @@ mod tests {
         // mid-word identically (`Err(UnexpectedToken)`, pre-existing/unrelated
         // to extglob) — `diff_err` (not `diff_cmd`) is the correct comparison
         // for a case where BOTH sides error the same way rather than succeed.
-        diff_err("echo +(a)");               // extglob off: oracle+atom both treat as-is
+        diff_err("echo +(a)"); // extglob off: oracle+atom both treat as-is
     }
 
     // ── v264 nested-body flip: route cmdsub / backtick bodies to the ATOM
@@ -7867,10 +9049,12 @@ mod tests {
             // Concatenate all Literal parts (an extglob group glued to literal
             // prefix/suffix, e.g. `a*(b)c`, assembles as several `Literal` parts).
             fn concat(w: &Word) -> String {
-                w.0.iter().map(|p| match p {
-                    WordPart::Literal { text, .. } => text.clone(),
-                    o => panic!("rhs part not a plain literal: {o:?}"),
-                }).collect()
+                w.0.iter()
+                    .map(|p| match p {
+                        WordPart::Literal { text, .. } => text.clone(),
+                        o => panic!("rhs part not a plain literal: {o:?}"),
+                    })
+                    .collect()
             }
             match t6_first(s) {
                 Command::DoubleBracket { expr, .. } => match *expr {
@@ -7897,7 +9081,10 @@ mod tests {
     fn g3_dbracket_grouping_and_literal_paren_still_parse() {
         // `[[ (expr) ]]` grouping must still parse (bare `(`, no `?*+@!` prefix,
         // does NOT trigger the extglob gate).
-        assert!(matches!(t6_first("[[ (a == a) ]]"), Command::DoubleBracket { .. }));
+        assert!(matches!(
+            t6_first("[[ (a == a) ]]"),
+            Command::DoubleBracket { .. }
+        ));
         // A quoted paren RHS is a quoted literal, NOT an extglob group (no
         // `ExtglobOpen` fires for `"("` — the `(` is inside a `"…"` span). It
         // parses as a Binary whose rhs is a single Quoted part.
@@ -7905,7 +9092,11 @@ mod tests {
             Command::DoubleBracket { expr, .. } => match *expr {
                 TestExpr::Binary { rhs, .. } => {
                     assert_eq!(rhs.0.len(), 1);
-                    assert!(matches!(rhs.0[0], WordPart::Quoted { .. }), "got {:?}", rhs.0[0]);
+                    assert!(
+                        matches!(rhs.0[0], WordPart::Quoted { .. }),
+                        "got {:?}",
+                        rhs.0[0]
+                    );
                 }
                 o => panic!("{o:?}"),
             },
@@ -7919,7 +9110,10 @@ mod tests {
         // `echo @(a)` with extglob OFF is still a parse error (unchanged), and a
         // `@(a)` inside a `$(…)` nested in the operand is NOT force-recognized
         // (extglob stays off inside the command substitution, matching bash).
-        assert!(new_seq("echo @(a)").is_err(), "bare @( must still error with extglob off");
+        assert!(
+            new_seq("echo @(a)").is_err(),
+            "bare @( must still error with extglob off"
+        );
         assert!(
             new_seq("[[ x == $(echo @(a)) ]]").is_err(),
             "@( inside a nested cmdsub must NOT inherit force-extglob"
@@ -7952,11 +9146,17 @@ mod tests {
     fn parse_and_or_prunes_long_semicolon_chain() {
         let empty = std::collections::HashMap::new();
         let n = HISTORY_PRUNE_THRESHOLD + 200;
-        let src: String = (0..n).map(|i| format!("echo {i}")).collect::<Vec<_>>().join("; ");
+        let src: String = (0..n)
+            .map(|i| format!("echo {i}"))
+            .collect::<Vec<_>>()
+            .join("; ");
         let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
         let seq = parse_sequence(&mut lx).unwrap().unwrap();
         assert_eq!(1 + seq.rest.len(), n, "all commands parsed");
-        assert!(lx.scanned_token_count() < 2 * HISTORY_PRUNE_THRESHOLD, "pruned during parse");
+        assert!(
+            lx.scanned_token_count() < 2 * HISTORY_PRUNE_THRESHOLD,
+            "pruned during parse"
+        );
     }
 
     #[test]
@@ -7971,7 +9171,9 @@ mod tests {
         // wrapping a subshell, exactly like the original oracle construct.
         let empty = std::collections::HashMap::new();
         let filler: String = (0..HISTORY_PRUNE_THRESHOLD + 50)
-            .map(|i| format!("echo {i}")).collect::<Vec<_>>().join("; ");
+            .map(|i| format!("echo {i}"))
+            .collect::<Vec<_>>()
+            .join("; ");
         let src = format!("{filler}; echo $((echo x) )");
         let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
         assert!(parse_sequence(&mut lx).unwrap().is_some());
@@ -7981,7 +9183,9 @@ mod tests {
     fn prune_inside_nested_command_sub() {
         let empty = std::collections::HashMap::new();
         let inner: String = (0..HISTORY_PRUNE_THRESHOLD + 50)
-            .map(|i| format!("echo {i}")).collect::<Vec<_>>().join("; ");
+            .map(|i| format!("echo {i}"))
+            .collect::<Vec<_>>()
+            .join("; ");
         let src = format!("x=$({inner})");
         let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
         assert!(parse_sequence(&mut lx).unwrap().is_some());
@@ -7992,26 +9196,42 @@ mod tests {
         // Heredoc redirect, then enough `;`-commands on the SAME line to cross the
         // threshold BEFORE the body, then the body. The prune must skip while the
         // heredoc is pending, so the body still attaches.
-        use crate::command::{Command, SimpleCommand, RedirOp};
+        use crate::command::{Command, RedirOp, SimpleCommand};
         use crate::lexer::WordPart;
         let empty = std::collections::HashMap::new();
         let filler: String = (0..HISTORY_PRUNE_THRESHOLD + 50)
-            .map(|i| format!("; echo {i}")).collect();
+            .map(|i| format!("; echo {i}"))
+            .collect();
         let src = format!("cat <<EOF{filler}\nBODYLINE\nEOF\n");
         let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
         let seq = parse_one_unit(&mut lx).unwrap().unwrap();
         // Extract the first heredoc body from the first command.
-        let Command::Pipeline(p) = &seq.first else { panic!("expected pipeline") };
-        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!("expected exec") };
-        let body = e.redirects.iter().find_map(|r| match &r.op {
-            RedirOp::Heredoc { body, .. } => Some(body.clone()),
-            _ => None,
-        }).expect("heredoc redirect present");
-        let text: String = body.0.iter().filter_map(|part| match part {
-            WordPart::Literal { text, .. } => Some(text.clone()),
-            _ => None,
-        }).collect();
-        assert!(text.contains("BODYLINE"), "heredoc body lost across prune: {text:?}");
+        let Command::Pipeline(p) = &seq.first else {
+            panic!("expected pipeline")
+        };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else {
+            panic!("expected exec")
+        };
+        let body = e
+            .redirects
+            .iter()
+            .find_map(|r| match &r.op {
+                RedirOp::Heredoc { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .expect("heredoc redirect present");
+        let text: String = body
+            .0
+            .iter()
+            .filter_map(|part| match part {
+                WordPart::Literal { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains("BODYLINE"),
+            "heredoc body lost across prune: {text:?}"
+        );
     }
 
     #[test]
@@ -8051,19 +9271,35 @@ mod tests {
     fn cmdword_indexed_assignment_builds_indexed_target() {
         // Regression: a[i]=v and a[$(echo 2)]=v still produce AssignTarget::Indexed
         // with the right subscript Word (was the lexer bridge; now parser-assembled).
-        use crate::command::{Command, SimpleCommand, AssignTarget};
+        use crate::command::{AssignTarget, Command, SimpleCommand};
         for (src, want_sub_lit) in [("a[0]=v", Some("0")), ("a[$(echo 2)]=v", None)] {
             let empty = std::collections::HashMap::new();
-            let mut lx = crate::lexer::Lexer::new_live_atoms(src, &empty, crate::lexer::LexerOptions::default());
+            let mut lx = crate::lexer::Lexer::new_live_atoms(
+                src,
+                &empty,
+                crate::lexer::LexerOptions::default(),
+            );
             let seq = parse_sequence(&mut lx).unwrap().unwrap();
             // Bare assignment → Command::Simple(SimpleCommand::Assign([a], _))
-            let Command::Pipeline(p) = &seq.first else { panic!("pipeline") };
-            let Command::Simple(SimpleCommand::Assign(items, _)) = &p.commands[0] else { panic!("assign, got {:?}", p.commands[0]) };
+            let Command::Pipeline(p) = &seq.first else {
+                panic!("pipeline")
+            };
+            let Command::Simple(SimpleCommand::Assign(items, _)) = &p.commands[0] else {
+                panic!("assign, got {:?}", p.commands[0])
+            };
             assert_eq!(items.len(), 1);
-            let AssignTarget::Indexed { name, subscript } = &items[0].target else { panic!("indexed") };
+            let AssignTarget::Indexed { name, subscript } = &items[0].target else {
+                panic!("indexed")
+            };
             assert_eq!(name, "a");
             if let Some(lit) = want_sub_lit {
-                assert_eq!(subscript.0, vec![crate::lexer::WordPart::Literal { text: lit.into(), quoted: false }]);
+                assert_eq!(
+                    subscript.0,
+                    vec![crate::lexer::WordPart::Literal {
+                        text: lit.into(),
+                        quoted: false
+                    }]
+                );
             }
         }
     }
@@ -8076,34 +9312,78 @@ mod tests {
         use crate::lexer::WordPart;
         let empty = std::collections::HashMap::new();
         // a[bc]: single literal word, program "a[bc]", no inline assignment.
-        let mut lx = crate::lexer::Lexer::new_live_atoms("a[bc]", &empty, crate::lexer::LexerOptions::default());
+        let mut lx = crate::lexer::Lexer::new_live_atoms(
+            "a[bc]",
+            &empty,
+            crate::lexer::LexerOptions::default(),
+        );
         let seq = parse_sequence(&mut lx).unwrap().unwrap();
-        let Command::Pipeline(p) = &seq.first else { panic!() };
-        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!("exec, got {:?}", p.commands[0]) };
-        assert!(e.inline_assignments.is_empty(), "a[bc] must NOT be an assignment");
-        assert_eq!(e.program.0, vec![WordPart::Literal { text: "a[bc]".into(), quoted: false }]);
+        let Command::Pipeline(p) = &seq.first else {
+            panic!()
+        };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else {
+            panic!("exec, got {:?}", p.commands[0])
+        };
+        assert!(
+            e.inline_assignments.is_empty(),
+            "a[bc] must NOT be an assignment"
+        );
+        assert_eq!(
+            e.program.0,
+            vec![WordPart::Literal {
+                text: "a[bc]".into(),
+                quoted: false
+            }]
+        );
         // a[$x]: program parts must contain a Var (proves expansion, D1 fix), not a literal "$x".
-        let mut lx2 = crate::lexer::Lexer::new_live_atoms("a[$x]", &empty, crate::lexer::LexerOptions::default());
+        let mut lx2 = crate::lexer::Lexer::new_live_atoms(
+            "a[$x]",
+            &empty,
+            crate::lexer::LexerOptions::default(),
+        );
         let seq2 = parse_sequence(&mut lx2).unwrap().unwrap();
-        let Command::Pipeline(p2) = &seq2.first else { panic!() };
-        let Command::Simple(SimpleCommand::Exec(e2)) = &p2.commands[0] else { panic!() };
-        assert!(e2.program.0.iter().any(|p| matches!(p, WordPart::Var { name, .. } if name == "x")),
-            "a[$x] subscript must EXPAND (D1): {:?}", e2.program.0);
+        let Command::Pipeline(p2) = &seq2.first else {
+            panic!()
+        };
+        let Command::Simple(SimpleCommand::Exec(e2)) = &p2.commands[0] else {
+            panic!()
+        };
+        assert!(
+            e2.program
+                .0
+                .iter()
+                .any(|p| matches!(p, WordPart::Var { name, .. } if name == "x")),
+            "a[$x] subscript must EXPAND (D1): {:?}",
+            e2.program.0
+        );
     }
 
     #[test]
     fn cmdword_indexed_value_leading_tilde_expands() {
         // D2: a[0]=~/y — the value's leading ~ becomes a Tilde part (was literal).
-        use crate::command::{Command, SimpleCommand, AssignTarget};
+        use crate::command::{AssignTarget, Command, SimpleCommand};
         use crate::lexer::WordPart;
         let empty = std::collections::HashMap::new();
-        let mut lx = crate::lexer::Lexer::new_live_atoms("a[0]=~/y", &empty, crate::lexer::LexerOptions::default());
+        let mut lx = crate::lexer::Lexer::new_live_atoms(
+            "a[0]=~/y",
+            &empty,
+            crate::lexer::LexerOptions::default(),
+        );
         let seq = parse_sequence(&mut lx).unwrap().unwrap();
-        let Command::Pipeline(p) = &seq.first else { panic!() };
-        let Command::Simple(SimpleCommand::Assign(items, _)) = &p.commands[0] else { panic!() };
-        let AssignTarget::Indexed { .. } = &items[0].target else { panic!("indexed") };
-        assert!(matches!(items[0].value.0.first(), Some(WordPart::Tilde { .. })),
-            "D2: leading ~ must be a Tilde part, got {:?}", items[0].value.0);
+        let Command::Pipeline(p) = &seq.first else {
+            panic!()
+        };
+        let Command::Simple(SimpleCommand::Assign(items, _)) = &p.commands[0] else {
+            panic!()
+        };
+        let AssignTarget::Indexed { .. } = &items[0].target else {
+            panic!("indexed")
+        };
+        assert!(
+            matches!(items[0].value.0.first(), Some(WordPart::Tilde { .. })),
+            "D2: leading ~ must be a Tilde part, got {:?}",
+            items[0].value.0
+        );
     }
 
     #[test]
@@ -8137,15 +9417,30 @@ mod tests {
             ("printf '%s\\n' a[=1", "printf", vec!["%s\\n", "a[=1"]),
             ("echo one a[=x two", "echo", vec!["one", "a[=x", "two"]),
         ] {
-            let mut lx = crate::lexer::Lexer::new_live_atoms(src, &empty, crate::lexer::LexerOptions::default());
+            let mut lx = crate::lexer::Lexer::new_live_atoms(
+                src,
+                &empty,
+                crate::lexer::LexerOptions::default(),
+            );
             let result = parse_sequence(&mut lx);
-            assert!(result.is_ok(), "{src:?} must parse without error, got {result:?}");
+            assert!(
+                result.is_ok(),
+                "{src:?} must parse without error, got {result:?}"
+            );
             let seq = result.unwrap().expect("non-empty sequence");
-            let Command::Pipeline(p) = &seq.first else { panic!("{src:?}: not a pipeline") };
-            let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else {
-                panic!("{src:?}: not a plain Exec (got {:?}) — must NOT be an assignment", p.commands[0])
+            let Command::Pipeline(p) = &seq.first else {
+                panic!("{src:?}: not a pipeline")
             };
-            assert!(e.inline_assignments.is_empty(), "{src:?}: must NOT be an assignment");
+            let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else {
+                panic!(
+                    "{src:?}: not a plain Exec (got {:?}) — must NOT be an assignment",
+                    p.commands[0]
+                )
+            };
+            assert!(
+                e.inline_assignments.is_empty(),
+                "{src:?}: must NOT be an assignment"
+            );
             assert_eq!(word_text(&e.program), prog, "{src:?}: program mismatch");
             let got_args: Vec<String> = e.args.iter().map(word_text).collect();
             assert_eq!(got_args, args, "{src:?}: args mismatch");

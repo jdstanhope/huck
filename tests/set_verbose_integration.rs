@@ -2,19 +2,31 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn huck_binary() -> String { env!("CARGO_BIN_EXE_huck").to_string() }
+fn huck_binary() -> String {
+    env!("CARGO_BIN_EXE_huck").to_string()
+}
 
 /// Pipes `script` to huck on stdin (exercises read_logical_command).
 /// Returns (stdout, stderr, exit_code).
 fn run_capture(script: &str) -> (String, String, i32) {
     let mut child = Command::new(huck_binary())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn huck");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
-    (String::from_utf8_lossy(&out.stdout).to_string(),
-     String::from_utf8_lossy(&out.stderr).to_string(),
-     out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
@@ -57,7 +69,10 @@ fn verbose_echoes_sourced_file_lines() {
     let script = format!("set -v\nsource {}\n", f.display());
     let (out, err, _) = run_capture(&script);
     assert_eq!(out, "sourced\n");
-    assert!(err.contains(&format!("source {}", f.display())), "stderr: {err:?}");
+    assert!(
+        err.contains(&format!("source {}", f.display())),
+        "stderr: {err:?}"
+    );
     assert!(err.contains("echo sourced\n"), "stderr: {err:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

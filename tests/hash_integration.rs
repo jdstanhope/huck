@@ -29,14 +29,15 @@ fn run_capture(script: &str) -> (String, String, i32) {
 #[test]
 fn hash_empty_table_listing() {
     let (out, _, _) = run_capture("hash\nexit\n");
-    assert!(out.lines().any(|l| l == "hash: hash table empty"), "stdout: {out:?}");
+    assert!(
+        out.lines().any(|l| l == "hash: hash table empty"),
+        "stdout: {out:?}"
+    );
 }
 
 #[test]
 fn hash_p_then_list() {
-    let (out, _, _) = run_capture(
-        "hash -p /foo a\nhash -l\nexit\n",
-    );
+    let (out, _, _) = run_capture("hash -p /foo a\nhash -l\nexit\n");
     assert!(
         out.lines().any(|l| l == "builtin hash -p /foo a"),
         "stdout: {out:?}",
@@ -45,9 +46,7 @@ fn hash_p_then_list() {
 
 #[test]
 fn hash_path_lookup_succeeds_for_sh() {
-    let (out, _, _) = run_capture(
-        "hash sh\nrc=$?\necho rc=$rc\nhash -t sh\nexit\n",
-    );
+    let (out, _, _) = run_capture("hash sh\nrc=$?\necho rc=$rc\nhash -t sh\nexit\n");
     assert!(out.lines().any(|l| l == "rc=0"), "stdout: {out:?}");
     assert!(
         out.lines().any(|l| l.ends_with("/sh")),
@@ -57,34 +56,27 @@ fn hash_path_lookup_succeeds_for_sh() {
 
 #[test]
 fn hash_path_lookup_fails_for_missing() {
-    let (out, err, _) = run_capture(
-        "hash __no_such_cmd_xyzzy__\nrc=$?\necho rc=$rc\nexit\n",
-    );
+    let (out, err, _) = run_capture("hash __no_such_cmd_xyzzy__\nrc=$?\necho rc=$rc\nexit\n");
     assert!(err.contains("not found"), "stderr: {err:?}");
     assert!(out.lines().any(|l| l == "rc=1"), "stdout: {out:?}");
 }
 
 #[test]
 fn hash_r_clears() {
-    let (out, _, _) = run_capture(
-        "hash -p /foo a\nhash -r\nhash -t a\nrc=$?\necho rc=$rc\nexit\n",
-    );
+    let (out, _, _) = run_capture("hash -p /foo a\nhash -r\nhash -t a\nrc=$?\necho rc=$rc\nexit\n");
     assert!(out.lines().any(|l| l == "rc=1"), "stdout: {out:?}");
 }
 
 #[test]
 fn hash_t_multi_format() {
-    let (out, _, _) = run_capture(
-        "hash -p /foo a\nhash -p /bar b\nhash -t a b\nexit\n",
-    );
+    let (out, _, _) = run_capture("hash -p /foo a\nhash -p /bar b\nhash -t a b\nexit\n");
     assert!(out.lines().any(|l| l == "a\t/foo"), "stdout: {out:?}");
     assert!(out.lines().any(|l| l == "b\t/bar"), "stdout: {out:?}");
 }
 
 #[test]
 fn hash_d_then_lookup_fails() {
-    let (out, _, _) = run_capture(
-        "hash -p /foo a\nhash -d a\nhash -t a\nrc=$?\necho rc=$rc\nexit\n",
-    );
+    let (out, _, _) =
+        run_capture("hash -p /foo a\nhash -d a\nhash -t a\nrc=$?\necho rc=$rc\nexit\n");
     assert!(out.lines().any(|l| l == "rc=1"), "stdout: {out:?}");
 }

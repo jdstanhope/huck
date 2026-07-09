@@ -12,7 +12,12 @@ fn run(script: &str) -> (String, String, std::process::ExitStatus) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -34,9 +39,16 @@ fn error_if_unset_non_interactive_exits_shell() {
     // The script is `${X:?missing}\necho after\n` — huck should exit
     // with status 1 BEFORE reaching `echo after` (no `after` in stdout).
     let (out, err, status) = run("${X:?missing}\necho after\n");
-    assert!(!out.lines().any(|l| l == "after"), "stdout should not have 'after': {out}");
+    assert!(
+        !out.lines().any(|l| l == "after"),
+        "stdout should not have 'after': {out}"
+    );
     assert!(err.contains("X: missing"), "stderr: {err}");
-    assert_eq!(status.code(), Some(1), "exit status should be 1, got {status:?}");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "exit status should be 1, got {status:?}"
+    );
 }
 
 #[test]
@@ -109,8 +121,14 @@ fn error_if_unset_in_case_pattern_aborts() {
     // the case statement should not execute any arm body, and subsequent
     // commands should not run.
     let (out, _err, status) = run("case foo in\n${X:?missing}) echo matched;;\nesac\necho after\n");
-    assert!(!out.lines().any(|l| l == "matched"), "stdout should not have 'matched': {out}");
-    assert!(!out.lines().any(|l| l == "after"), "stdout should not have 'after': {out}");
+    assert!(
+        !out.lines().any(|l| l == "matched"),
+        "stdout should not have 'matched': {out}"
+    );
+    assert!(
+        !out.lines().any(|l| l == "after"),
+        "stdout should not have 'after': {out}"
+    );
     assert_eq!(status.code(), Some(1));
 }
 
@@ -119,7 +137,13 @@ fn error_if_unset_in_redirect_target_aborts() {
     // The redirect target contains ${X:?missing}. The command should
     // not fork — no file created, no command runs, exit before `echo after`.
     let (out, _err, status) = run("echo hello > ${X:?missing}\necho after\n");
-    assert!(!out.lines().any(|l| l == "hello"), "stdout should not have 'hello': {out}");
-    assert!(!out.lines().any(|l| l == "after"), "stdout should not have 'after': {out}");
+    assert!(
+        !out.lines().any(|l| l == "hello"),
+        "stdout should not have 'hello': {out}"
+    );
+    assert!(
+        !out.lines().any(|l| l == "after"),
+        "stdout should not have 'after': {out}"
+    );
     assert_eq!(status.code(), Some(1));
 }

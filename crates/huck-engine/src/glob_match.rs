@@ -19,7 +19,7 @@ pub(crate) fn translate_bracket_negation(pattern: &str) -> Cow<'_, str> {
     let mut in_class = false;
     let mut escaped = false;
     let mut pos_in_class = 0usize; // chars seen since '[' (1 = first content char)
-    let mut negated = false;       // class opened with `!` or `^`
+    let mut negated = false; // class opened with `!` or `^`
     for i in 0..chars.len() {
         let c = chars[i];
         let mut emit = c;
@@ -241,9 +241,7 @@ fn parse_seq(chars: &[char], pos: &mut usize, in_group: bool) -> Vec<Item> {
             '[' => {
                 items.push(parse_class(chars, pos));
             }
-            '?' | '*' | '+' | '@' | '!'
-                if *pos + 1 < chars.len() && chars[*pos + 1] == '(' =>
-            {
+            '?' | '*' | '+' | '@' | '!' if *pos + 1 < chars.len() && chars[*pos + 1] == '(' => {
                 let kind = match c {
                     '?' => GroupKind::ZeroOrOne,
                     '*' => GroupKind::ZeroOrMore,
@@ -351,11 +349,7 @@ fn lc(c: char) -> char {
 }
 
 fn eqc(a: char, b: char, ci: bool) -> bool {
-    if ci {
-        lc(a) == lc(b)
-    } else {
-        a == b
-    }
+    if ci { lc(a) == lc(b) } else { a == b }
 }
 
 fn class_matches(set: &[ClassAtom], negated: bool, c: char, ci: bool) -> bool {
@@ -414,7 +408,9 @@ fn match_here(items: &[Item], text: &[char], ci: bool) -> bool {
         None => return text.is_empty(),
     };
     match item {
-        Item::Lit(c) => !text.is_empty() && eqc(text[0], *c, ci) && match_here(rest, &text[1..], ci),
+        Item::Lit(c) => {
+            !text.is_empty() && eqc(text[0], *c, ci) && match_here(rest, &text[1..], ci)
+        }
         Item::AnyChar => !text.is_empty() && match_here(rest, &text[1..], ci),
         Item::AnyRun => (0..=text.len()).any(|k| match_here(rest, &text[k..], ci)),
         Item::Class { negated, set } => {
@@ -423,8 +419,9 @@ fn match_here(items: &[Item], text: &[char], ci: bool) -> bool {
                 && match_here(rest, &text[1..], ci)
         }
         Item::Group { kind, alts } => match kind {
-            GroupKind::ExactlyOne => (0..=text.len())
-                .any(|k| alt_matches_whole(alts, &text[..k], ci) && match_here(rest, &text[k..], ci)),
+            GroupKind::ExactlyOne => (0..=text.len()).any(|k| {
+                alt_matches_whole(alts, &text[..k], ci) && match_here(rest, &text[k..], ci)
+            }),
             GroupKind::ZeroOrOne => {
                 match_here(rest, text, ci)
                     || (1..=text.len()).any(|k| {
@@ -432,10 +429,12 @@ fn match_here(items: &[Item], text: &[char], ci: bool) -> bool {
                     })
             }
             GroupKind::ZeroOrMore => match_star(alts, rest, text, ci),
-            GroupKind::OneOrMore => (1..=text.len())
-                .any(|k| alt_matches_whole(alts, &text[..k], ci) && match_star(alts, rest, &text[k..], ci)),
-            GroupKind::Not => (0..=text.len())
-                .any(|k| !alt_matches_whole(alts, &text[..k], ci) && match_here(rest, &text[k..], ci)),
+            GroupKind::OneOrMore => (1..=text.len()).any(|k| {
+                alt_matches_whole(alts, &text[..k], ci) && match_star(alts, rest, &text[k..], ci)
+            }),
+            GroupKind::Not => (0..=text.len()).any(|k| {
+                !alt_matches_whole(alts, &text[..k], ci) && match_here(rest, &text[k..], ci)
+            }),
         },
     }
 }
@@ -455,7 +454,11 @@ pub fn extglob_pathname_expand(pattern: &str, nocaseglob: bool, dotglob: bool) -
     if comps.is_empty() {
         return Vec::new();
     }
-    let start = if absolute { "/".to_string() } else { String::new() };
+    let start = if absolute {
+        "/".to_string()
+    } else {
+        String::new()
+    };
     let mut out = Vec::new();
     walk_components(&start, &comps, 0, nocaseglob, dotglob, &mut out);
     out.sort();
@@ -668,7 +671,10 @@ mod pathname_tests {
     fn negation_excludes_listed_and_dotfiles() {
         let (_d, base) = fixture();
         let got = extglob_pathname_expand(&format!("{base}/!(a|ab)"), false, false);
-        assert_eq!(got, abs(&base, &["aab", "abc", "b", "cd", "dir1", "dir2", "xy"]));
+        assert_eq!(
+            got,
+            abs(&base, &["aab", "abc", "b", "cd", "dir1", "dir2", "xy"])
+        );
     }
 
     #[test]
@@ -711,7 +717,9 @@ mod bracket_negation_tests {
     use super::translate_bracket_negation;
     use std::borrow::Cow;
 
-    fn t(p: &str) -> String { translate_bracket_negation(p).into_owned() }
+    fn t(p: &str) -> String {
+        translate_bracket_negation(p).into_owned()
+    }
 
     #[test]
     fn leading_caret_becomes_bang() {
@@ -719,9 +727,13 @@ mod bracket_negation_tests {
         assert_eq!(t("[^0-9]"), "[!0-9]");
     }
     #[test]
-    fn bang_unchanged() { assert_eq!(t("[!abc]"), "[!abc]"); }
+    fn bang_unchanged() {
+        assert_eq!(t("[!abc]"), "[!abc]");
+    }
     #[test]
-    fn plain_class_unchanged() { assert_eq!(t("[abc]"), "[abc]"); }
+    fn plain_class_unchanged() {
+        assert_eq!(t("[abc]"), "[abc]");
+    }
     #[test]
     fn caret_not_leading_is_literal() {
         assert_eq!(t("[a^b]"), "[a^b]");
@@ -748,13 +760,19 @@ mod bracket_negation_tests {
     }
     #[test]
     fn posix_class_inner_brackets() {
-        assert_eq!(t("[[:alpha:]]"), "[[:alpha:]]");      // no leading ^
-        assert_eq!(t("[^[:digit:]]"), "[![:digit:]]");    // leading ^ converted
+        assert_eq!(t("[[:alpha:]]"), "[[:alpha:]]"); // no leading ^
+        assert_eq!(t("[^[:digit:]]"), "[![:digit:]]"); // leading ^ converted
     }
     #[test]
     fn no_change_returns_borrowed() {
-        assert!(matches!(translate_bracket_negation("[abc]"), Cow::Borrowed(_)));
-        assert!(matches!(translate_bracket_negation("plain"), Cow::Borrowed(_)));
+        assert!(matches!(
+            translate_bracket_negation("[abc]"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            translate_bracket_negation("plain"),
+            Cow::Borrowed(_)
+        ));
     }
 }
 
@@ -762,7 +780,9 @@ mod bracket_negation_tests {
 mod posix_class_tests {
     use super::{extglob_match, has_posix_class};
 
-    fn m(p: &str, t: &str) -> bool { extglob_match(p, t, false) }
+    fn m(p: &str, t: &str) -> bool {
+        extglob_match(p, t, false)
+    }
 
     #[test]
     fn digit_alpha_space() {
@@ -813,6 +833,6 @@ mod posix_class_tests {
         assert!(!has_posix_class("[abc]"));
         assert!(!has_posix_class("[a-z]"));
         assert!(!has_posix_class("plain*"));
-        assert!(!has_posix_class("\\[[:x"));  // escaped, no close
+        assert!(!has_posix_class("\\[[:x")); // escaped, no close
     }
 }

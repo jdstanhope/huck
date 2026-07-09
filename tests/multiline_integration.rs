@@ -63,7 +63,8 @@ fn multiline_until() {
 
 #[test]
 fn nested_loop_inside_if() {
-    let script = "if true\nthen\ni=0\nwhile test $i -lt 2\ndo\necho x$i\ni=$((i+1))\ndone\nfi\nexit\n";
+    let script =
+        "if true\nthen\ni=0\nwhile test $i -lt 2\ndo\necho x$i\ni=$((i+1))\ndone\nfi\nexit\n";
     let (out, _) = run(script);
     assert!(out.lines().any(|l| l == "x0"), "stdout: {out}");
     assert!(out.lines().any(|l| l == "x1"), "stdout: {out}");

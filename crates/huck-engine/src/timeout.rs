@@ -7,7 +7,7 @@
 //! the `ExecBuilder::timeout` epilogue.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -71,7 +71,11 @@ mod tests {
     fn timer_fires_after_deadline() {
         let flag = Arc::new(AtomicBool::new(false));
         let pids = Arc::new(Mutex::new(Vec::new()));
-        let h = spawn_timer(Duration::from_millis(50), Arc::clone(&flag), Arc::clone(&pids));
+        let h = spawn_timer(
+            Duration::from_millis(50),
+            Arc::clone(&flag),
+            Arc::clone(&pids),
+        );
         std::thread::sleep(Duration::from_millis(150));
         assert!(flag.load(Ordering::Relaxed), "flag should be set");
         h.cancel();
@@ -81,12 +85,22 @@ mod tests {
     fn timer_cancel_prevents_fire() {
         let flag = Arc::new(AtomicBool::new(false));
         let pids = Arc::new(Mutex::new(Vec::new()));
-        let h = spawn_timer(Duration::from_secs(60), Arc::clone(&flag), Arc::clone(&pids));
+        let h = spawn_timer(
+            Duration::from_secs(60),
+            Arc::clone(&flag),
+            Arc::clone(&pids),
+        );
         let start = Instant::now();
         h.cancel();
-        assert!(start.elapsed() < Duration::from_secs(1), "cancel should return immediately");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "cancel should return immediately"
+        );
         std::thread::sleep(Duration::from_millis(50));
-        assert!(!flag.load(Ordering::Relaxed), "flag should NOT be set after cancel");
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "flag should NOT be set after cancel"
+        );
     }
 
     #[test]

@@ -2,15 +2,28 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 fn run(script: &str) -> (String, i32) {
     let mut child = Command::new(huck_bin())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-        .spawn().expect("spawn huck");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn huck");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
-    (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
@@ -21,12 +34,18 @@ fn indirect_through_named_var() {
 #[test]
 fn indirect_through_positional() {
     // OPTIND=2 -> ${2}
-    assert_eq!(run("set -- a b c\nOPTIND=2\necho \"${!OPTIND}\"\n").0, "b\n");
+    assert_eq!(
+        run("set -- a b c\nOPTIND=2\necho \"${!OPTIND}\"\n").0,
+        "b\n"
+    );
 }
 
 #[test]
 fn indirect_with_default_modifier_unset() {
-    assert_eq!(run("ref=missing\necho \"${!ref-fallback}\"\n").0, "fallback\n");
+    assert_eq!(
+        run("ref=missing\necho \"${!ref-fallback}\"\n").0,
+        "fallback\n"
+    );
 }
 
 #[test]
@@ -40,7 +59,10 @@ fn indirect_unset_source_errors() {
     // no normal output. (NOT empty-string.)
     let (out, rc) = run("unset ref\necho \"[${!ref}]\"\necho AFTER\n");
     assert_ne!(rc, 0, "expected nonzero exit; out={out:?}");
-    assert!(!out.contains("[]"), "should not emit empty indirect result; out={out:?}");
+    assert!(
+        !out.contains("[]"),
+        "should not emit empty indirect result; out={out:?}"
+    );
 }
 
 #[test]
@@ -75,7 +97,10 @@ fn indirect_spaced_source_value_is_not_trimmed() {
 #[test]
 fn indirect_through_numeric_positional() {
     // ${!2}: indirect through $2's value as a name.
-    assert_eq!(run("two=DEREF\nset -- a two c\necho \"${!2}\"\n").0, "DEREF\n");
+    assert_eq!(
+        run("two=DEREF\nset -- a two c\necho \"${!2}\"\n").0,
+        "DEREF\n"
+    );
 }
 
 #[test]

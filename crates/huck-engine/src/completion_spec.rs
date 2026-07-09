@@ -144,8 +144,8 @@ impl Action {
 
 /// The set of bash shell keywords huck recognizes. Used by `-A keyword`.
 const SHELL_KEYWORDS: &[&str] = &[
-    "!", "[[", "]]", "case", "do", "done", "elif", "else", "esac",
-    "fi", "for", "function", "if", "in", "select", "then", "until", "while", "{", "}",
+    "!", "[[", "]]", "case", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if",
+    "in", "select", "then", "until", "while", "{", "}",
 ];
 
 /// Completion context for a single `run_spec` call.
@@ -175,11 +175,7 @@ pub struct CompletionCtx {
 /// Note: this does NOT apply `-o filenames` rendering or `-o default`/
 /// `bashdefault` empty-fallback. Those are the caller's responsibility
 /// (Task 5) because they depend on rustyline / dispatch-ladder state.
-pub fn run_spec(
-    spec: &CompletionSpec,
-    ctx: &CompletionCtx,
-    shell: &mut Shell,
-) -> Vec<String> {
+pub fn run_spec(spec: &CompletionSpec, ctx: &CompletionCtx, shell: &mut Shell) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
     // -F func: invoke the completion function. Sets COMP_*, runs body,
@@ -350,13 +346,21 @@ fn split_wordlist(wordlist: &str, ifs: &str) -> Vec<String> {
     let mut chars = wordlist.chars().peekable();
     // Strip leading whitespace-IFS.
     while let Some(&c) = chars.peek() {
-        if ws.contains(&c) { chars.next(); } else { break; }
+        if ws.contains(&c) {
+            chars.next();
+        } else {
+            break;
+        }
     }
     while let Some(c) = chars.next() {
         if ws.contains(&c) {
             // Collapse run of whitespace-IFS.
             while let Some(&n) = chars.peek() {
-                if ws.contains(&n) { chars.next(); } else { break; }
+                if ws.contains(&n) {
+                    chars.next();
+                } else {
+                    break;
+                }
             }
             if !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
@@ -554,7 +558,9 @@ fn list_dir_filtered(dir: &str, prefix: &str, dirs_only: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else { continue };
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
         if !name.starts_with(prefix) {
             continue;
         }
@@ -607,9 +613,30 @@ mod tests {
     #[test]
     fn action_parse_round_trips_all_24() {
         let names = [
-            "file", "directory", "command", "function", "variable", "alias", "builtin", "keyword",
-            "arrayvar", "binding", "disabled", "enabled", "export", "group", "helptopic",
-            "hostname", "job", "running", "service", "setopt", "shopt", "signal", "stopped", "user",
+            "file",
+            "directory",
+            "command",
+            "function",
+            "variable",
+            "alias",
+            "builtin",
+            "keyword",
+            "arrayvar",
+            "binding",
+            "disabled",
+            "enabled",
+            "export",
+            "group",
+            "helptopic",
+            "hostname",
+            "job",
+            "running",
+            "service",
+            "setopt",
+            "shopt",
+            "signal",
+            "stopped",
+            "user",
         ];
         for n in names {
             let a = Action::parse(n).unwrap_or_else(|| panic!("parse failed: {n}"));
@@ -792,11 +819,8 @@ mod tests {
         let mut sh = Shell::new();
         // Define a function whose body sets COMPREPLY=(alpha beta).
         // Building the AST by hand is painful; route through process_line.
-        let outcome = crate::shell::process_line(
-            "_myf() { COMPREPLY=(alpha beta); }",
-            &mut sh,
-            false,
-        );
+        let outcome =
+            crate::shell::process_line("_myf() { COMPREPLY=(alpha beta); }", &mut sh, false);
         assert!(matches!(outcome, crate::builtins::ExecOutcome::Continue(_)));
         assert!(sh.functions.contains_key("_myf"));
 
@@ -860,11 +884,7 @@ mod tests {
     fn function_invocation_preserves_last_status() {
         let mut sh = Shell::new();
         // Function exits with 17.
-        let _ = crate::shell::process_line(
-            "_myf() { COMPREPLY=(x); return 17; }",
-            &mut sh,
-            false,
-        );
+        let _ = crate::shell::process_line("_myf() { COMPREPLY=(x); return 17; }", &mut sh, false);
         // Set $? AFTER process_line (which itself zeroes $? on success).
         sh.set_last_status(42);
 

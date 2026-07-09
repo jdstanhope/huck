@@ -90,7 +90,11 @@ fn disown_a_h_marks_all_alive() {
         .filter_map(|w| w.parse::<i32>().ok())
         .filter(|n| *n > 0)
         .collect();
-    assert!(pids.len() >= 2, "expected >= 2 pids in stdout, got {:?}", pids);
+    assert!(
+        pids.len() >= 2,
+        "expected >= 2 pids in stdout, got {:?}",
+        pids
+    );
     thread::sleep(Duration::from_millis(200));
     let all_results: Vec<(i32, bool)> = pids.iter().map(|p| (*p, pid_alive(*p))).collect();
     // Cleanup regardless of assertion outcome.

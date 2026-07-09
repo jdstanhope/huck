@@ -3,18 +3,30 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 /// Returns (stdout, stderr, exit_code).
 fn run(script: &str) -> (String, String, i32) {
     let mut child = Command::new(huck_bin())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().expect("spawn huck");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn huck");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
-    (String::from_utf8_lossy(&out.stdout).into_owned(),
-     String::from_utf8_lossy(&out.stderr).into_owned(),
-     out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 // --- Part A: M-90 combined `>file 2>&1` ---
@@ -47,7 +59,10 @@ fn bare_2to1_still_pipes() {
 fn unredirected_builtin_error_still_reaches_stderr() {
     // No stderr redirect → error still hits the real fd 2 (must-not-regress).
     let (_o, err, _c) = run("declare -p NOPED\n");
-    assert!(err.contains("NOPED"), "unredirected error should reach stderr: {err}");
+    assert!(
+        err.contains("NOPED"),
+        "unredirected error should reach stderr: {err}"
+    );
 }
 
 // --- Part B: M-105 unquoted `${x+alt}` spurious empty field ---

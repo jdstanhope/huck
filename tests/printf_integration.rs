@@ -62,9 +62,7 @@ fn printf_b_c_halts_output() {
     // `printf '%b' 'a\cb'; echo X` → stdout begins "a" then "X".
     // No trailing newline from printf (no \n in format), no "b"
     // beyond the \c.
-    let (out, _, _) = run_capture(
-        "printf '%b' 'a\\cb'\necho X\nexit\n",
-    );
+    let (out, _, _) = run_capture("printf '%b' 'a\\cb'\necho X\nexit\n");
     // The `a` and `X` should be on the same line (since printf
     // produced no newline). Echo's newline lands after "X".
     assert!(
@@ -75,26 +73,21 @@ fn printf_b_c_halts_output() {
 
 #[test]
 fn printf_v_var_captures() {
-    let (out, _, _) = run_capture(
-        "printf -v X '%d' 42\necho \"[$X]\"\nexit\n",
-    );
+    let (out, _, _) = run_capture("printf -v X '%d' 42\necho \"[$X]\"\nexit\n");
     assert!(out.lines().any(|l| l == "[42]"), "stdout: {out:?}");
 }
 
 #[test]
 fn printf_v_readonly_errors() {
-    let (out, err, _) = run_capture(
-        "readonly X=v\nprintf -v X '%d' 42\nrc=$?\necho \"rc=$rc [$X]\"\nexit\n",
-    );
+    let (out, err, _) =
+        run_capture("readonly X=v\nprintf -v X '%d' 42\nrc=$?\necho \"rc=$rc [$X]\"\nexit\n");
     assert!(err.contains("readonly"), "stderr: {err:?}");
     assert!(out.lines().any(|l| l == "rc=1 [v]"), "stdout: {out:?}");
 }
 
 #[test]
 fn printf_invalid_int_status_1() {
-    let (out, err, _) = run_capture(
-        "printf '%d\\n' abc\nrc=$?\necho rc=$rc\nexit\n",
-    );
+    let (out, err, _) = run_capture("printf '%d\\n' abc\nrc=$?\necho rc=$rc\nexit\n");
     assert!(err.contains("invalid number"), "stderr: {err:?}");
     // The parsed-prefix value of "abc" is 0; printf emits "0\n".
     assert!(out.lines().any(|l| l == "0"), "stdout: {out:?}");
@@ -106,9 +99,7 @@ fn printf_no_args_usage_error() {
     // Capture printf's status via $? — huck's bare `exit` does not
     // inherit last_status (pre-existing divergence outside v56
     // scope), so we observe printf's exit code via $? directly.
-    let (out, err, _) = run_capture(
-        "printf\nrc=$?\necho rc=$rc\nexit\n",
-    );
+    let (out, err, _) = run_capture("printf\nrc=$?\necho rc=$rc\nexit\n");
     assert!(err.contains("usage"), "stderr: {err:?}");
     assert!(
         out.lines().any(|l| l == "rc=2"),

@@ -1,14 +1,26 @@
 //! v135: M-27 test/[[ file-type/mode/fd operators.
-use std::process::{Command, Stdio};
 use std::io::Write;
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+use std::process::{Command, Stdio};
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 fn run(script: &str) -> (String, i32) {
     let mut c = Command::new(huck_bin())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().expect("spawn");
-    c.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    c.stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let o = c.wait_with_output().unwrap();
-    (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+        o.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
@@ -18,7 +30,13 @@ fn char_special_dev_null() {
 }
 #[test]
 fn char_special_regular_file_false() {
-    assert_eq!(run("printf x > /tmp/v135reg; [ -c /tmp/v135reg ] && echo T || echo F; rm -f /tmp/v135reg\n").0, "F\n");
+    assert_eq!(
+        run(
+            "printf x > /tmp/v135reg; [ -c /tmp/v135reg ] && echo T || echo F; rm -f /tmp/v135reg\n"
+        )
+        .0,
+        "F\n"
+    );
 }
 #[test]
 fn fifo_via_mkfifo() {
@@ -31,7 +49,10 @@ fn block_special_dev_null_is_not_block() {
 }
 #[test]
 fn owned_by_euid_true_for_own_file() {
-    assert_eq!(run("f=$(mktemp); [ -O $f ] && echo T || echo F; rm -f $f\n").0, "T\n");
+    assert_eq!(
+        run("f=$(mktemp); [ -O $f ] && echo T || echo F; rm -f $f\n").0,
+        "T\n"
+    );
 }
 #[test]
 fn sticky_setuid_setgid() {
@@ -47,7 +68,7 @@ fn terminal_fd_false_when_redirected() {
 }
 #[test]
 fn missing_file_all_false() {
-    for op in ["-p","-S","-b","-c","-O","-G","-k","-u","-g"] {
+    for op in ["-p", "-S", "-b", "-c", "-O", "-G", "-k", "-u", "-g"] {
         let s = format!("[ {op} /no/such/path/v135 ] && echo T || echo F\n");
         assert_eq!(run(&s).0, "F\n", "op {op}");
     }
@@ -55,13 +76,19 @@ fn missing_file_all_false() {
 
 #[test]
 fn v_plain_name_regression() {
-    assert_eq!(run("x=1; [ -v x ] && echo T || echo F; [ -v NOPE ] && echo T || echo F\n").0, "T\nF\n");
+    assert_eq!(
+        run("x=1; [ -v x ] && echo T || echo F; [ -v NOPE ] && echo T || echo F\n").0,
+        "T\nF\n"
+    );
     assert_eq!(run("x=1; [[ -v x ]] && echo T || echo F\n").0, "T\n");
 }
 #[test]
 fn v_indexed_array_element() {
     assert_eq!(run("arr=(a b c); [[ -v arr[1] ]] && echo T || echo F; [[ -v arr[9] ]] && echo T || echo F\n").0, "T\nF\n");
-    assert_eq!(run("arr=(a b c); [ -v 'arr[1]' ] && echo T || echo F\n").0, "T\n");
+    assert_eq!(
+        run("arr=(a b c); [ -v 'arr[1]' ] && echo T || echo F\n").0,
+        "T\n"
+    );
 }
 #[test]
 fn v_indexed_array_arith_subscript() {

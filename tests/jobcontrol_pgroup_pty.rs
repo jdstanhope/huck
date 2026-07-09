@@ -10,8 +10,8 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use expectrl::session::OsSession;
 use expectrl::Expect;
+use expectrl::session::OsSession;
 
 fn spawn() -> Option<OsSession> {
     let cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
@@ -98,7 +98,10 @@ fn noninteractive_pipeline_stages_share_shell_pgroup() {
     let descendants = descendant_pids(huck_pid);
     let _ = child.kill();
     for &p in &descendants {
-        let _ = Command::new("kill").args(["-9", &p.to_string()]).stderr(Stdio::null()).status();
+        let _ = Command::new("kill")
+            .args(["-9", &p.to_string()])
+            .stderr(Stdio::null())
+            .status();
     }
     let _ = child.wait();
 
@@ -144,7 +147,10 @@ fn noninteractive_background_pipeline_shares_shell_pgroup() {
     let descendants = descendant_pids(huck_pid);
     let _ = child.kill();
     for &p in &descendants {
-        let _ = Command::new("kill").args(["-9", &p.to_string()]).stderr(Stdio::null()).status();
+        let _ = Command::new("kill")
+            .args(["-9", &p.to_string()])
+            .stderr(Stdio::null())
+            .status();
     }
     let _ = child.wait();
 
@@ -182,7 +188,10 @@ fn noninteractive_background_subshell_shares_shell_pgroup() {
 
     let _ = child.kill();
     for &p in &kids {
-        let _ = Command::new("kill").args(["-9", &p.to_string()]).stderr(Stdio::null()).status();
+        let _ = Command::new("kill")
+            .args(["-9", &p.to_string()])
+            .stderr(Stdio::null())
+            .status();
     }
     let _ = child.wait();
 
@@ -206,14 +215,19 @@ fn pgid_of(pid: u32) -> i32 {
         .args(["-o", "pgid=", "-p", &pid.to_string()])
         .output();
     match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(-1),
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(-1),
         Err(_) => -2,
     }
 }
 
 /// Direct child pids of `parent` via `pgrep -P`.
 fn child_pids(parent: u32) -> Vec<u32> {
-    let out = Command::new("pgrep").args(["-P", &parent.to_string()]).output();
+    let out = Command::new("pgrep")
+        .args(["-P", &parent.to_string()])
+        .output();
     match out {
         Ok(o) => String::from_utf8_lossy(&o.stdout)
             .lines()

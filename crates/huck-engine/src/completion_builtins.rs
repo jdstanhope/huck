@@ -241,7 +241,12 @@ fn print_complete(
                 let _ = writeln!(out, "{}", format_spec_for_print(d, None, Some("-D")));
             }
             None => {
-                crate::sh_error_to!(shell, err, None, "complete: no completion specification for -D");
+                crate::sh_error_to!(
+                    shell,
+                    err,
+                    None,
+                    "complete: no completion specification for -D"
+                );
                 status = 1;
             }
         }
@@ -252,7 +257,12 @@ fn print_complete(
                 let _ = writeln!(out, "{}", format_spec_for_print(es, None, Some("-E")));
             }
             None => {
-                crate::sh_error_to!(shell, err, None, "complete: no completion specification for -E");
+                crate::sh_error_to!(
+                    shell,
+                    err,
+                    None,
+                    "complete: no completion specification for -E"
+                );
                 status = 1;
             }
         }
@@ -285,7 +295,12 @@ fn print_complete(
                     let _ = writeln!(out, "{}", format_spec_for_print(s, Some(n.as_str()), None));
                 }
                 None => {
-                    crate::sh_error_to!(shell, err, None, "complete: {n}: no completion specification");
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "complete: {n}: no completion specification"
+                    );
                     status = 1;
                 }
             }
@@ -317,16 +332,18 @@ fn remove_complete(
         // the loop, once that borrow has ended.
         let mut missing: Vec<&String> = Vec::new();
         for n in names {
-            if specs.by_command.remove(n).is_none()
-                && !parsed.is_default
-                && !parsed.is_empty
-            {
+            if specs.by_command.remove(n).is_none() && !parsed.is_default && !parsed.is_empty {
                 missing.push(n);
                 status = 1;
             }
         }
         for n in missing {
-            crate::sh_error_to!(shell, err, None, "complete: {n}: no completion specification");
+            crate::sh_error_to!(
+                shell,
+                err,
+                None,
+                "complete: {n}: no completion specification"
+            );
         }
     }
     ExecOutcome::Continue(status)
@@ -334,7 +351,12 @@ fn remove_complete(
 
 fn register_complete(parsed: &ParsedFlags, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if (parsed.is_default || parsed.is_empty) && !parsed.positional.is_empty() {
-        crate::sh_error_to!(shell, err, None, "complete: cannot use -D or -E with command names");
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "complete: cannot use -D or -E with command names"
+        );
         return ExecOutcome::Continue(2);
     }
     if !parsed.positional.is_empty()
@@ -358,11 +380,7 @@ fn register_complete(parsed: &ParsedFlags, err: &mut dyn Write, shell: &mut Shel
 }
 
 /// Renders a spec for `complete -p` in deterministic re-input form.
-fn format_spec_for_print(
-    spec: &CompletionSpec,
-    name: Option<&str>,
-    mode: Option<&str>,
-) -> String {
+fn format_spec_for_print(spec: &CompletionSpec, name: Option<&str>, mode: Option<&str>) -> String {
     let mut parts: Vec<String> = vec!["complete".to_string()];
     if let Some(m) = mode {
         parts.push(m.to_string());
@@ -528,14 +546,24 @@ pub fn builtin_compopt(
                         ci = chars.len();
                         args[i].clone()
                     } else {
-                        crate::sh_error_to!(shell, err, None, "compopt: -o: option requires an argument");
+                        crate::sh_error_to!(
+                            shell,
+                            err,
+                            None,
+                            "compopt: -o: option requires an argument"
+                        );
                         return ExecOutcome::Continue(2);
                     };
                     let off = leading == '+';
                     if !["default", "nospace", "filenames", "bashdefault", "dirnames"]
                         .contains(&arg_value.as_str())
                     {
-                        crate::sh_error_to!(shell, err, None, "compopt: {arg_value}: invalid completion option");
+                        crate::sh_error_to!(
+                            shell,
+                            err,
+                            None,
+                            "compopt: {arg_value}: invalid completion option"
+                        );
                         return ExecOutcome::Continue(2);
                     }
                     option_set.push((arg_value, off));
@@ -568,7 +596,12 @@ pub fn builtin_compopt(
         // it out, mutate, and put it back so dispatch's later .take()
         // observes the change.
         let Some(mut live) = shell.current_completion_spec.take() else {
-            crate::sh_error_to!(shell, err, None, "compopt: not currently executing completion function");
+            crate::sh_error_to!(
+                shell,
+                err,
+                None,
+                "compopt: not currently executing completion function"
+            );
             return ExecOutcome::Continue(1);
         };
         apply_compopt_options(&mut live.options, &option_set);
@@ -579,10 +612,18 @@ pub fn builtin_compopt(
     // Named: mutate registry.
     let mut status = 0;
     for n in &names {
-        match Rc::make_mut(&mut shell.completion_specs).by_command.get_mut(n) {
+        match Rc::make_mut(&mut shell.completion_specs)
+            .by_command
+            .get_mut(n)
+        {
             Some(spec) => apply_compopt_options(&mut spec.options, &option_set),
             None => {
-                crate::sh_error_to!(shell, err, None, "compopt: {n}: no completion specification");
+                crate::sh_error_to!(
+                    shell,
+                    err,
+                    None,
+                    "compopt: {n}: no completion specification"
+                );
                 status = 1;
             }
         }
@@ -737,7 +778,9 @@ mod tests {
         // install into CompOptions and the compspec registers successfully.
         let mut sh = Shell::new();
         let (_, code) = run_complete(
-            &["-o", "nosort", "-o", "noquote", "-o", "plusdirs", "-W", "x", "--", "foo"],
+            &[
+                "-o", "nosort", "-o", "noquote", "-o", "plusdirs", "-W", "x", "--", "foo",
+            ],
             &mut sh,
         );
         assert_eq!(code, 0);
@@ -892,10 +935,7 @@ mod tests {
     #[test]
     fn complete_plus_o_clears_option() {
         let mut sh = Shell::new();
-        let (_, code) = run_complete(
-            &["-W", "x", "-o", "nospace", "--", "foo"],
-            &mut sh,
-        );
+        let (_, code) = run_complete(&["-W", "x", "-o", "nospace", "--", "foo"], &mut sh);
         assert_eq!(code, 0);
         assert!(sh.completion_specs.by_command["foo"].options.nospace);
 
@@ -994,21 +1034,30 @@ mod tests {
         assert!(out.contains("-D"), "{out:?}");
         assert!(out.contains("_default_func"), "{out:?}");
         // Should NOT contain the by_command entry's name "foo".
-        assert!(!out.contains(" -- foo"), "should not print foo's spec: {out:?}");
+        assert!(
+            !out.contains(" -- foo"),
+            "should not print foo's spec: {out:?}"
+        );
     }
 
     #[test]
     fn compopt_D_rejected_with_exit_2() {
         let mut sh = Shell::new();
         let (_, code) = run_compopt(&["-D", "-o", "nospace"], &mut sh);
-        assert_eq!(code, 2, "compopt -D is a parse-time rejection, should be exit 2");
+        assert_eq!(
+            code, 2,
+            "compopt -D is a parse-time rejection, should be exit 2"
+        );
     }
 
     #[test]
     fn compopt_E_rejected_with_exit_2() {
         let mut sh = Shell::new();
         let (_, code) = run_compopt(&["-E", "-o", "nospace"], &mut sh);
-        assert_eq!(code, 2, "compopt -E is a parse-time rejection, should be exit 2");
+        assert_eq!(
+            code, 2,
+            "compopt -E is a parse-time rejection, should be exit 2"
+        );
     }
 
     #[test]
@@ -1017,11 +1066,7 @@ mod tests {
         // Define a function and run compgen -F. After it returns,
         // shell.current_completion_spec MUST be None — otherwise the
         // next tab dispatch on an unrelated spec gets the wrong options.
-        let _ = crate::shell::process_line(
-            "_myf() { COMPREPLY=(a b); }",
-            &mut sh,
-            false,
-        );
+        let _ = crate::shell::process_line("_myf() { COMPREPLY=(a b); }", &mut sh, false);
         let _ = run_compgen(&["-F", "_myf"], &mut sh);
         assert!(
             sh.current_completion_spec.is_none(),
@@ -1037,24 +1082,38 @@ mod tests {
         // After --, "foo" should be a name (not a flag). With no registered
         // spec for "foo", this errors with exit 1 (missing name).
         let (_, code) = run_compopt(&["-o", "nospace", "--", "foo"], &mut sh);
-        assert_eq!(code, 1, "-- should end flags so 'foo' is a name; no spec → exit 1");
+        assert_eq!(
+            code, 1,
+            "-- should end flags so 'foo' is a name; no spec → exit 1"
+        );
     }
 
     #[test]
     fn complete_short_flag_actions_map_to_actions() {
         use crate::completion_spec::Action;
         let cases = [
-            ("-a", Action::Alias), ("-b", Action::Builtin), ("-c", Action::Command),
-            ("-d", Action::Directory), ("-e", Action::Export), ("-f", Action::File),
-            ("-g", Action::Group), ("-j", Action::Job), ("-k", Action::Keyword),
-            ("-s", Action::Service), ("-u", Action::User), ("-v", Action::Variable),
+            ("-a", Action::Alias),
+            ("-b", Action::Builtin),
+            ("-c", Action::Command),
+            ("-d", Action::Directory),
+            ("-e", Action::Export),
+            ("-f", Action::File),
+            ("-g", Action::Group),
+            ("-j", Action::Job),
+            ("-k", Action::Keyword),
+            ("-s", Action::Service),
+            ("-u", Action::User),
+            ("-v", Action::Variable),
         ];
         for (flag, want) in cases {
             let mut sh = Shell::new();
             let (_, code) = run_complete(&[flag, "--", "foo"], &mut sh);
             assert_eq!(code, 0, "flag {flag} should be accepted");
-            assert_eq!(sh.completion_specs.by_command["foo"].actions, vec![want],
-                "flag {flag} → wrong action");
+            assert_eq!(
+                sh.completion_specs.by_command["foo"].actions,
+                vec![want],
+                "flag {flag} → wrong action"
+            );
         }
     }
 
@@ -1063,7 +1122,12 @@ mod tests {
         let mut sh = Shell::new();
         let (_, code) = run_complete(&["-ev", "--", "foo"], &mut sh);
         assert_eq!(code, 0);
-        assert_eq!(sh.completion_specs.by_command["foo"].actions,
-            vec![crate::completion_spec::Action::Export, crate::completion_spec::Action::Variable]);
+        assert_eq!(
+            sh.completion_specs.by_command["foo"].actions,
+            vec![
+                crate::completion_spec::Action::Export,
+                crate::completion_spec::Action::Variable
+            ]
+        );
     }
 }

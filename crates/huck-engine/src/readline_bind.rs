@@ -15,22 +15,36 @@
 /// enforces this subset relation), so huck never reports a binding bash lacks.
 /// Functions in the honored set with no entry here render as `# … (not bound)`.
 pub const DEFAULT_EMACS_BINDS: &[(&str, &str)] = &[
-    ("\\C-a", "beginning-of-line"), ("\\C-e", "end-of-line"),
-    ("\\C-f", "forward-char"), ("\\C-b", "backward-char"),
-    ("\\ef", "forward-word"), ("\\eb", "backward-word"),
-    ("\\C-k", "kill-line"), ("\\C-u", "unix-line-discard"),
-    ("\\C-w", "unix-word-rubout"), ("\\ed", "kill-word"),
+    ("\\C-a", "beginning-of-line"),
+    ("\\C-e", "end-of-line"),
+    ("\\C-f", "forward-char"),
+    ("\\C-b", "backward-char"),
+    ("\\ef", "forward-word"),
+    ("\\eb", "backward-word"),
+    ("\\C-k", "kill-line"),
+    ("\\C-u", "unix-line-discard"),
+    ("\\C-w", "unix-word-rubout"),
+    ("\\ed", "kill-word"),
     ("\\e\\C-?", "backward-kill-word"),
-    ("\\C-l", "clear-screen"), ("\\C-g", "abort"),
-    ("\\C-j", "accept-line"), ("\\C-m", "accept-line"),
-    ("\\C-p", "previous-history"), ("\\C-n", "next-history"),
-    ("\\e<", "beginning-of-history"), ("\\e>", "end-of-history"),
-    ("\\C-r", "reverse-search-history"), ("\\C-s", "forward-search-history"),
+    ("\\C-l", "clear-screen"),
+    ("\\C-g", "abort"),
+    ("\\C-j", "accept-line"),
+    ("\\C-m", "accept-line"),
+    ("\\C-p", "previous-history"),
+    ("\\C-n", "next-history"),
+    ("\\e<", "beginning-of-history"),
+    ("\\e>", "end-of-history"),
+    ("\\C-r", "reverse-search-history"),
+    ("\\C-s", "forward-search-history"),
     ("\\C-i", "complete"),
-    ("\\eu", "upcase-word"), ("\\el", "downcase-word"),
-    ("\\ec", "capitalize-word"), ("\\C-t", "transpose-chars"),
-    ("\\et", "transpose-words"), ("\\C-_", "undo"),
-    ("\\C-y", "yank"), ("\\C-d", "delete-char"),
+    ("\\eu", "upcase-word"),
+    ("\\el", "downcase-word"),
+    ("\\ec", "capitalize-word"),
+    ("\\C-t", "transpose-chars"),
+    ("\\et", "transpose-words"),
+    ("\\C-_", "undo"),
+    ("\\C-y", "yank"),
+    ("\\C-d", "delete-char"),
     ("\\C-?", "backward-delete-char"),
 ];
 
@@ -187,7 +201,10 @@ mod tests {
     fn default_emacs_binds_only_reference_honored_functions() {
         assert!(!DEFAULT_EMACS_BINDS.is_empty());
         for (seq, func) in DEFAULT_EMACS_BINDS {
-            assert!(is_known_function(func), "default binds a function huck can't honor: {func}");
+            assert!(
+                is_known_function(func),
+                "default binds a function huck can't honor: {func}"
+            );
             assert!(!seq.is_empty());
         }
     }

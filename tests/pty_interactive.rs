@@ -170,8 +170,14 @@ fn tab_double_tab_lists() {
         .expect("huck> ")
         .unwrap_or_else(|e| panic!("no prompt redraw after double-tab: {e}"));
     let listing = String::from_utf8_lossy(caps.before());
-    assert!(listing.contains("echo"), "double-tab listing missing 'echo': {listing:?}");
-    assert!(listing.contains("history"), "double-tab listing missing 'history': {listing:?}");
+    assert!(
+        listing.contains("echo"),
+        "double-tab listing missing 'echo': {listing:?}"
+    );
+    assert!(
+        listing.contains("history"),
+        "double-tab listing missing 'history': {listing:?}"
+    );
     send(&mut session, CTRL_C);
     expect(&mut session, "huck> ");
     send(&mut session, "exit");
@@ -243,7 +249,7 @@ fn up_arrow_recalls_previous() {
     send(&mut session, "echo recallmarker");
     send(&mut session, ENTER);
     expect(&mut session, "recallmarker"); // sync past the command
-    expect(&mut session, "huck> ");       // sync to the next prompt
+    expect(&mut session, "huck> "); // sync to the next prompt
     send(&mut session, UP);
     // If up-arrow recalled the entry, the line is redrawn as the full
     // previous command.

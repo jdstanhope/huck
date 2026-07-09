@@ -12,7 +12,12 @@ fn run_capture(script: &str) -> (String, String, i32) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -25,7 +30,10 @@ fn run_capture(script: &str) -> (String, String, i32) {
 fn help_lists_known_builtin() {
     let (out, _, _) = run_capture("help\nexit\n");
     assert!(out.lines().any(|l| l.starts_with("cd:")), "stdout: {out:?}");
-    assert!(out.lines().any(|l| l.starts_with("echo:")), "stdout: {out:?}");
+    assert!(
+        out.lines().any(|l| l.starts_with("echo:")),
+        "stdout: {out:?}"
+    );
 }
 
 #[test]
@@ -41,18 +49,13 @@ fn help_named_includes_synopsis_and_description() {
 #[test]
 fn help_s_synopsis_only() {
     let (out, _, _) = run_capture("help -s echo\nexit\n");
-    let echo_lines: Vec<&str> = out
-        .lines()
-        .filter(|l| l.starts_with("echo:"))
-        .collect();
+    let echo_lines: Vec<&str> = out.lines().filter(|l| l.starts_with("echo:")).collect();
     assert_eq!(echo_lines.len(), 1, "stdout: {out:?}");
 }
 
 #[test]
 fn help_unknown_errors() {
-    let (out, err, _) = run_capture(
-        "help __no_such_builtin__\nrc=$?\necho rc=$rc\nexit\n",
-    );
+    let (out, err, _) = run_capture("help __no_such_builtin__\nrc=$?\necho rc=$rc\nexit\n");
     assert!(err.contains("no help topics match"), "stderr: {err:?}");
     assert!(out.lines().any(|l| l == "rc=1"), "stdout: {out:?}");
 }

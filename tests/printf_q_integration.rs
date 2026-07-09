@@ -3,12 +3,21 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 static COUNTER: AtomicU64 = AtomicU64::new(0);
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 fn run(script: &str) -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("huck_v120q_{}_{}.sh", std::process::id(), n));
-    { let mut f = std::fs::File::create(&path).unwrap(); f.write_all(script.as_bytes()).unwrap(); }
-    let out = Command::new(huck_bin()).arg(&path).stdin(Stdio::null()).output().unwrap();
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+    }
+    let out = Command::new(huck_bin())
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
     let _ = std::fs::remove_file(&path);
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -31,5 +40,8 @@ fn q_width_and_capture() {
 }
 #[test]
 fn q_tilde_hash_leading_only() {
-    assert_eq!(run("printf '%q\\n' '~a' 'a~' 'b~c' '#a' 'a#'\n"), "\\~a\na~\nb~c\n\\#a\na#\n");
+    assert_eq!(
+        run("printf '%q\\n' '~a' 'a~' 'b~c' '#a' 'a#'\n"),
+        "\\~a\na~\nb~c\n\\#a\na#\n"
+    );
 }

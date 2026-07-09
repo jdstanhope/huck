@@ -47,7 +47,7 @@ pub mod test_support;
 
 pub use completion::{Candidate, CandidateKind};
 pub use engine::{Completion, Engine, EngineBuilder, Output};
-pub use error_emit::{emit_cli_error, emit_error, emit_error_to, emit_syntax_error, Diag};
+pub use error_emit::{Diag, emit_cli_error, emit_error, emit_error_to, emit_syntax_error};
 pub use exec_builder::ExecBuilder;
 pub use executor::{StderrSink, StdoutSink};
 

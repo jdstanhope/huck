@@ -2,7 +2,9 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 // Run via a temp script file, NOT piped stdin. huck's piped-stdin path goes
 // through `read_logical_command` which performs `!`-history expansion (a
 // documented, intentional behavior — see bash-divergences B-10 / the REPL/piped
@@ -17,15 +19,23 @@ fn run(script: &str) -> (String, String, i32) {
         static N: AtomicU64 = AtomicU64::new(0);
         N.fetch_add(1, Ordering::Relaxed)
     }));
-    std::fs::File::create(&path).unwrap().write_all(script.as_bytes()).unwrap();
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = Command::new(huck_bin())
         .arg(&path)
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .output().expect("spawn huck");
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn huck");
     let _ = std::fs::remove_file(&path);
-    (String::from_utf8_lossy(&out.stdout).into_owned(),
-     String::from_utf8_lossy(&out.stderr).into_owned(),
-     out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
@@ -47,7 +57,10 @@ fn subst_negated_posix_class() {
 }
 #[test]
 fn case_negated_class() {
-    assert_eq!(run("case A in [^0-9]) echo letter;; *) echo other;; esac\n").0, "letter\n");
+    assert_eq!(
+        run("case A in [^0-9]) echo letter;; *) echo other;; esac\n").0,
+        "letter\n"
+    );
 }
 #[test]
 fn dbracket_negated_class() {
@@ -67,6 +80,7 @@ fn pathname_negated_class() {
     // Create files in a temp dir and glob with [^a].
     let (out, _e, _c) = run(
         "d=$(mktemp -d)\ntouch \"$d/afile\" \"$d/bfile\" \"$d/cfile\"\n\
-         cd \"$d\"\nfor f in [^a]file; do echo \"$f\"; done\nrm -rf \"$d\"\n");
+         cd \"$d\"\nfor f in [^a]file; do echo \"$f\"; done\nrm -rf \"$d\"\n",
+    );
     assert_eq!(out, "bfile\ncfile\n", "out: {out}");
 }

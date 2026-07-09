@@ -60,24 +60,21 @@ fn type_p_for_file_returns_path() {
 
 #[test]
 fn type_not_found_exit_1() {
-    let (out, err, _) = run_capture(
-        "type __no_such_command_xyzzy__\nrc=$?\necho rc=$rc\nexit\n",
-    );
+    let (out, err, _) = run_capture("type __no_such_command_xyzzy__\nrc=$?\necho rc=$rc\nexit\n");
     assert!(err.contains("not found"), "stderr: {err:?}");
     assert!(out.lines().any(|l| l == "rc=1"), "stdout: {out:?}");
 }
 
 #[test]
 fn type_a_alias_then_path() {
-    let (out, _, _) = run_capture(
-        "alias ls=foo\ntype -a ls\nexit\n",
-    );
+    let (out, _, _) = run_capture("alias ls=foo\ntype -a ls\nexit\n");
     assert!(
         out.lines().any(|l| l.contains("aliased to `foo'")),
         "stdout: {out:?}",
     );
     assert!(
-        out.lines().any(|l| l.starts_with("ls is /") || l == "ls is /usr/bin/ls"),
+        out.lines()
+            .any(|l| l.starts_with("ls is /") || l == "ls is /usr/bin/ls"),
         "expected at least one path line; stdout: {out:?}",
     );
 }
@@ -93,9 +90,7 @@ fn type_capital_p_force_path_for_sh() {
 
 #[test]
 fn type_f_skips_function() {
-    let (out, err, _) = run_capture(
-        "f() { :; }\ntype -f f\nrc=$?\necho rc=$rc\nexit\n",
-    );
+    let (out, err, _) = run_capture("f() { :; }\ntype -f f\nrc=$?\necho rc=$rc\nexit\n");
     assert!(err.contains("not found"), "stderr: {err:?}");
     assert!(out.lines().any(|l| l == "rc=1"), "stdout: {out:?}");
 }

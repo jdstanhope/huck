@@ -49,9 +49,8 @@ fn pushd_dir_then_dirs() {
 
 #[test]
 fn pushd_then_popd_returns_to_origin() {
-    let (out, _, _) = run_capture(
-        "ORIG=$PWD\npushd /tmp\npopd\necho \"AT $PWD\"\necho \"WANT $ORIG\"\nexit\n",
-    );
+    let (out, _, _) =
+        run_capture("ORIG=$PWD\npushd /tmp\npopd\necho \"AT $PWD\"\necho \"WANT $ORIG\"\nexit\n");
     let at = out.lines().find(|l| l.starts_with("AT ")).unwrap_or("?");
     let want = out.lines().find(|l| l.starts_with("WANT ")).unwrap_or("?");
     assert_eq!(
@@ -63,9 +62,7 @@ fn pushd_then_popd_returns_to_origin() {
 
 #[test]
 fn pushd_no_args_swaps_top_two() {
-    let (out, _, _) = run_capture(
-        "pushd /tmp\npushd /var\npushd\necho \"AT $PWD\"\nexit\n",
-    );
+    let (out, _, _) = run_capture("pushd /tmp\npushd /var\npushd\necho \"AT $PWD\"\nexit\n");
     let tmp = canonical("/tmp");
     let want = format!("AT {tmp}");
     assert!(
@@ -77,42 +74,34 @@ fn pushd_no_args_swaps_top_two() {
 #[test]
 fn pushd_only_one_entry_errors() {
     let (_out, err, _) = run_capture("pushd\necho rc=$?\nexit\n");
-    assert!(
-        err.contains("no other directory"),
-        "stderr: {err:?}",
-    );
+    assert!(err.contains("no other directory"), "stderr: {err:?}",);
 }
 
 #[test]
 fn popd_empty_errors() {
     let (_out, err, _) = run_capture("popd\necho rc=$?\nexit\n");
-    assert!(
-        err.contains("directory stack empty"),
-        "stderr: {err:?}",
-    );
+    assert!(err.contains("directory stack empty"), "stderr: {err:?}",);
 }
 
 #[test]
 fn dirs_default_collapses_home() {
-    let (out, _, _) = run_capture(
-        "export HOME=$PWD\ndirs\nexit\n",
-    );
+    let (out, _, _) = run_capture("export HOME=$PWD\ndirs\nexit\n");
     // After HOME=cwd, dirs default prints just `~`.
-    assert!(
-        out.lines().any(|l| l == "~"),
-        "stdout: {out:?}",
-    );
+    assert!(out.lines().any(|l| l == "~"), "stdout: {out:?}",);
 }
 
 #[test]
 fn dirs_v_numbered() {
-    let (out, _, _) = run_capture(
-        "pushd /tmp\npushd /var\ndirs -v\nexit\n",
-    );
+    let (out, _, _) = run_capture("pushd /tmp\npushd /var\ndirs -v\nexit\n");
     // Expect 3 numbered lines: " 0", " 1", " 2".
     let numbered = out
         .lines()
-        .filter(|l| l.trim_start().chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .filter(|l| {
+            l.trim_start()
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })
         .count();
     assert!(
         numbered >= 3,
@@ -122,9 +111,7 @@ fn dirs_v_numbered() {
 
 #[test]
 fn dirs_c_clears() {
-    let (out, _, _) = run_capture(
-        "pushd /tmp\ndirs -c\ndirs\nexit\n",
-    );
+    let (out, _, _) = run_capture("pushd /tmp\ndirs -c\ndirs\nexit\n");
     // After -c, dirs should print just one entry (the current dir).
     // Find the last non-empty line printed by `dirs`.
     let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
@@ -156,9 +143,7 @@ fn pushd_plus_n_rotates() {
 
 #[test]
 fn dirs_plus_index_prints_one() {
-    let (out, _, _) = run_capture(
-        "pushd /tmp\ndirs +1\nexit\n",
-    );
+    let (out, _, _) = run_capture("pushd /tmp\ndirs +1\nexit\n");
     // dirs +1 prints just the second entry (the original cwd,
     // which would have ~ collapse if it matches HOME, or its
     // absolute path otherwise).

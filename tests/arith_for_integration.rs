@@ -12,7 +12,12 @@ fn run_huck(script: &str) -> (String, String, i32) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     drop(child.stdin.take());
     let out = child.wait_with_output().expect("wait");
     (
@@ -60,7 +65,8 @@ fn arith_for_nested() {
 
 #[test]
 fn arith_for_continue_skips_to_step() {
-    let script = "for ((i=0;i<5;i++)) do if [ $i -eq 2 ]; then continue; fi; printf '%d ' $i; done\n";
+    let script =
+        "for ((i=0;i<5;i++)) do if [ $i -eq 2 ]; then continue; fi; printf '%d ' $i; done\n";
     let (out, _, code) = run_huck(script);
     assert_eq!(code, 0);
     assert_eq!(out, "0 1 3 4 ");

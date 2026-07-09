@@ -114,9 +114,8 @@ fn syntax_error_reports_line_and_continues() {
 
 #[test]
 fn midfile_extglob_then_case_pattern() {
-    let (out, _e, _c) = run(
-        "shopt -s extglob\ncase abc in\n  @(abc|xyz)) echo hit ;;\n  *) echo miss ;;\nesac\n",
-    );
+    let (out, _e, _c) =
+        run("shopt -s extglob\ncase abc in\n  @(abc|xyz)) echo hit ;;\n  *) echo miss ;;\nesac\n");
     assert_eq!(out, "hit\n");
 }
 

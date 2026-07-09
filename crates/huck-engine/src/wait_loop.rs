@@ -32,7 +32,11 @@ mod linux {
     #[allow(dead_code)]
     impl WaitLoop {
         pub fn new() -> io::Result<Self> {
-            Ok(Self { sigchld_fd: None, pipes: Vec::new(), saved_mask: None })
+            Ok(Self {
+                sigchld_fd: None,
+                pipes: Vec::new(),
+                saved_mask: None,
+            })
         }
 
         pub fn register_pipe(&mut self, fd: RawFd) -> io::Result<()> {
@@ -55,17 +59,14 @@ mod linux {
             unsafe { libc::sigaddset(&mut new_mask, libc::SIGCHLD) };
 
             let mut old_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-            let ret = unsafe {
-                libc::pthread_sigmask(libc::SIG_BLOCK, &new_mask, &mut old_mask)
-            };
+            let ret = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &new_mask, &mut old_mask) };
             if ret != 0 {
                 return Err(io::Error::from_raw_os_error(ret));
             }
             self.saved_mask = Some(old_mask);
 
-            let fd = unsafe {
-                libc::signalfd(-1, &new_mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK)
-            };
+            let fd =
+                unsafe { libc::signalfd(-1, &new_mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -78,19 +79,35 @@ mod linux {
                 None => -1,
                 Some(d) => {
                     let ms = d.as_millis();
-                    if ms > i32::MAX as u128 { i32::MAX } else { ms as i32 }
+                    if ms > i32::MAX as u128 {
+                        i32::MAX
+                    } else {
+                        ms as i32
+                    }
                 }
             };
             let mut pollfds: Vec<libc::pollfd> = self
                 .pipes
                 .iter()
-                .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+                .map(|&fd| libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                })
                 .collect();
             if let Some(fd) = self.sigchld_fd {
-                pollfds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+                pollfds.push(libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
             }
             let n = unsafe {
-                libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms)
+                libc::poll(
+                    pollfds.as_mut_ptr(),
+                    pollfds.len() as libc::nfds_t,
+                    timeout_ms,
+                )
             };
             if n < 0 {
                 let err = io::Error::last_os_error();
@@ -107,9 +124,7 @@ mod linux {
                 if Some(pfd.fd) == self.sigchld_fd {
                     // Drain the signalfd so it returns to non-ready.
                     let mut buf = [0u8; std::mem::size_of::<libc::signalfd_siginfo>() * 4];
-                    let _ = unsafe {
-                        libc::read(pfd.fd, buf.as_mut_ptr() as *mut _, buf.len())
-                    };
+                    let _ = unsafe { libc::read(pfd.fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     events.push(Event::ChildExited);
                 } else if pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                     events.push(Event::Readable(pfd.fd));
@@ -203,9 +218,7 @@ mod macos {
             unsafe { libc::sigemptyset(&mut new_mask) };
             unsafe { libc::sigaddset(&mut new_mask, libc::SIGCHLD) };
             let mut old_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-            let ret = unsafe {
-                libc::pthread_sigmask(libc::SIG_BLOCK, &new_mask, &mut old_mask)
-            };
+            let ret = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &new_mask, &mut old_mask) };
             if ret != 0 {
                 return Err(io::Error::from_raw_os_error(ret));
             }
@@ -315,7 +328,10 @@ mod tests {
         unsafe { libc::write(w, b"hi\n".as_ptr() as *const _, 3) };
         let evs = wl.poll(Some(Duration::from_millis(100))).unwrap();
         assert!(evs.contains(&Event::Readable(r)));
-        unsafe { libc::close(r); libc::close(w); }
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
     }
 
     #[test]
@@ -327,8 +343,14 @@ mod tests {
         let evs = wl.poll(Some(Duration::from_millis(50))).unwrap();
         let elapsed = start.elapsed();
         assert!(evs.is_empty(), "expected no events on timeout, got {evs:?}");
-        assert!(elapsed >= Duration::from_millis(40), "elapsed too short: {elapsed:?}");
-        unsafe { libc::close(r); libc::close(w); }
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "elapsed too short: {elapsed:?}"
+        );
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
     }
 
     #[test]
@@ -379,10 +401,7 @@ mod tests {
                 libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut m);
                 m
             };
-            assert_eq!(
-                unsafe { libc::sigismember(&blocked, libc::SIGCHLD) },
-                1
-            );
+            assert_eq!(unsafe { libc::sigismember(&blocked, libc::SIGCHLD) }, 1);
         }
         // After Drop: SIGCHLD mask should be back to its prior state.
         let after: libc::sigset_t = unsafe {

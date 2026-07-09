@@ -99,10 +99,7 @@ mod tests {
 
     #[test]
     fn parse_percent_tilde_is_prefix() {
-        assert_eq!(
-            parse_job_spec("%~"),
-            Ok(JobSpec::Prefix("~".to_string()))
-        );
+        assert_eq!(parse_job_spec("%~"), Ok(JobSpec::Prefix("~".to_string())));
     }
 
     #[test]

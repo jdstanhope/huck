@@ -136,16 +136,14 @@ pub fn pipeline_drain_loop(
         for ev in events {
             match ev {
                 Event::Readable(fd) if fd == pipe_out && !out_eof => {
-                    let eof =
-                        read_and_dispatch_eof(fd, sinks.stdout.as_deref_mut(), true)?;
+                    let eof = read_and_dispatch_eof(fd, sinks.stdout.as_deref_mut(), true)?;
                     if eof {
                         out_eof = true;
                         wl.unregister_pipe(fd);
                     }
                 }
                 Event::Readable(fd) if fd == pipe_err && !err_eof => {
-                    let eof =
-                        read_and_dispatch_eof(fd, sinks.stderr.as_deref_mut(), false)?;
+                    let eof = read_and_dispatch_eof(fd, sinks.stderr.as_deref_mut(), false)?;
                     if eof {
                         err_eof = true;
                         wl.unregister_pipe(fd);
@@ -214,11 +212,7 @@ fn set_nonblock(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn read_and_dispatch(
-    fd: RawFd,
-    mut sink: Option<&mut Vec<u8>>,
-    is_stdout: bool,
-) -> io::Result<()> {
+fn read_and_dispatch(fd: RawFd, mut sink: Option<&mut Vec<u8>>, is_stdout: bool) -> io::Result<()> {
     let mut buf = [0u8; CHUNK_SIZE];
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
@@ -256,11 +250,7 @@ fn read_and_dispatch(
     }
 }
 
-fn drain_to_eof(
-    fd: RawFd,
-    sink: Option<&mut Vec<u8>>,
-    is_stdout: bool,
-) -> io::Result<()> {
+fn drain_to_eof(fd: RawFd, sink: Option<&mut Vec<u8>>, is_stdout: bool) -> io::Result<()> {
     let mut buf = [0u8; CHUNK_SIZE];
     let mut sink = sink;
     loop {

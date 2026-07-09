@@ -57,14 +57,8 @@ fn local_array_scoped_to_function_restores_outer_after_return() {
          echo \"outer: ${a[@]}\"\n\
          exit\n",
     );
-    assert!(
-        out.lines().any(|l| l == "inner: p q"),
-        "stdout: {out:?}",
-    );
-    assert!(
-        out.lines().any(|l| l == "outer: x y z"),
-        "stdout: {out:?}",
-    );
+    assert!(out.lines().any(|l| l == "inner: p q"), "stdout: {out:?}",);
+    assert!(out.lines().any(|l| l == "outer: x y z"), "stdout: {out:?}",);
 }
 
 #[test]

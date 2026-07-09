@@ -45,7 +45,10 @@ fn c_mode_first_operand_is_argv0() {
 #[test]
 fn c_mode_no_operands_argv0_is_shell_name() {
     let (out, _e, _c) = run(&["-c", "echo \"0=$0 1=$1 #=$#\""], "");
-    assert!(out.starts_with("0=") && out.contains("huck"), "expected shell name in $0: {out:?}");
+    assert!(
+        out.starts_with("0=") && out.contains("huck"),
+        "expected shell name in $0: {out:?}"
+    );
     assert!(out.contains("#=0"), "expected #=0: {out:?}");
 }
 
@@ -105,7 +108,10 @@ fn file_mode_missing_file_exits_127() {
 fn set_e_propagates_failure_exit() {
     let f = write_script("set -e\nfalse\necho nope\n");
     let (out, _e, c) = run(&[f.path().to_str().unwrap()], "");
-    assert!(!out.contains("nope"), "errexit should stop before echo: {out:?}");
+    assert!(
+        !out.contains("nope"),
+        "errexit should stop before echo: {out:?}"
+    );
     assert_ne!(c, 0, "errexit should exit non-zero");
 }
 
@@ -131,6 +137,9 @@ fn payoff_read_from_file_consumes_real_stdin() {
 fn set_u_aborts_script_on_unbound_var() {
     let f = write_script("set -u\necho \"x=$UNSET_VAR_XYZ\"\necho after\n");
     let (out, _e, c) = run(&[f.path().to_str().unwrap()], "");
-    assert!(!out.contains("after"), "set -u should abort before 'after': {out:?}");
+    assert!(
+        !out.contains("after"),
+        "set -u should abort before 'after': {out:?}"
+    );
     assert_ne!(c, 0, "set -u unbound var should exit non-zero");
 }

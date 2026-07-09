@@ -14,7 +14,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     drop(child.stdin.take());
     let output = child.wait_with_output().expect("wait");
     (
@@ -62,7 +67,10 @@ fn dollar_zero_same_inside_and_outside_function() {
     let (out, _) = run("f() { echo $0; }\nf\necho $0\nexit\n");
     // The in-function and top-level `$0` are the same invocation name.
     let zero_lines: Vec<&str> = out.lines().filter(|l| l.contains("huck")).collect();
-    assert!(zero_lines.len() >= 2, "expected matching $0 lines, got: {out}");
+    assert!(
+        zero_lines.len() >= 2,
+        "expected matching $0 lines, got: {out}"
+    );
     assert_eq!(zero_lines[0].trim(), zero_lines[1].trim(), "got: {out}");
 }
 
@@ -73,7 +81,10 @@ fn dollar_zero_same_inside_and_outside_function() {
 #[test]
 fn dollar_dollar_top_level_is_positive_integer() {
     let (out, _) = run("echo $$\nexit\n");
-    let line = out.lines().find(|l| l.trim().parse::<i32>().is_ok()).expect("numeric line");
+    let line = out
+        .lines()
+        .find(|l| l.trim().parse::<i32>().is_ok())
+        .expect("numeric line");
     let pid: i32 = line.trim().parse().unwrap();
     assert!(pid > 0, "expected positive pid, got: {pid}");
 }
@@ -81,11 +92,15 @@ fn dollar_dollar_top_level_is_positive_integer() {
 #[test]
 fn dollar_dollar_same_in_subshell() {
     let (out, _) = run("echo $$\necho $$ | cat\nexit\n");
-    let numeric_lines: Vec<i32> = out.lines()
+    let numeric_lines: Vec<i32> = out
+        .lines()
         .filter_map(|l| l.trim().parse::<i32>().ok())
         .collect();
     assert!(numeric_lines.len() >= 2, "got: {out}");
-    assert_eq!(numeric_lines[0], numeric_lines[1], "subshell $$ should match parent; got: {out}");
+    assert_eq!(
+        numeric_lines[0], numeric_lines[1],
+        "subshell $$ should match parent; got: {out}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -107,8 +122,11 @@ fn dollar_bang_set_after_backgrounded_external() {
     // background spawn sets $!, not how long it sleeps.
     let (out, _) = run("/bin/sleep 1 &\necho \"[$!]\"\nwait\nexit\n");
     // Output should contain "[N]" where N is a positive integer.
-    let bracketed = out.lines().find(|l| l.starts_with('[') && l.ends_with(']')).expect("[pid] line");
-    let inner = &bracketed[1..bracketed.len()-1];
+    let bracketed = out
+        .lines()
+        .find(|l| l.starts_with('[') && l.ends_with(']'))
+        .expect("[pid] line");
+    let inner = &bracketed[1..bracketed.len() - 1];
     let pid: i32 = inner.parse().expect("integer inside brackets");
     assert!(pid > 0, "got: {out}");
 }
@@ -119,16 +137,19 @@ fn dollar_bang_is_last_stage_of_pipeline() {
     // $! should be the LAST stage's pid (the cat), not the first stage's.
     // Use /bin/ paths — present on both Linux and macOS (the latter
     // doesn't ship /usr/bin/{sh,cat}).
-    let (out, _) = run(
-        "/bin/sh -c 'echo $$' | /bin/cat &\nLAST=$!\nwait\necho \"[$LAST]\"\nexit\n"
-    );
+    let (out, _) =
+        run("/bin/sh -c 'echo $$' | /bin/cat &\nLAST=$!\nwait\necho \"[$LAST]\"\nexit\n");
     let bracketed = out.lines().find(|l| l.starts_with('[')).expect("bracketed");
-    let last_pid: i32 = bracketed[1..bracketed.len()-1].parse().expect("int");
-    let first_pid: i32 = out.lines()
+    let last_pid: i32 = bracketed[1..bracketed.len() - 1].parse().expect("int");
+    let first_pid: i32 = out
+        .lines()
         .find(|l| l.trim().parse::<i32>().is_ok())
         .and_then(|l| l.trim().parse().ok())
         .expect("first stage pid printed");
-    assert_ne!(last_pid, first_pid, "$! should be last stage's pid, not first; got: {out}");
+    assert_ne!(
+        last_pid, first_pid,
+        "$! should be last stage's pid, not first; got: {out}"
+    );
     assert!(last_pid > 0);
 }
 
@@ -139,10 +160,11 @@ fn dollar_bang_set_after_backgrounded_pure_builtin() {
     // stayed unset/stale. Post-fix: echo runs in a forked subshell and $!
     // returns that pid.
     let (out, _) = run("echo hi &\necho \"[$!]\"\nwait\nexit\n");
-    let bracketed = out.lines()
+    let bracketed = out
+        .lines()
         .find(|l| l.starts_with('[') && l.ends_with(']') && l.len() > 2)
         .unwrap_or_else(|| panic!("expected non-empty bracketed pid line, got: {out}"));
-    let inner = &bracketed[1..bracketed.len()-1];
+    let inner = &bracketed[1..bracketed.len() - 1];
     let pid: i32 = inner.parse().expect("integer inside brackets");
     assert!(pid > 0, "got: {out}");
 }
@@ -151,25 +173,34 @@ fn dollar_bang_set_after_backgrounded_pure_builtin() {
 fn dollar_bang_updates_after_second_background() {
     // After cmd1 &; cmd2 &, $! should reflect cmd2's pid, not cmd1's.
     let (out, _) = run(
-        "/usr/bin/sleep 0.2 &\nFIRST=$!\necho hi &\nSECOND=$!\nwait\necho \"[$FIRST] [$SECOND]\"\nexit\n"
+        "/usr/bin/sleep 0.2 &\nFIRST=$!\necho hi &\nSECOND=$!\nwait\necho \"[$FIRST] [$SECOND]\"\nexit\n",
     );
-    let line = out.lines()
+    let line = out
+        .lines()
         .find(|l| l.contains("[") && l.contains("]"))
         .unwrap_or_else(|| panic!("got: {out}"));
     let parts: Vec<&str> = line.split_whitespace().collect();
     assert_eq!(parts.len(), 2, "got: {out}");
-    assert_ne!(parts[0], parts[1], "$! should differ between two backgrounds; got: {out}");
+    assert_ne!(
+        parts[0], parts[1],
+        "$! should differ between two backgrounds; got: {out}"
+    );
 }
 
 #[test]
 fn dollar_bang_preserves_across_subsequent_foreground() {
     // $! should not change after a foreground command.
-    let (out, _) = run(
-        "/usr/bin/sleep 0.1 &\nBG_PID=$!\ntrue\necho \"[$BG_PID] [$!]\"\nwait\nexit\n"
-    );
-    let line = out.lines().find(|l| l.contains('[')).expect("bracketed line");
+    let (out, _) =
+        run("/usr/bin/sleep 0.1 &\nBG_PID=$!\ntrue\necho \"[$BG_PID] [$!]\"\nwait\nexit\n");
+    let line = out
+        .lines()
+        .find(|l| l.contains('['))
+        .expect("bracketed line");
     // Both bracketed values should be identical.
     let parts: Vec<&str> = line.split_whitespace().collect();
     assert_eq!(parts.len(), 2, "got: {out}");
-    assert_eq!(parts[0], parts[1], "$! changed after foreground command; got: {out}");
+    assert_eq!(
+        parts[0], parts[1],
+        "$! changed after foreground command; got: {out}"
+    );
 }

@@ -2,25 +2,44 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 fn run(script: &str) -> (String, i32) {
     let mut child = Command::new(huck_bin())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-        .spawn().expect("spawn huck");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn huck");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
-    (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
 fn dollar_hash_in_dbl_paren() {
-    assert_eq!(run("set -- a b\n(($# == 2)) && echo Y || echo N\n").0, "Y\n");
+    assert_eq!(
+        run("set -- a b\n(($# == 2)) && echo Y || echo N\n").0,
+        "Y\n"
+    );
 }
 
 #[test]
 fn arr_len_in_dbl_paren() {
-    assert_eq!(run("a=(x y z)\n((${#a[@]} == 3)) && echo Y || echo N\n").0, "Y\n");
+    assert_eq!(
+        run("a=(x y z)\n((${#a[@]} == 3)) && echo Y || echo N\n").0,
+        "Y\n"
+    );
 }
 
 #[test]
@@ -35,7 +54,10 @@ fn command_sub_in_arith_expansion() {
 
 #[test]
 fn dollar_in_arith_for_header() {
-    assert_eq!(run("a=(x y z)\nfor ((i=0; i<${#a[@]}; i++)); do printf '%s' \"$i\"; done\necho\n").0, "012\n");
+    assert_eq!(
+        run("a=(x y z)\nfor ((i=0; i<${#a[@]}; i++)); do printf '%s' \"$i\"; done\necho\n").0,
+        "012\n"
+    );
 }
 
 #[test]

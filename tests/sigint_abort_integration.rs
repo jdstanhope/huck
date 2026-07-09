@@ -3,12 +3,15 @@
 //! PTY/timing). Runs the huck binary as a subprocess.
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 /// Run `huck -c <script>`; return (stdout, stderr, exit_code).
 fn huck_c(script: &str) -> (String, String, i32) {
     let o = Command::new(huck_bin())
-        .arg("-c").arg(script)
+        .arg("-c")
+        .arg(script)
         .stdin(Stdio::null())
         .output()
         .expect("spawn huck");
@@ -29,7 +32,10 @@ fn sequence_aborts_on_sigint() {
 #[test]
 fn function_body_aborts_and_unwinds_caller() {
     let (out, _e, code) = huck_c("f(){ echo a; kill -INT $$; echo b; }; f; echo after");
-    assert_eq!(out, "a\n", "abort unwinds through the function AND the caller; out={out:?}");
+    assert_eq!(
+        out, "a\n",
+        "abort unwinds through the function AND the caller; out={out:?}"
+    );
     assert_eq!(code, 130);
 }
 
@@ -88,6 +94,9 @@ fn while_read_loop_aborts() {
 fn command_substitution_aborts() {
     // SIGINT inside $(...) aborts; the trailing command must not run.
     let (out, _e, code) = huck_c("x=$(echo a; kill -INT $$; echo b); echo \"[$x]\"; echo after");
-    assert!(!out.contains("after"), "must abort before `after`; out={out:?}");
+    assert!(
+        !out.contains("after"),
+        "must abort before `after`; out={out:?}"
+    );
     assert_eq!(code, 130, "out={out:?}");
 }

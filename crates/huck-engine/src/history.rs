@@ -75,7 +75,9 @@ impl History {
         if number < self.base_number {
             return None;
         }
-        self.entries.get(number - self.base_number).map(|s| s.as_str())
+        self.entries
+            .get(number - self.base_number)
+            .map(|s| s.as_str())
     }
 
     /// The most recent entry.
@@ -132,8 +134,7 @@ impl History {
         let Some(path) = &self.file else { return None };
         match std::fs::read_to_string(path) {
             Ok(contents) => {
-                let mut lines: Vec<String> =
-                    contents.lines().map(unescape_for_load).collect();
+                let mut lines: Vec<String> = contents.lines().map(unescape_for_load).collect();
                 if let Some(cap) = self.max
                     && lines.len() > cap
                 {
@@ -144,7 +145,10 @@ impl History {
                 None
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => Some(format!("warning: could not read history file: {}", crate::bash_io_error(&e))),
+            Err(e) => Some(format!(
+                "warning: could not read history file: {}",
+                crate::bash_io_error(&e)
+            )),
         }
     }
 
@@ -166,7 +170,10 @@ impl History {
             out.push('\n');
         }
         if let Err(e) = std::fs::write(path, out) {
-            return Some(format!("warning: could not write history file: {}", crate::bash_io_error(&e)));
+            return Some(format!(
+                "warning: could not write history file: {}",
+                crate::bash_io_error(&e)
+            ));
         }
         None
     }
@@ -209,9 +216,15 @@ fn unescape_for_load(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.peek() {
-                Some('\\') => { chars.next(); out.push('\\'); }
-                Some('n')  => { chars.next(); out.push('\n'); }
-                _          => out.push('\\'),
+                Some('\\') => {
+                    chars.next();
+                    out.push('\\');
+                }
+                Some('n') => {
+                    chars.next();
+                    out.push('\n');
+                }
+                _ => out.push('\\'),
             }
         } else {
             out.push(c);
@@ -252,10 +265,7 @@ pub fn expand(line: &str, history: &History) -> Result<Option<String>, HistError
 
 /// Handles `^old^new^` (or `^old^new`) quick substitution on the previous
 /// command. `line`, after leading blanks, begins with `^`.
-fn quick_substitution(
-    line: &str,
-    history: &History,
-) -> Result<Option<String>, HistError> {
+fn quick_substitution(line: &str, history: &History) -> Result<Option<String>, HistError> {
     let leading = line.len() - line.trim_start().len();
     // Skip the leading blanks and the first `^`.
     let body = &line[leading + 1..];
@@ -326,13 +336,14 @@ fn scan(line: &str, history: &History) -> Result<Option<String>, HistError> {
                         out.push('!');
                         i += 1;
                     }
-                    Some(n) if preceded_by_dollar
-                        || preceded_by_dollar_lbrace
-                        || n.is_whitespace()
-                        || n == '='
-                        || n == '('
-                        || n == '\''
-                        || n == '"' =>
+                    Some(n)
+                        if preceded_by_dollar
+                            || preceded_by_dollar_lbrace
+                            || n.is_whitespace()
+                            || n == '='
+                            || n == '('
+                            || n == '\''
+                            || n == '"' =>
                     {
                         out.push('!');
                         i += 1;
@@ -386,7 +397,11 @@ fn read_event(
                 // `!-` not followed by digits — not a trigger.
                 return Ok(None);
             }
-            let n: usize = chars[after + 1..j].iter().collect::<String>().parse().unwrap_or(usize::MAX);
+            let n: usize = chars[after + 1..j]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .unwrap_or(usize::MAX);
             let token: String = chars[start..j].iter().collect();
             let last_num = history
                 .last_number()
@@ -402,7 +417,11 @@ fn read_event(
             while j < chars.len() && chars[j].is_ascii_digit() {
                 j += 1;
             }
-            let n: usize = chars[after..j].iter().collect::<String>().parse().unwrap_or(usize::MAX);
+            let n: usize = chars[after..j]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .unwrap_or(usize::MAX);
             let token: String = chars[start..j].iter().collect();
             match history.get(n) {
                 Some(s) => Ok(Some((s.to_string(), j - start))),
@@ -463,13 +482,25 @@ mod tests {
     use super::*;
 
     fn empty() -> History {
-        History { entries: Vec::new(), base_number: 1, max: Some(1000), file: None }
+        History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: Some(1000),
+            file: None,
+        }
     }
 
     #[test]
     fn set_max_some_evicts_to_cap() {
-        let mut h = History { entries: Vec::new(), base_number: 1, max: Some(1000), file: None };
-        for c in ["c1", "c2", "c3", "c4", "c5"] { h.add(c.to_string()); }
+        let mut h = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: Some(1000),
+            file: None,
+        };
+        for c in ["c1", "c2", "c3", "c4", "c5"] {
+            h.add(c.to_string());
+        }
         h.set_max(Some(3));
         let got: Vec<(usize, &str)> = h.entries().collect();
         assert_eq!(got, vec![(3, "c3"), (4, "c4"), (5, "c5")]);
@@ -477,16 +508,28 @@ mod tests {
 
     #[test]
     fn set_max_none_keeps_all() {
-        let mut h = History { entries: Vec::new(), base_number: 1, max: Some(2), file: None };
+        let mut h = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: Some(2),
+            file: None,
+        };
         h.set_max(None);
-        for c in ["c1", "c2", "c3", "c4"] { h.add(c.to_string()); }
+        for c in ["c1", "c2", "c3", "c4"] {
+            h.add(c.to_string());
+        }
         let got: Vec<(usize, &str)> = h.entries().collect();
         assert_eq!(got, vec![(1, "c1"), (2, "c2"), (3, "c3"), (4, "c4")]);
     }
 
     #[test]
     fn set_max_zero_empties() {
-        let mut h = History { entries: Vec::new(), base_number: 1, max: Some(10), file: None };
+        let mut h = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: Some(10),
+            file: None,
+        };
         h.add("c1".to_string());
         h.set_max(Some(0));
         assert_eq!(h.last(), None);
@@ -498,8 +541,15 @@ mod tests {
     fn save_capped_writes_last_n() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hist");
-        let mut h = History { entries: Vec::new(), base_number: 1, max: None, file: Some(path.clone()) };
-        for c in ["c1", "c2", "c3"] { h.add(c.to_string()); }
+        let mut h = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: None,
+            file: Some(path.clone()),
+        };
+        for c in ["c1", "c2", "c3"] {
+            h.add(c.to_string());
+        }
         h.save_capped(Some(2));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "c2\nc3\n");
     }
@@ -508,8 +558,15 @@ mod tests {
     fn save_capped_none_writes_all_and_zero_writes_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hist");
-        let mut h = History { entries: Vec::new(), base_number: 1, max: None, file: Some(path.clone()) };
-        for c in ["c1", "c2"] { h.add(c.to_string()); }
+        let mut h = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: None,
+            file: Some(path.clone()),
+        };
+        for c in ["c1", "c2"] {
+            h.add(c.to_string());
+        }
         h.save_capped(None);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "c1\nc2\n");
         h.save_capped(Some(0));
@@ -540,7 +597,12 @@ mod tests {
 
     #[test]
     fn cap_eviction_bumps_base_number() {
-        let mut h = History { entries: Vec::new(), base_number: 1, max: Some(3), file: None };
+        let mut h = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: Some(3),
+            file: None,
+        };
         for cmd in ["c1", "c2", "c3", "c4", "c5"] {
             h.add(cmd.to_string());
         }
@@ -639,7 +701,12 @@ mod tests {
 
     #[test]
     fn load_and_save_no_op_when_file_is_none() {
-        let mut h = History { entries: Vec::new(), base_number: 1, max: Some(1000), file: None };
+        let mut h = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: Some(1000),
+            file: None,
+        };
         h.load();
         h.save();
         assert_eq!(h.last(), None);
@@ -712,7 +779,12 @@ mod tests {
     }
 
     fn hist_with(cmds: &[&str]) -> History {
-        let mut h = History { entries: Vec::new(), base_number: 1, max: Some(1000), file: None };
+        let mut h = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: Some(1000),
+            file: None,
+        };
         for c in cmds {
             h.add(c.to_string());
         }
@@ -734,7 +806,10 @@ mod tests {
     #[test]
     fn expand_bang_bang_embedded_in_line() {
         let h = hist_with(&["ls -l"]);
-        assert_eq!(expand("sudo !!", &h).unwrap(), Some("sudo ls -l".to_string()));
+        assert_eq!(
+            expand("sudo !!", &h).unwrap(),
+            Some("sudo ls -l".to_string())
+        );
     }
 
     #[test]
@@ -746,7 +821,10 @@ mod tests {
     #[test]
     fn expand_bang_n_out_of_range_errors() {
         let h = hist_with(&["only"]);
-        assert!(matches!(expand("!9", &h).unwrap_err(), HistError::EventNotFound(_)));
+        assert!(matches!(
+            expand("!9", &h).unwrap_err(),
+            HistError::EventNotFound(_)
+        ));
     }
 
     #[test]
@@ -759,13 +837,19 @@ mod tests {
     #[test]
     fn expand_bang_minus_n_out_of_range_errors() {
         let h = hist_with(&["one"]);
-        assert!(matches!(expand("!-5", &h).unwrap_err(), HistError::EventNotFound(_)));
+        assert!(matches!(
+            expand("!-5", &h).unwrap_err(),
+            HistError::EventNotFound(_)
+        ));
     }
 
     #[test]
     fn expand_bang_bang_no_history_errors() {
         let h = hist_with(&[]);
-        assert!(matches!(expand("!!", &h).unwrap_err(), HistError::EventNotFound(_)));
+        assert!(matches!(
+            expand("!!", &h).unwrap_err(),
+            HistError::EventNotFound(_)
+        ));
     }
 
     #[test]
@@ -795,7 +879,10 @@ mod tests {
     #[test]
     fn expand_bang_inside_double_quotes_still_expands() {
         let h = hist_with(&["prev"]);
-        assert_eq!(expand("echo \"!!\"", &h).unwrap(), Some("echo \"prev\"".to_string()));
+        assert_eq!(
+            expand("echo \"!!\"", &h).unwrap(),
+            Some("echo \"prev\"".to_string())
+        );
     }
 
     #[test]
@@ -816,7 +903,10 @@ mod tests {
     #[test]
     fn expand_bang_dollar_is_last_word() {
         let h = hist_with(&["ls -l /tmp"]);
-        assert_eq!(expand("echo !$", &h).unwrap(), Some("echo /tmp".to_string()));
+        assert_eq!(
+            expand("echo !$", &h).unwrap(),
+            Some("echo /tmp".to_string())
+        );
     }
 
     #[test]
@@ -828,7 +918,10 @@ mod tests {
     #[test]
     fn expand_bang_star_is_all_arguments() {
         let h = hist_with(&["ls -l /tmp /var"]);
-        assert_eq!(expand("echo !*", &h).unwrap(), Some("echo -l /tmp /var".to_string()));
+        assert_eq!(
+            expand("echo !*", &h).unwrap(),
+            Some("echo -l /tmp /var".to_string())
+        );
     }
 
     #[test]
@@ -852,7 +945,10 @@ mod tests {
     #[test]
     fn expand_bang_dollar_no_history_errors() {
         let h = hist_with(&[]);
-        assert!(matches!(expand("echo !$", &h).unwrap_err(), HistError::EventNotFound(_)));
+        assert!(matches!(
+            expand("echo !$", &h).unwrap_err(),
+            HistError::EventNotFound(_)
+        ));
     }
 
     #[test]
@@ -864,25 +960,37 @@ mod tests {
     #[test]
     fn expand_bang_string_no_match_errors() {
         let h = hist_with(&["ls -l"]);
-        assert!(matches!(expand("!nope", &h).unwrap_err(), HistError::EventNotFound(_)));
+        assert!(matches!(
+            expand("!nope", &h).unwrap_err(),
+            HistError::EventNotFound(_)
+        ));
     }
 
     #[test]
     fn expand_bang_string_stops_at_whitespace() {
         let h = hist_with(&["make build"]);
-        assert_eq!(expand("!make again", &h).unwrap(), Some("make build again".to_string()));
+        assert_eq!(
+            expand("!make again", &h).unwrap(),
+            Some("make build again".to_string())
+        );
     }
 
     #[test]
     fn expand_quick_substitution_basic() {
         let h = hist_with(&["echo hello"]);
-        assert_eq!(expand("^hello^world^", &h).unwrap(), Some("echo world".to_string()));
+        assert_eq!(
+            expand("^hello^world^", &h).unwrap(),
+            Some("echo world".to_string())
+        );
     }
 
     #[test]
     fn expand_quick_substitution_trailing_caret_optional() {
         let h = hist_with(&["echo hello"]);
-        assert_eq!(expand("^hello^world", &h).unwrap(), Some("echo world".to_string()));
+        assert_eq!(
+            expand("^hello^world", &h).unwrap(),
+            Some("echo world".to_string())
+        );
     }
 
     #[test]
@@ -894,7 +1002,10 @@ mod tests {
     #[test]
     fn expand_quick_substitution_leading_blanks_allowed() {
         let h = hist_with(&["echo hello"]);
-        assert_eq!(expand("  ^hello^world^", &h).unwrap(), Some("echo world".to_string()));
+        assert_eq!(
+            expand("  ^hello^world^", &h).unwrap(),
+            Some("echo world".to_string())
+        );
     }
 
     #[test]

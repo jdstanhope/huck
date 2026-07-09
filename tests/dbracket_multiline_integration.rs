@@ -2,17 +2,29 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 
 /// Runs `script` through huck on stdin; returns (stdout, exit_code).
 fn run(script: &str) -> (String, i32) {
     let mut child = Command::new(huck_bin())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-        .spawn().expect("spawn huck");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn huck");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
-    (String::from_utf8_lossy(&out.stdout).into_owned(),
-     out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
@@ -23,12 +35,18 @@ fn multiline_break_before_close() {
 
 #[test]
 fn multiline_break_after_and() {
-    assert_eq!(run("[[ -f /etc/passwd &&\n   -f /etc/hosts ]] && echo both\n").0, "both\n");
+    assert_eq!(
+        run("[[ -f /etc/passwd &&\n   -f /etc/hosts ]] && echo both\n").0,
+        "both\n"
+    );
 }
 
 #[test]
 fn multiline_break_after_open() {
-    assert_eq!(run("[[\n  -f /etc/passwd ]] && echo opened\n").0, "opened\n");
+    assert_eq!(
+        run("[[\n  -f /etc/passwd ]] && echo opened\n").0,
+        "opened\n"
+    );
 }
 
 #[test]
@@ -53,15 +71,27 @@ fn bare_double_bracket_token_is_literal_arg() {
 
 #[test]
 fn dbracket_v_set_and_unset() {
-    assert_eq!(run("x=1\n[[ -v x ]] && echo set || echo unset\n").0, "set\n");
-    assert_eq!(run("y=\"\"\n[[ -v y ]] && echo set || echo unset\n").0, "set\n"); // set-but-empty
-    assert_eq!(run("unset z\n[[ -v z ]] && echo set || echo unset\n").0, "unset\n");
+    assert_eq!(
+        run("x=1\n[[ -v x ]] && echo set || echo unset\n").0,
+        "set\n"
+    );
+    assert_eq!(
+        run("y=\"\"\n[[ -v y ]] && echo set || echo unset\n").0,
+        "set\n"
+    ); // set-but-empty
+    assert_eq!(
+        run("unset z\n[[ -v z ]] && echo set || echo unset\n").0,
+        "unset\n"
+    );
 }
 
 #[test]
 fn test_builtin_v_set_and_unset() {
     assert_eq!(run("x=1\n[ -v x ] && echo set || echo unset\n").0, "set\n");
-    assert_eq!(run("unset z\n[ -v z ] && echo set || echo unset\n").0, "unset\n");
+    assert_eq!(
+        run("unset z\n[ -v z ] && echo set || echo unset\n").0,
+        "unset\n"
+    );
 }
 
 use std::fs;
@@ -118,7 +148,11 @@ fn dbracket_file_ops() {
         "ef\n"
     );
     assert_eq!(
-        run_in_dir(&make_old_new_link, "[[ old -ef new ]] && echo ef || echo no\n").0,
+        run_in_dir(
+            &make_old_new_link,
+            "[[ old -ef new ]] && echo ef || echo no\n"
+        )
+        .0,
         "no\n"
     );
 }

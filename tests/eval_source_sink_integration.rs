@@ -3,16 +3,28 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+fn huck_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_huck")
+}
 fn run(script: &str) -> (String, String, i32) {
     let mut child = Command::new(huck_bin())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().expect("spawn huck");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn huck");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
-    (String::from_utf8_lossy(&out.stdout).into_owned(),
-     String::from_utf8_lossy(&out.stderr).into_owned(),
-     out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 #[test]
@@ -31,12 +43,17 @@ fn eval_pipe_inside_capture() {
     // BSD `wc -l` (macOS) pads its output with leading spaces; GNU
     // `wc -l` (Linux) doesn't. The padding survives `$()` and lands
     // inside the brackets, so compare the inner numeric value.
-    let inner = o.trim().trim_start_matches('[').trim_end_matches(']').trim();
+    let inner = o
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
     assert_eq!(inner, "100", "o: {o:?}");
 }
 #[test]
 fn source_captured_in_subst() {
-    let (o, _e, _c) = run("printf 'echo S\\n' > /tmp/v132src.sh\nx=$(source /tmp/v132src.sh); echo \"[$x]\"\n");
+    let (o, _e, _c) =
+        run("printf 'echo S\\n' > /tmp/v132src.sh\nx=$(source /tmp/v132src.sh); echo \"[$x]\"\n");
     assert_eq!(o, "[S]\n", "o: {o:?}");
 }
 #[test]
@@ -64,7 +81,8 @@ fn eval_redirect_to_file() {
 #[test]
 fn eval_stdin_redirect() {
     // stdin redirect on eval flows to the eval'd command (via with_redirect_scope).
-    let (o, _e, _c) = run("printf 'IN\\n' > /tmp/v132in.txt\nx=$(eval 'cat' < /tmp/v132in.txt); echo \"[$x]\"\n");
+    let (o, _e, _c) =
+        run("printf 'IN\\n' > /tmp/v132in.txt\nx=$(eval 'cat' < /tmp/v132in.txt); echo \"[$x]\"\n");
     let _ = std::fs::remove_file("/tmp/v132in.txt");
     assert_eq!(o, "[IN]\n", "o: {o:?}");
 }

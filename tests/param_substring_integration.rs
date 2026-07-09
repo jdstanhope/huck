@@ -12,7 +12,12 @@ fn run(script: &str) -> (String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn huck");
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -74,8 +79,14 @@ fn substring_negative_computed_length_aborts_command() {
     // exit the shell. So in this test we verify the non-interactive
     // exit-on-fatal behavior: huck exits before reaching `echo after`.
     let (out, err) = run("s=abc\necho \"[${s:0:-4}]\"\necho after\nexit\n");
-    assert!(!out.lines().any(|l| l == "[]"), "stdout should NOT have []: {out}");
-    assert!(!out.lines().any(|l| l == "after"), "stdout should NOT have 'after': {out}");
+    assert!(
+        !out.lines().any(|l| l == "[]"),
+        "stdout should NOT have []: {out}"
+    );
+    assert!(
+        !out.lines().any(|l| l == "after"),
+        "stdout should NOT have 'after': {out}"
+    );
     assert!(err.contains("substring expression < 0"), "stderr: {err}");
 }
 
@@ -129,6 +140,9 @@ fn substring_bad_arith_is_fatal() {
     // (`${s:@@@}` / `${v:1+:2}` exit 1), so the command aborts and the `[]`
     // is never printed. huck now matches (routes through pending_fatal_pe_error).
     let (out, err) = run("s=hello\necho \"[${s:@@@}]\"\nexit\n");
-    assert!(!out.lines().any(|l| l == "[]"), "command should abort, not print []; stdout: {out}");
+    assert!(
+        !out.lines().any(|l| l == "[]"),
+        "command should abort, not print []; stdout: {out}"
+    );
     assert!(err.contains("error token is"), "stderr: {err}");
 }
