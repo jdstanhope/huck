@@ -39,10 +39,11 @@ Actively developed, one coherent feature at a time. Current scope:
   loading nvm: ~0.7 s vs ~46 s pre-fix; `nvm ls` wall-clock now matches bash.
 - Sources `~/.bashrc`-class startup files and the system `bash-completion`
   framework without errors.
-- Known gaps and deliberate divergences are tracked exhaustively in
-  [`docs/bash-divergences.md`](docs/bash-divergences.md) (Tiers: bugs, missing
-  features, intentional, low-impact) — see **Known differences from bash** below
-  for the summary.
+- Known gaps and actionable divergences are tracked as GitHub issues labelled
+  [`divergence`](https://github.com/jdstanhope/huck/issues?q=is%3Aissue+label%3Adivergence);
+  deliberate, kept-by-design divergences live in
+  [`docs/bash-divergences.md`](docs/bash-divergences.md) — see **Known
+  differences from bash** below for the summary.
 
 The full feature history (every iteration's spec and plan) lives in
 `docs/superpowers/`.
@@ -122,13 +123,16 @@ drives the system `bash-completion` framework.
 
 ## Known differences from bash
 
-huck targets byte-identical behavior with bash 5.x. The remaining differences —
-open bugs, missing features, and intentional divergences kept by design — are
-tracked exhaustively in
-[`docs/bash-divergences.md`](docs/bash-divergences.md), tiered by severity and
-kept current as each iteration lands. That document is the single source of
-truth; this README deliberately does not duplicate the list (it would only drift
-out of date).
+huck targets byte-identical behavior with bash 5.x. The remaining differences
+are tracked as GitHub issues: open bugs and missing features are labelled
+[`divergence`](https://github.com/jdstanhope/huck/issues?q=is%3Aissue+is%3Aopen+label%3Adivergence)
+(filter by `bug`/`enhancement` and `sev:high`/`sev:medium`/`sev:low`), and
+deliberate divergences kept by design are the closed
+[`by-design`](https://github.com/jdstanhope/huck/issues?q=is%3Aissue+label%3Aby-design)
+issues — also mirrored, with rationale, in
+[`docs/bash-divergences.md`](docs/bash-divergences.md). The issue tracker is the
+single source of truth; this README deliberately does not duplicate the list (it
+would only drift out of date).
 
 Note: a *fully* working `mise<TAB>` additionally requires `bash-completion`
 **2.12+** (mise's generated completion calls the 2.12 API); on systems with
@@ -168,7 +172,8 @@ crates/
   huck (root)/src/      thin binary: main.rs → huck_cli::run(args)
 docs/
   architecture.md       module map, key types, pipeline, where-to-add cheatsheet
-  bash-divergences.md   exhaustive, tiered list of differences from bash
+  bash-divergences.md   intentional (kept-by-design) divergences from bash;
+                        actionable ones live in GitHub `divergence` issues
   superpowers/specs/    design spec per iteration
   superpowers/plans/    implementation plan per iteration
 ```
@@ -177,13 +182,16 @@ docs/
 
 Each iteration follows the same loop:
 
+0. **Take an issue** → pick an open [`divergence`](https://github.com/jdstanhope/huck/issues?q=is%3Aissue+is%3Aopen+label%3Adivergence)
+   issue, or open a new one to capture the work
 1. **Brainstorm** → design spec in `docs/superpowers/specs/`
 2. **Plan**      → task-by-task plan in `docs/superpowers/plans/`
 3. **Implement** task-by-task on a feature branch, with per-task spec-compliance
    and code-quality review
-4. **Final review** across the whole branch, then merge to `main`
+4. **Final review** across the whole branch, then open a pull request
+   (`Closes #N`) for the maintainer to review and merge to `main`
 5. **Verify** against bash via a per-feature `tests/scripts/*_diff_check.sh`
-   harness, and flip the relevant `docs/bash-divergences.md` entry
+   harness; the merged PR closes its `divergence` issue
 
 Tests live alongside each module in `#[cfg(test)] mod tests` blocks, plus
 binary-driven integration tests under `tests/`. Interactive features (tab

@@ -1,285 +1,149 @@
-# huck vs bash 5.x — Divergence Reference
+# huck vs bash 5.x — Intentional Divergences
 
-**Last updated:** 2026-07-07 (every entry empirically re-verified against bash 5.2.21 with the current huck binary; entries no longer reproducing were removed — M-09a, M-126, L-05, L-06, L-20, L-58 — and several partially-resolved entries trimmed to their still-diverging parts. Prior slim: 2026-06-09, to only the current/open divergences. Resolved divergences and the full shipped-iteration change log are preserved in git history.)
+**Last updated:** 2026-07-09.
 
-This is the running audit of where huck differs from bash 5.x. As of the
-2026-06-09 slim, it lists ONLY the divergences that are still current:
-`[deferred]` entries (pending work) and `[intentional]` entries (kept on
-purpose by design). Resolved divergences — every `[fixed vNN]` entry — and the
-shipped-iteration change log have been removed; they live in git history,
-under `docs/superpowers/` (per-iteration specs + plans), and in the project
-iteration memory. Reference an ID (e.g. `M-114`) in commit messages so the doc
-stays in sync.
+This document lists ONLY the divergences from bash 5.x that huck keeps **on
+purpose** — deliberate design choices we do not intend to "fix." Each one is
+also tracked as a closed, `by-design`-labelled GitHub issue for the record.
 
-## How to read
+## Where the actionable divergences live
 
-- Each entry has an ID (`B-` bugs, `M-` missing features, `I-` intentional,
-  `L-` low-impact), status, severity, the two behaviours, and (when known)
-  the fix location.
-- **Status**: `[deferred]` (a real divergence still to be addressed, ranked by
-  severity) or `[intentional]` (a deliberate divergence we're keeping). A
-  compound status (e.g. "(a) `[deferred]` / (b) `[intentional]`") means the
-  entry has both open and kept-by-design parts.
-- **Severity**: `high` (likely to surprise users / break scripts), `medium`
-  (rare but real), `low` (cosmetic / edge case).
+Every *actionable* divergence (bugs and missing bash features that we do intend
+to address) now lives in the **GitHub issue tracker**, not in this file:
 
-## Summary
+- **All divergences:** issues labelled [`divergence`](https://github.com/jdstanhope/huck/issues?q=is%3Aissue+label%3Adivergence)
+- **Open / actionable:** [`divergence` + open](https://github.com/jdstanhope/huck/issues?q=is%3Aissue+is%3Aopen+label%3Adivergence)
+  — filter further by `bug` / `enhancement` and `sev:high` / `sev:medium` / `sev:low`.
+- **Kept by design:** [`by-design`](https://github.com/jdstanhope/huck/issues?q=is%3Aissue+label%3Aby-design) (the items below).
 
-| Tier | Count | Notes |
-| --- | --- | --- |
-| Bugs (Tier 1) | 3 | Real behavioral divergences (surfaced by the 2026-07-09 differential sweep). |
-| Missing features (Tier 2) | 9 | Deferred bash-compat backlog, ranked by severity within each group. |
-| Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
-| Low-impact (Tier 4) | 66 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
+**Workflow:** before starting new work, review the open `divergence` issues and
+either take an existing one or open a new issue to capture the work. When the
+work is done, open a pull request that closes the issue (`Closes #N`) for review
+and merge. See `CLAUDE.md` for the full loop.
 
 ---
 
-## Tier 1: Bugs
+## Intentional divergences (kept by design)
 
-huck behaves wrong without a design reason; should be fixed. (The `set -e` /
-ERR-trap and-or-list exemption bug — huck wrongly exited on `false && echo x` —
-was FIXED in v275; see git history / the iterations memory. The entries below
-are the remaining behavioral divergences surfaced by the 2026-07-09 differential
-sweep.)
+huck behaves differently from bash here on purpose. Each links to its
+`by-design` tracking issue.
 
-- **B-01: `! eval CMD` / `! (subshell)` does not suppress `set -e` for a failure INSIDE the body** — `[deferred]`, medium (found v275). `set -e; ! eval false; echo after` → bash prints `after` (rc 0: the `!` negates the whole command, so its failure is not a set-e trigger), but huck EXITS (rc 1). Same for `! eval '(exit 5)'` (huck exits rc 5) and, by the same root cause, a `!`-negated subshell whose body fails. `! false` and `! builtin false` are CORRECT — the divergence is specific to constructs that run an inner execution (`eval`, `( … )`): the outer `!`/errexit-suppression context (`err_suppressed_depth`) is not propagated into the eval/subshell body, so the inner command's failure fires errexit before the `!` negates it. Surfaced by bash's own `set-e.tests` (line 93 `! eval false`), which huck exits early on. Fix: thread the negation/suppression context into `eval`'s `process_line_in_sinks` and the subshell body execution.
-- **B-03: `read` with a non-whitespace IFS keeps a trailing delimiter in the last variable** — `[deferred]`, low. `printf ':a:b:\n' | { IFS=: read x y z; echo "[$x][$y][$z]"; }` → bash `[][a][b]`, huck `[][a][b:]`. When there are more fields than variables, bash strips a trailing IFS delimiter from the remainder assigned to the last variable; huck strips only trailing IFS-**whitespace**, keeping a trailing non-ws delimiter. **v276 attempted a heuristic fix and REVERTED it**: the rule is genuinely subtle — for a multi-char IFS mixing whitespace and non-whitespace (`IFS=": "`), whether the trailing delimiter is stripped depends on preceding-character context in a way no simple "strip the sole trailing delimiter" heuristic captures (bash's own `ifs-posix.tests` enumerates hundreds of these; each heuristic tried fixed some rows and regressed others). A faithful fix requires porting bash's `read.def` last-field splitter and gating it on the full `ifs-posix` matrix — its own iteration. Narrow in practice (colon/CSV parsing where the line ends in the delimiter); huck keeps an extra trailing delimiter, it does not lose data.
-- **B-04: a failed arithmetic expansion returns rc 0 and still runs the command** — `[deferred]`, low. `echo $((3.5)); echo done` → bash prints the arith error to stderr, the `echo` does NOT run, and the command status is 1; huck prints the error, STILL runs `echo` (blank line), and the command status is 0. A malformed `$(( ))` in a simple command should abort the command with a non-zero status (bash), not be swallowed. Rare (a literal bad arithmetic expression in command position), but the rc/abort divergence can mask a real failure under `set -e`.
 
----
+### `case` requires a separator before `esac`
 
-## Tier 2: Missing bash features
+[Issue #12 · by-design](https://github.com/jdstanhope/huck/issues/12)
 
-Bash features huck doesn't implement. Listed roughly by impact within each
-group.
-
-### Job control
-
-- **M-42: `kill` with negative PID** — `[deferred]` low. huck: rejects. bash: passes to `kill(2)` as a pgrp / wildcard target.
-- **M-96: first-class nested and-or AST (`list → and_or → pipeline → command`)** — `[deferred]` low. M-95 follow-on. v98 keeps the flat `Sequence` model with executor-side grouping (`partition_into_groups` + `run_andor_group`), which is correct and low-risk. A future first-class `list → and_or → pipeline → command` AST may eventually be wanted to express `time` on a whole group, per-group traps, and cleaner pipeline-status propagation — none of which the flat model represents natively. Not user-visible today; logged so the structural debt is tracked.
-
-### Builtins (other)
-
-- **M-36b: system-data completion actions** — `[deferred]` low. `compgen -A
-  hostname`/`user`/`group`/`service` are recognized but return nothing; bash reads
-  `/etc/hosts`(`$HOSTFILE`)/`/etc/passwd`/`/etc/group`/`/etc/services`. Rarely the
-  decisive completion source; deferred to avoid new filesystem/libc lookups.
-- **M-46: `history -d`/`-w`/`-r`/`-a` flags** — `[deferred]` low. huck: only `-c`. bash: full set.
-- **M-47: `history N`** — `[deferred]` low. huck: rejects numeric arg. bash: prints last N entries.
-- **M-160: extquote `$'…'`-name not decoded in 3 less-common double-quote contexts** —
-  `[deferred]` low (v235 follow-on). v235 closed M-156: the `$'…'`-as-name decode inside
-  `${…}` is now gated on double-quote context (bash `extquote`) for top-level, `:-`/`:=`/`:+`
-  defaults, and `#`/`%`/`/`/`^`/`,` pattern operands incl. nesting — unquoted `${$'x1'}` is
-  now `bad substitution` (rc 1) like bash, quoted `"${$'x1'}"`/`"${x#${$'x1'%$'t'}}"` decode.
-  RESIDUAL: three OTHER operand-scanning paths do not seed the lexer's `in_dquote` flag, so
-  a `$'…'`-name nested inside them still `bad-subst`s in DOUBLE-QUOTE context where bash
-  decodes: (a) substring offset `"${x:${$'1'}}"` (bash `abcdef`; huck bad-subst + a spurious
-  second "operand expected"), (b) array subscript `"${arr[${$'i'}]}"`, (c) command-sub
-  directly inside `"…"` `"$(echo ${$'a'})"` (huck re-lexes the cmdsub body with a fresh
-  `quoted=false`/no `in_dquote`). All exotic (a `$'…'` literal used AS a parameter name in
-  these positions); huck is the stricter side here, so a bash-valid script bad-substs rather
-  than misbehaving. Fix: seed `opts.with_in_dquote(quoted || opts.in_dquote)` at the
-  substring-offset/length operand and `scan_param_subscript`, and propagate dquote context
-  into the cmdsub re-tokenize. (Note: the v235 spec's claim that substring is "out of scope,
-  extquote-name doesn't apply" is factually slightly off — bash DOES decode there.) MINOR
-  display residuals (error-message name-form only; `bad substitution` tail, rc, continuation
-  all match bash): invalid decoded name `${$'x\ty'}` shows raw source vs bash's `${x\ty}`;
-  `${$"x1"}` (locale form) shows `${$"x1"}` vs bash's `${"x1"}`. (The `${#$'x1'}` length-form
-  rc divergence previously noted here is now tracked separately as M-161.)
-- **M-161: malformed `${…}` gives a syntax error (rc 2) where bash defers a runtime
-  `bad substitution` (rc 1)** — `[deferred]` low (found in the 2026-06-28 param-expansion
-  architectural review). v233 began migrating malformed-but-lexable `${…}` from parse-time
-  reject (`LexError` — rc 2 "syntax error"/"unterminated") toward bash's
-  scan-to-`}`-then-runtime-`bad substitution` (rc 1) model, routed via `recover_bad_subst` /
-  `ParamModifier::BadSubst`. That migration is mostly complete — the malformed LENGTH forms
-  (`${#$'x1'}`, `${#1foo}`, `${#foo bar}`) now bad-subst (rc 1) like bash (verified 2026-07-07).
-  Two confirmed forms still return a lex error where bash bad-substs:
-  (a) `${x@QQ}` / `${x@Q@Q}` — the `@`-transform tail at lexer.rs:3808. MEASURE-FIRST: bash's
-  transform-edge result is variable-state dependent — bad-subst rc 1 when the var is SET, but
-  rc 0 / empty when unset (`${x@Q}` itself is valid; only the doubled/garbage tail bad-substs).
-  CLEAN one-line fix once measured.
-  (b) `${x[i}` — the subscript scan at lexer.rs:3187/3234. NOT a clean fix: `scan_subscript`
-  is quote-naive, so telling the brace-closer `}` apart from a `}` inside a nested `${y}` or a
-  quoted `'}'` needs a quote-aware subscript scanner; belongs with a scanner rewrite, not a
-  one-liner. (A minimal brace-depth hack here would regress `${x['}']}`.)
-  Both are exotic (malformed `${…}` no real script writes) and huck is the stricter side
-  (rejects rather than misbehaves). The broader consolidation of this subsystem (the duplicated
-  scanners, the three overlapping dquote flags, and this error-model seam) was reviewed
-  2026-06-28 and consciously deferred — a pure refactor is incompatible with the drifted
-  duplicates, and a behavior-changing rewrite was judged not worth the hot-path risk. (a) can
-  be picked off individually as a small bash-alignment fix if desired.
-
-### Globbing
-
-- **M-165: `shopt -s failglob`** — `[deferred]` low (found 2026-07-09 sweep). huck ignores `failglob`: a pattern with no matches expands to itself (default) and the command runs; bash with `failglob` prints `no match` and the whole command fails (rc 1) WITHOUT running. `nullglob` is correctly implemented; `failglob` is the unimplemented sibling. Fix: when `failglob` is set and a glob matches nothing, error + abort the command instead of leaving the literal pattern.
-- **M-53: bare `**` globstar matches dirs-only (not files)** — `[deferred]` low (narrowed v193). `shopt globstar` now gates `**` correctly: OFF (default) `**` ≡ `*` (single level), ON `**` is recursive — both byte-identical to bash for the common `**/<glob>` form (v193, `collapse_globstar` in the glob path). RESIDUAL: a bare `**` with globstar ON matches directories at all depths but NOT the files bash also yields (huck's regular glob path uses the `glob` crate, whose bare `**` is dir-recursive only). Matching bash's bare-`**` set exactly needs huck's own recursive walker (the extglob `walk_components` path). Also: globstar inside an extglob pattern (`**/+(…)`) does not recurse. Rarely decisive; the dominant `**/<glob>` form is correct.
-
----
-
-## Tier 3: Intentional divergences
-
-Things huck deliberately does differently from bash. Document and keep.
-
-### I-02: `case` requires a separator before `esac`
-- **Status**: intentional
-- **Severity**: low
 - **huck**: `case x in foo) echo hi esac` errors with `UnterminatedCase` (`esac` is eaten as an argument to `echo`).
 - **bash**: same as huck — POSIX-strict; bash also requires a separator. (Documented here because the v21 spec example was initially wrong and was corrected.)
 - **Why**: matches POSIX and `fi`/`done` precedent.
 
-### I-03: REPL silently neutralizes stray `break`/`continue`/`return`
-- **Status**: intentional
-- **Severity**: low
+---
+
+### REPL silently neutralizes stray `break`/`continue`/`return`
+
+[Issue #13 · by-design](https://github.com/jdstanhope/huck/issues/13)
+
 - **huck**: a `return` (or `break`/`continue`) at the top-level prompt sets `$?` to 0 and continues.
 - **bash**: prints an error and sets `$?` to 1.
 - **Why**: deliberate friendly simplification.
 
-### I-05: Multi-line commands collapse to one line in history
-- **Status**: intentional
-- **Severity**: low
+---
+
+### Multi-line commands collapse to one line in history
+
+[Issue #14 · by-design](https://github.com/jdstanhope/huck/issues/14)
+
 - **huck**: v19 collapses a multi-line `if`/`for`/`{…}`/etc. into a single physical line using `;` / space / no-sep joiners. Lossy for quotes that span lines.
 - **bash**: stores embedded newlines.
 - **Why**: keeps the history file format one-entry-per-line.
 
-### I-06: `(`/`)`/`{`/`}`/`;;`/`;&`/`;;&` are metacharacters
-- **Status**: intentional
-- **Severity**: low
+---
+
+### `(`/`)`/`{`/`}`/`;;`/`;&`/`;;&` are metacharacters
+
+[Issue #15 · by-design](https://github.com/jdstanhope/huck/issues/15)
+
 - **huck**: unquoted `(` or `)` in arguments is a syntax error (v21); standalone `{`/`}` are keywords (v22).
 - **bash**: same — `(` `)` and standalone `{`/`}` are all metacharacters.
 - **Why**: required for `case`/subshell/brace-group recognition. Pre-v21 scripts using literal parens must quote them.
 
-### I-07: Functions shadow regular builtins; control builtins are un-shadowable
-- **Status**: intentional
-- **Severity**: low
+---
+
+### Functions shadow regular builtins; control builtins are un-shadowable
+
+[Issue #16 · by-design](https://github.com/jdstanhope/huck/issues/16)
+
 - **huck**: a user-defined `cd() { … }` overrides the builtin; `return`/`exit`/`break`/`continue` cannot be shadowed.
 - **bash**: distinguishes "special" vs "regular" builtins per POSIX, with similar (but more nuanced) precedence.
 - **Why**: shadowing fundamental flow control would let a user break the shell.
 
-### I-11: EOF mid-command exits the shell with status 2
-- **Status**: intentional (per v19 spec)
-- **Severity**: medium
+---
+
+### EOF mid-command exits the shell with status 2
+
+[Issue #17 · by-design](https://github.com/jdstanhope/huck/issues/17)
+
 - **huck**: Ctrl-D while a partial command is pending → "syntax error: unexpected end of input", exit 2.
 - **bash**: interactive Ctrl-D mid-buffer abandons the line and returns to the prompt.
 - **Why**: v19 spec called this a deliberate simplification; revisit if it becomes painful.
 
-### I-13: HISTFILE defaults to `~/.huck_history`
-- **Status**: intentional
-- **Severity**: low
+---
+
+### HISTFILE defaults to `~/.huck_history`
+
+[Issue #18 · by-design](https://github.com/jdstanhope/huck/issues/18)
+
 - **huck/bash**: different shells, different defaults.
 
-### I-15: Non-UTF8 command-sub output is lossy
-- **Status**: intentional
-- **Severity**: low
+---
+
+### Non-UTF8 command-sub output is lossy
+
+[Issue #19 · by-design](https://github.com/jdstanhope/huck/issues/19)
+
 - **huck**: invalid UTF-8 from `$(cmd)` → `U+FFFD` replacement.
 - **bash**: byte-faithful.
 
-### I-16: `name=(…)` array literal as a non-declaration/non-eval command argument
-- **Status**: `[intentional]`
-- **Severity**: low (v136)
+---
+
+### `name=(…)` array literal as a non-declaration/non-eval command argument
+
+[Issue #20 · by-design](https://github.com/jdstanhope/huck/issues/20)
+
 - **huck**: the lexer accepts an array literal `name=(…)` as a command ARGUMENT and `expand()` reconstructs the argument to its `name=(…)` text — so `echo x=(a b)` prints `x=(a b)`.
 - **bash**: a parse-time syntax error (`echo x=(a b)` → `syntax error near unexpected token '('`).
 - **Why**: replicating bash's parse-time gating would need command-context-aware lexing; the reconstruction is harmless and is what makes `eval x=(a b)` / `declare`-style array-literal args work (v136 resolved the prior panic via this reconstruction).
 
 ---
 
-## Tier 4: Low-impact / edge cases
+### `trap '' PIPE` ignore-form is not preserved inside a forked subshell/pipeline stage
 
-- **L-01**: `~user` lookup capped at 16 KiB buffer. (Never hit in practice.)
-- **L-02**: Glob sort order is byte-lexicographic, not `LC_COLLATE`-aware.
-- **L-03**: Non-integer variable in `$((…))` errors instead of bash's "treat as recursive arith expression."
-- **L-04**: `${#var}` counts Unicode chars; bash counts bytes (matches in UTF-8 locale). v33 extends the same char-counting convention to `${var:off:len}` — offset/length units are codepoints, never byte indices. Slices never split a multi-byte UTF-8 codepoint. v37 `${var^^}` / `${var,,}` uses Rust's `char::to_uppercase` / `char::to_lowercase` Unicode iterators — locale-independent (matches bash with UTF-8 locale; may differ in non-UTF-8 locales).
-- **L-07**: `wait` polls (50ms) rather than blocking — small latency / minor CPU usage.
-- **L-27: history expansion runs on piped (non-interactive) stdin** — `[low]`. huck applies `!`-history expansion to commands read from piped stdin (`printf 'echo hi!there\n' | huck` → `huck: !there: event not found`), whereas bash disables history expansion when non-interactive (piped stdin or a script) and prints `hi!there`. huck's file-arg path (`huck script.sh`) and `source` are unaffected — they match bash. Root: the REPL/piped-stdin reader (`src/shell.rs` `read_logical_command`) runs the history scanner regardless of interactivity; bash gates `histexpand` on an interactive shell. Surfaced repeatedly while testing `[!…]`/`[^…]` glob fragments (which contain `!`) via piped stdin; the v116 bracket-negation harness and integration tests run fragments as file-args to avoid it. Low impact: interactive use and scripts/`source` (the common paths) are correct; only literal piped-to-stdin command streams containing `!` diverge.
+[Issue #38 · by-design](https://github.com/jdstanhope/huck/issues/38)
 
-- **L-29: residual prompt/`$PS4` xtrace quirks** — `[deferred]`, low. The original L-29 gap (`$LINENO` empty in prompts/`$PS4`) is **resolved**: v141 added `$(...)`/`$((...))`/backticks to `prompt::expand_prompt`, and **v152 added the `LINENO` variable**, so `$LINENO` now expands in `$PS4`, prompts, and `${var@P}` byte-identically to bash. Two unrelated residuals remain (same low tier): (a) a `PS4=…` assignment command traces its OWN line with the POST-assignment `PS4` value (huck emits e.g. `+2+ PS4=…`), whereas bash uses the PRE-assignment value (`+ PS4=…`) — huck's bare-assignment xtrace emits after applying the assignment; narrow and cosmetic. (b) (v141, arcane) an ESCAPED backtick inside a backtick prompt body (`` `echo a\`b` `` via `@P`) — huck's prompt backtick scanner treats `\`` as a literal and runs `echo a`b`, whereas bash treats it as a nested-cmdsub delimiter (errors on the unmatched inner). Far outside common use; deferred.
+Since v137 restores `SIGPIPE` to `SIG_DFL` at startup, `trap … PIPE` is now SETTABLE (it was previously rejected with `cannot reset ignored signal` because Rust's startup `SIG_IGN` put SIGPIPE in the ignored-at-startup set). A top-level PIPE trap fires via huck's flag-based dispatch. However, huck represents the ignore-form `trap '' PIPE` as a signal-hook handler (an empty closure), NOT a true OS `SIG_IGN` (the pre-existing model — see `src/traps.rs`), and v137's forked-stage child unconditionally resets `SIGPIPE` to `SIG_DFL` (matching bash's "a trapped signal is reset to default inside a subshell"). The net gap: a `trap '' PIPE` ignore that bash would keep ignored inside a pipeline subshell is instead reset to default in huck, so a producer in that subshell still dies on SIGPIPE. The handler-form and the top-level cases match bash; only the ignore-stays-ignored-in-a-subshell nuance diverges. Strictly more functional than pre-v137 (where the trap could not be set at all). Fixing it would require representing trap-installed ignores as real `SIG_IGN` distinct from startup-ignored signals.
 
-- **L-84: `set -a` (allexport) auto-exports only assignment-list assignments** — `[deferred]`, low (v270). Under `set -o allexport`, huck marks a variable exported when it is set via a bare assignment / assignment-list (`X=1`), matching bash for the common case. bash ALSO auto-exports variables created by other means — `read NAME`, `for`/`select` loop variables, and `declare`/`typeset NAME` without `-x` — which huck does NOT (`set -a; read y <<<v; export -p` shows `y` unexported in huck, exported in bash). The gate lives at one site (`executor.rs` `run_assignment_list`); extending it to the read/loop/declare creation paths is the fix. Arrays are correctly skipped (bash does not export arrays; huck's gate no-ops on them). Low impact: the dominant `set -a; VAR=val` idiom matches.
-- **L-85: `set +o braceexpand` (`set +B`) can't retroact within one lex batch** — `[deferred]`, low (v270). huck performs brace expansion at LEX time, so a `set +B` / `set +o braceexpand` only affects words lexed AFTER it as a separate input unit — line-by-line stdin/REPL is byte-identical to bash, but a single `-c 'set +B; echo {a,b}'` string or a whole script file (lexed as one batch) still brace-expands the `echo` because that word was already lexed before the option flipped. bash matches only because it expands braces at expansion time, not lex time. The flag itself stores/lists/round-trips correctly (`set -o`/`set +o`). A faithful fix means relocating brace expansion out of the lexer into the expansion pipeline — a broad, higher-risk change deliberately deferred. Rare (toggling braceexpand mid-batch).
-- **L-89: a malformed backtick command substitution aborts (rc 2) where bash reports the error but continues (rc 0)** — `[deferred]`, low (v274, whole-branch review). huck's v274 three-phase backtick path (capture → unescape → re-parse) propagates a phase-3 parse error and exits rc 2 when the re-lexed body is itself a syntax error — an unterminated body, a quote-blind early close (`` `echo '`'` ``), or a deeply-undefined nesting such as an UNescaped backtick inside `$()` inside a backtick (`` `echo $(echo `echo z`)` ``). bash instead prints a comsub error and continues with an empty substitution (rc 0). Two facets: (a) bash treats a backtick-comsub parse error as NON-fatal; (b) the unterminated case reuses `ParseError::UnterminatedSubshell`, whose message names `'('` even for a backtick (the general error-text non-goal, spec §5). All WELL-FORMED / correctly-escaped nesting matches bash byte-for-byte — this is the malformed/undefined-POSIX-corner residue of the v274 restructure, itself a net improvement (the quote-blind close now correctly REJECTS where the pre-v274 lexer leniently accepted). Rare. Fix: make backtick-comsub parse errors non-fatal (print + empty, rc 0) and give the unterminated case a backtick-specific message.
-- **L-88: a quoted SET `"${@-word}"` joins to one field instead of splitting per element** — `[deferred]`, low (v273, in `iquote`). When `$@` is set (`$#>0`) and used with a modifier under an outer double-quote — `"${@-word}"`, `"${@:-word}"`, `"${@+word}"` — huck returns the positionals IFS-**joined** into a single field, whereas bash preserves each positional as its own field: `set -- a b; printf '<%s>' "${@-x}"` → bash `<a><b>`, huck `<a b>`. The v273 `$*`/`$@` set-detection fix (see [[project-huck-iterations]]) routes the positional `$@`-with-modifier through the scalar `expand_modifier_quoted` path (which returns a single joined `Value`), so it can't emit multiple fields the way the named-array `${arr[@]-word}` handler does (that one returns a `WordList`). The `$*` (Star, joined-by-design) forms are fully correct; only the field-preserving `@` semantics are missing when a modifier is present AND `$@` is set. The default word's OWN fields are preserved (`"${@:-d1 d2}"` on an empty `$@` → `<d1 d2>` matches bash). Rare (a modifier on a set `"$@"`). Fix: route the positional `${@…}` set-branch through a word-list result like the array handler.
-- **L-87: parser syntax errors don't match bash's `near unexpected token` format** — `[deferred]`, medium (v272, blocks `posix2`). huck reports a generic `syntax error: unexpected token after command`, whereas bash reports `<prog>: [eval: ]line N: syntax error near unexpected token \`<tok>'` followed by a second line echoing the offending source (`<prog>: [eval: ]line N: \`<source line>'`). Concretely, `eval 'case esac in esac) ;; *) echo x;; esac'` (a deliberate syntax error) yields, in bash: two lines naming the unexpected `)` token, the `eval:` marker, the enclosing-script line number (199 in `posix2.tests`, not the line within the eval string), and the source echo — none of which huck reproduces. This is the sole remaining `posix2` blocker after v272 fixed its OPTIND-initial-value and `set`-quoting sub-tests. A faithful fix is a general parser-error-reporting feature (track the offending token text + span, echo the source line, thread an `eval:`/line-number context through the parser's error path) — comparable in scope to the v269 error-prologue rollout but for syntax errors — and is its own iteration. Rare outside conformance suites, but it gates any test that asserts bash's exact syntax-error text.
-- **L-86: exported array variables leak their `[0]` element into a child's environment** — `[deferred]`, low (found v271, whole-branch review). bash never exports array variables to a child process's environment at all (`declare -ax a=(x y z); printenv a` → rc 1, unset), but huck exports the array as its scalar view — the element at subscript `0` / key `"0"` (`printenv a` → `x`). Pre-existing for indexed arrays; the v271 `nquote1` fix (bare associative ref → `${m[0]}`, see [[project-huck-iterations]]) merely made the associative case consistent with the existing indexed behavior (an exported assoc-with-`"0"`-key now exports `m=x` instead of `m=`). Root cause is in `exported_env` (`shell_state.rs` ~2555), which maps every exported var through `scalar_view()` with no array skip; the fix is to omit `Indexed`/`Associative` values from the exported environment entirely (matching bash). Rare (arrays are seldom marked `-x`).
-- **L-31: the `read` builtin issues one `libc::read` syscall per byte** — `[deferred]`, low (perf, not a hang). `read`/`read -r` reads stdin one byte at a time (`src/builtins.rs` ~line 2027), so consuming a large body via `read` is O(n) syscalls — slow on big inputs (e.g. a 200KB heredoc piped into `while read`). NOT a deadlock (it completes); off the `nvm ls-remote` path (nvm feeds the big index.tab to `awk`, which reads in blocks). Fix: buffer `read`'s stdin (read a chunk, scan for the delimiter, push back the remainder) — but `read` must not over-consume past its delimiter from a shared fd, so the buffering needs care. Found v134.
+---
 
-- **L-42: redirect-open error routing ignores an earlier same-command `2>…`** — `[deferred]`, low. When one redirect on a command fails to open, huck prints the error (`huck: /path: No such file…`) to the REAL stderr regardless of an earlier `2>/dev/null` on the same command, whereas bash processes redirects strictly left-to-right, so a later failing redirect's error lands under the earlier `2>…` (`cmd 2>/dev/null < /missing` → bash: silent, huck: prints the error). Affects normal commands AND the assignment/redirect-only command equally — a routing/ordering limitation of the field-based `ExecCommand` redirect model (related to L-08, which covers the same source-order-not-preserved root cause for the `2>&1 >file` anti-pattern). The exit status (1) matches; only the error-message routing differs.
-- **L-43: a readonly assignment does not abort a non-interactive shell** — `[deferred]`, low. Assigning to a readonly variable (`UID=5`, `BASH_VERSINFO[0]=9`) correctly prints `huck: NAME: readonly variable` and yields status 1, but huck CONTINUES executing the rest of the script; bash treats a variable-assignment error as fatal in a non-interactive shell and EXITS immediately (`bash -c 'UID=5; echo done'` prints only the error and exits 1 — `done` never runs). Independent of any redirect (reproduces with a bare `UID=5; echo done`). The common interactive case (where bash also keeps going) matches; only non-interactive scripts diverge. **v226 fixed the POSIX-mode half** — under `set -o posix` a non-interactive huck shell now exits on a readonly/assignment error (`run_assignment_list` and the inline-assignment apply call `shell.posix_fatal(127)`). This entry now covers ONLY the DEFAULT-mode case, where bash 5.2.21 still exits but huck continues (bash's default-mode assignment-error-fatal is a non-posix behavior huck has not adopted). Fix would extend the same `posix_fatal`-style abort to default mode.
-- **L-44: associative-array iteration order in `declare -p` / bare-`declare` / `${var@A}` / `${var@K}` etc.** — `[deferred]`, low. huck lists associative-array elements in insertion order, bash in internal hash order. Both round-trip correctly through `eval`/`source` (the value is the point), so this is cosmetic. Impractical to match bash's hash order; v210 closed the related quoting+trailing-space facts (originally tracked as (a)+(b) here). Related: L-41 (`declare -p` omits computed dynamics).
-- **L-46: bare attribute-only declaration prints `NAME=""` in `declare -p`** — `[deferred]`, low (found during v158). A declaration that sets an attribute but assigns NO value — `declare -i x`, `declare -r x`, `declare -x x`, `declare -l x`, `declare -A m` — creates the variable as a SET empty-string value in huck, so `declare -p x` prints `declare -i x=""` where bash prints `declare -i x` (no `=…`, because the variable is declared-but-UNSET). Affects every attribute flag equally (the attribute mutators — `mark_integer`/`mark_readonly`/`set_case_fold`/etc. — create the var with `VarValue::Scalar(String::new())` rather than a distinct "declared, unset" state). Pre-existing; not specific to v158's `-l`/`-u`. Round-trips fine via `eval`/`source` (an empty-string assignment is harmless). Fix would need a tri-state value (unset-but-declared vs set-empty vs set-value) on `Variable`, or a per-var "has been assigned" flag consulted by `declare -p`. Low impact: the bare-attribute-then-`declare -p` pattern is rare and the `=""` is cosmetic.
+### a SIGINT delivered to the shell while it waits on a foreground job that is NOT itself SIGINT-killed over-aborts
 
-- **L-47: nameref follow-on gaps (`for ref in …` and `[[ -R ref ]]`)** — `[deferred]`, low (v160 follow-ons; v160 shipped comprehensive-core `declare -n` namerefs). (a) A nameref used as a `for`-loop VARIABLE: huck routes the loop assignments THROUGH the nameref (writes the target each iteration), whereas bash does NOT route a for-loop var through a nameref (bash itself is inconsistent here — the loop var reads empty and the target is untouched). huck's behavior is arguably more sensible, but diverges; rare (pass-by-ref code seldom uses the ref as a loop var). (b) The `[[ -R name ]]` test operator (true iff `name` is a set nameref) is not implemented — `[[ -v ref ]]` IS implemented (tests the target). Both are completeness edges; the common nameref idioms (`local -n out=$1`, scalar/array/element targets, chains, `${!ref}`, `unset`/`unset -n`, `declare -p`) all match bash (`nameref_diff_check.sh`, 21 cases).
+[Issue #39 · by-design](https://github.com/jdstanhope/huck/issues/39)
 
-- **L-50: `bind` builtin — partial readline surface** — `[deferred]`, low (v161 shipped the `bind` builtin over huck's rustyline editor). v161 implements: the 5 readline VARIABLES that map to live rustyline config (`editing-mode` vi/emacs, `bell-style`, `show-all-if-ambiguous`, `completion-query-items`, `keyseq-timeout`), real key REBINDING for the ~33 readline functions with a rustyline `Cmd` equivalent (`bind '"\C-w":backward-kill-word'` genuinely takes effect), and the listing/error flags (`-v/-V/-l/-p/-P`, unknown-option → rc 2 + usage). KNOWN GAPS vs bash: (a) **`bind -x`** (bind a key to a SHELL COMMAND) is accepted but a no-op. FEASIBILITY (investigated 2026-06-15, deliberately KEPT DEFERRED — robust support is high-effort/high-risk for a rarely-used feature): rustyline's `ConditionalEventHandler` (`Send + Sync`, returns `Option<Cmd>`) CAN run the command if the handler holds only the command STRING and reaches the single-threaded `Shell` via a `thread_local!` the run loop populates before each `readline()` (sidesteps `Send+Sync` since the `Rc<RefCell<Shell>>` lives in the thread-local, not the handler). `EventContext::line()` gives the buffer → `READLINE_LINE` (read) works; `Cmd::Replace(Movement::WholeLine, Some(new))` writes it back. BUT two hard limits make full bash parity impractical: (i) `EventContext` exposes NO cursor position, so `READLINE_POINT` can't be read (only faked at end-of-line); (ii) the command runs while rustyline owns the terminal in RAW mode, so a `bind -x` command that PRINTS (the common fzf-style use) renders mangled unless huck manually toggles `tcsetattr` cooked→run→raw and forces a redraw — re-entrant with rustyline's own terminal management and fiddly/risky. A line-transform-only subset (READLINE_LINE in/out, no output handling) would be feasible and lower-risk if a real need appears. (b) **`bind -f file`** (read an `.inputrc`) is a no-op. (c) **readline functions with no rustyline `Cmd`** (e.g. `dump-functions`, `re-read-init-file`, keyboard macros) can't be bound — warn/no-op. (d) **`bind -v` lists 5 variables**, not bash's ~30 (the ones huck genuinely models); other `set VAR value` are recorded for round-trip but inert. (e) **a bogus function name** (`bind '"\C-x":no-such-fn'`) → huck rc 1 (validates) vs bash rc 0 (bash skips bind-arg validation when non-interactive — "line editing not enabled"); huck's stricter validation is deliberate. (f) **`bind -p`/`-P` now emit an honest default emacs keymap** (v191) — previously they listed nothing in non-interactive `-c`/script mode (bindings were only recorded into the active list by the interactive REPL run-loop seam). v191 seeds the default emacs key→function table so `bind -p`/`-P` produce bash-faithful output even non-interactively, with any live user rebinds layered on top. THREE v191 follow-ons remain (`[deferred]`, low): (i) **vi-mode default keymap** — `bind -p` under `set -o vi` still shows the emacs table (huck has no vi default-keymap data); (ii) **`bind -l` coverage** — lists huck's 33 honored readline functions vs bash's 173; (iii) **`bind '"\C-a": kill-line'` with a SPACE after the colon** errors ("unknown function name" — the function name isn't trimmed of leading whitespace). All editor-effecting paths are proven by `tests/bind_pty.rs` (live rebind) + `bind_diff_check.sh` (13 cases) + `bind_keymap_diff_check.sh` (v191 default-keymap parity); coupling to rustyline is confined to `src/readline_bind.rs` + the run loop.
+v138 aborts the running command list when an untrapped SIGINT is observed (`sigint_flag` set). bash's wait-path abort keys specifically on the foreground CHILD being terminated by SIGINT (`WTERMSIG==SIGINT`), not merely on the shell receiving a SIGINT during the wait. The narrow divergence: `seq 1 3 | while read x; do echo $x; kill -INT $$; done; echo after` — here `kill -INT $$` (a) signals the PARENT shell pid (`$$` is unchanged inside the pipeline subshell), while the pipeline's `while` subshell exits NORMALLY. bash keeps the parent's pending SIGINT from aborting (the job wasn't interrupted) and runs `after` (rc 0); huck sees `sigint_flag` set after the pipeline and aborts (`after` suppressed, rc 130). This requires `kill -INT $$` from inside a pipeline subshell — pathological. For a REAL interactive Ctrl-C the signal goes to the foreground job's process group (the job dies via SIGINT → huck's `WTERMSIG==SIGINT` trigger aborts, matching bash); and for `-c`/script the shell and children share the foreground pgroup so both receive it. So the in-scope v138 behavior matches bash; only this synthetic parent-only-SIGINT-during-a-surviving-job case diverges. Matching bash exactly would require gating the wait-path abort on the job's own SIGINT-termination rather than on the shell's flag.
 
-- **L-48: subshell with a leading comment/blank line before the first command** — `[deferred]`, low (found during v183). `(\n# c\necho hi\n)` errors in huck (`expected a command`) though `( # c\necho hi )` works. `(` is a real token and the body is tokenized normally (comments stripped), so this is NOT a comment-scanner bug — `parse_subshell` does not skip leading newlines / comment-blank lines before the first command. Rare (a comment as the very first line of a subshell body); the same pattern inside `{ … }` groups already works.
+---
 
-- **L-49: subscripted array element whose value begins with `#` is dropped** — `[deferred]`, low (found during v183). `a=([0]=#x)` → huck `${a[0]}` empty, bash `#x`. The `[i]=` subscript is consumed, then the value word `#x` is collected and RE-tokenized via `tokenize`, whose word-start `#` rule treats the leading `#` as a comment → empty value. bash keeps a subscript value verbatim. The bare element form `a=(#x …)` correctly IS a comment in both shells. Pathological (`#`-leading subscript value).
+### `command builtin <decl>` (a `command`-led nest wrapping a declaration builtin) errors instead of running
 
-- **L-32: `trap '' PIPE` ignore-form is not preserved inside a forked subshell/pipeline stage** — `[intentional]`, low (v137). Since v137 restores `SIGPIPE` to `SIG_DFL` at startup, `trap … PIPE` is now SETTABLE (it was previously rejected with `cannot reset ignored signal` because Rust's startup `SIG_IGN` put SIGPIPE in the ignored-at-startup set). A top-level PIPE trap fires via huck's flag-based dispatch. However, huck represents the ignore-form `trap '' PIPE` as a signal-hook handler (an empty closure), NOT a true OS `SIG_IGN` (the pre-existing model — see `src/traps.rs`), and v137's forked-stage child unconditionally resets `SIGPIPE` to `SIG_DFL` (matching bash's "a trapped signal is reset to default inside a subshell"). The net gap: a `trap '' PIPE` ignore that bash would keep ignored inside a pipeline subshell is instead reset to default in huck, so a producer in that subshell still dies on SIGPIPE. The handler-form and the top-level cases match bash; only the ignore-stays-ignored-in-a-subshell nuance diverges. Strictly more functional than pre-v137 (where the trap could not be set at all). Fixing it would require representing trap-installed ignores as real `SIG_IGN` distinct from startup-ignored signals.
+[Issue #41 · by-design](https://github.com/jdstanhope/huck/issues/41)
 
-- **L-33: a SIGINT delivered to the shell while it waits on a foreground job that is NOT itself SIGINT-killed over-aborts** — `[intentional]`, low (v138). v138 aborts the running command list when an untrapped SIGINT is observed (`sigint_flag` set). bash's wait-path abort keys specifically on the foreground CHILD being terminated by SIGINT (`WTERMSIG==SIGINT`), not merely on the shell receiving a SIGINT during the wait. The narrow divergence: `seq 1 3 | while read x; do echo $x; kill -INT $$; done; echo after` — here `kill -INT $$` (a) signals the PARENT shell pid (`$$` is unchanged inside the pipeline subshell), while the pipeline's `while` subshell exits NORMALLY. bash keeps the parent's pending SIGINT from aborting (the job wasn't interrupted) and runs `after` (rc 0); huck sees `sigint_flag` set after the pipeline and aborts (`after` suppressed, rc 130). This requires `kill -INT $$` from inside a pipeline subshell — pathological. For a REAL interactive Ctrl-C the signal goes to the foreground job's process group (the job dies via SIGINT → huck's `WTERMSIG==SIGINT` trigger aborts, matching bash); and for `-c`/script the shell and children share the foreground pgroup so both receive it. So the in-scope v138 behavior matches bash; only this synthetic parent-only-SIGINT-during-a-surviving-job case diverges. Matching bash exactly would require gating the wait-path abort on the job's own SIGINT-termination rather than on the shell's flag.
+v142 adds the `builtin NAME [args]` builtin. huck correctly peels `builtin`-led nests around a declaration builtin (`builtin builtin local x=5`, `builtin command local x=5` both run and print the assignment). But any nest where a `command` wrapper sits immediately outside `builtin <decl>` — `command builtin local x=5`, and also the builtin-led `builtin command builtin local x=5` (the outer `builtin` is peeled, leaving `command builtin local`) — surfaces post-resolve with `decl_args` already discarded, so huck prints `huck: builtin: local: declaration builtins must not be wrapped by \`command builtin\`` and returns rc 1, whereas bash runs it (prints `x=5`). Maximally pathological — no real script nests `command builtin` around a declaration builtin; huck errors cleanly (rc 1, no panic) rather than running it. Matching bash would require carrying `decl_args` through the `command`-led resolution path.
 
-- **L-34: `mapfile`/`read` unimplemented flags + two `mapfile` edges** — `[deferred]`/`[low]` (v140). v140 ships `mapfile`/`readarray` with `-t -d -n -O -s` (+ default `MAPFILE`) and `read -a`. **`read -u FD` (v270), `read -n`/`-N`/`-t` (v276) are now implemented.** `read -n`/`-N` do character-counted reads (UTF-8, `-n` stops at the delimiter, `-N` reads it literally); `read -t` does a `poll(2)`-based timed read (fractional timeouts; `128+SIGALRM` on expiry with partial data assigned; `-t 0` availability probe). STILL NOT implemented: `mapfile -u FD`/`-C callback`/`-c quantum`. `-C`/`-c` need callback eval; `mapfile -u` needs the same arbitrary-fd read (share `read`'s `RawFdReader`); rare in practice, deferred. **RESIDUAL from v276 (deferred, low):** interactive-TTY `-n`/`-t` do NOT switch the terminal to non-canonical (`ICANON`-off) mode, so on a real tty they still wait for a line before returning — byte-exact only for pipe/file/redirect input (the scriptable paths); and `read -t 0` on a pipe is inherently timing-dependent (matches bash's `select`/`poll` probe mechanism, not its exact pipe-buffer race). Two minor edges in the shipped set: (a) a malformed numeric option arg (`mapfile -n xyz`) exits rc 2 with `huck: mapfile: xyz: invalid number`, vs bash rc 1 `invalid line count` (program-name-prefix class + a pathological-input rc); (b) a high-byte raw delimiter `-d $'\xff'` doesn't split (the `0xFF` becomes U+FFFD through huck's UTF-8 `String` word model and never matches the stream byte) — inherited from the general non-UTF-8-byte limitation (L-04/L-11 class), not specific to mapfile; multi-byte UTF-8 delimiters split on the first byte like bash. All common usage matches bash (12/12 bash-diff harness).
+---
 
-- **L-35: `command builtin <decl>` (a `command`-led nest wrapping a declaration builtin) errors instead of running** — `[intentional]`, low (v142). v142 adds the `builtin NAME [args]` builtin. huck correctly peels `builtin`-led nests around a declaration builtin (`builtin builtin local x=5`, `builtin command local x=5` both run and print the assignment). But any nest where a `command` wrapper sits immediately outside `builtin <decl>` — `command builtin local x=5`, and also the builtin-led `builtin command builtin local x=5` (the outer `builtin` is peeled, leaving `command builtin local`) — surfaces post-resolve with `decl_args` already discarded, so huck prints `huck: builtin: local: declaration builtins must not be wrapped by \`command builtin\`` and returns rc 1, whereas bash runs it (prints `x=5`). Maximally pathological — no real script nests `command builtin` around a declaration builtin; huck errors cleanly (rc 1, no panic) rather than running it. Matching bash would require carrying `decl_args` through the `command`-led resolution path.
+### sourced-file syntax error points at the logical command's first line
 
-- **L-36: `complete -o nospace` is a no-op (no default trailing space after completion)** — `[deferred]`, low (v143). huck never appends the trailing space bash adds after completing a final (non-directory) word — rustyline (`CompletionType::List`) inserts the replacement verbatim; the only append is `/` for directories. So `complete -o nospace` has nothing to suppress (it parses into `CompOptions.nospace` but is unread at tab-dispatch). Honoring nospace meaningfully would first require implementing bash's default trailing-space behavior. Low impact: the directory-descend flow is unaffected (`cd dir/<TAB>` already adds no space).
+[Issue #53 · by-design](https://github.com/jdstanhope/huck/issues/53)
 
-- **L-37: indexed subscripted array element with a literal brace** — `[deferred]`, low (v144). v144 brace-expands BARE array-literal elements. An INDEXED subscripted element whose value contains a literal brace — `a=([2]=x{a,b})` — keeps the value literal in huck (`a[2]="x{a,b}"`), whereas bash brace-expands the whole `[i]=…` word into BARE literals dropping the subscript (`[0]="[2]=xa" [1]="[2]=xb"`). ASSOCIATIVE subscripts (`declare -A m=([k]=x{a,b})`) keep the brace literal in BOTH shells (huck matches bash). Pathological; bash's own indexed-vs-associative behavior here is surprising. Low impact.
-
-- **L-38: brace expansion ordering vs parameters and scalar assignments** — `[deferred]`, low (v144; pre-existing, command-word path). Two related spots where huck's brace expansion diverges from bash's textual-first model: (a) a brace FOLLOWING a parameter — `v1=A v2=B; echo $v{1,2}` — bash expands `$v{1,2}`→`$v1 $v2` textually FIRST → `A B`, huck expands `$v` first → `1 2`; (b) a scalar assignment RHS — `v={1,2}; echo "$v"` — bash assigns the literal `{1,2}` (no brace expansion on a scalar assignment RHS), huck brace-expands the assignment word (`v=1 v=2`) leaving `v=2` (`x={a,b}` → `b`). Both pre-existing (NOT introduced by v144's array-element brace expansion, which is correct); surfaced during v144 review. Low/rare.
-- **L-39: process-substitution edge cases** — `[deferred]`, low (v150). The v150 process substitution `<(…)`/`>(…)` covers command-argument and redirect-target usage (foreground + pipelines + compound commands + background). Three residual edge gaps: (a) **assignment-RHS context** — `x=<(cmd)` is NOT realized (the `expand_assignment` path is a no-op for `ProcessSub`); bash assigns `/dev/fd/N`. Realizing there would fork a child with no command to consume the fd. (b) **setup-failure path** — if `pipe()`/`fork()` fails while realizing a process sub, huck prints an error and emits an EMPTY field, so the outer command still runs (with an empty arg / failing-open redirect); bash aborts the command on process-sub setup failure. Only reachable under fd/process exhaustion. (c) **background long-running inner producer** — `cmd < <(slow_producer) &` reaps the inner via `waitpid(WNOHANG)` after spawning the bg job (to avoid blocking `&`), so a still-running inner producer leaves a bounded zombie until SIGCHLD/shell-exit (its fd IS closed — no fd leak). Also: the FIFO fallback (`/dev/fd` absent) is verified by inspection only — unreachable on Linux/macOS, which both provide `/dev/fd`.
-- **L-53: a bare empty-quoted `=~` regex operand fails to parse** — `[deferred]`, low (found during v199). `[[ x =~ "" ]]` (an empty `""` as the WHOLE regex operand) errors `unterminated '[[ ]]' (missing ']]')` in huck; bash accepts it (empty regex → matches, rc 0). A non-bare empty-quoted operand (`[[ a =~ a"" ]]`) parses fine, so the bug is specific to `scan_regex_operand` when the operand begins with (and consists only of) an empty quote — the scanner likely treats the immediately-following `]]` as still inside the operand. Separate from v199's matching fix (L-23, which made quoted spans match literally); this is a lexer/parse edge. Rare (`=~ ""` is unusual).
-- **L-54: SINGLE QUOTES are stripped (not rejected) in arithmetic contexts** — `[deferred]`, low (found during v200; broadened 2026-06-21; the pattern-quoting part (a) was RESOLVED v201). bash treats a single-quoted token as a SYNTAX ERROR in any arithmetic context (single quotes have no meaning in arith — the `'` is an invalid operand token), whereas huck STRIPS the single quotes and evaluates the unquoted content. DOUBLE quotes are accepted by BOTH (removed → content evaluated). Originally noticed as the substring edge `${x:1:'2'}` (bash `'2': syntax error: operand expected`, huck `bc`), but it's GENERAL — same divergence in `$(( '2' + 1 ))` (bash errors, huck `3`), `(( '2' ))`, array-subscript read `${a['1']}` and assignment `a['1']=9`, and `${x:'1'}`. ROOT CAUSE: huck strips single quotes in multiple arith-string builders — `arith_string_to_word` (`$(( ))`/`(( ))`; its comment even wrongly claims "single quotes are literal" while the code removes them) and `parse_braced_operand_opts` (substring, shared with the value/pattern operands where single quotes DO have meaning) and the subscript scanner — and the arith parser never sees a `'` to reject. A faithful fix is feature-sized: stop stripping single quotes in the arith-specific paths (without affecting the shared value/pattern-operand single-quote semantics), and make the arith parser reject a literal `'` with a bash-compatible message. DELIBERATELY DEFERRED (2026-06-21, user call): low real-world impact — it's a STRICTNESS divergence where huck ACCEPTS quoted numbers in arith that bash rejects (a buggy script runs instead of erroring), and matching bash's exact arith error text is finicky. (The original L-54(a) — a quoted glob metacharacter in a `${x#pat}`/`${x%pat}`/`${x/pat/repl}`/`${x^^pat}` PATTERN not matching literally — WAS fixed in v201 by routing the pattern through `expand_pattern`, the same quoted-span escaping `case`/`[[ == ]]` use.)
-- **L-41: computed builtin-variable edge cases** — `[deferred]`, low (v154). v154 added the shell-maintained builtin variables. The STATIC ones (`UID`/`EUID`/`PPID`/`GROUPS`/`HOSTNAME`/`HOSTTYPE`/`OSTYPE`/`MACHTYPE`/`BASH`/`BASH_VERSION`/`BASH_VERSINFO`/`HUCK_VERSION`/`SHLVL`) are stored in the vars table and match bash; the DYNAMIC ones (`RANDOM`/`SECONDS`/`EPOCHSECONDS`/`BASHPID`) are computed in `lookup_var` and therefore NOT in the vars table, which yields several edge divergences: (a) **`set`/`declare -p` omit them** — bare `set` and `declare -p RANDOM` don't list/print the computed dynamics (bash does); they DO complete via `compgen -v`/`$<TAB>` (the v154 completion registry). (b) **`[[ -v RANDOM ]]` is false** — `is_set` checks the vars table, so `-v` on a computed dynamic reports unset (bash: set). (c) **`BASHPID`/`EPOCHSECONDS` assignment** silently stores a shadowed ghost (the computed value still wins on read) rather than erroring as bash's readonly does. (d) **inline-assignment scoping** — `RANDOM=n cmd` / `SECONDS=n cmd` reseed/reset GLOBALLY (the reseed bypasses the vars snapshot/restore), whereas bash SCOPES the reseed to that command; standalone `RANDOM=n; …` (the common case) matches bash. (e) **`GROUPS` order** — huck returns the raw `getgroups(2)` order; bash orders egid-first (the SET matches; only order differs). (f) `RANDOM`'s LCG is huck's own — only range (0–32767) and reseed-determinism are guaranteed, not bash's exact sequence; `BASH_VERSION`/`BASH_VERSINFO` are a deliberate bash masquerade (`HUCK_VERSION` is the true identity). All low-impact; the common read/assign/completion paths match bash.
-
-- **L-55: arithmetic expansion errors in `-c` mode continue instead of halting** — `[deferred]`, low (found during v215). `bash -c 'y=$((1/0)); echo POST'` prints the arith error to stderr and exits 1 without printing `POST` — bash treats arith expansion errors as fatal in `-c` mode. huck's same invocation prints the error AND prints `POST` (exit 0). Script-file mode (the dominant use case) matches bash in both shells: both print the error and continue. The divergence is huck under-halting in `-c` mode where bash over-halts. v215 corrected huck's previously-fatal-everywhere behavior to match bash script-file mode; the `-c` distinction is a follow-on. Detected via the v214 bash test-suite arith category sweep. Real-world impact: low — `-c` chains where an early arith error should halt later commands are rare.
-
-### L-08: Redirect source-order not preserved on PIPELINE STAGES
-- **Status**: `[deferred]` low
-- **Severity**: low
-- **huck**: v156 RESOLVED the source-order bug for SINGLE commands — bare builtins, external commands, compound commands (brace groups, subshells, if/for/while/case), functions, and `exec` all now process redirects in strict left-to-right order via an ordered `Vec<Redirect>` list, so `cmd 2>&1 >file` (puts stderr to terminal, stdout to file) and `cmd >file 2>&1` (both to file) are correctly distinguished on a single command. The gap REMAINS for PIPELINE STAGES: the fast-path `slots_for_simple_path` used to set up 0/1/2 for pipeline stages applies redirects in a last-wins fashion rather than preserving source order, so `cmd1 2>&1 >file | cmd2` may not produce the same result as bash. Additionally, a heredoc or here-string targeting fd>2 on a pipeline stage is dropped (the pipeline stage setup path does not plumb fd>2 heredocs). Two residual edges in this narrow scope:
-  - **Pipeline-stage ordering**: `cmd 2>&1 >file | …` — stage-level redirect setup is last-wins for fds 0/1/2.
-  - **fd>2 heredoc on a pipeline stage**: `cmd 3<<EOF … | …` — the heredoc for fd>2 is silently discarded on a pipeline stage.
-- **bash**: processes all redirects in strict left-to-right order on every command, including pipeline stages.
-- **Why deferred**: the pipeline-stage fast-path (`slots_for_simple_path`) would need to be replaced with the same ordered-redirect walk used for single commands; the heredoc-on-fd>2-in-pipeline gap would require extending the pipeline setup to pass through fd>2 heredoc fds. Single-command usage (the overwhelmingly common case) now matches bash.
-- **Workaround**: write `cmd >file 2>&1` (canonical form, correct on both single commands and pipeline stages); avoid fd>2 heredocs on pipeline stages.
-
-### L-09: Regex `=~` is RE2-style, not POSIX ERE
-- **Status**: intentional (v30)
-- **Severity**: low
-- **huck**: `[[ $s =~ regex ]]` uses the Rust `regex` crate (RE2-based). No lookbehind / lookahead (`(?<=...)`, `(?=...)`); minor syntax differences from POSIX ERE for some edge cases (e.g., `(?:...)` non-capturing groups are supported in both, but bash's POSIX-mode is stricter).
-- **bash**: POSIX ERE. Has its own quirks.
-- **Why intentional**: `regex` is a mature, fast, well-maintained Rust crate. Implementing POSIX-ERE-faithful regex isn't worth the cost for the rare divergences. Most real-world shell-regex usage works identically.
-- **Workaround**: if a script relies on POSIX-ERE-specific features, fall back to `grep -E "pattern"` (which uses libc's POSIX ERE).
-
-### L-11: `$'\xHH'` and `$'\nnn'` produce Unicode codepoints, not raw bytes
-
-Bash inserts the raw byte value (0x00–0xFF) directly into the output
-string. huck, whose strings are Rust `String` (UTF-8), interprets the
-numeric value as a Unicode codepoint via `char::from_u32`. For ASCII-range
-values (< 0x80) the two encodings are bit-identical. For high-bit values
-the divergence is visible: bash's `$'\xFF'` is a single byte (`0xFF`),
-huck's `$'\xFF'` is the two-byte UTF-8 encoding of U+00FF
-(`0xC3 0xBF`).
-
-This aligns with L-04 (huck's Unicode-by-default convention for parameter
-expansion). Scripts that depend on injecting raw high bytes via
-`$'\xHH'` — rare in practice — will see different output sizes.
-Surrogate-range escapes (`\uD800`..`\uDFFF`) and codepoints above
-U+10FFFF are rejected with a `LexError::AnsiCInvalidCodepoint` rather
-than silently producing invalid UTF-8.
-
-Related NUL edge (found v266, `ansi_c_escapes_diff_check.sh`, kept out of the
-byte-diff harness by design): an embedded `\0` NUL inside `$'…'` — `echo $'a\0b'`
-— TRUNCATES the C-string at the NUL in bash (prints `a`), whereas huck emits the
-literal NUL byte and keeps scanning (`a`, `\0`, `b`). huck's `String` word model
-carries the interior NUL instead of terminating on it. Rare; a lexer-unit-test
-concern rather than a diff-harness one.
-
-### L-15: sourced-file syntax error points at the logical command's first line
-
-- **Status**: `[intentional]` (v94)
-- **Severity**: low
 - **huck**: a lex or parse (syntax) error raised while reading a sourced file (`source`/`.`, `--rcfile`, script-file mode) is reported as `huck: FILE: line N: syntax error: MSG`, where `N` is the physical line on which the offending logical command STARTED (`cmd_start_line` in `run_sourced_contents`). For a multi-line construct (a function body, a continued `if`, a `case`, etc.) that is the construct's opening line, not the line containing the offending token.
 - **bash**: reports the physical line of the offending token itself, so for multi-line constructs bash's `line N` is later than huck's.
 - **Why intentional**: huck parses a whole logical command (gathering continuation lines) before it can report a syntax error, so the precise within-command token line is not available without per-`Token` position tracking. The first-line report is accurate for the overwhelming majority of cases (single-line commands, where the two coincide) and is enough to locate the failing construct. Exact token `line:col` reporting is deferred (needs per-`Token` position tracking). Note: in huck unterminated quotes/braces become continuation rather than lex errors, so most user-visible cases are parse errors.
@@ -287,133 +151,65 @@ concern rather than a diff-harness one.
 
 ---
 
-### L-16: `${!name}` unbound effective name under `set -u` — text + rc
+### `${var@OP}` scalar-transform edge divergences
 
-- **Status**: `[deferred]`, low (v95; narrowed 2026-07-07)
-- **Severity**: low
-- **huck**: a `set -u` unbound EFFECTIVE indirect name — `set -u; ref=nope; ${!ref}` — reports `nope: unbound variable` and exits **rc 1**, whereas bash names the indirect form (`!ref: unbound variable`) and exits **rc 127**. Both abort; only the offending-name text and the exit code differ. (The two other v95 `${!…}` error cases once tracked here — a SET-but-empty source `ref=""; ${!ref}` and a space-containing effective name `ref="a b"; ${!ref}` — now emit bash's exact `: invalid variable name` / `a b: invalid variable name` and MATCH, verified 2026-07-07.)
-- **bash**: `!ref: unbound variable`, rc 127.
-- **Why deferred**: pathological (`${!ref}` on an unbound computed name under `set -u`); matching bash needs the `!name` indirect form in the message plus bash's set-u exit code (127). The stdout is empty in both.
-- **Workaround**: none needed for scripts that only care that the shell aborts.
+[Issue #55 · by-design](https://github.com/jdstanhope/huck/issues/55)
 
----
-
-### L-17: `${var@OP}` scalar-transform edge divergences
-
-- **Status**: `[intentional]` (v96)
-- **Severity**: low
 - **huck**: three edge divergences in the v96 `${var@OP}` scalar transforms (M-86): (a) `@P` reuses `expand_prompt`, which always expands `$VAR`/command-substitution, whereas bash suppresses those in `@P` when `shopt -u promptvars` (default is ON, and backslash-escape processing matches; oh-my-posh's pre-rendered ANSI value has no `$VAR` so it is unaffected); (b) `@U`/`@u` non-ASCII case mapping inherits the pre-existing `case_modify` Rust `to_uppercase` quirk (e.g. `straße`@U → `STRASSE` vs bash `STRAßE`) — the SAME behavior as the existing `${v^^}`/`${v^}` modifier (M-17), not a v96 regression; (c) `@Q` of a high / non-UTF-8 byte renders char-wise (`$'\xff'`@Q → `'ÿ'`) rather than bash's byte-wise `$'\377'`, the same char-vs-byte gap as L-11 — the value still round-trips.
 - **bash**: as described above — promptvars-gated `@P` $VAR suppression; locale/byte-faithful `@U`/`@Q`.
 - **Why intentional**: (a) requires plumbing the `promptvars` shopt into prompt expansion for a default-on, rarely-unset option; (b)/(c) are pre-existing UTF-8/char-based architecture choices shared with M-17 and L-11, not new to `@OP`. In every common case (pre-rendered prompt values, ASCII text) output matches bash.
 - **Workaround**: none needed for the oh-my-posh `@P` path or ASCII transforms.
 
-### L-18: `&` ordering inside a command-substitution
+---
 
-- **Status**: `[intentional]`, low (v98)
-- **Severity**: low
+### `&` ordering inside a command-substitution
+
+[Issue #56 · by-design](https://github.com/jdstanhope/huck/issues/56)
+
 - **huck**: **Command-substitution `&` ordering**: `$( a & b )` runs synchronously in source order in huck (the documented capture-context "ignore `&`" design — see the `execute_capturing` top-level `Amp`→`Semi` rewrite) rather than backgrounding `a`; the output *content* matches bash, but interleaving/ordering may differ when `a` would have overlapped `b`. (The former nested-`&`-inside-a-captured-subshell edge — `x=$( ( echo n1 & wait ) )` yielding empty vs bash's `n1` — is RESOLVED and now matches bash, verified 2026-07-07.)
 - **bash**: `a` is genuinely backgrounded inside the substitution.
 - **Why intentional**: the intentional capture-context design — backgrounding inside a substitution that synchronously drains stdout has no observable benefit and risks lost output, so huck serializes. Real scripts rarely background inside `$(…)`; the edge is pathological.
 - **Workaround**: avoid backgrounding inside `$(…)`; run the `&`'d command at the top level and capture its output by other means.
 
-### L-19: `command CMD` bare-form edges (`-p` PATH, `command declare -a`, function named `command`)
+---
 
-- **Status**: `[intentional]`, all low (v99)
-- **Severity**: low
+### `command CMD` bare-form edges (`-p` PATH, `command declare -a`, function named `command`)
+
+[Issue #57 · by-design](https://github.com/jdstanhope/huck/issues/57)
+
 - **huck**: three edges in the v99 `command CMD` bare form (M-85): (a) `command -p CMD` resolves CMD via the CURRENT `$PATH`, not bash's guaranteed default PATH (`getconf PATH` / a "standard utilities" path); huck has no separate default-PATH search, so `-p` is accepted but effectively a no-op over the live `$PATH`. (b) `command declare -a a=(x y z)` (a compound array RHS reached via `command`): bash REJECTS it as a syntax error, but huck ACCEPTS it (the pre-resolve declaration-builtin reconstruction assigns the array) — a no-panic SUPERSET. Scalar `command export X=1` matches bash. (c) A user FUNCTION named `command` (`command() { …; }`) cannot shadow the builtin in huck — the interception is unconditional and runs BEFORE function lookup — whereas bash lets the function take precedence. The same holds for a function named `builtin` (added v142): the `builtin` pre-resolve interception also runs before function lookup, so `builtin() { …; }` cannot shadow the `builtin` builtin either.
 - **bash**: (a) `-p` searches a guaranteed default PATH; (b) `command declare -a a=(…)` is a syntax error; (c) a function named `command` (or `builtin`) shadows the corresponding builtin.
 - **Why intentional**: (a) huck has no built-in default-PATH constant; the live `$PATH` covers every real use of `-p` (recovering a real command past a shadowing function). (b) accepting the array assignment is strictly more permissive and panic-free — the only divergence is huck succeeding where bash errors on a pathological input. (c) POSIX discourages naming a function `command`; the unconditional interception is what makes the bare form reliably bypass functions in the first place.
 - **Workaround**: (a) none needed — set `$PATH` explicitly if a default-PATH search is required; (b) avoid `command declare -a` for array RHS; (c) do not name a function `command`.
 
-### L-21: `set -x` (xtrace) trace-format divergences
+---
 
-- **Status**: `[intentional]`, all low (v103; narrowed v130 — per-word arg quoting, inline + bare assignment prefixes, and `command`/`local`/`declare` arg tracing now match bash; v131 — PS4 depth-repeat + `$VAR`/escape expansion now match bash)
-- **Severity**: low
+### `set -x` (xtrace) trace-format divergences
+
+[Issue #58 · by-design](https://github.com/jdstanhope/huck/issues/58)
+
 - **huck**: residual differences from bash's xtrace output, none of which affect the diagnostic value. (a) **Compound-header traces — IMPLEMENTED (v198)**: huck now emits a trace line for each compound-command header — the `for`-iteration variable (per loop pass, `+ for i in 1 2`), the `case` word (`+ case x in`), `select`, standalone `(( ))` and C-style `for ((;;))` arith clauses, and `[[ … ]]` LEAF-BY-LEAF with expanded operands and short-circuit (`+ [[ 1 -gt 0 ]]`; `[[ a && b ]]` → up to two lines; an untaken `||`/`&&` branch is not traced; `! leaf` folds into one line). Raw headers come from a `reconstruct_word_source` Word→source renderer; `[[ ]]` leaves from a `suppress`-threaded hook in `eval_test_expr`. Narrow RESIDUALS remain: (i) the rhs *pattern* of `[[ … == … ]]`/`=~` is shown as its expanded value, not bash's per-character quote-provenance escaping (`[[ $x == "p q" ]]` → bash `\p\ \q`, huck `p q`); (ii) the string-equality operator renders canonically as `==` (the AST collapses source `=` and `==`); (iii) reconstructed-header quote/brace STYLE is not recoverable from the parsed `Word` (`'x'`/`"x"` both render `"x"`; a bare `${x}` renders `$x`), and a deeply-nested compound command inside a `$()` header renders approximately; (iv) a command-substitution *operand* inside `[[ ]]` is expanded twice under `set -x` (once for the trace line, once for the comparison), so a `$(cmd)` with side effects may run twice — same family as (b). **(v219 provenance note)** the lexer now records source quote spans in `WordPart::Quoted` (added to make `declare -f` / `type` reconstruction bash-faithful, L-57); that provenance is available to the xtrace `reconstruct_part` path and would let residuals (i) and (iii) render with bash-faithful quote/brace style if wired up later — but the trace renderer does not yet consult it. (b) **Decl-RHS-with-command-substitution edge**: a `local`/`declare`/`export` RHS that contains a command substitution (e.g. `local x=$(cmd)`) is traced with the EXPANDED value, which re-runs the command substitution for the trace (double-execution) — rare. (c) Per M-90, `2>/dev/null` does NOT suppress the trace (builtin/executor stderr ignores `2>` — consistent with M-90). (d) **Pipeline-stage trace ORDER is best-effort**: the set of trace lines matches bash, but in-process (builtin/function) stages trace from a forked child while external stages trace from the parent, so the left-to-right ORDER of trace lines in a mixed pipeline may differ from bash (the lines themselves are identical).
 - **bash**: renders the `[[ ]]` rhs pattern with quote-provenance escaping; echoes the source `=`/`==` spelling and the source quote/brace style; traces a decl RHS without re-executing a command substitution; left-to-right pipeline-stage trace order; `2>` can redirect the trace.
 - **Why intentional**: the v198 compound-header traces match bash for the common cases (`xtrace_compound_diff_check.sh`); the four remaining `(a)` residuals are cosmetic display-only divergences (quote/brace style and the rare cmdsub-operand double-run). The decl-RHS-cmdsub double-execution and pipeline-stage ORDER edges are inherited from existing architecture; the `2>` gap is M-90's stderr-sink limitation. Every command still emits a trace line.
 - **Workaround**: none needed for diagnostic use; the trace still shows each command before it runs.
 
-### L-22: linear source-reader unit-boundary / resync edges
+---
 
-- **Status**: `[intentional]`, both low (v104)
-- **Severity**: low
+### linear source-reader unit-boundary / resync edges
+
+[Issue #59 · by-design](https://github.com/jdstanhope/huck/issues/59)
+
 - **huck**: two edges in the v104 O(n) script source reader (M-99), both confined to already-divergent verbose / error paths. (a) **Trailing top-level `;`/`&` before a newline**: a trailing top-level `;` or `&` immediately before a newline (e.g. `set -v ;⏎cmd`) groups with the NEXT command into one parsed unit — only `&&`/`||`/`;`-on-a-line and bare top-level newlines bound units — so `set -v` / `set +v` taking effect via such a trailing-separator-then-newline line may echo one fewer / more line than bash. (`set -v; cmd` on ONE line already matched bash; only the rare trailing-`;`-then-newline differs.) Execution OUTPUT is unaffected — only the `set -v` echo of that boundary. (b) **Post-syntax-error resync**: after a syntax error the reader skips to the next top-level newline (the token-stream analogue of the old "clear the buffer, continue at the next line" recovery), so the cascade AFTER a syntax error may differ slightly from the old per-line resync.
 - **bash**: (a) `set -v` echoes exactly the physical lines as read; (b) bash's own error-recovery boundaries.
 - **Why intentional**: both are negligible and only affect the already-divergent-from-bash verbose / error edges; unit boundaries are intentionally `&&`/`||`/`;`-on-a-line / top-level-newline so the one-command-at-a-time linear reader (M-99) stays O(n). Normal execution output is identical.
 - **Workaround**: none needed; put `set -v` / `set +v` on its own line (no trailing `;`/`&`) for an exact bash-matching echo boundary.
 
-### L-56: Remaining arithmetic behavioral divergences (post-v216)
+---
 
-- **Status**: `[deferred]`
-- **Severity**: medium (items a–b); low (items c–f)
+### FUNCNEST recursion backstop diverges from bash on pathological recursion
 
-v216 aligned arith error-message FORMAT with bash (leading-trimmed expression echo + `(error token is "...")` suffix — verified 10/10 by `arith_error_diff_check.sh`); the prologue itself is now handled by the unified v269 emitter (see below). The following BEHAVIORAL divergences remain (the former items (c) lazy/short-circuit dead-branch and (d) array-element-lvalue-in-arith were RESOLVED and now match bash, verified 2026-07-07):
+[Issue #66 · by-design](https://github.com/jdstanhope/huck/issues/66)
 
-(a) **Integer-literal overflow wrapping** — literals ≥ 2^63 (`9223372036854775808`) wrap two's-complement to the minimum signed value (`-9223372036854775808`) in bash; huck rejects them as `integer literal out of range`. Affects `$(( ))`, `(( ))`, and `let`. Medium: breaks scripts that rely on signed overflow.
+huck enforces `FUNCNEST` exactly like bash, but additionally clamps the effective nesting limit to an internal backstop `FUNCNEST_HARD_MAX = 2048` (below huck's ~2800 native-stack crash ceiling). So unbounded recursion with no/`0` FUNCNEST — or `FUNCNEST` set above 2048 — produces a clean `maximum function nesting level exceeded (2048)` error + rc 1 where bash would recurse deeper (and ultimately SIGSEGV). Intentional robustness improvement over bash's segfault; the message shows `2048` rather than a user-set value when clamped. Not a no-crash guarantee — a sufficiently stack-heavy recursive function can still overflow below 2048.
 
-(b) **`++`/`--` before a non-lvalue literal** — bash treats a leading `++` or `--` applied to a bare integer literal (`++7`, `-- 7`) as repeated unary `+` / `-` (yields the value unchanged); huck errors with `prefix ++ requires variable`. Postfix on a non-lvalue (`7++`, `7--`) also diverges in error wording. Medium: some scripts apply prefix `++` to constants defensively.
-
-(c) **Substring offset/length with arith ternary colons** — `${PARAM:1?4:2:1}` (a ternary expression as the `${var:off:len}` offset or length) produces different results or parse errors. Low.
-
-(d) **Expression-echo shows pre-expansion form** — when huck emits the arith expression in an error message it may show the un-expanded form (e.g. `$iv`) where bash shows the expanded value (e.g. `\29`). This is because huck echoes the expression string BEFORE variable substitution completes. Low; related to L-54 (single-quote stripping in arith string builders). Cross-reference L-54.
-
-(e) **Standalone `(( ))` command missing `line N:` in script mode** — `Command::Arith` carries no source-line number, so huck either omits the `line N:` segment or reports an inaccurate line when a standalone `(( ))` command errors in a script. This is a broader LINENO-stamping gap (compound-command AST nodes do not carry their source line); it is also why `arith_error_diff_check.sh` covers only `$(( ))` / `let` forms and not standalone `(( ))`. Low.
-
-(f) **Malformed second-`#` base-N number error kind** — `2#110#11` (a valid-prefix base-N literal with a spurious second `#`) maps to `invalid integer constant` in huck vs bash's `invalid number`; the fatal outcome is the same and only the wording differs. Low.
-
-Note: the bash error-message prologue (`<name>: [-c: ][line N: ][cmd: ]`) is now applied by the unified emitter family shipped in **v269** (`error_emit.rs` — `sh_error!`/`sh_error_to!`/`emit_syntax_error`), so ALL error sites (arith and everything else) carry the bash-faithful prologue, and the Rust ` (os error N)` io-text leakage was cleaned up shell-wide in v229 (`crate::bash_io_error`). The items above are the remaining BEHAVIORAL arith divergences, independent of the (now-complete) prologue work.
-
-### L-66: getopts prints only the identifier error when both the option and the name are invalid
-
-- **Status**: `[deferred]`, low (v227)
-- **Severity**: low
-- **huck**: when a single `getopts` call hits BOTH an invalid optstring option (non-silent mode) AND an invalid name-variable identifier, huck prints only the `` getopts: `name': not a valid identifier `` error — the invalid-name check returns before the `$0`-prefixed option diagnostic is emitted.
-- **bash**: prints both the option diagnostic and the identifier error.
-- **Why deferred**: not exercised by any bash-test category (the `getopts` category's invalid-name case uses a SILENT optstring, so there is no option diagnostic to suppress); emitting both would require reordering the diagnostic ahead of the name check. The code comment at the early return documents the choice. Independent of the v227 getopts flip.
-
-- **L-57: `herestr` harness-masked empty-command-name runtime bug** — `[deferred]`, low (re-scoped v220). The `herestr` bash-test-suite category PASSes (0 diff) as of v220: the v219 `WordPart::Quoted` quote-provenance fix removed the reconstruction hunks, and v220 task 1 resolved the last runner residual — `declare -p` of an indexed-array element whose value holds a non-printable byte now ANSI-C `$'…'`-quotes it (`[3]=$'i\n'`) to match bash 5.2.21. One genuine general divergence remains but is masked under the runner: a command whose LEADING word expands to empty (`$Z echo hi` with `Z` unset, or the test's `${THIS_SH} ./herestr1.sub` when `THIS_SH` is unset) should drop the empty word via word-splitting and run the remainder; huck instead treats the empty expansion as an empty command NAME and prints `huck: command not found:` (rc 127). This surfaces only on a DIRECT `huck herestr.tests` invocation; the runner exports `THIS_SH=$HUCK`, so it does NOT gate the category (the sub-script runs and its `foo`/`qux` output matches). Worth fixing on its own. **v228 characterized the full family** (a command word that expands to ZERO fields, executor.rs `resolve` site `prog_fields.is_empty()`): bash's behavior depends on what remains — `$Z` alone → no-op rc 0 (no command); `$Z >redir` → redirection-only, rc 0; `$Z echo hi` → promote the surviving field (`echo`) as the command. huck instead errors `huck: command not found:` rc 127 in all three. v228 (command-not-found word order) deliberately did NOT convert this site's message, because no `: command not found` text is ever bash-correct from a zero-field word — fixing it requires the empty-simple-command/field-promotion semantics above, not a message reformat. (The quoted-empty `''` REAL-field case is unaffected: it is a genuine empty command NAME that routes through the spawn-NotFound site, which v228 fixed to `<src>: line N: : command not found`.)
-
-- **L-60: `ansi_c_quote` passes C1 controls (U+0080–U+009F) through literally inside `$'…'`** — `[deferred]`, low (v220). The `declare -p` / `declare`-bare ANSI-C value quoter octal-escapes C0 controls and other non-printables but emits C1 control bytes (U+0080–U+009F) literally rather than as `\NNN` octal escapes. Matching bash here needs locale-aware printability classification; not exercised by any current bash-test-suite category.
-
-- **L-59: residual `declare -f` / `type` reconstruction-fidelity gap (arith-for empty section)** — `[deferred]`, low (v218). The v218 port made function reconstruction byte-identical to bash for the common constructs (verified by `declare_f_diff_check.sh`). One narrow fidelity gap remains, surfaced by the `arith-for` bash test category: huck leaves an **empty `for ((` section** empty (`for ((; i<3; i++))`) where bash normalizes a missing section to `1` (`for ((1; i<3; i++))`) — `arith_for_to_source` would need to emit `1` for a `None` section. Reconstruction-only (no runtime effect); blocks full PASS of `arith-for` in combination with that category's arith-error-message wording divergences. (The v218 brace-group-redirect and nested-`function`-keyword reconstruction gaps were RESOLVED in v222 — see git history.)
-
-- **L-64: `export`/`readonly` over-persist a prefix assignment of an UNNAMED variable** — `[deferred]`, low (v225). bash's assignment-builtin absorption is per-variable: `FOO=val export FOO` persists `FOO` (named), but `FOO=val export BAR` does NOT persist `FOO` (bash restores it). huck's `persistent` decision (executor.rs `run_exec_single`) is per-command — `export`/`readonly` are persistent for their WHOLE prefix in both modes — so `FOO=val export BAR; echo "${FOO-unset}"` yields `val` in huck vs `unset` in bash. Predates v225 (the v225 posix gating deliberately left the export/readonly whole-prefix behavior as-is to avoid regressing `FOO=val export FOO`). A bash-exact fix needs per-variable absorption: only persist a prefix var that the assignment builtin actually names. Not currently exercised by a gating bash-test category. (v225 DID fix the related func3.sub posix temp-assignment/special-builtin interaction — the `func` category now PASSes — and the inner-`export` enclosing-restore quadrant is handled correctly; this entry is only the top-level unnamed-var case.)
-
-- **L-63: FUNCNEST recursion backstop diverges from bash on pathological recursion** — `[intentional]`, low (v224). huck enforces `FUNCNEST` exactly like bash, but additionally clamps the effective nesting limit to an internal backstop `FUNCNEST_HARD_MAX = 2048` (below huck's ~2800 native-stack crash ceiling). So unbounded recursion with no/`0` FUNCNEST — or `FUNCNEST` set above 2048 — produces a clean `maximum function nesting level exceeded (2048)` error + rc 1 where bash would recurse deeper (and ultimately SIGSEGV). Intentional robustness improvement over bash's segfault; the message shows `2048` rather than a user-set value when clamped. Not a no-crash guarantee — a sufficiently stack-heavy recursive function can still overflow below 2048.
-
-- **L-62: residual FUNCNAME / exported-function-attribute edges (post-v223)** — `[deferred]`, low. v223 protects plain FUNCNAME writes and adds the `declare -fx` export-attribute listing form, but four narrower edges remain (none exercised by a currently-gating category): (a) **`declare FUNCNAME=v` / array `FUNCNAME=(a b c)`** return rc 0 in huck (the write is silently discarded) where bash returns rc 1 with an error (`FUNCNAME: variable may not be assigned value`; the array form is a hard error that aborts `-c`) — the value is now bash-correct (unset) but the rc/diagnostic is not. (b) **`unset FUNCNAME` then re-entering a function** — bash leaves FUNCNAME empty thereafter; huck's call-stack rebuild repopulates it. (c) **`readonly -f` on an exported function** lists as `declare -frx` in bash but `declare -fx` in huck (the readonly-function `r` attribute is untracked). (d) **BASH_SOURCE / BASH_LINENO writes are not protected** — bash silently discards them like FUNCNAME (same call-stack-array mechanism), but unlike FUNCNAME they are populated at top level, so the v223 guard (`is_write_protected_var`, FUNCNAME-only) deliberately omits them pending a population-safe approach.
-
-- **L-65: residual POSIX-mode non-interactive-exit edges (post-v226)** — `[deferred]`, low (v226). v226 made a non-interactive `set -o posix` huck shell exit-on-error for the Cluster-A special-builtin / assignment-error cases (via `shell.posix_fatal(status)`), but three narrower edges remain (none exercised by a currently-gating category): (a) **single-char bad-option detection gaps** — `trap -z`, `. -z` (source), and `set -z`/`set -h` where the flag is a valid bash *letter* huck simply doesn't implement: huck does not raise a usage error there, so it does NOT exit where bash's posix shell would. (The `set -o NAME` long-option-unknown path and the four `Err(OptSetErr::Unknown)` arms DO fire correctly — only the single-letter unknown/unimplemented path is silent.) (b) **abort-rest-of-line, not shell-exit** — `readonly x=1; x=2 true` (an assignment error in the prefix of a *regular* command): bash aborts the rest of that input *line* but resumes at the next line — it is NOT a shell exit. huck continues through the whole line. v226 only models the special-builtin prefix case (`x=2 export y`), which IS a true exit; the regular-command line-abort is unmodeled. (c) the **DEFAULT-mode** halves of all these cases remain open by design — see L-43; v226 deliberately gated every new abort behind `shell_options.posix`.
-
-- **L-67: pipeline-stage / background redirect-open errors omit `line N:`** — `[deferred]`, low (v229). v229 routed all redirect-open failures through `redir_open_error`, which prefixes `error_prefix(None)` (`<src>: line N: `) — but `error_prefix` only emits the `line N:` segment when `current_lineno > 0`, and the multi-stage / background pipeline executors (`run_multi_stage`, `run_background_sequence`) do not propagate `current_lineno` into their stage setup. So a redirect-open error on a pipeline STAGE or a backgrounded command (`cat < /missing | wc` &-style) emits `<src>: <path>: <strerror>` — correct text, correct exit, but missing the `line N:` segment that a single-command redirect now carries. Strictly better than the pre-v229 `huck: <path>: …(os error N)` (text + prologue now match; only the line number is absent). Same root as the broader LINENO-stamping family (L-56(g) standalone `(( ))`, L-08 pipeline-stage redirects): the fix is to thread `current_lineno` into the pipeline/background stage setup. Not exercised by a currently-gating bash-test category.
-
-- **L-68: residual umask/ulimit/enable builtin edges (post-v230)** — `[deferred]`, low (v230). v230 shipped `umask` (octal+symbolic, prologue errors), `ulimit` (full Linux resource table, real `get`/`setrlimit`), `enable` (a `disabled_builtins` set toggled via `enable -n`/`enable`, consulted by `builtin_active` in dispatch + `type`/`command -v`), and the `times` POSIX special builtin (so `enable -ps` lists it). Narrow residuals, none exercised by a currently-gating category (the v230 deliverable was a broad shrink — the `command not found` clusters left `builtins`/`errors`/`procsub` — with NO category flip): (a) **`enable -f file` / `enable -d` (dynamically-loaded builtins)** are rejected as `invalid option`; huck has no loadable-builtin support (the `loadable` bash-test category is in known-skips), so dynamic loading is out of scope. (b) **`ulimit -a` omits `-p` (pipe size) and `-R` (RLIMIT_RTTIME), and its column labels are not byte-verified** — `-a` absolute values are environment-specific and deliberately NOT harness-pinned; only the env-independent round-trips and error forms are checked by `ulimit_diff_check.sh`. (c) **`ulimit` value `saturating_mul` overflow** — a set value large enough that `value × multiplier` saturates `u64` is written as `RLIM_INFINITY` (unlimited) rather than erroring; only reachable with astronomically large inputs the kernel would reject anyway. (The former (d) — the declaration-command path not being disable-aware — is RESOLVED: `enable -n declare; declare x=1` now reports `declare: command not found` like bash, verified 2026-07-07.) The common forms (octal/symbolic umask, `ulimit -n`/`-c` round-trips, `enable -n`/`enable`/`enable -ps` listing) are byte-identical to bash (`umask_diff_check.sh` 10/10, `ulimit_diff_check.sh` 5/5, `enable_diff_check.sh` 6/6).
-
-- **L-69: residual `expand_aliases` edges (post-v239 read-time architecture)** — `[deferred]`, low. **v239 replaced the post-pass token `Expander` (deleted, along with `expand_aliases_in_tokens`/`alias_generation`) with read-time alias expansion in the lexer**: command-position words are expanded during the parser's live token pull (`Lexer::maybe_expand_command_alias` at the parser's command-position entry), in the REPL and the `source`/`-c` loop alike (between-unit `set_aliases` propagates def-then-use). This RESOLVED two prior residuals: (b) **`-c` command-strings now expand** (`huck -c 'shopt -s expand_aliases; alias x=…; x'` works — REPL and `-c` share the read-time path), and aliasing a **compound-opener keyword** (`if`/`while`/`for`/`case`/`time`/`{`/`[[`/…) at genuine command position now **expands** it, matching bash (pre-v239 huck syntax-errored — a bash-fidelity *improvement*; expansion happens before the parser's reserved-word check). Same-unit def-then-use (`alias x=…; x` on one physical line/compound) correctly does NOT expand (matches bash — the line is read before the `alias` command runs). Remaining residuals, both **under-expansion**, low-frequency: (a) **redirect-prefix command position** — a command word that follows a leading redirection (`< file foo`, `>out cmd`) is NOT alias-expanded; bash expands it. (b) **command substitution** — aliases are NOT expanded inside `$(…)`/backticks, because comsub bodies are tokenized via a `from_tokens` replay carrying no alias map; bash expands them with `expand_aliases` set (e.g. `y=$(x hi)` with `alias x=echo`). Plus the test-infra `alias2.sub`/`alias4.sub` residuals (unrelated to expansion). The common patterns — def-on-an-earlier-line use, trailing-blank chaining, recursion guard, redefine/unalias, case patterns, reserved-word keyword slots, for-lists, `[[ ]]` interiors, quoted-word suppression — are byte-identical to bash (`alias_expand_diff_check.sh`, `alias_readtime_diff_check.sh`, `alias_case_diff_check.sh`), and `set -v` echoes the RAW pre-expansion line. (v231's `source` path/device-file fixes remain in place: no-slash `$PATH`+CWD fallback gated on `shopt sourcepath`, and device-file/fifo/procsub acceptance — `source_device_diff_check.sh`.)
-
-- **L-71: named-user tilde (`~user`) immediately before `:` in a COMMAND word not expanded** — `[deferred]`, low (found v266, `tilde_diff_check.sh`). `echo ~root:~root` (or `echo ~root:x`) yields `~root:~root` in huck but `/root:~root` in bash — huck leaves the whole word literal when a named-user tilde prefix is terminated by `:` in a command (non-assignment) word, so even the leading `~root` bash expands is dropped. Narrow: `~root`, `~root/a`, `~/a:~root`, and BOTH assignment-context `~root` colon forms (`x=~root:~root`) all match bash; the `~/`, `~+`, `~-` colon forms are unaffected. Only "named-user tilde immediately followed by `:` in a command word" breaks. Fix: apply the same post-`:` tilde-prefix scan the assignment-RHS path uses to command-word tilde segments for the named-user (`~name`) form.
-
-- **L-72: parameter-expansion indirect/`$-` edges** — `[deferred]`, low (found v266, `param_expansion_diff_check.sh`). Two unrelated small gaps surfaced while backfilling bad-substitution coverage: (a) **`${!!}` / `${!$}` over-accepted as indirect** — bash rejects both as `${…}: bad substitution` (rc 1), but huck treats `!`/`$` as valid indirect targets: `${!!}` → `huck: !: invalid indirect expansion` (rc 1, wrong message class), `${!$}` → empty output rc 0 (should bad-subst). Fix: reject a non-name/non-positional indirect target in `${!X}` before the indirect lookup. (b) **`${#-}` wrong because `$-` carries no option-flag string** — `${#-}` is the length of `$-`; bash's `$-` reflects the current shell option letters (e.g. `hB`) so `${#-}` is ≥1, whereas huck's `$-` expands empty, so `${#-}=0` (`echo ${#?} ${#-} ${#$} ${#!}` → bash `1 2 7 0`, huck `1 0 7 0`). Root cause is `$-` flag-string content, not the `${#…}` length operator. Also related (error-prologue staging, tracked under L-56): `${X:&Y}` arith-operand error drops bash's `X: ` param-name prefix, and `${!*}`/`${!@}` invalid-computed-name errors use the `huck:` prefix instead of the `<src>: line N:` prologue.
-
-- **L-73: unquoted nested-bracket subscripts unsupported in every subscript context** — `[deferred]`, low (v268, `subscript_lvalue_diff_check.sh`). An unquoted literal `[` inside a subscript (indirect indexing, `a[b[i]]`) is not supported: `a[0]=9; a[a[0]]=hit` → bash sets `a[9]=hit`, huck folds `a[a[0]]=hit` to a glob → `command not found`. The v268 cycle-sever made the command-word lvalue path assemble subscripts under `Mode::ParamSubscriptOperand` (terminates on the first `]`), which is what the two SIBLING contexts already did — `${a[a[0]]}` → `bad substitution`, array-literal `([a[0]]=x)` → syntax error. So v268 UNIFIED the divergence (all three subscript contexts now reject unquoted nested brackets identically) rather than introducing a new class; before v268 the command-word lvalue was the lone context that depth-counted `[` (via the deleted forward-scan). Quoted / command-sub subscripts are unaffected (`a[$(echo 0)]=v`, `a["k]"]=v` match bash). Fix: teach the subscript scanner/parser to emit + balance nested `[`/`]` across all three contexts — a real feature, its own iteration.
-
-- **L-74: unterminated command-word `name[…` (no closing `]`) containing a separator** — `[deferred]`, low (v268, `subscript_lvalue_diff_check.sh`). After v268 deleted the old literal-swallow-to-EOF fallback, an unclosed `name[` at command-word start re-scans as an ordinary word (a D1 improvement: `echo a[$x` and `echo a[$x | cat` now match bash, where old-huck wrongly swallowed the `|`/newline into one literal). But when the unclosed region contains a command separator, all three shells differ: `x=9; a[$x b=1; echo hi` → bash ERRORS (`unexpected EOF looking for matching ]`, rc 2), old-huck swallowed to EOF (rc 127), new-huck runs the trailing command (`a[9: not found` then `echo hi`). Since bash itself rejects these, no shell "matches" and the case is degenerate. Reproducing bash's whole-word error would require a lexer forward-scan to EOF — exactly what the v268 "parser owns delimiter-matching" rule forbids — so this is intentional under the new architecture.
-
-- **L-75: compound-array RHS assigned to an array ELEMENT** — `[deferred]`, low (pre-existing, documented v268). `a[i]=(x y z)` — bash rejects assigning a list to a single array member (`a[i]: cannot assign list to array member`, rc 1); huck parses it (the `[sub]=(` `(`-probe emits an `ArrayLiteral`) and the engine rejects at assign time with the SAME rc 1 but a different message (`a: cannot assign array literal to array element` vs bash's `a[i]: cannot assign list to array member`) — only the message text now differs (the earlier rc-0 divergence is resolved, verified 2026-07-07). Compound-array RHS is only valid on the WHOLE array (`a=(…)`). Pre-existing (v268's `begin_assignment_value` replicates the old Indexed arm's `(`-probe byte-for-byte, so the behavior is unchanged); surfaced while writing the v268 harness. Fix: reject a list RHS on an indexed/assoc ELEMENT lvalue at parse or assign time with bash's message + rc 1.
-
-- **L-76: `command`/`builtin` wrapper option-errors leak under captured `2>&1`** — `[deferred]`, low (surfaced v269, `error_message_diff_check.sh` capture matrix). A bare-option error from the `command -Z` / `builtin -Z` *wrappers* (`x=$(command -Z 2>&1)`) leaks to the real stderr instead of the captured stdout — bash captures it. The wrapper emits via its own `err` writer correctly, but the executor's in-memory bare-builtin `route_err_to_out`/`route_out_to_err` swap (which makes `2>&1` capture work for a bare builtin) is applied in `run_builtin_with_redirects`, and the `command`/`builtin` wrappers reach their option-parse error on a path that doesn't run that swap. (`builtin cd … 2>&1` *does* capture — it re-dispatches into the real builtin under the redirect scope.) NOT a v269 regression: v269 preserved the wrapper's writer identity; the swap gap pre-existed. Fix: apply the same trailing-`2>&1` swap detection to the `command`/`builtin` wrapper option-error path.
-
-- **L-77: pipeline-stage spawn failure leaks + wrong message** — `[deferred]`, low (surfaced v269). `echo hi | nosuchcmd 2>&1` (and `x=$(… )` capture) — huck prints the raw `No such file or directory` to the REAL stderr; bash prints `nosuchcmd: command not found` routed to the stage's redirect target (so `2>&1` capture sees it). Two gaps: (a) the parent-side spawn-failure detection for a *pipeline stage* (`executor.rs` multi-stage path) emits to the parent sink, not the stage's redirect target — the single-command path got the `emit_exec_spawn_diag` fix in v269 but `run_multi_stage`/`spawn_external_with_fds` did not; (b) the body is the raw `io::Error` text rather than bash's `<name>: command not found`. Pre-existing (v269 left the multi-stage arms untouched). Fix: extend the single-command spawn-diag routing + command-not-found message to the pipeline-stage arms.
-
-- **L-78: non-interactive piped-stdin line numbers are always `line 1`** — `[deferred]`, low (documented in-code v269, `shell.rs` `process_line_in_sinks`). For commands read from piped stdin (`printf 'echo hi\ncd /nope\n' | huck`), a runtime/syntax error reports `line 1:` regardless of the real line — bash reports the true cumulative line (`line 2:`). huck's per-command REPL/piped-stdin reader does not track a cumulative `current_lineno` across logical commands. `-c` multiline input and script-file mode track correctly; only the piped-stdin stream diverges. Fix: thread a cumulative line counter through the piped-stdin logical-command reader.
-
-- **L-79: `jobs` shows only the command name (or a placeholder), not the full command line** — `[deferred]`, low (found 2026-07-07 while re-verifying the old L-06). The `jobs` listing renders a backgrounded job's command as just its leading command NAME: `sleep 100 arg2 arg3 & jobs` → huck `[1]+ Running   sleep &` where bash shows the full `sleep 100 arg2 arg3 &`. A backgrounded PIPELINE renders as the literal placeholder `background job` (`sleep 30 | cat & jobs` → huck `[1]+ Running   background job &`) rather than bash's `sleep 30 | cat &`. huck's `JobTable` stores only the command name / a placeholder, not the reconstructed source. Exit status, job-spec resolution (`%1`/`%cmd`), and `jobs -l`/`-p` PID handling are unaffected — only the human-facing command column diverges (the status field's column padding also differs slightly from bash, but neither shell adapts it to terminal width — this replaced the removed, factually-wrong L-06). Fix: store or reconstruct the job's full command source (a `Word`→source render, as `declare -f` / xtrace already do) at job-creation time.
-
-- **L-80: piped-stdin here-document body line ending in a literal backslash is corrupted** — `[deferred]`, low (found 2026-07-08, `parse-gaps-round2` final review). For a heredoc read from PIPED stdin, a body line ending in `\` is wrongly treated as a line continuation: `printf "cat <<'EOT'\nd \\\ng\nEOT\n" | huck` yields `d g` where bash keeps `d \<newline>g`. The same input as a FILE or `-c` string is byte-identical to bash. Root: the REPL/piped-stdin reader (`crates/huck-cli/src/repl.rs` ~424) calls `continuation::classify` per physical line; a heredoc body line ending in `\` classifies as `Incomplete(Backslash)`, so the reader strips the trailing backslash and joins. Same piped-stdin-reader family as L-27 (history) and L-78 (line numbers) — the reader applies line-oriented rules that should be suppressed inside a heredoc body. Fix: don't apply backslash-continuation while accumulating a here-document body.
-
-- **L-81: `export name=(array)` errors instead of exporting the array** — `[deferred]`, low (found 2026-07-08). bash accepts `export a=(1 2)` — it assigns the indexed array and marks it exported (`declare -ax a=(...)`, rc 0; the array is not actually inherited by children, a separate bash quirk). huck errors `export: cannot export arrays` (rc 1) and does not create the variable. The array-literal-in-declaration-builtin PARSE is correct (huck parses `export a=(1 2)`); only the `export` builtin's runtime rejects the array assignment. Fix: have `export` perform the array assignment and set the export attribute (matching bash) rather than rejecting.
-
-- **L-82: an unterminated `$(` inside a here-document body is a parse error** — `[deferred]`, low (found 2026-07-08, bash-suite `comsub-eof6.sub`). bash keeps a here-document body opaque at parse time and defers command-substitution parsing to runtime, so `read foo <<EOF`↵`$(seq 10`↵`EOF` PARSES (`bash -n` rc 0; the unterminated `$(` errors only at runtime). huck parses `$(…)` inside an expanding heredoc body eagerly into typed AST, so the unterminated `$(` is a parse error (rc 2). Matching bash needs runtime-deferred heredoc-body expansion — a major front-end/runtime rework; a `-n`-only leniency would create a parses-but-mis-runs divergence. Errors cleanly, no panic.
-
-- **L-83: `${…}` brace scanner over-consumes on nested quotes** — `[deferred]`, low (found 2026-07-08, bash-suite `array6.sub`/`posixexp2.tests`/`quote1.sub`; part of the [[huck-param-expansion-debt]] brace-scanner backlog). A `${…}` modifier whose body contains nested quotes with an embedded brace/quote — e.g. `echo "${dbg-'"'hey}"` or `"${foo%*'a'*}"` — is mis-scanned: huck fails to find the matching `}` and runs to EOF (`array6` → huck rejects a file bash parses, GAP), or huck accepts a construct bash rejects under `set -o posix` (`posixexp2`/`quote1` → over-accept). Root is the drifted/duplicated `${}` brace scanners' quote handling (consciously deferred hot-path debt — see [[huck-param-expansion-debt]]); not a naive-refactor target. Also in this family (measured, kept-lenient): huck does not enforce bash's arbitrary `maximum here-document count exceeded` limit (~18 heredocs on one command, `exportfunc1.sub`) — harmless permissiveness.
+---

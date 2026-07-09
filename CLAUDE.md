@@ -13,14 +13,19 @@ read these two docs — they're the project's authoritative source:
   cheatsheet (new builtin / modifier / `test` operator / control
   flow / `set -o` option / trap signal / array follow-on).
 
-- **`docs/bash-divergences.md`** — the CURRENT (open) divergences from
-  bash 5.x only, grouped into Bugs / Missing features / Intentional /
-  Low-impact tiers. Each entry is `[deferred]` (pending work, ranked by
-  severity `high`/`medium`/`low`) or `[intentional]` (kept by design).
-  Resolved divergences and the per-iteration history are NOT here — they
-  live in git history and `docs/superpowers/` specs+plans. (The doc was
-  slimmed 2026-06-09; it previously carried every `[fixed vNN]` entry and
-  a change log.)
+- **GitHub issues labelled [`divergence`](https://github.com/jdstanhope/huck/issues?q=is%3Aissue+label%3Adivergence)** —
+  the live tracker for every ACTIONABLE divergence from bash 5.x (bugs and
+  missing features we intend to address). Filter open work by `bug` /
+  `enhancement` and `sev:high` / `sev:medium` / `sev:low`. Deliberate,
+  kept-by-design divergences are the closed [`by-design`](https://github.com/jdstanhope/huck/issues?q=is%3Aissue+label%3Aby-design)
+  issues. **Before starting new work, review the open `divergence` issues** and
+  either take an existing one or open a new issue to capture the work.
+
+- **`docs/bash-divergences.md`** — the INTENTIONAL (kept-by-design)
+  divergences only, each linking to its closed `by-design` issue. Actionable
+  divergences are NOT here — they live in the GitHub issue tracker (above).
+  Resolved divergences and the per-iteration history are in git history and
+  `docs/superpowers/` specs+plans.
 
 The README's iteration table indexes the v1–vNN history at a glance.
 For per-iteration design context, `docs/superpowers/specs/` and
@@ -30,6 +35,10 @@ For per-iteration design context, `docs/superpowers/specs/` and
 
 Run the standard iteration loop without being asked:
 
+0. **Pick up (or open) an issue.** Review the open [`divergence`](https://github.com/jdstanhope/huck/issues?q=is%3Aissue+is%3Aopen+label%3Adivergence)
+   issues. Take the existing issue that matches the work, or open a new one
+   (`gh issue create`, labels `divergence` + `bug`/`enhancement` +
+   `sev:*`) to capture it. Note the issue number — the PR will close it.
 1. **Brainstorm** via the `superpowers:brainstorming` skill — ask
    one question at a time, propose 2-3 approaches, present design
    in sections with per-section approval.
@@ -41,12 +50,20 @@ Run the standard iteration loop without being asked:
    `vNN-<topic>` branch: fresh subagent per task with spec + code
    quality review between tasks.
 5. **Final review** of the whole branch diff before merge.
-6. **Merge** with `--no-ff`, push to origin, delete the local
-   branch. Update `docs/bash-divergences.md` (DELETE the resolved
-   `M-*`/`L-*` entry — it's a current-divergences-only doc; add a new
-   `[deferred]` entry for any follow-on gap discovered), and record the
-   iteration in the long-running memory files (`project_huck_iterations.md`
-   + `MEMORY.md`). (The README no longer carries a per-version table.)
+6. **Open a pull request** (`gh pr create`) targeting `main`, with the body
+   referencing the issue via `Closes #N`, and hand it to the user to review
+   and merge — do NOT merge to main yourself. Push the `vNN-<topic>` branch
+   to origin so the PR has a head. Before opening the PR, update the docs +
+   memory as part of the branch:
+   - If the work resolved a divergence, the merged PR auto-closes its issue
+     (`Closes #N`); no edit to `docs/bash-divergences.md` is needed unless the
+     resolved item was **intentional** (then remove it there too). Open a new
+     `divergence` issue for any follow-on gap discovered.
+   - If the work adds a NEW intentional divergence, add it to
+     `docs/bash-divergences.md` and open + close a `by-design` issue for it.
+   - Record the iteration in the long-running memory files
+     (`project_huck_iterations.md` + `MEMORY.md`). (The README no longer
+     carries a per-version table.)
 
 ## Conventions
 
@@ -59,5 +76,6 @@ Run the standard iteration loop without being asked:
   the same fragments through bash and huck and assert byte-identical
   output. Adding a `<feature>_diff_check.sh` is the gold standard
   for verifying bash compat on a new feature.
-- **Don't push directly to main without confirmation.** Use
-  `AskUserQuestion` before merging an iteration branch.
+- **Don't push directly to main, and don't merge PRs yourself.** Iteration
+  work lands via a pull request that the user reviews and merges. Push the
+  feature branch and open the PR (`Closes #N`); leave the merge to the user.

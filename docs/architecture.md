@@ -4,7 +4,8 @@ This is a one-page map of how huck is structured, intended as the
 starting point for anyone (human or LLM) extending the shell. It
 covers the load-bearing types, the execution pipeline, the
 iteration workflow, and where to add common new features. For the
-list of pending bash-compat work see `docs/bash-divergences.md`.
+list of pending bash-compat work see the GitHub issues labelled
+`divergence`; `docs/bash-divergences.md` holds the intentional ones.
 For the iteration history see `git log` + the long-running memory notes
 (`project_huck_iterations.md`); there is no per-version table.
 
@@ -325,6 +326,8 @@ The project is built one numbered iteration at a time
 (`v1`, `v2`, …, `v269` as of this writing). `CLAUDE.md` holds the authoritative
 version of this loop; the cadence is:
 
+0. **Take an issue.** Review the open GitHub issues labelled `divergence`
+   and take (or open) the one this iteration addresses; the PR will close it.
 1. **Brainstorm** the next feature via the `superpowers:brainstorming`
    skill. Produces a design doc at
    `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md`.
@@ -334,13 +337,16 @@ version of this loop; the cadence is:
 3. **Implement** via `superpowers:subagent-driven-development`: one
    subagent per task, spec-compliance review + code-quality review
    between tasks, fix-up loops as needed.
-4. **Merge** the iteration branch (`vNN-<topic>`) to main via
-   `--no-ff` after user confirmation; push to origin.
-5. **Update docs**: `docs/bash-divergences.md` is a *current-divergences-only*
-   doc — DELETE the resolved `M-*` / `L-*` entry (resolved history lives in git,
-   not the doc), and add a new `[deferred]` entry for any follow-on gap
-   discovered. (There is no `[fixed vNN]` change-log and no README iteration
-   table any more.)
+4. **Open a pull request** from the iteration branch (`vNN-<topic>`) targeting
+   main, body referencing the issue via `Closes #N`; push the branch to origin
+   and hand the PR to the user to review and merge. Do NOT self-merge to main.
+5. **Update docs**: the merged PR auto-closes its `divergence` issue via
+   `Closes #N` — no doc edit is needed unless the resolved item was
+   *intentional* (then also remove it from `docs/bash-divergences.md`, which is
+   now the intentional-only mirror of the `by-design` issues). Open a new
+   `divergence` issue for any follow-on gap discovered; a NEW intentional
+   divergence gets added to `docs/bash-divergences.md` + an open+closed
+   `by-design` issue.
 6. **Update memory**: edit the long-running notes under
    `/home/john/.claude/projects/-home-john-projects-huck/memory/`
    (`project_huck_iterations.md` + the `MEMORY.md` index) to capture the new
@@ -368,9 +374,11 @@ remove it.
 
 ## Pointers for new sessions
 
-- **Pending bash-compat work**: see `docs/bash-divergences.md`. Search
-  for `[deferred]` to find every open M-/B-/L-/I- entry. Severity tag
-  (high/medium/low) on each.
+- **Pending bash-compat work**: the open GitHub issues labelled `divergence`
+  (`gh issue list --label divergence --state open`). Filter by `bug` /
+  `enhancement` and `sev:high` / `sev:medium` / `sev:low`. Intentional,
+  kept-by-design divergences are the closed `by-design` issues, mirrored in
+  `docs/bash-divergences.md`.
 - **Past iteration design notes**: `docs/superpowers/specs/` and
   `docs/superpowers/plans/` have the full per-iteration paper trail.
   Search for the M-* / feature name.
