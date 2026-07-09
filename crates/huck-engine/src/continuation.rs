@@ -53,7 +53,7 @@ pub fn classify(buffer: &str, extglob: bool) -> Completeness {
         ..Default::default()
     };
     let empty = std::collections::HashMap::new();
-    let mut lx = lexer::Lexer::new_live_atoms(buffer, &empty, opts);
+    let mut lx = lexer::Lexer::new(buffer, &empty, opts);
     let parsed = parser::parse_sequence(&mut lx);
 
     // Lex-level incompleteness short-circuits everything else, mirroring the old

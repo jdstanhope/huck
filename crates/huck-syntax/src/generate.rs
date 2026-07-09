@@ -903,7 +903,7 @@ mod tests {
     use super::*;
     fn live_parse(src: &str) -> crate::command::Sequence {
         use crate::{lexer, parser};
-        parser::parse_sequence(&mut lexer::Lexer::new_live_atoms(
+        parser::parse_sequence(&mut lexer::Lexer::new(
             src,
             &Default::default(),
             lexer::LexerOptions::default(),

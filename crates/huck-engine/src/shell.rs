@@ -433,7 +433,7 @@ pub fn process_line_in_sinks(
     } else {
         &empty
     };
-    let mut lx = lexer::Lexer::new_live_atoms(line, aliases, opts);
+    let mut lx = lexer::Lexer::new(line, aliases, opts);
     // `set +o braceexpand` / `set +B` disables `{a,b}` brace expansion.
     lx.set_brace_expand(shell.shell_options.braceexpand);
     match parser::parse_sequence(&mut lx) {

@@ -1252,7 +1252,7 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
-    fn new(input: &'a str, opts: LexerOptions, brace_expand: bool) -> Self {
+    fn new_scanner(input: &'a str, opts: LexerOptions, brace_expand: bool) -> Self {
         Lexer {
             cursor: CharCursor::new(input),
             opts,
@@ -1341,7 +1341,7 @@ impl<'a> Lexer<'a> {
 
     /// Set the brace-expansion flag (`set +o braceexpand` / `set +B` clears it).
     /// Must be called before the first token is pulled — the mode stack captures
-    /// this value when a mode is pushed. The default (`new_live`) is `true`.
+    /// this value when a mode is pushed. The default (`new`) is `true`.
     pub fn set_brace_expand(&mut self, on: bool) {
         self.brace_expand = on;
     }
@@ -5982,7 +5982,7 @@ impl<'a> Lexer<'a> {
         self.cursor.offset()
     }
 
-    /// Set the starting line number for span generation. Call after `new_live`
+    /// Set the starting line number for span generation. Call after `new`
     /// when the input slice starts mid-file (`start > 0`) so that token spans
     /// carry file-absolute line numbers and `$LINENO` reflects the true file
     /// line rather than a chunk-relative one.
@@ -6123,25 +6123,17 @@ impl<'a> Lexer<'a> {
         e
     }
 
-    /// Build a live lexer for the REPL: the lexer scans `input` incrementally
-    /// and expands registered aliases at command position.
-    pub fn new_live(
+    /// Build a lexer over `input`: it scans incrementally and expands the
+    /// registered `aliases` at command position. This is the entry point for
+    /// turning source into tokens — pair it with `parser::parse_sequence`.
+    pub fn new(
         input: &'a str,
         aliases: &std::collections::HashMap<String, String>,
         opts: LexerOptions,
     ) -> Lexer<'a> {
-        let mut lx = Lexer::new(input, opts, true);
+        let mut lx = Lexer::new_scanner(input, opts, true);
         lx.aliases = aliases.clone();
         lx
-    }
-
-    /// v247: a live lexer whose `Mode::Command` emits atoms (dormant atom path).
-    pub fn new_live_atoms(
-        input: &'a str,
-        aliases: &std::collections::HashMap<String, String>,
-        opts: LexerOptions,
-    ) -> Lexer<'a> {
-        Lexer::new_live(input, aliases, opts)
     }
 }
 
@@ -7237,7 +7229,7 @@ mod tests {
     #[test]
     fn begin_assignment_value_sets_value_mode_and_tilde() {
         let empty = std::collections::HashMap::new();
-        let mut lx = Lexer::new_live_atoms("x", &empty, LexerOptions::default());
+        let mut lx = Lexer::new("x", &empty, LexerOptions::default());
         lx.begin_assignment_value(false);
         assert!(lx.in_assignment_value);
         assert!(
@@ -7379,7 +7371,7 @@ mod tests {
     // ---- v238: direct next_token (incremental pull) API ----
 
     fn drain(input: &str) -> Vec<Token> {
-        let mut lx = Lexer::new(input, LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner(input, LexerOptions::default(), true);
         let mut v = Vec::new();
         while let Some(t) = lx.next_token().expect("lex") {
             v.push(t);
@@ -7406,7 +7398,7 @@ mod tests {
 
     #[test]
     fn mode_stack_push_pop_current() {
-        let mut lx = Lexer::new("echo hi", LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner("echo hi", LexerOptions::default(), true);
         assert_eq!(lx.current_mode(), Mode::Command);
         lx.push_mode(Mode::Arith {
             paren_depth: 0,
@@ -7461,7 +7453,7 @@ mod tests {
         // Drive Mode::Arith with for_header=true over a for-header body (no `((`
         // prefix — body_started=true starts at the body loop). Top-level `;`
         // must emit ArithSemi; a `;` nested in `()` stays literal.
-        let mut lx = Lexer::new_live_atoms(
+        let mut lx = Lexer::new(
             "i=0;i<3;i++))",
             &Default::default(),
             LexerOptions::default(),
@@ -7507,8 +7499,7 @@ mod tests {
         );
 
         // Nested `;` (depth>0) stays literal — one Lit, no ArithSemi.
-        let mut lx2 =
-            Lexer::new_live_atoms("(a;b)))", &Default::default(), LexerOptions::default());
+        let mut lx2 = Lexer::new("(a;b)))", &Default::default(), LexerOptions::default());
         lx2.push_mode(Mode::Arith {
             paren_depth: 0,
             in_squote: false,
@@ -7544,8 +7535,7 @@ mod tests {
     fn arith_bracket_mode_scans_legacy_arith() {
         // A Mode::Arith{delim:Bracket} body: `$[a[0]+1]` → LegacyArithOpen, the
         // body Lit "a[0]+1" (inner [0] bracket-nested), then ArithClose.
-        let mut lx =
-            Lexer::new_live_atoms("$[a[0]+1]", &Default::default(), LexerOptions::default());
+        let mut lx = Lexer::new("$[a[0]+1]", &Default::default(), LexerOptions::default());
         lx.push_mode(Mode::Arith {
             paren_depth: 0,
             in_squote: false,
@@ -7610,7 +7600,7 @@ mod tests {
         // incremental design — this test fails loudly in that case.
         let words: Vec<String> = (0..100).map(|i| format!("w{i}")).collect();
         let src = words.join(" ");
-        let mut lx = Lexer::new(&src, LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner(&src, LexerOptions::default(), true);
         let first = lx.next_token().unwrap().unwrap();
         assert_eq!(word_text(&first).as_deref(), Some("w0"));
         let off = lx.cursor_offset();
@@ -7857,8 +7847,7 @@ mod tests {
         // $()-blind) as BacktickRawText atoms framed by BeginBacktick…EndBacktick.
         // Body source (between the outer backticks):  a\`b\\c
         //   (an escaped backtick + an escaped backslash are raw body content).
-        let mut lx =
-            Lexer::new_live_atoms("`a\\`b\\\\c`", &Default::default(), LexerOptions::default());
+        let mut lx = Lexer::new("`a\\`b\\\\c`", &Default::default(), LexerOptions::default());
         lx.push_mode(Mode::BacktickRaw);
         let mut kinds: Vec<String> = Vec::new();
         loop {
@@ -7884,7 +7873,7 @@ mod tests {
         assert_eq!(kinds.last().unwrap(), "END");
 
         // Quote-blind: a `'`/`"`/`(`/`#` inside the body is ordinary run text.
-        let mut lx2 = Lexer::new_live_atoms(
+        let mut lx2 = Lexer::new(
             "`echo '(' \"#\"`",
             &Default::default(),
             LexerOptions::default(),
@@ -7902,7 +7891,7 @@ mod tests {
         assert_eq!(body, "echo '(' \"#\"");
 
         // A trailing lone `\` at EOF is emitted raw, then EOF → finish (no close).
-        let mut lx3 = Lexer::new_live_atoms("`ab\\", &Default::default(), LexerOptions::default());
+        let mut lx3 = Lexer::new("`ab\\", &Default::default(), LexerOptions::default());
         lx3.push_mode(Mode::BacktickRaw);
         let mut body3 = String::new();
         let mut saw_end = false;
@@ -7942,7 +7931,7 @@ mod tests {
     /// Drive `Mode::ParamExpansion` directly and collect all head atoms through
     /// (and including) `ParamClose`.
     fn head_atoms(s: &str) -> Vec<TokenKind> {
-        let mut lx = Lexer::new(s, LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner(s, LexerOptions::default(), true);
         lx.push_mode(Mode::ParamExpansion {
             seen_name: false,
             indirect: false,
@@ -7962,7 +7951,7 @@ mod tests {
     /// Like `head_atoms` but stops after the first `ParamOp` is emitted
     /// (operand is a different mode, so we stop at the operator boundary).
     fn head_atoms_until_op(s: &str) -> Vec<TokenKind> {
-        let mut lx = Lexer::new(s, LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner(s, LexerOptions::default(), true);
         lx.push_mode(Mode::ParamExpansion {
             seen_name: false,
             indirect: false,
@@ -8046,7 +8035,7 @@ mod tests {
     #[test]
     fn head_subscript() {
         // ${a[...] emits ParamOpen, ParamName(a), LBracket then yields to subscript mode
-        let mut lx = Lexer::new("${a[1]}", LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner("${a[1]}", LexerOptions::default(), true);
         lx.push_mode(Mode::ParamExpansion {
             seen_name: false,
             indirect: false,
@@ -8078,7 +8067,7 @@ mod tests {
         // Then simulate the parser entering a nested ${b} by pushing a fresh
         // inner frame, pull its ParamOpen + ParamName("b"), then pop it.
         // The outer frame's seen_name must still be true afterwards.
-        let mut lx = Lexer::new("${a${b}}", LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner("${a${b}}", LexerOptions::default(), true);
         lx.push_mode(Mode::ParamExpansion {
             seen_name: false,
             indirect: false,
@@ -8144,7 +8133,7 @@ mod tests {
     /// `RBracket`, or `ParamSep` (a separator also ends the immediate operand
     /// segment — the test inputs may not include a trailing `}` after the sep).
     fn operand_atoms(s: &str, mode: Mode) -> Vec<TokenKind> {
-        let mut lx = Lexer::new(s, LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner(s, LexerOptions::default(), true);
         lx.push_mode(mode);
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
@@ -8332,7 +8321,7 @@ mod tests {
         // observed right after that signal was pulled). Stops at the first opener
         // signal (parser would push the sub-mode there).
         fn signal_and_quoted(s: &str) -> (TokenKind, bool) {
-            let mut lx = Lexer::new(s, LexerOptions::default(), true);
+            let mut lx = Lexer::new_scanner(s, LexerOptions::default(), true);
             lx.push_mode(Mode::ParamWordOperand {
                 in_dquote: false,
                 enclosing_dquote: false,
@@ -8396,7 +8385,7 @@ mod tests {
     /// `ArithOpen`/`ParamOpen`) exactly like `operand_atoms`, so a raw drive
     /// with no parser mode-push cannot spin on the same zero-width opener.
     fn command_atoms_of(s: &str) -> Vec<TokenKind> {
-        let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions::default());
+        let mut lx = Lexer::new(s, &Default::default(), LexerOptions::default());
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
             let stop = matches!(
@@ -8689,7 +8678,7 @@ mod tests {
     fn t6_atoms_extglob_open_signal() {
         // `@(a|b)` with extglob on → a zero-width ExtglobOpen signal (the parser
         // assembles the group); the `(` is NOT consumed.
-        let mut lx = Lexer::new_live_atoms(
+        let mut lx = Lexer::new(
             "@(a|b)",
             &Default::default(),
             LexerOptions {
@@ -8804,7 +8793,7 @@ mod tests {
         // `"a${y}b"` — split into a quoted Lit for `a`, then ParamOpen (NOT
         // DeferredExpansion).  The parser would push ParamExpansion on ParamOpen;
         // this test confirms the lexer emits the correct flat tokens.
-        let mut lx = Lexer::new("\"a${y}b\"}", LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner("\"a${y}b\"}", LexerOptions::default(), true);
         lx.push_mode(Mode::ParamWordOperand {
             in_dquote: false,
             enclosing_dquote: false,
@@ -8825,7 +8814,7 @@ mod tests {
     #[test]
     fn operand_dquote_var_inside() {
         // `"$a"` — a DollarName token, not a DeferredExpansion.
-        let mut lx = Lexer::new("\"$a\"}", LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner("\"$a\"}", LexerOptions::default(), true);
         lx.push_mode(Mode::ParamWordOperand {
             in_dquote: false,
             enclosing_dquote: false,
@@ -8878,7 +8867,7 @@ mod array_parse_tests {
         // drain past the `"` would re-emit the opener forever — that is not how
         // the lexer is consumed in production. (See bad_alias_body_surfaces_on_drain.)
         let empty = std::collections::HashMap::new();
-        let mut lx = Lexer::new_live_atoms("echo \"unterminated", &empty, LexerOptions::default());
+        let mut lx = Lexer::new("echo \"unterminated", &empty, LexerOptions::default());
         let r = crate::parser::parse_sequence(&mut lx);
         assert!(
             matches!(r, Err(crate::command::ParseError::Lex(_))),
@@ -8892,7 +8881,7 @@ mod array_parse_tests {
     // re-lexed inline by the live cursor), not a history splice of pre-tokenized
     // Word tokens. The old `lx_with_alias` replay helper (`from_tokens`) never
     // scans, so it cannot drive expansion; these tests use the live atom path
-    // (`new_live_atoms`) — the production front-end.
+    // (`new`) — the production front-end.
 
     /// Build a LIVE atom lexer with `pairs` registered as aliases.
     fn lx_atoms_with_alias(input: &'static str, pairs: &[(&str, &str)]) -> Lexer<'static> {
@@ -8900,7 +8889,7 @@ mod array_parse_tests {
         for (k, v) in pairs {
             m.insert(k.to_string(), v.to_string());
         }
-        Lexer::new_live_atoms(input, &m, LexerOptions::default())
+        Lexer::new(input, &m, LexerOptions::default())
     }
 
     /// Literal text of a command-word atom (`Lit`/`QuoteRun`), else `None`.
@@ -9034,7 +9023,7 @@ mod array_parse_tests {
         // lexer is ever consumed in production.
         let mut m = std::collections::HashMap::new();
         m.insert("x".to_string(), "echo \"".to_string()); // unterminated quote in body
-        let mut lx = Lexer::new_live_atoms("x", &m, LexerOptions::default());
+        let mut lx = Lexer::new("x", &m, LexerOptions::default());
         let r = crate::parser::parse_sequence(&mut lx);
         assert!(
             matches!(r, Err(crate::command::ParseError::Lex(_))),
@@ -9048,7 +9037,7 @@ mod array_parse_tests {
 
     #[test]
     fn rewind_reproduces_tokens_same_mode() {
-        let mut lx = Lexer::new("echo one two; echo three", LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner("echo one two; echo three", LexerOptions::default(), true);
         let m = lx.mark();
         let first: Vec<Token> = (0..4).map(|_| lx.next_token().unwrap().unwrap()).collect();
         lx.rewind(&m);
@@ -9063,7 +9052,7 @@ mod array_parse_tests {
 
     #[test]
     fn rewind_across_buffered_lookahead() {
-        let mut lx = Lexer::new("alpha beta gamma", LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner("alpha beta gamma", LexerOptions::default(), true);
         // Buffer history[0] without consuming it (pos stays 0) so mark() resumes
         // from the buffered token's span, not the advanced cursor.
         lx.fill_to(0).unwrap();
@@ -9082,7 +9071,7 @@ mod array_parse_tests {
 
     #[test]
     fn rewind_restores_line_and_column() {
-        let mut lx = Lexer::new("a\nbb\nccc", LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner("a\nbb\nccc", LexerOptions::default(), true);
         let _ = lx.next_token().unwrap().unwrap(); // Word "a" (line 1)
         let _ = lx.next_token().unwrap().unwrap(); // Newline (line 1)
         let m = lx.mark(); // at start of "bb" on line 2
@@ -9098,7 +9087,7 @@ mod array_parse_tests {
 
     #[test]
     fn rewind_restores_mode_stack() {
-        let mut lx = Lexer::new("x", LexerOptions::default(), true);
+        let mut lx = Lexer::new_scanner("x", LexerOptions::default(), true);
         lx.push_mode(Mode::Arith {
             paren_depth: 0,
             in_squote: false,
@@ -9155,7 +9144,7 @@ mod array_parse_tests {
         // signal: scan_step re-emits it without advancing the cursor. The guard must
         // surface Err(NoProgress) within a bounded number of pulls, not loop/OOM.
         let empty = std::collections::HashMap::new();
-        let mut lx = Lexer::new_live_atoms("$((", &empty, LexerOptions::default());
+        let mut lx = Lexer::new("$((", &empty, LexerOptions::default());
         let mut err = None;
         for _ in 0..(SCAN_STALL_CAP as usize + 100) {
             match lx.next() {
@@ -9183,7 +9172,7 @@ mod array_parse_tests {
             "$(( $(( 1 + 1 )) + 1 ))",
         ] {
             let empty = std::collections::HashMap::new();
-            let mut lx = Lexer::new_live_atoms(src, &empty, LexerOptions::default());
+            let mut lx = Lexer::new(src, &empty, LexerOptions::default());
             assert!(
                 crate::parser::parse_sequence(&mut lx).is_ok(),
                 "false NoProgress on {src:?}"
@@ -9206,7 +9195,7 @@ mod array_parse_tests {
             "(cat <<EOF)\nhi\nEOF\n",
         ];
         for src in cases {
-            let mut lx = Lexer::new_live_atoms(src, &empty, LexerOptions::default());
+            let mut lx = Lexer::new(src, &empty, LexerOptions::default());
             assert!(
                 crate::parser::parse_sequence(&mut lx).is_ok(),
                 "expected clean parse for {src:?}",
@@ -9243,7 +9232,7 @@ mod array_parse_tests {
         let body = "a ".repeat(SCAN_STALL_CAP as usize + 500);
         let mut aliases = std::collections::HashMap::new();
         aliases.insert("x".to_string(), format!("echo {body}"));
-        let mut lx = Lexer::new_live_atoms("x", &aliases, LexerOptions::default());
+        let mut lx = Lexer::new("x", &aliases, LexerOptions::default());
         assert!(crate::parser::parse_sequence(&mut lx).is_ok());
     }
 
@@ -9251,7 +9240,7 @@ mod array_parse_tests {
     fn maybe_prune_history_drops_consumed_prefix() {
         let empty = std::collections::HashMap::new();
         let src = "a ".repeat(HISTORY_PRUNE_THRESHOLD + 50); // many simple words + blanks
-        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        let mut lx = Lexer::new(&src, &empty, LexerOptions::default());
         for _ in 0..(HISTORY_PRUNE_THRESHOLD + 1) {
             let _ = lx.next().unwrap();
         }
@@ -9270,7 +9259,7 @@ mod array_parse_tests {
     #[test]
     fn maybe_prune_history_noop_below_threshold() {
         let empty = std::collections::HashMap::new();
-        let mut lx = Lexer::new_live_atoms("echo a b c", &empty, LexerOptions::default());
+        let mut lx = Lexer::new("echo a b c", &empty, LexerOptions::default());
         let _ = lx.next().unwrap();
         let _ = lx.next().unwrap();
         let pos = lx.pos;

@@ -19,7 +19,7 @@
 //! use huck_syntax::lexer::{Lexer, LexerOptions};
 //!
 //! let src = "echo hello";
-//! let mut lx = Lexer::new_live_atoms(src, &Default::default(), LexerOptions::default());
+//! let mut lx = Lexer::new(src, &Default::default(), LexerOptions::default());
 //! let seq = parse_sequence(&mut lx).expect("parse").expect("non-empty");
 //! // The Sequence has a first Command and no trailing commands.
 //! assert!(seq.rest.is_empty());

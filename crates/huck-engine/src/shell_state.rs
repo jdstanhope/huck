@@ -954,7 +954,7 @@ fn parse_imported_function(name: &str, value: &str) -> Option<Box<crate::command
         return None;
     }
     let src = format!("{name} {value}");
-    let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+    let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
         &src,
         &Default::default(),
         crate::lexer::LexerOptions::default(),
@@ -3411,7 +3411,7 @@ mod tests {
 
     #[cfg(test)]
     fn test_fn_body() -> Box<crate::command::Command> {
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
             "f(){ echo hi; }",
             &Default::default(),
             crate::lexer::LexerOptions::default(),
