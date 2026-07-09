@@ -72,6 +72,11 @@ Run the standard iteration loop without being asked:
   The "(1M context)" parenthetical is canonical; do not remove it. (Update
   the model version to match whichever Claude model is doing the work; was
   4.7 through v136, 4.8 from v137.)
+- **Formatting**: run `cargo fmt --all` before committing — CI enforces
+  `cargo fmt --all --check`, so an unformatted tree fails the build.
+- **CI**: `.github/workflows/ci.yml` runs fmt-check + `cargo build`/`cargo test`
+  (`--workspace --locked`) on every push and every PR to `main`, on
+  `ubuntu-24.04` (bash 5.2.21, huck's compat target).
 - **Bash-diff harnesses** under `tests/scripts/*_diff_check.sh` run
   the same fragments through bash and huck and assert byte-identical
   output. Adding a `<feature>_diff_check.sh` is the gold standard

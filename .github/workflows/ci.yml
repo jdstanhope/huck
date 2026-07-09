@@ -1,0 +1,51 @@
+name: CI
+
+# Build + test on every push to the remote (any branch) and on every pull
+# request targeting main. A merge to main is itself a push to main, so the
+# post-merge build/test is covered by the `push` trigger below.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+
+# Cancel an in-progress run when a newer commit is pushed to the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # UTF-8 locale so the Unicode-sensitive expansion/case tests behave.
+  LANG: C.UTF-8
+
+jobs:
+  build-and-test:
+    name: build & test
+    # Pin 24.04: it ships bash 5.2.21, huck's exact compatibility target, so the
+    # bash-differential integration tests compare against the right bash.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show bash version (compat target is 5.2.21)
+        run: bash --version | head -1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Formatting (cargo fmt --check)
+        run: cargo fmt --all --check
+
+      - name: Build (workspace)
+        run: cargo build --workspace --locked --verbose
+
+      - name: Test (workspace)
+        run: cargo test --workspace --locked --verbose
