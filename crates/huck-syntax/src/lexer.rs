@@ -715,12 +715,12 @@ pub enum TokenKind {
     ParamNameDecoded(String),
     /// v264: a deferred bad-substitution detected by the head scanner (a `$"…"`
     /// or bare-quote name, a decoded name in the wrong quote context, an invalid
-    /// decoded identifier, or an unrecognised post-name modifier char). Carries
-    /// the full `${…}` verbatim source so the parser can build
+    /// decoded identifier, or an unrecognised post-name modifier char). A
+    /// payload-free marker: the lexer does NOT forward-scan the rest of the body.
+    /// The PARSER drives the tail to the matching `}` via the operand machinery
+    /// and assembles the verbatim `${…}` raw (`source_span`) for
     /// `ParamModifier::BadSubst { raw }` (mirrors the oracle's `recover_bad_subst`).
-    ParamBadSubst {
-        raw: String,
-    },
+    ParamBadSubst,
     /// v264: the `*}` / `@}` tail of a `${!prefix*}` / `${!prefix@}` prefix-name
     /// expansion (both the sigil and the closing `}` are consumed). `at` is true
     /// for the `@` form. Mirrors the oracle's `ParamModifier::PrefixNames { at }`.
@@ -1307,15 +1307,11 @@ impl<'a> Lexer<'a> {
     /// Verbatim source of a `${…}` from its `$` (`start_off`) through its `}`
     /// (`close_off`), inclusive — used by the parser to reconstruct a
     /// bad-substitution's raw without forward-scanning.
-    // wired up in the parser in the next task (#107)
-    #[allow(dead_code)]
     pub(crate) fn source_span(&self, start_off: usize, close_off: usize) -> &str {
         self.cursor.slice_inclusive(start_off, close_off)
     }
 
     /// Byte offset of the leading `$` of the innermost `${` currently open.
-    // wired up in the parser in the next task (#107)
-    #[allow(dead_code)]
     pub(crate) fn param_start_off(&self) -> usize {
         match self.modes.iter().rev().find_map(|m| match m {
             Mode::ParamExpansion { start_off, .. } => Some(*start_off),
@@ -1776,12 +1772,15 @@ impl<'a> Lexer<'a> {
             })
         );
 
-        // Shared helper: emit a deferred bad-substitution. Consumes the rest of
-        // the `${…}` body through the matching `}` (depth/quote/`$'…'`-aware, via
-        // `scan_braced_operand`), reconstructs the verbatim `${…}` raw from the
-        // recorded `start_off`, marks the frame `seen_name` (so the head mode
-        // terminates), and emits `ParamBadSubst { raw }`. Mirrors the oracle's
-        // `recover_bad_subst`. Usable from both Phase 1 (name) and Phase 2 (op).
+        // Shared helper: emit a deferred bad-substitution MARKER at the offending
+        // char. The lexer does NOT forward-scan the rest of the body: it only
+        // marks the frame `seen_name` (so the head mode won't re-enter and
+        // re-detect before the parser switches to the operand tail) and pushes
+        // the payload-free `ParamBadSubst`. The PARSER then drives the rest of
+        // the body to the matching `}` (via the operand machinery, with correct
+        // nesting/quote matching) and assembles the verbatim `${…}` raw from the
+        // recorded `start_off` (`source_span`). Usable from both Phase 1 (name)
+        // and Phase 2 (op). Mirrors the oracle's `recover_bad_subst`.
         macro_rules! emit_bad_subst {
             () => {{
                 let sp = Span::new(
@@ -1789,17 +1788,10 @@ impl<'a> Lexer<'a> {
                     self.cursor.line(),
                     self.cursor.column(),
                 );
-                let start_off = match self.modes.last() {
-                    Some(Mode::ParamExpansion { start_off, .. }) => *start_off,
-                    _ => 0,
-                };
-                let _ = scan_braced_operand(&mut self.cursor)?;
-                let raw = self.cursor.slice_from(start_off).to_string();
                 if let Some(Mode::ParamExpansion { seen_name, .. }) = self.modes.last_mut() {
                     *seen_name = true;
                 }
-                self.history
-                    .push(Token::new(TokenKind::ParamBadSubst { raw }, sp));
+                self.history.push(Token::new(TokenKind::ParamBadSubst, sp));
                 return Ok(Step::Produced);
             }};
         }
@@ -6608,6 +6600,10 @@ fn extended_utf8_bytes(v: u32) -> Vec<u8> {
 /// through its matching closing `quote`, verbatim. Single quotes take every
 /// char literally; double quotes honor `\` so `\"` does not close the span.
 /// Running out of input returns `Err(err)`.
+// v279 (#107): dead once the parser stopped forward-scanning bad-subst bodies;
+// kept (test-covered) pending the Task-4 deletion of the whole verbatim-scanner
+// cluster (scan_braced_operand + its helpers).
+#[allow(dead_code)]
 fn push_quoted_span(
     chars: &mut CharCursor<'_>,
     quote: char,
@@ -6655,6 +6651,9 @@ fn push_quoted_span(
 /// appended to `out`. Running out of input unterminated returns `Err(unterminated)`.
 /// The single source of truth for `$()` scanning (see `scan_paren_substitution`,
 /// `consume_paren_cmdsub_verbatim`, `split_modifier_operand`).
+// v279 (#107): dead once the parser stopped forward-scanning bad-subst bodies;
+// kept (test-covered) pending the Task-4 deletion of the verbatim-scanner cluster.
+#[allow(dead_code)]
 fn scan_cmdsub_body(
     chars: &mut CharCursor<'_>,
     out: &mut String,
@@ -6824,6 +6823,9 @@ fn scan_cmdsub_body(
     }
 }
 
+// v279 (#107): dead once the parser stopped forward-scanning bad-subst bodies;
+// kept (test-covered) pending the Task-4 deletion of the verbatim-scanner cluster.
+#[allow(dead_code)]
 fn consume_paren_cmdsub_verbatim(
     chars: &mut CharCursor<'_>,
     out: &mut String,
@@ -6843,6 +6845,9 @@ fn consume_paren_cmdsub_verbatim(
 /// `out`. Backticks are quote-naive and do not nest. EOF → `Err(unterminated)`.
 /// The single source of truth for backtick boundary scanning (see
 /// `scan_backtick_substitution`, `consume_backtick_verbatim`).
+// v279 (#107): dead once the parser stopped forward-scanning bad-subst bodies;
+// kept (test-covered) pending the Task-4 deletion of the verbatim-scanner cluster.
+#[allow(dead_code)]
 fn scan_backtick_body(
     chars: &mut CharCursor<'_>,
     out: &mut String,
@@ -6867,6 +6872,9 @@ fn scan_backtick_body(
 /// Appends a backtick command substitution to `out` verbatim, the opening
 /// backtick having already been pushed by the caller: the kernel collects the
 /// raw body (excluding the closing backtick); this re-adds the closing backtick.
+// v279 (#107): dead once the parser stopped forward-scanning bad-subst bodies;
+// kept (test-covered) pending the Task-4 deletion of the verbatim-scanner cluster.
+#[allow(dead_code)]
 fn consume_backtick_verbatim(chars: &mut CharCursor<'_>, out: &mut String) -> Result<(), LexError> {
     scan_backtick_body(chars, out, LexError::UnterminatedBrace)?;
     out.push('`');
@@ -6896,6 +6904,10 @@ fn scan_raw_ansi_c_body(
     }
 }
 
+// v279 (#107): the last lexer forward-scanner. Dead now that the parser
+// assembles the bad-subst raw via `source_span`; kept (test-covered) pending its
+// Task-4 deletion together with the rest of the verbatim-scanner cluster.
+#[allow(dead_code)]
 fn scan_braced_operand(chars: &mut CharCursor<'_>) -> Result<String, LexError> {
     // Known limitation: a `${...}` nested *inside* a double-quoted span of
     // the operand (e.g. `${X:-"${Y}}"}`) is not depth-tracked — the inner

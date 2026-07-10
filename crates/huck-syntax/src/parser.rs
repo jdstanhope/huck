@@ -963,6 +963,47 @@ pub(crate) fn parse_param_expansion(
         }
     }
 
+    // Byte offset of the leading `$` of this `${…}`, captured once now that the
+    // frame's `start_off` is set. A bad-substitution arm (name-position or
+    // post-name) uses it with `source_span` to assemble the verbatim `${…}` raw
+    // AFTER the parser has driven the body's tail to the matching `}`.
+    let start_off = iter.param_start_off();
+
+    // Operand macros, hoisted above the name-dispatch match so BOTH the
+    // name-position and post-name `ParamBadSubst` arms (and the operator arm)
+    // can use them.
+    //
+    // Macro: push a mode, parse_word, pop mode. On error pops ParamExpansion too.
+    // NOTE: macros are scoped to this function.
+    macro_rules! word_in_mode {
+        ($mode:expr, $wquoted:expr) => {{
+            iter.push_mode($mode);
+            match parse_word(iter, $wquoted) {
+                Ok(w) => {
+                    iter.pop_mode();
+                    w
+                }
+                Err(e) => {
+                    iter.pop_mode(); // the operand mode
+                    iter.pop_mode(); // ParamExpansion
+                    return Err(e);
+                }
+            }
+        }};
+    }
+    // Macro: consume ParamClose; on failure pop ParamExpansion and return Err.
+    macro_rules! expect_close {
+        () => {
+            match iter.next_kind()? {
+                Some(TokenKind::ParamClose) => {}
+                _ => {
+                    iter.pop_mode(); // ParamExpansion
+                    return Err(ParseError::UnsupportedExpansion);
+                }
+            }
+        };
+    }
+
     // 2. Optional length prefix (`${#name}`) or indirect prefix (`${!name}`).
     let mut length_form = false;
     let mut indirect = false;
@@ -985,7 +1026,24 @@ pub(crate) fn parse_param_expansion(
             name_decoded = true;
             n
         }
-        Some(TokenKind::ParamBadSubst { raw }) => {
+        Some(TokenKind::ParamBadSubst) => {
+            // Name-position bad substitution. The lexer emitted only a marker
+            // (cursor left on the offending char); drive the rest of the body to
+            // the matching `}` via the operand machinery (correct nesting/quote
+            // matching), discard the resulting word, then assemble the verbatim
+            // `${…}` raw from `source_span`. If the body is unterminated,
+            // `word_in_mode!` itself returns the lexer's Unterminated* error
+            // (propagates as rc=2 — the intended behavior).
+            let _ = word_in_mode!(
+                Mode::ParamWordOperand {
+                    in_dquote: false,
+                    enclosing_dquote: quoted
+                },
+                quoted
+            );
+            let close_off = iter.peek_span()?.map(|s| s.offset).unwrap_or(start_off);
+            expect_close!();
+            let raw = iter.source_span(start_off, close_off).to_string();
             restore_dq!();
             iter.pop_mode();
             return Ok(WordPart::ParamExpansion {
@@ -1105,17 +1163,6 @@ pub(crate) fn parse_param_expansion(
                     quoted,
                     joined: true,
                 }
-            } else if name.is_empty() {
-                // `${}` — bad substitution at runtime.
-                WordPart::ParamExpansion {
-                    name: String::new(),
-                    modifier: ParamModifier::BadSubst {
-                        raw: "${}".to_string(),
-                    },
-                    quoted,
-                    subscript: None,
-                    indirect: false,
-                }
             } else if name_decoded {
                 // `${$'x1'}` / `${a$'b'}` — a `$'…'`-decoded name in bare form.
                 // The oracle promotes the plain `Var` to `ParamExpansion{None}`
@@ -1143,13 +1190,29 @@ pub(crate) fn parse_param_expansion(
         },
 
         // ── Post-name bad substitution (`${x!}`, `${V@}`, `${-3}`, `${x@Z}`).
-        Some(TokenKind::ParamBadSubst { raw }) => WordPart::ParamExpansion {
-            name: String::new(),
-            modifier: ParamModifier::BadSubst { raw },
-            quoted,
-            subscript: None,
-            indirect: false,
-        },
+        // The lexer emitted only a marker; drive the body's tail to the matching
+        // `}` via the operand machinery, discard the word, then assemble the
+        // verbatim `${…}` raw from `source_span`. The common cleanup at the end
+        // of the function runs `restore_dq!()` + `pop_mode()`.
+        Some(TokenKind::ParamBadSubst) => {
+            let _ = word_in_mode!(
+                Mode::ParamWordOperand {
+                    in_dquote: false,
+                    enclosing_dquote: quoted
+                },
+                quoted
+            );
+            let close_off = iter.peek_span()?.map(|s| s.offset).unwrap_or(start_off);
+            expect_close!();
+            let raw = iter.source_span(start_off, close_off).to_string();
+            WordPart::ParamExpansion {
+                name: String::new(),
+                modifier: ParamModifier::BadSubst { raw },
+                quoted,
+                subscript: None,
+                indirect: false,
+            }
+        }
 
         // ── Operator: pattern removal, substitute, case, transform, substring
         Some(TokenKind::ParamOp(op_kind)) => {
@@ -1166,36 +1229,6 @@ pub(crate) fn parse_param_expansion(
                     | ParamOpKind::Case(_, _)
             ) {
                 iter.set_in_dquote(m156_dq);
-            }
-            // Macro: push a mode, parse_word, pop mode. On error pops ParamExpansion too.
-            // NOTE: macros are scoped to this function.
-            macro_rules! word_in_mode {
-                ($mode:expr, $wquoted:expr) => {{
-                    iter.push_mode($mode);
-                    match parse_word(iter, $wquoted) {
-                        Ok(w) => {
-                            iter.pop_mode();
-                            w
-                        }
-                        Err(e) => {
-                            iter.pop_mode(); // the operand mode
-                            iter.pop_mode(); // ParamExpansion
-                            return Err(e);
-                        }
-                    }
-                }};
-            }
-            // Macro: consume ParamClose; on failure pop ParamExpansion and return Err.
-            macro_rules! expect_close {
-                () => {
-                    match iter.next_kind()? {
-                        Some(TokenKind::ParamClose) => {}
-                        _ => {
-                            iter.pop_mode(); // ParamExpansion
-                            return Err(ParseError::UnsupportedExpansion);
-                        }
-                    }
-                };
             }
 
             match op_kind {
