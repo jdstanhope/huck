@@ -223,6 +223,16 @@ impl<'a> CharCursor<'a> {
         &self.s[start..self.pos]
     }
 
+    /// Verbatim source `&s[start..=end]`. `end` is the byte offset of the last
+    /// char to include (the `}` of a `${…}`). Mirrors `slice_from`'s guard.
+    pub fn slice_inclusive(&self, start: usize, end: usize) -> &str {
+        debug_assert!(
+            self.injected.is_empty(),
+            "slice_inclusive must not straddle an injected alias body"
+        );
+        &self.s[start..=end]
+    }
+
     /// Reposition the cursor to a byte offset with explicit line/column, clearing
     /// any pending 1-char peek. Used by `Lexer::rewind` to re-lex from a checkpoint.
     /// v266: base-only — mark/rewind is not expected to straddle an injected alias
@@ -1292,6 +1302,28 @@ impl<'a> Lexer<'a> {
             .modes
             .last()
             .expect("mode stack is never empty (Command is the floor)")
+    }
+
+    /// Verbatim source of a `${…}` from its `$` (`start_off`) through its `}`
+    /// (`close_off`), inclusive — used by the parser to reconstruct a
+    /// bad-substitution's raw without forward-scanning.
+    // wired up in the parser in the next task (#107)
+    #[allow(dead_code)]
+    pub(crate) fn source_span(&self, start_off: usize, close_off: usize) -> &str {
+        self.cursor.slice_inclusive(start_off, close_off)
+    }
+
+    /// Byte offset of the leading `$` of the innermost `${` currently open.
+    // wired up in the parser in the next task (#107)
+    #[allow(dead_code)]
+    pub(crate) fn param_start_off(&self) -> usize {
+        match self.modes.iter().rev().find_map(|m| match m {
+            Mode::ParamExpansion { start_off, .. } => Some(*start_off),
+            _ => None,
+        }) {
+            Some(off) => off,
+            None => 0,
+        }
     }
 
     /// True when the top-of-stack mode is a `${…}` operand scanner currently
@@ -7237,6 +7269,38 @@ mod tests {
             "D2: tilde enabled for indexed value"
         );
         assert!(!lx.cmd_at_word_start);
+    }
+
+    #[test]
+    fn slice_inclusive_returns_inclusive_range() {
+        // "abc${d}ef": bytes $=3 {=4 d=5 }=6
+        let c = CharCursor::new("abc${d}ef");
+        assert_eq!(c.slice_inclusive(3, 6), "${d}");
+    }
+
+    #[test]
+    fn source_span_returns_inclusive_slice() {
+        // "abc${d}ef": bytes $=3 {=4 d=5 }=6
+        let lx = Lexer::new_scanner("abc${d}ef", LexerOptions::default(), true);
+        assert_eq!(lx.source_span(3, 6), "${d}");
+    }
+
+    #[test]
+    fn param_start_off_reads_innermost_frame_start_off() {
+        let mut lx = Lexer::new_scanner("${d}", LexerOptions::default(), true);
+        assert_eq!(lx.param_start_off(), 0, "no ParamExpansion frame yet");
+        lx.push_mode(Mode::ParamExpansion {
+            seen_name: false,
+            indirect: false,
+            start_off: 7,
+        });
+        assert_eq!(lx.param_start_off(), 7);
+        lx.push_mode(Mode::ParamExpansion {
+            seen_name: false,
+            indirect: false,
+            start_off: 12,
+        });
+        assert_eq!(lx.param_start_off(), 12, "innermost frame wins when nested");
     }
 
     #[test]
