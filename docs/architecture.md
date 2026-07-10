@@ -44,7 +44,7 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   `crates/huck-engine/src/stdin_pipe.rs` (CLOEXEC pipe + dup2(r, 0) save/restore
   guard). Sandbox knobs (v206) layer on top: `.cwd(path)` chdirs for the call
   (RAII via `cwd_scope.rs`, snapshotting OS cwd + shell `PWD`/`OLDPWD`);
-  `.restricted(true)` enables a bash `rbash`-subset policy (refuses
+  `.restricted()` enables a bash `rbash`-subset policy (refuses
   `cd`/`exec`/slash-bearing command names/slash-bearing `source` paths/
   absolute-or-`..`-redirect targets/assignment to SHELL/PATH/ENV/BASH_ENV/
   `set +r`) via `restricted.rs`; `.timeout(dur)` spawns a timer thread
