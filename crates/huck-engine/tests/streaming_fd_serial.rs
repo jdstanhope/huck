@@ -55,7 +55,7 @@ fn on_stderr_line_fires_per_line() {
     let mut out_lines: Vec<String> = Vec::new();
     let mut err_lines: Vec<String> = Vec::new();
     let mut e = Engine::new();
-    e.exec("echo hi; echo err >&2")
+    e.prepare("echo hi; echo err >&2")
         .on_stdout_line(|line| out_lines.push(line.to_string()))
         .on_stderr_line(|line| err_lines.push(line.to_string()))
         .capture();
@@ -68,7 +68,7 @@ fn on_stdout_line_merge_stderr_routes_through_stdout() {
     let mut out_lines: Vec<String> = Vec::new();
     let mut err_lines: Vec<String> = Vec::new();
     let mut e = Engine::new();
-    e.exec("echo a; echo b >&2")
+    e.prepare("echo a; echo b >&2")
         .merge_stderr()
         .on_stdout_line(|line| out_lines.push(line.to_string()))
         .on_stderr_line(|line| err_lines.push(line.to_string()))
@@ -83,7 +83,7 @@ fn on_stderr_line_builtin_redirect_to_err() {
     let mut lines: Vec<String> = Vec::new();
     let mut e = Engine::new();
     let out = e
-        .exec("echo hi >&2")
+        .prepare("echo hi >&2")
         .on_stderr_line(|line| lines.push(line.to_string()))
         .capture();
     assert_eq!(out.stderr, "hi\n");
@@ -95,7 +95,7 @@ fn on_stdout_line_builtin_redirect_2to1() {
     let mut lines: Vec<String> = Vec::new();
     let mut e = Engine::new();
     let _ = e
-        .exec("declare -p NOPE_NOT_DEFINED 2>&1")
+        .prepare("declare -p NOPE_NOT_DEFINED 2>&1")
         .on_stdout_line(|line| lines.push(line.to_string()))
         .capture();
     assert!(

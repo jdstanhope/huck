@@ -1,10 +1,10 @@
-//! `ExecBuilder` — per-call builder for [`Engine::exec`].
+//! `ExecBuilder` — per-call builder for [`Engine::prepare`].
 //!
 //! Holds the script source + optional stdin bytes + merge flag + sandbox knobs
 //! (cwd / restricted / timeout), and runs them through the engine's sink-aware
 //! path on `.run()` / `.capture()`.
 //!
-//! [`Engine::exec`]: crate::engine::Engine::exec
+//! [`Engine::prepare`]: crate::engine::Engine::prepare
 
 use std::cell::RefCell;
 use std::path::PathBuf;

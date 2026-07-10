@@ -20,8 +20,8 @@ fn main() {
 
     let mut e = Engine::new();
     let out = match mode.as_str() {
-        "bare" => e.exec(&fragment).capture(),
-        "restricted" => e.exec(&fragment).restricted(true).capture(),
+        "bare" => e.prepare(&fragment).capture(),
+        "restricted" => e.prepare(&fragment).restricted(true).capture(),
         m if m.starts_with("cwd:") => {
             let body = &m[4..];
             let (path, restricted) = if let Some(stripped) = body.strip_suffix(":r") {
@@ -29,7 +29,7 @@ fn main() {
             } else {
                 (PathBuf::from(body), false)
             };
-            let mut b = e.exec(&fragment).cwd(path);
+            let mut b = e.prepare(&fragment).cwd(path);
             if restricted {
                 b = b.restricted(true);
             }

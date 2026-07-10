@@ -15,9 +15,9 @@ fn main() {
 
     let mut e = Engine::new();
     let out = if mode == "merged" {
-        e.exec(&fragment).merge_stderr().capture()
+        e.prepare(&fragment).merge_stderr().capture()
     } else {
-        e.exec(&fragment).capture()
+        e.prepare(&fragment).capture()
     };
 
     let stdout = std::io::stdout();
