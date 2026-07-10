@@ -6596,41 +6596,6 @@ fn extended_utf8_bytes(v: u32) -> Vec<u8> {
     }
 }
 
-/// Appends a quoted span — the opening quote already pushed by the caller —
-/// through its matching closing `quote`, verbatim. Single quotes take every
-/// char literally; double quotes honor `\` so `\"` does not close the span.
-/// Running out of input returns `Err(err)`.
-// v279 (#107): dead once the parser stopped forward-scanning bad-subst bodies.
-// The Task-4 deletion removed its only two callers (the former
-// `scan_cmdsub_body`/`scan_braced_operand` verbatim-scanner cluster); this
-// function is now itself unreferenced. Left in place (not deleted here) per
-// the task-4 brief's "STOP and report" rule for newly-dead code — the
-// controller decides whether to remove it in a follow-up.
-#[allow(dead_code)]
-fn push_quoted_span(
-    chars: &mut CharCursor<'_>,
-    quote: char,
-    out: &mut String,
-    err: LexError,
-) -> Result<(), LexError> {
-    loop {
-        match chars.next() {
-            None => return Err(err),
-            Some(c) if c == quote => {
-                out.push(c);
-                return Ok(());
-            }
-            Some('\\') if quote == '"' => {
-                out.push('\\');
-                if let Some(c) = chars.next() {
-                    out.push(c);
-                }
-            }
-            Some(c) => out.push(c),
-        }
-    }
-}
-
 /// Collects a raw ANSI-C `$'…'` body (both `$` and opening `'` already consumed).
 /// Appends chars to `out` with `\`-escape pairs verbatim; does NOT push the
 /// closing `'`. Returns `Ok(())` on the first unescaped `'`; `Err(err)` on EOF.
