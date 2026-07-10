@@ -223,6 +223,16 @@ impl<'a> CharCursor<'a> {
         &self.s[start..self.pos]
     }
 
+    /// Verbatim source `&s[start..=end]`. `end` is the byte offset of the last
+    /// char to include (the `}` of a `${…}`). Mirrors `slice_from`'s guard.
+    pub fn slice_inclusive(&self, start: usize, end: usize) -> &str {
+        debug_assert!(
+            self.injected.is_empty(),
+            "slice_inclusive must not straddle an injected alias body"
+        );
+        &self.s[start..=end]
+    }
+
     /// Reposition the cursor to a byte offset with explicit line/column, clearing
     /// any pending 1-char peek. Used by `Lexer::rewind` to re-lex from a checkpoint.
     /// v266: base-only — mark/rewind is not expected to straddle an injected alias
@@ -705,12 +715,12 @@ pub enum TokenKind {
     ParamNameDecoded(String),
     /// v264: a deferred bad-substitution detected by the head scanner (a `$"…"`
     /// or bare-quote name, a decoded name in the wrong quote context, an invalid
-    /// decoded identifier, or an unrecognised post-name modifier char). Carries
-    /// the full `${…}` verbatim source so the parser can build
+    /// decoded identifier, or an unrecognised post-name modifier char). A
+    /// payload-free marker: the lexer does NOT forward-scan the rest of the body.
+    /// The PARSER drives the tail to the matching `}` via the operand machinery
+    /// and assembles the verbatim `${…}` raw (`source_span`) for
     /// `ParamModifier::BadSubst { raw }` (mirrors the oracle's `recover_bad_subst`).
-    ParamBadSubst {
-        raw: String,
-    },
+    ParamBadSubst,
     /// v264: the `*}` / `@}` tail of a `${!prefix*}` / `${!prefix@}` prefix-name
     /// expansion (both the sigil and the closing `}` are consumed). `at` is true
     /// for the `@` form. Mirrors the oracle's `ParamModifier::PrefixNames { at }`.
@@ -1294,6 +1304,24 @@ impl<'a> Lexer<'a> {
             .expect("mode stack is never empty (Command is the floor)")
     }
 
+    /// Verbatim source of a `${…}` from its `$` (`start_off`) through its `}`
+    /// (`close_off`), inclusive — used by the parser to reconstruct a
+    /// bad-substitution's raw without forward-scanning.
+    pub(crate) fn source_span(&self, start_off: usize, close_off: usize) -> &str {
+        self.cursor.slice_inclusive(start_off, close_off)
+    }
+
+    /// Byte offset of the leading `$` of the innermost `${` currently open.
+    pub(crate) fn param_start_off(&self) -> usize {
+        match self.modes.iter().rev().find_map(|m| match m {
+            Mode::ParamExpansion { start_off, .. } => Some(*start_off),
+            _ => None,
+        }) {
+            Some(off) => off,
+            None => 0,
+        }
+    }
+
     /// True when the top-of-stack mode is a `${…}` operand scanner currently
     /// INSIDE its inline `"…"` span (`in_dquote == true`). The parser queries
     /// this at the exact moment it dispatches an operand-position opener signal
@@ -1744,12 +1772,15 @@ impl<'a> Lexer<'a> {
             })
         );
 
-        // Shared helper: emit a deferred bad-substitution. Consumes the rest of
-        // the `${…}` body through the matching `}` (depth/quote/`$'…'`-aware, via
-        // `scan_braced_operand`), reconstructs the verbatim `${…}` raw from the
-        // recorded `start_off`, marks the frame `seen_name` (so the head mode
-        // terminates), and emits `ParamBadSubst { raw }`. Mirrors the oracle's
-        // `recover_bad_subst`. Usable from both Phase 1 (name) and Phase 2 (op).
+        // Shared helper: emit a deferred bad-substitution MARKER at the offending
+        // char. The lexer does NOT forward-scan the rest of the body: it only
+        // marks the frame `seen_name` (so the head mode won't re-enter and
+        // re-detect before the parser switches to the operand tail) and pushes
+        // the payload-free `ParamBadSubst`. The PARSER then drives the rest of
+        // the body to the matching `}` (via the operand machinery, with correct
+        // nesting/quote matching) and assembles the verbatim `${…}` raw from the
+        // recorded `start_off` (`source_span`). Usable from both Phase 1 (name)
+        // and Phase 2 (op). Mirrors the oracle's `recover_bad_subst`.
         macro_rules! emit_bad_subst {
             () => {{
                 let sp = Span::new(
@@ -1757,17 +1788,10 @@ impl<'a> Lexer<'a> {
                     self.cursor.line(),
                     self.cursor.column(),
                 );
-                let start_off = match self.modes.last() {
-                    Some(Mode::ParamExpansion { start_off, .. }) => *start_off,
-                    _ => 0,
-                };
-                let _ = scan_braced_operand(&mut self.cursor)?;
-                let raw = self.cursor.slice_from(start_off).to_string();
                 if let Some(Mode::ParamExpansion { seen_name, .. }) = self.modes.last_mut() {
                     *seen_name = true;
                 }
-                self.history
-                    .push(Token::new(TokenKind::ParamBadSubst { raw }, sp));
+                self.history.push(Token::new(TokenKind::ParamBadSubst, sp));
                 return Ok(Step::Produced);
             }};
         }
@@ -6572,275 +6596,6 @@ fn extended_utf8_bytes(v: u32) -> Vec<u8> {
     }
 }
 
-/// Appends a quoted span — the opening quote already pushed by the caller —
-/// through its matching closing `quote`, verbatim. Single quotes take every
-/// char literally; double quotes honor `\` so `\"` does not close the span.
-/// Running out of input returns `Err(err)`.
-fn push_quoted_span(
-    chars: &mut CharCursor<'_>,
-    quote: char,
-    out: &mut String,
-    err: LexError,
-) -> Result<(), LexError> {
-    loop {
-        match chars.next() {
-            None => return Err(err),
-            Some(c) if c == quote => {
-                out.push(c);
-                return Ok(());
-            }
-            Some('\\') if quote == '"' => {
-                out.push('\\');
-                if let Some(c) = chars.next() {
-                    out.push(c);
-                }
-            }
-            Some(c) => out.push(c),
-        }
-    }
-}
-
-/// Reads the inner text of a `${...}` operand. The opening `{` has already
-/// been consumed; this function consumes through the matching `}` at depth 0.
-/// Tracks brace-depth, plus `'...'` and `"..."` so a stray `}` inside a
-/// quoted span doesn't close the expansion. Returns the inner text (without
-/// the closing `}`).
-/// Consumes a `$(…)` command substitution body VERBATIM from `chars`, starting
-/// just after the opening `(` (which the caller has already appended to `out`),
-/// through the matching `)` (also appended). Any unquoted `(` raises the paren
-/// depth and any unquoted `)` lowers it, so nested `$(…)`, `$((…))`, and
-/// `$( (…) )` all balance; `'…'`/`"…"` spans are skipped (double-quote honors
-/// `\`) so a `)` or `}` inside them does not affect depth. Running out of input
-/// yields `Err(LexError::UnterminatedBrace)` (the same error `scan_braced_operand`
-/// raises for an unterminated operand). Mirrors `scan_paren_substitution`'s loop
-/// but appends text instead of parsing it.
-/// Scans a `$(…)` command-substitution body, the opening `$(` having already
-/// been consumed by the caller. Consumes through the matching `)` (which is
-/// consumed but NOT appended); any unquoted `(` raises the paren depth and any
-/// unquoted `)` lowers it, so nested `$(…)`, `$((…))`, and `$( (…) )` balance;
-/// `'…'`/`"…"` spans are skipped (double-quote honors `\`) and `\` escapes the
-/// next char — none affect depth. The body (excluding the closing `)`) is
-/// appended to `out`. Running out of input unterminated returns `Err(unterminated)`.
-/// The single source of truth for `$()` scanning (see `scan_paren_substitution`,
-/// `consume_paren_cmdsub_verbatim`, `split_modifier_operand`).
-fn scan_cmdsub_body(
-    chars: &mut CharCursor<'_>,
-    out: &mut String,
-    unterminated: LexError,
-) -> Result<(), LexError> {
-    let mut depth: usize = 0;
-    // `#` comment recognition (v183): a `#` at a word boundary starts a comment.
-    let mut at_boundary = true;
-    // v186: `case … esac` state so a BARE case-pattern `)` at paren-depth 0 is a
-    // pattern terminator, not the cmdsub close. `cmd_pos` = the next word begins
-    // at a COMMAND position (so a bare `case`/`esac` there is a keyword, but
-    // `echo case` / `grep case` are not). `word` accumulates the current BARE
-    // word (identifier chars); `word_bare` goes false once a quote/`$`/other char
-    // makes the word not a bare keyword. KNOWN LIMITATION (pathological, absent
-    // from real code): a `case`/`esac` literal in PATTERN position is mishandled —
-    // a pattern named `case`/`esac` (after `in` or `;;`) is mis-counted, and the
-    // empty case `$(case x in esac)` errors (huck doesn't track `in`, so the first
-    // pattern position isn't a command position). Also a `VAR=val case` prefix-
-    // assignment case. These match bash's own LEX_INCASE edges' rarity.
-    let mut case_depth: usize = 0;
-    let mut cmd_pos = true;
-    let mut word = String::new();
-    let mut word_bare = true;
-
-    // End the current word: recognise a bare `case`/`esac` keyword at command
-    // position; return whether it was a command-introducer keyword (for the
-    // space transition). Resets `word`/`word_bare`.
-    macro_rules! end_word {
-        () => {{
-            let introducer = word_bare
-                && matches!(
-                    word.as_str(),
-                    "if" | "then" | "elif" | "else" | "while" | "until" | "do"
-                );
-            if word_bare && cmd_pos {
-                if word == "case" {
-                    case_depth += 1;
-                } else if word == "esac" {
-                    case_depth = case_depth.saturating_sub(1);
-                }
-            }
-            word.clear();
-            word_bare = true;
-            introducer
-        }};
-    }
-
-    loop {
-        match chars.next() {
-            None => return Err(unterminated),
-            Some('#') if at_boundary => {
-                end_word!();
-                // Word-start comment to end-of-line: keep it VERBATIM in `out`
-                // (re-tokenized + stripped later) so its `)` is not counted.
-                out.push('#');
-                while let Some(&c) = chars.peek() {
-                    if c == '\n' {
-                        break;
-                    }
-                    out.push(c);
-                    chars.next();
-                }
-                // the trailing newline (next char) restores at_boundary + cmd_pos
-            }
-            Some(')') => {
-                // Finalize the pending word FIRST so e.g. `esac)` updates
-                // case_depth before we decide whether this `)` is the close.
-                end_word!();
-                if depth == 0 {
-                    if case_depth == 0 {
-                        return Ok(()); // the cmdsub close
-                    }
-                    // depth-0 `)` inside a `case` is a pattern terminator — keep
-                    // scanning; a clause body (commands) follows.
-                    out.push(')');
-                } else {
-                    depth -= 1;
-                    out.push(')');
-                }
-                at_boundary = true;
-                cmd_pos = true;
-            }
-            Some('(') => {
-                end_word!();
-                depth += 1;
-                out.push('(');
-                at_boundary = true;
-                cmd_pos = true;
-            }
-            Some('\\') => {
-                word_bare = false;
-                out.push('\\');
-                match chars.next() {
-                    Some(c) => out.push(c),
-                    None => return Err(unterminated),
-                }
-                at_boundary = false;
-            }
-            Some('\'') => {
-                word_bare = false;
-                out.push('\'');
-                push_quoted_span(chars, '\'', out, unterminated.clone())?;
-                at_boundary = false;
-            }
-            Some('"') => {
-                word_bare = false;
-                out.push('"');
-                loop {
-                    match chars.next() {
-                        Some('"') => {
-                            out.push('"');
-                            break;
-                        }
-                        Some('\\') => {
-                            out.push('\\');
-                            match chars.next() {
-                                Some(c) => out.push(c),
-                                None => return Err(unterminated),
-                            }
-                        }
-                        Some(c) => out.push(c),
-                        None => return Err(unterminated),
-                    }
-                }
-                at_boundary = false;
-            }
-            Some(c) => {
-                out.push(c);
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    // identifier char: extend the current bare word.
-                    if word_bare {
-                        word.push(c);
-                    }
-                    at_boundary = false;
-                } else if c.is_whitespace() {
-                    // A word was being built iff `word` is non-empty (bare) or
-                    // `word_bare` is false (a non-bare word). Whitespace after a
-                    // separator (no word) must PRESERVE cmd_pos (e.g. after `;;`).
-                    let had_word = !word.is_empty() || !word_bare;
-                    let introducer = end_word!();
-                    if had_word {
-                        // command position survives a space only after an
-                        // introducer keyword (`then case` → keyword; `echo case` → arg).
-                        cmd_pos = introducer;
-                    }
-                    at_boundary = true;
-                } else if matches!(c, ';' | '&' | '|') {
-                    end_word!();
-                    cmd_pos = true;
-                    at_boundary = true;
-                } else if matches!(c, '{' | '}') {
-                    end_word!();
-                    cmd_pos = c == '{';
-                    at_boundary = false;
-                } else if matches!(c, '<' | '>') {
-                    end_word!();
-                    cmd_pos = false; // redirect — same command
-                    at_boundary = true;
-                } else {
-                    // `$`, `-`, `.`, `*`, `?`, `=`, `~`, backtick, etc.: continues
-                    // / starts a word that is not a bare keyword.
-                    word_bare = false;
-                    at_boundary = false;
-                }
-            }
-        }
-    }
-}
-
-fn consume_paren_cmdsub_verbatim(
-    chars: &mut CharCursor<'_>,
-    out: &mut String,
-) -> Result<(), LexError> {
-    // The kernel consumes (but does not append) the closing `)`; re-add it so
-    // the command substitution is reconstructed verbatim in `out`.
-    scan_cmdsub_body(chars, out, LexError::UnterminatedBrace)?;
-    out.push(')');
-    Ok(())
-}
-
-/// Scans a backtick (`` `…` ``) command-substitution body, the opening backtick
-/// having already been consumed by the caller. Consumes through the matching
-/// un-escaped backtick (consumed but NOT appended); a `\` escapes the next char
-/// (so `` \` `` does not close — the `\` and next char are appended raw). The
-/// raw body (escapes preserved, excluding the closing backtick) is appended to
-/// `out`. Backticks are quote-naive and do not nest. EOF → `Err(unterminated)`.
-/// The single source of truth for backtick boundary scanning (see
-/// `scan_backtick_substitution`, `consume_backtick_verbatim`).
-fn scan_backtick_body(
-    chars: &mut CharCursor<'_>,
-    out: &mut String,
-    unterminated: LexError,
-) -> Result<(), LexError> {
-    loop {
-        match chars.next() {
-            None => return Err(unterminated),
-            Some('`') => return Ok(()),
-            Some('\\') => {
-                out.push('\\');
-                match chars.next() {
-                    Some(c) => out.push(c),
-                    None => return Err(unterminated),
-                }
-            }
-            Some(c) => out.push(c),
-        }
-    }
-}
-
-/// Appends a backtick command substitution to `out` verbatim, the opening
-/// backtick having already been pushed by the caller: the kernel collects the
-/// raw body (excluding the closing backtick); this re-adds the closing backtick.
-fn consume_backtick_verbatim(chars: &mut CharCursor<'_>, out: &mut String) -> Result<(), LexError> {
-    scan_backtick_body(chars, out, LexError::UnterminatedBrace)?;
-    out.push('`');
-    Ok(())
-}
-
 /// Collects a raw ANSI-C `$'…'` body (both `$` and opening `'` already consumed).
 /// Appends chars to `out` with `\`-escape pairs verbatim; does NOT push the
 /// closing `'`. Returns `Ok(())` on the first unescaped `'`; `Err(err)` on EOF.
@@ -6860,117 +6615,6 @@ fn scan_raw_ansi_c_body(
             }
             Some('\'') => return Ok(()),
             Some(c) => out.push(c),
-        }
-    }
-}
-
-fn scan_braced_operand(chars: &mut CharCursor<'_>) -> Result<String, LexError> {
-    // Known limitation: a `${...}` nested *inside* a double-quoted span of
-    // the operand (e.g. `${X:-"${Y}}"}`) is not depth-tracked — the inner
-    // `}` chars are consumed literally by the quote loop. Real scripts very
-    // rarely nest this way, and bash's own handling here is murky. Plain
-    // nesting like `${X:-${Y}}` IS handled (depth tracking outside quotes).
-    let mut body = String::new();
-    let mut depth: u32 = 1;
-    loop {
-        match chars.next() {
-            None => return Err(LexError::UnterminatedBrace),
-            Some('\\') => {
-                body.push('\\');
-                if let Some(c) = chars.next() {
-                    body.push(c);
-                }
-            }
-            Some('"') => {
-                body.push('"');
-                loop {
-                    match chars.next() {
-                        None => return Err(LexError::UnterminatedBrace),
-                        Some('"') => {
-                            body.push('"');
-                            break;
-                        }
-                        Some('\\') => {
-                            body.push('\\');
-                            if let Some(c) = chars.next() {
-                                body.push(c);
-                            }
-                        }
-                        Some(c) => body.push(c),
-                    }
-                }
-            }
-            Some('\'') => {
-                body.push('\'');
-                push_quoted_span(chars, '\'', &mut body, LexError::UnterminatedBrace)?;
-            }
-            Some('`') => {
-                // Backtick command substitution: consume verbatim through the
-                // matching unescaped backtick so a `}` inside it does not close
-                // the operand (L-52). `\` escapes the next char inside.
-                body.push('`');
-                consume_backtick_verbatim(chars, &mut body)?;
-            }
-            Some('$') => {
-                // `${` nests; `$(` is a cmdsub consumed verbatim; `$'…'` /
-                // `$"…"` are ANSI-C / locale quoted spans whose internal `'`/`"`
-                // (and `\'` escapes) must not be mistaken for plain quoting.
-                body.push('$');
-                match chars.peek() {
-                    Some(&'{') => {
-                        chars.next();
-                        body.push('{');
-                        depth += 1;
-                    }
-                    Some(&'(') => {
-                        chars.next();
-                        body.push('(');
-                        consume_paren_cmdsub_verbatim(chars, &mut body)?;
-                    }
-                    Some(&'\'') => {
-                        chars.next();
-                        body.push('\'');
-                        // ANSI-C span: `\` escapes the next char (incl. `\'`),
-                        // closing on the first UNescaped `'`.
-                        scan_raw_ansi_c_body(chars, &mut body, LexError::UnterminatedBrace)?;
-                        body.push('\'');
-                    }
-                    Some(&'"') => {
-                        chars.next();
-                        body.push('"');
-                        // Locale `$"…"`: same scan as a normal double-quote span
-                        // (handled by the outer `Some('"')` loop shape).
-                        loop {
-                            match chars.next() {
-                                None => return Err(LexError::UnterminatedBrace),
-                                Some('"') => {
-                                    body.push('"');
-                                    break;
-                                }
-                                Some('\\') => {
-                                    body.push('\\');
-                                    if let Some(c) = chars.next() {
-                                        body.push(c);
-                                    }
-                                }
-                                Some(c) => body.push(c),
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Some('{') => {
-                body.push('{');
-            } // bare brace: literal, does not nest
-            Some('}') => {
-                if depth == 1 {
-                    return Ok(body);
-                }
-                depth -= 1;
-                body.push('}');
-            }
-            Some(c) => body.push(c),
         }
     }
 }
@@ -7237,6 +6881,38 @@ mod tests {
             "D2: tilde enabled for indexed value"
         );
         assert!(!lx.cmd_at_word_start);
+    }
+
+    #[test]
+    fn slice_inclusive_returns_inclusive_range() {
+        // "abc${d}ef": bytes $=3 {=4 d=5 }=6
+        let c = CharCursor::new("abc${d}ef");
+        assert_eq!(c.slice_inclusive(3, 6), "${d}");
+    }
+
+    #[test]
+    fn source_span_returns_inclusive_slice() {
+        // "abc${d}ef": bytes $=3 {=4 d=5 }=6
+        let lx = Lexer::new_scanner("abc${d}ef", LexerOptions::default(), true);
+        assert_eq!(lx.source_span(3, 6), "${d}");
+    }
+
+    #[test]
+    fn param_start_off_reads_innermost_frame_start_off() {
+        let mut lx = Lexer::new_scanner("${d}", LexerOptions::default(), true);
+        assert_eq!(lx.param_start_off(), 0, "no ParamExpansion frame yet");
+        lx.push_mode(Mode::ParamExpansion {
+            seen_name: false,
+            indirect: false,
+            start_off: 7,
+        });
+        assert_eq!(lx.param_start_off(), 7);
+        lx.push_mode(Mode::ParamExpansion {
+            seen_name: false,
+            indirect: false,
+            start_off: 12,
+        });
+        assert_eq!(lx.param_start_off(), 12, "innermost frame wins when nested");
     }
 
     #[test]
@@ -7629,216 +7305,6 @@ mod tests {
         skip_line_comment(&mut chars);
         assert_eq!(chars.next(), Some('\n'));
         assert_eq!(chars.next(), Some('N'));
-    }
-
-    #[test]
-    fn scan_braced_operand_simple() {
-        let mut chars = CharCursor::new("foo}");
-        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "foo");
-    }
-
-    #[test]
-    fn scan_braced_operand_nested_braces() {
-        let mut chars = CharCursor::new("${Y}}");
-        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "${Y}");
-    }
-
-    #[test]
-    fn scan_braced_operand_double_quote_protects_brace() {
-        let mut chars = CharCursor::new("\"a}b\"c}");
-        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "\"a}b\"c");
-    }
-
-    #[test]
-    fn scan_braced_operand_single_quote_protects_brace() {
-        let mut chars = CharCursor::new("'a}b'c}");
-        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "'a}b'c");
-    }
-
-    #[test]
-    fn scan_braced_operand_unterminated_is_error() {
-        let mut chars = CharCursor::new("foo");
-        assert_eq!(
-            scan_braced_operand(&mut chars).unwrap_err(),
-            LexError::UnterminatedBrace
-        );
-    }
-
-    #[test]
-    fn scan_braced_operand_skips_paren_cmdsub_with_brace() {
-        let mut chars = CharCursor::new("$(echo a}b)/Z}");
-        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "$(echo a}b)/Z");
-    }
-
-    #[test]
-    fn scan_braced_operand_skips_backtick_cmdsub_with_brace() {
-        let mut chars = CharCursor::new("`echo a}b`/Z}");
-        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "`echo a}b`/Z");
-    }
-
-    #[test]
-    fn scan_braced_operand_skips_nested_cmdsub() {
-        let mut chars = CharCursor::new("$(echo $(echo a}b))/Q}");
-        assert_eq!(
-            scan_braced_operand(&mut chars).unwrap(),
-            "$(echo $(echo a}b))/Q"
-        );
-    }
-
-    #[test]
-    fn scan_braced_operand_skips_arith_cmdsub() {
-        let mut chars = CharCursor::new("$((1+2))}");
-        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "$((1+2))");
-    }
-
-    #[test]
-    fn scan_braced_operand_unterminated_paren_cmdsub_errors() {
-        let mut chars = CharCursor::new("$(echo a");
-        assert_eq!(
-            scan_braced_operand(&mut chars).unwrap_err(),
-            LexError::UnterminatedBrace
-        );
-    }
-
-    #[test]
-    fn scan_braced_operand_paren_cmdsub_skips_quoted_paren() {
-        // A `)` inside a quoted span within $(…) must not end the substitution.
-        let mut chars = CharCursor::new("$(echo \")\")}");
-        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "$(echo \")\")");
-    }
-
-    #[test]
-    fn scan_cmdsub_body_basic_consumes_through_close_paren() {
-        let mut chars = CharCursor::new("echo hi)rest");
-        let mut out = String::new();
-        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedSubstitution).unwrap();
-        assert_eq!(out, "echo hi"); // closing ) consumed, not appended
-        assert_eq!(chars.next(), Some('r')); // cursor left just past the )
-    }
-
-    #[test]
-    fn scan_cmdsub_body_balances_nested_and_arith() {
-        let mut chars = CharCursor::new("echo $(echo x))");
-        let mut out = String::new();
-        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
-        assert_eq!(out, "echo $(echo x)");
-
-        // $((1+2)) — caller consumed the outer `$(`, body starts at the inner `(`
-        let mut chars = CharCursor::new("(1+2))");
-        let mut out = String::new();
-        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
-        assert_eq!(out, "(1+2)");
-    }
-
-    #[test]
-    fn scan_cmdsub_body_skips_quoted_paren() {
-        let mut chars = CharCursor::new("echo \")\")");
-        let mut out = String::new();
-        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
-        assert_eq!(out, "echo \")\"");
-    }
-
-    #[test]
-    fn scan_cmdsub_body_unterminated_uses_passed_error() {
-        let mut chars = CharCursor::new("echo hi");
-        let mut out = String::new();
-        assert_eq!(
-            scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedSubstitution).unwrap_err(),
-            LexError::UnterminatedSubstitution
-        );
-        let mut chars = CharCursor::new("echo hi");
-        let mut out = String::new();
-        assert_eq!(
-            scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap_err(),
-            LexError::UnterminatedBrace
-        );
-    }
-
-    #[test]
-    fn scan_cmdsub_body_case_pattern_paren_not_close() {
-        // v186: a bare case-pattern `)` (depth 0) is a pattern terminator, not the
-        // cmdsub close. Stops at the FINAL `)` after `esac`.
-        let mut chars = CharCursor::new("case $y in a) echo hit;; esac)rest");
-        let mut out = String::new();
-        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedSubstitution).unwrap();
-        assert_eq!(out, "case $y in a) echo hit;; esac");
-        assert_eq!(chars.next(), Some('r'));
-    }
-
-    #[test]
-    fn scan_cmdsub_body_case_as_arg_is_not_keyword() {
-        // v186: `case` NOT in command position (an argument) is a plain word — the
-        // first `)` closes.
-        let mut chars = CharCursor::new("echo case)rest");
-        let mut out = String::new();
-        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
-        assert_eq!(out, "echo case");
-        assert_eq!(chars.next(), Some('r'));
-    }
-
-    #[test]
-    fn scan_cmdsub_body_nested_case() {
-        // v186: nested `case … esac` — only the FINAL `)` closes.
-        let mut chars = CharCursor::new("case $y in a) case $y in a) :;; esac;; esac)X");
-        let mut out = String::new();
-        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
-        assert_eq!(out, "case $y in a) case $y in a) :;; esac;; esac");
-        assert_eq!(chars.next(), Some('X'));
-    }
-
-    #[test]
-    fn scan_cmdsub_body_skips_word_start_comment() {
-        // v183: a word-start `#` comment is kept verbatim in the body; a `)`
-        // inside it does NOT close the substitution. Stops at the FINAL `)`.
-        let mut chars = CharCursor::new("echo hi # c with ) paren\n)rest");
-        let mut out = String::new();
-        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedSubstitution).unwrap();
-        assert_eq!(out, "echo hi # c with ) paren\n");
-        assert_eq!(chars.next(), Some('r'));
-    }
-
-    #[test]
-    fn scan_cmdsub_body_midword_hash_not_comment() {
-        // v183 regression: `#` mid-word (`a#b`) is literal, not a comment.
-        let mut chars = CharCursor::new("echo a#b)");
-        let mut out = String::new();
-        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
-        assert_eq!(out, "echo a#b");
-    }
-
-    #[test]
-    fn scan_backtick_body_basic_consumes_through_close() {
-        let mut chars = CharCursor::new("echo hi`rest");
-        let mut out = String::new();
-        scan_backtick_body(&mut chars, &mut out, LexError::UnterminatedSubstitution).unwrap();
-        assert_eq!(out, "echo hi"); // closing backtick consumed, not appended
-        assert_eq!(chars.next(), Some('r'));
-    }
-
-    #[test]
-    fn scan_backtick_body_escaped_backtick_does_not_close() {
-        // Input: a \ ` b `  — the escaped backtick is raw-preserved and does not close.
-        let mut chars = CharCursor::new("a\\`b`");
-        let mut out = String::new();
-        scan_backtick_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
-        assert_eq!(out, "a\\`b"); // raw, escape preserved
-    }
-
-    #[test]
-    fn scan_backtick_body_unterminated_uses_passed_error() {
-        let mut chars = CharCursor::new("echo hi");
-        let mut out = String::new();
-        assert_eq!(
-            scan_backtick_body(&mut chars, &mut out, LexError::UnterminatedSubstitution)
-                .unwrap_err(),
-            LexError::UnterminatedSubstitution
-        );
-        let mut chars = CharCursor::new("echo hi");
-        let mut out = String::new();
-        assert_eq!(
-            scan_backtick_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap_err(),
-            LexError::UnterminatedBrace
-        );
     }
 
     #[test]

@@ -305,13 +305,12 @@ naming review). New code should match them:
   `lookup_*` computes one resolved value (owned `Option<String>`, e.g.
   `lookup_var`); `resolve_*` follows indirection to a concrete target
   (namerefs, paths — e.g. `resolve_nameref`, `resolve_dir`).
-- **Lexing/scanning** — `scan_*` advances a `CharCursor` and collects a span
-  (e.g. `scan_cmdsub_body`, `scan_subscript`); `split_*` partitions an
-  already-collected `&str` (e.g. `split_modifier_operand`); `parse_*` (in
-  `parser.rs`) produces AST/structure by pulling atoms from the incremental
+- **Lexing/scanning** — `scan_*` advances a `CharCursor` and collects a bounded
+  span (e.g. `scan_ansi_c_quoted`, `scan_braced_name_ext`, `scan_var_name`) —
+  none forward-scan across nested structure for a matching delimiter; `split_*`
+  partitions an already-collected `&str` (e.g. `split_on_sentinels`); `parse_*`
+  (in `parser.rs`) produces AST/structure by pulling atoms from the incremental
   `Lexer` (there is no batch `tokenize` — the lexer yields one atom at a time).
-  The thin `consume_…_verbatim` wrappers re-emit a closing delimiter around a
-  `scan_*`.
 - **Execution** — `run_*` executes an AST node/construct (`run_command`,
   `run_pipeline`); `execute*` are the public crate entry points
   (`execute`/`execute_with_sink`/`execute_capturing`); `eval_*` computes a value
