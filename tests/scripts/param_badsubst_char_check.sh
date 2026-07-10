@@ -31,6 +31,16 @@
 # The remaining rows are PRE-EXISTING huck/bash divergences (out of scope for
 # #107 — see the spec's non-goals); this harness pins huck's own current
 # wording so the refactor cannot silently change it.
+#
+# UPDATE (Task 3 review fix): the refactor is behavior-preserving on every
+# row above, EXCEPT for a class of nested `${op"..."}` bad-subst inputs whose
+# quoted tail contains an inner `${...}` with a mismatched `"` — there, NEW
+# huck's parser-assembled raw legitimately CHANGED from OLD's lexer-scanned
+# raw (OLD's flat scanner didn't recurse into the nested `${...}` and picked
+# the wrong closing `}`; NEW's parser does recurse, matching bash's real
+# grammar). See the "Nested-quote bad-subst CORRECTIONS" block below for the
+# specific cases; every one there is NEW-huck's new baseline AND, where the
+# shape allows a byte-exact comparison, verified against live bash too.
 set -u
 HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
 [[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
@@ -105,6 +115,51 @@ EXIT:1'
 
 check_baseline "unterminated \${x (EOF)" 'echo ${x' 'bash: line 2: syntax error: unexpected end of input
 EXIT:2'
+
+# --- Nested-quote bad-subst CORRECTIONS (#107 Task 3 review fix) ---------
+#
+# An adversarial review of Task 3 rebuilt pre-refactor ("OLD") huck and found
+# a class of inputs where NEW huck's parser-assembled raw differs from OLD's
+# lexer-scanned raw: a `${op"..."}` bad-substitution whose quoted tail
+# contains a NESTED `${...}` with a mismatched/unbalanced `"` inside it.
+# OLD's flat scanner (scan_braced_operand) tracked quote state but did NOT
+# recurse into nested `${...}`, so it closed on the first bare `"` it saw
+# after the nested form and picked the WRONG closing `}`. NEW's parser
+# recurses into the nested `${...}` (matching bash's real grammar), so it
+# closes on the correct `}`. In every case captured below, NEW == bash and
+# OLD did not — this is a correction TOWARD bash, not a regression. (OLD's
+# now-superseded output is recorded only in this comment for the record, not
+# re-asserted by the harness: OLD gave `${@Z"${Y:-"}ab}: bad substitution`
+# rc=1 for the first case below, and `${@Z"${Y:-"}a}b}: bad substitution`
+# rc=1 for the second — both wrong vs bash.)
+check_baseline "nested-\${} unterminated tail (@Z)" \
+    'echo ${@Z"${Y:-"}a"b"}' \
+    'bash: line 2: syntax error: unexpected end of input
+EXIT:2'
+# NOTE: rc matches bash (2) but the message text is huck's own unterminated-
+# input wording, same pre-existing wording divergence as the plain
+# "unterminated ${x (EOF)" row above (bash says "unexpected EOF while
+# looking for matching `\"'" instead) — no check_bash_match for this shape.
+
+check_baseline "nested-\${} closed tail, extra quote after (@Z)" \
+    'echo ${@Z"${Y:-"}a"}b"}' \
+    'bash: line 1: ${@Z"${Y:-"}a"}b"}: bad substitution
+EXIT:1'
+check_bash_match "nested-\${} closed tail, extra quote after (@Z)" \
+    'echo ${@Z"${Y:-"}a"}b"}'
+
+check_baseline "nested-\${} unterminated tail (@X, distinct op)" \
+    'echo ${@X"${Y:-"}c"d"}' \
+    'bash: line 2: syntax error: unexpected end of input
+EXIT:2'
+# Same wording caveat as the @Z unterminated-tail case above.
+
+check_baseline "nested-\${} closed tail, #-name prefix (#n@Z)" \
+    'echo ${#n@Z"${Y:-"}a"}b"}' \
+    'bash: line 1: ${#n@Z"${Y:-"}a"}b"}: bad substitution
+EXIT:1'
+check_bash_match "nested-\${} closed tail, #-name prefix (#n@Z)" \
+    'echo ${#n@Z"${Y:-"}a"}b"}'
 
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
