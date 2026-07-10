@@ -3,8 +3,8 @@
 //! Run: `cargo run --example list_assignments -p huck-syntax -- 'a=1 b+=2 echo hi'`
 //! (falls back to a built-in sample if no argument is given).
 
-use huck_syntax::command::{Command, SimpleCommand};
-use huck_syntax::{Assignment, parse};
+use huck_syntax::command::SimpleCommand;
+use huck_syntax::{Assignment, Command, IfClause, RedirectSlot, Redirection, parse};
 
 fn main() {
     let src = std::env::args()
@@ -32,6 +32,16 @@ fn main() {
         let op = if a.append { "+=" } else { "=" };
         println!("{}{}{}", a.target.name(), op, "…");
     }
+
+    // Self-contained-surface check: these types are all nameable from the crate
+    // root (see the Tier 2 re-exports). Sizes are compile-time only.
+    let _sizes = (
+        std::mem::size_of::<Command>(),
+        std::mem::size_of::<IfClause>(),
+        std::mem::size_of::<Redirection>(),
+        std::mem::size_of::<RedirectSlot>(),
+    );
+    let _ = _sizes;
 }
 
 /// Pull the assignments off the first simple command (inline `a=1 cmd` prefix

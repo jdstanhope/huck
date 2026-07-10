@@ -27,7 +27,7 @@
 //! # let generated_script = "echo hi";
 //! let out = e.prepare(generated_script)
 //!     .cwd(sandbox_dir)
-//!     .restricted(true)
+//!     .restricted()
 //!     .timeout(std::time::Duration::from_secs(5))
 //!     .capture();
 //!
@@ -59,6 +59,7 @@ use crate::shell_state::Shell;
 ///
 /// [`ExecBuilder::capture`]: crate::exec_builder::ExecBuilder::capture
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Output {
     /// Everything the script wrote to stdout. Under `merge_stderr` this also
     /// contains the script's stderr bytes, interleaved in execution order.
@@ -72,6 +73,7 @@ pub struct Output {
 
 /// The result of a completion query — see [`Engine::complete`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Completion {
     /// Byte offset in the input line where the replacement starts.
     /// Embedders substitute `line[start..cursor]` with each candidate's
@@ -276,7 +278,7 @@ impl EngineBuilder {
     /// Override `$HUCK_VERSION` with the embedder's release-version
     /// string. When unset, the engine's default (its own crate version)
     /// is used.
-    pub fn with_version(mut self, version: &str) -> Self {
+    pub fn version(mut self, version: &str) -> Self {
         self.version = Some(version.to_string());
         self
     }
@@ -664,10 +666,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
-        let out = e
-            .prepare("cd /tmp; echo \"$PWD\"")
-            .restricted(true)
-            .capture();
+        let out = e.prepare("cd /tmp; echo \"$PWD\"").restricted().capture();
         assert!(
             out.stderr.contains("restricted: cd"),
             "stderr={:?}",
@@ -680,7 +679,7 @@ mod tests {
     #[test]
     fn restricted_refuses_exec() {
         let mut e = Engine::new();
-        let out = e.prepare("exec /bin/true").restricted(true).capture();
+        let out = e.prepare("exec /bin/true").restricted().capture();
         assert!(
             out.stderr.contains("restricted: exec"),
             "stderr={:?}",
@@ -691,7 +690,7 @@ mod tests {
     #[test]
     fn restricted_refuses_command_name_with_slash() {
         let mut e = Engine::new();
-        let out = e.prepare("/bin/echo hi").restricted(true).capture();
+        let out = e.prepare("/bin/echo hi").restricted().capture();
         assert!(
             out.stderr.contains("restricted:"),
             "stderr={:?}",
@@ -703,14 +702,14 @@ mod tests {
     #[test]
     fn restricted_accepts_command_name_without_slash() {
         let mut e = Engine::new();
-        let out = e.prepare("true").restricted(true).capture();
+        let out = e.prepare("true").restricted().capture();
         assert_eq!(out.exit_code, 0);
     }
 
     #[test]
     fn restricted_refuses_source_with_slash() {
         let mut e = Engine::new();
-        let out = e.prepare(". /etc/profile").restricted(true).capture();
+        let out = e.prepare(". /etc/profile").restricted().capture();
         assert!(
             out.stderr.contains("restricted: source"),
             "stderr={:?}",
@@ -723,7 +722,7 @@ mod tests {
         let mut e = Engine::new();
         let out = e
             .prepare("echo hi > /tmp/v206-restricted-test")
-            .restricted(true)
+            .restricted()
             .capture();
         assert!(
             out.stderr.contains("restricted:"),
@@ -742,7 +741,7 @@ mod tests {
     #[test]
     fn restricted_refuses_parent_dir_redirect() {
         let mut e = Engine::new();
-        let out = e.prepare("echo hi > ../escape").restricted(true).capture();
+        let out = e.prepare("echo hi > ../escape").restricted().capture();
         assert!(
             out.stderr.contains("restricted:"),
             "stderr={:?}",
@@ -753,7 +752,7 @@ mod tests {
     #[test]
     fn restricted_refuses_path_assignment() {
         let mut e = Engine::new();
-        let out = e.prepare("PATH=/tmp; echo done").restricted(true).capture();
+        let out = e.prepare("PATH=/tmp; echo done").restricted().capture();
         assert!(
             out.stderr.contains("restricted: PATH"),
             "stderr={:?}",
@@ -766,7 +765,7 @@ mod tests {
         let mut e = Engine::new();
         let out = e
             .prepare("SHELL=/bin/bash; echo done")
-            .restricted(true)
+            .restricted()
             .capture();
         assert!(
             out.stderr.contains("restricted: SHELL"),
@@ -781,7 +780,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
-        let out = e.prepare("set +r; cd /tmp").restricted(true).capture();
+        let out = e.prepare("set +r; cd /tmp").restricted().capture();
         assert!(
             out.stderr.contains("restricted: cannot turn off")
                 || out.stderr.contains("restricted:"),
@@ -802,7 +801,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
-        let out = e.prepare("f() { cd /tmp; }; f").restricted(true).capture();
+        let out = e.prepare("f() { cd /tmp; }; f").restricted().capture();
         assert!(
             out.stderr.contains("restricted: cd"),
             "stderr={:?}",
@@ -816,7 +815,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
-        let _ = e.prepare("cd /tmp; pwd").restricted(true).capture();
+        let _ = e.prepare("cd /tmp; pwd").restricted().capture();
         // Next call, no restricted: cd works.
         let out = e.prepare("cd /; pwd").capture();
         assert_eq!(out.stdout, "/\n", "stderr={:?}", out.stderr);
@@ -906,7 +905,7 @@ mod tests {
         let out = e
             .prepare("read x; echo \"got:$x\"")
             .cwd(tmp.path())
-            .restricted(true)
+            .restricted()
             .timeout(Duration::from_secs(2))
             .stdin(b"hello\n".to_vec())
             .capture();
@@ -925,7 +924,7 @@ mod tests {
         let out = e
             .prepare("pwd; cd /")
             .cwd(tmp.path())
-            .restricted(true)
+            .restricted()
             .capture();
         assert!(
             out.stderr.contains("restricted: cd"),
@@ -1146,7 +1145,7 @@ mod tests {
         let mut e = Engine::new();
         let _ = e
             .prepare("cd /tmp")
-            .restricted(true)
+            .restricted()
             .on_stderr_line(|line| err_lines.push(line.to_string()))
             .capture();
         assert!(err_lines.iter().any(|l| l.contains("restricted: cd")));
@@ -1182,7 +1181,7 @@ mod tests {
         let out = e
             .prepare("read x; echo \"got:$x\"")
             .cwd(tmp.path())
-            .restricted(true)
+            .restricted()
             .timeout(Duration::from_secs(2))
             .stdin(b"hello\n".to_vec())
             .on_stdout_line(|line| out_lines.push(line.to_string()))
@@ -1376,8 +1375,8 @@ mod tests {
     }
 
     #[test]
-    fn builder_with_version_sets_huck_version() {
-        let mut e = Engine::builder().with_version("9.9.9").build();
+    fn builder_version_sets_huck_version() {
+        let mut e = Engine::builder().version("9.9.9").build();
         let out = e.capture("echo $HUCK_VERSION");
         assert_eq!(out.stdout.trim(), "9.9.9");
         assert_eq!(out.exit_code, 0);

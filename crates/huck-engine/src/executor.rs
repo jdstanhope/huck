@@ -6,7 +6,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use crate::builtins::{self, ExecOutcome, InterruptReason};
 use crate::command::{
     CaseClause, CaseItem, CaseTerminator, Command, Connector, ExecCommand, FileMode, ForClause,
-    IfClause, Pipeline, RedirFd, RedirOp, Redirect, Redirection, Sequence, SimpleCommand,
+    IfClause, Pipeline, RedirFd, RedirOp, RedirectSlot, Redirection, Sequence, SimpleCommand,
     TestBinaryOp, TestExpr, TestUnaryOp, WhileClause,
 };
 use crate::expand::{expand, expand_assignment, expand_pattern, glob_expand_fields_opts};
@@ -3315,7 +3315,7 @@ fn run_background_sequence(
         // end.
         let stdin_fd: RawFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
             match &exec.slot_stdin() {
-                Some(Redirect::Read(word)) => {
+                Some(RedirectSlot::Read(word)) => {
                     if let Some(r) = prev_pipe_read.take() {
                         parent_held.retain(|&fd| fd != r);
                         unsafe {
@@ -3351,7 +3351,7 @@ fn run_background_sequence(
                         }
                     }
                 }
-                Some(Redirect::Heredoc { body, .. }) => {
+                Some(RedirectSlot::Heredoc { body, .. }) => {
                     if let Some(r) = prev_pipe_read.take() {
                         parent_held.retain(|&fd| fd != r);
                         unsafe {
@@ -3387,7 +3387,7 @@ fn run_background_sequence(
                         }
                     }
                 }
-                Some(Redirect::HereString(body)) => {
+                Some(RedirectSlot::HereString(body)) => {
                     if let Some(r) = prev_pipe_read.take() {
                         parent_held.retain(|&fd| fd != r);
                         unsafe {
@@ -3433,208 +3433,208 @@ fn run_background_sequence(
         parent_held.retain(|&fd| fd != stdin_fd);
 
         // ---- Stdout redirect (ExecCommand only) ------------------------------
-        let explicit_stdout_fd: Option<RawFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
-            stage_cmd
-        {
-            match &exec.slot_stdout() {
-                Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
+        let explicit_stdout_fd: Option<RawFd> =
+            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+                match &exec.slot_stdout() {
+                    Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                            Ok(p) => p,
+                            Err(()) => {
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
                                 }
+                                return bail_teardown_bg(
+                                    shell,
+                                    procsub_base,
+                                    first_pid,
+                                    &spawned_pids,
+                                    &mut parent_held,
+                                );
                             }
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    };
-                    use std::os::unix::io::IntoRawFd;
-                    let guard = shell.shell_options.noclobber && !matches!(r, Redirect::Clobber(_));
-                    match open_writable(&path, guard) {
-                        Ok(f) => Some(f.into_raw_fd()),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
+                        };
+                        use std::os::unix::io::IntoRawFd;
+                        let guard =
+                            shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
+                        match open_writable(&path, guard) {
+                            Ok(f) => Some(f.into_raw_fd()),
+                            Err(e) => {
+                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
                                 }
+                                return bail_teardown_bg(
+                                    shell,
+                                    procsub_base,
+                                    first_pid,
+                                    &spawned_pids,
+                                    &mut parent_held,
+                                );
                             }
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    }
-                }
-                Some(Redirect::Append(w)) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
-                                }
-                            }
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    };
-                    use std::os::unix::io::IntoRawFd;
-                    match OpenOptions::new().create(true).append(true).open(&path) {
-                        Ok(f) => Some(f.into_raw_fd()),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
-                                }
-                            }
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
                         }
                     }
+                    Some(RedirectSlot::Append(w)) => {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                            Ok(p) => p,
+                            Err(()) => {
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
+                                }
+                                return bail_teardown_bg(
+                                    shell,
+                                    procsub_base,
+                                    first_pid,
+                                    &spawned_pids,
+                                    &mut parent_held,
+                                );
+                            }
+                        };
+                        use std::os::unix::io::IntoRawFd;
+                        match OpenOptions::new().create(true).append(true).open(&path) {
+                            Ok(f) => Some(f.into_raw_fd()),
+                            Err(e) => {
+                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
+                                }
+                                return bail_teardown_bg(
+                                    shell,
+                                    procsub_base,
+                                    first_pid,
+                                    &spawned_pids,
+                                    &mut parent_held,
+                                );
+                            }
+                        }
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // ---- Stderr redirect (ExecCommand only) ------------------------------
-        let explicit_stderr_fd: Option<RawFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
-            stage_cmd
-        {
-            match &exec.slot_stderr() {
-                Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
+        let explicit_stderr_fd: Option<RawFd> =
+            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+                match &exec.slot_stderr() {
+                    Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                            Ok(p) => p,
+                            Err(()) => {
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
                                 }
-                            }
-                            if let Some(fd) = explicit_stdout_fd {
-                                unsafe {
-                                    libc::close(fd);
+                                if let Some(fd) = explicit_stdout_fd {
+                                    unsafe {
+                                        libc::close(fd);
+                                    }
                                 }
+                                return bail_teardown_bg(
+                                    shell,
+                                    procsub_base,
+                                    first_pid,
+                                    &spawned_pids,
+                                    &mut parent_held,
+                                );
                             }
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    };
-                    use std::os::unix::io::IntoRawFd;
-                    let guard = shell.shell_options.noclobber && !matches!(r, Redirect::Clobber(_));
-                    match open_writable(&path, guard) {
-                        Ok(f) => Some(f.into_raw_fd()),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
+                        };
+                        use std::os::unix::io::IntoRawFd;
+                        let guard =
+                            shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
+                        match open_writable(&path, guard) {
+                            Ok(f) => Some(f.into_raw_fd()),
+                            Err(e) => {
+                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
                                 }
-                            }
-                            if let Some(fd) = explicit_stdout_fd {
-                                unsafe {
-                                    libc::close(fd);
+                                if let Some(fd) = explicit_stdout_fd {
+                                    unsafe {
+                                        libc::close(fd);
+                                    }
                                 }
+                                return bail_teardown_bg(
+                                    shell,
+                                    procsub_base,
+                                    first_pid,
+                                    &spawned_pids,
+                                    &mut parent_held,
+                                );
                             }
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    }
-                }
-                Some(Redirect::Append(w)) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
-                                }
-                            }
-                            if let Some(fd) = explicit_stdout_fd {
-                                unsafe {
-                                    libc::close(fd);
-                                }
-                            }
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    };
-                    use std::os::unix::io::IntoRawFd;
-                    match OpenOptions::new().create(true).append(true).open(&path) {
-                        Ok(f) => Some(f.into_raw_fd()),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
-                                }
-                            }
-                            if let Some(fd) = explicit_stdout_fd {
-                                unsafe {
-                                    libc::close(fd);
-                                }
-                            }
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
                         }
                     }
+                    Some(RedirectSlot::Append(w)) => {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                            Ok(p) => p,
+                            Err(()) => {
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
+                                }
+                                if let Some(fd) = explicit_stdout_fd {
+                                    unsafe {
+                                        libc::close(fd);
+                                    }
+                                }
+                                return bail_teardown_bg(
+                                    shell,
+                                    procsub_base,
+                                    first_pid,
+                                    &spawned_pids,
+                                    &mut parent_held,
+                                );
+                            }
+                        };
+                        use std::os::unix::io::IntoRawFd;
+                        match OpenOptions::new().create(true).append(true).open(&path) {
+                            Ok(f) => Some(f.into_raw_fd()),
+                            Err(e) => {
+                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
+                                }
+                                if let Some(fd) = explicit_stdout_fd {
+                                    unsafe {
+                                        libc::close(fd);
+                                    }
+                                }
+                                return bail_teardown_bg(
+                                    shell,
+                                    procsub_base,
+                                    first_pid,
+                                    &spawned_pids,
+                                    &mut parent_held,
+                                );
+                            }
+                        }
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // ---- Stdout fd -------------------------------------------------------
         let stdout_fd: RawFd = if let Some(fd) = explicit_stdout_fd {
@@ -3750,65 +3750,69 @@ fn run_background_sequence(
         let (stdout_dup_target, stderr_dup_target) =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 let sdt = match &exec.slot_stdout() {
-                    Some(Redirect::Dup { source, .. }) => match resolve_fd_target(source, shell) {
-                        Ok(fd) => Some(fd),
-                        Err(e) => {
-                            {
-                                let mut err = err_writer(err_sink, sink);
-                                crate::sh_error_to!(
+                    Some(RedirectSlot::Dup { source, .. }) => {
+                        match resolve_fd_target(source, shell) {
+                            Ok(fd) => Some(fd),
+                            Err(e) => {
+                                {
+                                    let mut err = err_writer(err_sink, sink);
+                                    crate::sh_error_to!(
+                                        shell,
+                                        &mut *err,
+                                        None,
+                                        "{}",
+                                        crate::bash_io_error(&e)
+                                    );
+                                }
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
+                                }
+                                return bail_teardown_bg(
                                     shell,
-                                    &mut *err,
-                                    None,
-                                    "{}",
-                                    crate::bash_io_error(&e)
+                                    procsub_base,
+                                    first_pid,
+                                    &spawned_pids,
+                                    &mut parent_held,
                                 );
                             }
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
-                                }
-                            }
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
                         }
-                    },
+                    }
                     _ => None,
                 };
                 let sedt = match &exec.slot_stderr() {
-                    Some(Redirect::Dup { source, .. }) => match resolve_fd_target(source, shell) {
-                        Ok(fd) => Some(fd),
-                        Err(e) => {
-                            {
-                                let mut err = err_writer(err_sink, sink);
-                                crate::sh_error_to!(
+                    Some(RedirectSlot::Dup { source, .. }) => {
+                        match resolve_fd_target(source, shell) {
+                            Ok(fd) => Some(fd),
+                            Err(e) => {
+                                {
+                                    let mut err = err_writer(err_sink, sink);
+                                    crate::sh_error_to!(
+                                        shell,
+                                        &mut *err,
+                                        None,
+                                        "{}",
+                                        crate::bash_io_error(&e)
+                                    );
+                                }
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
+                                }
+                                return bail_teardown_bg(
                                     shell,
-                                    &mut *err,
-                                    None,
-                                    "{}",
-                                    crate::bash_io_error(&e)
+                                    procsub_base,
+                                    first_pid,
+                                    &spawned_pids,
+                                    &mut parent_held,
                                 );
                             }
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
-                                }
-                            }
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
                         }
-                    },
+                    }
                     _ => None,
                 };
                 (sdt, sedt)
@@ -4157,7 +4161,7 @@ fn expand_single(
 }
 
 /// Expands `source` to a string and parses it as an fd number (e.g. "1" or "2").
-/// Used for `Redirect::Dup { source }` to obtain the target fd pre-fork.
+/// Used for `RedirectSlot::Dup { source }` to obtain the target fd pre-fork.
 /// Errors with "bad fd: ..." if the expansion is not a valid non-negative integer.
 fn resolve_fd_target(source: &crate::lexer::Word, shell: &mut Shell) -> Result<i32, io::Error> {
     let expanded = expand_assignment(source, shell);
@@ -6979,7 +6983,7 @@ fn run_multi_stage(
         // becomes this stage's stdin. The parent never holds the pipe write end.
         let stdin_fd: RawFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
             match &exec.slot_stdin() {
-                Some(Redirect::Read(word)) => {
+                Some(RedirectSlot::Read(word)) => {
                     // Discard the previous stage's pipe read-end: this stage
                     // overrides stdin, so that pipe would otherwise be leaked
                     // into parent_held, keeping the write-end alive and
@@ -7007,7 +7011,7 @@ fn run_multi_stage(
                         }
                     }
                 }
-                Some(Redirect::Heredoc { body, .. }) => {
+                Some(RedirectSlot::Heredoc { body, .. }) => {
                     // Discard the previous stage's pipe read-end: this stage
                     // overrides stdin via heredoc, so that pipe would otherwise
                     // be leaked into parent_held, deadlocking the previous
@@ -7044,7 +7048,7 @@ fn run_multi_stage(
                         }
                     }
                 }
-                Some(Redirect::HereString(body)) => {
+                Some(RedirectSlot::HereString(body)) => {
                     // Discard the previous stage's pipe read-end: this stage
                     // overrides stdin via here-string.
                     if let Some(r) = prev_pipe_read.take() {
@@ -7097,160 +7101,160 @@ fn run_multi_stage(
         }
 
         // ---- Determine stdout redirect (from ExecCommand if Simple) ----------
-        let explicit_stdout_fd: Option<RawFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
-            stage_cmd
-        {
-            match &exec.slot_stdout() {
-                Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
+        let explicit_stdout_fd: Option<RawFd> =
+            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+                match &exec.slot_stdout() {
+                    Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                            Ok(p) => p,
+                            Err(()) => {
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
                                 }
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
-                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                        }
-                    };
-                    use std::os::unix::io::IntoRawFd;
-                    let guard = shell.shell_options.noclobber && !matches!(r, Redirect::Clobber(_));
-                    match open_writable(&path, guard) {
-                        Ok(f) => Some(f.into_raw_fd()),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
+                        };
+                        use std::os::unix::io::IntoRawFd;
+                        let guard =
+                            shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
+                        match open_writable(&path, guard) {
+                            Ok(f) => Some(f.into_raw_fd()),
+                            Err(e) => {
+                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
                                 }
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
-                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                        }
-                    }
-                }
-                Some(Redirect::Append(w)) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
-                                }
-                            }
-                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                        }
-                    };
-                    use std::os::unix::io::IntoRawFd;
-                    match OpenOptions::new().create(true).append(true).open(&path) {
-                        Ok(f) => Some(f.into_raw_fd()),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
-                                }
-                            }
-                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     }
+                    Some(RedirectSlot::Append(w)) => {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                            Ok(p) => p,
+                            Err(()) => {
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
+                                }
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                            }
+                        };
+                        use std::os::unix::io::IntoRawFd;
+                        match OpenOptions::new().create(true).append(true).open(&path) {
+                            Ok(f) => Some(f.into_raw_fd()),
+                            Err(e) => {
+                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
+                                }
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                            }
+                        }
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // ---- Determine stderr redirect (from ExecCommand if Simple) ----------
-        let explicit_stderr_fd: Option<RawFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
-            stage_cmd
-        {
-            match &exec.slot_stderr() {
-                Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
+        let explicit_stderr_fd: Option<RawFd> =
+            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+                match &exec.slot_stderr() {
+                    Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                            Ok(p) => p,
+                            Err(()) => {
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
                                 }
-                            }
-                            if let Some(fd) = explicit_stdout_fd {
-                                unsafe {
-                                    libc::close(fd);
+                                if let Some(fd) = explicit_stdout_fd {
+                                    unsafe {
+                                        libc::close(fd);
+                                    }
                                 }
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
-                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                        }
-                    };
-                    use std::os::unix::io::IntoRawFd;
-                    let guard = shell.shell_options.noclobber && !matches!(r, Redirect::Clobber(_));
-                    match open_writable(&path, guard) {
-                        Ok(f) => Some(f.into_raw_fd()),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
+                        };
+                        use std::os::unix::io::IntoRawFd;
+                        let guard =
+                            shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
+                        match open_writable(&path, guard) {
+                            Ok(f) => Some(f.into_raw_fd()),
+                            Err(e) => {
+                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
                                 }
-                            }
-                            if let Some(fd) = explicit_stdout_fd {
-                                unsafe {
-                                    libc::close(fd);
+                                if let Some(fd) = explicit_stdout_fd {
+                                    unsafe {
+                                        libc::close(fd);
+                                    }
                                 }
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
-                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                        }
-                    }
-                }
-                Some(Redirect::Append(w)) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
-                                }
-                            }
-                            if let Some(fd) = explicit_stdout_fd {
-                                unsafe {
-                                    libc::close(fd);
-                                }
-                            }
-                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                        }
-                    };
-                    use std::os::unix::io::IntoRawFd;
-                    match OpenOptions::new().create(true).append(true).open(&path) {
-                        Ok(f) => Some(f.into_raw_fd()),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
-                                }
-                            }
-                            if let Some(fd) = explicit_stdout_fd {
-                                unsafe {
-                                    libc::close(fd);
-                                }
-                            }
-                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     }
+                    Some(RedirectSlot::Append(w)) => {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                            Ok(p) => p,
+                            Err(()) => {
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
+                                }
+                                if let Some(fd) = explicit_stdout_fd {
+                                    unsafe {
+                                        libc::close(fd);
+                                    }
+                                }
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                            }
+                        };
+                        use std::os::unix::io::IntoRawFd;
+                        match OpenOptions::new().create(true).append(true).open(&path) {
+                            Ok(f) => Some(f.into_raw_fd()),
+                            Err(e) => {
+                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
+                                }
+                                if let Some(fd) = explicit_stdout_fd {
+                                    unsafe {
+                                        libc::close(fd);
+                                    }
+                                }
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                            }
+                        }
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // ---- Build stdout fd -------------------------------------------------
         // Priority: explicit redirect > inter-stage pipe > Capture sink pipe > STDOUT_FILENO.
@@ -7457,65 +7461,69 @@ fn run_multi_stage(
         let (stdout_dup_target, stderr_dup_target) =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 let sdt = match &exec.slot_stdout() {
-                    Some(Redirect::Dup { source, .. }) => match resolve_fd_target(source, shell) {
-                        Ok(fd) => Some(fd),
-                        Err(e) => {
-                            {
-                                let mut err = err_writer(err_sink, sink);
-                                crate::sh_error_to!(
-                                    shell,
-                                    &mut *err,
-                                    None,
-                                    "{}",
-                                    crate::bash_io_error(&e)
-                                );
-                            }
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
+                    Some(RedirectSlot::Dup { source, .. }) => {
+                        match resolve_fd_target(source, shell) {
+                            Ok(fd) => Some(fd),
+                            Err(e) => {
+                                {
+                                    let mut err = err_writer(err_sink, sink);
+                                    crate::sh_error_to!(
+                                        shell,
+                                        &mut *err,
+                                        None,
+                                        "{}",
+                                        crate::bash_io_error(&e)
+                                    );
                                 }
-                            }
-                            if let Some(r) = capture_read_fd {
-                                parent_held.retain(|&fd| fd != r);
-                                unsafe {
-                                    libc::close(r);
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
                                 }
+                                if let Some(r) = capture_read_fd {
+                                    parent_held.retain(|&fd| fd != r);
+                                    unsafe {
+                                        libc::close(r);
+                                    }
+                                }
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
-                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
-                    },
+                    }
                     _ => None,
                 };
                 let sedt = match &exec.slot_stderr() {
-                    Some(Redirect::Dup { source, .. }) => match resolve_fd_target(source, shell) {
-                        Ok(fd) => Some(fd),
-                        Err(e) => {
-                            {
-                                let mut err = err_writer(err_sink, sink);
-                                crate::sh_error_to!(
-                                    shell,
-                                    &mut *err,
-                                    None,
-                                    "{}",
-                                    crate::bash_io_error(&e)
-                                );
-                            }
-                            restore_inline_assignments(snap, shell);
-                            if stdin_fd > 2 {
-                                unsafe {
-                                    libc::close(stdin_fd);
+                    Some(RedirectSlot::Dup { source, .. }) => {
+                        match resolve_fd_target(source, shell) {
+                            Ok(fd) => Some(fd),
+                            Err(e) => {
+                                {
+                                    let mut err = err_writer(err_sink, sink);
+                                    crate::sh_error_to!(
+                                        shell,
+                                        &mut *err,
+                                        None,
+                                        "{}",
+                                        crate::bash_io_error(&e)
+                                    );
                                 }
-                            }
-                            if let Some(r) = capture_read_fd {
-                                parent_held.retain(|&fd| fd != r);
-                                unsafe {
-                                    libc::close(r);
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 {
+                                    unsafe {
+                                        libc::close(stdin_fd);
+                                    }
                                 }
+                                if let Some(r) = capture_read_fd {
+                                    parent_held.retain(|&fd| fd != r);
+                                    unsafe {
+                                        libc::close(r);
+                                    }
+                                }
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
-                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
-                    },
+                    }
                     _ => None,
                 };
                 (sdt, sedt)
@@ -8492,7 +8500,7 @@ fn reset_job_control_signals_in_child() -> std::io::Result<()> {
 ///
 /// `stdout_dup_target` / `stderr_dup_target`: if `Some(fd)`, after the
 /// normal stdio dup2s, apply `dup2(fd, 1)` and/or `dup2(fd, 2)` in the
-/// child. Used for `Redirect::Dup` (e.g. `2>&1`). Resolution happens in
+/// child. Used for `RedirectSlot::Dup` (e.g. `2>&1`). Resolution happens in
 /// the parent (pre-fork) so this is always an i32, never a Word.
 #[allow(clippy::too_many_arguments)]
 pub fn fork_and_run_in_subshell(
@@ -8710,11 +8718,11 @@ fn spawn_external_with_fds(
     // Resolve Dup targets pre-fork (Word expansion may allocate; not async-signal-safe).
     // stdout-dup BEFORE stderr-dup matches canonical `>file 2>&1` semantics.
     let stdout_dup_target: Option<i32> = match &exec.slot_stdout() {
-        Some(Redirect::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
+        Some(RedirectSlot::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
         _ => None,
     };
     let stderr_dup_target: Option<i32> = match &exec.slot_stderr() {
-        Some(Redirect::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
+        Some(RedirectSlot::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
         _ => None,
     };
 

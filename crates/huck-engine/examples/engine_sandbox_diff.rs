@@ -2,9 +2,9 @@
 //!
 //! Argv: `<mode> <fragment>` where mode is:
 //!   - `bare`           — `.capture()` only.
-//!   - `restricted`     — `.restricted(true).capture()`.
+//!   - `restricted`     — `.restricted().capture()`.
 //!   - `cwd:<path>`     — `.cwd(<path>).capture()`.
-//!   - `cwd:<path>:r`   — `.cwd(<path>).restricted(true).capture()`.
+//!   - `cwd:<path>:r`   — `.cwd(<path>).restricted().capture()`.
 //!
 //! Output format (same as engine_capture_diff):
 //!   `STDOUT:<n>\n<bytes>STDERR:<n>\n<bytes>EXIT:<code>\n`
@@ -21,7 +21,7 @@ fn main() {
     let mut e = Engine::new();
     let out = match mode.as_str() {
         "bare" => e.prepare(&fragment).capture(),
-        "restricted" => e.prepare(&fragment).restricted(true).capture(),
+        "restricted" => e.prepare(&fragment).restricted().capture(),
         m if m.starts_with("cwd:") => {
             let body = &m[4..];
             let (path, restricted) = if let Some(stripped) = body.strip_suffix(":r") {
@@ -31,7 +31,7 @@ fn main() {
             };
             let mut b = e.prepare(&fragment).cwd(path);
             if restricted {
-                b = b.restricted(true);
+                b = b.restricted();
             }
             b.capture()
         }

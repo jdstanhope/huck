@@ -5,8 +5,8 @@
 //! the `rt_*` tests). Built across v146 Tasks 1-3; bash-faithful port in v218.
 use crate::command::{
     Assignment, CaseClause, CaseItem, CaseTerminator, Command, Connector, ElifBranch, ExecCommand,
-    ForClause, IfClause, Pipeline, Redirect, SelectClause, Sequence, SimpleCommand, TestBinaryOp,
-    TestExpr, TestUnaryOp, WhileClause,
+    ForClause, IfClause, Pipeline, RedirectSlot, SelectClause, Sequence, SimpleCommand,
+    TestBinaryOp, TestExpr, TestUnaryOp, WhileClause,
 };
 use crate::lexer::{
     CaseDirection, ParamModifier, SubscriptKind, SubstAnchor, TildeSpec, TransformOp, Word,
@@ -448,19 +448,19 @@ enum RedirDefault {
     Stderr,
 }
 
-fn redirect_to_source(r: &Redirect, which: RedirDefault) -> String {
+fn redirect_to_source(r: &RedirectSlot, which: RedirDefault) -> String {
     let fd_prefix = match which {
         RedirDefault::Stderr => "2",
         RedirDefault::Stdin | RedirDefault::Stdout => "",
     };
     match r {
-        Redirect::Read(w) => format!("< {}", word_to_source(w)),
-        Redirect::Truncate(w) => format!("{fd_prefix}> {}", word_to_source(w)),
-        Redirect::Append(w) => format!("{fd_prefix}>> {}", word_to_source(w)),
-        Redirect::Clobber(w) => format!("{fd_prefix}>| {}", word_to_source(w)),
-        Redirect::Dup { fd, source } => format!("{fd}>&{}", word_to_source(source)),
-        Redirect::HereString(w) => format!("<<< {}", word_to_source(w)),
-        Redirect::Heredoc {
+        RedirectSlot::Read(w) => format!("< {}", word_to_source(w)),
+        RedirectSlot::Truncate(w) => format!("{fd_prefix}> {}", word_to_source(w)),
+        RedirectSlot::Append(w) => format!("{fd_prefix}>> {}", word_to_source(w)),
+        RedirectSlot::Clobber(w) => format!("{fd_prefix}>| {}", word_to_source(w)),
+        RedirectSlot::Dup { fd, source } => format!("{fd}>&{}", word_to_source(source)),
+        RedirectSlot::HereString(w) => format!("<<< {}", word_to_source(w)),
+        RedirectSlot::Heredoc {
             body,
             expand,
             strip_tabs,

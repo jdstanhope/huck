@@ -7319,9 +7319,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     Ok(_) => break,
                     Err(le) => {
                         let line = line_of(start + tok_off) as u32;
-                        let msg = crate::parse_error_message(&crate::command::ParseError::Lex(
-                            Box::new(le),
-                        ));
+                        let msg = crate::command::ParseError::Lex(Box::new(le)).to_string();
                         crate::err_thread_local::install_err_sinks(sink, err_sink, || {
                             crate::emit_syntax_error(
                                 shell,
@@ -7451,9 +7449,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                         // Report at the failing token's START line (not the cursor's
                         // post-scan EOF position), and restart just past that line.
                         let line = line_of(start + tok_off) as u32;
-                        let msg = crate::parse_error_message(&crate::command::ParseError::Lex(
-                            Box::new(le),
-                        ));
+                        let msg = crate::command::ParseError::Lex(Box::new(le)).to_string();
                         crate::err_thread_local::install_err_sinks(sink, err_sink, || {
                             crate::emit_syntax_error(
                                 shell,
@@ -7479,7 +7475,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                         unit_start_off
                     };
                     let line = line_of(start + foff) as u32;
-                    let msg = crate::parse_error_message(&e);
+                    let msg = e.to_string();
                     crate::err_thread_local::install_err_sinks(sink, err_sink, || {
                         crate::emit_syntax_error(shell, line, format_args!("syntax error: {msg}"));
                     });

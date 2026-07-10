@@ -691,7 +691,7 @@ pub struct Shell {
     /// this list to send SIGTERM when the deadline fires.
     pub live_external_children: Arc<Mutex<Vec<libc::pid_t>>>,
     /// True while the current `ExecBuilder::run`/`capture` call is running
-    /// under `.restricted(true)`. Snapshot-and-restored by the builder.
+    /// under `.restricted()`. Snapshot-and-restored by the builder.
     pub restricted: bool,
     pub shell_pgid: i32,
     /// Command history. `Rc` so cloning the Shell (per command substitution) is
