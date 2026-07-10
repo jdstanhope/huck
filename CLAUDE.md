@@ -53,6 +53,10 @@ Run the standard iteration loop without being asked:
    `vNN-<topic>` branch: fresh subagent per task with spec + code
    quality review between tasks.
 5. **Final review** of the whole branch diff before merge.
+   - Run the bash-diff sweep before the PR: build both binaries
+     (`cargo build --locked --bin huck` + `cargo build --release --locked
+     --bin huck`) then `tests/scripts/run_diff_checks.sh`; it must be green.
+     (CI runs it too, but catch regressions locally first.)
 6. **Open a pull request** (`gh pr create`) targeting `main`, with the body
    referencing the issue via `Closes #N`, and hand it to the user to review
    and merge — do NOT merge to main yourself. Push the `vNN-<topic>` branch
