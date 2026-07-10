@@ -42,7 +42,7 @@ assert_eq!(lines, vec!["1", "2", "3"]);
 // ...or run it sandboxed: a scratch cwd, restricted mode, a time budget.
 let out = e.prepare(untrusted_script)
     .cwd(scratch_dir)
-    .restricted(true)
+    .restricted()
     .timeout(Duration::from_secs(5))
     .capture();`;
 

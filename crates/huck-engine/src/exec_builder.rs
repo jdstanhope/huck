@@ -184,8 +184,8 @@ impl<'a> ExecBuilder<'a> {
     /// emit `huck: restricted: <op>` via the active stderr sink and return
     /// exit 1; the script keeps running unless `set -e` propagates the
     /// failure.
-    pub fn restricted(mut self, on: bool) -> Self {
-        self.restricted = on;
+    pub fn restricted(mut self) -> Self {
+        self.restricted = true;
         self
     }
 
