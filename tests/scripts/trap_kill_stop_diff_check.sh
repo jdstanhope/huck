@@ -11,7 +11,7 @@ set -u
 HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
 [[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
 PASS=0; FAIL=0
-norm() { sed -E 's/^(bash|huck): (line [0-9]+: )?//; s/\bSIG([A-Z])/\1/g'; }
+norm() { sed -E 's#^([^:]*/)?(bash|huck): (line [0-9]+: )?##; s/\bSIG([A-Z])/\1/g'; }
 check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1; echo "rc=$?"); b=$(printf '%s\n' "$b" | norm)

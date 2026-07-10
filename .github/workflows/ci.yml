@@ -52,3 +52,9 @@ jobs:
         # the first (the huck-package integration suite can't run on the 1-core
         # dev box, so CI is where the full suite is exercised).
         run: cargo test --workspace --locked --no-fail-fast --verbose
+
+      - name: Build release huck (release-default harnesses)
+        run: cargo build --release --locked --bin huck
+
+      - name: Bash-diff harness sweep
+        run: tests/scripts/run_diff_checks.sh
