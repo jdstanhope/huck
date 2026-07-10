@@ -2822,7 +2822,7 @@ fn parse_simple_with_leading_word(
         // ordinary top-level `BeginBacktick` ZERO-WIDTH signal instead (handled by
         // `parse_word_command`'s BeginBacktick arm). So there is no longer a
         // reachable `BeginBacktick` token at this point in the token stream.
-        // RedirectSlot tokens — parse in source order, extending the redirects
+        // Redirect tokens — parse in source order, extending the redirects
         // list.  Mirrors the `next_is_redirect` + `parse_trailing_redirects`
         // delegation in `parse_simple_stage`.
         if crate::command::next_is_redirect(iter)? {

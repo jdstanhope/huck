@@ -4148,7 +4148,7 @@ fn expand_single(
     shell: &mut Shell,
     err: &mut dyn std::io::Write,
 ) -> Result<String, ()> {
-    // RedirectSlot targets do NOT undergo pathname expansion in v10 (per spec).
+    // Redirect targets do NOT undergo pathname expansion in v10 (per spec).
     // We call `expand` directly and require exactly one field, preserving the
     // ambiguous-redirect contract for word-splitting that produces 0 or >1.
     let fields = expand(word, shell);
@@ -5505,7 +5505,7 @@ fn run_exec_builtin(
 
     let operands = &resolved.args[flags.operand_start..];
     if operands.is_empty() {
-        // RedirectSlot-only (or bare) `exec`: redirections done, status 0.
+        // Redirect-only (or bare) `exec`: redirections done, status 0.
         return ExecOutcome::Continue(0);
     }
 
