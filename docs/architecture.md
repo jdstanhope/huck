@@ -118,6 +118,11 @@ the bottom, expansion + execution above, builtins at the top.
 | `lib.rs` | `huck` library crate root: declares the runtime modules (`pub mod`) AND re-exports the `huck-syntax` frontend at the crate root (`pub use huck_syntax::{lexer, command, brace_expand, generate, …}`) so `crate::lexer::`/`crate::command::` paths stay valid. Also holds the `#[cfg(test)] test_support` (`CWD_LOCK`) module. |
 | `main.rs` | Thin binary shim: argv parsing + `huck::shell::run` invocation. All logic lives in the `huck` library crate. |
 
+> Unit tests live in per-module sibling files: `<file>/tests.rs` (and, for
+> files with several test modules such as `builtins.rs`/`executor.rs`, one
+> `<file>/<name>_tests.rs` per module). Production symbols named in this map
+> are unaffected.
+
 ## Execution pipeline
 
 A line typed at the prompt traverses these stages:
