@@ -1616,6 +1616,13 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
     ) {
         iter.next_kind()?;
     }
+    // #109: a body that is only whitespace/comments reaching EOF before `)` is
+    // an UNTERMINATED substitution, not a missing command — mirror
+    // parse_subshell's guard (~4664) so the REPL/stdin reader keeps reading.
+    if iter.peek_kind()?.is_none() {
+        iter.pop_mode();
+        return Err(ParseError::UnterminatedSubshell);
+    }
     let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
         // Empty (or whitespace/newline-only) body `$()`/`$( )`/`$(\n)` —
         // consume `)` and construct the same Sequence the production oracle
@@ -1685,6 +1692,12 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
         Some(TokenKind::Blank) | Some(TokenKind::Newline)
     ) {
         iter.next_kind()?;
+    }
+    // #109: same guard as parse_command_sub — a comment-only/empty body at EOF
+    // is an unterminated process substitution.
+    if iter.peek_kind()?.is_none() {
+        iter.pop_mode();
+        return Err(ParseError::UnterminatedSubshell);
     }
     let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
         iter.next_kind()?; // consume `)`
