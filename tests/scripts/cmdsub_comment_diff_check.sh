@@ -14,20 +14,9 @@ check() {
     if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
     else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
 }
-# Expected-fail: huck currently diverges from bash on this input (tracked in
-# #109 — comment inside $() ). Passes the harness while it stays broken, and
-# self-flags the day it is silently fixed so we restore check() and close #109.
-xfail() {
-    local label="$1" frag="$2" b h
-    b=$(printf '%s\n' "$frag" | bash --norc --noprofile 2>&1; echo "EXIT:$?")
-    h=$(printf '%s\n' "$frag" | "$HUCK_BIN" 2>&1; echo "EXIT:$?")
-    if [[ "$b" != "$h" ]]; then printf 'XFAIL: %s (#109)\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s unexpectedly passes — close #109 and restore check()\n' "$label"; FAIL=$((FAIL+1)); fi
-}
-
 check "paren in comment"      'echo "[$(echo hi  # c with ) paren
 )]"'
-xfail "comment after open"    'echo "[$(# c with ) paren
+check "comment after open"    'echo "[$(# c with ) paren
 echo yo)]"'
 check "hash after semicolon"  'echo "[$(echo a;# c ) z
 echo b)]"'
