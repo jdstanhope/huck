@@ -14,7 +14,7 @@ HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
 PASS=0; FAIL=0
 # Normalize the diverging error-line prefix: bash uses "bash: line N: ",
 # huck uses "huck: " — strip both so the message TEXT is what's compared.
-norm() { sed -E 's/^(bash|huck): (line [0-9]+: )?//'; }
+norm() { sed -E 's#^([^:]*/)?(bash|huck): (line [0-9]+: )?##'; }
 check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1; echo "rc=$?"); b=$(printf '%s\n' "$b" | norm)

@@ -27,7 +27,7 @@ run_normalized() {
     exit_code=$?
     # Normalise "bash: line N: CMD:" and "huck: CMD:" to "SHELL: CMD:"
     printf '%s\n' "$combined" \
-        | sed 's/^bash: line [0-9]*: /SHELL: /g; s/^huck: /SHELL: /g'
+        | sed -E 's#^([^:]*/)?bash: (line [0-9]+: )?#SHELL: #g; s#^([^:]*/)?huck: (line [0-9]+: )?#SHELL: #g'
     printf 'EXIT:%d\n' "$exit_code"
 }
 
