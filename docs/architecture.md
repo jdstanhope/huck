@@ -257,6 +257,12 @@ These appear in many call-site signatures; learn them once.
   `error_message_diff_check.sh`). Adding a `<feature>_diff_check.sh` is the
   gold standard for bash-compat verification. On a memory-constrained box,
   guard a sweep with `ulimit -v 1500000` + a per-harness `timeout`.
+  `tests/scripts/run_diff_checks.sh` runs the whole sweep against each
+  harness's default binary (most use `target/debug/huck`; a few need
+  `target/release/huck`, so build both first — it never overrides `HUCK_BIN`)
+  and CI runs it on every build, so a red harness fails CI. A known-failing
+  case is quarantined in-harness with a self-flagging `xfail` (see
+  `cmdsub_comment_diff_check.sh`, tracking #109), not dropped from the gate.
 - **Bash test-suite integration** — opt-in runner at `tests/bash-test-suite/`
   that consumes upstream bash's own test suite via `$BASH_SOURCE_DIR`;
   baseline triaged at `docs/bash-test-suite-baseline.md`.
