@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 /// What kind of completion a `Candidate` represents. Useful for embedders
 /// rendering icons or sorting by kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CandidateKind {
     /// Command position: executable on PATH, shell function, builtin, or alias.
     Command,
@@ -21,6 +22,7 @@ pub enum CandidateKind {
 /// One completion candidate. `display` is shown in the Tab-Tab list;
 /// `replacement` is the (possibly escaped) text inserted into the line.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Candidate {
     pub display: String,
     pub replacement: String,

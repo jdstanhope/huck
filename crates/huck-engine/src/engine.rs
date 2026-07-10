@@ -59,6 +59,7 @@ use crate::shell_state::Shell;
 ///
 /// [`ExecBuilder::capture`]: crate::exec_builder::ExecBuilder::capture
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Output {
     /// Everything the script wrote to stdout. Under `merge_stderr` this also
     /// contains the script's stderr bytes, interleaved in execution order.
@@ -72,6 +73,7 @@ pub struct Output {
 
 /// The result of a completion query — see [`Engine::complete`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Completion {
     /// Byte offset in the input line where the replacement starts.
     /// Embedders substitute `line[start..cursor]` with each candidate's
