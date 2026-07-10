@@ -3,20 +3,9 @@
 //! The canonical rendering lives in `lex_error_message_impl` /
 //! `parse_error_message_impl` (crate-private). The error types
 //! `LexError` / `ParseError` delegate their `Display` impls here.
-//! The historical public free functions [`lex_error_message`] /
-//! [`parse_error_message`] are kept as thin wrappers but now take
-//! `&LexError` / `&ParseError` so callers can render without moving.
 
 use crate::command::ParseError;
 use crate::lexer::LexError;
-
-pub fn lex_error_message(error: &LexError) -> String {
-    lex_error_message_impl(error)
-}
-
-pub fn parse_error_message(error: &ParseError) -> String {
-    parse_error_message_impl(error)
-}
 
 pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
     match error {
@@ -55,7 +44,7 @@ pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
             format!("'for ((...))' header: {msg}")
         }
         ParseError::Lex(e) => {
-            let s = crate::lex_error_message(e);
+            let s = lex_error_message_impl(e);
             s.strip_prefix(": ").map(|t| t.to_string()).unwrap_or(s)
         }
         ParseError::UnsupportedExpansion => "unsupported expansion".to_string(),
@@ -110,28 +99,16 @@ mod tests {
     use crate::lexer::LexError;
 
     #[test]
-    fn lex_error_display_equals_free_function() {
-        let err = LexError::UnterminatedHeredoc;
-        assert_eq!(format!("{err}"), lex_error_message(&err));
-    }
-
-    #[test]
-    fn parse_error_display_equals_free_function() {
-        let err = ParseError::MissingCommand;
-        assert_eq!(format!("{err}"), parse_error_message(&err));
-    }
-
-    #[test]
     fn parse_error_lex_strips_leading_colon_space() {
         // LexError::UnterminatedQuote renders as ": unterminated quote" via
-        // lex_error_message. When wrapped in ParseError::Lex, parse_error_message
+        // Display. When wrapped in ParseError::Lex, ParseError's Display
         // must strip the leading ": " so callers using "syntax error: {}"
         // produce a single separator, not a double one.
         let err = ParseError::Lex(Box::new(LexError::UnterminatedQuote));
-        let msg = parse_error_message(&err);
+        let msg = err.to_string();
         assert!(
             !msg.starts_with(": "),
-            "parse_error_message for ParseError::Lex should NOT start with \": \", got: {msg:?}"
+            "ParseError::Lex's Display should NOT start with \": \", got: {msg:?}"
         );
         assert_eq!(msg, "unterminated quote");
     }

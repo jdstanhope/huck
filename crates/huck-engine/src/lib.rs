@@ -62,5 +62,5 @@ pub use exec_builder::ExecBuilder;
 pub use executor::{StderrSink, StdoutSink};
 
 // Re-export the frontend so `huck_engine::lexer::`/`::command::` resolve downstream.
+pub use huck_syntax::escape_double_quote_value;
 pub use huck_syntax::{brace_expand, command, generate, lexer, parser};
-pub use huck_syntax::{escape_double_quote_value, lex_error_message, parse_error_message};
