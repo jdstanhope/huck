@@ -182,7 +182,7 @@ pub(crate) fn lit_word(s: &str) -> Word {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub enum Redirect {
+pub enum RedirectSlot {
     /// `<file` — open file for reading on stdin.
     Read(Word),
     /// `>file` — open file for writing (truncate first).
@@ -305,7 +305,11 @@ impl Redirection {
 /// they apply `cmd.redirects` in source order (so L-08 is fixed there).
 pub fn slots_for_simple_path(
     redirs: &[Redirection],
-) -> (Option<Redirect>, Option<Redirect>, Option<Redirect>) {
+) -> (
+    Option<RedirectSlot>,
+    Option<RedirectSlot>,
+    Option<RedirectSlot>,
+) {
     let (mut sin, mut sout, mut serr) = (None, None, None);
     for r in redirs {
         let Some(fd) = r.target_fd() else { continue };
@@ -313,19 +317,19 @@ pub fn slots_for_simple_path(
             RedirOp::File {
                 mode: FileMode::ReadOnly,
                 target,
-            } => Some(Redirect::Read(target.clone())),
+            } => Some(RedirectSlot::Read(target.clone())),
             RedirOp::File {
                 mode: FileMode::Truncate,
                 target,
-            } => Some(Redirect::Truncate(target.clone())),
+            } => Some(RedirectSlot::Truncate(target.clone())),
             RedirOp::File {
                 mode: FileMode::Append,
                 target,
-            } => Some(Redirect::Append(target.clone())),
+            } => Some(RedirectSlot::Append(target.clone())),
             RedirOp::File {
                 mode: FileMode::Clobber,
                 target,
-            } => Some(Redirect::Clobber(target.clone())),
+            } => Some(RedirectSlot::Clobber(target.clone())),
             RedirOp::File {
                 mode: FileMode::ReadWrite,
                 ..
@@ -333,7 +337,7 @@ pub fn slots_for_simple_path(
             RedirOp::Dup {
                 source,
                 output: true,
-            } => Some(Redirect::Dup {
+            } => Some(RedirectSlot::Dup {
                 fd: fd as i32,
                 source: source.clone(),
             }),
@@ -342,12 +346,12 @@ pub fn slots_for_simple_path(
                 body,
                 expand,
                 strip_tabs,
-            } => Some(Redirect::Heredoc {
+            } => Some(RedirectSlot::Heredoc {
                 body: body.clone(),
                 expand: *expand,
                 strip_tabs: *strip_tabs,
             }),
-            RedirOp::HereString(w) => Some(Redirect::HereString(w.clone())),
+            RedirOp::HereString(w) => Some(RedirectSlot::HereString(w.clone())),
         };
         // Only fill a slot when the op direction matches the fd:
         //   stdin  (0): input ops only (ReadOnly, Heredoc, HereString)
@@ -482,13 +486,13 @@ impl ExecCommand {
     /// fast-path (v156). The single-command builtin/external paths no longer use
     /// these — they apply `redirects` in source order. Last-wins, source-order
     /// NOT preserved (see `slots_for_simple_path`).
-    pub fn slot_stdin(&self) -> Option<Redirect> {
+    pub fn slot_stdin(&self) -> Option<RedirectSlot> {
         slots_for_simple_path(&self.redirects).0
     }
-    pub fn slot_stdout(&self) -> Option<Redirect> {
+    pub fn slot_stdout(&self) -> Option<RedirectSlot> {
         slots_for_simple_path(&self.redirects).1
     }
-    pub fn slot_stderr(&self) -> Option<Redirect> {
+    pub fn slot_stderr(&self) -> Option<RedirectSlot> {
         slots_for_simple_path(&self.redirects).2
     }
 }
