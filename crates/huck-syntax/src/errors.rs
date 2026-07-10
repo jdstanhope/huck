@@ -93,7 +93,6 @@ pub(crate) fn lex_error_message_impl(error: &LexError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::brace_expand::BraceError;
     use crate::command::ParseError;
     use crate::lexer::LexError;
