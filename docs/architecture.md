@@ -18,7 +18,8 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   (the incremental atom-emitting `Lexer`), `parser` (the parser — pulls from the
   lexer, owns delimiter-matching), `command` (AST types), `brace_expand`,
   `generate` (AST→source), plus
-  `errors.rs` (`lex_error_message`/`parse_error_message`) and `util.rs`
+  `errors.rs` (the crate-private message renderers behind the `Display` impls)
+  and `util.rs`
   (`escape_double_quote_value`). No dependencies. As of v211 it ships polished
   public-API ergonomics (`Display` + `std::error::Error` on the error types,
   `#[non_exhaustive]` on the AST enums, `try_split_assignment_ref` peek variant,
@@ -97,7 +98,7 @@ the bottom, expansion + execution above, builtins at the top.
 |---|---|
 | `lexer.rs` | The incremental `Lexer`: pulls one token/word-part atom at a time. Owns the `Word` / `WordPart` / `SubscriptKind` types. Driven by a parser-controlled **mode stack** (`Mode::Command`/`ParamExpansion`/`CommandSub`/…); it emits *small atoms* and **never forward-scans for a matching delimiter** — the parser owns all delimiter-matching and recursion (front-end is strictly one-way, `parser → lexer`, since v268; the old fat-lexer "oracle" was deleted in v266). |
 | `parser.rs` | The parser. Pulls live from a `&mut Lexer` and assembles both **words** (subscripts, param-expansions, array literals) and **structure** into the `command.rs` AST. Entry points `parse_sequence` / `parse_one_unit`. Owns delimiter-matching + recursion (nested `$( )`, `${ }`, `( )`, subscripts). |
-| `command.rs` | AST types: `Sequence`, `Pipeline`, `Command`, `SimpleCommand`, `ExecCommand`, `Redirect`/`Redirection`, `AssignTarget`, `Assignment`, `DeclArg`, `IfClause` / `WhileClause` / `ForClause` / `CaseClause`, `TestExpr` (for `[[ ]]`) + assignment-word helpers (`try_split_assignment`, `is_assignment_word`). |
+| `command.rs` | AST types: `Sequence`, `Pipeline`, `Command`, `SimpleCommand`, `ExecCommand`, `RedirectSlot`/`Redirection`, `AssignTarget`, `Assignment`, `DeclArg`, `IfClause` / `WhileClause` / `ForClause` / `CaseClause`, `TestExpr` (for `[[ ]]`) + assignment-word helpers (`try_split_assignment`, `is_assignment_word`). |
 | `shell_state.rs` | `Shell` struct (all session state) + `Variable` + `VarValue` (`Scalar`/`Indexed`/`Associative`) + `ShellOptions` + `AssignErr` / `DeclareErr`. Snapshot/restore primitives (`snapshot_var`/`restore_var`, `snapshot_for_local_scope`). |
 | `expand.rs` | Word → Field expansion pipeline. Owns `Field`, `expand`, `emit_split_fields` (IFS-driven), `eval_subscript` (arith), `eval_subscript_key` (string), `slice_word_list`, `expand_array_param`, `expand_assoc_param`. |
 | `param_expansion.rs` | Modifier-aware parameter expansion (`${var:-w}`, `${#var}`, `${var/pat/repl}`, `${var^^}`, etc.). `ExpansionResult` enum (`Value` / `Empty` / `Fatal` / `WordList`) + `ParamLookup` enum (`Scalar` / `Element(Option<&str>)`). |
