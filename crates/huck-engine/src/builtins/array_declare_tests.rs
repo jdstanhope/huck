@@ -57,14 +57,22 @@ fn readonly_array_blocks_element_write() {
 }
 
 #[test]
-fn export_array_rejects() {
+fn export_array_assigns_and_exports() {
+    // #82: bash accepts `export a=(x y)` — assign the indexed array AND mark it
+    // exported (declare -ax), rc 0. huck used to reject with "cannot export
+    // arrays" and not create the variable.
     let mut s = Shell::new();
     let outcome = run(&mut s, "export a=(x y)");
-    assert!(matches!(
-        outcome,
-        ExecOutcome::Continue(1) | ExecOutcome::Exit(1)
-    ));
-    assert!(s.get_indexed("a").is_none());
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    let m = s.get_indexed("a").expect("array a created");
+    assert_eq!(m.get(&0).map(String::as_str), Some("x"));
+    assert_eq!(m.get(&1).map(String::as_str), Some("y"));
+    let (_, v) = s
+        .iter_vars()
+        .find(|(n, _)| n.as_str() == "a")
+        .expect("a is set");
+    assert!(v.exported, "a must carry the export attribute");
+    assert!(matches!(v.value, crate::shell_state::VarValue::Indexed(_)));
 }
 
 #[test]

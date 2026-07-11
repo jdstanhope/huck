@@ -94,12 +94,37 @@ fn readonly_dash_cap_a_creates_readonly_associative() {
 }
 
 #[test]
-fn export_associative_rejects() {
+fn export_associative_assigns_and_exports() {
+    // #82: bash accepts `export m=([k]=v)` too. Without a prior `declare -A`,
+    // `[k]=v` is indexed-array syntax (the unset var `k` arith-evaluates to
+    // 0), so this creates an INDEXED array `m=([0]=v)`, exported, rc 0.
+    // huck used to reject with "cannot export arrays" for this compound-RHS
+    // form regardless of target type.
     let mut s = Shell::new();
     let outcome = run(&mut s, "export m=([k]=v)");
-    assert!(matches!(
-        outcome,
-        ExecOutcome::Continue(1) | ExecOutcome::Exit(1)
-    ));
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
     assert!(s.get_associative("m").is_none());
+    let idx = s.get_indexed("m").expect("m created as indexed array");
+    assert_eq!(idx.get(&0).map(String::as_str), Some("v"));
+    let (_, v) = s
+        .iter_vars()
+        .find(|(n, _)| n.as_str() == "m")
+        .expect("m is set");
+    assert!(v.exported, "m must carry the export attribute");
+}
+
+#[test]
+fn export_pre_declared_associative_assigns_and_exports() {
+    // With a prior `declare -A m`, the same compound-RHS syntax assigns into
+    // the associative array as bash does (declare -Ax m=([k]="v")).
+    let mut s = Shell::new();
+    let _ = run(&mut s, "declare -A m");
+    let outcome = run(&mut s, "export m=([k]=v)");
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    assert_eq!(s.lookup_associative_element("m", "k"), Some("v".into()));
+    let (_, v) = s
+        .iter_vars()
+        .find(|(n, _)| n.as_str() == "m")
+        .expect("m is set");
+    assert!(v.exported, "m must carry the export attribute");
 }
