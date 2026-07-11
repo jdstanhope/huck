@@ -220,6 +220,24 @@ mod tests {
     }
 
     #[test]
+    fn classify_cmdsub_comment_only_body_is_incomplete() {
+        // #109: a `$(` body that is only a comment, reaching EOF before `)`, must
+        // request continuation (the stdin/REPL reader keeps reading), not Error.
+        assert_eq!(
+            classify("echo $(# c", false),
+            Completeness::Incomplete(ContinuationReason::Subshell)
+        );
+    }
+
+    #[test]
+    fn classify_procsub_comment_only_body_is_incomplete() {
+        assert_eq!(
+            classify("cat <(# c", false),
+            Completeness::Incomplete(ContinuationReason::Subshell)
+        );
+    }
+
+    #[test]
     fn open_array_literal_is_incomplete() {
         // v183: `a=(1 2` — the array literal `(` isn't closed yet. Classify as
         // Incomplete (continuation), not Error, so the REPL / piped stdin keeps

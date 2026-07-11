@@ -2732,6 +2732,42 @@ fn cs_simple() {
     diff_cs("$()"); // empty -> empty Sequence (NOT EmptySubshell)
 }
 
+#[test]
+fn cs_comment_only_body_at_eof_is_unterminated() {
+    // #109: a `$(` body that is only a comment (or empty) reaching EOF before
+    // `)` is an UNTERMINATED substitution — so the stdin/REPL reader keeps
+    // reading — not a MissingCommand error. Mirrors parse_subshell's guard.
+    assert!(
+        matches!(
+            new_cs("$(# c", false),
+            Err(ParseError::UnterminatedSubshell)
+        ),
+        "comment-only body: got {:?}",
+        new_cs("$(# c", false)
+    );
+    assert!(
+        matches!(new_cs("$(", false), Err(ParseError::UnterminatedSubshell)),
+        "bare $( at EOF: got {:?}",
+        new_cs("$(", false)
+    );
+    // Regression guards: empty `$()` is still a valid empty substitution.
+    assert!(
+        new_cs("$()", false).is_ok(),
+        "empty $(): {:?}",
+        new_cs("$()", false)
+    );
+}
+
+#[test]
+fn process_sub_comment_only_body_at_eof_is_unterminated() {
+    // #109 sibling: `<(` with a comment-only body at EOF is likewise unterminated.
+    assert!(
+        matches!(new_seq("cat <(# c"), Err(ParseError::UnterminatedSubshell)),
+        "procsub comment-only body: got {:?}",
+        new_seq("cat <(# c")
+    );
+}
+
 /// G2: a command-substitution body that is only whitespace/newlines
 /// (no actual command) must parse the SAME empty `Sequence` a truly-empty
 /// `$()` body does — bash treats `$( )`/`$(\n\t)` as an empty command
