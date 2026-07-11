@@ -2999,7 +2999,12 @@ impl Shell {
         self.vars
             .iter()
             .filter(|(_, v)| v.exported)
-            .map(|(k, v)| (k.as_str(), v.value.scalar_view()))
+            // bash never inherits array variables into a child's environment;
+            // emit only true scalars (skip Indexed/Associative). See #28.
+            .filter_map(|(k, v)| match &v.value {
+                VarValue::Scalar(s) => Some((k.as_str(), s.as_str())),
+                VarValue::Indexed(_) | VarValue::Associative(_) => None,
+            })
     }
 
     /// Iterates the names of all variables (exported or not).

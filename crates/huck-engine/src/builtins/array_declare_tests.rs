@@ -76,6 +76,23 @@ fn export_array_assigns_and_exports() {
 }
 
 #[test]
+fn exported_array_omitted_from_child_env_but_scalar_kept() {
+    // #28: bash never puts an array into a child's environment; huck used to
+    // leak the [0] element as a scalar. An exported scalar is still inherited.
+    let mut s = Shell::new();
+    let _ = run(&mut s, "export a=(x y z)");
+    let _ = run(&mut s, "export s=hi");
+    assert!(
+        !s.exported_env().any(|(k, _)| k == "a"),
+        "exported array must NOT appear in the child environment"
+    );
+    assert!(
+        s.exported_env().any(|(k, v)| k == "s" && v == "hi"),
+        "exported scalar must still be inherited"
+    );
+}
+
+#[test]
 fn readonly_p_lists_array_with_full_elements() {
     // Regression: `readonly -p` used to route through scalar_view and
     // collapse arrays to element 0. The fix routes through
