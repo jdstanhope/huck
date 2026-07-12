@@ -203,3 +203,14 @@ v142 adds the `builtin NAME [args]` builtin. huck correctly peels `builtin`-led 
 huck enforces `FUNCNEST` exactly like bash, but additionally clamps the effective nesting limit to an internal backstop `FUNCNEST_HARD_MAX = 2048` (below huck's ~2800 native-stack crash ceiling). So unbounded recursion with no/`0` FUNCNEST — or `FUNCNEST` set above 2048 — produces a clean `maximum function nesting level exceeded (2048)` error + rc 1 where bash would recurse deeper (and ultimately SIGSEGV). Intentional robustness improvement over bash's segfault; the message shows `2048` rather than a user-set value when clamped. Not a no-crash guarantee — a sufficiently stack-heavy recursive function can still overflow below 2048.
 
 ---
+
+### an unterminated `$(` inside a here-document body is a parse error
+
+[Issue #83 · by-design](https://github.com/jdstanhope/huck/issues/83)
+
+- **huck**: an expanding here-document body is parsed into typed AST at parse time (`parse_heredoc_body_expanding`), so a malformed command substitution in the body — e.g. `read foo <<EOF`⏎`$(seq 10`⏎`EOF` — is a **parse** error (rc 2), reported at parse time (and by `huck -n`).
+- **bash**: keeps a here-document body opaque at parse time and defers command-substitution parsing to **runtime**, so the same input parses (`bash -n` rc 0) and the unterminated `$(` errors only when the heredoc is instantiated (rc 1, `unexpected EOF while looking for matching ')'`).
+- **Why intentional**: for every VALID heredoc body huck's eager parse and bash's runtime parse produce identical results — the divergence is confined to genuinely malformed expansion bodies (exotic, sev:low), where huck still errors cleanly (no panic), just at parse time with rc 2 instead of runtime with rc 1. Full parity requires runtime-deferred heredoc-body expansion (storing the body as raw text and parsing+expanding it at runtime), a major rework of a hot, heavily-tested happy path; the risk is not justified for a malformed-input edge. (Surfaced by the bash test-suite `comsub-eof6.sub`.)
+- **Workaround**: none needed; write terminated command substitutions in heredoc bodies.
+
+---
