@@ -5163,7 +5163,7 @@ fn run_exec_single_inner(
     // scopes. finalize_inline_scope (every exit path below) pops exactly this.
     shell
         .inline_scopes
-        .push(snap.iter().map(|(n, _)| n.clone()).collect());
+        .push(snap.vars.iter().map(|(n, _)| n.clone()).collect());
 
     if crate::restricted::is_restricted(shell)
         && let Err(msg) = crate::restricted::check_command_name(&resolved.program)
@@ -7949,7 +7949,16 @@ fn wait_pipeline_raw(
 /// Cloning the entire `Variable` (rather than just its scalar value
 /// and export flag) is what lets v71 array-valued inline prefixes
 /// round-trip correctly through restore.
-type AssignmentSnapshot = Vec<(String, Option<crate::shell_state::Variable>)>;
+/// Snapshot of the variable state an inline-prefix scope must restore, plus
+/// bookkeeping for the `#28` child-env scalar overlay.
+#[derive(Debug)]
+struct AssignmentSnapshot {
+    /// `(name, prior)` per snapshotted variable, restored LIFO.
+    vars: Vec<(String, Option<crate::shell_state::Variable>)>,
+    /// How many entries this apply pushed onto `shell.inline_scalar_export`,
+    /// truncated (LIFO) by restore/finalize. See #28.
+    overlay_pushed: usize,
+}
 
 /// Expands and applies `assignments` left-to-right, exporting each, and
 /// returns a snapshot the caller can pass to `restore_inline_assignments`
@@ -7960,7 +7969,10 @@ fn apply_inline_assignments(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> Result<AssignmentSnapshot, AssignmentSnapshot> {
-    let mut snap: AssignmentSnapshot = Vec::with_capacity(assignments.len());
+    let mut snap = AssignmentSnapshot {
+        vars: Vec::with_capacity(assignments.len()),
+        overlay_pushed: 0,
+    };
     for a in assignments {
         let name = a.target.name();
 
@@ -8008,8 +8020,20 @@ fn apply_inline_assignments(
             && !is_array_value_word(&a.value)
         {
             shell.export(&snap_name);
+            // #28: `exported_env` omits persistent exported arrays, but an
+            // inline-prefix SCALAR assignment must still reach the child as that
+            // scalar even when the target variable is array-typed (bash exports
+            // the inline scalar). Record its scalar view so `exported_env`
+            // re-adds it; the overlay is popped when this scope is restored.
+            if shell.get_indexed(&snap_name).is_some()
+                || shell.get_associative(&snap_name).is_some()
+            {
+                let sv = shell.get(&snap_name).unwrap_or_default().to_string();
+                shell.inline_scalar_export.push((snap_name.clone(), sv));
+                snap.overlay_pushed += 1;
+            }
         }
-        snap.push((snap_name, prior));
+        snap.vars.push((snap_name, prior));
     }
     Ok(snap)
 }
@@ -8017,9 +8041,17 @@ fn apply_inline_assignments(
 /// Restores each snapshot entry in reverse order, so repeated names
 /// unwind LIFO and end up at their pre-prefix value.
 fn restore_inline_assignments(snap: AssignmentSnapshot, shell: &mut Shell) {
-    for (name, prior) in snap.into_iter().rev() {
+    pop_inline_scalar_overlay(snap.overlay_pushed, shell);
+    for (name, prior) in snap.vars.into_iter().rev() {
         shell.restore_var(&name, prior);
     }
+}
+
+/// Truncate the `#28` inline-scalar child-env overlay by the `count` entries a
+/// paired `apply_inline_assignments` pushed (LIFO).
+fn pop_inline_scalar_overlay(count: usize, shell: &mut Shell) {
+    let new_len = shell.inline_scalar_export.len().saturating_sub(count);
+    shell.inline_scalar_export.truncate(new_len);
 }
 
 /// Pops the top `inline_scopes` entry pushed by `run_exec_single` and finalizes
@@ -8028,6 +8060,7 @@ fn restore_inline_assignments(snap: AssignmentSnapshot, shell: &mut Shell) {
 /// PERSISTENT (posix special builtin / export / readonly): keep the live values
 /// and delete these names from every enclosing scope so their restores skip them.
 fn finalize_inline_scope(snap: AssignmentSnapshot, persistent: bool, shell: &mut Shell) {
+    pop_inline_scalar_overlay(snap.overlay_pushed, shell);
     let kept = shell.inline_scopes.pop().unwrap_or_default();
     if persistent {
         // Only POSIX mode propagates a persist THROUGH an enclosing
@@ -8035,14 +8068,14 @@ fn finalize_inline_scope(snap: AssignmentSnapshot, persistent: bool, shell: &mut
         // value at their own level (snap not restored here) but must NOT
         // survive an enclosing same-name restore — so skip the deletion.
         if shell.shell_options.posix {
-            for (name, _) in &snap {
+            for (name, _) in &snap.vars {
                 for scope in shell.inline_scopes.iter_mut() {
                     scope.remove(name);
                 }
             }
         }
     } else {
-        for (name, prior) in snap.into_iter().rev() {
+        for (name, prior) in snap.vars.into_iter().rev() {
             if kept.contains(&name) {
                 shell.restore_var(&name, prior);
             }

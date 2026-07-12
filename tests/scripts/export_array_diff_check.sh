@@ -23,5 +23,9 @@ check "export existing array"    'a=(x y); export a; declare -p a'
 check "export array append"      'a=(1 2 3); export a+=(4 5); declare -p a'
 check "array not in child env"   'export a=(x y z); printenv a; echo "rc=$?"'
 check "scalar IS in child env"   'export s=hi; printenv s; echo "rc=$?"'
+# #28: an inline-prefix scalar over an array IS exported to the child as that
+# scalar (unlike a persistent exported array); the parent array is restored.
+check "inline scalar over array" 'FOO=(o d m); FOO=inner printenv FOO; echo "rc=$? after:${FOO[*]}"'
+check "inline nested restore"    'FOO=(a b c); f(){ FOO=in2 printenv FOO; echo "inrc=$?"; printenv FOO; echo "aftrc=$?"; }; FOO=out f; echo "final:${FOO[*]}"'
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

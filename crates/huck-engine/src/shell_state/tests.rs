@@ -398,6 +398,22 @@ fn export_marks_existing_exported() {
 }
 
 #[test]
+fn exported_env_includes_inline_scalar_overlay() {
+    // #28: the inline-prefix scalar overlay (a scalar exported to a child even
+    // though the variable is array-typed) is chained into exported_env.
+    let mut shell = Shell::new();
+    shell
+        .inline_scalar_export
+        .push(("OVL".to_string(), "v".to_string()));
+    assert!(
+        shell
+            .exported_env()
+            .any(|(k, val)| k == "OVL" && val == "v"),
+        "inline scalar overlay must appear in exported_env"
+    );
+}
+
+#[test]
 fn export_creates_empty_when_missing() {
     let mut shell = Shell::new();
     shell.export("HUCK_TEST_EMPTY");

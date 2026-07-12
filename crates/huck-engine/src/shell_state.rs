@@ -725,6 +725,12 @@ pub struct Shell {
     /// deletes its names from all enclosing scopes so the live value survives
     /// their restores. Empty between top-level commands.
     pub inline_scopes: Vec<std::collections::HashSet<String>>,
+    /// Scalar `(name, value)` overrides added to a child's environment even
+    /// though the variable is array-typed — set by an inline-prefix SCALAR
+    /// assignment over an array target (bash exports the inline scalar, while a
+    /// persistent exported array is omitted; see [`Shell::exported_env`]).
+    /// Managed as a LIFO stack by `apply`/`restore_inline_assignments`. See #28.
+    pub inline_scalar_export: Vec<(String, String)>,
     /// Map of function-name → defining source file path. Populated when a
     /// function is defined. Used to fill `Frame.source` and ultimately
     /// `BASH_SOURCE`.
@@ -1063,6 +1069,7 @@ impl Shell {
             shell_argv0,
             call_stack: Vec::new(),
             inline_scopes: Vec::new(),
+            inline_scalar_export: Vec::new(),
             function_source: std::collections::HashMap::new(),
             pending_fatal_status: None,
             builtin_usage_error: None,
@@ -3005,6 +3012,15 @@ impl Shell {
                 VarValue::Scalar(s) => Some((k.as_str(), s.as_str())),
                 VarValue::Indexed(_) | VarValue::Associative(_) => None,
             })
+            // …plus inline-prefix scalar assignments over an array target: bash
+            // still exports the assigned scalar even though the variable is an
+            // array. Chained LAST so a same-name duplicate wins (std
+            // `Command::envs` keeps the last value). See #28.
+            .chain(
+                self.inline_scalar_export
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str())),
+            )
     }
 
     /// Iterates the names of all variables (exported or not).
