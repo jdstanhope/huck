@@ -100,6 +100,11 @@ impl History {
         }
     }
 
+    /// The resolved default history file (`$HISTFILE` / `~/.huck_history`), if any.
+    pub fn file_path(&self) -> Option<&std::path::Path> {
+        self.file.as_deref()
+    }
+
     /// The most recent entry that starts with `prefix`.
     pub fn search_prefix(&self, prefix: &str) -> Option<&str> {
         self.entries
