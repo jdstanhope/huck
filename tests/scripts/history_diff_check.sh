@@ -30,5 +30,16 @@ check "delete nonnum err" "$POP history -d abc; echo rc=\$?"
 check "read append"       "$POP history -r fix; history"
 check "write file"        "$POP history -w out; cat out"
 check "append after read" "$POP : > ap; history -a ap; echo \"ap=[\$(cat ap)]\""
+check "delete empty crash guard" "$POP history -d ''; echo rc=\$?"
+check "double-dash lists all" "$POP history --"
+check "nonnumeric count arg"    "$POP history abc; echo rc=\$?"
+# NB: bash's "too many arguments" error for the trailing-count path
+# discards the REST OF THE SAME PARSED LIST (a bash-internal
+# jump-to-top-level(DISCARD) quirk specific to this one check -- e.g.
+# `history 2 3 || echo x` never runs the `|| echo x` either). That list-abort
+# propagation is out of scope for the history builtin fix; put the trailing
+# `echo rc=$?` on its own line so both shells resume at the next top-level
+# command and we verify just the message/rc this fix is responsible for.
+check "too many arguments" "$(printf '%s\nhistory 2 3\necho rc=$?' "$POP")"
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

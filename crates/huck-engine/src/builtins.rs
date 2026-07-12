@@ -5291,6 +5291,11 @@ fn builtin_history(
     }
 
     let mut idx = 0;
+    // Set true only when -c/-d/-w/-r/-a actually ran (NOT for `--` or an
+    // unknown option), so the trailing "list all" block can distinguish
+    // "no operand, no action" (list all) from "no operand, action already
+    // performed" (nothing more to do).
+    let mut did_action = false;
     // ---- options ----
     while idx < args.len() {
         let a = &args[idx];
@@ -5301,6 +5306,7 @@ fn builtin_history(
         match a.as_str() {
             "-c" => {
                 Rc::make_mut(&mut shell.history).clear();
+                did_action = true;
                 idx += 1;
             }
             "-d" => {
@@ -5314,8 +5320,14 @@ fn builtin_history(
                     return ExecOutcome::Continue(1);
                 };
                 // Range iff a '-' appears AFTER the first char (so a leading
-                // negative sign on a single offset isn't mistaken for a range).
-                let split = operand[1..].find('-').map(|i| i + 1);
+                // negative sign on a single offset isn't mistaken for a
+                // range). `operand.get(1..)` (rather than `operand[1..]`)
+                // avoids panicking when `operand` is empty or the byte at
+                // index 1 isn't a char boundary; an empty operand simply
+                // falls through to the single-offset path below, where
+                // `resolve_offset("")` fails and yields the standard
+                // out-of-range error.
+                let split = operand.get(1..).and_then(|s| s.find('-')).map(|i| i + 1);
                 let range = match split {
                     Some(i) => Some((&operand[..i], &operand[i + 1..])),
                     None => None,
@@ -5324,6 +5336,7 @@ fn builtin_history(
                     match (resolve_offset(shell, sa), resolve_offset(shell, sb)) {
                         (Some(a), Some(b)) => {
                             Rc::make_mut(&mut shell.history).delete_range(a, b);
+                            did_action = true;
                         }
                         _ => {
                             crate::sh_error_to!(
@@ -5337,7 +5350,9 @@ fn builtin_history(
                     }
                 } else {
                     match resolve_offset(shell, operand) {
-                        Some(n) if Rc::make_mut(&mut shell.history).delete(n) => {}
+                        Some(n) if Rc::make_mut(&mut shell.history).delete(n) => {
+                            did_action = true;
+                        }
                         _ => {
                             crate::sh_error_to!(
                                 shell,
@@ -5389,6 +5404,7 @@ fn builtin_history(
                     );
                     return ExecOutcome::Continue(1);
                 }
+                did_action = true;
                 idx += 1;
             }
             "-p" | "-s" | "-n" => {
@@ -5410,14 +5426,25 @@ fn builtin_history(
 
     // ---- trailing operand: the listing count N (only when no option consumed it) ----
     let rest = &args[idx..];
+    if did_action {
+        // Bash only validates/uses trailing operands on the pure "list"
+        // path. Once an action (-c/-d/-w/-r/-a) has actually run, any
+        // leftover operands (numeric or not, one or many) are silently
+        // discarded — confirmed against bash 5.2: `history -d 2 3 4` and
+        // `history -c 3` neither error nor print a listing.
+        return ExecOutcome::Continue(0);
+    }
+    if rest.len() > 1 {
+        crate::sh_error_to!(shell, err, None, "history: too many arguments");
+        return ExecOutcome::Continue(1);
+    }
     match rest.first().map(|s| s.as_str()) {
         None => {
-            // No numeric operand: if any option ran, we're done (rc 0); else list all.
-            if idx == 0 {
-                for (number, command) in shell.history.entries() {
-                    if writeln!(out, "{number:>5}  {command}").is_err() {
-                        return ExecOutcome::Continue(1);
-                    }
+            // No numeric operand and no action ran: list all (this also
+            // covers a bare `--` with nothing after it).
+            for (number, command) in shell.history.entries() {
+                if writeln!(out, "{number:>5}  {command}").is_err() {
+                    return ExecOutcome::Continue(1);
                 }
             }
             ExecOutcome::Continue(0)
@@ -5432,13 +5459,13 @@ fn builtin_history(
                 ExecOutcome::Continue(0)
             }
             Err(_) => {
-                crate::sh_error_to!(shell, err, None, "history: {n_str}: invalid option");
-                e!(
+                crate::sh_error_to!(
+                    shell,
                     err,
-                    "history: usage: history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]"
+                    None,
+                    "history: {n_str}: numeric argument required"
                 );
-                shell.builtin_usage_error = Some(2);
-                ExecOutcome::Continue(2)
+                ExecOutcome::Continue(1)
             }
         },
     }
