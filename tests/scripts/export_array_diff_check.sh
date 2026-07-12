@@ -27,5 +27,8 @@ check "scalar IS in child env"   'export s=hi; printenv s; echo "rc=$?"'
 # scalar (unlike a persistent exported array); the parent array is restored.
 check "inline scalar over array" 'FOO=(o d m); FOO=inner printenv FOO; echo "rc=$? after:${FOO[*]}"'
 check "inline nested restore"    'FOO=(a b c); f(){ FOO=in2 printenv FOO; echo "inrc=$?"; printenv FOO; echo "aftrc=$?"; }; FOO=out f; echo "final:${FOO[*]}"'
+# #28: a redirection-only `exec` with an inline scalar over an array must not
+# leak that scalar into the child env of subsequent commands.
+check "inline over array + exec" 'FOO=(a b c); FOO=inner exec 3>/dev/null; printenv FOO; echo "rc=$?"'
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

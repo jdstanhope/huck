@@ -5139,6 +5139,11 @@ fn run_exec_single_inner(
                 let mut err = err_writer(err_sink, sink);
                 crate::sh_error_to!(shell, &mut *err, None, "{msg}");
             }
+            // exec's variable assignments persist (special builtin), but the
+            // #28 child-env scalar overlay must NOT — pop it so a later command
+            // doesn't inherit this inline scalar. (inline_scopes isn't pushed on
+            // this early-return path, so only the overlay is popped.)
+            pop_inline_scalar_overlay(snap.overlay_pushed, shell);
             drain_procsubs(shell, procsub_base);
             return ExecOutcome::Continue(1);
         }
@@ -5154,6 +5159,10 @@ fn run_exec_single_inner(
         {
             shell.posix_fatal(st);
         }
+        // exec's variable assignments persist, but pop the #28 child-env scalar
+        // overlay so it doesn't leak into subsequent commands (redirection-only
+        // `exec` continues the shell). See the early-return above.
+        pop_inline_scalar_overlay(snap.overlay_pushed, shell);
         drain_procsubs(shell, procsub_base);
         return outcome;
     }
