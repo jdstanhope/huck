@@ -1309,19 +1309,11 @@ fn emit_function(
 // via `executor::apply_one_assignment` — the same path used by ordinary
 // assignment commands.
 
-/// True iff the `Word` value of an Assignment carries a trailing
-/// `ArrayLiteral` (i.e. it's a compound-RHS form like `name=(x y)`).
-fn assign_value_is_array(a: &crate::command::Assignment) -> bool {
-    matches!(
-        a.value.0.last(),
-        Some(crate::lexer::WordPart::ArrayLiteral(_))
-    )
-}
-
-/// `export` entry point with DeclArg input. Rejects array compound-RHS;
-/// otherwise mirrors the legacy `builtin_export` behavior (scalar `=`
-/// assigns + exports; bare `NAME` flips the export bit without checking
-/// readonly).
+/// `export` entry point with DeclArg input. Mirrors the legacy `builtin_export`
+/// behavior: scalar `=` assigns + exports; array compound-RHS (`name=(x y)`)
+/// assigns the array via `apply_one_assignment` and sets the export attribute
+/// (bash `declare -ax`); bare `NAME` flips the export bit without checking
+/// readonly.
 fn builtin_export_decl(
     args: &[DeclArg],
     out: &mut dyn Write,
@@ -1458,11 +1450,6 @@ fn builtin_export_decl(
                 }
             },
             DeclArg::Assign(a) => {
-                if assign_value_is_array(a) {
-                    crate::sh_error_to!(shell, err, None, "export: cannot export arrays");
-                    any_error = true;
-                    continue;
-                }
                 if matches!(&a.target, crate::command::AssignTarget::Indexed { .. }) {
                     let name = a.target.name();
                     crate::sh_error_to!(

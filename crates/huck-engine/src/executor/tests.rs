@@ -997,7 +997,7 @@ fn apply_inline_assignments_sets_and_exports_left_to_right() {
     assert_eq!(shell.get("B"), Some("1"));
     assert!(shell.is_exported("A"));
     assert!(shell.is_exported("B"));
-    assert_eq!(snap.len(), 2);
+    assert_eq!(snap.vars.len(), 2);
 }
 
 #[test]
