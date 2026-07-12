@@ -231,6 +231,26 @@ fn history_too_many_arguments_errors() {
 }
 
 #[test]
+fn history_nonnumeric_first_multi_operand_reports_numeric_not_too_many() {
+    // The numeric check on the FIRST operand precedes the operand count:
+    // `history abc def` → "abc: numeric argument required", not "too many".
+    let mut shell = Shell::new();
+    Rc::make_mut(&mut shell.history).add("a".to_string());
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "history",
+        &["abc".to_string(), "def".to_string()],
+        &mut Vec::new(),
+        &mut err,
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    let t = String::from_utf8(err).unwrap();
+    assert!(t.contains("abc: numeric argument required"), "got: {t}");
+    assert!(!t.contains("too many"), "got: {t}");
+}
+
+#[test]
 fn history_extra_operands_after_action_are_ignored() {
     // Bash 5.2 ground truth: once an option has actually performed an
     // action (-c/-d/-w/-r/-a), any leftover trailing operands are silently

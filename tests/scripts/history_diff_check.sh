@@ -33,6 +33,7 @@ check "append after read" "$POP : > ap; history -a ap; echo \"ap=[\$(cat ap)]\""
 check "delete empty crash guard" "$POP history -d ''; echo rc=\$?"
 check "double-dash lists all" "$POP history --"
 check "nonnumeric count arg"    "$POP history abc; echo rc=\$?"
+check "nonnumeric-first multi"  "$POP history abc def; echo rc=\$?"
 # NB: bash's "too many arguments" error for the trailing-count path
 # discards the REST OF THE SAME PARSED LIST (a bash-internal
 # jump-to-top-level(DISCARD) quirk specific to this one check -- e.g.

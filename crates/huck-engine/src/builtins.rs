@@ -5434,10 +5434,6 @@ fn builtin_history(
         // `history -c 3` neither error nor print a listing.
         return ExecOutcome::Continue(0);
     }
-    if rest.len() > 1 {
-        crate::sh_error_to!(shell, err, None, "history: too many arguments");
-        return ExecOutcome::Continue(1);
-    }
     match rest.first().map(|s| s.as_str()) {
         None => {
             // No numeric operand and no action ran: list all (this also
@@ -5449,15 +5445,9 @@ fn builtin_history(
             }
             ExecOutcome::Continue(0)
         }
+        // Bash validates the FIRST operand numerically BEFORE counting operands:
+        // `history abc def` → "abc: numeric argument required", not "too many".
         Some(n_str) => match n_str.parse::<usize>() {
-            Ok(n) => {
-                for (number, command) in shell.history.tail(n) {
-                    if writeln!(out, "{number:>5}  {command}").is_err() {
-                        return ExecOutcome::Continue(1);
-                    }
-                }
-                ExecOutcome::Continue(0)
-            }
             Err(_) => {
                 crate::sh_error_to!(
                     shell,
@@ -5466,6 +5456,18 @@ fn builtin_history(
                     "history: {n_str}: numeric argument required"
                 );
                 ExecOutcome::Continue(1)
+            }
+            Ok(_) if rest.len() > 1 => {
+                crate::sh_error_to!(shell, err, None, "history: too many arguments");
+                ExecOutcome::Continue(1)
+            }
+            Ok(n) => {
+                for (number, command) in shell.history.tail(n) {
+                    if writeln!(out, "{number:>5}  {command}").is_err() {
+                        return ExecOutcome::Continue(1);
+                    }
+                }
+                ExecOutcome::Continue(0)
             }
         },
     }
