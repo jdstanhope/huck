@@ -34,6 +34,10 @@ pub struct History {
     base_number: usize,
     max: Option<usize>,
     file: Option<PathBuf>,
+    /// Index of the first entry not yet written to a file via `-a`/`-w`
+    /// (reset on `clear`/session start). `history -a` appends
+    /// `entries[unwritten_start..]` then advances this to `entries.len()`.
+    unwritten_start: usize,
 }
 
 impl History {
@@ -43,6 +47,7 @@ impl History {
             base_number: 1,
             max: Some(HISTORY_MAX),
             file: resolve_histfile(),
+            unwritten_start: 0,
         }
     }
 
@@ -59,6 +64,7 @@ impl History {
             while self.entries.len() > cap {
                 self.entries.remove(0);
                 self.base_number += 1;
+                self.unwritten_start = self.unwritten_start.saturating_sub(1);
             }
         }
     }
@@ -116,6 +122,7 @@ impl History {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.base_number = 1;
+        self.unwritten_start = 0;
     }
 
     /// Reads the histfile into `entries`, keeping the most recent `max`
@@ -184,6 +191,94 @@ impl History {
     #[cfg(test)]
     pub fn save(&self) {
         self.save_capped(self.max);
+    }
+
+    /// The last `n` entries as `(absolute_number, command)`, oldest-first.
+    /// `n == 0` yields nothing; `n` past the length yields the whole list.
+    pub fn tail(&self, n: usize) -> impl Iterator<Item = (usize, &str)> {
+        let start = self.entries.len().saturating_sub(n);
+        let base = self.base_number;
+        self.entries[start..]
+            .iter()
+            .enumerate()
+            .map(move |(i, s)| (base + start + i, s.as_str()))
+    }
+
+    /// Deletes the entry with absolute display `number`. Returns `false` if it
+    /// is outside `base_number..=last_number`. Remaining entries renumber
+    /// contiguously (the base+index model). Adjusts the `-a` marker if an entry
+    /// before it is removed.
+    pub fn delete(&mut self, number: usize) -> bool {
+        if number < self.base_number {
+            return false;
+        }
+        let idx = number - self.base_number;
+        if idx >= self.entries.len() {
+            return false;
+        }
+        self.entries.remove(idx);
+        if idx < self.unwritten_start {
+            self.unwritten_start -= 1;
+        }
+        true
+    }
+
+    /// Deletes every entry with absolute number in `start..=end` (inclusive);
+    /// returns the count removed. Reversed/empty range removes nothing.
+    /// Deletes high→low so lower indices stay valid.
+    pub fn delete_range(&mut self, start: usize, end: usize) -> usize {
+        if end < start {
+            return 0;
+        }
+        let mut removed = 0;
+        for number in (start..=end).rev() {
+            if self.delete(number) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// `history -w`: writes the WHOLE list to `path` (truncating), one escaped
+    /// entry per line, and marks everything written.
+    pub fn write_all_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let mut out = String::new();
+        for e in &self.entries {
+            out.push_str(&escape_for_save(e));
+            out.push('\n');
+        }
+        std::fs::write(path, out)?;
+        self.unwritten_start = self.entries.len();
+        Ok(())
+    }
+
+    /// `history -a`: appends only the not-yet-written entries
+    /// (`entries[unwritten_start..]`) to `path` (append mode, create if absent),
+    /// then advances the marker.
+    pub fn append_new_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        for e in &self.entries[self.unwritten_start..] {
+            writeln!(f, "{}", escape_for_save(e))?;
+        }
+        self.unwritten_start = self.entries.len();
+        Ok(())
+    }
+
+    /// `history -r`: reads `path`, unescapes, APPENDS its lines to the list,
+    /// enforces the cap, and marks all-written (read lines are on-disk origin,
+    /// not re-appended by a later `-a`).
+    pub fn read_append_from(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let contents = std::fs::read_to_string(path)?;
+        for line in contents.lines() {
+            self.entries.push(unescape_for_load(line));
+        }
+        self.enforce_max();
+        self.unwritten_start = self.entries.len();
+        Ok(())
     }
 }
 
@@ -487,6 +582,7 @@ mod tests {
             base_number: 1,
             max: Some(1000),
             file: None,
+            unwritten_start: 0,
         }
     }
 
@@ -497,6 +593,7 @@ mod tests {
             base_number: 1,
             max: Some(1000),
             file: None,
+            unwritten_start: 0,
         };
         for c in ["c1", "c2", "c3", "c4", "c5"] {
             h.add(c.to_string());
@@ -513,6 +610,7 @@ mod tests {
             base_number: 1,
             max: Some(2),
             file: None,
+            unwritten_start: 0,
         };
         h.set_max(None);
         for c in ["c1", "c2", "c3", "c4"] {
@@ -529,6 +627,7 @@ mod tests {
             base_number: 1,
             max: Some(10),
             file: None,
+            unwritten_start: 0,
         };
         h.add("c1".to_string());
         h.set_max(Some(0));
@@ -546,6 +645,7 @@ mod tests {
             base_number: 1,
             max: None,
             file: Some(path.clone()),
+            unwritten_start: 0,
         };
         for c in ["c1", "c2", "c3"] {
             h.add(c.to_string());
@@ -563,6 +663,7 @@ mod tests {
             base_number: 1,
             max: None,
             file: Some(path.clone()),
+            unwritten_start: 0,
         };
         for c in ["c1", "c2"] {
             h.add(c.to_string());
@@ -602,6 +703,7 @@ mod tests {
             base_number: 1,
             max: Some(3),
             file: None,
+            unwritten_start: 0,
         };
         for cmd in ["c1", "c2", "c3", "c4", "c5"] {
             h.add(cmd.to_string());
@@ -654,6 +756,7 @@ mod tests {
             base_number: 1,
             max: Some(1000),
             file: Some(path.clone()),
+            unwritten_start: 0,
         };
         writer.save();
 
@@ -662,6 +765,7 @@ mod tests {
             base_number: 1,
             max: Some(1000),
             file: Some(path.clone()),
+            unwritten_start: 0,
         };
         reader.load();
         let collected: Vec<(usize, &str)> = reader.entries().collect();
@@ -677,6 +781,7 @@ mod tests {
             base_number: 1,
             max: Some(1000),
             file: Some(path),
+            unwritten_start: 0,
         };
         h.load();
         assert_eq!(h.last(), None);
@@ -693,6 +798,7 @@ mod tests {
             base_number: 1,
             max: Some(3),
             file: Some(path),
+            unwritten_start: 0,
         };
         h.load();
         let collected: Vec<(usize, &str)> = h.entries().collect();
@@ -706,6 +812,7 @@ mod tests {
             base_number: 1,
             max: Some(1000),
             file: None,
+            unwritten_start: 0,
         };
         h.load();
         h.save();
@@ -722,6 +829,7 @@ mod tests {
                 base_number: 1,
                 max: Some(1000),
                 file: Some(path.clone()),
+                unwritten_start: 0,
             };
             h.add("cat <<EOF\nhello\nworld\nEOF".to_string());
             h.save();
@@ -731,6 +839,7 @@ mod tests {
             base_number: 1,
             max: Some(1000),
             file: Some(path.clone()),
+            unwritten_start: 0,
         };
         h2.load();
         let entries: Vec<String> = h2.entries().map(|(_, s)| s.to_string()).collect();
@@ -747,6 +856,7 @@ mod tests {
                 base_number: 1,
                 max: Some(1000),
                 file: Some(path.clone()),
+                unwritten_start: 0,
             };
             h.add(r"echo a\b".to_string());
             h.save();
@@ -756,6 +866,7 @@ mod tests {
             base_number: 1,
             max: Some(1000),
             file: Some(path.clone()),
+            unwritten_start: 0,
         };
         h2.load();
         let entries: Vec<String> = h2.entries().map(|(_, s)| s.to_string()).collect();
@@ -772,6 +883,7 @@ mod tests {
             base_number: 1,
             max: Some(1000),
             file: Some(path.clone()),
+            unwritten_start: 0,
         };
         h.load();
         let entries: Vec<String> = h.entries().map(|(_, s)| s.to_string()).collect();
@@ -784,6 +896,7 @@ mod tests {
             base_number: 1,
             max: Some(1000),
             file: None,
+            unwritten_start: 0,
         };
         for c in cmds {
             h.add(c.to_string());
@@ -1097,5 +1210,85 @@ mod tests {
         let result = expand("echo ${!foo}", &history);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn tail_returns_last_n_with_numbers() {
+        let mut h = empty();
+        for c in ["a", "b", "c", "d"] {
+            h.add(c.to_string());
+        }
+        assert_eq!(h.tail(2).collect::<Vec<_>>(), vec![(3, "c"), (4, "d")]);
+        assert_eq!(h.tail(0).count(), 0);
+        assert_eq!(
+            h.tail(99).collect::<Vec<_>>(),
+            vec![(1, "a"), (2, "b"), (3, "c"), (4, "d")]
+        );
+    }
+
+    #[test]
+    fn delete_renumbers_and_bounds() {
+        let mut h = empty();
+        for c in ["a", "b", "c"] {
+            h.add(c.to_string());
+        }
+        assert!(h.delete(2)); // remove "b"
+        assert_eq!(h.entries().collect::<Vec<_>>(), vec![(1, "a"), (2, "c")]);
+        assert!(!h.delete(9)); // out of range
+        assert!(h.delete(1)); // remove "a"
+        assert_eq!(h.entries().collect::<Vec<_>>(), vec![(1, "c")]);
+    }
+
+    #[test]
+    fn delete_range_inclusive_and_reversed_noop() {
+        let mut h = empty();
+        for c in ["a", "b", "c", "d", "e"] {
+            h.add(c.to_string());
+        }
+        assert_eq!(h.delete_range(2, 3), 2); // remove b,c
+        assert_eq!(
+            h.entries().collect::<Vec<_>>(),
+            vec![(1, "a"), (2, "d"), (3, "e")]
+        );
+        assert_eq!(h.delete_range(5, 2), 0); // reversed
+    }
+
+    #[test]
+    fn write_read_append_roundtrip_and_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hf");
+        let mut h = empty();
+        for c in ["a", "b"] {
+            h.add(c.to_string());
+        }
+        h.write_all_to(&path).unwrap(); // marker -> 2
+        // append_new_to now writes nothing (all written)
+        let ap = dir.path().join("ap");
+        h.append_new_to(&ap).unwrap();
+        assert_eq!(std::fs::read_to_string(&ap).unwrap(), "");
+        // add a new one; append_new_to writes only it
+        h.add("c".to_string());
+        h.append_new_to(&ap).unwrap();
+        assert_eq!(std::fs::read_to_string(&ap).unwrap(), "c\n");
+        // read_append_from appends file lines
+        let mut h2 = empty();
+        h2.read_append_from(&path).unwrap();
+        assert_eq!(h2.entries().collect::<Vec<_>>(), vec![(1, "a"), (2, "b")]);
+    }
+
+    #[test]
+    fn eviction_decrements_unwritten_marker() {
+        let mut h = empty();
+        for c in ["a", "b", "c"] {
+            h.add(c.to_string());
+        }
+        h.write_all_to(&std::path::PathBuf::from("/dev/null"))
+            .unwrap(); // marker -> 3
+        h.set_max(Some(1)); // evict a,b → marker saturating to 1
+        h.add("d".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let ap = dir.path().join("ap");
+        h.append_new_to(&ap).unwrap();
+        assert_eq!(std::fs::read_to_string(&ap).unwrap(), "d\n"); // only the truly-new entry
     }
 }
