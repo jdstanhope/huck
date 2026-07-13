@@ -261,7 +261,7 @@ fn execute_with_sink_inner(
                 return run_background_sequence(p, shell, sink, err_sink, source);
             }
             if let Command::Subshell { .. } = &seq.first {
-                return run_background_subshell(&seq.first, shell, sink, err_sink, source);
+                return run_background_subshell(&seq.first, shell, sink, err_sink, false, source);
             }
         } else if seq
             .rest
@@ -282,7 +282,7 @@ fn execute_with_sink_inner(
             let subshell = Command::Subshell {
                 body: Box::new(inner),
             };
-            return run_background_subshell(&subshell, shell, sink, err_sink, source);
+            return run_background_subshell(&subshell, shell, sink, err_sink, false, source);
         }
     }
     execute_sequence_body(seq, shell, sink, err_sink)
@@ -554,13 +554,17 @@ fn execute_sequence_body(
             // original source text isn't threaded down to this point, so derive
             // a label from the group's first command's static program name when
             // possible (good enough for `jobs` listings — not byte-diffed).
+            // bash: a bare multi-stage pipeline backgrounded via `&` keeps the
+            // shell's stdin on stage 0; every other async unit gets /dev/null.
+            let inherit_stdin = group.rest.is_empty()
+                && matches!(group.first, Command::Pipeline(p) if p.commands.len() > 1);
             let source = group_display_label(group.first);
             let subshell = Command::Subshell {
                 body: Box::new(inner),
             };
             // Launch; ignore the Continue(0) it returns — the foreground status
             // is unchanged by a background launch.
-            run_background_subshell(&subshell, shell, sink, err_sink, &source);
+            run_background_subshell(&subshell, shell, sink, err_sink, inherit_stdin, &source);
         } else {
             last_status = run_andor_group(group.first, &group.rest, shell, sink, err_sink);
             // Propagate control-flow outcomes immediately.
@@ -3050,6 +3054,47 @@ fn is_negated_pipeline(cmd: &Command) -> bool {
 
 // ----- background pipeline --------------------------------------------------
 
+/// The stdin an async (`&`) child should start with. bash defaults async stdin
+/// to `/dev/null` when the shell is non-interactive and the unit is not a bare
+/// multi-stage pipeline; otherwise the child inherits the shell's stdin.
+enum AsyncStdin {
+    /// Inherit the shell's stdin (fd 0).
+    Inherit,
+    /// A freshly opened `/dev/null` fd; the caller closes it after forking.
+    DevNull(RawFd),
+}
+
+/// Decide an async child's default stdin. `inherit` is true when the unit must
+/// keep the shell's stdin regardless of interactivity (a bare multi-stage
+/// pipeline). An interactive shell always inherits. Otherwise stdin defaults to
+/// `/dev/null` (`O_RDONLY`); on open failure a `/dev/null: <error>` diagnostic is
+/// emitted and `Err(())` returned.
+fn async_default_stdin(
+    inherit: bool,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> Result<AsyncStdin, ()> {
+    if inherit || shell.is_interactive {
+        return Ok(AsyncStdin::Inherit);
+    }
+    use std::os::unix::io::IntoRawFd;
+    match File::open("/dev/null") {
+        Ok(f) => Ok(AsyncStdin::DevNull(f.into_raw_fd())),
+        Err(e) => {
+            let mut err = err_writer(err_sink, sink);
+            crate::sh_error_to!(
+                shell,
+                &mut *err,
+                None,
+                "/dev/null: {}",
+                crate::bash_io_error(&e)
+            );
+            Err(())
+        }
+    }
+}
+
 /// Backgrounds a `Command::Subshell` via fork + job registration.
 /// Used by `execute()` when `seq.background` is set and `seq.first` is
 /// `Command::Subshell`.  Does NOT waitpid — returns immediately after
@@ -3059,23 +3104,37 @@ fn run_background_subshell(
     shell: &mut Shell,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
+    inherit_stdin: bool,
     source: &str,
 ) -> ExecOutcome {
     let display = display_command(source);
     let job_control = shell.job_control_active();
-    // Inherit stdin from the terminal (unlike pipeline backgrounds that use
-    // /dev/null) — match bash/dash behaviour for `(cmd) &`.
-    match fork_and_run_in_subshell(
+    // bash: an async command's stdin defaults to /dev/null (non-interactive, no
+    // explicit input redirect) so it can't steal the terminal; a bare
+    // multi-stage pipeline inherits instead (async_default_stdin, #126).
+    let stdin_fd = match async_default_stdin(inherit_stdin, shell, sink, err_sink) {
+        Ok(AsyncStdin::Inherit) => libc::STDIN_FILENO,
+        Ok(AsyncStdin::DevNull(fd)) => fd,
+        Err(()) => return ExecOutcome::Continue(1),
+    };
+    let fork_result = fork_and_run_in_subshell(
         cmd,
         shell,
-        libc::STDIN_FILENO,
+        stdin_fd,
         libc::STDOUT_FILENO,
         libc::STDERR_FILENO,
         /*pgid_target=*/ if job_control { 0 } else { NO_PGROUP },
         /*parent_fds_to_close=*/ &[],
         None, // no Dup redirect at this call site
         None,
-    ) {
+    );
+    if stdin_fd != libc::STDIN_FILENO {
+        // Parent drops its /dev/null copy; the child kept its own across fork.
+        unsafe {
+            libc::close(stdin_fd);
+        }
+    }
+    match fork_result {
         Ok(pid) => {
             shell.last_bg_pid = Some(pid);
             let id = shell
