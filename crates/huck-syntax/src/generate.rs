@@ -5,8 +5,8 @@
 //! the `rt_*` tests). Built across v146 Tasks 1-3; bash-faithful port in v218.
 use crate::command::{
     Assignment, CaseClause, CaseItem, CaseTerminator, Command, Connector, ElifBranch, ExecCommand,
-    ForClause, IfClause, Pipeline, RedirectSlot, SelectClause, Sequence, SimpleCommand,
-    TestBinaryOp, TestExpr, TestUnaryOp, WhileClause,
+    ForClause, IfClause, Pipeline, SelectClause, Sequence, SimpleCommand, TestBinaryOp, TestExpr,
+    TestUnaryOp, WhileClause,
 };
 use crate::lexer::{
     CaseDirection, ParamModifier, SubscriptKind, SubstAnchor, TildeSpec, TransformOp, Word,
@@ -18,23 +18,94 @@ pub fn function_to_source(name: &str, body: &Command) -> String {
     render_function_def(name, body, 0, false)
 }
 
-/// Append the 0/1/2 slot redirects to `s`, each prefixed with a space
-/// (e.g. ` 1>&2`). Shared by the hoisted-brace-group path, the
-/// `Command::Redirected` arm, and `exec_to_source` — all three emit
-/// identical spacing/ordering (stdin → stdout → stderr, empty slots skipped).
-fn append_slot_redirects(s: &mut String, redirects: &[crate::command::Redirection]) {
-    let (stdin, stdout, stderr) = crate::command::slots_for_simple_path(redirects);
-    if let Some(r) = &stdin {
+/// Append every redirection in SOURCE ORDER, each prefixed with a space
+/// (e.g. ` 2>&1`). Faithful — preserves fd numbers, order, `<&`/`>&`, close,
+/// `<>`, `{var}`, and move. Shared by the hoisted-brace-group path, the
+/// `Command::Redirected` arm, and `exec_to_source`.
+fn append_redirects(s: &mut String, redirects: &[crate::command::Redirection]) {
+    for r in redirects {
         s.push(' ');
-        s.push_str(&redirect_to_source(r, RedirDefault::Stdin));
+        s.push_str(&redirection_to_source(r));
     }
-    if let Some(r) = &stdout {
-        s.push(' ');
-        s.push_str(&redirect_to_source(r, RedirDefault::Stdout));
-    }
-    if let Some(r) = &stderr {
-        s.push(' ');
-        s.push_str(&redirect_to_source(r, RedirDefault::Stderr));
+}
+
+/// Render one `Redirection` faithfully, matching bash's `declare -f`
+/// canonicalization (verified against bash 5.2.21). File redirects drop the fd
+/// when it is the directional default (1 for output, 0 for input); `<>` drops
+/// only fd 1 (an absent fd is 0, shown). A NUMERIC dup source always shows the
+/// fd (`>&2` -> `1>&2`); a WORD dup source (`$fd`, a name) drops the directional
+/// default like a File redirect (`<&$fd` -> `<&$fd`). Move always shows the fd
+/// (even for a word source); close normalizes to `{fd}>&-`.
+fn redirection_to_source(r: &crate::command::Redirection) -> String {
+    use crate::command::{FileMode, RedirFd, RedirOp};
+    // Prefix for a File op whose directional default is `def` (droppable).
+    let file_prefix = |def: u16| -> String {
+        match &r.fd {
+            RedirFd::Var(name) => format!("{{{name}}}"),
+            RedirFd::Default => String::new(),
+            RedirFd::Number(n) if *n == def => String::new(),
+            RedirFd::Number(n) => n.to_string(),
+        }
+    };
+    // Prefix for dup/move/readwrite: always shown; Default resolves to `def`.
+    let always_prefix = |def: u16| -> String {
+        match &r.fd {
+            RedirFd::Var(name) => format!("{{{name}}}"),
+            RedirFd::Default => def.to_string(),
+            RedirFd::Number(n) => n.to_string(),
+        }
+    };
+    match &r.op {
+        RedirOp::File { mode, target } => {
+            let (arrow, def) = match mode {
+                FileMode::ReadOnly => ("<", 0),
+                FileMode::Truncate => (">", 1),
+                FileMode::Append => (">>", 1),
+                FileMode::Clobber => (">|", 1),
+                FileMode::ReadWrite => ("<>", 0),
+            };
+            // `<>` shows the fd unless it is exactly 1 (an absent fd is 0, shown);
+            // the other File modes drop the directional default `def`.
+            let prefix = if matches!(mode, FileMode::ReadWrite) {
+                match &r.fd {
+                    RedirFd::Var(name) => format!("{{{name}}}"),
+                    RedirFd::Default => "0".to_string(),
+                    RedirFd::Number(1) => String::new(),
+                    RedirFd::Number(n) => n.to_string(),
+                }
+            } else {
+                file_prefix(def)
+            };
+            format!("{prefix}{arrow} {}", word_to_source(target))
+        }
+        RedirOp::Dup { source, output } => {
+            let (arrow, def) = if *output { (">&", 1) } else { ("<&", 0) };
+            let src = word_to_source(source);
+            // A numeric dup source always shows the fd (`>&2` -> `1>&2`); a word
+            // source (`$fd`, a name) drops the directional default like a File
+            // redirect (`<&$fd` -> `<&$fd`), matching bash's r_duplicating_word.
+            let prefix = if !src.is_empty() && src.bytes().all(|b| b.is_ascii_digit()) {
+                always_prefix(def)
+            } else {
+                file_prefix(def)
+            };
+            format!("{prefix}{arrow}{src}")
+        }
+        RedirOp::Move { source, output } => {
+            let (arrow, def) = if *output { (">&", 1) } else { ("<&", 0) };
+            format!("{}{arrow}{}-", always_prefix(def), word_to_source(source))
+        }
+        RedirOp::Close => {
+            // Direction normalized to `>&-`; fd is always concrete (parser
+            // resolves the directional default to 1/0), so `always_prefix(1)`'s
+            // Default branch is never taken.
+            format!("{}>&-", always_prefix(1))
+        }
+        RedirOp::Heredoc { .. } | RedirOp::HereString(_) => {
+            // Preserve the existing heredoc / here-string rendering by delegating
+            // to the current slot renderer for these two ops only.
+            heredoc_or_herestring_to_source(&r.op)
+        }
     }
 }
 
@@ -54,7 +125,7 @@ fn render_function_def(name: &str, body: &Command, indent: usize, with_keyword: 
                 unreachable!()
             };
             let mut hoisted = String::new();
-            append_slot_redirects(&mut hoisted, redirects);
+            append_redirects(&mut hoisted, redirects);
             ((**seq).clone(), hoisted)
         }
         other => (
@@ -120,11 +191,8 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
             }
         }
         Command::Redirected { inner, redirects } => {
-            // Source regeneration uses the 0/1/2 slot fast-path (v156).
-            // Regeneration of fd>2 / `<&` / `{var}` redirects is best-effort
-            // (slot-collapsed).
             let mut s = command_to_source(inner, indent);
-            append_slot_redirects(&mut s, redirects);
+            append_redirects(&mut s, redirects);
             s
         }
     }
@@ -426,8 +494,7 @@ fn exec_to_source(e: &ExecCommand) -> String {
         parts.push(word_to_source(w));
     }
     let mut s = parts.join(" ");
-    // 0/1/2 slot fast-path for source regeneration (v156, best-effort).
-    append_slot_redirects(&mut s, &e.redirects);
+    append_redirects(&mut s, &e.redirects);
     s
 }
 
@@ -442,25 +509,14 @@ fn assignment_to_source(a: &Assignment) -> String {
 
 /// Which standard fd a redirect attaches to, so we know whether to emit a
 /// leading `2` for stderr. Stdin/stdout use the bare operator.
-enum RedirDefault {
-    Stdin,
-    Stdout,
-    Stderr,
-}
-
-fn redirect_to_source(r: &RedirectSlot, which: RedirDefault) -> String {
-    let fd_prefix = match which {
-        RedirDefault::Stderr => "2",
-        RedirDefault::Stdin | RedirDefault::Stdout => "",
-    };
-    match r {
-        RedirectSlot::Read(w) => format!("< {}", word_to_source(w)),
-        RedirectSlot::Truncate(w) => format!("{fd_prefix}> {}", word_to_source(w)),
-        RedirectSlot::Append(w) => format!("{fd_prefix}>> {}", word_to_source(w)),
-        RedirectSlot::Clobber(w) => format!("{fd_prefix}>| {}", word_to_source(w)),
-        RedirectSlot::Dup { fd, source } => format!("{fd}>&{}", word_to_source(source)),
-        RedirectSlot::HereString(w) => format!("<<< {}", word_to_source(w)),
-        RedirectSlot::Heredoc {
+/// Render a `Heredoc` / `HereString` `RedirOp` (the only two ops
+/// `redirection_to_source` delegates here — all other ops are rendered
+/// directly there).
+fn heredoc_or_herestring_to_source(op: &crate::command::RedirOp) -> String {
+    use crate::command::RedirOp;
+    match op {
+        RedirOp::HereString(w) => format!("<<< {}", word_to_source(w)),
+        RedirOp::Heredoc {
             body,
             expand,
             strip_tabs,
@@ -484,6 +540,7 @@ fn redirect_to_source(r: &RedirectSlot, which: RedirDefault) -> String {
             // expanding heredoc keeps them.
             format!("{opener}{d}\n{body_text}{delim}")
         }
+        _ => unreachable!("heredoc_or_herestring_to_source called on a non-heredoc RedirOp"),
     }
 }
 
@@ -1583,5 +1640,37 @@ mod tests {
     #[test]
     fn rt_quote_specials() {
         assert!(declf_word("\\&\\|'()'").contains("echo \\&\\|'()'"));
+    }
+
+    // ── Task 2 (v286): faithful ordered redirect regeneration ──
+    #[test]
+    fn redirect_regen_matches_bash_forms() {
+        // (body, expected declare -f redirect fragment)
+        for (src, want) in [
+            ("f() { true 1>x; }", "> x"),
+            ("f() { true 2>x; }", "2> x"),
+            ("f() { true 0>x; }", "0> x"),
+            ("f() { true <>x; }", "0<> x"),
+            ("f() { true >&2; }", "1>&2"),
+            ("f() { true 3<&0; }", "3<&0"),
+            ("f() { exec 3<&-; }", "3>&-"),
+            ("f() { exec 0<&5-; }", "0<&5-"),
+            ("f() { true >&2-; }", "1>&2-"),
+            ("f() { exec {v}<&3-; }", "{v}<&3-"),
+            // Word dup source drops the directional default fd (bash
+            // r_duplicating_word). Leading space makes the drop strict: a stray
+            // `0`/`1` prefix would break the match.
+            ("f() { exec <&$fd; }", " <&$fd"),
+            ("f() { true >&2x; }", " >&2x"),
+            // `<>` drops the fd only when it is exactly 1.
+            ("f() { true 1<>x; }", " <> x"),
+            ("f() { true 2<>x; }", " 2<> x"),
+        ] {
+            let out = declf(src);
+            assert!(
+                out.contains(want),
+                "src {src:?}: want fragment {want:?} in:\n{out}"
+            );
+        }
     }
 }
