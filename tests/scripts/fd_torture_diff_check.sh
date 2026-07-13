@@ -45,5 +45,19 @@ check "1>&2 to stderr"            'echo hi 1>&2 2>/dev/null; echo done'
 check "2>&1 merge into pipe"      'ls /no_such_xyz 2>&1 | cat'
 check "&> merge to file"          'echo hi &> f; cat f'
 
+# --- #128: a non-interactive shell must NOT SIGHUP background jobs at exit ---
+# The child writes a file after a short sleep while the shell exits immediately;
+# bash leaves it running (file appears), huck must match. Poll after exit.
+nohangup() {
+    local label="$1" shbin="$2" out
+    rm -f "$WORK/bg.out"
+    timeout 5 "$shbin" -c 'sleep 0.3 && echo alive > "'"$WORK"'/bg.out" & exit 0' </dev/null >/dev/null 2>&1
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$WORK/bg.out" ] && break; sleep 0.1; done
+    [ -s "$WORK/bg.out" ] && echo alive || echo KILLED
+}
+b=$(nohangup bg bash); h=$(nohangup bg "$HUCK_BIN")
+if [[ "$b" == alive && "$h" == "$b" ]]; then printf 'PASS: #128 bg child survives non-interactive exit\n'; PASS=$((PASS+1))
+else printf 'FAIL: #128 bg child survives (bash=%s huck=%s)\n' "$b" "$h"; FAIL=$((FAIL+1)); fi
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

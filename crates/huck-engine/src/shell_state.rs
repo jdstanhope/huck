@@ -3044,6 +3044,13 @@ impl Shell {
     /// already-reaped pgid) are intentionally ignored; this is a
     /// best-effort cleanup.
     pub fn hangup_jobs(&mut self) {
+        // bash: SIGHUP jobs at exit only for an interactive shell with `huponexit`
+        // set (default off). Non-interactive shells (and interactive shells without
+        // huponexit) leave background jobs running. This also wires the huponexit
+        // shopt, which was defined but never read. (#128)
+        if !(self.is_interactive && self.shopt_options.get("huponexit").unwrap_or(false)) {
+            return;
+        }
         for job in self.jobs.iter() {
             if !should_hangup(job) {
                 continue;
