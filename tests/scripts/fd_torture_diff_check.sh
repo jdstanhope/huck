@@ -59,5 +59,25 @@ b=$(nohangup bg bash); h=$(nohangup bg "$HUCK_BIN")
 if [[ "$b" == alive && "$h" == "$b" ]]; then printf 'PASS: #128 bg child survives non-interactive exit\n'; PASS=$((PASS+1))
 else printf 'FAIL: #128 bg child survives (bash=%s huck=%s)\n' "$b" "$h"; FAIL=$((FAIL+1)); fi
 
+# --- #129: run_background_sequence stage-0 stdin async rule (Path A) ---
+# Shell stdin is a real file ($WORK/inA); the async child prints readlink of its
+# fd0. Single-stage async -> /dev/null (non-interactive); bare multi-stage pipeline
+# -> inherits the shell's stdin. Trailing `&` at EOF => Path A; poll after exit.
+poll_fd0() {
+    local shbin="$1" frag="$2" out
+    rm -f "$WORK/fd0.out"
+    timeout 5 "$shbin" -c "$frag" < "$WORK/inA" >/dev/null 2>&1
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$WORK/fd0.out" ] && break; sleep 0.1; done
+    cat "$WORK/fd0.out" 2>/dev/null | sed "s#$WORK#@W@#g"
+}
+p129() {
+    local label="$1" frag="$2" b h
+    b=$(poll_fd0 bash "$frag"); h=$(poll_fd0 "$HUCK_BIN" "$frag")
+    if [[ -n "$b" && "$h" == "$b" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
+    else printf 'FAIL: %s (bash=[%s] huck=[%s])\n' "$label" "$b" "$h"; FAIL=$((FAIL+1)); fi
+}
+p129 "#129 single-stage & -> /dev/null" 'readlink /proc/self/fd/0 > "'"$WORK"'/fd0.out" &'
+p129 "#129 multi-stage a|b & -> inherit" 'readlink /proc/self/fd/0 | cat > "'"$WORK"'/fd0.out" &'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
