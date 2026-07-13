@@ -4,6 +4,7 @@ use std::os::unix::io::RawFd;
 use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::builtins::{self, ExecOutcome, InterruptReason};
+use crate::child_fd::{ChildFd, ChildStdio};
 use crate::command::{
     CaseClause, CaseItem, CaseTerminator, Command, Connector, ExecCommand, FileMode, ForClause,
     IfClause, Pipeline, RedirFd, RedirOp, RedirectSlot, Redirection, Sequence, SimpleCommand,
@@ -668,12 +669,51 @@ fn run_command(
                 },
             };
 
+            // Build the child's fd environment. stdin inherits; stdout/stderr are
+            // the shell's real streams (Inherit) or freshly-made capture-pipe
+            // write ends (Owned). Merged stderr dups whatever stdout resolves to.
+            let child_stdout = if stdout_fd == libc::STDOUT_FILENO {
+                ChildFd::Inherit
+            } else {
+                unsafe { ChildFd::owned_raw(stdout_fd) }
+            };
+            let child_stderr = match err_sink {
+                StderrSink::Terminal => ChildFd::Inherit,
+                // SAFETY: the slot (STDOUT_FILENO) is always a live shell std fd.
+                StderrSink::Merged => match child_stdout.try_clone_resolving(libc::STDOUT_FILENO) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "fork: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
+                        if let Some(r) = capture_read_fd {
+                            unsafe {
+                                libc::close(r);
+                            }
+                        }
+                        if let Some(r) = capture_err_read_fd {
+                            unsafe {
+                                libc::close(r);
+                            }
+                        }
+                        return ExecOutcome::Continue(1);
+                    }
+                },
+                StderrSink::Capture(_) => unsafe { ChildFd::owned_raw(stderr_fd) },
+            };
+            let child_stdio = ChildStdio::new(ChildFd::Inherit, child_stdout, child_stderr);
+
             let pid = match fork_and_run_in_subshell(
                 cmd,
                 shell,
-                libc::STDIN_FILENO,
-                stdout_fd,
-                stderr_fd,
+                child_stdio,
                 if interactive { 0 } else { NO_PGROUP },
                 &[],
                 None, // no Dup redirect at this call site
@@ -701,16 +741,8 @@ fn run_command(
                             libc::close(r);
                         }
                     }
-                    if stdout_fd != libc::STDOUT_FILENO {
-                        unsafe {
-                            libc::close(stdout_fd);
-                        }
-                    }
-                    if stderr_fd != libc::STDERR_FILENO && stderr_fd != stdout_fd {
-                        unsafe {
-                            libc::close(stderr_fd);
-                        }
-                    }
+                    // child_stdio (with any owned stdout/stderr write end) was
+                    // consumed by the failed call and already dropped.
                     return ExecOutcome::Continue(1);
                 }
             };
@@ -725,23 +757,9 @@ fn run_command(
                 pid: pid as libc::pid_t,
             };
 
-            // Close the write-end in the parent so the child's write-end is
-            // the only writer; once the child exits, the read-end sees EOF.
-            if stdout_fd != libc::STDOUT_FILENO {
-                unsafe {
-                    libc::close(stdout_fd);
-                }
-            }
-            // Same for the dedicated stderr pipe (skip if it's the merged-stdout
-            // alias; that fd has already been closed above).
-            if matches!(err_sink, StderrSink::Capture(_))
-                && stderr_fd != libc::STDERR_FILENO
-                && stderr_fd != stdout_fd
-            {
-                unsafe {
-                    libc::close(stderr_fd);
-                }
-            }
+            // The child's stdout/stderr pipe write ends were owned by the moved
+            // ChildStdio and closed in the parent by the call — the read ends
+            // (capture_read_fd / capture_err_read_fd) stay open for draining.
 
             if interactive {
                 // Interactive subshell path keeps the dual-drain +
@@ -3057,30 +3075,21 @@ fn is_negated_pipeline(cmd: &Command) -> bool {
 /// The stdin an async (`&`) child should start with. bash defaults async stdin
 /// to `/dev/null` when the shell is non-interactive and the unit is not a bare
 /// multi-stage pipeline; otherwise the child inherits the shell's stdin.
-enum AsyncStdin {
-    /// Inherit the shell's stdin (fd 0).
-    Inherit,
-    /// A freshly opened `/dev/null` fd; the caller closes it after forking.
-    DevNull(RawFd),
-}
-
-/// Decide an async child's default stdin. `inherit` is true when the unit must
-/// keep the shell's stdin regardless of interactivity (a bare multi-stage
-/// pipeline). An interactive shell always inherits. Otherwise stdin defaults to
-/// `/dev/null` (`O_RDONLY`); on open failure a `/dev/null: <error>` diagnostic is
-/// emitted and `Err(())` returned.
+/// Decide an async child's default stdin as a `ChildFd`. `inherit` is true when
+/// the unit must keep the shell's stdin regardless of interactivity (a bare
+/// multi-stage pipeline). Interactive always inherits. Otherwise stdin defaults
+/// to `/dev/null` (`Owned`); on open failure emit `/dev/null: <error>` + Err.
 fn async_default_stdin(
     inherit: bool,
     shell: &mut Shell,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
-) -> Result<AsyncStdin, ()> {
+) -> Result<ChildFd, ()> {
     if inherit || shell.is_interactive {
-        return Ok(AsyncStdin::Inherit);
+        return Ok(ChildFd::Inherit);
     }
-    use std::os::unix::io::IntoRawFd;
     match File::open("/dev/null") {
-        Ok(f) => Ok(AsyncStdin::DevNull(f.into_raw_fd())),
+        Ok(f) => Ok(ChildFd::from(f)),
         Err(e) => {
             let mut err = err_writer(err_sink, sink);
             crate::sh_error_to!(
@@ -3112,28 +3121,20 @@ fn run_background_subshell(
     // bash: an async command's stdin defaults to /dev/null (non-interactive, no
     // explicit input redirect) so it can't steal the terminal; a bare
     // multi-stage pipeline inherits instead (async_default_stdin, #126).
-    let stdin_fd = match async_default_stdin(inherit_stdin, shell, sink, err_sink) {
-        Ok(AsyncStdin::Inherit) => libc::STDIN_FILENO,
-        Ok(AsyncStdin::DevNull(fd)) => fd,
+    let stdin = match async_default_stdin(inherit_stdin, shell, sink, err_sink) {
+        Ok(c) => c,
         Err(()) => return ExecOutcome::Continue(1),
     };
     let fork_result = fork_and_run_in_subshell(
         cmd,
         shell,
-        stdin_fd,
-        libc::STDOUT_FILENO,
-        libc::STDERR_FILENO,
+        ChildStdio::new(stdin, ChildFd::Inherit, ChildFd::Inherit),
         /*pgid_target=*/ if job_control { 0 } else { NO_PGROUP },
         /*parent_fds_to_close=*/ &[],
         None, // no Dup redirect at this call site
         None,
     );
-    if stdin_fd != libc::STDIN_FILENO {
-        // Parent drops its /dev/null copy; the child kept its own across fork.
-        unsafe {
-            libc::close(stdin_fd);
-        }
-    }
+    // The parent's /dev/null copy (if any) was consumed + dropped by the call.
     match fork_result {
         Ok(pid) => {
             shell.last_bg_pid = Some(pid);
@@ -3189,13 +3190,9 @@ fn run_background_sequence(
     // bare multi-stage pipeline's stage 0 inherits the shell's stdin; a single
     // async command gets /dev/null when non-interactive; interactive always
     // inherits. (#129)
-    let stage0_stdin_default: RawFd =
+    let stage0_default: ChildFd =
         match async_default_stdin(pipeline.commands.len() > 1, shell, sink, err_sink) {
-            Ok(AsyncStdin::Inherit) => libc::STDIN_FILENO,
-            Ok(AsyncStdin::DevNull(fd)) => {
-                parent_held.push(fd);
-                fd
-            }
+            Ok(c) => c,
             Err(()) => return ExecOutcome::Continue(1),
         };
 
@@ -3226,16 +3223,37 @@ fn run_background_sequence(
             } else {
                 NO_PGROUP
             };
-            let stdin_fd = stage0_stdin_default; // stage 0 default (overridden below if not first)
+            // stage 0 default (a distinct clone of the shared /dev/null / inherit).
+            let stdin: ChildFd = match stage0_default.try_clone() {
+                Ok(c) => c,
+                Err(e) => {
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(
+                            shell,
+                            &mut *err,
+                            None,
+                            "dup: {}",
+                            crate::bash_io_error(&e)
+                        );
+                    }
+                    return bail_teardown_bg(
+                        shell,
+                        procsub_base,
+                        first_pid,
+                        &spawned_pids,
+                        &mut parent_held,
+                    );
+                }
+            };
             // For a no-op assign stage, stdout is irrelevant but we still need
             // to either pipe or close it for downstream stages.
-            let stdout_fd = if !is_last {
+            let stdout: ChildFd = if !is_last {
                 match make_pipe() {
                     Ok((r, w)) => {
                         prev_pipe_read = Some(r);
                         parent_held.push(r);
-                        parent_held.push(w);
-                        w
+                        unsafe { ChildFd::owned_raw(w) }
                     }
                     Err(e) => {
                         {
@@ -3258,31 +3276,31 @@ fn run_background_sequence(
                     }
                 }
             } else {
-                libc::STDOUT_FILENO
+                ChildFd::Inherit
             };
-            let fds_to_close: Vec<RawFd> = parent_held
+            let mut fds_to_close: Vec<RawFd> = parent_held
                 .iter()
                 .copied()
-                .filter(|&fd| fd != stdout_fd && fd != stdin_fd)
+                .filter(|&fd| Some(fd) != stdout.raw() && Some(fd) != stdin.raw())
                 .collect();
+            // The parent's shared /dev/null original is inherited by the child;
+            // close it there (the child's own stdin is a distinct clone).
+            if let Some(d) = stage0_default.raw() {
+                fds_to_close.push(d);
+            }
+            let child_stdio = ChildStdio::new(stdin, stdout, ChildFd::Inherit);
             match fork_and_run_in_subshell(
                 &assign_cmd,
                 shell,
-                stdin_fd,
-                stdout_fd,
-                libc::STDERR_FILENO,
+                child_stdio,
                 pgid_target,
                 &fds_to_close,
                 None,
                 None,
             ) {
                 Ok(pid) => {
-                    if stdout_fd > 2 {
-                        parent_held.retain(|&fd| fd != stdout_fd);
-                        unsafe {
-                            libc::close(stdout_fd);
-                        }
-                    }
+                    // The pipe write end (if any) was owned by the moved
+                    // child_stdio and closed in the parent by the call.
                     if first_pid.is_none() {
                         first_pid = Some(pid);
                         if job_control {
@@ -3311,11 +3329,8 @@ fn run_background_sequence(
                             crate::bash_io_error(&e)
                         );
                     }
-                    if stdout_fd > 2 {
-                        unsafe {
-                            libc::close(stdout_fd);
-                        }
-                    }
+                    // child_stdio (with any owned write end) was consumed by the
+                    // failed call and already dropped.
                     return bail_teardown_bg(
                         shell,
                         procsub_base,
@@ -3353,7 +3368,7 @@ fn run_background_sequence(
         // A heredoc/herestring stdin is fed by a forked writer process (M-120);
         // the read end becomes this stage's stdin and the parent holds no write
         // end.
-        let stdin_fd: RawFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+        let stdin: ChildFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
             match &exec.slot_stdin() {
                 Some(RedirectSlot::Read(word)) => {
                     if let Some(r) = prev_pipe_read.take() {
@@ -3375,9 +3390,8 @@ fn run_background_sequence(
                             );
                         }
                     };
-                    use std::os::unix::io::IntoRawFd;
                     match File::open(&path) {
-                        Ok(f) => f.into_raw_fd(),
+                        Ok(f) => ChildFd::from(f),
                         Err(e) => {
                             redir_open_error(shell, err_sink, sink, &path, &e);
                             restore_inline_assignments(snap, shell);
@@ -3404,7 +3418,7 @@ fn run_background_sequence(
                     // NOT added to spawned_pids/first_pid.
                     let bytes = expand_assignment(body, shell).into_bytes();
                     match spawn_heredoc_writer(&bytes) {
-                        Ok((r, _pid)) => r,
+                        Ok((r, _pid)) => unsafe { ChildFd::owned_raw(r) },
                         Err(e) => {
                             {
                                 let mut err = err_writer(err_sink, sink);
@@ -3439,7 +3453,7 @@ fn run_background_sequence(
                     let mut bytes = expand_assignment(body, shell).into_bytes();
                     bytes.push(b'\n');
                     match spawn_heredoc_writer(&bytes) {
-                        Ok((r, _pid)) => r,
+                        Ok((r, _pid)) => unsafe { ChildFd::owned_raw(r) },
                         Err(e) => {
                             {
                                 let mut err = err_writer(err_sink, sink);
@@ -3462,18 +3476,71 @@ fn run_background_sequence(
                         }
                     }
                 }
-                _ => prev_pipe_read.take().unwrap_or(stage0_stdin_default),
+                _ => match prev_pipe_read.take() {
+                    Some(r) => {
+                        parent_held.retain(|&fd| fd != r);
+                        unsafe { ChildFd::owned_raw(r) }
+                    }
+                    None => match stage0_default.try_clone() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            {
+                                let mut err = err_writer(err_sink, sink);
+                                crate::sh_error_to!(
+                                    shell,
+                                    &mut *err,
+                                    None,
+                                    "dup: {}",
+                                    crate::bash_io_error(&e)
+                                );
+                            }
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    },
+                },
             }
         } else {
             // Compound stage: use prev pipe or /dev/null for stage 0.
-            prev_pipe_read.take().unwrap_or(stage0_stdin_default)
+            match prev_pipe_read.take() {
+                Some(r) => {
+                    parent_held.retain(|&fd| fd != r);
+                    unsafe { ChildFd::owned_raw(r) }
+                }
+                None => match stage0_default.try_clone() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "dup: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
+                        restore_inline_assignments(snap, shell);
+                        return bail_teardown_bg(
+                            shell,
+                            procsub_base,
+                            first_pid,
+                            &spawned_pids,
+                            &mut parent_held,
+                        );
+                    }
+                },
+            }
         };
 
-        // Remove stdin_fd from parent_held if it was tracked there.
-        parent_held.retain(|&fd| fd != stdin_fd);
-
         // ---- Stdout redirect (ExecCommand only) ------------------------------
-        let explicit_stdout_fd: Option<RawFd> =
+        let explicit_stdout: Option<ChildFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 match &exec.slot_stdout() {
                     Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
@@ -3481,11 +3548,6 @@ fn run_background_sequence(
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
                                 return bail_teardown_bg(
                                     shell,
                                     procsub_base,
@@ -3495,19 +3557,13 @@ fn run_background_sequence(
                                 );
                             }
                         };
-                        use std::os::unix::io::IntoRawFd;
                         let guard =
                             shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
                         match open_writable(&path, guard) {
-                            Ok(f) => Some(f.into_raw_fd()),
+                            Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
                                 return bail_teardown_bg(
                                     shell,
                                     procsub_base,
@@ -3523,11 +3579,6 @@ fn run_background_sequence(
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
                                 return bail_teardown_bg(
                                     shell,
                                     procsub_base,
@@ -3537,17 +3588,11 @@ fn run_background_sequence(
                                 );
                             }
                         };
-                        use std::os::unix::io::IntoRawFd;
                         match OpenOptions::new().create(true).append(true).open(&path) {
-                            Ok(f) => Some(f.into_raw_fd()),
+                            Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
                                 return bail_teardown_bg(
                                     shell,
                                     procsub_base,
@@ -3565,7 +3610,7 @@ fn run_background_sequence(
             };
 
         // ---- Stderr redirect (ExecCommand only) ------------------------------
-        let explicit_stderr_fd: Option<RawFd> =
+        let explicit_stderr: Option<ChildFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 match &exec.slot_stderr() {
                     Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
@@ -3573,16 +3618,6 @@ fn run_background_sequence(
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
-                                if let Some(fd) = explicit_stdout_fd {
-                                    unsafe {
-                                        libc::close(fd);
-                                    }
-                                }
                                 return bail_teardown_bg(
                                     shell,
                                     procsub_base,
@@ -3592,24 +3627,13 @@ fn run_background_sequence(
                                 );
                             }
                         };
-                        use std::os::unix::io::IntoRawFd;
                         let guard =
                             shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
                         match open_writable(&path, guard) {
-                            Ok(f) => Some(f.into_raw_fd()),
+                            Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
-                                if let Some(fd) = explicit_stdout_fd {
-                                    unsafe {
-                                        libc::close(fd);
-                                    }
-                                }
                                 return bail_teardown_bg(
                                     shell,
                                     procsub_base,
@@ -3625,16 +3649,6 @@ fn run_background_sequence(
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
-                                if let Some(fd) = explicit_stdout_fd {
-                                    unsafe {
-                                        libc::close(fd);
-                                    }
-                                }
                                 return bail_teardown_bg(
                                     shell,
                                     procsub_base,
@@ -3644,22 +3658,11 @@ fn run_background_sequence(
                                 );
                             }
                         };
-                        use std::os::unix::io::IntoRawFd;
                         match OpenOptions::new().create(true).append(true).open(&path) {
-                            Ok(f) => Some(f.into_raw_fd()),
+                            Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
-                                if let Some(fd) = explicit_stdout_fd {
-                                    unsafe {
-                                        libc::close(fd);
-                                    }
-                                }
                                 return bail_teardown_bg(
                                     shell,
                                     procsub_base,
@@ -3677,7 +3680,7 @@ fn run_background_sequence(
             };
 
         // ---- Stdout fd -------------------------------------------------------
-        let stdout_fd: RawFd = if let Some(fd) = explicit_stdout_fd {
+        let stdout: ChildFd = if let Some(cf) = explicit_stdout {
             // Upstream stdout goes to the file. For a non-final stage we
             // STILL need to create an inter-stage pipe so the downstream
             // stage reads EOF instead of inheriting parent stdin (M-125).
@@ -3699,19 +3702,7 @@ fn run_background_sequence(
                             );
                         }
                         restore_inline_assignments(snap, shell);
-                        if stdin_fd > 2 {
-                            unsafe {
-                                libc::close(stdin_fd);
-                            }
-                        }
-                        if let Some(efd) = explicit_stderr_fd {
-                            unsafe {
-                                libc::close(efd);
-                            }
-                        }
-                        unsafe {
-                            libc::close(fd);
-                        } // close the open file fd we won't use
+                        // stdin / cf (the open file) / explicit_stderr all drop here.
                         drain_procsubs(shell, procsub_base);
                         cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                         for pfd in parent_held.drain(..) {
@@ -3723,14 +3714,13 @@ fn run_background_sequence(
                     }
                 }
             }
-            fd
+            cf
         } else if !is_last {
             match make_pipe() {
                 Ok((r, w)) => {
                     prev_pipe_read = Some(r);
                     parent_held.push(r);
-                    parent_held.push(w);
-                    w
+                    unsafe { ChildFd::owned_raw(w) }
                 }
                 Err(e) => {
                     {
@@ -3744,16 +3734,7 @@ fn run_background_sequence(
                         );
                     }
                     restore_inline_assignments(snap, shell);
-                    if stdin_fd > 2 {
-                        unsafe {
-                            libc::close(stdin_fd);
-                        }
-                    }
-                    if let Some(fd) = explicit_stderr_fd {
-                        unsafe {
-                            libc::close(fd);
-                        }
-                    }
+                    // stdin / explicit_stderr drop here.
                     return bail_teardown_bg(
                         shell,
                         procsub_base,
@@ -3764,10 +3745,10 @@ fn run_background_sequence(
                 }
             }
         } else {
-            libc::STDOUT_FILENO
+            ChildFd::Inherit
         };
 
-        let stderr_fd = explicit_stderr_fd.unwrap_or(libc::STDERR_FILENO);
+        let stderr: ChildFd = explicit_stderr.unwrap_or(ChildFd::Inherit);
 
         // ---- Classify and spawn ----------------------------------------------
         let pgid_target = if job_control {
@@ -3776,11 +3757,19 @@ fn run_background_sequence(
             NO_PGROUP
         };
 
-        let fds_to_close_in_child: Vec<RawFd> = parent_held
+        let mut fds_to_close_in_child: Vec<RawFd> = parent_held
             .iter()
             .copied()
-            .filter(|&fd| fd != stdout_fd && fd != stdin_fd && fd != stderr_fd)
+            .filter(|&fd| {
+                Some(fd) != stdin.raw() && Some(fd) != stdout.raw() && Some(fd) != stderr.raw()
+            })
             .collect();
+        // The parent's shared /dev/null original (stage0_default) is inherited by
+        // every child; close it there. Each stage's own stdin is a distinct clone
+        // or pipe end, so this never closes a fd the child needs.
+        if let Some(d) = stage0_default.raw() {
+            fds_to_close_in_child.push(d);
+        }
         // (Any heredoc pipe write end lives in the forked writer process, not
         // here, so there is nothing extra to add to fds_to_close_in_child.)
 
@@ -3805,11 +3794,7 @@ fn run_background_sequence(
                                     );
                                 }
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
+                                // stdin / stdout / stderr ChildFds drop on return.
                                 return bail_teardown_bg(
                                     shell,
                                     procsub_base,
@@ -3838,11 +3823,7 @@ fn run_background_sequence(
                                     );
                                 }
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
+                                // stdin / stdout / stderr ChildFds drop on return.
                                 return bail_teardown_bg(
                                     shell,
                                     procsub_base,
@@ -3860,36 +3841,30 @@ fn run_background_sequence(
                 (None, None)
             };
 
-        let went_external;
+        // Build the child's fd environment ONCE; move it into whichever spawner.
+        // Both spawners consume it and close the parent's owned copies (on both
+        // the success and error paths — RAII), so there is no post-spawn parent
+        // close bookkeeping to do.
+        let child_stdio = ChildStdio::new(stdin, stdout, stderr);
         let spawn_result = match classify_stage(stage_cmd, shell) {
-            StageKind::External(simple) => {
-                went_external = true;
-                spawn_external_with_fds(
-                    simple,
-                    shell,
-                    sink,
-                    err_sink,
-                    stdin_fd,
-                    stdout_fd,
-                    stderr_fd,
-                    pgid_target,
-                    &fds_to_close_in_child,
-                )
-            }
-            StageKind::InProcess(cmd) => {
-                went_external = false;
-                fork_and_run_in_subshell(
-                    cmd,
-                    shell,
-                    stdin_fd,
-                    stdout_fd,
-                    stderr_fd,
-                    pgid_target,
-                    &fds_to_close_in_child,
-                    stdout_dup_target,
-                    stderr_dup_target,
-                )
-            }
+            StageKind::External(simple) => spawn_external_with_fds(
+                simple,
+                shell,
+                sink,
+                err_sink,
+                child_stdio,
+                pgid_target,
+                &fds_to_close_in_child,
+            ),
+            StageKind::InProcess(cmd) => fork_and_run_in_subshell(
+                cmd,
+                shell,
+                child_stdio,
+                pgid_target,
+                &fds_to_close_in_child,
+                stdout_dup_target,
+                stderr_dup_target,
+            ),
         };
 
         restore_inline_assignments(snap, shell);
@@ -3901,28 +3876,9 @@ fn run_background_sequence(
                     let mut err = err_writer(err_sink, sink);
                     crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e));
                 }
-                if !went_external {
-                    if stdin_fd > 2 {
-                        unsafe {
-                            libc::close(stdin_fd);
-                        }
-                    }
-                    if stdout_fd > 2 {
-                        unsafe {
-                            libc::close(stdout_fd);
-                        }
-                    }
-                    if stderr_fd > 2 {
-                        unsafe {
-                            libc::close(stderr_fd);
-                        }
-                    }
-                }
-                for fd in [stdout_fd, stdin_fd, stderr_fd] {
-                    if fd > 2 {
-                        parent_held.retain(|&x| x != fd);
-                    }
-                }
+                // child_stdio (with all owned stdio fds) was consumed by the
+                // failed call and already dropped; the pipe read end (if any)
+                // stays in parent_held and is closed by bail_teardown_bg.
                 return bail_teardown_bg(
                     shell,
                     procsub_base,
@@ -3932,28 +3888,6 @@ fn run_background_sequence(
                 );
             }
         };
-
-        // Close parent copies of fds given to child.
-        if !went_external {
-            if stdin_fd > 2 {
-                unsafe {
-                    libc::close(stdin_fd);
-                }
-            }
-            if stderr_fd > 2 {
-                unsafe {
-                    libc::close(stderr_fd);
-                }
-            }
-        }
-        if stdout_fd > 2 {
-            parent_held.retain(|&fd| fd != stdout_fd);
-            if !went_external {
-                unsafe {
-                    libc::close(stdout_fd);
-                }
-            }
-        }
 
         // (A heredoc/herestring body, if any, is written by the forked writer
         // process; the parent holds no write end and nothing to record here.)
@@ -6674,9 +6608,11 @@ fn run_coproc(
     let pid = match fork_and_run_in_subshell(
         body,
         shell,
-        in_r,
-        out_w,
-        libc::STDERR_FILENO,
+        ChildStdio::new(
+            unsafe { ChildFd::owned_raw(in_r) },
+            unsafe { ChildFd::owned_raw(out_w) },
+            ChildFd::Inherit,
+        ),
         0,
         &[in_w, out_r],
         None,
@@ -6684,11 +6620,11 @@ fn run_coproc(
     ) {
         Ok(pid) => pid,
         Err(e) => {
+            // in_r / out_w were owned by the moved ChildStdio and already
+            // dropped; close only the parent-kept ends here.
             unsafe {
-                libc::close(in_r);
                 libc::close(in_w);
                 libc::close(out_r);
-                libc::close(out_w);
             }
             {
                 let mut err = err_writer(err_sink, sink);
@@ -6703,11 +6639,8 @@ fn run_coproc(
             return ExecOutcome::Continue(1);
         }
     };
-    // Parent: close the child ends; relocate the shell ends high + cloexec.
-    unsafe {
-        libc::close(in_r);
-        libc::close(out_w);
-    }
+    // Parent: the child ends (in_r/out_w) were closed by the call; relocate the
+    // shell ends high + cloexec.
     let read_fd = match alloc_high_fd(out_r) {
         Ok(hi) => {
             unsafe {
@@ -6975,15 +6908,13 @@ fn run_multi_stage(
             } else {
                 NO_PGROUP
             };
-            let stdin_fd = libc::STDIN_FILENO;
-            let stdout_fd = if !is_last {
+            let stdout_child: ChildFd = if !is_last {
                 // Create a pipe; next stage reads from it (will be empty).
                 match make_pipe() {
                     Ok((r, w)) => {
                         prev_pipe_read = Some(r);
                         parent_held.push(r);
-                        parent_held.push(w);
-                        w
+                        unsafe { ChildFd::owned_raw(w) }
                     }
                     Err(e) => {
                         {
@@ -7006,7 +6937,7 @@ fn run_multi_stage(
                         Ok((r, w)) => {
                             capture_read_fd = Some(r);
                             parent_held.push(r);
-                            w
+                            unsafe { ChildFd::owned_raw(w) }
                         }
                         Err(e) => {
                             {
@@ -7022,36 +6953,26 @@ fn run_multi_stage(
                             return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     },
-                    StdoutSink::Terminal => libc::STDOUT_FILENO,
+                    StdoutSink::Terminal => ChildFd::Inherit,
                 }
             };
             let fds_to_close: Vec<RawFd> = parent_held
                 .iter()
                 .copied()
-                .filter(|&fd| fd != stdout_fd)
+                .filter(|&fd| Some(fd) != stdout_child.raw())
                 .collect();
             match fork_and_run_in_subshell(
                 &assign_cmd,
                 shell,
-                stdin_fd,
-                stdout_fd,
-                libc::STDERR_FILENO,
+                ChildStdio::new(ChildFd::Inherit, stdout_child, ChildFd::Inherit),
                 pgid_target,
                 &fds_to_close,
                 None,
                 None,
             ) {
                 Ok(pid) => {
-                    // Close the stdout fd we gave to the child.
-                    if stdout_fd > 2 {
-                        let pos = parent_held.iter().position(|&fd| fd == stdout_fd);
-                        if let Some(p) = pos {
-                            parent_held.remove(p);
-                        }
-                        unsafe {
-                            libc::close(stdout_fd);
-                        }
-                    }
+                    // The pipe/capture write end was owned by the moved
+                    // ChildStdio and closed in the parent by the call.
                     if interactive && first_pid.is_none() {
                         first_pid = Some(pid);
                     }
@@ -7101,7 +7022,7 @@ fn run_multi_stage(
         // $var references see the stage's own inline assignments — v24 deferred-
         // heredoc contract), handed to `spawn_heredoc_writer`, and the read end
         // becomes this stage's stdin. The parent never holds the pipe write end.
-        let stdin_fd: RawFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+        let stdin: ChildFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
             match &exec.slot_stdin() {
                 Some(RedirectSlot::Read(word)) => {
                     // Discard the previous stage's pipe read-end: this stage
@@ -7121,9 +7042,8 @@ fn run_multi_stage(
                             return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     };
-                    use std::os::unix::io::IntoRawFd;
                     match File::open(&path) {
-                        Ok(f) => f.into_raw_fd(),
+                        Ok(f) => ChildFd::from(f),
                         Err(e) => {
                             redir_open_error(shell, err_sink, sink, &path, &e);
                             restore_inline_assignments(snap, shell);
@@ -7150,7 +7070,7 @@ fn run_multi_stage(
                     match spawn_heredoc_writer(&bytes) {
                         Ok((r, pid)) => {
                             heredoc_writers.push(pid);
-                            r
+                            unsafe { ChildFd::owned_raw(r) }
                         }
                         Err(e) => {
                             {
@@ -7184,7 +7104,7 @@ fn run_multi_stage(
                     match spawn_heredoc_writer(&bytes) {
                         Ok((r, pid)) => {
                             heredoc_writers.push(pid);
-                            r
+                            unsafe { ChildFd::owned_raw(r) }
                         }
                         Err(e) => {
                             {
@@ -7203,25 +7123,29 @@ fn run_multi_stage(
                     }
                 }
                 _ => {
-                    // No explicit stdin redirect: use prev_pipe_read or STDIN_FILENO.
-                    prev_pipe_read.take().unwrap_or(libc::STDIN_FILENO)
+                    // No explicit stdin redirect: use prev_pipe_read or inherit.
+                    match prev_pipe_read.take() {
+                        Some(r) => {
+                            parent_held.retain(|&fd| fd != r);
+                            unsafe { ChildFd::owned_raw(r) }
+                        }
+                        None => ChildFd::Inherit,
+                    }
                 }
             }
         } else {
             // Compound command: no explicit stdin at stage level.
-            prev_pipe_read.take().unwrap_or(libc::STDIN_FILENO)
+            match prev_pipe_read.take() {
+                Some(r) => {
+                    parent_held.retain(|&fd| fd != r);
+                    unsafe { ChildFd::owned_raw(r) }
+                }
+                None => ChildFd::Inherit,
+            }
         };
 
-        // stdin_fd is now consumed by this stage; remove from parent_held if it was there.
-        {
-            let pos = parent_held.iter().position(|&fd| fd == stdin_fd);
-            if let Some(p) = pos {
-                parent_held.remove(p);
-            }
-        }
-
         // ---- Determine stdout redirect (from ExecCommand if Simple) ----------
-        let explicit_stdout_fd: Option<RawFd> =
+        let explicit_stdout: Option<ChildFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 match &exec.slot_stdout() {
                     Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
@@ -7229,27 +7153,16 @@ fn run_multi_stage(
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         };
-                        use std::os::unix::io::IntoRawFd;
                         let guard =
                             shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
                         match open_writable(&path, guard) {
-                            Ok(f) => Some(f.into_raw_fd()),
+                            Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
@@ -7259,25 +7172,14 @@ fn run_multi_stage(
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         };
-                        use std::os::unix::io::IntoRawFd;
                         match OpenOptions::new().create(true).append(true).open(&path) {
-                            Ok(f) => Some(f.into_raw_fd()),
+                            Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
@@ -7289,7 +7191,7 @@ fn run_multi_stage(
             };
 
         // ---- Determine stderr redirect (from ExecCommand if Simple) ----------
-        let explicit_stderr_fd: Option<RawFd> =
+        let explicit_stderr: Option<ChildFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 match &exec.slot_stderr() {
                     Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
@@ -7297,37 +7199,16 @@ fn run_multi_stage(
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
-                                if let Some(fd) = explicit_stdout_fd {
-                                    unsafe {
-                                        libc::close(fd);
-                                    }
-                                }
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         };
-                        use std::os::unix::io::IntoRawFd;
                         let guard =
                             shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
                         match open_writable(&path, guard) {
-                            Ok(f) => Some(f.into_raw_fd()),
+                            Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
-                                if let Some(fd) = explicit_stdout_fd {
-                                    unsafe {
-                                        libc::close(fd);
-                                    }
-                                }
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
@@ -7337,35 +7218,14 @@ fn run_multi_stage(
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
-                                if let Some(fd) = explicit_stdout_fd {
-                                    unsafe {
-                                        libc::close(fd);
-                                    }
-                                }
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         };
-                        use std::os::unix::io::IntoRawFd;
                         match OpenOptions::new().create(true).append(true).open(&path) {
-                            Ok(f) => Some(f.into_raw_fd()),
+                            Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
-                                if let Some(fd) = explicit_stdout_fd {
-                                    unsafe {
-                                        libc::close(fd);
-                                    }
-                                }
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
@@ -7378,7 +7238,7 @@ fn run_multi_stage(
 
         // ---- Build stdout fd -------------------------------------------------
         // Priority: explicit redirect > inter-stage pipe > Capture sink pipe > STDOUT_FILENO.
-        let stdout_fd: RawFd = if let Some(fd) = explicit_stdout_fd {
+        let stdout: ChildFd = if let Some(cf) = explicit_stdout {
             // Upstream stdout goes to the file. For a non-final stage we
             // STILL need to create an inter-stage pipe so the downstream
             // stage reads EOF instead of inheriting parent stdin (M-125).
@@ -7400,19 +7260,7 @@ fn run_multi_stage(
                             );
                         }
                         restore_inline_assignments(snap, shell);
-                        if stdin_fd > 2 {
-                            unsafe {
-                                libc::close(stdin_fd);
-                            }
-                        }
-                        if let Some(efd) = explicit_stderr_fd {
-                            unsafe {
-                                libc::close(efd);
-                            }
-                        }
-                        unsafe {
-                            libc::close(fd);
-                        } // close the open file fd we won't use
+                        // stdin / cf (the open file) / explicit_stderr drop here.
                         drain_procsubs(shell, procsub_base);
                         for pfd in parent_held.drain(..) {
                             unsafe {
@@ -7423,16 +7271,15 @@ fn run_multi_stage(
                     }
                 }
             }
-            fd
+            cf
         } else if !is_last {
             // Create the inter-stage pipe.
             match make_pipe() {
                 Ok((r, w)) => {
                     prev_pipe_read = Some(r);
                     parent_held.push(r);
-                    // w is given to the child; track it so other children can close it.
-                    parent_held.push(w);
-                    w
+                    // w is owned by the child's stdout ChildFd (not parent_held).
+                    unsafe { ChildFd::owned_raw(w) }
                 }
                 Err(e) => {
                     {
@@ -7446,16 +7293,7 @@ fn run_multi_stage(
                         );
                     }
                     restore_inline_assignments(snap, shell);
-                    if stdin_fd > 2 {
-                        unsafe {
-                            libc::close(stdin_fd);
-                        }
-                    }
-                    if let Some(fd) = explicit_stderr_fd {
-                        unsafe {
-                            libc::close(fd);
-                        }
-                    }
+                    // stdin / explicit_stderr drop here.
                     return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                 }
             }
@@ -7465,7 +7303,7 @@ fn run_multi_stage(
                     Ok((r, w)) => {
                         capture_read_fd = Some(r);
                         parent_held.push(r);
-                        w
+                        unsafe { ChildFd::owned_raw(w) }
                     }
                     Err(e) => {
                         {
@@ -7479,43 +7317,60 @@ fn run_multi_stage(
                             );
                         }
                         restore_inline_assignments(snap, shell);
-                        if stdin_fd > 2 {
-                            unsafe {
-                                libc::close(stdin_fd);
-                            }
-                        }
-                        if let Some(fd) = explicit_stderr_fd {
-                            unsafe {
-                                libc::close(fd);
-                            }
-                        }
+                        // stdin / explicit_stderr drop here.
                         return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                     }
                 },
-                StdoutSink::Terminal => libc::STDOUT_FILENO,
+                StdoutSink::Terminal => ChildFd::Inherit,
             }
         };
 
         // ---- Build stderr fd -------------------------------------------------
         // Priority: explicit redirect (`2>file` / `2>&n`) > sink-derived.
         //   StderrSink::Terminal → STDERR_FILENO (inherit).
-        //   StderrSink::Merged   → stdout_fd (kernel-level 2>&1; for non-last
-        //                          stages this aliases the inter-stage pipe,
-        //                          matching bash `pipe1 2>&1 | pipe2 2>&1`).
+        //   StderrSink::Merged   → a distinct dup of stdout_fd via
+        //                          try_clone_resolving (kernel-level 2>&1,
+        //                          matching bash `pipe1 2>&1 | pipe2 2>&1`;
+        //                          never an alias of the same owned fd).
         //   StderrSink::Capture  → dup of the shared capture_err write-end. We
         //                          dup PER STAGE because spawn_external_with_fds
         //                          consumes its stderr_fd via OwnedFd (closes
-        //                          parent's copy) and fork_and_run_in_subshell
-        //                          paths close it explicitly after spawn — both
-        //                          would otherwise destroy the shared write-end
-        //                          after the first stage.
-        let stderr_fd = if let Some(fd) = explicit_stderr_fd {
-            fd
+        //                          parent's copy) and fork_and_run_in_subshell's
+        //                          ChildStdio closes its copy via RAII (Drop) —
+        //                          both would otherwise destroy the shared
+        //                          write-end after the first stage.
+        let stderr: ChildFd = if let Some(cf) = explicit_stderr {
+            cf
         } else {
             match err_sink {
-                StderrSink::Terminal => libc::STDERR_FILENO,
-                StderrSink::Merged => stdout_fd,
+                StderrSink::Terminal => ChildFd::Inherit,
+                // Kernel-level 2>&1: stderr := a distinct dup of whatever stdout
+                // resolves to (a real fd 1 when stdout inherits, else a clone of
+                // the owned pipe/file). A clone — never an alias of the same fd —
+                // so no fd is double-owned (the §5 double-OwnedFd fix).
+                // SAFETY: STDOUT_FILENO is always a live shell std fd.
+                StderrSink::Merged => match stdout.try_clone_resolving(libc::STDOUT_FILENO) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "dup: {}",
+                                crate::bash_io_error(&e)
+                            );
+                        }
+                        restore_inline_assignments(snap, shell);
+                        // stdin / stdout drop here.
+                        return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                    }
+                },
                 StderrSink::Capture(_) => {
+                    // dup the shared capture_err write-end PER STAGE (each stage
+                    // owns its own copy; the shared original stays open until the
+                    // pipeline finishes).
                     let shared = capture_err_pipe_write_fd
                         .expect("capture_err_pipe_write_fd set when err_sink is Capture");
                     let fd = unsafe { libc::dup(shared) };
@@ -7532,26 +7387,11 @@ fn run_multi_stage(
                             );
                         }
                         restore_inline_assignments(snap, shell);
-                        if stdin_fd > 2 {
-                            unsafe {
-                                libc::close(stdin_fd);
-                            }
-                        }
-                        if stdout_fd > 2 {
-                            parent_held.retain(|&x| x != stdout_fd);
-                            unsafe {
-                                libc::close(stdout_fd);
-                            }
-                        }
-                        if let Some(r) = capture_read_fd {
-                            parent_held.retain(|&x| x != r);
-                            unsafe {
-                                libc::close(r);
-                            }
-                        }
+                        // stdin / stdout drop here; capture_read_fd stays in
+                        // parent_held and is closed by bail_teardown_stage.
                         return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                     }
-                    fd
+                    unsafe { ChildFd::owned_raw(fd) }
                 }
             }
         };
@@ -7572,7 +7412,9 @@ fn run_multi_stage(
         let fds_to_close_in_child: Vec<RawFd> = parent_held
             .iter()
             .copied()
-            .filter(|&fd| fd != stdout_fd && fd != stdin_fd && fd != stderr_fd)
+            .filter(|&fd| {
+                Some(fd) != stdin.raw() && Some(fd) != stdout.raw() && Some(fd) != stderr.raw()
+            })
             .collect();
 
         // Resolve Dup targets pre-fork for InProcess stages (Word expansion may
@@ -7596,17 +7438,8 @@ fn run_multi_stage(
                                     );
                                 }
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
-                                if let Some(r) = capture_read_fd {
-                                    parent_held.retain(|&fd| fd != r);
-                                    unsafe {
-                                        libc::close(r);
-                                    }
-                                }
+                                // stdin / stdout / stderr ChildFds drop on return;
+                                // capture_read_fd stays in parent_held (drained).
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
@@ -7629,17 +7462,8 @@ fn run_multi_stage(
                                     );
                                 }
                                 restore_inline_assignments(snap, shell);
-                                if stdin_fd > 2 {
-                                    unsafe {
-                                        libc::close(stdin_fd);
-                                    }
-                                }
-                                if let Some(r) = capture_read_fd {
-                                    parent_held.retain(|&fd| fd != r);
-                                    unsafe {
-                                        libc::close(r);
-                                    }
-                                }
+                                // stdin / stdout / stderr ChildFds drop on return;
+                                // capture_read_fd stays in parent_held (drained).
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
@@ -7651,43 +7475,32 @@ fn run_multi_stage(
                 (None, None)
             };
 
-        // Track whether we went External (in which case spawn_external_with_fds
-        // consumes stdin/stdout/stderr via OwnedFd and the parent must NOT close
-        // them) or InProcess (in which case the parent must close them since
-        // fork_and_run_in_subshell only dup2's in the child).
-        let went_external;
+        // Build the child's fd environment ONCE; move it into whichever spawner.
+        // Both spawners consume the ChildStdio and close the parent's owned
+        // copies (on success AND error — RAII), so there is no post-spawn parent
+        // close bookkeeping. The inter-stage pipe WRITE end is owned by `stdout`
+        // (never entered parent_held); the READ end stays in parent_held for the
+        // next stage to consume.
+        let child_stdio = ChildStdio::new(stdin, stdout, stderr);
         let spawn_result = match classify_stage(stage_cmd, shell) {
-            StageKind::External(simple) => {
-                went_external = true;
-                // spawn_external_with_fds takes ownership of stdin_fd/stdout_fd/stderr_fd
-                // via OwnedFd::from_raw_fd. The parent's copies are closed inside the
-                // function. Do NOT close them in the parent after this call.
-                spawn_external_with_fds(
-                    simple,
-                    shell,
-                    sink,
-                    err_sink,
-                    stdin_fd,
-                    stdout_fd,
-                    stderr_fd,
-                    pgid_target,
-                    &fds_to_close_in_child,
-                )
-            }
-            StageKind::InProcess(cmd) => {
-                went_external = false;
-                fork_and_run_in_subshell(
-                    cmd,
-                    shell,
-                    stdin_fd,
-                    stdout_fd,
-                    stderr_fd,
-                    pgid_target,
-                    &fds_to_close_in_child,
-                    stdout_dup_target,
-                    stderr_dup_target,
-                )
-            }
+            StageKind::External(simple) => spawn_external_with_fds(
+                simple,
+                shell,
+                sink,
+                err_sink,
+                child_stdio,
+                pgid_target,
+                &fds_to_close_in_child,
+            ),
+            StageKind::InProcess(cmd) => fork_and_run_in_subshell(
+                cmd,
+                shell,
+                child_stdio,
+                pgid_target,
+                &fds_to_close_in_child,
+                stdout_dup_target,
+                stderr_dup_target,
+            ),
         };
 
         // ---- Restore inline assignments (v23 scoping) -----------------------
@@ -7700,89 +7513,18 @@ fn run_multi_stage(
                     let mut err = err_writer(err_sink, sink);
                     crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e));
                 }
-                // For InProcess (fork failed), close the fds we were going to
-                // pass. For External, they were already consumed by OwnedFd.
-                if !went_external {
-                    if stdin_fd > 2 {
-                        unsafe {
-                            libc::close(stdin_fd);
-                        }
-                    }
-                    if stdout_fd > 2 {
-                        unsafe {
-                            libc::close(stdout_fd);
-                        }
-                    }
-                    if stderr_fd > 2 {
-                        unsafe {
-                            libc::close(stderr_fd);
-                        }
-                    }
-                }
-                // Remove consumed fds from parent_held.
-                for fd in [stdout_fd, stdin_fd, stderr_fd] {
-                    if fd > 2 {
-                        let pos = parent_held.iter().position(|&x| x == fd);
-                        if let Some(p) = pos {
-                            parent_held.remove(p);
-                        }
-                    }
-                }
-                // Exclude capture_read_fd from the drain: it will be closed
-                // explicitly below, avoiding a double-close.
-                if let Some(r) = capture_read_fd {
-                    parent_held.retain(|&fd| fd != r);
-                }
+                // child_stdio (with all owned stdio fds) was consumed by the
+                // failed call and already dropped. Close every remaining
+                // parent-held fd (inter-stage read ends + capture read ends).
                 drain_procsubs(shell, procsub_base);
                 for fd in parent_held.drain(..) {
                     unsafe {
                         libc::close(fd);
                     }
                 }
-                if let Some(r) = capture_read_fd {
-                    unsafe {
-                        libc::close(r);
-                    }
-                }
                 return ExecOutcome::Continue(1);
             }
         };
-
-        // ---- Close fds the child consumed in the parent ---------------------
-        // For InProcess: the child dup2'd stdin/stdout/stderr but the parent's
-        // copies still exist. Close them here.
-        // For External: spawn_external_with_fds consumed them via OwnedFd;
-        // they are already closed. Do NOT close again.
-        if !went_external {
-            if stdin_fd > 2 {
-                unsafe {
-                    libc::close(stdin_fd);
-                }
-            }
-            // stdout_fd will be closed below (shared with External path).
-            if stderr_fd > 2 {
-                unsafe {
-                    libc::close(stderr_fd);
-                }
-            }
-        }
-        // stdout_fd (write-end of the inter-stage pipe or explicit redirect):
-        // - For External: already closed by OwnedFd inside spawn_external_with_fds.
-        // - For InProcess: closed above if stderr, here for stdout.
-        // But we still need to remove it from parent_held in both cases so
-        // subsequent stages don't include it in their fds_to_close_in_child.
-        if stdout_fd > 2 {
-            let pos = parent_held.iter().position(|&fd| fd == stdout_fd);
-            if let Some(p) = pos {
-                parent_held.remove(p);
-            }
-            // Only close if InProcess (External already closed it).
-            if !went_external {
-                unsafe {
-                    libc::close(stdout_fd);
-                }
-            }
-        }
 
         // (A heredoc/herestring body, if any, is written by the forked writer
         // process spawned above; the parent holds no write end here.)
@@ -8659,9 +8401,7 @@ fn reset_job_control_signals_in_child() -> std::io::Result<()> {
 pub fn fork_and_run_in_subshell(
     cmd: &Command,
     shell: &mut Shell,
-    stdin_fd: RawFd,
-    stdout_fd: RawFd,
-    stderr_fd: RawFd,
+    stdio: ChildStdio,
     pgid_target: i32,
     parent_fds_to_close: &[RawFd],
     stdout_dup_target: Option<i32>,
@@ -8694,29 +8434,60 @@ pub fn fork_and_run_in_subshell(
             if pgid_target >= 0 {
                 libc::setpgid(0, pgid_target);
             }
-            // 3. dup2 the stdio fds to 0/1/2.
-            if stdin_fd != 0 {
-                libc::dup2(stdin_fd, 0);
-            }
-            if stdout_fd != 1 {
-                libc::dup2(stdout_fd, 1);
-            }
-            if stderr_fd != 2 {
-                libc::dup2(stderr_fd, 2);
-            }
-            // 4. Close the originals if not already at 0/1/2.
-            for fd in [stdin_fd, stdout_fd, stderr_fd] {
-                if fd > 2 {
-                    libc::close(fd);
+            // 3-5. Install stdio from ChildStdio. Convert to raw NOW so no
+            // OwnedFd destructor can run in the forked child (Drop safety).
+            let ChildStdio {
+                stdin,
+                stdout,
+                stderr,
+            } = stdio;
+            let mut plan: [(Option<RawFd>, RawFd); 3] = [
+                (stdin.into_raw(), 0),
+                (stdout.into_raw(), 1),
+                (stderr.into_raw(), 2),
+            ];
+            let original_raws: [RawFd; 3] = {
+                // fd numbers this child owns as stdio sources, -1 for Inherit.
+                [
+                    plan[0].0.unwrap_or(-1),
+                    plan[1].0.unwrap_or(-1),
+                    plan[2].0.unwrap_or(-1),
+                ]
+            };
+            // Pass 1 (PRE-MOVE): move any owned source in 0..=2 up to >=3, so
+            // pass 2's dup2 always has source != target (clears FD_CLOEXEC ->
+            // the §H2b fix) and installs are order-independent. F_DUPFD (not
+            // _CLOEXEC): the moved copy must survive exec if its install no-ops.
+            for (src, _) in plan.iter_mut() {
+                if let Some(s) = *src
+                    && s <= 2
+                {
+                    let moved = libc::fcntl(s, libc::F_DUPFD, 3);
+                    if moved >= 0 {
+                        libc::close(s);
+                        *src = Some(moved);
+                    }
+                    // On failure keep s: the pass-2 `s != slot` guard below is
+                    // what makes this truly never-worse — a same-slot owned
+                    // source is installed by a no-op dup2 and left open,
+                    // matching the old behavior.
                 }
             }
-            // 5. Close every other pipe fd the parent held, skipping any
-            //    that were one of our stdio sources (they may have been > 2
-            //    and are already closed above, but guard against the case
-            //    where a parent_fds_to_close entry coincides with stdin/
-            //    stdout/stderr — we must not close what we just dup2'd from).
+            // Pass 2 (INSTALL): sources now all >=3 and pairwise distinct (except
+            // the pathological case where a pass-1 F_DUPFD failed and left an
+            // owned source at its own slot — a no-op dup2 we must NOT then close).
+            for (src, slot) in plan {
+                if let Some(s) = src {
+                    libc::dup2(s, slot);
+                    if s != slot {
+                        libc::close(s);
+                    }
+                }
+            }
+            // Pass 3: close every parent-held pipe fd, skipping this child's own
+            // stdio sources by their ORIGINAL numbers.
             for &fd in parent_fds_to_close {
-                if fd != stdin_fd && fd != stdout_fd && fd != stderr_fd {
+                if fd != original_raws[0] && fd != original_raws[1] && fd != original_raws[2] {
                     libc::close(fd);
                 }
             }
@@ -8814,12 +8585,12 @@ fn classify_stage<'a>(cmd: &'a Command, shell: &Shell) -> StageKind<'a> {
     StageKind::InProcess(cmd)
 }
 
-/// Spawns an external command with pre-opened raw stdio fds.
+/// Spawns an external command with a pre-built `ChildStdio`.
 ///
-/// Converts `stdin_fd`/`stdout_fd`/`stderr_fd` to `Stdio` via
-/// `OwnedFd::from_raw_fd` (transfers ownership — the caller must NOT close
-/// these fds after calling this function; `std::process::Command` handles
-/// closing them in the parent after the fork).
+/// Consumes `stdio`: each `ChildFd::Owned` slot becomes a `Stdio` (ownership
+/// transferred — `std::process::Command` closes it in the parent after fork),
+/// and each `ChildFd::Inherit` slot uses `Stdio::inherit()`. On every early
+/// return the un-consumed `stdio` drops, closing the parent's owned fds (#78).
 ///
 /// `pgid_target`: 0 = become own pgrp leader; >0 = join this pgrp.
 ///
@@ -8835,16 +8606,13 @@ fn spawn_external_with_fds(
     shell: &mut Shell,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
-    stdin_fd: RawFd,
-    stdout_fd: RawFd,
-    stderr_fd: RawFd,
+    stdio: ChildStdio,
     pgid_target: i32,
     parent_fds_to_close: &[RawFd],
 ) -> Result<i32, io::Error> {
     // Flush pending parent stdout before spawning an external stage so its output
     // does not race ahead of buffered parent bytes (M-118 sibling: ordering).
     flush_stdout();
-    use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
 
     let SimpleCommand::Exec(exec) = cmd else {
@@ -8945,45 +8713,39 @@ fn spawn_external_with_fds(
         process.process_group(pgid_target);
     }
 
-    // Convert raw fds to Stdio. For fds that are already at their "natural"
-    // slot (stdin=0, stdout=1, stderr=2), use Stdio::inherit() so we don't
-    // accidentally close the parent's standard streams. For other fds, use
-    // OwnedFd::from_raw_fd which transfers ownership — std::process::Command
-    // closes the original fd in the parent after forking.
-    // For Dup-redirect fds, always use Stdio::inherit() to avoid the
-    // close-on-drop trap of OwnedFd (the dup2 pre_exec handles the actual
-    // redirect in the child).
-    let stdin_stdio = if stdin_fd == 0 {
-        Stdio::inherit()
-    } else {
-        unsafe { Stdio::from(OwnedFd::from_raw_fd(stdin_fd)) }
+    // Convert the ChildStdio to std Stdio. An `Inherit` slot leaves the shell's
+    // real fd alone; an `Owned` slot transfers the OwnedFd to Stdio (std closes
+    // it in the parent after fork). For a Dup-redirect slot, use Stdio::inherit()
+    // and drop the owned fd (if any) — the dup2 pre_exec applies the real
+    // redirect in the child; dropping closes the parent's copy.
+    let ChildStdio {
+        stdin,
+        stdout,
+        stderr,
+    } = stdio;
+    let stdin_stdio = match stdin {
+        ChildFd::Inherit => Stdio::inherit(),
+        ChildFd::Owned(fd) => Stdio::from(fd),
     };
     let stdout_stdio = if stdout_dup_target.is_some() {
-        // Dup on stdout: inherit so the dup2 pre_exec can redirect to target.
-        // We must still consume stdout_fd so it isn't leaked in the parent.
-        if stdout_fd != 1 {
-            unsafe {
-                libc::close(stdout_fd);
-            }
-        }
-        Stdio::inherit()
-    } else if stdout_fd == 1 {
+        // Dup on stdout: inherit so the dup2 pre_exec redirects to target.
+        // Dropping the owned fd (if any) closes the parent's copy.
+        drop(stdout);
         Stdio::inherit()
     } else {
-        unsafe { Stdio::from(OwnedFd::from_raw_fd(stdout_fd)) }
+        match stdout {
+            ChildFd::Inherit => Stdio::inherit(),
+            ChildFd::Owned(fd) => Stdio::from(fd),
+        }
     };
     let stderr_stdio = if stderr_dup_target.is_some() {
-        // Dup on stderr: inherit so the dup2 pre_exec can redirect to target.
-        if stderr_fd != 2 {
-            unsafe {
-                libc::close(stderr_fd);
-            }
-        }
-        Stdio::inherit()
-    } else if stderr_fd == 2 {
+        drop(stderr);
         Stdio::inherit()
     } else {
-        unsafe { Stdio::from(OwnedFd::from_raw_fd(stderr_fd)) }
+        match stderr {
+            ChildFd::Inherit => Stdio::inherit(),
+            ChildFd::Owned(fd) => Stdio::from(fd),
+        }
     };
 
     process.stdin(stdin_stdio);

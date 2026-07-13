@@ -4,8 +4,8 @@
 # background matrix, restricted to behavior huck ALREADY matches bash on, so it is
 # green today and its job is to catch REGRESSIONS as Phases 1-5 rework the fd
 # machinery. #128 (no-hangup) and #129 (bg stdin) cases are added by their tasks.
-# Deliberately excluded until their fixing phase: `exec <&-; cat < file | cat`
-# (#132) and stage redirect source-order (#50).
+# Deliberately excluded until their fixing phase: stage redirect source-order (#50)
+# and the in-process whole-command redirect on a freed std fd (#135, Phase 3).
 set -u
 HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
 [[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
@@ -30,6 +30,10 @@ check() {
 check "freed fd0: cat|cat"        'exec <&-; cat | cat; echo end'
 check "freed fd0: cat|cat|cat"    'exec <&-; cat | cat | cat; echo end'
 check "freed fd2: err|cat"        'exec 2>&-; ls /no_such_xyz | cat; echo "end=$?"'
+# --- #132: redirect fd landing on a freed std slot, pipeline-stage path (Phase 1 fix) ---
+check "132 external stage on freed fd0" 'exec <&-; cat < inA | cat; echo end'
+check "132 stdout to file on freed fd1" 'exec >&-; /bin/echo hi > f | cat; cat f'
+check "132 bg pipeline file redirect"   'exec <&-; cat < inA | cat & wait; echo end'
 # --- per-stage redirects on a non-last stage ---
 check "stage stdout redirect"     'echo hi > f | cat; cat f'
 check "stage stderr redirect"     'ls /no_such_xyz 2>e | cat; cat e'

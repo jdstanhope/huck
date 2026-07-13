@@ -13,6 +13,7 @@ pub(crate) mod array_transforms;
 #[doc(hidden)]
 pub mod builtins;
 pub(crate) mod callbacks_thread_local;
+pub(crate) mod child_fd;
 #[doc(hidden)]
 pub mod completion;
 pub(crate) mod completion_builtins;
