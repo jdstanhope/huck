@@ -1086,76 +1086,31 @@ impl RedirectScope {
                 }
                 Ok(())
             }
-            RedirOp::Dup { source, .. } => {
-                // `>&w` / `<&w`: duplicate the source fd onto target. Resolved
-                // AFTER earlier swaps so e.g. `>file 2>&1` makes stderr follow
-                // the already-redirected stdout.
-                let src = match resolve_fd_target(source, shell) {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "{}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        return Err(ExecOutcome::Continue(1));
-                    }
-                };
-                // Validate the source fd is open before dup2 (bash: bad fd error).
-                if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
-                    {
-                        let mut err = err_writer(err_sink, sink);
-                        crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor");
-                    }
-                    return Err(ExecOutcome::Continue(1));
-                }
-                if self.redirect(shell, src, target, sink, err_sink).is_err() {
-                    return Err(ExecOutcome::Continue(1));
-                }
-                Ok(())
-            }
-            RedirOp::Move { source, output: _ } => {
-                let src = match resolve_fd_target(source, shell) {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "{}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        return Err(ExecOutcome::Continue(1));
-                    }
-                };
-                // bash (redir.c do_redirection_internal): the entire dup2+close
-                // is guarded by `redir_fd != redirector` — a degenerate
-                // `N>&N-` (source == target) is a pure no-op: no fd validation,
-                // no dup2, no close.
-                if src == target {
+            RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
+                // `>&w` / `<&w` (dup), and `>&w-` / `<&w-` (move = dup then close
+                // the source). Resolved AFTER earlier swaps so e.g. `>file 2>&1`
+                // makes stderr follow the already-redirected stdout.
+                let is_move = matches!(&redir.op, RedirOp::Move { .. });
+                let src = resolve_dup_source(source, shell, sink, err_sink)
+                    .map_err(|()| ExecOutcome::Continue(1))?;
+                // bash (redir.c do_redirection_internal): a degenerate move
+                // `N>&N-` (source == target) is guarded by `redir_fd != redirector`
+                // — a pure no-op with no fd validation, dup2, or close.
+                if is_move && src == target {
                     return Ok(());
                 }
-                if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
-                    {
-                        let mut err = err_writer(err_sink, sink);
-                        crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor");
-                    }
-                    return Err(ExecOutcome::Continue(1));
-                }
+                // Validate the source fd is open before dup2 (bash: bad fd error).
+                validate_fd_open(src, shell, sink, err_sink)
+                    .map_err(|()| ExecOutcome::Continue(1))?;
                 if self.redirect(shell, src, target, sink, err_sink).is_err() {
                     return Err(ExecOutcome::Continue(1));
                 }
-                // The "move": close the source fd (save/restore via close_target
-                // so a command-scoped move restores it; `exec` persists).
-                self.close_target(src);
+                if is_move {
+                    // The "move": close the source fd (save/restore via
+                    // close_target so a command-scoped move restores it; `exec`
+                    // persists).
+                    self.close_target(src);
+                }
                 Ok(())
             }
             RedirOp::Close => {
@@ -1323,59 +1278,15 @@ impl RedirectScope {
                 };
                 (fd, true)
             }
-            RedirOp::Dup { source, .. } => {
-                let src = match resolve_fd_target(source, shell) {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "{}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        return Err(ExecOutcome::Continue(1));
-                    }
-                };
-                if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
-                    {
-                        let mut err = err_writer(err_sink, sink);
-                        crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor");
-                    }
-                    return Err(ExecOutcome::Continue(1));
-                }
-                (src, false)
-            }
-            RedirOp::Move { source, output: _ } => {
-                let src = match resolve_fd_target(source, shell) {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "{}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        return Err(ExecOutcome::Continue(1));
-                    }
-                };
-                if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
-                    {
-                        let mut err = err_writer(err_sink, sink);
-                        crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor");
-                    }
-                    return Err(ExecOutcome::Continue(1));
-                }
-                // Not "owned" here (the plain owns_src close path is a temp,
-                // non-restoring close); the move-close happens below via
-                // `close_target` once `high` is allocated, so it saves/restores.
+            RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
+                // Dup and move resolve the source fd identically here; a move's
+                // extra source-close happens below via `close_target` (save/
+                // restore) once `high` is allocated, gated on `is_move`. The
+                // source is not "owned" (the shell's fd, not a temp we opened).
+                let src = resolve_dup_source(source, shell, sink, err_sink)
+                    .map_err(|()| ExecOutcome::Continue(1))?;
+                validate_fd_open(src, shell, sink, err_sink)
+                    .map_err(|()| ExecOutcome::Continue(1))?;
                 (src, false)
             }
             RedirOp::Heredoc { body, .. } => {
@@ -4248,6 +4159,46 @@ fn resolve_fd_target(source: &crate::lexer::Word, shell: &mut Shell) -> Result<i
         .map_err(|_| io::Error::other(format!("bad fd: {expanded}")))
 }
 
+/// Resolve a `>&w` / `<&w` / move (`>&w-`) source word to an fd, writing bash's
+/// error to the redirect-aware writer on failure. Shared by every dup/move
+/// redirect-apply site (in-process `apply`/`apply_var` and the child-plan
+/// builders). Does NOT check the fd is currently open — the in-process sites
+/// add that via `validate_fd_open` (they perform the `dup2` in the parent);
+/// the child-plan sites defer the check to child replay. Returns `Err(())`
+/// after emitting the error.
+fn resolve_dup_source(
+    source: &crate::lexer::Word,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> Result<RawFd, ()> {
+    match resolve_fd_target(source, shell) {
+        Ok(fd) => Ok(fd),
+        Err(e) => {
+            let mut err = err_writer(err_sink, sink);
+            crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e));
+            Err(())
+        }
+    }
+}
+
+/// Check that `src` is currently an open fd; on failure write bash's
+/// `N: Bad file descriptor` and return `Err(())`. Used by the in-process
+/// dup/move apply sites before the parent-side `dup2`.
+fn validate_fd_open(
+    src: RawFd,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> Result<(), ()> {
+    if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
+        let mut err = err_writer(err_sink, sink);
+        crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor");
+        return Err(());
+    }
+    Ok(())
+}
+
 /// Glob-expands one word honoring `shopt` flags. On a `failglob` no-match,
 /// prints the bash-style "no match" error to stderr and returns `Err(())`,
 /// signaling the caller to abort the command/loop with status 1.
@@ -5867,45 +5818,11 @@ fn build_child_redir_plan(
                     };
                     (file.into_raw_fd(), true)
                 }
-                RedirOp::Dup { source, .. } => {
-                    let src = match resolve_fd_target(source, shell) {
-                        Ok(fd) => fd,
-                        Err(e) => {
-                            {
-                                let mut err = err_writer(err_sink, sink);
-                                crate::sh_error_to!(
-                                    shell,
-                                    &mut *err,
-                                    None,
-                                    "{}",
-                                    crate::bash_io_error(&e)
-                                );
-                            }
-                            return Err(1);
-                        }
-                    };
-                    (src, false)
-                }
-                RedirOp::Move { source, output: _ } => {
-                    let src = match resolve_fd_target(source, shell) {
-                        Ok(fd) => fd,
-                        Err(e) => {
-                            {
-                                let mut err = err_writer(err_sink, sink);
-                                crate::sh_error_to!(
-                                    shell,
-                                    &mut *err,
-                                    None,
-                                    "{}",
-                                    crate::bash_io_error(&e)
-                                );
-                            }
-                            return Err(1);
-                        }
-                    };
-                    // Not "owned" here (that path is a temp, parent-side close);
-                    // the move-close is replayed in the CHILD once `high` is
-                    // allocated, below.
+                RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
+                    // Dup and move resolve the source identically; a move's extra
+                    // child-side close is replayed below, gated on `is_move`. Not
+                    // "owned" (the shell's fd, not a temp we opened).
+                    let src = resolve_dup_source(source, shell, sink, err_sink).map_err(|()| 1)?;
                     (src, false)
                 }
                 RedirOp::Heredoc { body, .. } => {
@@ -6074,59 +5991,24 @@ fn build_child_redir_plan(
                 });
                 plan.held.push(owned);
             }
-            RedirOp::Dup { source, .. } => {
-                // `>&w` / `<&w`: resolve the source fd in the parent. The fd
-                // refers to a descriptor the child inherits (e.g. `&1`), so the
-                // number is valid in the child after fork.
-                let src = match resolve_fd_target(source, shell) {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "{}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        return Err(1);
-                    }
-                };
-                plan.ops.push(ChildRedirOp::Dup {
-                    target,
-                    source: src,
-                });
-            }
-            RedirOp::Move { source, output: _ } => {
-                // The move: resolve `src` exactly like Dup, then dup2 it onto
-                // `target` and also close `src` in the child replay.
-                let src = match resolve_fd_target(source, shell) {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "{}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        return Err(1);
-                    }
-                };
-                // bash: a degenerate `N>&N-` (source == target) is a pure
-                // no-op (see redir.c's `redir_fd != redirector` guard) — skip
-                // both the dup and the close entirely.
-                if src != target {
+            RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
+                // `>&w` / `<&w` (dup), `>&w-` / `<&w-` (move). Resolve the source
+                // in the parent; the fd refers to a descriptor the child inherits
+                // (e.g. `&1`), so the number is valid in the child after fork. A
+                // move also replays a `Close` of the source in the child, except
+                // for the degenerate `N>&N-` (source == target), which bash treats
+                // as a pure no-op (redir.c's `redir_fd != redirector` guard).
+                let is_move = matches!(&redir.op, RedirOp::Move { .. });
+                let src = resolve_dup_source(source, shell, sink, err_sink).map_err(|()| 1)?;
+                // Degenerate `N>&N-` (source == target) contributes nothing.
+                if !(is_move && src == target) {
                     plan.ops.push(ChildRedirOp::Dup {
                         target,
                         source: src,
                     });
-                    plan.ops.push(ChildRedirOp::Close { target: src });
+                    if is_move {
+                        plan.ops.push(ChildRedirOp::Close { target: src });
+                    }
                 }
             }
             RedirOp::Close => {
@@ -6290,56 +6172,21 @@ fn build_child_extra_ops(
                 });
                 held.push(unsafe { OwnedFd::from_raw_fd(raw) });
             }
-            RedirOp::Dup { source, .. } => {
-                let src = match resolve_fd_target(source, shell) {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "{}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        return Err(1);
-                    }
-                };
-                ops.push(ChildRedirOp::Dup {
-                    target,
-                    source: src,
-                });
-            }
-            RedirOp::Move { source, output: _ } => {
-                // The move: resolve `src` exactly like Dup, then dup2 it onto
-                // `target` and also close `src` in the child replay.
-                let src = match resolve_fd_target(source, shell) {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "{}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        return Err(1);
-                    }
-                };
-                // bash: a degenerate `N>&N-` (source == target) is a pure
-                // no-op (see redir.c's `redir_fd != redirector` guard) — skip
-                // both the dup and the close entirely.
-                if src != target {
+            RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
+                // `>&w` (dup) / `>&w-` (move): resolve in the parent (the fd is
+                // valid in the child after fork). A move also replays a `Close` of
+                // the source in the child, except for the degenerate `N>&N-`
+                // (source == target), which bash treats as a pure no-op.
+                let is_move = matches!(&redir.op, RedirOp::Move { .. });
+                let src = resolve_dup_source(source, shell, sink, err_sink).map_err(|()| 1)?;
+                if !(is_move && src == target) {
                     ops.push(ChildRedirOp::Dup {
                         target,
                         source: src,
                     });
-                    ops.push(ChildRedirOp::Close { target: src });
+                    if is_move {
+                        ops.push(ChildRedirOp::Close { target: src });
+                    }
                 }
             }
             RedirOp::Close => ops.push(ChildRedirOp::Close { target }),
