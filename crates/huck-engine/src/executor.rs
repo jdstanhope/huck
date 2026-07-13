@@ -3185,27 +3185,19 @@ fn run_background_sequence(
     let mut prev_pipe_read: Option<RawFd> = None;
     let mut parent_held: Vec<RawFd> = Vec::new();
 
-    // Open /dev/null once for the first stage's default stdin.
-    let devnull_fd: RawFd = {
-        use std::os::unix::io::IntoRawFd;
-        match File::open("/dev/null") {
-            Ok(f) => f.into_raw_fd(),
-            Err(e) => {
-                {
-                    let mut err = err_writer(err_sink, sink);
-                    crate::sh_error_to!(
-                        shell,
-                        &mut *err,
-                        None,
-                        "/dev/null: {}",
-                        crate::bash_io_error(&e)
-                    );
-                }
-                return ExecOutcome::Continue(1);
+    // Stage-0 stdin default (async rule, shared with run_background_subshell): a
+    // bare multi-stage pipeline's stage 0 inherits the shell's stdin; a single
+    // async command gets /dev/null when non-interactive; interactive always
+    // inherits. (#129)
+    let stage0_stdin_default: RawFd =
+        match async_default_stdin(pipeline.commands.len() > 1, shell, sink, err_sink) {
+            Ok(AsyncStdin::Inherit) => libc::STDIN_FILENO,
+            Ok(AsyncStdin::DevNull(fd)) => {
+                parent_held.push(fd);
+                fd
             }
-        }
-    };
-    parent_held.push(devnull_fd);
+            Err(()) => return ExecOutcome::Continue(1),
+        };
 
     // Snapshot the procsub stack. Word expansion in the spawn loop may realize
     // process substitutions (pushing onto shell.procsub_pending). We must drain
@@ -3234,7 +3226,7 @@ fn run_background_sequence(
             } else {
                 NO_PGROUP
             };
-            let stdin_fd = devnull_fd; // stage 0 default (overridden below if not first)
+            let stdin_fd = stage0_stdin_default; // stage 0 default (overridden below if not first)
             // For a no-op assign stage, stdout is irrelevant but we still need
             // to either pipe or close it for downstream stages.
             let stdout_fd = if !is_last {
@@ -3470,11 +3462,11 @@ fn run_background_sequence(
                         }
                     }
                 }
-                _ => prev_pipe_read.take().unwrap_or(devnull_fd),
+                _ => prev_pipe_read.take().unwrap_or(stage0_stdin_default),
             }
         } else {
             // Compound stage: use prev pipe or /dev/null for stage 0.
-            prev_pipe_read.take().unwrap_or(devnull_fd)
+            prev_pipe_read.take().unwrap_or(stage0_stdin_default)
         };
 
         // Remove stdin_fd from parent_held if it was tracked there.

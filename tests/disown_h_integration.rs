@@ -1,3 +1,17 @@
+//! Integration coverage for `disown` on background jobs at shell exit.
+//!
+//! Since #128 (v289), a **non-interactive** shell (these tests drive huck with a
+//! piped stdin, so `is_interactive` is false) never SIGHUPs its jobs at exit —
+//! matching bash, which only hangs up jobs when an interactive shell exits with
+//! the `huponexit` shopt set. So every background job here survives exit
+//! regardless of `disown`; these tests confirm that `disown`/`disown -h`/`disown
+//! -ah` do not error and that the job is left alive.
+//!
+//! The `disown -h` *exemption* itself (a marked job is skipped by the exit-hangup
+//! loop) is exercised directly by the `should_hangup_skips_marked_and_done_jobs`
+//! unit test in `huck-engine/src/shell_state/tests.rs`, which does not need the
+//! interactive+huponexit hangup path.
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -69,16 +83,20 @@ fn disown_h_lets_bg_job_survive() {
 }
 
 #[test]
-fn disown_without_h_kills_bg_job_on_exit() {
+fn bg_job_survives_noninteractive_exit_without_disown() {
+    // #128: a non-interactive shell must NOT SIGHUP its jobs at exit, even without
+    // `disown` — matching bash (which only hangs up jobs for an interactive shell
+    // exiting with `huponexit` set). The bg job must still be alive after exit.
     let script = "sleep 30 >/dev/null 2>&1 &\necho $!\nexit\n";
     let (out, _) = run_capture(script);
     let pid = first_pid(&out).unwrap_or_else(|| panic!("no pid found in: {:?}", out));
     thread::sleep(Duration::from_millis(200));
     let alive = pid_alive(pid);
-    if alive {
-        cleanup_kill(pid);
-        panic!("bg job (pid {pid}) survived shell exit; expected SIGHUP delivery");
-    }
+    cleanup_kill(pid);
+    assert!(
+        alive,
+        "bg job (pid {pid}) was SIGHUP'd on non-interactive exit; bash leaves it running (#128)"
+    );
 }
 
 #[test]
