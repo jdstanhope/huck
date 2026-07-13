@@ -7328,16 +7328,17 @@ fn run_multi_stage(
         // ---- Build stderr fd -------------------------------------------------
         // Priority: explicit redirect (`2>file` / `2>&n`) > sink-derived.
         //   StderrSink::Terminal → STDERR_FILENO (inherit).
-        //   StderrSink::Merged   → stdout_fd (kernel-level 2>&1; for non-last
-        //                          stages this aliases the inter-stage pipe,
-        //                          matching bash `pipe1 2>&1 | pipe2 2>&1`).
+        //   StderrSink::Merged   → a distinct dup of stdout_fd via
+        //                          try_clone_resolving (kernel-level 2>&1,
+        //                          matching bash `pipe1 2>&1 | pipe2 2>&1`;
+        //                          never an alias of the same owned fd).
         //   StderrSink::Capture  → dup of the shared capture_err write-end. We
         //                          dup PER STAGE because spawn_external_with_fds
         //                          consumes its stderr_fd via OwnedFd (closes
-        //                          parent's copy) and fork_and_run_in_subshell
-        //                          paths close it explicitly after spawn — both
-        //                          would otherwise destroy the shared write-end
-        //                          after the first stage.
+        //                          parent's copy) and fork_and_run_in_subshell's
+        //                          ChildStdio closes its copy via RAII (Drop) —
+        //                          both would otherwise destroy the shared
+        //                          write-end after the first stage.
         let stderr: ChildFd = if let Some(cf) = explicit_stderr {
             cf
         } else {
@@ -8466,14 +8467,21 @@ pub fn fork_and_run_in_subshell(
                         libc::close(s);
                         *src = Some(moved);
                     }
-                    // On failure keep s: degraded to old behavior, never worse.
+                    // On failure keep s: the pass-2 `s != slot` guard below is
+                    // what makes this truly never-worse — a same-slot owned
+                    // source is installed by a no-op dup2 and left open,
+                    // matching the old behavior.
                 }
             }
-            // Pass 2 (INSTALL): sources now all >=3 and pairwise distinct.
+            // Pass 2 (INSTALL): sources now all >=3 and pairwise distinct (except
+            // the pathological case where a pass-1 F_DUPFD failed and left an
+            // owned source at its own slot — a no-op dup2 we must NOT then close).
             for (src, slot) in plan {
                 if let Some(s) = src {
                     libc::dup2(s, slot);
-                    libc::close(s);
+                    if s != slot {
+                        libc::close(s);
+                    }
                 }
             }
             // Pass 3: close every parent-held pipe fd, skipping this child's own

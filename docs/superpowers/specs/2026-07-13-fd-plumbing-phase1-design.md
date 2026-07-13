@@ -7,10 +7,15 @@
 - [#78](https://github.com/jdstanhope/huck/issues/78) (`divergence` + `bug` +
   `sev:low`): pipeline-stage spawn-failure leak + wrong message. This phase
   addresses the **fd-leak half only**; the wrong-message half is Phase 3.
-- The **§H2b fork-path sibling** (`fork_and_run_in_subshell` — same class as
-  #132, distinct spawner) is filed as a NEW `divergence` + `bug` + `sev:medium`
-  issue **#NNN** as part of this work; this PR closes it alongside #132. (Repro
-  in the Problem section — confirmed divergent on the v289 binary.)
+- **Implementation finding:** the §H2b compound repro originally attributed to
+  a `fork_and_run_in_subshell` spawner sibling turned out, on investigation, to
+  be a **distinct, pre-existing bug in the in-process whole-command redirect
+  path** (`apply_redirections`/`RedirectScope`) — it reproduces with **no
+  pipeline at all** and on the pre-Phase-1 baseline. Filed as
+  [#135](https://github.com/jdstanhope/huck/issues/135) (`divergence` + `bug`,
+  **open**, deferred to Phase 3). **This PR does NOT close #135.** See the
+  "Implementation finding" note after the Problem section for the full
+  correction.
 
 **Parent context:** Phase 1 of the 6-phase (0–5) fd/redirect/process-launch
 remediation in
@@ -22,8 +27,11 @@ phase is scoped, per maintainer decision:
   functions STAY in `executor.rs`; only their signatures change. Moving the
   spawners into the module is a deliberate later follow-up (a non-goal here).
 - **Both spawners converted this iteration** — `spawn_external_with_fds` AND
-  `fork_and_run_in_subshell` — so the whole #132 class is fixed at once,
-  including the §H2b sibling.
+  `fork_and_run_in_subshell` — so the whole #132 class is fixed at once. The
+  fork spawner's pre-move additionally **hardens** the fork path against the
+  freed-fd/CLOEXEC class defensively; the compound-redirect divergence
+  (originally thought to be a spawner sibling reachable through this path)
+  turned out to be #135, the in-process path, deferred to Phase 3.
 - A CONCRETE owned type + dedicated module, **not** a polymorphic trait
   (maintainer decision, 2026-07-13; recorded in the review §4).
 
@@ -49,27 +57,57 @@ number:
 - `fork_and_run_in_subshell` (`executor.rs` ~:8698–8712): `if stdin_fd != 0 {
   dup2 }`, `if fd > 2 { close }`. An InProcess stage whose slot-opened CLOEXEC
   file landed on freed fd 0/1/2 skips the CLOEXEC-clearing dup2; if that
-  in-process child then execs an external grandchild, the fd vanishes on the
-  grandchild's exec — the §H2b sibling, same class, distinct spawner.
+  in-process child then execs an external grandchild, the fd would vanish on
+  the grandchild's exec — same class as #132, distinct spawner. **No
+  reproduced case actually flows through this spawner today** (see below); the
+  conversion here is defensive hardening against the class, not a fix for an
+  observed repro.
 
-Both repros are **confirmed divergent on the v289 release binary** (bash prints
-the file contents + `end`; huck prints `Bad file descriptor`):
+Two repros were considered. The **external** repro is **confirmed divergent on
+the v289 release binary** and IS the #132 spawner bug fixed by this PR (bash
+prints the file contents + `end`; huck prints `Bad file descriptor`):
 
 ```
 printf 'x\n' > inA
-# #132 — External stage:
+# #132 — External stage (fixed by this PR):
 huck -c 'exec <&-; /bin/cat < inA | /bin/cat; echo end'
 #   huck: /bin/cat: -: Bad file descriptor        bash: x + end
-# §H2b — InProcess (compound) stage:
-huck -c 'exec <&-; { /bin/cat; } < inA | /bin/cat; echo end'
-#   huck: /bin/cat: -: Bad file descriptor        bash: x + end
+```
+
+The **compound** repro was originally assumed to reach `fork_and_run_in_subshell`
+and be closed by the same fix. Investigation during Task 2 showed otherwise: it
+reproduces even with **no pipeline at all**, and on the **pre-Phase-1 baseline**,
+so it is not a spawner bug — it is a distinct, pre-existing bug in the
+in-process whole-command redirect path (`apply_redirections`/`RedirectScope`).
+Filed as [#135](https://github.com/jdstanhope/huck/issues/135), open, deferred
+to Phase 3; **not closed by this PR**:
+
+```
+# #135 — in-process whole-command redirect on a freed std fd (NOT fixed here):
+huck -c 'exec <&-; { /bin/cat; } < inA; echo end'
+#   diverges from bash with NO pipeline present — confirms it is not a
+#   spawner/pipeline-stage bug.
 ```
 
 The fix makes illegal states unrepresentable: carry *meaning + ownership* in a
 type, leaning on `std::os::fd::OwnedFd` for RAII (single-ownership,
 close-on-drop, CLOEXEC travels with the fd). Then leak and double-close become
 type errors (#78 leak half), and an `Owned` fd numbered 0/1/2 is dup2'd like any
-other fd (#132 + §H2b).
+other fd (#132; the fork spawner's own conversion hardens against the same
+class defensively, though no reproduced case flows through it today).
+
+**Implementation finding:** during Task 2, the compound repro above (`{ ...; }
+< inA` on a freed fd) was found to reproduce identically with the pipeline
+removed and on the pre-Phase-1 baseline binary — proving it is unrelated to
+`fork_and_run_in_subshell` or pipeline staging at all. The original design
+mis-attributed it as a "§H2b" spawner sibling to be filed and closed alongside
+#132; that attribution was wrong. It has instead been filed as
+[#135](https://github.com/jdstanhope/huck/issues/135) (`divergence` + `bug`,
+open, deferred to Phase 3, in the in-process `apply_redirections`/
+`RedirectScope` path) and is explicitly **not** closed by this PR. This spec
+has been corrected throughout to reflect that; any remaining "§H2b" label
+below refers only to the fork spawner's own freed-fd/CLOEXEC hardening, not to
+a closed issue.
 
 ### `Stdio::from(OwnedFd)` verification (settled — do not re-litigate)
 
@@ -239,8 +277,11 @@ pub fn fork_and_run_in_subshell(
 
 **Child-side install** (replaces today's steps 3–5, ~:8697–8722). Today's
 sentinels — `if stdin_fd != 0 { dup2 }` (skips the CLOEXEC-clearing dup2 when an
-owned fd lands on its own slot = §H2b) and `if fd > 2 { close }` (leaks owned
-fds numbered ≤ 2) — become a 3-pass sequence, mimicking std's shape from §2:
+owned fd lands on its own slot — hardens the fork path against the freed-fd/
+CLOEXEC class defensively; the compound repro that motivated looking here
+turned out to be #135, the in-process path) and `if fd > 2 { close }` (leaks
+owned fds numbered ≤ 2) — become a 3-pass sequence, mimicking std's shape from
+§2:
 
 ```rust
 // CHILD (single-threaded; fcntl/dup2/close are async-signal-safe).
@@ -254,8 +295,10 @@ let original_raws: Vec<RawFd> = plan.iter().filter_map(|(s, _)| *s).collect();
 // the original. This (a) makes pass 2 order-independent (an owned fd parked on
 // ANOTHER slot's number can't be clobbered before its own install) and (b)
 // guarantees pass 2's dup2 has source != target, so dup2 always clears
-// FD_CLOEXEC on the slot — the §H2b fix. F_DUPFD (not _CLOEXEC): the moved
-// copy must survive exec if its slot install is a no-op.
+// FD_CLOEXEC on the slot — hardens the fork path against the freed-fd/CLOEXEC
+// class (defensive; the compound repro turned out to be #135, the in-process
+// path). F_DUPFD (not _CLOEXEC): the moved copy must survive exec if its slot
+// install is a no-op.
 for (src, _) in plan.iter_mut() {
     if let Some(s) = *src && s <= 2 {
         let moved = libc::fcntl(s, libc::F_DUPFD, 3);   // lowest free fd >= 3
@@ -362,15 +405,17 @@ per-crate, single-threaded, guarded:
    - `owned_raws` skips `Inherit` slots.
 2. **Binaries:** `cargo build -p huck` (debug) and
    `cargo build --release --locked --bin huck` — the sweep needs both.
-3. **Flip 4 `fd_torture` cases green** in
+3. **Flip 3 `fd_torture` cases green** in
    `tests/scripts/fd_torture_diff_check.sh` (they are excluded today; update the
-   header comment lines 7–8 to leave only #50 excluded). Verify each case's bash
-   output shape when writing them (byte-identical rule; external commands where
-   builtin wording diverges):
+   header comment to exclude only #50 and #135 going forward). Verify each
+   case's bash output shape when writing them (byte-identical rule; external
+   commands where builtin wording diverges):
    - `#132` External — `exec <&-; cat < inA | cat; echo end`
-   - `§H2b` InProcess compound — `exec <&-; { /bin/cat; } < inA | /bin/cat; echo end`
    - freed fd1 stdout-to-file — `exec >&-; /bin/echo hi > f | cat; cat f`
    - bg pipeline file redirect — `exec <&-; cat < inA | cat & wait; echo end`
+
+   The compound InProcess case (`{ /bin/cat; } < inA | /bin/cat`) is NOT added
+   here — it is #135, still red, deferred to Phase 3.
 4. **Full bash-diff sweep:** `tests/scripts/run_diff_checks.sh` on the intended
    per-harness default binaries (never override `HUCK_BIN`), guarded:
    `ulimit -v 1500000; timeout 1200 tests/scripts/run_diff_checks.sh`.
