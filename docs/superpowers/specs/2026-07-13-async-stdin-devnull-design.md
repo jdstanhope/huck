@@ -37,13 +37,17 @@ huck has two background entry points in `crates/huck-engine/src/executor.rs`:
   with a comment wrongly claiming `(cmd) &` inherits the terminal. This is the
   #126 bug; the repro `/bin/cat & wait` (where `&` is a separator) hits it.
 
-Two latent Path A divergences, folded into this iteration for a single
-consistent rule (user-approved scope):
-
-- **(a)** Path A applies `/dev/null` unconditionally, even in an interactive
-  shell (bash inherits the terminal there).
-- **(b)** Path A gives a backgrounded **multi-stage pipeline's** first stage
-  `/dev/null`, but bash inherits the shell's stdin for that stage.
+**Scope:** this iteration changes **Path B only** — the entire #126 hang lives
+there. Path A has two latent divergences of its own ((a) it applies `/dev/null`
+even in interactive shells; (b) it gives a backgrounded multi-stage pipeline's
+first stage `/dev/null` instead of the inherited stdin), but both are masked by
+a separate, larger bug: a bare trailing-`&` background child does not survive a
+`huck -c` exit ([#128](https://github.com/jdstanhope/huck/issues/128)), so
+Path A's behavior is not deterministically testable until #128 is fixed. The
+Path A consistency fix is therefore deferred to
+[#129](https://github.com/jdstanhope/huck/issues/129) (blocked by #128). The
+unified rule below is stated in full for reference, but only Path B is wired up
+here.
 
 ## Ground truth (bash 5.2.21, verified by `readlink /proc/self/fd/0`)
 
@@ -154,36 +158,27 @@ predicate is computed at the call site, where the group structure is still
 visible — it cannot be recovered from the already-wrapped `Command::Subshell`
 that `run_background_subshell` receives.
 
-### Path A — `run_background_sequence`
+### Path A — `run_background_sequence` (deferred, not changed here)
 
-Replace the unconditional `/dev/null` open with the helper, keyed on stage
-count:
-
-```rust
-let n = pipeline.commands.len();
-let stage0_stdin_default: RawFd =
-    match async_default_stdin(n > 1, shell, sink, err_sink) {
-        Ok(AsyncStdin::Inherit) => libc::STDIN_FILENO,
-        Ok(AsyncStdin::DevNull(fd)) => { parent_held.push(fd); fd }
-        Err(()) => return ExecOutcome::Continue(1),
-    };
-```
-
-Rename today's `devnull_fd` local to `stage0_stdin_default` and use it at the
-three existing stage-0 sites (the assign-only stage's `stdin_fd`, and the two
-`prev_pipe_read.take().unwrap_or(devnull_fd)` fallbacks). `/dev/null` is now
-opened — and pushed to `parent_held` — only when it will actually be used
-(single-stage, non-interactive). In the multi-stage or interactive cases,
-stage 0 defaults to `STDIN_FILENO` (inherit) and nothing is opened; `STDIN_FILENO`
-is never added to `parent_held`, so teardown never closes fd 0. Later stages are
-unaffected — they always take their incoming pipe read end (the `unwrap_or`
-fallback is only reached for stage 0).
+Path A already defaults stage-0 stdin to `/dev/null`, so a bare `cmd &` at EOF
+is already correct for the common single-stage non-interactive case. Its two
+divergences (interactive over-application; multi-stage pipeline stage-0) are
+deferred to [#129](https://github.com/jdstanhope/huck/issues/129) because they
+are not deterministically testable until the trailing-`&` child-survival bug
+([#128](https://github.com/jdstanhope/huck/issues/128)) is fixed. The
+`async_default_stdin` helper is written so #129 can reuse it verbatim
+(`async_default_stdin(n > 1, …)`), but this iteration leaves Path A untouched.
 
 ### Out of scope
 
+- **Path A (`run_background_sequence`) changes** — deferred to #129 (blocked by
+  #128). See above.
+- **The trailing-`&` child-survival bug** ([#128](https://github.com/jdstanhope/huck/issues/128))
+  — a separate, larger divergence discovered during this work; not fixed here.
 - **Interactive job-control terminal handling** beyond the stdin default (SIGTTIN
   stop semantics for background readers) — huck's existing behavior is unchanged.
-- **`coproc`** and any other construct — only the two `&` background paths change.
+- **`coproc`** and any other construct — only the `run_background_subshell`
+  background path changes.
 
 ## Testing
 
