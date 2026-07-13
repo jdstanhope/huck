@@ -1,6 +1,6 @@
 [package]
 name = "huck-engine"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 description = "huck's terminal-free execution core: expansion, execution, builtins, shell state"
 license = "MIT"
