@@ -104,8 +104,9 @@ engineered from bash 5.2.21 (each row verified):
 | `File{Truncate}` (`>`) | drop iff fd is default **1** | `>` | yes |
 | `File{Append}` (`>>`) | drop iff fd is default **1** | `>>` | yes |
 | `File{Clobber}` (`>\|`) | drop iff fd is default **1** | `>\|` | yes |
-| `File{ReadWrite}` (`<>`) | **always show** (default `0`) | `<>` | yes |
-| `Dup{output}` | **always show** (default 1/0) | `>&` / `<&` | no |
+| `File{ReadWrite}` (`<>`) | show unless fd is exactly **1** (absent → `0`, shown) | `<>` | yes |
+| `Dup{output}`, **numeric** source | **always show** (default 1/0) | `>&` / `<&` | no |
+| `Dup{output}`, **word** source (`$fd`) | drop iff directional default (like File) | `>&` / `<&` | no |
 | `Move{output}` | **always show** (default 1/0) | `>&`…`-` / `<&`…`-` | no |
 | `Close` | show fd (parser resolves default→1/0) | `>&-` (direction normalized) | no |
 | `Heredoc` / `HereString` | (unchanged from current renderer) | | |
