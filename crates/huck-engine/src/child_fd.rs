@@ -22,8 +22,6 @@
 //!     its FIRST act, so no `OwnedFd` exists in the child at any point where a
 //!     panic-unwind or early drop could close a live fd number. The parent
 //!     branch keeps the `ChildStdio` and drops it right after fork.
-#![allow(dead_code)] // TODO(phase1-task2): drop this once executor.rs wires ChildStdio through.
-
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -133,6 +131,11 @@ impl ChildStdio {
     }
 
     /// Raw fd numbers of the owned slots (close-list bookkeeping; skips Inherit).
+    // Kept as part of the ChildStdio surface for close-list bookkeeping; the
+    // current callers compute their close lists from per-field `.raw()` before
+    // moving fields into the struct, so this convenience accessor has no caller
+    // yet (Phase 2 fd-creation migration will use it).
+    #[allow(dead_code)]
     pub(crate) fn owned_raws(&self) -> impl Iterator<Item = RawFd> + '_ {
         [&self.stdin, &self.stdout, &self.stderr]
             .into_iter()

@@ -5,6 +5,7 @@
 //! `ProcSub` cleanup record. `cleanup` closes the parent fd, unlinks any FIFO, and
 //! reaps the inner pid. POSIX-only; macOS-portable (no `/proc`).
 
+use crate::child_fd::{ChildFd, ChildStdio};
 use crate::command::{Command, Sequence};
 use crate::lexer::ProcDir;
 use crate::shell_state::Shell;
@@ -56,46 +57,55 @@ fn realize_via_devfd(
     }
     let (read_fd, write_fd) = (fds[0], fds[1]);
 
-    // Which end the PARENT keeps, and which fds the INNER gets on 0/1.
-    // child_closes: the parent's retained end that the child must close for EOF to work.
-    let (parent_fd, inner_stdin, inner_stdout, child_closes) = match dir {
-        // <(cmd): parent reads cmd's stdout; inner writes to the pipe on fd 1.
-        ProcDir::In => (read_fd, libc::STDIN_FILENO, write_fd, read_fd),
-        // >(cmd): parent writes cmd's stdin; inner reads from the pipe on fd 0.
-        ProcDir::Out => (write_fd, read_fd, libc::STDOUT_FILENO, write_fd),
+    // Which end the PARENT keeps (parent_fd), and which end the CHILD owns as its
+    // stdio (inner_end). The child owns inner_end via `ChildStdio`; the other
+    // stdio slot inherits. The parent-kept end stays raw.
+    let inner = Command::Subshell {
+        body: Box::new(seq.clone()),
+    };
+    let (parent_fd, inner_end, child_stdio) = match dir {
+        // <(cmd): child writes stdout to the pipe; parent reads.
+        ProcDir::In => (
+            read_fd,
+            write_fd,
+            ChildStdio::new(
+                ChildFd::Inherit,
+                unsafe { ChildFd::owned_raw(write_fd) },
+                ChildFd::Inherit,
+            ),
+        ),
+        // >(cmd): child reads stdin from the pipe; parent writes.
+        ProcDir::Out => (
+            write_fd,
+            read_fd,
+            ChildStdio::new(
+                unsafe { ChildFd::owned_raw(read_fd) },
+                ChildFd::Inherit,
+                ChildFd::Inherit,
+            ),
+        ),
     };
 
     // Fork the inner sequence as a subshell. pgid_target = the shell's group so the
     // procsub child is NOT a foreground job and the terminal is never handed to it
     // (avoids the SIGTTOU / terminal-handoff deadlocks of v108/v124). No give_terminal_to.
-    let inner = Command::Subshell {
-        body: Box::new(seq.clone()),
-    };
-    let child_close_list = [child_closes];
+    let child_close_list = [parent_fd]; // the child must close the parent-kept end
     let pid = crate::executor::fork_and_run_in_subshell(
         &inner,
         shell,
-        inner_stdin,
-        inner_stdout,
-        libc::STDERR_FILENO,
+        child_stdio,
         shell.shell_pgid,
         &child_close_list,
         None,
         None,
     )
     .inspect_err(|_| unsafe {
-        libc::close(read_fd);
-        libc::close(write_fd);
+        // child_stdio (owning inner_end) was already dropped on the error path;
+        // close only the parent-kept end here.
+        libc::close(parent_fd);
     })?;
-
-    // Parent closes the end the inner owns (the inner has its own copy via dup2).
-    let inner_end = match dir {
-        ProcDir::In => write_fd,
-        ProcDir::Out => read_fd,
-    };
-    unsafe {
-        libc::close(inner_end);
-    }
+    // inner_end was owned by child_stdio and closed in the parent by the call.
+    let _ = inner_end;
 
     let path = format!("/dev/fd/{parent_fd}");
     Ok((
@@ -175,9 +185,7 @@ fn realize_via_fifo(
     let pid_child = crate::executor::fork_and_run_in_subshell(
         &inner,
         shell,
-        libc::STDIN_FILENO,
-        libc::STDOUT_FILENO,
-        libc::STDERR_FILENO,
+        ChildStdio::inherit_all(),
         shell.shell_pgid,
         child_close_list,
         None,

@@ -1304,18 +1304,20 @@ fn fork_and_run_in_subshell_echo_stage_writes_to_pipe() {
     let child_pid = fork_and_run_in_subshell(
         &cmd,
         &mut shell,
-        libc::STDIN_FILENO,  // stdin = terminal
-        write_fd,            // stdout → pipe write end
-        libc::STDERR_FILENO, // stderr = terminal
-        0,                   // pgid_target: become own pgrp leader
-        &[read_fd],          // close the read end in the child
-        None,                // no Dup redirect
+        ChildStdio::new(
+            ChildFd::Inherit,                        // stdin = terminal
+            unsafe { ChildFd::owned_raw(write_fd) }, // stdout → pipe write end
+            ChildFd::Inherit,                        // stderr = terminal
+        ),
+        0,          // pgid_target: become own pgrp leader
+        &[read_fd], // close the read end in the child
+        None,       // no Dup redirect
         None,
     )
     .expect("fork_and_run_in_subshell failed");
 
-    // 4. Parent: close the write end so reading will eventually see EOF.
-    unsafe { libc::close(write_fd) };
+    // 4. The pipe write end was owned by the moved ChildStdio and closed in the
+    //    parent by the call, so reading will eventually see EOF.
 
     // 5. Read from the pipe into a buffer.
     let mut buf = vec![0u8; 256];
