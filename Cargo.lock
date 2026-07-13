@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "huck"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "expectrl",
  "huck-cli",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "huck-cli"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "expectrl",
  "huck-engine",
@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "huck-engine"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "glob",
  "huck-syntax",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "huck-syntax"
-version = "0.3.0"
+version = "0.4.0-dev"
 
 [[package]]
 name = "id-arena"
