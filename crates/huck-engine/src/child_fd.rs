@@ -77,6 +77,10 @@ impl ChildFd {
     pub(crate) fn try_clone_resolving(&self, slot: RawFd) -> io::Result<Self> {
         match self {
             Self::Inherit => {
+                // SAFETY: `slot` is one of the shell's live std fds (callers pass
+                // STDOUT_FILENO for merged stderr); the borrow lasts only for the
+                // dup below. A closed/invalid `slot` degrades to an EBADF error
+                // from `try_clone_to_owned`, not UB.
                 let real = unsafe { BorrowedFd::borrow_raw(slot) };
                 Ok(Self::Owned(real.try_clone_to_owned()?))
             }

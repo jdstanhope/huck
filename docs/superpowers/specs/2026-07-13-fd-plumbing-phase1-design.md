@@ -303,13 +303,16 @@ for (src, _) in plan.iter_mut() {
     if let Some(s) = *src && s <= 2 {
         let moved = libc::fcntl(s, libc::F_DUPFD, 3);   // lowest free fd >= 3
         if moved >= 0 { libc::close(s); *src = Some(moved); }
-        // On failure keep s: degraded to today's behavior, never worse.
+        // On failure keep s: the pass-2 `s != slot` guard makes this never
+        // worse than today's behavior (a same-slot source is a no-op dup2,
+        // left open).
     }
 }
 // Pass 2 (INSTALL): sources are now all >=3 and pairwise distinct (exclusive
-// ownership), so no aliasing / double close.
+// ownership). Guard the close with `s != slot` for the pathological
+// F_DUPFD-failure edge where a source is still at its own slot.
 for (src, slot) in plan {
-    if let Some(s) = src { libc::dup2(s, slot); libc::close(s); }
+    if let Some(s) = src { libc::dup2(s, slot); if s != slot { libc::close(s); } }
 }
 // Pass 3 (was step 5): close parent-held pipe fds, skipping this child's own
 // stdio sources by their ORIGINAL numbers.

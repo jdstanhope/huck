@@ -27,10 +27,12 @@ fn try_clone_owned_yields_distinct_open_fd() {
     let clone_raw = clone.raw().unwrap();
     assert_ne!(orig_raw, clone_raw, "clone must be a distinct fd number");
     assert!(fd_is_open(orig_raw) && fd_is_open(clone_raw));
-    // Dropping one leaves the other open.
+    // Dropping one leaves the other open. Assert only the positive: a post-drop
+    // `assert!(!fd_is_open(clone_raw))` would race a concurrent open() reusing
+    // the just-freed fd number under a parallel test runner (CI runs threaded).
+    // Close-on-drop is OwnedFd's guaranteed contract.
     drop(clone);
     assert!(fd_is_open(orig_raw));
-    assert!(!fd_is_open(clone_raw));
 }
 
 #[test]
@@ -43,8 +45,8 @@ fn try_clone_resolving_inherit_dups_the_slot() {
     let dup_raw = resolved.raw().expect("Inherit resolved to an Owned dup");
     assert_ne!(dup_raw, r, "resolved dup must be a new fd number");
     assert!(fd_is_open(dup_raw));
+    // close-on-drop is std's contract; not asserted (parallel-runner fd-reuse race).
     drop(resolved);
-    assert!(!fd_is_open(dup_raw));
     unsafe {
         libc::close(r);
         libc::close(w);
@@ -59,9 +61,11 @@ fn into_raw_does_not_close_but_drop_does() {
     let taken = c.into_raw().expect("Owned -> Some(raw)");
     assert_eq!(taken, raw);
     assert!(fd_is_open(taken), "into_raw must NOT close");
-    // We now own `taken` again; wrap + drop closes it.
+    // We now own `taken` again; wrap + drop reclaims it (so the test doesn't
+    // leak). Not asserting the post-drop close: it would race a concurrent
+    // open() reusing the number under a parallel runner. `raw` == `taken`.
     drop(unsafe { OwnedFd::from_raw_fd(taken) });
-    assert!(!fd_is_open(raw), "drop of Owned closes the fd");
+    let _ = raw;
     // Inherit -> None, closes nothing.
     assert_eq!(ChildFd::Inherit.into_raw(), None);
 }
