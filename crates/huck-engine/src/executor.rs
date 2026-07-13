@@ -1504,9 +1504,10 @@ fn has_any_redirect(cmd: &ExecCommand) -> bool {
 
 /// True if any redirection in `redirs` re-targets fd 1 (stdout) — the gate for
 /// forcing a `Terminal` inner sink so the redirect wins over an outer capture.
-/// Any output File, a Dup (`>&N`), OR a Close (`>&-`) on fd 1 qualifies: in all
-/// three cases the command's real fd 1 is redirected (to a file, another fd, or
-/// closed), so an in-process builtin must write through `io::stdout()` (= fd 1 =
+/// Any output File, a Dup (`>&N`), a Move (`>&N-`), OR a Close (`>&-`) on fd 1
+/// qualifies: in all cases the command's real fd 1 is redirected (to a file,
+/// another fd, or closed), so an in-process builtin must write through
+/// `io::stdout()` (= fd 1 =
 /// the redirect target) rather than into the capture buffer — otherwise `>&-`'s
 /// discard / `>&N`'s dup would be silently ignored by the buffer. A stdin-only
 /// redirect does not force Terminal. `RedirFd::Var` (target_fd None) is ignored.
@@ -1522,6 +1523,7 @@ fn redirs_write_stdout(redirs: &[Redirection]) -> bool {
                         | FileMode::ReadWrite,
                     ..
                 } | RedirOp::Dup { .. }
+                    | RedirOp::Move { .. }
                     | RedirOp::Close
             )
     })
