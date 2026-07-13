@@ -250,6 +250,14 @@ pub enum RedirOp {
     },
     /// `N>&-` / `N<&-`.
     Close,
+    /// `[n]>&digit-` (output) / `[n]<&digit-` (input): dup `source` onto the
+    /// target fd, THEN close `source` (bash's "move fd"). `output` picks the
+    /// directional default target fd (1 for `>&`, 0 for `<&`) and the `>&`/`<&`
+    /// rendering.
+    Move {
+        source: Word,
+        output: bool,
+    },
     Heredoc {
         body: Word,
         expand: bool,
@@ -269,6 +277,8 @@ impl RedirOp {
             RedirOp::File { .. } => 1,
             RedirOp::Dup { output: true, .. } => 1,
             RedirOp::Dup { output: false, .. } => 0,
+            RedirOp::Move { output: true, .. } => 1,
+            RedirOp::Move { output: false, .. } => 0,
             RedirOp::Close => 0,
             RedirOp::Heredoc { .. } | RedirOp::HereString(_) => 0,
         }
@@ -341,7 +351,7 @@ pub fn slots_for_simple_path(
                 fd: fd as i32,
                 source: source.clone(),
             }),
-            RedirOp::Dup { output: false, .. } | RedirOp::Close => None,
+            RedirOp::Dup { output: false, .. } | RedirOp::Close | RedirOp::Move { .. } => None,
             RedirOp::Heredoc {
                 body,
                 expand,
@@ -1029,13 +1039,23 @@ pub(crate) fn build_redirections(
     }
 }
 
-/// `>&w`/`<&w`: a `-` source word closes the fd; otherwise a Dup.
+/// `>&w`/`<&w`: `-` closes; `<digits>-` moves (dup then close source);
+/// otherwise a Dup.
 pub(crate) fn dup_op(source: Word, output: bool) -> RedirOp {
-    if word_literal_text(&source) == Some("-") {
-        RedirOp::Close
-    } else {
-        RedirOp::Dup { source, output }
+    match word_literal_text(&source) {
+        Some("-") => RedirOp::Close,
+        Some(t) if is_move_operand(t) => RedirOp::Move {
+            source: lit_word(&t[..t.len() - 1]),
+            output,
+        },
+        _ => RedirOp::Dup { source, output },
     }
+}
+
+/// True for a bash move-fd operand: one or more ASCII digits then a single
+/// trailing `-` (e.g. `5-`, `10-`). `-` alone is Close (handled by the caller).
+fn is_move_operand(t: &str) -> bool {
+    matches!(t.strip_suffix('-'), Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// True iff the next token begins a redirection: a `TokenKind::RedirFd` prefix,
@@ -1285,4 +1305,23 @@ mod tests {
     }
 
     // ── coproc parser tests (v157 task 2) ─────────────────────────────────
+
+    #[test]
+    fn dup_op_classifies_close_move_dup() {
+        assert!(matches!(dup_op(lit_word("-"), true), RedirOp::Close));
+        assert!(matches!(
+            dup_op(lit_word("5-"), false),
+            RedirOp::Move { output: false, .. }
+        ));
+        assert!(matches!(
+            dup_op(lit_word("10-"), true),
+            RedirOp::Move { output: true, .. }
+        ));
+        assert!(matches!(
+            dup_op(lit_word("5"), true),
+            RedirOp::Dup { output: true, .. }
+        ));
+        // A non-numeric source ending in `-` stays a Dup (bash: move needs digits).
+        assert!(matches!(dup_op(lit_word("x-"), true), RedirOp::Dup { .. }));
+    }
 }

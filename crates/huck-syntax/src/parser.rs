@@ -3730,6 +3730,7 @@ fn fill_redirects(redirects: &mut [Redirection], bodies: &mut impl Iterator<Item
         match &mut r.op {
             RedirOp::File { target, .. } => fill_word(target, bodies),
             RedirOp::Dup { source, .. } => fill_word(source, bodies),
+            RedirOp::Move { source, .. } => fill_word(source, bodies),
             RedirOp::Close => {}
             RedirOp::Heredoc { body, .. } => {
                 if body.0.is_empty() {
