@@ -33,6 +33,15 @@ pub fn external_capture_loop(
     sinks: CaptureSinks<'_>,
     mut timeout_remaining: impl FnMut() -> Option<Duration>,
 ) -> io::Result<i32> {
+    // #120: With no capture pipes to stream AND no embedder deadline, there is
+    // nothing for the poll loop to watch — it would fall back to sleeping
+    // POLL_TICK_MS (100ms) before each reap, so every foreground external
+    // command / subshell with inherited stdio paid ~100ms. Block on the child
+    // directly instead. Behavior-equivalent for signals/traps (both re-wait on
+    // EINTR); no pipes means no final drain is needed.
+    if pipe_out < 0 && pipe_err < 0 && timeout_remaining().is_none() {
+        return blocking_wait(child_pid);
+    }
     let mut wl = WaitLoop::new()?;
     if pipe_out >= 0 {
         set_nonblock(pipe_out)?;
@@ -95,6 +104,30 @@ pub fn external_capture_loop(
                 Event::Readable(_) | Event::ChildExited => {}
             }
         }
+    }
+}
+
+/// Block until `child_pid` exits, retrying on `EINTR` so a signal delivered to
+/// the shell (e.g. a trap) is handled and the wait resumes. Returns the raw
+/// `waitpid` status. Used by `external_capture_loop`'s no-pipe / no-timeout
+/// fast path, where there is nothing to stream. Flags `0` (no `WUNTRACED`)
+/// match the poll loop it replaces; foreground job-control stop handling lives
+/// on the interactive path, not here.
+fn blocking_wait(child_pid: libc::pid_t) -> io::Result<i32> {
+    loop {
+        let mut status: i32 = 0;
+        let r = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+        if r == child_pid {
+            return Ok(status);
+        }
+        if r < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        // r == 0 is impossible without WNOHANG; loop defensively.
     }
 }
 
@@ -288,5 +321,36 @@ fn drain_to_eof(fd: RawFd, sink: Option<&mut Vec<u8>>, is_stdout: bool) -> io::R
             }
             return Err(err);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn no_pipe_wait_is_prompt_and_correct() {
+        // Fork a child that exits(7) immediately. The no-pipe / no-timeout
+        // fast path must return its status without the old ~100ms poll-tick
+        // latency (regression guard for #120).
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::_exit(7) };
+        }
+        let sinks = CaptureSinks {
+            stdout: None,
+            stderr: None,
+        };
+        let start = Instant::now();
+        let status = external_capture_loop(pid, -1, -1, sinks, || None).unwrap();
+        let elapsed = start.elapsed();
+        assert!(libc::WIFEXITED(status), "child did not exit normally");
+        assert_eq!(libc::WEXITSTATUS(status), 7, "wrong exit status");
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "no-pipe wait took {elapsed:?}; expected prompt return (#120 regression)"
+        );
     }
 }
