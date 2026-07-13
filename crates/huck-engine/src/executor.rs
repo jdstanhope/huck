@@ -6785,13 +6785,57 @@ fn run_coproc(
     ExecOutcome::Continue(0)
 }
 
-/// Opens a `libc::pipe()` and returns `(read_end, write_end)` as raw fds.
+/// Move `fd` above the stdio range (>= 3) so a freed 0/1/2 (e.g. after
+/// `exec <&-`) is never silently reused as a pipeline pipe end, which would
+/// alias a stage's std fd onto the pipe (issue #130). Returns `fd` unchanged
+/// when it is already >= 3 (the common case). Uses `F_DUPFD` (NOT
+/// `F_DUPFD_CLOEXEC`) to keep the moved fd's non-close-on-exec semantics
+/// identical to the raw `libc::pipe()` ends the callers dup2/close by hand,
+/// then closes the original low fd.
+fn move_fd_above_stdio(fd: RawFd) -> io::Result<RawFd> {
+    if fd > 2 {
+        return Ok(fd);
+    }
+    let newfd = unsafe { libc::fcntl(fd, libc::F_DUPFD, 3) };
+    if newfd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe {
+        libc::close(fd);
+    }
+    Ok(newfd)
+}
+
+/// Opens a `libc::pipe()` and returns `(read_end, write_end)` as raw fds, both
+/// guaranteed >= 3 so a freed std fd cannot be aliased into a pipeline stage's
+/// std fd (issue #130).
 fn make_pipe() -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((fds[0], fds[1]))
+    let (r0, w0) = (fds[0], fds[1]);
+    let r = match move_fd_above_stdio(r0) {
+        Ok(fd) => fd,
+        Err(e) => {
+            unsafe {
+                libc::close(r0);
+                libc::close(w0);
+            }
+            return Err(e);
+        }
+    };
+    let w = match move_fd_above_stdio(w0) {
+        Ok(fd) => fd,
+        Err(e) => {
+            unsafe {
+                libc::close(r);
+                libc::close(w0);
+            }
+            return Err(e);
+        }
+    };
+    Ok((r, w))
 }
 
 /// Create an inter-stage pipe for a downstream pipeline reader, where
