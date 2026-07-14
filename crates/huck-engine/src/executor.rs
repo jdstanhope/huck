@@ -3046,11 +3046,19 @@ fn run_background_sequence(
             }
         };
 
+        // Classify up front: external stages get a pipe/stage0_default-only base + a
+        // full ChildRedirPlan replayed in the child; InProcess stages (compound AND
+        // builtin) keep the slot base. A Simple(Exec) stage can be either kind, so key
+        // the base on the classification, not on Simple-vs-Compound.
+        let stage_is_external = matches!(classify_stage(stage_cmd, shell), StageKind::External(_));
+
         // ---- Stdin fd ---------------------------------------------------------
         // A heredoc/herestring stdin is fed by a forked writer process (M-120);
         // the read end becomes this stage's stdin and the parent holds no write
         // end.
-        let stdin: ChildFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+        let stdin: ChildFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd
+            && !stage_is_external
+        {
             match &exec.slot_stdin() {
                 Some(RedirectSlot::Read(word)) => {
                     if let Some(r) = prev_pipe_read.take() {
@@ -3227,164 +3235,201 @@ fn run_background_sequence(
         };
 
         // ---- Stdout redirect (ExecCommand only) ------------------------------
-        let explicit_stdout: Option<ChildFd> =
-            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.slot_stdout() {
-                    Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_bg(
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &spawned_pids,
-                                    &mut parent_held,
-                                );
-                            }
-                        };
-                        let guard =
-                            shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                        match open_redirect_file(
-                            &FileMode::Truncate,
-                            &path,
-                            guard,
-                            FdPlacement::Relocated,
-                        ) {
-                            Ok(f) => Some(ChildFd::from(f)),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_bg(
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &spawned_pids,
-                                    &mut parent_held,
-                                );
-                            }
+        let explicit_stdout: Option<ChildFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
+            stage_cmd
+            && !stage_is_external
+        {
+            match &exec.slot_stdout() {
+                Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    };
+                    let guard =
+                        shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
+                    match open_redirect_file(
+                        &FileMode::Truncate,
+                        &path,
+                        guard,
+                        FdPlacement::Relocated,
+                    ) {
+                        Ok(f) => Some(ChildFd::from(f)),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
                         }
                     }
-                    Some(RedirectSlot::Append(w)) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_bg(
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &spawned_pids,
-                                    &mut parent_held,
-                                );
-                            }
-                        };
-                        match open_redirect_file(
-                            &FileMode::Append,
-                            &path,
-                            false,
-                            FdPlacement::Relocated,
-                        ) {
-                            Ok(f) => Some(ChildFd::from(f)),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_bg(
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &spawned_pids,
-                                    &mut parent_held,
-                                );
-                            }
-                        }
-                    }
-                    _ => None,
                 }
-            } else {
-                None
-            };
+                Some(RedirectSlot::Append(w)) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    };
+                    match open_redirect_file(
+                        &FileMode::Append,
+                        &path,
+                        false,
+                        FdPlacement::Relocated,
+                    ) {
+                        Ok(f) => Some(ChildFd::from(f)),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         // ---- Stderr redirect (ExecCommand only) ------------------------------
-        let explicit_stderr: Option<ChildFd> =
+        let explicit_stderr: Option<ChildFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
+            stage_cmd
+            && !stage_is_external
+        {
+            match &exec.slot_stderr() {
+                Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    };
+                    let guard =
+                        shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
+                    match open_redirect_file(
+                        &FileMode::Truncate,
+                        &path,
+                        guard,
+                        FdPlacement::Relocated,
+                    ) {
+                        Ok(f) => Some(ChildFd::from(f)),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    }
+                }
+                Some(RedirectSlot::Append(w)) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    };
+                    match open_redirect_file(
+                        &FileMode::Append,
+                        &path,
+                        false,
+                        FdPlacement::Relocated,
+                    ) {
+                        Ok(f) => Some(ChildFd::from(f)),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_bg(
+                                shell,
+                                procsub_base,
+                                first_pid,
+                                &spawned_pids,
+                                &mut parent_held,
+                            );
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // External stage: lower the FULL ordered redirect list once (v292 machinery)
+        // and replay it in the child over the pipe/stage0_default base. Built BEFORE
+        // the inter-stage pipe so a forked heredoc writer can't inherit this stage's
+        // own write end (would deadlock EOF). #69: stamp current_lineno so a stage
+        // redirect-open error carries `line N:`. NOTE: unlike the foreground path,
+        // run_background_sequence does not track heredoc-writer pids — bg children are
+        // reaped by the SIGCHLD reaper — so the plan's heredoc_writers are left in the
+        // plan and dropped by the spawner (a no-op), matching the existing bg discard.
+        let external_plan: Option<ChildRedirPlan> = if stage_is_external {
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.slot_stderr() {
-                    Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_bg(
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &spawned_pids,
-                                    &mut parent_held,
-                                );
-                            }
-                        };
-                        let guard =
-                            shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                        match open_redirect_file(
-                            &FileMode::Truncate,
-                            &path,
-                            guard,
-                            FdPlacement::Relocated,
-                        ) {
-                            Ok(f) => Some(ChildFd::from(f)),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_bg(
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &spawned_pids,
-                                    &mut parent_held,
-                                );
-                            }
-                        }
+                if exec.line != 0 {
+                    shell.current_lineno = exec.line;
+                }
+                match build_child_redir_plan(&exec.redirects, shell, sink, err_sink) {
+                    Ok(p) => Some(p),
+                    Err(_) => {
+                        restore_inline_assignments(snap, shell);
+                        return bail_teardown_bg(
+                            shell,
+                            procsub_base,
+                            first_pid,
+                            &spawned_pids,
+                            &mut parent_held,
+                        );
                     }
-                    Some(RedirectSlot::Append(w)) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_bg(
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &spawned_pids,
-                                    &mut parent_held,
-                                );
-                            }
-                        };
-                        match open_redirect_file(
-                            &FileMode::Append,
-                            &path,
-                            false,
-                            FdPlacement::Relocated,
-                        ) {
-                            Ok(f) => Some(ChildFd::from(f)),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_bg(
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &spawned_pids,
-                                    &mut parent_held,
-                                );
-                            }
-                        }
-                    }
-                    _ => None,
                 }
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         // ---- Stdout fd -------------------------------------------------------
         let stdout: ChildFd = if let Some(cf) = explicit_stdout {
@@ -3562,7 +3607,7 @@ fn run_background_sequence(
                 child_stdio,
                 pgid_target,
                 &fds_to_close_in_child,
-                None,
+                external_plan,
             ),
             StageKind::InProcess(cmd) => fork_and_run_in_subshell(
                 cmd,
@@ -8446,16 +8491,23 @@ fn spawn_external_with_fds(
     let replay_ops: Vec<ChildRedirOp>;
     let held: Vec<std::os::fd::OwnedFd>;
     if let Some(p) = plan {
-        // NEW full-plan path (foreground external stages): the whole ordered
-        // redirect list is in the plan; no slot dup-targets, no extra_ops.
+        // Full-plan path (external pipeline stages, foreground AND background):
+        // the whole ordered redirect list is in the plan; no slot dup-targets,
+        // no extra_ops.
         stdout_dup_target = None;
         stderr_dup_target = None;
         replay_ops = p.ops;
         held = p.held;
-        // p.heredoc_writers was taken by the caller.
+        // p.heredoc_writers: the foreground caller drains this before calling;
+        // the background caller leaves it in the plan and it drops here as a
+        // no-op Vec<pid_t> (bg heredoc writers are SIGCHLD-reaped). Either way
+        // the spawner ignores the field.
     } else {
-        // LEGACY slot path (background stages, until v294): slot dup-targets +
-        // build_child_extra_ops for fd>2/dup-in/close/<>.
+        // LEGACY slot path: retained but no longer reached — after v294 both
+        // pipeline callers pass Some(plan) for external stages (single external
+        // commands still use run_subprocess). Kept until the slot-machinery
+        // retirement follow-up. slot dup-targets + build_child_extra_ops for
+        // fd>2/dup-in/close/<>.
         // Resolve Dup targets pre-fork (Word expansion may allocate; not
         // async-signal-safe). stdout-dup BEFORE stderr-dup matches canonical
         // `>file 2>&1` semantics.
