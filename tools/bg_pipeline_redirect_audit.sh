@@ -11,14 +11,21 @@ source "$HERE/bg_pipeline_redirect_audit_cases.sh"
 # Poll the given files until their combined byte-size is unchanged for 3
 # consecutive 50ms reads (job settled) or ~5s elapses. A minimum 200ms floor
 # gives a slow-starting detached job time to write before we read "empty".
+# A file that does not yet exist reads as sz=-1; every case's job creates all
+# its result files (even 0-byte ones) once it runs, so a -1 means "not started
+# writing yet" and must NEVER count toward stability — otherwise three
+# consecutive pre-start -1 readings could settle a job that has not begun. If a
+# real one-sided divergence leaves a file uncreated, no settle occurs and we
+# ride to the 5s cap, then compare what exists (→ DIVERGE), per the anti-hang model.
 poll_settle() {
-  local files="$1" elapsed=0 stable=0 prev="" sig f sz
+  local files="$1" elapsed=0 stable=0 prev="" sig f sz missing
   while [ "$elapsed" -lt 5000 ]; do
-    sig=""
+    sig=""; missing=0
     for f in $files; do
       sz=$(wc -c < "$f" 2>/dev/null || echo -1); sig="$sig,$sz"
+      [ "$sz" -lt 0 ] && missing=1
     done
-    if [ "$sig" = "$prev" ]; then stable=$((stable+1)); else stable=0; fi
+    if [ "$missing" -eq 0 ] && [ "$sig" = "$prev" ]; then stable=$((stable+1)); else stable=0; fi
     prev="$sig"
     if [ "$stable" -ge 3 ] && [ "$elapsed" -ge 200 ]; then return; fi
     sleep 0.05; elapsed=$((elapsed+50))
