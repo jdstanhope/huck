@@ -6649,74 +6649,69 @@ fn spawn_pipeline(
         // allocate; not async-signal-safe). External stages handle this inside
         // spawn_external_with_fds itself (via the replayed ChildRedirPlan), so
         // skip the expansion entirely for them.
-        let (stdout_dup_target, stderr_dup_target) =
-            if !stage_is_external && let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                let sdt = match &exec.slot_stdout() {
-                    Some(RedirectSlot::Dup { source, .. }) => {
-                        match resolve_fd_target(source, shell) {
-                            Ok(fd) => Some(fd),
-                            Err(e) => {
-                                {
-                                    let mut err = err_writer(err_sink, sink);
-                                    crate::sh_error_to!(
-                                        shell,
-                                        &mut *err,
-                                        None,
-                                        "{}",
-                                        crate::bash_io_error(&e)
-                                    );
-                                }
-                                restore_inline_assignments(snap, shell);
-                                // stdin / stdout / stderr ChildFds drop on return;
-                                // capture_read_fd stays in parent_held (drained).
-                                return Err(bail_teardown_pipeline(
-                                    mode,
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &stages,
-                                    &mut parent_held,
-                                ));
-                            }
+        let (stdout_dup_target, stderr_dup_target) = if !stage_is_external
+            && !redirect_failed
+            && let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd
+        {
+            // #145: an InProcess stage's own Dup-target resolution failing
+            // (`>&badfd` / `2>&badfd`) is a stage-own redirect failure, so it
+            // fails only this stage (redirect_failed -> spawn_failed_stage)
+            // rather than aborting the pipeline. (Not observably reachable
+            // today — pipeline builtin stages fork, so their dups resolve on
+            // the child path — but kept consistent with the four converted
+            // sites so a future in-process stage can't reintroduce the bug.)
+            let sdt = match &exec.slot_stdout() {
+                Some(RedirectSlot::Dup { source, .. }) => match resolve_fd_target(source, shell) {
+                    Ok(fd) => Some(fd),
+                    Err(e) => {
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "{}",
+                                crate::bash_io_error(&e)
+                            );
                         }
+                        redirect_failed = true;
+                        None
                     }
-                    _ => None,
-                };
-                let sedt = match &exec.slot_stderr() {
-                    Some(RedirectSlot::Dup { source, .. }) => {
-                        match resolve_fd_target(source, shell) {
-                            Ok(fd) => Some(fd),
-                            Err(e) => {
-                                {
-                                    let mut err = err_writer(err_sink, sink);
-                                    crate::sh_error_to!(
-                                        shell,
-                                        &mut *err,
-                                        None,
-                                        "{}",
-                                        crate::bash_io_error(&e)
-                                    );
-                                }
-                                restore_inline_assignments(snap, shell);
-                                // stdin / stdout / stderr ChildFds drop on return;
-                                // capture_read_fd stays in parent_held (drained).
-                                return Err(bail_teardown_pipeline(
-                                    mode,
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &stages,
-                                    &mut parent_held,
-                                ));
-                            }
-                        }
-                    }
-                    _ => None,
-                };
-                (sdt, sedt)
-            } else {
-                (None, None)
+                },
+                _ => None,
             };
+            // If stdout's Dup already failed, don't also try stderr's (one
+            // error, first failure wins — matching the phase-guard order).
+            let sedt = if redirect_failed {
+                None
+            } else {
+                match &exec.slot_stderr() {
+                    Some(RedirectSlot::Dup { source, .. }) => {
+                        match resolve_fd_target(source, shell) {
+                            Ok(fd) => Some(fd),
+                            Err(e) => {
+                                {
+                                    let mut err = err_writer(err_sink, sink);
+                                    crate::sh_error_to!(
+                                        shell,
+                                        &mut *err,
+                                        None,
+                                        "{}",
+                                        crate::bash_io_error(&e)
+                                    );
+                                }
+                                redirect_failed = true;
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            (sdt, sedt)
+        } else {
+            (None, None)
+        };
 
         // Build the child's fd environment ONCE; move it into whichever spawner.
         // Both spawners consume the ChildStdio and close the parent's owned
