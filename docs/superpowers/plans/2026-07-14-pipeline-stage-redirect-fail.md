@@ -61,16 +61,20 @@ check() {
   fi
 }
 
+# Upstreams feeding a FAILED stage must be silent (`true`, det exit 0) or
+# infinite (`yes`, det SIGPIPE 141); a finite writer (`echo A`) races the
+# dummy's exit — bash delivers the small write, huck's instant dummy sometimes
+# SIGPIPEs it (tracked in #151). Do NOT use `echo A |` upstreams here.
 # --- external stage fails at each position ---
-check 'ext-middle'   'echo A | cat </no/such/file | cat'
+check 'ext-middle'   'true | cat </no/such/file | cat'
 check 'ext-first'    'cat </no/such/file | wc -c'
-check 'ext-last'     'echo A | cat </no/such/file'
+check 'ext-last'     'true | cat </no/such/file'
 # --- builtin stage fails at each position ---
-check 'blt-middle'   'echo A | read x </no/such/file | cat'
+check 'blt-middle'   'true | read x </no/such/file | cat'
 check 'blt-first'    'read x </no/such/file | wc -c'
-check 'blt-last'     'echo A | read x </no/such/file'
+check 'blt-last'     'true | read x </no/such/file'
 # --- compound stage fails (regression guard: already correct) ---
-check 'cmp-middle'   'echo A | { cat; } </no/such/file | cat'
+check 'cmp-middle'   'true | { cat; } </no/such/file | cat'
 # --- two stages fail ---
 check 'two-fail'     'cat </no/a | cat </no/b | wc -c'
 # --- upstream floods a dead reader -> SIGPIPE 141 (yes never exits so its 141
