@@ -96,8 +96,11 @@ Expected: multiple `FAIL [ext-*]`, `FAIL [blt-*]`, `FAIL [two-fail]`, `FAIL [sig
 ```bash
   # A stage whose redirect fails must not abort the bg pipeline: the consumer
   # still runs and creates its result file (empty via EOF), matching bash.
-  printf '%s\t%s\t%s\n' "fail-continue"  "po" "/bin/sh -c 'cat </no/such/file' | cat >po &"
-  printf '%s\t%s\t%s\n' "fail-mid"       "po" "echo A | /bin/sh -c 'cat </no/such/file' | cat >po &"
+  # The failing redirect must be on a DIRECT stage (not wrapped in `sh -c`,
+  # which would fail the open() inside a nested shell and never exercise huck's
+  # own per-stage abort path).
+  printf '%s\t%s\t%s\n' "fail-continue"  "po" "cat </no/such/file | cat >po &"
+  printf '%s\t%s\t%s\n' "fail-mid"       "po" "echo A | cat </no/such/file | cat >po &"
 ```
 
 - [ ] **Step 4: Confirm the bg audit now shows the new cases RED (huck aborts → downstream file differs from bash).**
