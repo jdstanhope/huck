@@ -50,6 +50,19 @@ check "1>&2 to stderr"            'echo hi 1>&2 2>/dev/null; echo done'
 check "2>&1 merge into pipe"      'ls /no_such_xyz 2>&1 | cat'
 check "&> merge to file"          'echo hi &> f; cat f'
 
+# --- Phase 3a parity net: semantics the unified lowering must preserve ---
+# Lazy dup-source validation: 4>&3 is only valid because 3>file applied first.
+check "3a lazy dup after file"     'exec 3>&-; { echo x; } 3>f 4>&3; cat f'
+check "3a dup chain swap"          '{ echo o; echo e 1>&2; } 3>&1 1>&2 2>&3 2>/dev/null'
+# {var} persists in-process (exec / compound) but is per-command in a child.
+check "3a namedfd exec persists"   'exec {v}>f; echo hi >&"$v"; exec {v}>&-; cat f'
+check "3a namedfd compound"        '{ echo hi; } {v}>f; cat f'
+check "3a namedfd external child"  'echo hi {v}>f; cat f'
+check "3a namedfd move"            'exec 5>f; { echo hi; } {v}>&5-; cat f'
+# In-process ordering: 2>&1 >file (compound) vs a single external command.
+check "3a order compound 2>&1>f"   '{ echo o; echo e 1>&2; } 2>&1 >f; cat f'
+check "3a order external 2>&1>f"   '/bin/echo hi 2>&1 >f; cat f'
+
 # --- #128: a non-interactive shell must NOT SIGHUP background jobs at exit ---
 # The child writes a file after a short sleep while the shell exits immediately;
 # bash leaves it running (file appears), huck must match. Poll after exit.
