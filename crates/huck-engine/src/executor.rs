@@ -8491,16 +8491,23 @@ fn spawn_external_with_fds(
     let replay_ops: Vec<ChildRedirOp>;
     let held: Vec<std::os::fd::OwnedFd>;
     if let Some(p) = plan {
-        // NEW full-plan path (foreground external stages): the whole ordered
-        // redirect list is in the plan; no slot dup-targets, no extra_ops.
+        // Full-plan path (external pipeline stages, foreground AND background):
+        // the whole ordered redirect list is in the plan; no slot dup-targets,
+        // no extra_ops.
         stdout_dup_target = None;
         stderr_dup_target = None;
         replay_ops = p.ops;
         held = p.held;
-        // p.heredoc_writers was taken by the caller.
+        // p.heredoc_writers: the foreground caller drains this before calling;
+        // the background caller leaves it in the plan and it drops here as a
+        // no-op Vec<pid_t> (bg heredoc writers are SIGCHLD-reaped). Either way
+        // the spawner ignores the field.
     } else {
-        // LEGACY slot path (background stages, until v294): slot dup-targets +
-        // build_child_extra_ops for fd>2/dup-in/close/<>.
+        // LEGACY slot path: retained but no longer reached — after v294 both
+        // pipeline callers pass Some(plan) for external stages (single external
+        // commands still use run_subprocess). Kept until the slot-machinery
+        // retirement follow-up. slot dup-targets + build_child_extra_ops for
+        // fd>2/dup-in/close/<>.
         // Resolve Dup targets pre-fork (Word expansion may allocate; not
         // async-signal-safe). stdout-dup BEFORE stderr-dup matches canonical
         // `>file 2>&1` semantics.
