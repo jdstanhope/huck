@@ -95,12 +95,15 @@ Expected: multiple `FAIL [ext-*]`, `FAIL [blt-*]`, `FAIL [two-fail]`, `FAIL [sig
 - [ ] **Step 3: Add background failing-redirect cases to the bg audit.** In `tools/bg_pipeline_redirect_audit_cases.sh`, inside `emit_bg_cases()`, append two cases (real tabs between the three fields), mirroring the file's existing format (`label<TAB>resultfiles<TAB>fragment`, bare `pipeline &`):
 ```bash
   # A stage whose redirect fails must not abort the bg pipeline: the consumer
-  # still runs and creates its result file (empty via EOF), matching bash.
-  # The failing redirect must be on a DIRECT stage (not wrapped in `sh -c`,
-  # which would fail the open() inside a nested shell and never exercise huck's
-  # own per-stage abort path).
-  printf '%s\t%s\t%s\n' "fail-continue"  "po" "cat </no/such/file | cat >po &"
-  printf '%s\t%s\t%s\n' "fail-mid"       "po" "echo A | cat </no/such/file | cat >po &"
+  # still runs and writes its marker, matching bash. Two constraints:
+  #  - the failing redirect must be on a DIRECT stage (not wrapped in `sh -c`,
+  #    which fails the open() inside a nested shell, bypassing huck's own path);
+  #  - the consumer must write a MARKER (`echo DONE`), not just pass EOF through,
+  #    because the audit compares file CONTENT and an empty `po` (bash continue)
+  #    vs a missing `po` (huck abort) both read as the empty string — the marker
+  #    makes the difference observable (`DONE` vs empty).
+  printf '%s\t%s\t%s\n' "fail-continue"  "po" "cat </no/such/file | { cat; echo DONE; } >po &"
+  printf '%s\t%s\t%s\n' "fail-mid"       "po" "echo A | cat </no/such/file | { cat; echo DONE; } >po &"
 ```
 
 - [ ] **Step 4: Confirm the bg audit now shows the new cases RED (huck aborts → downstream file differs from bash).**
