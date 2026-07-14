@@ -5969,7 +5969,8 @@ fn spawn_pipeline(
         // child) vs InProcess (existing slot-base; its body applies redirects). A
         // Simple(Exec) stage can be EITHER kind (external program vs builtin), so we
         // must key the base on the classification, not on Simple-vs-Compound.
-        let stage_is_external = matches!(classify_stage(stage_cmd, shell), StageKind::External(_));
+        let kind = classify_stage(stage_cmd, shell);
+        let stage_is_external = matches!(&kind, StageKind::External(_));
 
         // ---- Build stdin fd --------------------------------------------------
         // Priority: explicit redirect on ExecCommand > prev_pipe_read > STDIN_FILENO.
@@ -6643,9 +6644,10 @@ fn spawn_pipeline(
 
         // Resolve Dup targets pre-fork for InProcess stages (Word expansion may
         // allocate; not async-signal-safe). External stages handle this inside
-        // spawn_external_with_fds itself.
+        // spawn_external_with_fds itself (via the replayed ChildRedirPlan), so
+        // skip the expansion entirely for them.
         let (stdout_dup_target, stderr_dup_target) =
-            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+            if !stage_is_external && let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 let sdt = match &exec.slot_stdout() {
                     Some(RedirectSlot::Dup { source, .. }) => {
                         match resolve_fd_target(source, shell) {
@@ -6720,7 +6722,7 @@ fn spawn_pipeline(
         // (never entered parent_held); the READ end stays in parent_held for the
         // next stage to consume.
         let child_stdio = ChildStdio::new(stdin, stdout, stderr);
-        let spawn_result = match classify_stage(stage_cmd, shell) {
+        let spawn_result = match kind {
             StageKind::External(simple) => spawn_external_with_fds(
                 simple,
                 shell,
