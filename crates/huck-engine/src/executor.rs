@@ -3562,6 +3562,7 @@ fn run_background_sequence(
                 child_stdio,
                 pgid_target,
                 &fds_to_close_in_child,
+                None,
             ),
             StageKind::InProcess(cmd) => fork_and_run_in_subshell(
                 cmd,
@@ -7240,6 +7241,7 @@ fn run_multi_stage(
                 child_stdio,
                 pgid_target,
                 &fds_to_close_in_child,
+                None,
             ),
             StageKind::InProcess(cmd) => fork_and_run_in_subshell(
                 cmd,
@@ -8358,6 +8360,7 @@ fn spawn_external_with_fds(
     stdio: ChildStdio,
     pgid_target: i32,
     parent_fds_to_close: &[RawFd],
+    plan: Option<ChildRedirPlan>,
 ) -> Result<i32, io::Error> {
     // Flush pending parent stdout before spawning an external stage so its output
     // does not race ahead of buffered parent bytes (M-118 sibling: ordering).
@@ -8385,23 +8388,46 @@ fn spawn_external_with_fds(
         ));
     }
 
-    // Resolve Dup targets pre-fork (Word expansion may allocate; not async-signal-safe).
-    // stdout-dup BEFORE stderr-dup matches canonical `>file 2>&1` semantics.
-    let stdout_dup_target: Option<i32> = match &exec.slot_stdout() {
-        Some(RedirectSlot::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
-        _ => None,
-    };
-    let stderr_dup_target: Option<i32> = match &exec.slot_stderr() {
-        Some(RedirectSlot::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
-        _ => None,
-    };
+    // Unify: `replay_ops` are replayed in the child pre_exec (source order),
+    // `held` keeps parent-opened files alive until after spawn, `extra_targets`
+    // (derived below) are fds a replay op installs (must be excluded from the
+    // close list).
+    let stdout_dup_target: Option<i32>;
+    let stderr_dup_target: Option<i32>;
+    let replay_ops: Vec<ChildRedirOp>;
+    let held: Vec<std::os::fd::OwnedFd>;
+    if let Some(p) = plan {
+        // NEW full-plan path (foreground external stages): the whole ordered
+        // redirect list is in the plan; no slot dup-targets, no extra_ops.
+        stdout_dup_target = None;
+        stderr_dup_target = None;
+        replay_ops = p.ops;
+        held = p.held;
+        // p.heredoc_writers was taken by the caller.
+    } else {
+        // LEGACY slot path (background stages, until v294): slot dup-targets +
+        // build_child_extra_ops for fd>2/dup-in/close/<>.
+        // Resolve Dup targets pre-fork (Word expansion may allocate; not
+        // async-signal-safe). stdout-dup BEFORE stderr-dup matches canonical
+        // `>file 2>&1` semantics.
+        stdout_dup_target = match &exec.slot_stdout() {
+            Some(RedirectSlot::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
+            _ => None,
+        };
+        stderr_dup_target = match &exec.slot_stderr() {
+            Some(RedirectSlot::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
+            _ => None,
+        };
 
-    // v156 task 4 (additive): lower the redirects the 0/1/2 bridge does NOT
-    // consume (fd>2, `<&` dup-in, `N>&-` close, `<>`) into an ordered replay
-    // applied in the child AFTER the bridge stdio/dup. `extra_held` keeps the
-    // parent-opened files alive (FD_CLOEXEC) until after spawn.
-    let (extra_ops, extra_held) = build_child_extra_ops(&exec.redirects, shell, sink, err_sink)
-        .map_err(|code| io::Error::other(format!("redirect failed with code {code}")))?;
+        // v156 task 4 (additive): lower the redirects the 0/1/2 bridge does NOT
+        // consume (fd>2, `<&` dup-in, `N>&-` close, `<>`) into an ordered replay
+        // applied in the child AFTER the bridge stdio/dup. `held` keeps the
+        // parent-opened files alive (FD_CLOEXEC) until after spawn.
+        let (extra_ops, extra_held) = build_child_extra_ops(&exec.redirects, shell, sink, err_sink)
+            .map_err(|code| io::Error::other(format!("redirect failed with code {code}")))?;
+        replay_ops = extra_ops;
+        held = extra_held;
+    }
 
     let mut process = ProcessCommand::new(&resolved.program);
     process.args(&resolved.args);
@@ -8435,10 +8461,10 @@ fn spawn_external_with_fds(
         }
     }
 
-    // Collect the target fds that extra_ops will set up in the child, so we
+    // Collect the target fds that replay_ops will set up in the child, so we
     // can exclude them from fds_to_close below (Fix B: a dup2 then close on
     // the same fd would silently defeat the redirect).
-    let extra_targets: Vec<RawFd> = extra_ops
+    let extra_targets: Vec<RawFd> = replay_ops
         .iter()
         .map(|op| match *op {
             ChildRedirOp::Dup { target, .. } | ChildRedirOp::Close { target } => target,
@@ -8448,8 +8474,8 @@ fn spawn_external_with_fds(
     // Replay the extra (fd>2 / dup-in / close / ReadWrite) ops in source order,
     // AFTER the bridge stdio + dup-target pre_execs above. Pure dup2/close, so
     // async-signal-safe. Runs even when the bridge dup pre_exec is absent.
-    if !extra_ops.is_empty() {
-        let ops = extra_ops;
+    if !replay_ops.is_empty() {
+        let ops = replay_ops;
         unsafe {
             process.pre_exec(move || replay_redir_ops(&ops));
         }
@@ -8523,7 +8549,7 @@ fn spawn_external_with_fds(
     let spawn_result = process.spawn();
     // The child inherited the parent-opened extra-redirect fds (FD_CLOEXEC).
     // Drop the parent's copies now so they don't leak.
-    drop(extra_held);
+    drop(held);
     let child = spawn_result?;
     let pid = child.id() as i32;
 
