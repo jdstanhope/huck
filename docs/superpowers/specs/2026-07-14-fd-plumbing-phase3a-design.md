@@ -84,41 +84,52 @@ Non-goals): it and the slot path are retired together in 3b.
 ```rust
 /// The result of lowering an ordered redirect list: what fds the command will
 /// see, resolved but not yet installed. Consumed by exactly two appliers.
+/// Ownership of every parent-opened temp lives INSIDE the ops (not a separate
+/// `held` vec) so an applier controls each temp's close timing precisely, and a
+/// lowering error drops them all (no leak; P1 discipline).
 struct RedirPlan {
     /// Ordered ops. Source order is preserved (this is the whole point).
     ops: Vec<PlanOp>,
-    /// Temp fds the parent opened (files, heredoc read ends, `{var}` high fds)
-    /// that must stay alive until the plan is applied (in-process) or the child
-    /// is spawned. Owned so a lowering error drops them (no leak; P1 discipline).
-    held: Vec<OwnedFd>,
     /// Heredoc / here-string writer child pids, reaped after the body runs.
     heredoc_writers: Vec<libc::pid_t>,
 }
 
 enum PlanOp {
     /// A parent-opened temp (`>file`, heredoc/here-string read end) that must be
-    /// duped onto `target`. `source` is the raw fd of an entry in `held`.
-    /// In-process: if `source == target` (a relocated file that landed on its own
-    /// target, target >= 10) clear FD_CLOEXEC in place and record a `-1` restore
-    /// (the #135 mechanism); else dup2 + save/restore. Child: dup2 (replay's
-    /// existing `source == target` arm clears CLOEXEC).
-    InstallOwned { target: RawFd, source: RawFd },
+    /// duped onto `target`; it OWNS the fd. In-process: if `source`'s fd ==
+    /// `target` (a relocated file that landed on its own target, target >= 10)
+    /// clear FD_CLOEXEC in place and record a `-1` restore (the #135 mechanism),
+    /// persisting the fd; else dup2 + save/restore, then close the temp
+    /// IMMEDIATELY (so a later `{var}`/open reuses its freed number — holding it
+    /// to end-of-plan would shift a subsequent `{var}` from fd 10 to 11). Child:
+    /// dup2 (replay's `source == target` arm clears CLOEXEC), held until spawn.
+    InstallOwned { target: RawFd, source: OwnedFd },
     /// A borrowed shell fd (`>&w` / `<&w`, and the dup half of a move). `source`
     /// is a resolved fd NUMBER. In-process: validate `source` is open, then dup2 +
     /// save/restore. Child: dup2 (no validation — the fd is inherited).
     InstallDup { target: RawFd, source: RawFd },
     /// `N>&-`, and the source-close half of a move (`>&w-`).
     Close { target: RawFd },
-    /// `{var}` named-fd. `high` is the live descriptor the command sees, already
-    /// allocated non-CLOEXEC (>= 10) in the parent and held. In-process: assign
-    /// `$name = high` and take `high` OUT of `held` so it persists past the
-    /// command (bash keeps it open until an explicit `{var}>&-` or shell exit).
-    /// Child: leave `high` in `held` (the child inherits it, non-CLOEXEC) and do
-    /// NOT assign `$name` (bash doesn't for an external command); the op replays
-    /// as a defensive `dup2(high, high)`.
-    NamedFd { high: RawFd, name: String },
+    /// `{var}` named-fd; OWNS the high fd. `high` is the live descriptor the
+    /// command sees, already allocated non-CLOEXEC (>= 10). In-process: assign
+    /// `$name = high` and `into_raw_fd()` it so it persists past the command
+    /// (bash keeps it open until an explicit `{var}>&-` or shell exit). Child:
+    /// keep `high` (the child inherits it, non-CLOEXEC), replay a defensive
+    /// `dup2(high, high)`, and do NOT assign `$name` (bash doesn't for an external
+    /// command).
+    NamedFd { high: OwnedFd, name: String },
 }
 ```
+
+> **Why ownership lives in the ops, not a separate `held` vec.** The in-process
+> applier must close each `InstallOwned` temp the instant after it dup2s it onto
+> the target — exactly as the pre-refactor `apply` did — because a later `{var}`
+> allocates its high fd with `dup_to_high_fd(_, 10, …)`, which takes the lowest
+> free number >= 10. If a `>file` temp opened at fd 10 stayed open until
+> end-of-plan, `>a {v}>x` would give `$v` fd 11 instead of bash's 10 — the same
+> class of bug P2 fixed. Carrying the `OwnedFd` inside `InstallOwned`/`NamedFd`
+> lets the applier `drop` (close) or `into_raw_fd` (persist) each fd at exactly
+> the right moment; the child translation moves them into `ChildRedirPlan.held`.
 
 ### `lower_redirects` — the single resolver
 
@@ -181,27 +192,24 @@ impl RedirectScope {
 It absorbs `plan.heredoc_writers` into `self.heredoc_writers`, then walks
 `plan.ops` in order:
 
-- `InstallOwned { target, source }` → if `source == target`, in-place
-  `FD_CLOEXEC` clear + `self.saved.push((target, -1))` (the existing #135 arm);
-  else `self.redirect(source, target)` (dup2 + save). The `held` `OwnedFd`s are
-  dropped when `plan` drops at the end of `apply_plan` (equivalent to today's
-  close-temp-after-each-dup2 — they are high fds that never collide with a 0..9
-  target).
+- `InstallOwned { target, source }` (owns the fd) → if `source`'s fd == `target`,
+  `into_raw_fd()` to persist it, in-place `FD_CLOEXEC` clear +
+  `self.saved.push((target, -1))` (the existing #135 arm); else
+  `self.redirect(source_raw, target)` (dup2 + save) then `drop(source)` to close
+  the temp IMMEDIATELY (matches the pre-refactor close-after-dup2, so a later
+  `{var}`/open reuses the freed number). On dup2 error, `source` drops (closes)
+  on the early return.
 - `InstallDup { target, source }` → `validate_fd_open(source)`, then
   `self.redirect(source, target)`.
 - `Close { target }` → `self.close_target(target)`.
-- `NamedFd { high, name }` → assign `$name = high`; ensure `high` is taken out of
-  `held` (`into_raw_fd`) so it is NOT closed on Drop (bash persists it). Not added
-  to `self.saved`.
+- `NamedFd { high, name }` → `let fd = high.into_raw_fd()` (persist; not closed on
+  Drop, bash keeps it), then assign `$name = fd`. Not added to `self.saved`.
 
 Drop-rollback (`saved` restored in reverse) and heredoc reaping are unchanged. The
 three call sites (`with_redirect_scope` ×2 at 1523/1639, and `exec` at 5378) change
 from a per-redir `scope.apply(r, …)` loop to `let plan = lower_redirects(…)?; scope.apply_plan(plan, …)?`.
-
-> **Held-ownership note.** `apply_plan` takes `plan` by value so it owns `held`.
-> `NamedFd` fds are `into_raw_fd`'d out before the end so the `{var}` fd survives;
-> all other `held` fds drop (close) after the ops are applied — high, CLOEXEC,
-> already duped onto their targets, so closing them is correct and collision-free.
+`apply_plan` takes `plan` by value so it owns each temp `OwnedFd` and closes or
+persists it at exactly the right moment (see the ownership note above).
 
 ### Applier 2 — child replay (`run_subprocess`)
 
@@ -211,15 +219,17 @@ from a per-redir `scope.apply(r, …)` loop to `let plan = lower_redirects(…)?
 `run_subprocess`/`replay_redir_ops` already consume — OR extend `replay_redir_ops`
 to consume `PlanOp` directly. Either way the translation is mechanical:
 
-- `InstallOwned { target, source }` / `InstallDup { target, source }` →
-  `ChildRedirOp::Dup { target, source }`.
+- `InstallOwned { target, source }` → `ChildRedirOp::Dup { target, source: raw }`
+  and move the `OwnedFd` into `ChildRedirPlan.held` (kept alive until spawn).
+- `InstallDup { target, source }` → `ChildRedirOp::Dup { target, source }` (no held).
 - `Close { target }` → `ChildRedirOp::Close { target }`.
-- `NamedFd { high, .. }` → `ChildRedirOp::Dup { target: high, source: high }`
-  (the existing defensive same-fd op) and keep `high` in `held`; do not assign
+- `NamedFd { high, .. }` → `ChildRedirOp::Dup { target: raw, source: raw }`
+  (the existing defensive same-fd op) and move `high` into `held`; do not assign
   `$var`.
 
-`held` and `heredoc_writers` move across unchanged. `replay_redir_ops` is unchanged
-(it already handles `source == target`). This preserves the child path byte-for-byte.
+The translation REBUILDS `ChildRedirPlan.held` from the ops' owned fds;
+`heredoc_writers` moves across unchanged. `replay_redir_ops` is unchanged (it
+already handles `source == target`). This preserves the child path byte-for-byte.
 
 **Recommendation:** keep the `ChildRedirPlan` → `ChildRedirOp` bridge (translate
 `PlanOp` into the existing child op list) rather than rewriting `replay_redir_ops`
@@ -277,10 +287,11 @@ integration binaries locally first (memory: this box OOMs on `--workspace`).
   assign + child-inherits) is the one place the two appliers genuinely diverge.
   It is localized to the `NamedFd` arm of each applier; the resolution (high-fd
   alloc) is shared. The `named_fd` integration + `{var}` fd_torture cases guard it.
-- **Held-fd close timing.** In-process closes File/heredoc temps at end-of-`apply_plan`
-  (Drop) instead of immediately after each dup2. Safe because they are relocated
-  high CLOEXEC fds duped onto their targets, but the sweep's heredoc/`<>`/multi-redirect
-  cases are the check that nothing observes the difference.
+- **Held-fd close timing.** In-process MUST close each File/heredoc temp
+  immediately after its dup2 (via `drop(source)` inside `apply_plan`), NOT at
+  end-of-plan — otherwise a subsequent `{var}` allocates a shifted high fd
+  (`>a {v}>x` → `$v` = 11 not 10). The `3a namedfd` + `3a order` fd_torture cases
+  guard this exactly.
 - **Async-signal safety.** `PlanOp::NamedFd` carries a `String`; it must be
   translated to a `ChildRedirOp` (no `String`) *before* `pre_exec`. Keeping the
   `ChildRedirPlan` bridge (not feeding `PlanOp` into `replay_redir_ops`) enforces this
