@@ -12,6 +12,11 @@ emit_bg_cases() {
   printf '%s\t%s\t%s\n' "fd4 open"       "pf po" "/bin/sh -c 'echo FOUR >&4' 4>pf | cat >po &"
   printf '%s\t%s\t%s\n' "fd3 dup"        "po" "/bin/sh -c 'echo THREE >&3' 3>&1 | cat >po &"
   printf '%s\t%s\t%s\n' "in <f"          "po" "echo FILE > infile; /bin/cat <infile | cat >po &"
+  # Here-string on fd 4 dup'd to an external stage's stdin: exercises the
+  # heredoc/here-string writer fork. It MUST be forked before the inter-stage
+  # pipe is created (the v293 deadlock lesson) — this case is the permanent
+  # regression gate for that ordering on the background path.
+  printf '%s\t%s\t%s\n' "hs fd4"         "po" "/bin/sh -c 'cat <&4' 4<<<HI | cat >po &"
   printf '%s\t%s\t%s\n' "stage0 nodir"   "po" "/bin/cat | cat >po &"
   printf '%s\t%s\t%s\n' "close 2>&-"     "po" "$W 2>&- | cat >po &"
   printf '%s\t%s\t%s\n' "last redir"     "pf po" "/bin/echo A | /bin/sh -c 'cat; echo E >&2' 2>&1 >pf | cat >po &"
