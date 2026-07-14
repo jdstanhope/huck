@@ -73,8 +73,9 @@ check 'blt-last'     'echo A | read x </no/such/file'
 check 'cmp-middle'   'echo A | { cat; } </no/such/file | cat'
 # --- two stages fail ---
 check 'two-fail'     'cat </no/a | cat </no/b | wc -c'
-# --- upstream floods a dead reader -> SIGPIPE 141 ---
-check 'sigpipe-up'   'yes | head -1000 | cat </no/such/file | wc -l'
+# --- upstream floods a dead reader -> SIGPIPE 141 (yes never exits so its 141
+#     is deterministic; a `head -N` middle stage would race 0-vs-141 in bash) ---
+check 'sigpipe-up'   'yes | cat </no/such/file | wc -l'
 # --- failed stage redirects stdin AWAY from the pipe; upstream still SIGPIPEs ---
 check 'stdin-away'   'yes | read x </no/such/file | cat'
 # --- bad-fd source-order (message fixed in v293; only rc/continue diverged) ---
