@@ -147,5 +147,48 @@ impl ChildStdio {
     }
 }
 
+/// Set FD_CLOEXEC on a raw fd so it does NOT leak into an exec'd program.
+/// (Moved from executor.rs in Phase 2; used by the best-effort relocation
+/// fallback and the macOS `make_pipe` path.)
+pub(crate) fn set_cloexec(fd: RawFd) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+}
+
+/// Dup `src` to the lowest free fd >= `min` (`F_DUPFD` / `F_DUPFD_CLOEXEC` per
+/// `cloexec`). `src` is left OPEN (caller-owned) — this is the dup-not-move
+/// primitive the `{var}` sites need (they keep the source and close it via
+/// their own `owns_src` logic). Errors: EMFILE/EBADF.
+pub(crate) fn dup_to_high_fd(src: RawFd, min: RawFd, cloexec: bool) -> io::Result<RawFd> {
+    let cmd = if cloexec {
+        libc::F_DUPFD_CLOEXEC
+    } else {
+        libc::F_DUPFD
+    };
+    let fd = unsafe { libc::fcntl(src, cmd, min) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// `dup_to_high_fd` + `close(src)`. Unconditional: relocates even when `src` is
+/// already >= `min` (matches the old `relocate_high_cloexec`; the hot-path
+/// `fd > 2` no-op conditional lives only in `make_pipe`). On Err, `src` is left
+/// OPEN (caller cleans up). huck's analogue of bash's `move_to_high_fd`, but
+/// with an explicit `min` + kernel lowest-free-≥min (one `F_DUPFD` syscall, no
+/// downward scan): the thresholds (3, 10) are load-bearing and frozen.
+pub(crate) fn move_to_high_fd(src: RawFd, min: RawFd, cloexec: bool) -> io::Result<RawFd> {
+    let new = dup_to_high_fd(src, min, cloexec)?;
+    unsafe {
+        libc::close(src);
+    }
+    Ok(new)
+}
+
 #[cfg(test)]
 mod tests;

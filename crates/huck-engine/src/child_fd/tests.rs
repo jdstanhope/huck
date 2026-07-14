@@ -1,5 +1,5 @@
 use super::*;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 // F_GETFD probe: returns Ok if fd is open, Err(EBADF) if closed.
 fn fd_is_open(fd: RawFd) -> bool {
@@ -84,4 +84,57 @@ fn owned_raws_skips_inherit_slots() {
 fn inherit_all_is_all_inherit() {
     let s = ChildStdio::inherit_all();
     assert_eq!(s.owned_raws().count(), 0);
+}
+
+#[test]
+fn dup_to_high_fd_keeps_src_open_and_honors_cloexec() {
+    // Fresh source fd from /dev/null.
+    let f = std::fs::File::open("/dev/null").unwrap();
+    let src = f.into_raw_fd();
+
+    // Non-CLOEXEC dup.
+    let a = dup_to_high_fd(src, 10, false).unwrap();
+    assert!(a >= 10);
+    // src still open.
+    assert!(unsafe { libc::fcntl(src, libc::F_GETFD) } >= 0);
+    let flags = unsafe { libc::fcntl(a, libc::F_GETFD) };
+    assert_eq!(flags & libc::FD_CLOEXEC, 0);
+
+    // CLOEXEC dup.
+    let b = dup_to_high_fd(src, 10, true).unwrap();
+    assert!(b >= 10);
+    let flags = unsafe { libc::fcntl(b, libc::F_GETFD) };
+    assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+
+    unsafe {
+        libc::close(a);
+        libc::close(b);
+        libc::close(src);
+    }
+}
+
+#[test]
+fn move_to_high_fd_closes_src() {
+    let f = std::fs::File::open("/dev/null").unwrap();
+    let src = f.into_raw_fd();
+    let hi = move_to_high_fd(src, 10, true).unwrap();
+    assert!(hi >= 10);
+    // src is now closed.
+    assert_eq!(unsafe { libc::fcntl(src, libc::F_GETFD) }, -1);
+    let flags = unsafe { libc::fcntl(hi, libc::F_GETFD) };
+    assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+    unsafe {
+        libc::close(hi);
+    }
+}
+
+#[test]
+fn move_to_high_fd_err_on_bad_src_leaves_state_sane() {
+    // A definitely-closed fd -> EBADF; the fn returns Err without panicking.
+    let f = std::fs::File::open("/dev/null").unwrap();
+    let bad = f.into_raw_fd();
+    unsafe {
+        libc::close(bad);
+    }
+    assert!(move_to_high_fd(bad, 10, false).is_err());
 }

@@ -1361,7 +1361,7 @@ impl RedirectScope {
         // Allocate a free high fd duped from `src` (non-CLOEXEC). The high fd
         // ITSELF is the live descriptor the command sees — do NOT dup2 onto a
         // lower fd.
-        let high = match alloc_high_fd(src) {
+        let high = match crate::child_fd::dup_to_high_fd(src, 10, false) {
             Ok(h) => h,
             Err(e) => {
                 if owns_src {
@@ -5649,18 +5649,6 @@ struct ChildRedirPlan {
     heredoc_writers: Vec<libc::pid_t>,
 }
 
-/// Set FD_CLOEXEC on a raw fd so it does NOT leak into the exec'd program. The
-/// child's `dup2(source, target)` clears CLOEXEC on `target`, so the redirect
-/// survives exec while the parent-opened source fd is closed automatically.
-fn set_cloexec(fd: RawFd) {
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags >= 0 {
-            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-        }
-    }
-}
-
 /// Relocate a freshly-opened parent fd to a high number (>= 10) with FD_CLOEXEC,
 /// returning the new fd and closing the original. This keeps parent-opened
 /// redirect *source* fds out of the low 0..9 range that explicit redirect
@@ -5668,27 +5656,12 @@ fn set_cloexec(fd: RawFd) {
 /// fd the child is still swapping (matches how bash relocates redirect fds).
 /// On fcntl failure the original fd is returned unchanged (best-effort).
 fn relocate_high_cloexec(fd: RawFd) -> RawFd {
-    unsafe {
-        let new = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10);
-        if new < 0 {
-            // Could not relocate (e.g. EMFILE) — fall back to the original fd
-            // with CLOEXEC set; collisions are unlikely in the common case.
-            set_cloexec(fd);
-            return fd;
-        }
-        libc::close(fd);
-        new
-    }
-}
-
-/// Allocate a free fd >= 10 duped from `src_fd`. CLOEXEC is OFF so the fd is
-/// inherited by an exec'd child (bash leaves {var}/exec fds open across exec).
-fn alloc_high_fd(src_fd: RawFd) -> io::Result<RawFd> {
-    let fd = unsafe { libc::fcntl(src_fd, libc::F_DUPFD, 10) }; // F_DUPFD (not _CLOEXEC)
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(fd)
+    crate::child_fd::move_to_high_fd(fd, 10, true).unwrap_or_else(|_| {
+        // Could not relocate (e.g. EMFILE) — fall back to the original fd with
+        // CLOEXEC set; collisions are unlikely in the common case.
+        crate::child_fd::set_cloexec(fd);
+        fd
+    })
 }
 
 /// Lower `redirects` (in source order) into a `ChildRedirPlan` for an external
@@ -5857,7 +5830,7 @@ fn build_child_redir_plan(
                 }
                 RedirOp::Close => unreachable!("Close handled above"),
             };
-            let high = match alloc_high_fd(src) {
+            let high = match crate::child_fd::dup_to_high_fd(src, 10, false) {
                 Ok(h) => h,
                 Err(e) => {
                     if owns_src {
@@ -6641,14 +6614,8 @@ fn run_coproc(
     };
     // Parent: the child ends (in_r/out_w) were closed by the call; relocate the
     // shell ends high + cloexec.
-    let read_fd = match alloc_high_fd(out_r) {
-        Ok(hi) => {
-            unsafe {
-                libc::close(out_r);
-            }
-            set_cloexec(hi);
-            hi
-        }
+    let read_fd = match crate::child_fd::move_to_high_fd(out_r, 10, true) {
+        Ok(hi) => hi,
         Err(e) => {
             unsafe {
                 libc::close(out_r);
@@ -6667,14 +6634,8 @@ fn run_coproc(
             return ExecOutcome::Continue(1);
         }
     };
-    let write_fd = match alloc_high_fd(in_w) {
-        Ok(hi) => {
-            unsafe {
-                libc::close(in_w);
-            }
-            set_cloexec(hi);
-            hi
-        }
+    let write_fd = match crate::child_fd::move_to_high_fd(in_w, 10, true) {
+        Ok(hi) => hi,
         Err(e) => {
             unsafe {
                 libc::close(read_fd);
@@ -6710,27 +6671,6 @@ fn run_coproc(
     ExecOutcome::Continue(0)
 }
 
-/// Move `fd` above the stdio range (>= 3) so a freed 0/1/2 (e.g. after
-/// `exec <&-`) is never silently reused as a pipeline pipe end, which would
-/// alias a stage's std fd onto the pipe (issue #130). Returns `fd` unchanged
-/// when it is already >= 3 (the common case). Uses `F_DUPFD` (NOT
-/// `F_DUPFD_CLOEXEC`) to keep the moved fd's non-close-on-exec semantics
-/// identical to the raw `libc::pipe()` ends the callers dup2/close by hand,
-/// then closes the original low fd.
-fn move_fd_above_stdio(fd: RawFd) -> io::Result<RawFd> {
-    if fd > 2 {
-        return Ok(fd);
-    }
-    let newfd = unsafe { libc::fcntl(fd, libc::F_DUPFD, 3) };
-    if newfd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    unsafe {
-        libc::close(fd);
-    }
-    Ok(newfd)
-}
-
 /// Opens a `libc::pipe()` and returns `(read_end, write_end)` as raw fds, both
 /// guaranteed >= 3 so a freed std fd cannot be aliased into a pipeline stage's
 /// std fd (issue #130).
@@ -6740,24 +6680,32 @@ fn make_pipe() -> io::Result<(RawFd, RawFd)> {
         return Err(io::Error::last_os_error());
     }
     let (r0, w0) = (fds[0], fds[1]);
-    let r = match move_fd_above_stdio(r0) {
-        Ok(fd) => fd,
-        Err(e) => {
-            unsafe {
-                libc::close(r0);
-                libc::close(w0);
+    let r = if r0 > 2 {
+        r0
+    } else {
+        match crate::child_fd::move_to_high_fd(r0, 3, false) {
+            Ok(fd) => fd,
+            Err(e) => {
+                unsafe {
+                    libc::close(r0);
+                    libc::close(w0);
+                }
+                return Err(e);
             }
-            return Err(e);
         }
     };
-    let w = match move_fd_above_stdio(w0) {
-        Ok(fd) => fd,
-        Err(e) => {
-            unsafe {
-                libc::close(r);
-                libc::close(w0);
+    let w = if w0 > 2 {
+        w0
+    } else {
+        match crate::child_fd::move_to_high_fd(w0, 3, false) {
+            Ok(fd) => fd,
+            Err(e) => {
+                unsafe {
+                    libc::close(r);
+                    libc::close(w0);
+                }
+                return Err(e);
             }
-            return Err(e);
         }
     };
     Ok((r, w))
