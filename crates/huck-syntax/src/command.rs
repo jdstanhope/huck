@@ -303,16 +303,15 @@ impl Redirection {
 /// than via the unified ordered applier — the PIPELINE-STAGE executor
 /// (`run_multi_stage` / `run_background_sequence` / `spawn_external_with_fds`)
 /// and AST→source regeneration (`generate.rs`). fd>2 targets, `RedirFd::Var`,
-/// `RedirOp::Close`, `<&` (Dup output:false), and ReadWrite are DROPPED here
-/// (the pipeline path picks the fd>2/dup-in/close/ReadWrite set up additively via
-/// `slots_for_simple_path` + `build_child_extra_ops`). LAST-WINS per slot.
+/// `RedirOp::Close`, `<&` (Dup output:false), and ReadWrite are DROPPED here;
+/// these slots feed only the 0/1/2 pipe/stdio wiring — the pipeline path
+/// separately replays the FULL ordered redirect list for external stages via
+/// `build_child_redir_plan`/`ChildRedirPlan` (v292), so ordering and fd>2
+/// heredocs are handled there, not by this helper.
 ///
-/// RESIDUAL LIMITATION (v156 task 7 fallback): because this is last-wins and the
-/// extra set is applied additively, SOURCE ORDERING between a 0/1/2 redirect and
-/// another redirect (`2>&1 >file` / `>file 3>&1`) is NOT preserved for pipeline
-/// stages, and an fd>2 heredoc on a pipeline-stage external is dropped. The
-/// single-command builtin and external paths do NOT use this helper anymore —
-/// they apply `cmd.redirects` in source order (so L-08 is fixed there).
+/// The single-command builtin and external paths do NOT use this helper
+/// anymore — they apply `cmd.redirects` in source order (so L-08 is fixed
+/// there too).
 pub fn slots_for_simple_path(
     redirs: &[Redirection],
 ) -> (
