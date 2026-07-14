@@ -1003,60 +1003,77 @@ impl RedirectScope {
         }
     }
 
-    /// Apply a lowered `RedirPlan` to the real fds in source order, save/restore
-    /// aware (Drop rolls back). Replaces the old per-`Redirection` `apply`.
-    fn apply_plan(
+    /// Apply a single lowered `PlanOp` to the real fds, save/restore aware
+    /// (Drop rolls back). Dup sources are NOT re-validated here: the caller's
+    /// `lower_one_redirect(None)` already validated the source against the real
+    /// fd table, and lower→apply for a single redirect is atomic w.r.t. the fd
+    /// table, so re-validation would be redundant.
+    fn apply_one(
         &mut self,
-        plan: RedirPlan,
+        op: PlanOp,
         shell: &mut Shell,
         sink: &mut StdoutSink,
         err_sink: &mut StderrSink,
     ) -> Result<(), ExecOutcome> {
         use std::os::fd::{AsRawFd, IntoRawFd};
-        self.heredoc_writers.extend(plan.heredoc_writers);
-        for op in plan.ops {
-            match op {
-                PlanOp::InstallOwned { target, source } => {
-                    let raw = source.as_raw_fd();
-                    if raw == target {
-                        // #135: a relocated file landed on its own target (target
-                        // >= 10). Keep it, clear FD_CLOEXEC in place (a no-op dup2
-                        // would NOT), record a was-closed restore. Persist by
-                        // taking it out of the OwnedFd so Drop doesn't close it.
-                        let fd = source.into_raw_fd();
-                        unsafe {
-                            let flags = libc::fcntl(fd, libc::F_GETFD);
-                            if flags >= 0 {
-                                let _ = libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-                            }
+        match op {
+            PlanOp::InstallOwned { target, source } => {
+                let raw = source.as_raw_fd();
+                if raw == target {
+                    let fd = source.into_raw_fd();
+                    unsafe {
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags >= 0 {
+                            let _ = libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
                         }
-                        self.saved.push((target, -1));
-                    } else if self.redirect(shell, raw, target, sink, err_sink).is_err() {
-                        // `source` drops here (closes the temp) on the error path.
-                        return Err(ExecOutcome::Continue(1));
-                    } else {
-                        // dup2 succeeded; close the temp now (matches the old
-                        // close-after-dup2 so a later {var}/open reuses its number).
-                        drop(source);
                     }
+                    self.saved.push((target, -1));
+                } else if self.redirect(shell, raw, target, sink, err_sink).is_err() {
+                    return Err(ExecOutcome::Continue(1));
+                } else {
+                    drop(source);
                 }
-                PlanOp::InstallDup { target, source } => {
-                    validate_fd_open(source, shell, sink, err_sink)
-                        .map_err(|()| ExecOutcome::Continue(1))?;
-                    if self
-                        .redirect(shell, source, target, sink, err_sink)
-                        .is_err()
-                    {
-                        return Err(ExecOutcome::Continue(1));
-                    }
+            }
+            PlanOp::InstallDup { target, source } => {
+                if self
+                    .redirect(shell, source, target, sink, err_sink)
+                    .is_err()
+                {
+                    return Err(ExecOutcome::Continue(1));
                 }
-                PlanOp::Close { target } => self.close_target(target),
-                PlanOp::NamedFd { high, name } => {
-                    // Assign $var and leave `high` OPEN (persists past the command);
-                    // NOT registered in `saved`, so Drop must not close it.
-                    let fd = high.into_raw_fd();
-                    shell.set(&name, fd.to_string());
-                }
+            }
+            PlanOp::Close { target } => self.close_target(target),
+            PlanOp::NamedFd { high, name } => {
+                let fd = high.into_raw_fd();
+                shell.set(&name, fd.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve-then-apply each redirection in source order against the shell's
+    /// real fds. Interleaved, so a `{var}`'s $v assignment + fd allocation and
+    /// each redirect's fd-table mutation are visible to the NEXT redirect —
+    /// matching bash and the pre-C `apply`.
+    fn apply_redirects(
+        &mut self,
+        redirs: &[Redirection],
+        shell: &mut Shell,
+        sink: &mut StdoutSink,
+        err_sink: &mut StderrSink,
+    ) -> Result<(), ExecOutcome> {
+        for redir in redirs {
+            let ops = lower_one_redirect(
+                redir,
+                shell,
+                sink,
+                err_sink,
+                None,
+                &mut self.heredoc_writers,
+            )
+            .map_err(ExecOutcome::Continue)?;
+            for op in ops {
+                self.apply_one(op, shell, sink, err_sink)?;
             }
         }
         Ok(())
@@ -1263,21 +1280,11 @@ where
     // `>file 2>&1`. A failure mid-list returns early; the scope's Drop rolls
     // back the entries already applied (atomic, matching pre-v156 behavior).
     let force_terminal = redirs_write_stdout(redirs);
-    match lower_redirects(redirs, shell, sink, err_sink) {
-        Ok(plan) => {
-            if let Err(outcome) = scope.apply_plan(plan, shell, sink, err_sink) {
-                scope.reap_heredoc_writers();
-                drop(scope);
-                drain_procsubs(shell, procsub_base);
-                return outcome;
-            }
-        }
-        Err(code) => {
-            scope.reap_heredoc_writers();
-            drop(scope);
-            drain_procsubs(shell, procsub_base);
-            return ExecOutcome::Continue(code);
-        }
+    if let Err(outcome) = scope.apply_redirects(redirs, shell, sink, err_sink) {
+        scope.reap_heredoc_writers();
+        drop(scope);
+        drain_procsubs(shell, procsub_base);
+        return outcome;
     }
 
     // Run the inner compound with the now-redirected fds. Its (possibly
@@ -1382,21 +1389,11 @@ fn run_builtin_with_redirects(
         && matches!(final_2, RedirectDest::Follows(1));
 
     let mut scope = RedirectScope::new();
-    match lower_redirects(redirs, shell, sink, err_sink) {
-        Ok(plan) => {
-            if let Err(outcome) = scope.apply_plan(plan, shell, sink, err_sink) {
-                scope.reap_heredoc_writers();
-                drop(scope);
-                drain_procsubs(shell, procsub_base);
-                return outcome;
-            }
-        }
-        Err(code) => {
-            scope.reap_heredoc_writers();
-            drop(scope);
-            drain_procsubs(shell, procsub_base);
-            return ExecOutcome::Continue(code);
-        }
+    if let Err(outcome) = scope.apply_redirects(redirs, shell, sink, err_sink) {
+        scope.reap_heredoc_writers();
+        drop(scope);
+        drain_procsubs(shell, procsub_base);
+        return outcome;
     }
 
     // When a stdout redirect is present, fd 1 now points at the target; force a
@@ -5218,20 +5215,15 @@ fn apply_redirects_permanently(
     // numeric fds, dup, close, heredoc, and `{var}` uniformly. On failure,
     // `scope` Drop rolls back any already-applied redirects atomically
     // (temporary semantics) and we return Err(()) to the caller.
-    match lower_redirects(&cmd.redirects, shell, sink, err_sink) {
-        Ok(plan) => {
-            if scope.apply_plan(plan, shell, sink, err_sink).is_err() {
-                // Reap any heredoc writers spawned by already-applied redirs
-                // before the scope drops (Drop is writer-agnostic) — else a
-                // zombie until shell exit. Mirrors with_redirect_scope's path.
-                scope.reap_heredoc_writers();
-                return Err(()); // scope Drop restores partial → atomic rollback
-            }
-        }
-        Err(_) => {
-            scope.reap_heredoc_writers();
-            return Err(());
-        }
+    if scope
+        .apply_redirects(&cmd.redirects, shell, sink, err_sink)
+        .is_err()
+    {
+        // Reap any heredoc writers spawned by already-applied redirs before the
+        // scope drops (Drop is writer-agnostic) — else a zombie until shell
+        // exit. Mirrors with_redirect_scope's path.
+        scope.reap_heredoc_writers();
+        return Err(()); // scope Drop restores partial → atomic rollback
     }
 
     // SUCCESS → make the redirections permanent.

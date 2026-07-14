@@ -72,6 +72,11 @@ check "3a file-before-baddup trunc" 'echo X > t2; { echo hi; } >t2 2>&77; echo r
 check "3a close-then-dup inproc"   '{ echo hi; } 1>&- 2>&1; echo done'
 check "3a same-plan dup external"  'exec 4>&-; /bin/echo hi 3>g 4>&3; cat g'
 
+# --- v292b: in-process {var} interleaving (fixed) ---
+check "b nf use later 2>&\$v"  '{ echo err 1>&2; } {v}>f 2>&$v; cat f'
+check "b nf persist on fail"   '{ true; } {v}>g 2>&9; echo "v=${v-unset}"'
+check "b nf num mixed list"    '{ true; } 3>a {v}>x; echo "v=$v"'
+
 # --- #128: a non-interactive shell must NOT SIGHUP background jobs at exit ---
 # The child writes a file after a short sleep while the shell exits immediately;
 # bash leaves it running (file appears), huck must match. Poll after exit.
