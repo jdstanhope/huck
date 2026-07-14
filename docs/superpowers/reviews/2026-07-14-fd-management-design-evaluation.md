@@ -90,8 +90,25 @@ correct decomposition and C's single-applier unification was the error.
 - **#137 (write-to-closed-fd not detected)** — 8 divergences, all in the
   software-sink write path (`StdoutSink`/builtin write). Bash checks each write
   for EBADF and reports `write error: Bad file descriptor` + `rc=1`. Its own fix.
-- **`{var}` error-message wording + external `$v`-visibility** — ~8 divergences,
-  message formatting and one external `{var}` interleaving case. Its own issue(s).
+- **`{var}` error-message wording + external `$v`-visibility (#140)** — ~8
+  divergences, message formatting and external `{var}` sibling-dup resolution.
+
+**Audit blind spot found by a manual probe (the corpus could not see it):** the
+harness observes the `{var}` fd via `$v`, which external commands do not persist,
+so the **external `{var}` fd *number*** was invisible. A direct `/proc/self/fd`
+probe shows `cmd 3>a {v}>x` inherits **fd 11** in huck (fd 12 with two preceding
+temps) vs bash's **fd 10**. This is *pre-existing* (main's `build_child_redir_plan`
+also batches and holds file temps at the high range during `{var}` allocation),
+so it is **not a v292 regression** — but it means the child path cannot match
+bash's in-child interleaved `{var}` numbering by simply allocating the lowest real
+free fd. The correct child fix is a **virtual `{var}` allocator**: pick the lowest
+number ≥10 not used as a *target* by an earlier plan op and not by an earlier
+`{var}`, and emit a `dup2(source → that number)` op — the held file temps occupy
+the high range only in the parent, but in the child they are dup2'd to their
+targets and closed, so the virtual number is free at replay time. Lesson for the
+harness: add an external `/proc/self/fd` observable so `{var}` numbering is
+covered automatically. (Deferred with #140's family — pre-existing, not blocking
+v292.)
 
 ## Implications
 
