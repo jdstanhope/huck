@@ -50,6 +50,33 @@ check "1>&2 to stderr"            'echo hi 1>&2 2>/dev/null; echo done'
 check "2>&1 merge into pipe"      'ls /no_such_xyz 2>&1 | cat'
 check "&> merge to file"          'echo hi &> f; cat f'
 
+# --- Phase 3a parity net: semantics the unified lowering must preserve ---
+# Lazy dup-source validation: 4>&3 is only valid because 3>file applied first.
+check "3a lazy dup after file"     'exec 3>&-; { echo x; } 3>f 4>&3; cat f'
+check "3a dup chain swap"          '{ echo o; echo e 1>&2; } 3>&1 1>&2 2>&3 2>/dev/null'
+# {var} persists in-process (exec / compound) but is per-command in a child.
+check "3a namedfd exec persists"   'exec {v}>f; echo hi >&"$v"; exec {v}>&-; cat f'
+check "3a namedfd compound"        '{ echo hi; } {v}>f; echo sep; cat f'
+check "3a namedfd external child"  'echo hi {v}>f; echo sep; cat f'
+check "3a namedfd move"            'exec 5>f; { echo hi; } {v}>&5-; echo sep; cat f'
+# In-process ordering: 2>&1 >file (compound) vs a single external command.
+check "3a order compound 2>&1>f"   '{ echo o; echo e 1>&2; } 2>&1 >f; cat f'
+check "3a order external 2>&1>f"   '/bin/echo hi 2>&1 >f; cat f'
+check "3a fd3 heredoc external"    $'/bin/cat 3<<EOF <&3\nbody\nEOF'
+
+# --- invalid-dup-before-file must NOT truncate (bash left-to-right) ---
+check "3a nodup-trunc inproc"      'echo X > t; { echo hi; } 2>&77 >t; echo rc=$?; cat t'
+check "3a nodup-trunc external"    'echo X > e; /bin/echo hi 2>&77 >e; echo rc=$?; cat e'
+check "3a nodup-trunc exec"        'echo X > t3; ( exec 2>&77 >t3; echo hi ); echo rc=$?; cat t3'
+check "3a file-before-baddup trunc" 'echo X > t2; { echo hi; } >t2 2>&77; echo rc=$?; cat t2'
+check "3a close-then-dup inproc"   '{ echo hi; } 1>&- 2>&1; echo done'
+check "3a same-plan dup external"  'exec 4>&-; /bin/echo hi 3>g 4>&3; cat g'
+
+# --- v292b: in-process {var} interleaving (fixed) ---
+check "b nf use later 2>&\$v"  '{ echo err 1>&2; } {v}>f 2>&$v; cat f'
+check "b nf persist on fail"   '{ true; } {v}>g 2>&9; echo "v=${v-unset}"'
+check "b nf num mixed list"    '{ true; } 3>a {v}>x; echo "v=$v"'
+
 # --- #128: a non-interactive shell must NOT SIGHUP background jobs at exit ---
 # The child writes a file after a short sleep while the shell exits immediately;
 # bash leaves it running (file appears), huck must match. Poll after exit.
