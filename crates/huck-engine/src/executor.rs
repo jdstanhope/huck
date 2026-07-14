@@ -1034,14 +1034,18 @@ impl RedirectScope {
                 if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
                     return Err(ExecOutcome::Continue(1));
                 }
-                let new_fd: RawFd =
-                    match open_redirect_file(mode, &path, shell.shell_options.noclobber, true) {
-                        Ok(owned) => owned.into_raw_fd(),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            return Err(ExecOutcome::Continue(1));
-                        }
-                    };
+                let new_fd: RawFd = match open_redirect_file(
+                    mode,
+                    &path,
+                    shell.shell_options.noclobber,
+                    FdPlacement::Relocated,
+                ) {
+                    Ok(owned) => owned.into_raw_fd(),
+                    Err(e) => {
+                        redir_open_error(shell, err_sink, sink, &path, &e);
+                        return Err(ExecOutcome::Continue(1));
+                    }
+                };
                 if new_fd == target {
                     // The relocated file landed directly on `target` (only
                     // possible for target >= 10 with 10..target busy). Leave it
@@ -1217,17 +1221,21 @@ impl RedirectScope {
                 if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
                     return Err(ExecOutcome::Continue(1));
                 }
-                // relocate=false: the {var}-fd relocation happens once below via
+                // FdPlacement::RawLow: the {var}-fd relocation happens once below via
                 // dup_to_high_fd; relocating here too would double-relocate the
                 // named fd (lands at 11 instead of bash's 10, #135 regression).
-                let fd: RawFd =
-                    match open_redirect_file(mode, &path, shell.shell_options.noclobber, false) {
-                        Ok(owned) => owned.into_raw_fd(),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            return Err(ExecOutcome::Continue(1));
-                        }
-                    };
+                let fd: RawFd = match open_redirect_file(
+                    mode,
+                    &path,
+                    shell.shell_options.noclobber,
+                    FdPlacement::RawLow,
+                ) {
+                    Ok(owned) => owned.into_raw_fd(),
+                    Err(e) => {
+                        redir_open_error(shell, err_sink, sink, &path, &e);
+                        return Err(ExecOutcome::Continue(1));
+                    }
+                };
                 (fd, true)
             }
             RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
@@ -3320,7 +3328,12 @@ fn run_background_sequence(
                             );
                         }
                     };
-                    match open_redirect_file(&FileMode::ReadOnly, &path, false, true) {
+                    match open_redirect_file(
+                        &FileMode::ReadOnly,
+                        &path,
+                        false,
+                        FdPlacement::Relocated,
+                    ) {
                         Ok(f) => ChildFd::from(f),
                         Err(e) => {
                             redir_open_error(shell, err_sink, sink, &path, &e);
@@ -3489,7 +3502,12 @@ fn run_background_sequence(
                         };
                         let guard =
                             shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                        match open_redirect_file(&FileMode::Truncate, &path, guard, true) {
+                        match open_redirect_file(
+                            &FileMode::Truncate,
+                            &path,
+                            guard,
+                            FdPlacement::Relocated,
+                        ) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -3518,7 +3536,12 @@ fn run_background_sequence(
                                 );
                             }
                         };
-                        match open_redirect_file(&FileMode::Append, &path, false, true) {
+                        match open_redirect_file(
+                            &FileMode::Append,
+                            &path,
+                            false,
+                            FdPlacement::Relocated,
+                        ) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -3559,7 +3582,12 @@ fn run_background_sequence(
                         };
                         let guard =
                             shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                        match open_redirect_file(&FileMode::Truncate, &path, guard, true) {
+                        match open_redirect_file(
+                            &FileMode::Truncate,
+                            &path,
+                            guard,
+                            FdPlacement::Relocated,
+                        ) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -3588,7 +3616,12 @@ fn run_background_sequence(
                                 );
                             }
                         };
-                        match open_redirect_file(&FileMode::Append, &path, false, true) {
+                        match open_redirect_file(
+                            &FileMode::Append,
+                            &path,
+                            false,
+                            FdPlacement::Relocated,
+                        ) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -4280,22 +4313,35 @@ fn spawn_heredoc_writer(bytes: &[u8]) -> Result<(RawFd, libc::pid_t), io::Error>
     Ok((r, pid))
 }
 
+/// Where a freshly-opened redirect-source fd should land.
+enum FdPlacement {
+    /// Relocate to >= 10 and set FD_CLOEXEC. Used for redirect *targets* on real
+    /// fds so the source stays out of the 0..9 swap range that explicit targets
+    /// (`3>&1 2>&3`) operate on.
+    Relocated,
+    /// Return the raw low File fd as opened (CLOEXEC). Used only by the `{var}`
+    /// path, which relocates once itself via `dup_to_high_fd` — relocating here
+    /// too double-relocates the named fd (fd 11 vs bash's 10; the #135 regression).
+    RawLow,
+}
+
 /// THE redirect file-open matrix: open `path` per `mode` (ReadOnly / Truncate
 /// honoring `noclobber` / Clobber / Append / ReadWrite-no-truncate). When
-/// `relocate` is true, relocate the fd >= 10 with FD_CLOEXEC (best-effort on
-/// EMFILE, via relocate_high_cloexec) so a parent-opened redirect *source* can
-/// never land in the 0..9 range that redirect *targets* operate on (#135,
-/// #132-class). When `relocate` is false, return the raw opened fd (Rust std
-/// ⇒ O_CLOEXEC, at a low number) WITHOUT relocating — this is for callers that
-/// relocate the source themselves via `dup_to_high_fd`, e.g. the `{var}`-fd
-/// arms (`apply_var`, `build_child_redir_plan`); relocating here too would
-/// double-relocate and land the named fd one number too high (#135 regression).
+/// `placement` is `Relocated`, relocate the fd >= 10 with FD_CLOEXEC
+/// (best-effort on EMFILE, via relocate_high_cloexec) so a parent-opened
+/// redirect *source* can never land in the 0..9 range that redirect *targets*
+/// operate on (#135, #132-class). When `placement` is `RawLow`, return the raw
+/// opened fd (Rust std ⇒ O_CLOEXEC, at a low number) WITHOUT relocating — this
+/// is for callers that relocate the source themselves via `dup_to_high_fd`,
+/// e.g. the `{var}`-fd arms (`apply_var`, `build_child_redir_plan`); relocating
+/// here too would double-relocate and land the named fd one number too high
+/// (#135 regression).
 /// Callers report failures via `redir_open_error(path, ..)` as today.
 fn open_redirect_file(
     mode: &FileMode,
     path: &str,
     noclobber: bool,
-    relocate: bool,
+    placement: FdPlacement,
 ) -> io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     let file: File = match mode {
@@ -4310,11 +4356,13 @@ fn open_redirect_file(
             .truncate(false)
             .open(path)?,
     };
-    if !relocate {
-        return Ok(OwnedFd::from(file));
+    match placement {
+        FdPlacement::RawLow => Ok(OwnedFd::from(file)),
+        FdPlacement::Relocated => {
+            let raw = relocate_high_cloexec(file.into_raw_fd());
+            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        }
     }
-    let raw = relocate_high_cloexec(file.into_raw_fd());
-    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
 /// Opens `path` for writing, truncating. When `guard_noclobber` is true
@@ -5668,18 +5716,21 @@ fn build_child_redir_plan(
                     if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
                         return Err(1);
                     }
-                    // relocate=false: the {var}-fd relocation happens once below via
+                    // FdPlacement::RawLow: the {var}-fd relocation happens once below via
                     // dup_to_high_fd; relocating here too would double-relocate the
                     // named fd (lands at 11 instead of bash's 10, #135 regression).
-                    let fd: RawFd =
-                        match open_redirect_file(mode, &path, shell.shell_options.noclobber, false)
-                        {
-                            Ok(owned) => owned.into_raw_fd(),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                return Err(1);
-                            }
-                        };
+                    let fd: RawFd = match open_redirect_file(
+                        mode,
+                        &path,
+                        shell.shell_options.noclobber,
+                        FdPlacement::RawLow,
+                    ) {
+                        Ok(owned) => owned.into_raw_fd(),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            return Err(1);
+                        }
+                    };
                     (fd, true)
                 }
                 RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
@@ -5798,14 +5849,18 @@ fn build_child_redir_plan(
                 if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
                     return Err(1);
                 }
-                let owned =
-                    match open_redirect_file(mode, &path, shell.shell_options.noclobber, true) {
-                        Ok(fd) => fd,
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            return Err(1);
-                        }
-                    };
+                let owned = match open_redirect_file(
+                    mode,
+                    &path,
+                    shell.shell_options.noclobber,
+                    FdPlacement::Relocated,
+                ) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        redir_open_error(shell, err_sink, sink, &path, &e);
+                        return Err(1);
+                    }
+                };
                 use std::os::fd::AsRawFd;
                 let raw = owned.as_raw_fd();
                 plan.ops.push(ChildRedirOp::Dup {
@@ -5941,14 +5996,18 @@ fn build_child_extra_ops(
                 if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
                     return Err(1);
                 }
-                let owned =
-                    match open_redirect_file(mode, &path, shell.shell_options.noclobber, true) {
-                        Ok(fd) => fd,
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            return Err(1);
-                        }
-                    };
+                let owned = match open_redirect_file(
+                    mode,
+                    &path,
+                    shell.shell_options.noclobber,
+                    FdPlacement::Relocated,
+                ) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        redir_open_error(shell, err_sink, sink, &path, &e);
+                        return Err(1);
+                    }
+                };
                 use std::os::fd::AsRawFd;
                 let raw = owned.as_raw_fd();
                 ops.push(ChildRedirOp::Dup {
@@ -6776,7 +6835,12 @@ fn run_multi_stage(
                             return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     };
-                    match open_redirect_file(&FileMode::ReadOnly, &path, false, true) {
+                    match open_redirect_file(
+                        &FileMode::ReadOnly,
+                        &path,
+                        false,
+                        FdPlacement::Relocated,
+                    ) {
                         Ok(f) => ChildFd::from(f),
                         Err(e) => {
                             redir_open_error(shell, err_sink, sink, &path, &e);
@@ -6892,7 +6956,12 @@ fn run_multi_stage(
                         };
                         let guard =
                             shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                        match open_redirect_file(&FileMode::Truncate, &path, guard, true) {
+                        match open_redirect_file(
+                            &FileMode::Truncate,
+                            &path,
+                            guard,
+                            FdPlacement::Relocated,
+                        ) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -6909,7 +6978,12 @@ fn run_multi_stage(
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         };
-                        match open_redirect_file(&FileMode::Append, &path, false, true) {
+                        match open_redirect_file(
+                            &FileMode::Append,
+                            &path,
+                            false,
+                            FdPlacement::Relocated,
+                        ) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -6938,7 +7012,12 @@ fn run_multi_stage(
                         };
                         let guard =
                             shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                        match open_redirect_file(&FileMode::Truncate, &path, guard, true) {
+                        match open_redirect_file(
+                            &FileMode::Truncate,
+                            &path,
+                            guard,
+                            FdPlacement::Relocated,
+                        ) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -6955,7 +7034,12 @@ fn run_multi_stage(
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         };
-                        match open_redirect_file(&FileMode::Append, &path, false, true) {
+                        match open_redirect_file(
+                            &FileMode::Append,
+                            &path,
+                            false,
+                            FdPlacement::Relocated,
+                        ) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
