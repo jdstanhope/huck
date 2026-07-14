@@ -147,5 +147,110 @@ impl ChildStdio {
     }
 }
 
+/// Set FD_CLOEXEC on a raw fd so it does NOT leak into an exec'd program.
+/// (Moved from executor.rs in Phase 2; used by the best-effort relocation
+/// fallback and the macOS `make_pipe` path.)
+pub(crate) fn set_cloexec(fd: RawFd) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+}
+
+/// Dup `src` to the lowest free fd >= `min` (`F_DUPFD` / `F_DUPFD_CLOEXEC` per
+/// `cloexec`). `src` is left OPEN (caller-owned) — this is the dup-not-move
+/// primitive the `{var}` sites need (they keep the source and close it via
+/// their own `owns_src` logic). Errors: EMFILE/EBADF.
+pub(crate) fn dup_to_high_fd(src: RawFd, min: RawFd, cloexec: bool) -> io::Result<RawFd> {
+    let cmd = if cloexec {
+        libc::F_DUPFD_CLOEXEC
+    } else {
+        libc::F_DUPFD
+    };
+    let fd = unsafe { libc::fcntl(src, cmd, min) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// `dup_to_high_fd` + `close(src)`. Unconditional: relocates even when `src` is
+/// already >= `min` (matches the old `relocate_high_cloexec`; the hot-path
+/// `fd > 2` no-op conditional lives only in `make_pipe`). On Err, `src` is left
+/// OPEN (caller cleans up). huck's analogue of bash's `move_to_high_fd`, but
+/// with an explicit `min` + kernel lowest-free-≥min (one `F_DUPFD` syscall, no
+/// downward scan): the thresholds (3, 10) are load-bearing and frozen.
+pub(crate) fn move_to_high_fd(src: RawFd, min: RawFd, cloexec: bool) -> io::Result<RawFd> {
+    let new = dup_to_high_fd(src, min, cloexec)?;
+    unsafe {
+        libc::close(src);
+    }
+    Ok(new)
+}
+
+/// THE pipe-creation helper. Both ends are guaranteed >= 3 so a freed std fd
+/// (e.g. after `exec <&-`) can never be silently reused as a pipe end and
+/// aliased onto a child's stdio (#130, and the procsub/heredoc/stdin_pipe
+/// latents). `cloexec` chooses the ends' close-on-exec state: false = inherited
+/// across exec (pipeline wiring, procsub /dev/fd/N, heredoc feed); true =
+/// shell/embedder-internal (stdin_pipe). The relocation uses the MATCHING dup
+/// flavor so a CLOEXEC end keeps CLOEXEC when moved off a low number.
+pub(crate) fn make_pipe(cloexec: bool) -> io::Result<(RawFd, RawFd)> {
+    let mut fds = [0 as RawFd; 2];
+    // `pipe2(O_CLOEXEC)` is Linux-only; elsewhere create then fcntl both ends.
+    #[cfg(target_os = "linux")]
+    let ret = unsafe {
+        if cloexec {
+            libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC)
+        } else {
+            libc::pipe(fds.as_mut_ptr())
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let ret = unsafe {
+        let r = libc::pipe(fds.as_mut_ptr());
+        if r == 0 && cloexec {
+            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        r
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (r0, w0) = (fds[0], fds[1]);
+    let r = if r0 > 2 {
+        r0
+    } else {
+        match move_to_high_fd(r0, 3, cloexec) {
+            Ok(fd) => fd,
+            Err(e) => {
+                unsafe {
+                    libc::close(r0);
+                    libc::close(w0);
+                }
+                return Err(e);
+            }
+        }
+    };
+    let w = if w0 > 2 {
+        w0
+    } else {
+        match move_to_high_fd(w0, 3, cloexec) {
+            Ok(fd) => fd,
+            Err(e) => {
+                unsafe {
+                    libc::close(r);
+                    libc::close(w0);
+                }
+                return Err(e);
+            }
+        }
+    };
+    Ok((r, w))
+}
+
 #[cfg(test)]
 mod tests;

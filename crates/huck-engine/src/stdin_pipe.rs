@@ -35,7 +35,7 @@ pub fn with_stdin_fd0<R>(
     shell_cell: &Rc<RefCell<Shell>>,
     f: impl FnOnce() -> R,
 ) -> R {
-    let (r, w) = match make_pipe() {
+    let (r, w) = match crate::child_fd::make_pipe(true) {
         Ok(pair) => pair,
         Err(e) => {
             // Hard-fail before any state change.
@@ -122,28 +122,6 @@ pub fn with_stdin_fd0<R>(
         let _ = handle.join();
         result
     }
-}
-
-fn make_pipe() -> io::Result<(RawFd, RawFd)> {
-    let mut fds = [0; 2];
-    // `pipe2(O_CLOEXEC)` is Linux-only; macOS/BSD have no `pipe2`, so create the
-    // pipe and set close-on-exec on both ends with `fcntl` (the standard portable
-    // fallback — a negligible race window versus a concurrent fork+exec).
-    #[cfg(target_os = "linux")]
-    let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    #[cfg(not(target_os = "linux"))]
-    let ret = unsafe {
-        let r = libc::pipe(fds.as_mut_ptr());
-        if r == 0 {
-            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        r
-    };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((fds[0], fds[1]))
 }
 
 #[cfg(test)]

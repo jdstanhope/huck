@@ -4,8 +4,9 @@
 # background matrix, restricted to behavior huck ALREADY matches bash on, so it is
 # green today and its job is to catch REGRESSIONS as Phases 1-5 rework the fd
 # machinery. #128 (no-hangup) and #129 (bg stdin) cases are added by their tasks.
-# Deliberately excluded until their fixing phase: stage redirect source-order (#50)
-# and the in-process whole-command redirect on a freed std fd (#135, Phase 3).
+# Deliberately excluded until their fixing phase: stage redirect source-order (#50).
+# (#135 — in-process whole-command redirect on a freed std fd — was fixed in v291
+# Phase 2; its cases are asserted below.)
 set -u
 HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
 [[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
@@ -82,6 +83,17 @@ p129() {
 }
 p129 "#129 single-stage & -> /dev/null" 'readlink /proc/self/fd/0 > "'"$WORK"'/fd0.out" &'
 p129 "#129 multi-stage a|b & -> inherit" 'readlink /proc/self/fd/0 | cat > "'"$WORK"'/fd0.out" &'
+
+# --- #135: in-process whole-command redirect on a freed std fd (v291 Phase 2 fix) ---
+check "135 brace group freed fd0"  'exec <&-; { /bin/cat; } < inA; echo end'
+check "135 subshell freed fd0"     'exec <&-; ( /bin/cat ) < inA; echo end'
+# fd1 flavor: prove via the FILE (a trailing builtin write to a closed fd1 is #137,
+# a separate open bug — keep this case independent of it).
+check "135 stdout to file freed fd1" 'exec >&-; { /bin/echo hi; } > f; /bin/cat f >&2'
+check "135 heredoc rfd freed fd3"    'exec 3<&-; { /bin/cat <&3; } 3<<EOF
+hh
+EOF
+echo end'
 
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

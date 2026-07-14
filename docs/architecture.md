@@ -42,8 +42,9 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   `huck_engine::StderrSink::{Terminal, Merged, Capture}` is the symmetric
   counterpart of `StdoutSink`, threaded through the executor and the
   builtin-dispatch path; engine-level stdin redirection lives in
-  `crates/huck-engine/src/stdin_pipe.rs` (CLOEXEC pipe + dup2(r, 0) save/restore
-  guard). Sandbox knobs (v206) layer on top: `.cwd(path)` chdirs for the call
+  `crates/huck-engine/src/stdin_pipe.rs` (`child_fd::make_pipe(true)` — a
+  >=3-relocated, CLOEXEC pipe — + dup2(r, 0) save/restore guard). Sandbox knobs
+  (v206) layer on top: `.cwd(path)` chdirs for the call
   (RAII via `cwd_scope.rs`, snapshotting OS cwd + shell `PWD`/`OLDPWD`);
   `.restricted()` enables a bash `rbash`-subset policy (refuses
   `cd`/`exec`/slash-bearing command names/slash-bearing `source` paths/

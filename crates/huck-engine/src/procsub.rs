@@ -51,11 +51,7 @@ fn realize_via_devfd(
     dir: ProcDir,
     shell: &mut Shell,
 ) -> io::Result<(String, ProcSub)> {
-    let mut fds = [0 as RawFd; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let (read_fd, write_fd) = (fds[0], fds[1]);
+    let (read_fd, write_fd) = crate::child_fd::make_pipe(false)?;
 
     // Which end the PARENT keeps (parent_fd), and which end the CHILD owns as its
     // stdio (inner_end). The child owns inner_end via `ChildStdio`; the other
