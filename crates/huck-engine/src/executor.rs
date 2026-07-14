@@ -615,7 +615,7 @@ fn run_command(
             // capture buffer after the child exits.
             let (stdout_fd, capture_read_fd): (RawFd, Option<RawFd>) = match sink {
                 StdoutSink::Terminal => (libc::STDOUT_FILENO, None),
-                StdoutSink::Capture(_) => match make_pipe() {
+                StdoutSink::Capture(_) => match crate::child_fd::make_pipe(false) {
                     Ok((r, w)) => (w, Some(r)),
                     Err(e) => {
                         {
@@ -641,7 +641,7 @@ fn run_command(
             let (stderr_fd, capture_err_read_fd): (RawFd, Option<RawFd>) = match err_sink {
                 StderrSink::Terminal => (libc::STDERR_FILENO, None),
                 StderrSink::Merged => (stdout_fd, None),
-                StderrSink::Capture(_) => match make_pipe() {
+                StderrSink::Capture(_) => match crate::child_fd::make_pipe(false) {
                     Ok((r, w)) => (w, Some(r)),
                     Err(e) => {
                         {
@@ -3176,7 +3176,7 @@ fn run_background_sequence(
             // For a no-op assign stage, stdout is irrelevant but we still need
             // to either pipe or close it for downstream stages.
             let stdout: ChildFd = if !is_last {
-                match make_pipe() {
+                match crate::child_fd::make_pipe(false) {
                     Ok((r, w)) => {
                         prev_pipe_read = Some(r);
                         parent_held.push(r);
@@ -3643,7 +3643,7 @@ fn run_background_sequence(
             }
             cf
         } else if !is_last {
-            match make_pipe() {
+            match crate::child_fd::make_pipe(false) {
                 Ok((r, w)) => {
                     prev_pipe_read = Some(r);
                     parent_held.push(r);
@@ -4218,11 +4218,7 @@ fn resolve(
 /// stages fork without exec). Returns the READ end (→ consumer stdin) and the
 /// writer PID (reap it at the consumer's wait point; ECHILD is fine).
 fn spawn_heredoc_writer(bytes: &[u8]) -> Result<(RawFd, libc::pid_t), io::Error> {
-    let mut fds: [libc::c_int; 2] = [-1, -1];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let (r, w) = (fds[0], fds[1]);
+    let (r, w) = crate::child_fd::make_pipe(false)?;
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let e = io::Error::last_os_error();
@@ -6349,10 +6345,10 @@ fn run_coproc(
             );
         }
     }
-    // make_pipe() returns (read_end, write_end).
+    // `child_fd::make_pipe` returns (read_end, write_end).
     // pipe_in: shell writes in_w -> coproc reads in_r (its stdin).
     // pipe_out: coproc writes out_w (its stdout) -> shell reads out_r.
-    let (in_r, in_w) = match make_pipe() {
+    let (in_r, in_w) = match crate::child_fd::make_pipe(false) {
         Ok(p) => p,
         Err(e) => {
             {
@@ -6368,7 +6364,7 @@ fn run_coproc(
             return ExecOutcome::Continue(1);
         }
     };
-    let (out_r, out_w) = match make_pipe() {
+    let (out_r, out_w) = match crate::child_fd::make_pipe(false) {
         Ok(p) => p,
         Err(e) => {
             unsafe {
@@ -6484,46 +6480,6 @@ fn run_coproc(
     ExecOutcome::Continue(0)
 }
 
-/// Opens a `libc::pipe()` and returns `(read_end, write_end)` as raw fds, both
-/// guaranteed >= 3 so a freed std fd cannot be aliased into a pipeline stage's
-/// std fd (issue #130).
-fn make_pipe() -> io::Result<(RawFd, RawFd)> {
-    let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let (r0, w0) = (fds[0], fds[1]);
-    let r = if r0 > 2 {
-        r0
-    } else {
-        match crate::child_fd::move_to_high_fd(r0, 3, false) {
-            Ok(fd) => fd,
-            Err(e) => {
-                unsafe {
-                    libc::close(r0);
-                    libc::close(w0);
-                }
-                return Err(e);
-            }
-        }
-    };
-    let w = if w0 > 2 {
-        w0
-    } else {
-        match crate::child_fd::move_to_high_fd(w0, 3, false) {
-            Ok(fd) => fd,
-            Err(e) => {
-                unsafe {
-                    libc::close(r);
-                    libc::close(w0);
-                }
-                return Err(e);
-            }
-        }
-    };
-    Ok((r, w))
-}
-
 /// Create an inter-stage pipe for a downstream pipeline reader, where
 /// the upstream stage's stdout is going elsewhere (an explicit file
 /// redirect). Closes the write-end immediately so the downstream reader
@@ -6531,9 +6487,8 @@ fn make_pipe() -> io::Result<(RawFd, RawFd)> {
 /// orphaned write-end. Returns the read-end fd to thread into
 /// `prev_pipe_read`. On `make_pipe` failure, the caller propagates the
 /// error.
-#[allow(dead_code)]
 fn make_orphan_pipe_for_eof_reader() -> io::Result<RawFd> {
-    let (r, w) = make_pipe()?;
+    let (r, w) = crate::child_fd::make_pipe(false)?;
     unsafe {
         libc::close(w);
     }
@@ -6606,7 +6561,7 @@ fn run_multi_stage(
     // 2>&1 ordering. For Terminal stderr inherits as before.
     let (capture_err_pipe_write_fd, mut capture_err_read_fd): (Option<RawFd>, Option<RawFd>) =
         if matches!(err_sink, StderrSink::Capture(_)) {
-            match make_pipe() {
+            match crate::child_fd::make_pipe(false) {
                 Ok((r, w)) => {
                     parent_held.push(r);
                     parent_held.push(w);
@@ -6671,7 +6626,7 @@ fn run_multi_stage(
             };
             let stdout_child: ChildFd = if !is_last {
                 // Create a pipe; next stage reads from it (will be empty).
-                match make_pipe() {
+                match crate::child_fd::make_pipe(false) {
                     Ok((r, w)) => {
                         prev_pipe_read = Some(r);
                         parent_held.push(r);
@@ -6694,7 +6649,7 @@ fn run_multi_stage(
                 }
             } else {
                 match sink {
-                    StdoutSink::Capture(_) => match make_pipe() {
+                    StdoutSink::Capture(_) => match crate::child_fd::make_pipe(false) {
                         Ok((r, w)) => {
                             capture_read_fd = Some(r);
                             parent_held.push(r);
@@ -7035,7 +6990,7 @@ fn run_multi_stage(
             cf
         } else if !is_last {
             // Create the inter-stage pipe.
-            match make_pipe() {
+            match crate::child_fd::make_pipe(false) {
                 Ok((r, w)) => {
                     prev_pipe_read = Some(r);
                     parent_held.push(r);
@@ -7060,7 +7015,7 @@ fn run_multi_stage(
             }
         } else {
             match sink {
-                StdoutSink::Capture(_) => match make_pipe() {
+                StdoutSink::Capture(_) => match crate::child_fd::make_pipe(false) {
                     Ok((r, w)) => {
                         capture_read_fd = Some(r);
                         parent_held.push(r);

@@ -138,3 +138,47 @@ fn move_to_high_fd_err_on_bad_src_leaves_state_sane() {
     }
     assert!(move_to_high_fd(bad, 10, false).is_err());
 }
+
+#[test]
+fn make_pipe_non_cloexec_ends_are_high_and_roundtrip() {
+    let (r, w) = make_pipe(false).unwrap();
+    assert!(r >= 3 && w >= 3);
+    assert_eq!(
+        unsafe { libc::fcntl(r, libc::F_GETFD) } & libc::FD_CLOEXEC,
+        0
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(w, libc::F_GETFD) } & libc::FD_CLOEXEC,
+        0
+    );
+    let msg = b"hi\n";
+    assert_eq!(unsafe { libc::write(w, msg.as_ptr().cast(), msg.len()) }, 3);
+    let mut buf = [0u8; 8];
+    assert_eq!(
+        unsafe { libc::read(r, buf.as_mut_ptr().cast(), buf.len()) },
+        3
+    );
+    assert_eq!(&buf[..3], msg);
+    unsafe {
+        libc::close(r);
+        libc::close(w);
+    }
+}
+
+#[test]
+fn make_pipe_cloexec_sets_flag_on_both_ends() {
+    let (r, w) = make_pipe(true).unwrap();
+    assert!(r >= 3 && w >= 3);
+    assert_eq!(
+        unsafe { libc::fcntl(r, libc::F_GETFD) } & libc::FD_CLOEXEC,
+        libc::FD_CLOEXEC
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(w, libc::F_GETFD) } & libc::FD_CLOEXEC,
+        libc::FD_CLOEXEC
+    );
+    unsafe {
+        libc::close(r);
+        libc::close(w);
+    }
+}
