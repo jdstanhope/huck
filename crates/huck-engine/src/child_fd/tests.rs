@@ -115,11 +115,20 @@ fn dup_to_high_fd_keeps_src_open_and_honors_cloexec() {
 
 #[test]
 fn move_to_high_fd_closes_src() {
+    // Park the source at a private HIGH number (>=700) first. move_to_high_fd
+    // closes it, and we then probe that it's closed. A low source number would
+    // race: a concurrent test's open() reuses the lowest free fd the instant we
+    // free it, so the negative F_GETFD probe would spuriously see it "open".
+    // Lowest-free allocation never wanders up to 700, so a high source is safe.
     let f = std::fs::File::open("/dev/null").unwrap();
-    let src = f.into_raw_fd();
+    let low = f.into_raw_fd();
+    let src = unsafe { libc::fcntl(low, libc::F_DUPFD, 700) };
+    assert!(src >= 700, "could not park source at a high fd");
+    unsafe { libc::close(low) };
+
     let hi = move_to_high_fd(src, 10, true).unwrap();
     assert!(hi >= 10);
-    // src is now closed.
+    // src (the high, non-reusable number) is now closed.
     assert_eq!(unsafe { libc::fcntl(src, libc::F_GETFD) }, -1);
     let flags = unsafe { libc::fcntl(hi, libc::F_GETFD) };
     assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
@@ -130,13 +139,12 @@ fn move_to_high_fd_closes_src() {
 
 #[test]
 fn move_to_high_fd_err_on_bad_src_leaves_state_sane() {
-    // A definitely-closed fd -> EBADF; the fn returns Err without panicking.
-    let f = std::fs::File::open("/dev/null").unwrap();
-    let bad = f.into_raw_fd();
-    unsafe {
-        libc::close(bad);
-    }
-    assert!(move_to_high_fd(bad, 10, false).is_err());
+    // -1 is deterministically invalid -> EBADF; the fn returns Err without
+    // panicking. Using a *closed real* fd number here would race: a concurrent
+    // test could reuse that number, the F_DUPFD would succeed, and the close of
+    // the original src would then close the OTHER test's live fd. -1 can never
+    // be a live fd, so there is nothing to race.
+    assert!(move_to_high_fd(-1, 10, false).is_err());
 }
 
 #[test]
