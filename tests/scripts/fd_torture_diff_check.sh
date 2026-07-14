@@ -64,6 +64,14 @@ check "3a order compound 2>&1>f"   '{ echo o; echo e 1>&2; } 2>&1 >f; cat f'
 check "3a order external 2>&1>f"   '/bin/echo hi 2>&1 >f; cat f'
 check "3a fd3 heredoc external"    $'/bin/cat 3<<EOF <&3\nbody\nEOF'
 
+# --- invalid-dup-before-file must NOT truncate (bash left-to-right) ---
+check "3a nodup-trunc inproc"      'echo X > t; { echo hi; } 2>&77 >t; echo rc=$?; cat t'
+check "3a nodup-trunc external"    'echo X > e; /bin/echo hi 2>&77 >e; echo rc=$?; cat e'
+check "3a nodup-trunc exec"        'echo X > t3; ( exec 2>&77 >t3; echo hi ); echo rc=$?; cat t3'
+check "3a file-before-baddup trunc" 'echo X > t2; { echo hi; } >t2 2>&77; echo rc=$?; cat t2'
+check "3a close-then-dup inproc"   '{ echo hi; } 1>&- 2>&1; echo done'
+check "3a same-plan dup external"  'exec 4>&-; /bin/echo hi 3>g 4>&3; cat g'
+
 # --- #128: a non-interactive shell must NOT SIGHUP background jobs at exit ---
 # The child writes a file after a short sleep while the shell exits immediately;
 # bash leaves it running (file appears), huck must match. Poll after exit.

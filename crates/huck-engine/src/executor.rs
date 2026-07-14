@@ -3886,6 +3886,32 @@ fn validate_fd_open(
     Ok(())
 }
 
+/// Validate a dup/move source at LOWER time, honoring earlier same-plan ops.
+/// `fd_state` records fds THIS plan has already opened (`true`) or closed
+/// (`false`); an fd the plan has not touched falls back to the real fd table.
+/// Emits bash's `"{src}: Bad file descriptor"` and returns `Err(1)` when the
+/// source is not open at this point in source order. Running this BEFORE later
+/// file opens in the same list is what prevents an invalid dup from truncating a
+/// file the command never successfully redirects to (bash left-to-right order).
+fn validate_plan_source(
+    src: RawFd,
+    fd_state: &std::collections::HashMap<RawFd, bool>,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> Result<(), i32> {
+    let open = match fd_state.get(&src) {
+        Some(&state) => state,
+        None => (unsafe { libc::fcntl(src, libc::F_GETFD) }) >= 0,
+    };
+    if !open {
+        let mut err = err_writer(err_sink, sink);
+        crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor");
+        return Err(1);
+    }
+    Ok(())
+}
+
 /// Glob-expands one word honoring `shopt` flags. On a `failglob` no-match,
 /// prints the bash-style "no match" error to stderr and returns `Err(())`,
 /// signaling the caller to abort the command/loop with status 1.
@@ -5464,6 +5490,10 @@ fn lower_redirects(
         ops: Vec::new(),
         heredoc_writers: Vec::new(),
     };
+    // Tracks fds THIS plan opens (true) / closes (false), in source order, so a
+    // dup source can be validated at lower time (before later files open) while a
+    // same-plan target (e.g. `3>g 4>&3`) is still recognized as valid.
+    let mut fd_state: std::collections::HashMap<RawFd, bool> = std::collections::HashMap::new();
     // On error: drop opened fds first (close read ends -> writers get EOF/EPIPE),
     // then reap. Hang-free even for >64KB heredoc bodies. Both appliers converge
     // on this cleanup (child path previously leaked the zombie; benign).
@@ -5479,7 +5509,9 @@ fn lower_redirects(
     }
     for redir in redirects {
         if let RedirFd::Var(name) = &redir.fd {
-            if let Err(code) = lower_named_fd(name, redir, shell, sink, err_sink, &mut plan) {
+            if let Err(code) =
+                lower_named_fd(name, redir, shell, sink, err_sink, &mut plan, &mut fd_state)
+            {
                 fail!(code);
             }
             continue;
@@ -5517,6 +5549,7 @@ fn lower_redirects(
                     target,
                     source: owned,
                 });
+                fd_state.insert(target, true);
             }
             RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
                 let is_move = matches!(&redir.op, RedirOp::Move { .. });
@@ -5527,16 +5560,27 @@ fn lower_redirects(
                 // Degenerate `N>&N-` (source == target): bash no-op (redir.c's
                 // `redir_fd != redirector` guard). Contributes nothing.
                 if !(is_move && src == target) {
+                    // Validate the source NOW (before any later file opens) so an invalid
+                    // dup errors without truncating a later `>file`. Same-plan targets are
+                    // recorded open in fd_state, so `3>g 4>&3` still passes.
+                    if let Err(code) = validate_plan_source(src, &fd_state, shell, sink, err_sink) {
+                        fail!(code);
+                    }
                     plan.ops.push(PlanOp::InstallDup {
                         target,
                         source: src,
                     });
+                    fd_state.insert(target, true);
                     if is_move {
                         plan.ops.push(PlanOp::Close { target: src });
+                        fd_state.insert(src, false);
                     }
                 }
             }
-            RedirOp::Close => plan.ops.push(PlanOp::Close { target }),
+            RedirOp::Close => {
+                plan.ops.push(PlanOp::Close { target });
+                fd_state.insert(target, false);
+            }
             RedirOp::Heredoc { body, .. } => {
                 let bytes = expand_assignment(body, shell).into_bytes();
                 match spawn_heredoc_writer(&bytes) {
@@ -5548,6 +5592,7 @@ fn lower_redirects(
                             target,
                             source: owned,
                         });
+                        fd_state.insert(target, true);
                     }
                     Err(e) => {
                         {
@@ -5576,6 +5621,7 @@ fn lower_redirects(
                             target,
                             source: owned,
                         });
+                        fd_state.insert(target, true);
                     }
                     Err(e) => {
                         {
@@ -5609,6 +5655,7 @@ fn lower_named_fd(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
     plan: &mut RedirPlan,
+    fd_state: &mut std::collections::HashMap<RawFd, bool>,
 ) -> Result<(), i32> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     if matches!(&redir.op, RedirOp::Close) {
@@ -5624,6 +5671,7 @@ fn lower_named_fd(
             }
         };
         plan.ops.push(PlanOp::Close { target: fd });
+        fd_state.insert(fd, false);
         return Ok(());
     }
     let is_move = matches!(&redir.op, RedirOp::Move { .. });
@@ -5706,6 +5754,11 @@ fn lower_named_fd(
         }
         RedirOp::Close => unreachable!("Close handled above"),
     }
+    // Validate a Dup/Move source at lower time. No owned file has been opened
+    // for a Dup/Move (`owned_src` is None), so an error here truncates nothing.
+    if let Some(s) = dup_src {
+        validate_plan_source(s, fd_state, shell, sink, err_sink)?;
+    }
     let raw_src: RawFd = match (&owned_src, dup_src) {
         (Some(o), _) => o.as_raw_fd(),
         (None, Some(s)) => s,
@@ -5734,11 +5787,13 @@ fn lower_named_fd(
         high: unsafe { OwnedFd::from_raw_fd(high) },
         name: name.to_string(),
     });
+    fd_state.insert(high, true);
     if is_move {
         // Move: close the original source (a shell fd) after the dup. Only a
         // Dup/Move source reaches here (owned sources aren't moves).
         if let Some(s) = dup_src {
             plan.ops.push(PlanOp::Close { target: s });
+            fd_state.insert(s, false);
         }
     }
     Ok(())
