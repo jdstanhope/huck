@@ -3562,6 +3562,7 @@ fn run_background_sequence(
                 child_stdio,
                 pgid_target,
                 &fds_to_close_in_child,
+                None,
             ),
             StageKind::InProcess(cmd) => fork_and_run_in_subshell(
                 cmd,
@@ -6736,6 +6737,13 @@ fn run_multi_stage(
             }
         };
 
+        // Classify the stage up front: the stdio-base construction differs for
+        // External (pipe/capture-only base + a full ChildRedirPlan replayed in the
+        // child) vs InProcess (existing slot-base; its body applies redirects). A
+        // Simple(Exec) stage can be EITHER kind (external program vs builtin), so we
+        // must key the base on the classification, not on Simple-vs-Compound.
+        let stage_is_external = matches!(classify_stage(stage_cmd, shell), StageKind::External(_));
+
         // ---- Build stdin fd --------------------------------------------------
         // Priority: explicit redirect on ExecCommand > prev_pipe_read > STDIN_FILENO.
         // For InProcess compound stages, there are no explicit redirects at the
@@ -6746,7 +6754,9 @@ fn run_multi_stage(
         // $var references see the stage's own inline assignments — v24 deferred-
         // heredoc contract), handed to `spawn_heredoc_writer`, and the read end
         // becomes this stage's stdin. The parent never holds the pipe write end.
-        let stdin: ChildFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+        let stdin: ChildFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd
+            && !stage_is_external
+        {
             match &exec.slot_stdin() {
                 Some(RedirectSlot::Read(word)) => {
                     // Discard the previous stage's pipe read-end: this stage
@@ -6874,116 +6884,156 @@ fn run_multi_stage(
         };
 
         // ---- Determine stdout redirect (from ExecCommand if Simple) ----------
-        let explicit_stdout: Option<ChildFd> =
-            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.slot_stdout() {
-                    Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                            }
-                        };
-                        let guard =
-                            shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                        match open_redirect_file(
-                            &FileMode::Truncate,
-                            &path,
-                            guard,
-                            FdPlacement::Relocated,
-                        ) {
-                            Ok(f) => Some(ChildFd::from(f)),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                            }
+        let explicit_stdout: Option<ChildFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
+            stage_cmd
+            && !stage_is_external
+        {
+            match &exec.slot_stdout() {
+                Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    };
+                    let guard =
+                        shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
+                    match open_redirect_file(
+                        &FileMode::Truncate,
+                        &path,
+                        guard,
+                        FdPlacement::Relocated,
+                    ) {
+                        Ok(f) => Some(ChildFd::from(f)),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     }
-                    Some(RedirectSlot::Append(w)) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                            }
-                        };
-                        match open_redirect_file(
-                            &FileMode::Append,
-                            &path,
-                            false,
-                            FdPlacement::Relocated,
-                        ) {
-                            Ok(f) => Some(ChildFd::from(f)),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                            }
-                        }
-                    }
-                    _ => None,
                 }
-            } else {
-                None
-            };
+                Some(RedirectSlot::Append(w)) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    };
+                    match open_redirect_file(
+                        &FileMode::Append,
+                        &path,
+                        false,
+                        FdPlacement::Relocated,
+                    ) {
+                        Ok(f) => Some(ChildFd::from(f)),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         // ---- Determine stderr redirect (from ExecCommand if Simple) ----------
-        let explicit_stderr: Option<ChildFd> =
+        let explicit_stderr: Option<ChildFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
+            stage_cmd
+            && !stage_is_external
+        {
+            match &exec.slot_stderr() {
+                Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    };
+                    let guard =
+                        shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
+                    match open_redirect_file(
+                        &FileMode::Truncate,
+                        &path,
+                        guard,
+                        FdPlacement::Relocated,
+                    ) {
+                        Ok(f) => Some(ChildFd::from(f)),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    }
+                }
+                Some(RedirectSlot::Append(w)) => {
+                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    };
+                    match open_redirect_file(
+                        &FileMode::Append,
+                        &path,
+                        false,
+                        FdPlacement::Relocated,
+                    ) {
+                        Ok(f) => Some(ChildFd::from(f)),
+                        Err(e) => {
+                            redir_open_error(shell, err_sink, sink, &path, &e);
+                            restore_inline_assignments(snap, shell);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // For an EXTERNAL stage, lower the FULL ordered redirect list once (v292
+        // machinery) and replay it in the child over the pipe/capture base. #69: set
+        // current_lineno so a stage redirect-open error carries `line N:` like a
+        // single command; the plan's opens route through redir_open_error.
+        //
+        // This MUST run BEFORE the inter-stage pipe / capture write end is created
+        // below: `build_child_redir_plan` forks heredoc/here-string writer
+        // processes (spawn_heredoc_writer), which inherit every fd the parent holds
+        // at fork time. If the inter-stage pipe write end already existed, a writer
+        // would keep it open and the downstream stage would never see EOF (hang).
+        // The existing slot-heredoc path forks its writer during stdin construction
+        // for the same reason.
+        let external_plan: Option<ChildRedirPlan> = if stage_is_external {
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.slot_stderr() {
-                    Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                            }
-                        };
-                        let guard =
-                            shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                        match open_redirect_file(
-                            &FileMode::Truncate,
-                            &path,
-                            guard,
-                            FdPlacement::Relocated,
-                        ) {
-                            Ok(f) => Some(ChildFd::from(f)),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                            }
-                        }
+                // #69: stamp the stage's line so a redirect-open error carries
+                // `line N:` (mirrors the single-command path at executor.rs:4550).
+                if exec.line != 0 {
+                    shell.current_lineno = exec.line;
+                }
+                match build_child_redir_plan(&exec.redirects, shell, sink, err_sink) {
+                    Ok(mut p) => {
+                        heredoc_writers.append(&mut p.heredoc_writers);
+                        Some(p)
                     }
-                    Some(RedirectSlot::Append(w)) => {
-                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                            Ok(p) => p,
-                            Err(()) => {
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                            }
-                        };
-                        match open_redirect_file(
-                            &FileMode::Append,
-                            &path,
-                            false,
-                            FdPlacement::Relocated,
-                        ) {
-                            Ok(f) => Some(ChildFd::from(f)),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                restore_inline_assignments(snap, shell);
-                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
-                            }
-                        }
+                    Err(_) => {
+                        restore_inline_assignments(snap, shell);
+                        return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                     }
-                    _ => None,
                 }
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         // ---- Build stdout fd -------------------------------------------------
         // Priority: explicit redirect > inter-stage pipe > Capture sink pipe > STDOUT_FILENO.
@@ -7240,6 +7290,7 @@ fn run_multi_stage(
                 child_stdio,
                 pgid_target,
                 &fds_to_close_in_child,
+                external_plan,
             ),
             StageKind::InProcess(cmd) => fork_and_run_in_subshell(
                 cmd,
@@ -8358,6 +8409,7 @@ fn spawn_external_with_fds(
     stdio: ChildStdio,
     pgid_target: i32,
     parent_fds_to_close: &[RawFd],
+    plan: Option<ChildRedirPlan>,
 ) -> Result<i32, io::Error> {
     // Flush pending parent stdout before spawning an external stage so its output
     // does not race ahead of buffered parent bytes (M-118 sibling: ordering).
@@ -8385,23 +8437,46 @@ fn spawn_external_with_fds(
         ));
     }
 
-    // Resolve Dup targets pre-fork (Word expansion may allocate; not async-signal-safe).
-    // stdout-dup BEFORE stderr-dup matches canonical `>file 2>&1` semantics.
-    let stdout_dup_target: Option<i32> = match &exec.slot_stdout() {
-        Some(RedirectSlot::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
-        _ => None,
-    };
-    let stderr_dup_target: Option<i32> = match &exec.slot_stderr() {
-        Some(RedirectSlot::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
-        _ => None,
-    };
+    // Unify: `replay_ops` are replayed in the child pre_exec (source order),
+    // `held` keeps parent-opened files alive until after spawn, `extra_targets`
+    // (derived below) are fds a replay op installs (must be excluded from the
+    // close list).
+    let stdout_dup_target: Option<i32>;
+    let stderr_dup_target: Option<i32>;
+    let replay_ops: Vec<ChildRedirOp>;
+    let held: Vec<std::os::fd::OwnedFd>;
+    if let Some(p) = plan {
+        // NEW full-plan path (foreground external stages): the whole ordered
+        // redirect list is in the plan; no slot dup-targets, no extra_ops.
+        stdout_dup_target = None;
+        stderr_dup_target = None;
+        replay_ops = p.ops;
+        held = p.held;
+        // p.heredoc_writers was taken by the caller.
+    } else {
+        // LEGACY slot path (background stages, until v294): slot dup-targets +
+        // build_child_extra_ops for fd>2/dup-in/close/<>.
+        // Resolve Dup targets pre-fork (Word expansion may allocate; not
+        // async-signal-safe). stdout-dup BEFORE stderr-dup matches canonical
+        // `>file 2>&1` semantics.
+        stdout_dup_target = match &exec.slot_stdout() {
+            Some(RedirectSlot::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
+            _ => None,
+        };
+        stderr_dup_target = match &exec.slot_stderr() {
+            Some(RedirectSlot::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
+            _ => None,
+        };
 
-    // v156 task 4 (additive): lower the redirects the 0/1/2 bridge does NOT
-    // consume (fd>2, `<&` dup-in, `N>&-` close, `<>`) into an ordered replay
-    // applied in the child AFTER the bridge stdio/dup. `extra_held` keeps the
-    // parent-opened files alive (FD_CLOEXEC) until after spawn.
-    let (extra_ops, extra_held) = build_child_extra_ops(&exec.redirects, shell, sink, err_sink)
-        .map_err(|code| io::Error::other(format!("redirect failed with code {code}")))?;
+        // v156 task 4 (additive): lower the redirects the 0/1/2 bridge does NOT
+        // consume (fd>2, `<&` dup-in, `N>&-` close, `<>`) into an ordered replay
+        // applied in the child AFTER the bridge stdio/dup. `held` keeps the
+        // parent-opened files alive (FD_CLOEXEC) until after spawn.
+        let (extra_ops, extra_held) = build_child_extra_ops(&exec.redirects, shell, sink, err_sink)
+            .map_err(|code| io::Error::other(format!("redirect failed with code {code}")))?;
+        replay_ops = extra_ops;
+        held = extra_held;
+    }
 
     let mut process = ProcessCommand::new(&resolved.program);
     process.args(&resolved.args);
@@ -8435,10 +8510,10 @@ fn spawn_external_with_fds(
         }
     }
 
-    // Collect the target fds that extra_ops will set up in the child, so we
+    // Collect the target fds that replay_ops will set up in the child, so we
     // can exclude them from fds_to_close below (Fix B: a dup2 then close on
     // the same fd would silently defeat the redirect).
-    let extra_targets: Vec<RawFd> = extra_ops
+    let extra_targets: Vec<RawFd> = replay_ops
         .iter()
         .map(|op| match *op {
             ChildRedirOp::Dup { target, .. } | ChildRedirOp::Close { target } => target,
@@ -8448,8 +8523,8 @@ fn spawn_external_with_fds(
     // Replay the extra (fd>2 / dup-in / close / ReadWrite) ops in source order,
     // AFTER the bridge stdio + dup-target pre_execs above. Pure dup2/close, so
     // async-signal-safe. Runs even when the bridge dup pre_exec is absent.
-    if !extra_ops.is_empty() {
-        let ops = extra_ops;
+    if !replay_ops.is_empty() {
+        let ops = replay_ops;
         unsafe {
             process.pre_exec(move || replay_redir_ops(&ops));
         }
@@ -8503,7 +8578,7 @@ fn spawn_external_with_fds(
 
     // In the child's pre_exec, close every parent-held pipe fd that this
     // child shouldn't inherit (so downstream readers see EOF).
-    // Exclude any fd that extra_ops already claimed as a redirect target: a
+    // Exclude any fd that replay_ops already claimed as a redirect target: a
     // dup2 into that fd followed by close(fd) would silently defeat the redirect.
     // The closure must be async-signal-safe; libc::close is.
     let fds_to_close: Vec<RawFd> = parent_fds_to_close
@@ -8523,7 +8598,7 @@ fn spawn_external_with_fds(
     let spawn_result = process.spawn();
     // The child inherited the parent-opened extra-redirect fds (FD_CLOEXEC).
     // Drop the parent's copies now so they don't leak.
-    drop(extra_held);
+    drop(held);
     let child = spawn_result?;
     let pid = child.id() as i32;
 

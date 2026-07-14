@@ -77,6 +77,20 @@ check "b nf use later 2>&\$v"  '{ echo err 1>&2; } {v}>f 2>&$v; cat f'
 check "b nf persist on fail"   '{ true; } {v}>g 2>&9; echo "v=${v-unset}"'
 check "b nf num mixed list"    '{ true; } 3>a {v}>x; echo "v=$v"'
 
+# --- v293: foreground external pipeline-stage redirect ordering (#50) ---
+check "p ext 2>&1 >f"   '/bin/sh -c "echo O; echo E >&2" 2>&1 >pf | cat; echo --; cat pf; rm -f pf'
+check "p ext >f 2>&1"   '/bin/sh -c "echo O; echo E >&2" >pf 2>&1 | cat; echo --; cat pf; rm -f pf'
+# fd>2 heredoc feeding a stage's stdin via <&3: the source-order lowering sets
+# up fd 3 from the heredoc FIRST, then <&3 dups it onto stdin. The last-wins
+# RedirectSlot path dropped the fd 3 heredoc (0/1/2 only) and hung on <&3; the
+# full ChildRedirPlan replays both in order. (The reversed order `<&3 3<<HD` is
+# a deliberate bad-fd error in bash; huck matches the message, but a stage
+# redirect failure aborts the whole pipeline here vs bash running the last
+# stage — a pre-existing, orthogonal divergence unrelated to #50, so not asserted.)
+check "p ext fd3 heredoc" '/bin/cat 3<<HD <&3 | cat
+BODY
+HD'
+
 # --- #128: a non-interactive shell must NOT SIGHUP background jobs at exit ---
 # The child writes a file after a short sleep while the shell exits immediately;
 # bash leaves it running (file appears), huck must match. Poll after exit.
