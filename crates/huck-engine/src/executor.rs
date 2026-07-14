@@ -933,13 +933,14 @@ fn run_command(
 /// `dup2`, and restores each on Drop. `saved` holds `(target_fd, saved_dup_fd)`
 /// pairs; restoration runs in reverse to undo overlapping swaps cleanly.
 ///
-/// v156: generalized into the ordered in-process redirect applier. `apply_plan`
-/// walks a lowered `RedirPlan` (`lower_redirects` output) over the real fds
-/// (open/dup2/close), honoring source order so e.g. `2>&1 >file` differs from
-/// `>file 2>&1`. A failure mid-list returns `Err(outcome)`; Drop then rolls back
-/// the entries already applied (atomic). Heredoc/here-string writer pids spawned
-/// during lowering are tracked in `heredoc_writers` and reaped by
-/// `reap_heredoc_writers` after the body has run.
+/// v156: generalized into the ordered in-process redirect applier. `apply_redirects`
+/// resolves each redirection with `lower_one_redirect` and applies its ops to the
+/// real fds (open/dup2/close) INTERLEAVED in source order, so e.g. `2>&1 >file`
+/// differs from `>file 2>&1` and a `{var}`'s side effects (assign `$v`, allocate a
+/// persistent fd) are visible to the next redirection. A failure mid-list returns
+/// `Err(outcome)`; Drop then rolls back the entries already applied (atomic).
+/// Heredoc/here-string writer pids spawned during resolution are tracked in
+/// `heredoc_writers` and reaped by `reap_heredoc_writers` after the body has run.
 struct RedirectScope {
     saved: Vec<(RawFd, RawFd)>,
     heredoc_writers: Vec<libc::pid_t>,
@@ -5210,11 +5211,12 @@ fn apply_redirects_permanently(
 ) -> Result<(), ()> {
     let mut scope = RedirectScope::new();
 
-    // Lower the redirections once, then apply the resulting plan in source
-    // order via the ordered RedirectScope applier. `lower_redirects` handles
-    // numeric fds, dup, close, heredoc, and `{var}` uniformly. On failure,
-    // `scope` Drop rolls back any already-applied redirects atomically
-    // (temporary semantics) and we return Err(()) to the caller.
+    // Resolve-then-apply each redirection INTERLEAVED in source order via the
+    // ordered RedirectScope applier (`apply_redirects` → `lower_one_redirect` +
+    // `apply_one`). Handles numeric fds, dup, close, heredoc, and `{var}`
+    // uniformly. On failure, `scope` Drop rolls back any already-applied
+    // redirects atomically (temporary semantics) and we return Err(()) to the
+    // caller.
     if scope
         .apply_redirects(&cmd.redirects, shell, sink, err_sink)
         .is_err()
@@ -5412,10 +5414,11 @@ unsafe fn replay_redir_ops(ops: &[ChildRedirOp]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The neutral result of lowering an ordered redirect list: what fds the
-/// command will see, resolved but not yet installed. Consumed by exactly two
-/// appliers — `redir_plan_to_child` (child dup2/close replay) and
-/// `RedirectScope::apply_plan` (in-process save/restore). Ownership of every
+/// The neutral result of BATCH-lowering an ordered redirect list (`lower_redirects`):
+/// what fds the command will see, resolved but not yet installed. Consumed by the
+/// child path only — `redir_plan_to_child` (child dup2/close replay). The in-process
+/// path does not build a `RedirPlan`; it interleaves `lower_one_redirect` +
+/// `RedirectScope::apply_one` per redirect (see `apply_redirects`). Ownership of every
 /// parent-opened temp (files, heredoc read ends, `{var}` high fds) lives INSIDE
 /// the ops, so a lowering error drops them (no leak; P1 discipline).
 struct RedirPlan {
@@ -5435,8 +5438,9 @@ enum PlanOp {
         source: std::os::fd::OwnedFd,
     },
     /// A borrowed shell fd (`>&w` / `<&w`, and the dup half of a move). `source`
-    /// is a resolved fd NUMBER. In-process: validate open, then dup2 + save/restore.
-    /// Child: dup2 (no validation — the fd is inherited).
+    /// is a resolved fd NUMBER. In-process: dup2 + save/restore (the source was
+    /// already validated open by `lower_one_redirect` against the real fds). Child:
+    /// dup2 (no validation — the fd is inherited).
     InstallDup { target: RawFd, source: RawFd },
     /// `N>&-`, and the source-close half of a move (`>&w-`).
     Close { target: RawFd },
@@ -5447,7 +5451,7 @@ enum PlanOp {
     /// do NOT assign `$name` (bash doesn't for an external command).
     NamedFd {
         high: std::os::fd::OwnedFd,
-        // Read by the in-process applier (`RedirectScope::apply_plan`) to assign
+        // Read by the in-process applier (`RedirectScope::apply_one`) to assign
         // `$name`; the child path (`redir_plan_to_child`) intentionally ignores it
         // (bash does not assign `$var` for an external command).
         name: String,
