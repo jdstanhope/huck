@@ -1080,9 +1080,10 @@ impl RedirectScope {
         Ok(())
     }
 
-    /// Reap any forked heredoc/here-string writers spawned during `apply`.
-    /// Call after the body has run (its consumer has drained + closed the read
-    /// end, so the writer has finished). ECHILD or any error is fine.
+    /// Reap any forked heredoc/here-string writers spawned during redirect
+    /// resolution (`lower_one_redirect`). Call after the body has run (its
+    /// consumer has drained + closed the read end, so the writer has finished).
+    /// ECHILD or any error is fine.
     fn reap_heredoc_writers(&mut self) {
         for pid in self.heredoc_writers.drain(..) {
             let mut st = 0;
@@ -5492,8 +5493,7 @@ fn relocate_high_cloexec(fd: RawFd) -> RawFd {
 /// dup sources against the plan simulation) and the in-process interleaved
 /// applier (`fd_state: None`, validating dup sources against the real fd
 /// table since earlier redirects are already applied). Does not reap/close on
-/// error — the caller does that. Mirrors the old `lower_redirects` per-item
-/// match + `lower_named_fd` exactly.
+/// error — the caller does that.
 fn lower_one_redirect(
     redir: &Redirection,
     shell: &mut Shell,
