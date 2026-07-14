@@ -933,13 +933,13 @@ fn run_command(
 /// `dup2`, and restores each on Drop. `saved` holds `(target_fd, saved_dup_fd)`
 /// pairs; restoration runs in reverse to undo overlapping swaps cleanly.
 ///
-/// v156: generalized into the ordered in-process redirect applier. `apply`
-/// walks one `Redirection` at a time over the real fds (open/dup2/close),
-/// honoring source order so e.g. `2>&1 >file` differs from `>file 2>&1`. A
-/// failure mid-list returns `Err(outcome)`; Drop then rolls back the entries
-/// already applied (atomic). Heredoc/here-string writer pids spawned during
-/// `apply` are tracked in `heredoc_writers` and reaped by `reap_heredoc_writers`
-/// after the body has run.
+/// v156: generalized into the ordered in-process redirect applier. `apply_plan`
+/// walks a lowered `RedirPlan` (`lower_redirects` output) over the real fds
+/// (open/dup2/close), honoring source order so e.g. `2>&1 >file` differs from
+/// `>file 2>&1`. A failure mid-list returns `Err(outcome)`; Drop then rolls back
+/// the entries already applied (atomic). Heredoc/here-string writer pids spawned
+/// during lowering are tracked in `heredoc_writers` and reaped by
+/// `reap_heredoc_writers` after the body has run.
 struct RedirectScope {
     saved: Vec<(RawFd, RawFd)>,
     heredoc_writers: Vec<libc::pid_t>,
@@ -1003,333 +1003,62 @@ impl RedirectScope {
         }
     }
 
-    /// Apply one redirection to the real fds, saving the prior target for
-    /// restore. Returns `Err(outcome)` on failure (diagnostic already printed).
-    fn apply(
+    /// Apply a lowered `RedirPlan` to the real fds in source order, save/restore
+    /// aware (Drop rolls back). Replaces the old per-`Redirection` `apply`.
+    fn apply_plan(
         &mut self,
-        redir: &Redirection,
+        plan: RedirPlan,
         shell: &mut Shell,
         sink: &mut StdoutSink,
         err_sink: &mut StderrSink,
     ) -> Result<(), ExecOutcome> {
-        use std::os::unix::io::IntoRawFd;
-        if let RedirFd::Var(name) = &redir.fd {
-            return self.apply_var(name, redir, shell, sink, err_sink);
-        }
-        let Some(target) = redir.target_fd() else {
-            // RedirFd::Var is handled above; any other None is unexpected.
-            {
-                let mut err = err_writer(err_sink, sink);
-                crate::sh_error_to!(shell, &mut *err, None, "ambiguous redirect");
-            }
-            return Err(ExecOutcome::Continue(1));
-        };
-        let target = target as RawFd;
-        match &redir.op {
-            RedirOp::File { mode, target: word } => {
-                let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
-                    Ok(p) => p,
-                    Err(()) => return Err(ExecOutcome::Continue(1)),
-                };
-                if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
-                    return Err(ExecOutcome::Continue(1));
-                }
-                let new_fd: RawFd = match open_redirect_file(
-                    mode,
-                    &path,
-                    shell.shell_options.noclobber,
-                    FdPlacement::Relocated,
-                ) {
-                    Ok(owned) => owned.into_raw_fd(),
-                    Err(e) => {
-                        redir_open_error(shell, err_sink, sink, &path, &e);
-                        return Err(ExecOutcome::Continue(1));
-                    }
-                };
-                if new_fd == target {
-                    // The relocated file landed directly on `target` (only
-                    // possible for target >= 10 with 10..target busy). Leave it
-                    // in place and record a "was-closed" restore (-1). It is
-                    // CLOEXEC'd (from open_redirect_file), and a no-op dup2 would
-                    // NOT clear that — so clear FD_CLOEXEC in place, exactly as
-                    // replay_redir_ops' source==target arm does, or it vanishes
-                    // on a later exec (this is the #135 mechanism generalized).
-                    unsafe {
-                        let flags = libc::fcntl(target, libc::F_GETFD);
-                        if flags >= 0 {
-                            let _ = libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        self.heredoc_writers.extend(plan.heredoc_writers);
+        for op in plan.ops {
+            match op {
+                PlanOp::InstallOwned { target, source } => {
+                    let raw = source.as_raw_fd();
+                    if raw == target {
+                        // #135: a relocated file landed on its own target (target
+                        // >= 10). Keep it, clear FD_CLOEXEC in place (a no-op dup2
+                        // would NOT), record a was-closed restore. Persist by
+                        // taking it out of the OwnedFd so Drop doesn't close it.
+                        let fd = source.into_raw_fd();
+                        unsafe {
+                            let flags = libc::fcntl(fd, libc::F_GETFD);
+                            if flags >= 0 {
+                                let _ = libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                            }
                         }
+                        self.saved.push((target, -1));
+                    } else if self.redirect(shell, raw, target, sink, err_sink).is_err() {
+                        // `source` drops here (closes the temp) on the error path.
+                        return Err(ExecOutcome::Continue(1));
+                    } else {
+                        // dup2 succeeded; close the temp now (matches the old
+                        // close-after-dup2 so a later {var}/open reuses its number).
+                        drop(source);
                     }
-                    self.saved.push((target, -1));
-                } else {
-                    // Normal case: save the prior target state (or -1 if it was
-                    // closed), dup2 the opened file onto the target (which clears
-                    // FD_CLOEXEC on target), then close the temp fd.
+                }
+                PlanOp::InstallDup { target, source } => {
+                    validate_fd_open(source, shell, sink, err_sink)
+                        .map_err(|()| ExecOutcome::Continue(1))?;
                     if self
-                        .redirect(shell, new_fd, target, sink, err_sink)
+                        .redirect(shell, source, target, sink, err_sink)
                         .is_err()
                     {
-                        unsafe { libc::close(new_fd) };
-                        return Err(ExecOutcome::Continue(1));
-                    }
-                    unsafe { libc::close(new_fd) };
-                }
-                Ok(())
-            }
-            RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
-                // `>&w` / `<&w` (dup), and `>&w-` / `<&w-` (move = dup then close
-                // the source). Resolved AFTER earlier swaps so e.g. `>file 2>&1`
-                // makes stderr follow the already-redirected stdout.
-                let is_move = matches!(&redir.op, RedirOp::Move { .. });
-                let src = resolve_dup_source(source, shell, sink, err_sink)
-                    .map_err(|()| ExecOutcome::Continue(1))?;
-                // bash (redir.c do_redirection_internal): a degenerate move
-                // `N>&N-` (source == target) is guarded by `redir_fd != redirector`
-                // — a pure no-op with no fd validation, dup2, or close.
-                if is_move && src == target {
-                    return Ok(());
-                }
-                // Validate the source fd is open before dup2 (bash: bad fd error).
-                validate_fd_open(src, shell, sink, err_sink)
-                    .map_err(|()| ExecOutcome::Continue(1))?;
-                if self.redirect(shell, src, target, sink, err_sink).is_err() {
-                    return Err(ExecOutcome::Continue(1));
-                }
-                if is_move {
-                    // The "move": close the source fd (save/restore via
-                    // close_target so a command-scoped move restores it; `exec`
-                    // persists).
-                    self.close_target(src);
-                }
-                Ok(())
-            }
-            RedirOp::Close => {
-                self.close_target(target);
-                Ok(())
-            }
-            RedirOp::Heredoc { body, .. } => {
-                // The lexer stores a `<<'EOF'` (non-expanding) body as a single
-                // literal Word, so `expand_assignment` is a no-op there; an
-                // expanding `<<EOF` body undergoes parameter/command expansion.
-                // Mirrors the pre-v156 with_redirect_scope stdin block.
-                let bytes = expand_assignment(body, shell).into_bytes();
-                match spawn_heredoc_writer(&bytes) {
-                    Ok((rfd, pid)) => {
-                        self.heredoc_writers.push(pid);
-                        let rfd = relocate_high_cloexec(rfd);
-                        if self.redirect(shell, rfd, target, sink, err_sink).is_err() {
-                            unsafe { libc::close(rfd) };
-                            return Err(ExecOutcome::Continue(1));
-                        }
-                        unsafe { libc::close(rfd) };
-                        Ok(())
-                    }
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "heredoc: {}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        Err(ExecOutcome::Continue(1))
-                    }
-                }
-            }
-            RedirOp::HereString(w) => {
-                let mut bytes = expand_assignment(w, shell).into_bytes();
-                bytes.push(b'\n');
-                match spawn_heredoc_writer(&bytes) {
-                    Ok((rfd, pid)) => {
-                        self.heredoc_writers.push(pid);
-                        let rfd = relocate_high_cloexec(rfd);
-                        if self.redirect(shell, rfd, target, sink, err_sink).is_err() {
-                            unsafe { libc::close(rfd) };
-                            return Err(ExecOutcome::Continue(1));
-                        }
-                        unsafe { libc::close(rfd) };
-                        Ok(())
-                    }
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "heredoc: {}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        Err(ExecOutcome::Continue(1))
-                    }
-                }
-            }
-        }
-    }
-
-    /// Apply a `{var}` named-fd redirection in-process. Allocates a free fd >= 10
-    /// (non-CLOEXEC, so an exec'd child would inherit it), wires the redirect onto
-    /// it, and assigns the number to `$name` (the var PERSISTS after the command).
-    /// The allocated fd is NOT registered in `saved` — bash keeps it open in the
-    /// shell process until an explicit `{var}>&-` (Close) or shell exit, so Drop
-    /// must NOT close it. Explicit close via `{var}>&-` is handled in the
-    /// `RedirOp::Close` arm above.
-    fn apply_var(
-        &mut self,
-        name: &str,
-        redir: &Redirection,
-        shell: &mut Shell,
-        sink: &mut StdoutSink,
-        err_sink: &mut StderrSink,
-    ) -> Result<(), ExecOutcome> {
-        use std::os::unix::io::IntoRawFd;
-        // `{var}>&-` / `{var}<&-`: close the fd currently named by $var.
-        if matches!(&redir.op, RedirOp::Close) {
-            let cur = shell.lookup_var(name).unwrap_or_default();
-            let fd: RawFd = match cur.trim().parse::<i32>() {
-                Ok(n) if n >= 0 => n,
-                _ => {
-                    {
-                        let mut err = err_writer(err_sink, sink);
-                        crate::sh_error_to!(shell, &mut *err, None, "{name}: ambiguous redirect");
-                    }
-                    return Err(ExecOutcome::Continue(1));
-                }
-            };
-            // Save prior state so Drop restores (saved == -1 if it was unopened),
-            // then close. EBADF (already closed) is lenient per bash.
-            self.close_target(fd);
-            return Ok(());
-        }
-        // A Move mirrors the Dup arm to resolve `src`, but the source fd must be
-        // closed (save/restore aware, via `close_target`) after the dup — this
-        // flag is checked once `high` is allocated, below.
-        let is_move = matches!(&redir.op, RedirOp::Move { .. });
-        // Compute the source fd to dup from. `owns_src` is true when WE opened it
-        // (File / heredoc / here-string read end) and must close it after duping;
-        // a Dup source belongs to the shell and is left alone.
-        let (src, owns_src): (RawFd, bool) = match &redir.op {
-            RedirOp::File { mode, target: word } => {
-                let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
-                    Ok(p) => p,
-                    Err(()) => return Err(ExecOutcome::Continue(1)),
-                };
-                if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
-                    return Err(ExecOutcome::Continue(1));
-                }
-                // FdPlacement::RawLow: the {var}-fd relocation happens once below via
-                // dup_to_high_fd; relocating here too would double-relocate the
-                // named fd (lands at 11 instead of bash's 10, #135 regression).
-                let fd: RawFd = match open_redirect_file(
-                    mode,
-                    &path,
-                    shell.shell_options.noclobber,
-                    FdPlacement::RawLow,
-                ) {
-                    Ok(owned) => owned.into_raw_fd(),
-                    Err(e) => {
-                        redir_open_error(shell, err_sink, sink, &path, &e);
-                        return Err(ExecOutcome::Continue(1));
-                    }
-                };
-                (fd, true)
-            }
-            RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
-                // Dup and move resolve the source fd identically here; a move's
-                // extra source-close happens below via `close_target` (save/
-                // restore) once `high` is allocated, gated on `is_move`. The
-                // source is not "owned" (the shell's fd, not a temp we opened).
-                let src = resolve_dup_source(source, shell, sink, err_sink)
-                    .map_err(|()| ExecOutcome::Continue(1))?;
-                validate_fd_open(src, shell, sink, err_sink)
-                    .map_err(|()| ExecOutcome::Continue(1))?;
-                (src, false)
-            }
-            RedirOp::Heredoc { body, .. } => {
-                let bytes = expand_assignment(body, shell).into_bytes();
-                match spawn_heredoc_writer(&bytes) {
-                    Ok((rfd, pid)) => {
-                        self.heredoc_writers.push(pid);
-                        (rfd, true)
-                    }
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "heredoc: {}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
                         return Err(ExecOutcome::Continue(1));
                     }
                 }
-            }
-            RedirOp::HereString(w) => {
-                let mut bytes = expand_assignment(w, shell).into_bytes();
-                bytes.push(b'\n');
-                match spawn_heredoc_writer(&bytes) {
-                    Ok((rfd, pid)) => {
-                        self.heredoc_writers.push(pid);
-                        (rfd, true)
-                    }
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "heredoc: {}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        return Err(ExecOutcome::Continue(1));
-                    }
+                PlanOp::Close { target } => self.close_target(target),
+                PlanOp::NamedFd { high, name } => {
+                    // Assign $var and leave `high` OPEN (persists past the command);
+                    // NOT registered in `saved`, so Drop must not close it.
+                    let fd = high.into_raw_fd();
+                    shell.set(&name, fd.to_string());
                 }
             }
-            RedirOp::Close => unreachable!("Close handled above"),
-        };
-        // Allocate a free high fd duped from `src` (non-CLOEXEC). The high fd
-        // ITSELF is the live descriptor the command sees — do NOT dup2 onto a
-        // lower fd.
-        let high = match crate::child_fd::dup_to_high_fd(src, 10, false) {
-            Ok(h) => h,
-            Err(e) => {
-                if owns_src {
-                    unsafe { libc::close(src) };
-                }
-                {
-                    let mut err = err_writer(err_sink, sink);
-                    crate::sh_error_to!(
-                        shell,
-                        &mut *err,
-                        None,
-                        "{name}: {}",
-                        crate::bash_io_error(&e)
-                    );
-                }
-                return Err(ExecOutcome::Continue(1));
-            }
-        };
-        if owns_src {
-            // The opened file / heredoc read-end was only a temp to dup from.
-            unsafe { libc::close(src) };
         }
-        if is_move {
-            // The "move": close the source fd, save/restore aware.
-            self.close_target(src);
-        }
-        // Assign $var and leave `high` OPEN — bash keeps the allocated fd alive
-        // in the shell process until an explicit `{var}>&-` or shell exit.
-        // Do NOT register `high` in `self.saved`; Drop must NOT close it.
-        shell.set(name, high.to_string());
         Ok(())
     }
 
@@ -1534,12 +1263,20 @@ where
     // `>file 2>&1`. A failure mid-list returns early; the scope's Drop rolls
     // back the entries already applied (atomic, matching pre-v156 behavior).
     let force_terminal = redirs_write_stdout(redirs);
-    for r in redirs {
-        if let Err(outcome) = scope.apply(r, shell, sink, err_sink) {
+    match lower_redirects(redirs, shell, sink, err_sink) {
+        Ok(plan) => {
+            if let Err(outcome) = scope.apply_plan(plan, shell, sink, err_sink) {
+                scope.reap_heredoc_writers();
+                drop(scope);
+                drain_procsubs(shell, procsub_base);
+                return outcome;
+            }
+        }
+        Err(code) => {
             scope.reap_heredoc_writers();
             drop(scope);
             drain_procsubs(shell, procsub_base);
-            return outcome;
+            return ExecOutcome::Continue(code);
         }
     }
 
@@ -1645,12 +1382,20 @@ fn run_builtin_with_redirects(
         && matches!(final_2, RedirectDest::Follows(1));
 
     let mut scope = RedirectScope::new();
-    for r in redirs {
-        if let Err(outcome) = scope.apply(r, shell, sink, err_sink) {
+    match lower_redirects(redirs, shell, sink, err_sink) {
+        Ok(plan) => {
+            if let Err(outcome) = scope.apply_plan(plan, shell, sink, err_sink) {
+                scope.reap_heredoc_writers();
+                drop(scope);
+                drain_procsubs(shell, procsub_base);
+                return outcome;
+            }
+        }
+        Err(code) => {
             scope.reap_heredoc_writers();
             drop(scope);
             drain_procsubs(shell, procsub_base);
-            return outcome;
+            return ExecOutcome::Continue(code);
         }
     }
 
@@ -4103,8 +3848,8 @@ fn resolve_fd_target(source: &crate::lexer::Word, shell: &mut Shell) -> Result<i
 
 /// Resolve a `>&w` / `<&w` / move (`>&w-`) source word to an fd, writing bash's
 /// error to the redirect-aware writer on failure. Shared by every dup/move
-/// redirect-apply site (in-process `apply`/`apply_var` and the child-plan
-/// builders). Does NOT check the fd is currently open — the in-process sites
+/// redirect-lowering site (`lower_redirects` for the in-process path and the
+/// child-plan builders). Does NOT check the fd is currently open — the in-process sites
 /// add that via `validate_fd_open` (they perform the `dup2` in the parent);
 /// the child-plan sites defer the check to child replay. Returns `Err(())`
 /// after emitting the error.
@@ -4333,7 +4078,7 @@ enum FdPlacement {
 /// operate on (#135, #132-class). When `placement` is `RawLow`, return the raw
 /// opened fd (Rust std ⇒ O_CLOEXEC, at a low number) WITHOUT relocating — this
 /// is for callers that relocate the source themselves via `dup_to_high_fd`,
-/// e.g. the `{var}`-fd arms (`apply_var`, `build_child_redir_plan`); relocating
+/// e.g. the `{var}`-fd lowering arms in `lower_redirects`; relocating
 /// here too would double-relocate and land the named fd one number too high
 /// (#135 regression).
 /// Callers report failures via `redir_open_error(path, ..)` as today.
@@ -5425,25 +5170,31 @@ fn apply_redirects_permanently(
 ) -> Result<(), ()> {
     let mut scope = RedirectScope::new();
 
-    // Apply each redirection in source order via the ordered RedirectScope
-    // applier. `apply` already dispatches `RedirFd::Var` to `apply_var`, so
-    // a single call handles numeric fds, dup, close, heredoc, and `{var}`.
-    // On failure, `scope` Drop rolls back any already-applied redirects
-    // atomically (temporary semantics) and we return Err(()) to the caller.
-    for redir in &cmd.redirects {
-        if scope.apply(redir, shell, sink, err_sink).is_err() {
-            // Reap any heredoc writers spawned by already-applied redirs before
-            // the scope drops (Drop is writer-agnostic) — else a zombie until
-            // shell exit. Mirrors with_redirect_scope's error path.
+    // Lower the redirections once, then apply the resulting plan in source
+    // order via the ordered RedirectScope applier. `lower_redirects` handles
+    // numeric fds, dup, close, heredoc, and `{var}` uniformly. On failure,
+    // `scope` Drop rolls back any already-applied redirects atomically
+    // (temporary semantics) and we return Err(()) to the caller.
+    match lower_redirects(&cmd.redirects, shell, sink, err_sink) {
+        Ok(plan) => {
+            if scope.apply_plan(plan, shell, sink, err_sink).is_err() {
+                // Reap any heredoc writers spawned by already-applied redirs
+                // before the scope drops (Drop is writer-agnostic) — else a
+                // zombie until shell exit. Mirrors with_redirect_scope's path.
+                scope.reap_heredoc_writers();
+                return Err(()); // scope Drop restores partial → atomic rollback
+            }
+        }
+        Err(_) => {
             scope.reap_heredoc_writers();
-            return Err(()); // scope Drop restores partial → atomic rollback
+            return Err(());
         }
     }
 
     // SUCCESS → make the redirections permanent.
     //
-    // For `{var}` redirections `apply_var` leaves the high fd OPEN and does
-    // NOT register it in `scope.saved`, so it already persists beyond this
+    // For `{var}` redirections the `NamedFd` arm leaves the high fd OPEN and
+    // does NOT register it in `scope.saved`, so it already persists beyond this
     // function — no special-casing needed.
     //
     // For heredoc writers: reap them NOW (before forget) so the writer
@@ -5661,10 +5412,9 @@ enum PlanOp {
     /// do NOT assign `$name` (bash doesn't for an external command).
     NamedFd {
         high: std::os::fd::OwnedFd,
-        // Read by the in-process applier (`RedirectScope::apply_plan`, Task 4) to
-        // assign `$name`; the child path (`redir_plan_to_child`) intentionally
-        // ignores it (bash does not assign `$var` for an external command).
-        #[allow(dead_code)]
+        // Read by the in-process applier (`RedirectScope::apply_plan`) to assign
+        // `$name`; the child path (`redir_plan_to_child`) intentionally ignores it
+        // (bash does not assign `$var` for an external command).
         name: String,
     },
 }
