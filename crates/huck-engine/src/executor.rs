@@ -2809,830 +2809,39 @@ fn run_background_sequence(
     let display = display_command(source);
     let job_control = shell.job_control_active();
 
-    // Spawn each stage using the same per-stage fork dispatch as run_multi_stage
-    // (classify_stage → External via spawn_external_with_fds, or InProcess via
-    // fork_and_run_in_subshell). This handles all Command variants including
-    // compound commands (if/while/for/case/brace-group), so there are no
-    // unreachable! arms. After all stages are spawned, register the job and
-    // return immediately (no wait) — that's what makes this "background".
-    //
-    // Background stdin default: /dev/null for stage 0 (no explicit redirect,
-    // no previous pipe) so the job doesn't compete for the terminal.
+    // Spawn every stage via the shared pipeline core in Background mode. This
+    // applies the async stdin default (#129) for stage 0, drops heredoc writers
+    // to the SIGCHLD reaper, never captures/merges the last stage's stdout/stderr
+    // (a `pipeline &` writes to the terminal), sets `first_pid` to the job's
+    // leader pid, and on a spawn failure kills+reaps the partial pipeline via
+    // bail_teardown_pipeline(Background, …). All that's left here is registering
+    // the job and returning immediately (no wait) — that's what makes it
+    // "background".
+    let sp = match spawn_pipeline(
+        &pipeline.commands,
+        SpawnMode::Background,
+        shell,
+        sink,
+        err_sink,
+    ) {
+        Ok(sp) => sp,
+        Err(outcome) => return outcome,
+    };
 
-    let n = pipeline.commands.len();
-    let mut spawned_pids: Vec<i32> = Vec::with_capacity(n);
-    let mut first_pid: Option<i32> = None;
-    let mut prev_pipe_read: Option<RawFd> = None;
-    let mut parent_held: Vec<RawFd> = Vec::new();
-
-    // Stage-0 stdin default (async rule, shared with run_background_subshell): a
-    // bare multi-stage pipeline's stage 0 inherits the shell's stdin; a single
-    // async command gets /dev/null when non-interactive; interactive always
-    // inherits. (#129)
-    let stage0_default: ChildFd =
-        match async_default_stdin(pipeline.commands.len() > 1, shell, sink, err_sink) {
-            Ok(c) => c,
-            Err(()) => return ExecOutcome::Continue(1),
-        };
-
-    // Snapshot the procsub stack. Word expansion in the spawn loop may realize
-    // process substitutions (pushing onto shell.procsub_pending). We must drain
-    // [procsub_base..] on every exit path so the parent fd is closed and the
-    // inner child is reaped. For background jobs we use a non-blocking reap after
-    // spawning (see drain_procsubs_nonblocking below) so we don't stall the
-    // background path on a long-running inner producer.
-    let procsub_base = shell.procsub_pending.len();
-
-    for (i, stage_cmd) in pipeline.commands.iter().enumerate() {
-        let is_last = i == n - 1;
-
-        // ---- Assign-only stages: no-op ----------------------------------------
-        if let Command::Simple(SimpleCommand::Assign(items, aline)) = stage_cmd {
-            // Drop incoming pipe (no-op stage produces no output).
-            if let Some(r) = prev_pipe_read.take() {
-                parent_held.retain(|&fd| fd != r);
-                unsafe {
-                    libc::close(r);
-                }
+    // Re-assert the job's process group in the parent (a race-close mirror of the
+    // per-stage setpgid the spawners already did). `sp.pgid_target` is the leader
+    // pid when job control is active, else NO_PGROUP (no grouping — every stage
+    // stays in the shell's group). Best-effort: a stage that already exec'd or
+    // exited yields EACCES/ESRCH, which is fine — its group was set at spawn.
+    if sp.pgid_target != NO_PGROUP {
+        for &PipelineStage::Forked(pid) in &sp.stages {
+            unsafe {
+                libc::setpgid(pid, sp.pgid_target);
             }
-            // Run via fork so it's isolated (assignments don't affect parent).
-            let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone(), *aline));
-            let pgid_target = if job_control {
-                first_pid.unwrap_or(0)
-            } else {
-                NO_PGROUP
-            };
-            // stage 0 default (a distinct clone of the shared /dev/null / inherit).
-            let stdin: ChildFd = match stage0_default.try_clone() {
-                Ok(c) => c,
-                Err(e) => {
-                    {
-                        let mut err = err_writer(err_sink, sink);
-                        crate::sh_error_to!(
-                            shell,
-                            &mut *err,
-                            None,
-                            "dup: {}",
-                            crate::bash_io_error(&e)
-                        );
-                    }
-                    return bail_teardown_bg(
-                        shell,
-                        procsub_base,
-                        first_pid,
-                        &spawned_pids,
-                        &mut parent_held,
-                    );
-                }
-            };
-            // For a no-op assign stage, stdout is irrelevant but we still need
-            // to either pipe or close it for downstream stages.
-            let stdout: ChildFd = if !is_last {
-                match crate::child_fd::make_pipe(false) {
-                    Ok((r, w)) => {
-                        prev_pipe_read = Some(r);
-                        parent_held.push(r);
-                        unsafe { ChildFd::owned_raw(w) }
-                    }
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "pipe: {}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        return bail_teardown_bg(
-                            shell,
-                            procsub_base,
-                            first_pid,
-                            &spawned_pids,
-                            &mut parent_held,
-                        );
-                    }
-                }
-            } else {
-                ChildFd::Inherit
-            };
-            let mut fds_to_close: Vec<RawFd> = parent_held
-                .iter()
-                .copied()
-                .filter(|&fd| Some(fd) != stdout.raw() && Some(fd) != stdin.raw())
-                .collect();
-            // The parent's shared /dev/null original is inherited by the child;
-            // close it there (the child's own stdin is a distinct clone).
-            if let Some(d) = stage0_default.raw() {
-                fds_to_close.push(d);
-            }
-            let child_stdio = ChildStdio::new(stdin, stdout, ChildFd::Inherit);
-            match fork_and_run_in_subshell(
-                &assign_cmd,
-                shell,
-                child_stdio,
-                pgid_target,
-                &fds_to_close,
-                None,
-                None,
-            ) {
-                Ok(pid) => {
-                    // The pipe write end (if any) was owned by the moved
-                    // child_stdio and closed in the parent by the call.
-                    if first_pid.is_none() {
-                        first_pid = Some(pid);
-                        if job_control {
-                            unsafe {
-                                if libc::setpgid(pid, pid) != 0 {
-                                    let errno =
-                                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                                    debug_assert!(
-                                        errno == libc::ESRCH || errno == libc::EACCES,
-                                        "setpgid({pid},{pid}) failed errno {errno}"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    spawned_pids.push(pid);
-                }
-                Err(e) => {
-                    {
-                        let mut err = err_writer(err_sink, sink);
-                        crate::sh_error_to!(
-                            shell,
-                            &mut *err,
-                            None,
-                            "fork: {}",
-                            crate::bash_io_error(&e)
-                        );
-                    }
-                    // child_stdio (with any owned write end) was consumed by the
-                    // failed call and already dropped.
-                    return bail_teardown_bg(
-                        shell,
-                        procsub_base,
-                        first_pid,
-                        &spawned_pids,
-                        &mut parent_held,
-                    );
-                }
-            }
-            continue;
-        }
-
-        // ---- Inline assignments (v23 scoping) ---------------------------------
-        let inline_assignments: &[crate::command::Assignment] =
-            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                &exec.inline_assignments
-            } else {
-                &[]
-            };
-        let snap = match apply_inline_assignments(inline_assignments, shell, sink, err_sink) {
-            Ok(s) => s,
-            Err(s) => {
-                restore_inline_assignments(s, shell);
-                return bail_teardown_bg(
-                    shell,
-                    procsub_base,
-                    first_pid,
-                    &spawned_pids,
-                    &mut parent_held,
-                );
-            }
-        };
-
-        // Classify up front: external stages get a pipe/stage0_default-only base + a
-        // full ChildRedirPlan replayed in the child; InProcess stages (compound AND
-        // builtin) keep the slot base. A Simple(Exec) stage can be either kind, so key
-        // the base on the classification, not on Simple-vs-Compound.
-        let stage_is_external = matches!(classify_stage(stage_cmd, shell), StageKind::External(_));
-
-        // ---- Stdin fd ---------------------------------------------------------
-        // A heredoc/herestring stdin is fed by a forked writer process (M-120);
-        // the read end becomes this stage's stdin and the parent holds no write
-        // end.
-        let stdin: ChildFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd
-            && !stage_is_external
-        {
-            match &exec.slot_stdin() {
-                Some(RedirectSlot::Read(word)) => {
-                    if let Some(r) = prev_pipe_read.take() {
-                        parent_held.retain(|&fd| fd != r);
-                        unsafe {
-                            libc::close(r);
-                        }
-                    }
-                    let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    };
-                    match open_redirect_file(
-                        &FileMode::ReadOnly,
-                        &path,
-                        false,
-                        FdPlacement::Relocated,
-                    ) {
-                        Ok(f) => ChildFd::from(f),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    }
-                }
-                Some(RedirectSlot::Heredoc { body, .. }) => {
-                    if let Some(r) = prev_pipe_read.take() {
-                        parent_held.retain(|&fd| fd != r);
-                        unsafe {
-                            libc::close(r);
-                        }
-                    }
-                    // Forked writer (M-120): the read end is this stage's stdin;
-                    // the writer process is an internal helper collected by the
-                    // existing SIGCHLD reaper — never a job, never $!, so it is
-                    // NOT added to spawned_pids/first_pid.
-                    let bytes = expand_assignment(body, shell).into_bytes();
-                    match spawn_heredoc_writer(&bytes) {
-                        Ok((r, _pid)) => unsafe { ChildFd::owned_raw(r) },
-                        Err(e) => {
-                            {
-                                let mut err = err_writer(err_sink, sink);
-                                crate::sh_error_to!(
-                                    shell,
-                                    &mut *err,
-                                    None,
-                                    "heredoc: {}",
-                                    crate::bash_io_error(&e)
-                                );
-                            }
-                            restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    }
-                }
-                Some(RedirectSlot::HereString(body)) => {
-                    if let Some(r) = prev_pipe_read.take() {
-                        parent_held.retain(|&fd| fd != r);
-                        unsafe {
-                            libc::close(r);
-                        }
-                    }
-                    // Here-string: expand with no split/glob + trailing newline,
-                    // then feed via a forked writer (M-120; see Heredoc above).
-                    let mut bytes = expand_assignment(body, shell).into_bytes();
-                    bytes.push(b'\n');
-                    match spawn_heredoc_writer(&bytes) {
-                        Ok((r, _pid)) => unsafe { ChildFd::owned_raw(r) },
-                        Err(e) => {
-                            {
-                                let mut err = err_writer(err_sink, sink);
-                                crate::sh_error_to!(
-                                    shell,
-                                    &mut *err,
-                                    None,
-                                    "heredoc: {}",
-                                    crate::bash_io_error(&e)
-                                );
-                            }
-                            restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    }
-                }
-                _ => match prev_pipe_read.take() {
-                    Some(r) => {
-                        parent_held.retain(|&fd| fd != r);
-                        unsafe { ChildFd::owned_raw(r) }
-                    }
-                    None => match stage0_default.try_clone() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            {
-                                let mut err = err_writer(err_sink, sink);
-                                crate::sh_error_to!(
-                                    shell,
-                                    &mut *err,
-                                    None,
-                                    "dup: {}",
-                                    crate::bash_io_error(&e)
-                                );
-                            }
-                            restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    },
-                },
-            }
-        } else {
-            // Compound stage: use prev pipe or /dev/null for stage 0.
-            match prev_pipe_read.take() {
-                Some(r) => {
-                    parent_held.retain(|&fd| fd != r);
-                    unsafe { ChildFd::owned_raw(r) }
-                }
-                None => match stage0_default.try_clone() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "dup: {}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        restore_inline_assignments(snap, shell);
-                        return bail_teardown_bg(
-                            shell,
-                            procsub_base,
-                            first_pid,
-                            &spawned_pids,
-                            &mut parent_held,
-                        );
-                    }
-                },
-            }
-        };
-
-        // ---- Stdout redirect (ExecCommand only) ------------------------------
-        let explicit_stdout: Option<ChildFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
-            stage_cmd
-            && !stage_is_external
-        {
-            match &exec.slot_stdout() {
-                Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    };
-                    let guard =
-                        shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                    match open_redirect_file(
-                        &FileMode::Truncate,
-                        &path,
-                        guard,
-                        FdPlacement::Relocated,
-                    ) {
-                        Ok(f) => Some(ChildFd::from(f)),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    }
-                }
-                Some(RedirectSlot::Append(w)) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    };
-                    match open_redirect_file(
-                        &FileMode::Append,
-                        &path,
-                        false,
-                        FdPlacement::Relocated,
-                    ) {
-                        Ok(f) => Some(ChildFd::from(f)),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    }
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        // ---- Stderr redirect (ExecCommand only) ------------------------------
-        let explicit_stderr: Option<ChildFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
-            stage_cmd
-            && !stage_is_external
-        {
-            match &exec.slot_stderr() {
-                Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    };
-                    let guard =
-                        shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                    match open_redirect_file(
-                        &FileMode::Truncate,
-                        &path,
-                        guard,
-                        FdPlacement::Relocated,
-                    ) {
-                        Ok(f) => Some(ChildFd::from(f)),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    }
-                }
-                Some(RedirectSlot::Append(w)) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    };
-                    match open_redirect_file(
-                        &FileMode::Append,
-                        &path,
-                        false,
-                        FdPlacement::Relocated,
-                    ) {
-                        Ok(f) => Some(ChildFd::from(f)),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            return bail_teardown_bg(
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &spawned_pids,
-                                &mut parent_held,
-                            );
-                        }
-                    }
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        // External stage: lower the FULL ordered redirect list once (v292 machinery)
-        // and replay it in the child over the pipe/stage0_default base. Built BEFORE
-        // the inter-stage pipe so a forked heredoc writer can't inherit this stage's
-        // own write end (would deadlock EOF). #69: stamp current_lineno so a stage
-        // redirect-open error carries `line N:`. NOTE: unlike the foreground path,
-        // run_background_sequence does not track heredoc-writer pids — bg children are
-        // reaped by the SIGCHLD reaper — so the plan's heredoc_writers are left in the
-        // plan and dropped by the spawner (a no-op), matching the existing bg discard.
-        let external_plan: Option<ChildRedirPlan> = if stage_is_external {
-            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                if exec.line != 0 {
-                    shell.current_lineno = exec.line;
-                }
-                match build_child_redir_plan(&exec.redirects, shell, sink, err_sink) {
-                    Ok(p) => Some(p),
-                    Err(_) => {
-                        restore_inline_assignments(snap, shell);
-                        return bail_teardown_bg(
-                            shell,
-                            procsub_base,
-                            first_pid,
-                            &spawned_pids,
-                            &mut parent_held,
-                        );
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // ---- Stdout fd -------------------------------------------------------
-        let stdout: ChildFd = if let Some(cf) = explicit_stdout {
-            // Upstream stdout goes to the file. For a non-final stage we
-            // STILL need to create an inter-stage pipe so the downstream
-            // stage reads EOF instead of inheriting parent stdin (M-125).
-            if !is_last {
-                match make_orphan_pipe_for_eof_reader() {
-                    Ok(r) => {
-                        prev_pipe_read = Some(r);
-                        parent_held.push(r);
-                    }
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "pipe: {}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        restore_inline_assignments(snap, shell);
-                        // stdin / cf (the open file) / explicit_stderr all drop here.
-                        drain_procsubs(shell, procsub_base);
-                        cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                        for pfd in parent_held.drain(..) {
-                            unsafe {
-                                libc::close(pfd);
-                            }
-                        }
-                        return ExecOutcome::Continue(1);
-                    }
-                }
-            }
-            cf
-        } else if !is_last {
-            match crate::child_fd::make_pipe(false) {
-                Ok((r, w)) => {
-                    prev_pipe_read = Some(r);
-                    parent_held.push(r);
-                    unsafe { ChildFd::owned_raw(w) }
-                }
-                Err(e) => {
-                    {
-                        let mut err = err_writer(err_sink, sink);
-                        crate::sh_error_to!(
-                            shell,
-                            &mut *err,
-                            None,
-                            "pipe: {}",
-                            crate::bash_io_error(&e)
-                        );
-                    }
-                    restore_inline_assignments(snap, shell);
-                    // stdin / explicit_stderr drop here.
-                    return bail_teardown_bg(
-                        shell,
-                        procsub_base,
-                        first_pid,
-                        &spawned_pids,
-                        &mut parent_held,
-                    );
-                }
-            }
-        } else {
-            ChildFd::Inherit
-        };
-
-        let stderr: ChildFd = explicit_stderr.unwrap_or(ChildFd::Inherit);
-
-        // ---- Classify and spawn ----------------------------------------------
-        let pgid_target = if job_control {
-            first_pid.unwrap_or(0)
-        } else {
-            NO_PGROUP
-        };
-
-        let mut fds_to_close_in_child: Vec<RawFd> = parent_held
-            .iter()
-            .copied()
-            .filter(|&fd| {
-                Some(fd) != stdin.raw() && Some(fd) != stdout.raw() && Some(fd) != stderr.raw()
-            })
-            .collect();
-        // The parent's shared /dev/null original (stage0_default) is inherited by
-        // every child; close it there. Each stage's own stdin is a distinct clone
-        // or pipe end, so this never closes a fd the child needs.
-        if let Some(d) = stage0_default.raw() {
-            fds_to_close_in_child.push(d);
-        }
-        // (Any heredoc pipe write end lives in the forked writer process, not
-        // here, so there is nothing extra to add to fds_to_close_in_child.)
-
-        // Resolve Dup targets pre-fork for InProcess stages (Word expansion may
-        // allocate; not async-signal-safe). External stages handle this inside
-        // spawn_external_with_fds itself.
-        let (stdout_dup_target, stderr_dup_target) =
-            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                let sdt = match &exec.slot_stdout() {
-                    Some(RedirectSlot::Dup { source, .. }) => {
-                        match resolve_fd_target(source, shell) {
-                            Ok(fd) => Some(fd),
-                            Err(e) => {
-                                {
-                                    let mut err = err_writer(err_sink, sink);
-                                    crate::sh_error_to!(
-                                        shell,
-                                        &mut *err,
-                                        None,
-                                        "{}",
-                                        crate::bash_io_error(&e)
-                                    );
-                                }
-                                restore_inline_assignments(snap, shell);
-                                // stdin / stdout / stderr ChildFds drop on return.
-                                return bail_teardown_bg(
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &spawned_pids,
-                                    &mut parent_held,
-                                );
-                            }
-                        }
-                    }
-                    _ => None,
-                };
-                let sedt = match &exec.slot_stderr() {
-                    Some(RedirectSlot::Dup { source, .. }) => {
-                        match resolve_fd_target(source, shell) {
-                            Ok(fd) => Some(fd),
-                            Err(e) => {
-                                {
-                                    let mut err = err_writer(err_sink, sink);
-                                    crate::sh_error_to!(
-                                        shell,
-                                        &mut *err,
-                                        None,
-                                        "{}",
-                                        crate::bash_io_error(&e)
-                                    );
-                                }
-                                restore_inline_assignments(snap, shell);
-                                // stdin / stdout / stderr ChildFds drop on return.
-                                return bail_teardown_bg(
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &spawned_pids,
-                                    &mut parent_held,
-                                );
-                            }
-                        }
-                    }
-                    _ => None,
-                };
-                (sdt, sedt)
-            } else {
-                (None, None)
-            };
-
-        // Build the child's fd environment ONCE; move it into whichever spawner.
-        // Both spawners consume it and close the parent's owned copies (on both
-        // the success and error paths — RAII), so there is no post-spawn parent
-        // close bookkeeping to do.
-        let child_stdio = ChildStdio::new(stdin, stdout, stderr);
-        let spawn_result = match classify_stage(stage_cmd, shell) {
-            StageKind::External(simple) => spawn_external_with_fds(
-                simple,
-                shell,
-                sink,
-                err_sink,
-                child_stdio,
-                pgid_target,
-                &fds_to_close_in_child,
-                external_plan.expect("external stage always has a ChildRedirPlan"),
-            ),
-            StageKind::InProcess(cmd) => fork_and_run_in_subshell(
-                cmd,
-                shell,
-                child_stdio,
-                pgid_target,
-                &fds_to_close_in_child,
-                stdout_dup_target,
-                stderr_dup_target,
-            ),
-        };
-
-        restore_inline_assignments(snap, shell);
-
-        let pid = match spawn_result {
-            Ok(p) => p,
-            Err(e) => {
-                {
-                    let mut err = err_writer(err_sink, sink);
-                    crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e));
-                }
-                // child_stdio (with all owned stdio fds) was consumed by the
-                // failed call and already dropped; the pipe read end (if any)
-                // stays in parent_held and is closed by bail_teardown_bg.
-                return bail_teardown_bg(
-                    shell,
-                    procsub_base,
-                    first_pid,
-                    &spawned_pids,
-                    &mut parent_held,
-                );
-            }
-        };
-
-        // (A heredoc/herestring body, if any, is written by the forked writer
-        // process; the parent holds no write end and nothing to record here.)
-
-        // Track pgrp + pid.
-        if first_pid.is_none() {
-            first_pid = Some(pid);
-            if job_control {
-                unsafe {
-                    if libc::setpgid(pid, pid) != 0 {
-                        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                        debug_assert!(
-                            errno == libc::ESRCH || errno == libc::EACCES,
-                            "setpgid({pid},{pid}) failed errno {errno}"
-                        );
-                    }
-                }
-            }
-        }
-        spawned_pids.push(pid);
-    }
-
-    // Close all remaining parent-held fds (inter-stage pipe read-ends that
-    // weren't consumed, and the /dev/null fd).
-    for fd in parent_held.drain(..) {
-        unsafe {
-            libc::close(fd);
         }
     }
 
-    // (Heredoc/herestring bodies are written by their forked writer processes,
-    // reaped by the existing SIGCHLD reaper — they are internal helpers, not
-    // part of this backgrounded job.)
-
-    let Some(pgid) = first_pid else {
+    let Some(pgid) = sp.first_pid else {
         // No actual children spawned (all-Assign pipeline). Treat as
         // synthetic Done. This shouldn't happen in practice — the parser
         // doesn't produce all-Assign backgrounded pipelines as a typical
@@ -3640,15 +2849,18 @@ fn run_background_sequence(
         shell.jobs.add_synthetic_done(display, 0);
         crate::jobs::reap_and_notify(shell);
         // Non-blocking drain: close parent fds so any inner child sees EOF.
-        drain_procsubs_nonblocking(shell, procsub_base);
+        drain_procsubs_nonblocking(shell, sp.procsub_base);
         return ExecOutcome::Continue(0);
     };
 
-    let last_pid = *spawned_pids.last().unwrap();
+    let pids: Vec<i32> = sp
+        .stages
+        .iter()
+        .map(|PipelineStage::Forked(p)| *p)
+        .collect();
+    let last_pid = *pids.last().unwrap();
     shell.last_bg_pid = Some(last_pid);
-    let id = shell
-        .jobs
-        .add_with_pgroup(pgid, spawned_pids, display, job_control);
+    let id = shell.jobs.add_with_pgroup(pgid, pids, display, job_control);
     // bash suppresses automatic job notices inside a subshell environment / completion funcs
     if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
         {
@@ -3660,29 +2872,8 @@ fn run_background_sequence(
     // procsub children. We don't block here because a long-running inner producer
     // (e.g. `cmd < <(long-running-gen) &`) should not make the background job
     // synchronous. Any child not yet exited is left to SIGCHLD/exit cleanup.
-    drain_procsubs_nonblocking(shell, procsub_base);
+    drain_procsubs_nonblocking(shell, sp.procsub_base);
     ExecOutcome::Continue(0)
-}
-
-/// Pipeline-spawn error teardown for `run_background_sequence`: reap process
-/// substitutions started this pipeline, kill+reap already-spawned stages, close
-/// every parent-held pipe fd, and return failure. Extracted from the ~19
-/// byte-identical bail sites in that function.
-fn bail_teardown_bg(
-    shell: &mut Shell,
-    procsub_base: usize,
-    first_pid: Option<i32>,
-    spawned_pids: &[i32],
-    parent_held: &mut Vec<RawFd>,
-) -> ExecOutcome {
-    drain_procsubs(shell, procsub_base);
-    cleanup_partial_pipeline_raw(first_pid, spawned_pids);
-    for fd in parent_held.drain(..) {
-        unsafe {
-            libc::close(fd);
-        }
-    }
-    ExecOutcome::Continue(1)
 }
 
 /// Unified pipeline-spawn error teardown. Both modes drain process substitutions
@@ -6255,9 +5446,9 @@ struct SpawnedPipeline {
     stages: Vec<PipelineStage>,
     heredoc_writers: Vec<i32>,
     /// The pipeline's target process group (job-control leader pid, else
-    /// `NO_PGROUP`). Consumed by the background wrapper (v295 Task 3) to register
-    /// the job; the foreground wrapper tracks the terminal handoff via `first_pid`.
-    #[allow(dead_code)]
+    /// `NO_PGROUP`). Consumed by the background wrapper (v295 Task 3) to re-assert
+    /// the job's process group; the foreground wrapper tracks the terminal handoff
+    /// via `first_pid`.
     pgid_target: i32,
     procsub_base: usize,
     capture_read_fd: Option<RawFd>,
@@ -6486,7 +5677,18 @@ fn spawn_pipeline(
     // with default SIGTTOU/SIGTTIN handling, deadlocking the subshell's wait on a
     // controlling terminal (M-104). A subshell's inner pipeline uses the
     // non-job-control path (stages stay in the subshell's pgrp), matching bash.
-    let interactive = shell.job_control_active() && matches!(sink, StdoutSink::Terminal);
+    let job_control = shell.job_control_active();
+    let interactive = job_control && matches!(sink, StdoutSink::Terminal);
+    // Mode-aware process-grouping predicate. Foreground groups the pipeline only
+    // when it owns the terminal (`interactive`); background groups whenever job
+    // control is active (it never owns the terminal, but the job still needs its
+    // own process group). Keyed here so every pgid_target computation below stays
+    // consistent: fg keeps its exact prior behavior (`group == interactive`), bg
+    // gets the leader pid + job_control-keyed pgrouping its wrapper needs.
+    let group = match mode {
+        SpawnMode::Foreground => interactive,
+        SpawnMode::Background => job_control,
+    };
     let n = commands.len();
 
     // Fd for the capture-sink case: last stage's stdout is piped back to parent.
@@ -6589,7 +5791,7 @@ fn spawn_pipeline(
             }
             // Run the assignments via fork so they're isolated.
             let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone(), *aline));
-            let pgid_target = if interactive {
+            let pgid_target = if group {
                 first_pid.unwrap_or(0)
             } else {
                 NO_PGROUP
@@ -6708,7 +5910,7 @@ fn spawn_pipeline(
                 Ok(pid) => {
                     // The pipe/capture write end was owned by the moved
                     // ChildStdio and closed in the parent by the call.
-                    if interactive && first_pid.is_none() {
+                    if (mode == SpawnMode::Background || interactive) && first_pid.is_none() {
                         first_pid = Some(pid);
                     }
                     if mode == SpawnMode::Foreground {
@@ -7232,13 +6434,14 @@ fn spawn_pipeline(
                         }
                         restore_inline_assignments(snap, shell);
                         // stdin / cf (the open file) / explicit_stderr drop here.
-                        drain_procsubs(shell, procsub_base);
-                        for pfd in parent_held.drain(..) {
-                            unsafe {
-                                libc::close(pfd);
-                            }
-                        }
-                        return Err(ExecOutcome::Continue(1));
+                        return Err(bail_teardown_pipeline(
+                            mode,
+                            shell,
+                            procsub_base,
+                            first_pid,
+                            &stages,
+                            &mut parent_held,
+                        ));
                     }
                 }
             }
@@ -7412,7 +6615,7 @@ fn spawn_pipeline(
         };
 
         // ---- Classify and spawn ----------------------------------------------
-        let pgid_target = if interactive {
+        let pgid_target = if group {
             first_pid.unwrap_or(0)
         } else {
             NO_PGROUP
@@ -7551,14 +6754,16 @@ fn spawn_pipeline(
                 }
                 // child_stdio (with all owned stdio fds) was consumed by the
                 // failed call and already dropped. Close every remaining
-                // parent-held fd (inter-stage read ends + capture read ends).
-                drain_procsubs(shell, procsub_base);
-                for fd in parent_held.drain(..) {
-                    unsafe {
-                        libc::close(fd);
-                    }
-                }
-                return Err(ExecOutcome::Continue(1));
+                // parent-held fd (inter-stage read ends + capture read ends);
+                // Background additionally kills+reaps the already-spawned stages.
+                return Err(bail_teardown_pipeline(
+                    mode,
+                    shell,
+                    procsub_base,
+                    first_pid,
+                    &stages,
+                    &mut parent_held,
+                ));
             }
         };
 
@@ -7566,7 +6771,7 @@ fn spawn_pipeline(
         // process spawned above; the parent holds no write end here.)
 
         // ---- Track pid -------------------------------------------------------
-        if interactive && first_pid.is_none() {
+        if (mode == SpawnMode::Background || interactive) && first_pid.is_none() {
             first_pid = Some(pid);
         }
         if mode == SpawnMode::Foreground {
@@ -7593,7 +6798,7 @@ fn spawn_pipeline(
     }
     parent_held.retain(|&fd| Some(fd) == capture_read_fd || Some(fd) == capture_err_read_fd);
 
-    let pgid_target = if interactive {
+    let pgid_target = if group {
         first_pid.unwrap_or(0)
     } else {
         NO_PGROUP
