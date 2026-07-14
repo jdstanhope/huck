@@ -5626,6 +5626,49 @@ unsafe fn replay_redir_ops(ops: &[ChildRedirOp]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The neutral result of lowering an ordered redirect list: what fds the
+/// command will see, resolved but not yet installed. Consumed by exactly two
+/// appliers — `redir_plan_to_child` (child dup2/close replay) and
+/// `RedirectScope::apply_plan` (in-process save/restore). Ownership of every
+/// parent-opened temp (files, heredoc read ends, `{var}` high fds) lives INSIDE
+/// the ops, so a lowering error drops them (no leak; P1 discipline).
+struct RedirPlan {
+    ops: Vec<PlanOp>,
+    heredoc_writers: Vec<libc::pid_t>,
+}
+
+/// One resolved, ordered redirect action. Source order is preserved.
+enum PlanOp {
+    /// A parent-opened temp (`>file`, heredoc/here-string read end) duped onto
+    /// `target`. In-process: if `source`'s fd == `target` (a relocated file that
+    /// landed on its own target, target >= 10) clear FD_CLOEXEC in place (#135);
+    /// else dup2 + save/restore, then close the temp. Child: dup2 (replay's
+    /// `source == target` arm clears CLOEXEC), temp held until spawn.
+    InstallOwned {
+        target: RawFd,
+        source: std::os::fd::OwnedFd,
+    },
+    /// A borrowed shell fd (`>&w` / `<&w`, and the dup half of a move). `source`
+    /// is a resolved fd NUMBER. In-process: validate open, then dup2 + save/restore.
+    /// Child: dup2 (no validation — the fd is inherited).
+    InstallDup { target: RawFd, source: RawFd },
+    /// `N>&-`, and the source-close half of a move (`>&w-`).
+    Close { target: RawFd },
+    /// `{var}` named-fd. `high` is the live descriptor the command sees, already
+    /// allocated non-CLOEXEC (>= 10). In-process: assign `$name = high` and let it
+    /// persist (take it out of the plan; do NOT save/restore). Child: keep `high`
+    /// held (inherited, non-CLOEXEC), replay a defensive `dup2(high, high)`, and
+    /// do NOT assign `$name` (bash doesn't for an external command).
+    NamedFd {
+        high: std::os::fd::OwnedFd,
+        // Read by the in-process applier (`RedirectScope::apply_plan`, Task 4) to
+        // assign `$name`; the child path (`redir_plan_to_child`) intentionally
+        // ignores it (bash does not assign `$var` for an external command).
+        #[allow(dead_code)]
+        name: String,
+    },
+}
+
 /// The parent-side result of lowering `cmd.redirects` into an ordered replay
 /// list for an external (forked) command. `ops` is applied IN ORDER in the
 /// child's `pre_exec`. `held` keeps the parent-opened files / heredoc read-ends
@@ -5653,201 +5696,60 @@ fn relocate_high_cloexec(fd: RawFd) -> RawFd {
     })
 }
 
-/// Lower `redirects` (in source order) into a `ChildRedirPlan` for an external
-/// command: open files / spawn heredoc writers in the PARENT, resolve dup
-/// sources, and emit an ordered `dup2`/`close` op list the child replays. On
-/// any error a diagnostic is printed and `Err(1)` is returned (the held fds and
-/// heredoc writers built so far are dropped/leaked-cleanly via `held`).
-/// `RedirFd::Var` (`{var}>file`) allocates a free fd >= 10 (non-CLOEXEC), assigns
-/// it to `$var`, and emits a source==target replay op so the child inherits it.
-fn build_child_redir_plan(
+/// The single redirect lowering (Phase 3a). Walks `redirects` in source order,
+/// resolving each into a neutral `PlanOp`: opens files (as OwnedFd), spawns
+/// heredoc writers, resolves dup WORDS to fd NUMBERS, and allocates `{var}` high
+/// fds. It does NOT apply anything and does NOT validate dup sources (validation
+/// is apply-time for the in-process path: `3>file 4>&3`). On any error it closes
+/// every fd opened so far (so heredoc writers hit EOF/EPIPE) then reaps those
+/// writers, and returns Err(code) with the diagnostic already printed.
+fn lower_redirects(
     redirects: &[Redirection],
     shell: &mut Shell,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
-) -> Result<ChildRedirPlan, i32> {
-    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-    let mut plan = ChildRedirPlan {
+) -> Result<RedirPlan, i32> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut plan = RedirPlan {
         ops: Vec::new(),
-        held: Vec::new(),
         heredoc_writers: Vec::new(),
     };
+    // On error: drop opened fds first (close read ends -> writers get EOF/EPIPE),
+    // then reap. Hang-free even for >64KB heredoc bodies. Both appliers converge
+    // on this cleanup (child path previously leaked the zombie; benign).
+    macro_rules! fail {
+        ($code:expr) => {{
+            plan.ops.clear();
+            for pid in plan.heredoc_writers.drain(..) {
+                let mut st = 0;
+                unsafe { libc::waitpid(pid, &mut st, 0) };
+            }
+            return Err($code);
+        }};
+    }
     for redir in redirects {
-        // `{var}` named-fd: allocate a free fd >= 10 in the PARENT (non-CLOEXEC so
-        // the child inherits it), assign $var (persists), and emit a source==target
-        // replay op so the child clears CLOEXEC on it (survives exec). The parent
-        // keeps it in `held` and closes it after spawn (normal-command semantics;
-        // exec's permanence is Task 6's caller decision).
         if let RedirFd::Var(name) = &redir.fd {
-            // `{var}>&-` / `{var}<&-`: close the fd currently named by $var.
-            if matches!(&redir.op, RedirOp::Close) {
-                let cur = shell.lookup_var(name).unwrap_or_default();
-                let fd: i32 = match cur.trim().parse::<i32>() {
-                    Ok(n) if n >= 0 => n,
-                    _ => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "{name}: ambiguous redirect"
-                            );
-                        }
-                        return Err(1);
-                    }
-                };
-                plan.ops.push(ChildRedirOp::Close { target: fd });
-                continue;
+            if let Err(code) = lower_named_fd(name, redir, shell, sink, err_sink, &mut plan) {
+                fail!(code);
             }
-            // A Move mirrors the Dup arm to resolve `src`, but the source fd
-            // must be closed in the CHILD (a replayed Close op) after the dup
-            // lands on `high` — checked once `high` is allocated, below.
-            let is_move = matches!(&redir.op, RedirOp::Move { .. });
-            // Resolve the source fd in the parent: an opened file, a dup source, or
-            // a forked heredoc/here-string read end. `owns_src` => we close it after
-            // duping to `high`; a Dup source belongs to the shell.
-            let (src, owns_src): (RawFd, bool) = match &redir.op {
-                RedirOp::File { mode, target: word } => {
-                    let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
-                        Err(()) => return Err(1),
-                    };
-                    if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
-                        return Err(1);
-                    }
-                    // FdPlacement::RawLow: the {var}-fd relocation happens once below via
-                    // dup_to_high_fd; relocating here too would double-relocate the
-                    // named fd (lands at 11 instead of bash's 10, #135 regression).
-                    let fd: RawFd = match open_redirect_file(
-                        mode,
-                        &path,
-                        shell.shell_options.noclobber,
-                        FdPlacement::RawLow,
-                    ) {
-                        Ok(owned) => owned.into_raw_fd(),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            return Err(1);
-                        }
-                    };
-                    (fd, true)
-                }
-                RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
-                    // Dup and move resolve the source identically; a move's extra
-                    // child-side close is replayed below, gated on `is_move`. Not
-                    // "owned" (the shell's fd, not a temp we opened).
-                    let src = resolve_dup_source(source, shell, sink, err_sink).map_err(|()| 1)?;
-                    (src, false)
-                }
-                RedirOp::Heredoc { body, .. } => {
-                    let bytes = expand_assignment(body, shell).into_bytes();
-                    match spawn_heredoc_writer(&bytes) {
-                        Ok((rfd, pid)) => {
-                            plan.heredoc_writers.push(pid);
-                            (rfd, true)
-                        }
-                        Err(e) => {
-                            {
-                                let mut err = err_writer(err_sink, sink);
-                                crate::sh_error_to!(
-                                    shell,
-                                    &mut *err,
-                                    None,
-                                    "heredoc: {}",
-                                    crate::bash_io_error(&e)
-                                );
-                            }
-                            return Err(1);
-                        }
-                    }
-                }
-                RedirOp::HereString(w) => {
-                    let mut bytes = expand_assignment(w, shell).into_bytes();
-                    bytes.push(b'\n');
-                    match spawn_heredoc_writer(&bytes) {
-                        Ok((rfd, pid)) => {
-                            plan.heredoc_writers.push(pid);
-                            (rfd, true)
-                        }
-                        Err(e) => {
-                            {
-                                let mut err = err_writer(err_sink, sink);
-                                crate::sh_error_to!(
-                                    shell,
-                                    &mut *err,
-                                    None,
-                                    "heredoc: {}",
-                                    crate::bash_io_error(&e)
-                                );
-                            }
-                            return Err(1);
-                        }
-                    }
-                }
-                RedirOp::Close => unreachable!("Close handled above"),
-            };
-            let high = match crate::child_fd::dup_to_high_fd(src, 10, false) {
-                Ok(h) => h,
-                Err(e) => {
-                    if owns_src {
-                        unsafe { libc::close(src) };
-                    }
-                    {
-                        let mut err = err_writer(err_sink, sink);
-                        crate::sh_error_to!(
-                            shell,
-                            &mut *err,
-                            None,
-                            "{name}: {}",
-                            crate::bash_io_error(&e)
-                        );
-                    }
-                    return Err(1);
-                }
-            };
-            if owns_src {
-                unsafe { libc::close(src) };
-            }
-            // NOTE: bash does NOT assign $var in the PARENT for an external
-            // command — the redirect + var-assignment happen in the forked child,
-            // so the parent's `$var` is untouched (verified: `fd=99; /bin/echo hi
-            // {fd}>f` leaves $fd == 99). The child still inherits `high` OPEN
-            // (non-CLOEXEC) so the exec'd program sees the descriptor; we do not
-            // export $var to it (bash doesn't either). Hence: no `shell.set` here.
-            let _ = name;
-            // source == target makes the child's replay clear CLOEXEC on `high`
-            // (it is non-CLOEXEC already, but the branch must NOT dup2 onto a
-            // lower fd — `high` itself is the inherited descriptor).
-            plan.ops.push(ChildRedirOp::Dup {
-                target: high,
-                source: high,
-            });
-            if is_move {
-                // The "move": close the original source fd in the CHILD replay
-                // (it has already landed on `high`, which the child inherits).
-                plan.ops.push(ChildRedirOp::Close { target: src });
-            }
-            plan.held.push(unsafe { OwnedFd::from_raw_fd(high) });
             continue;
         }
         let Some(target) = redir.target_fd() else {
-            // RedirFd::Var is handled above; any other None is unexpected.
             {
                 let mut err = err_writer(err_sink, sink);
                 crate::sh_error_to!(shell, &mut *err, None, "ambiguous redirect");
             }
-            return Err(1);
+            fail!(1);
         };
-        let target = target as i32;
+        let target = target as RawFd;
         match &redir.op {
             RedirOp::File { mode, target: word } => {
                 let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
                     Ok(p) => p,
-                    Err(()) => return Err(1),
+                    Err(()) => fail!(1),
                 };
                 if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
-                    return Err(1);
+                    fail!(1);
                 }
                 let owned = match open_redirect_file(
                     mode,
@@ -5858,40 +5760,33 @@ fn build_child_redir_plan(
                     Ok(fd) => fd,
                     Err(e) => {
                         redir_open_error(shell, err_sink, sink, &path, &e);
-                        return Err(1);
+                        fail!(1);
                     }
                 };
-                use std::os::fd::AsRawFd;
-                let raw = owned.as_raw_fd();
-                plan.ops.push(ChildRedirOp::Dup {
+                plan.ops.push(PlanOp::InstallOwned {
                     target,
-                    source: raw,
+                    source: owned,
                 });
-                plan.held.push(owned);
             }
             RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
-                // `>&w` / `<&w` (dup), `>&w-` / `<&w-` (move). Resolve the source
-                // in the parent; the fd refers to a descriptor the child inherits
-                // (e.g. `&1`), so the number is valid in the child after fork. A
-                // move also replays a `Close` of the source in the child, except
-                // for the degenerate `N>&N-` (source == target), which bash treats
-                // as a pure no-op (redir.c's `redir_fd != redirector` guard).
                 let is_move = matches!(&redir.op, RedirOp::Move { .. });
-                let src = resolve_dup_source(source, shell, sink, err_sink).map_err(|()| 1)?;
-                // Degenerate `N>&N-` (source == target) contributes nothing.
+                let src = match resolve_dup_source(source, shell, sink, err_sink) {
+                    Ok(n) => n,
+                    Err(()) => fail!(1),
+                };
+                // Degenerate `N>&N-` (source == target): bash no-op (redir.c's
+                // `redir_fd != redirector` guard). Contributes nothing.
                 if !(is_move && src == target) {
-                    plan.ops.push(ChildRedirOp::Dup {
+                    plan.ops.push(PlanOp::InstallDup {
                         target,
                         source: src,
                     });
                     if is_move {
-                        plan.ops.push(ChildRedirOp::Close { target: src });
+                        plan.ops.push(PlanOp::Close { target: src });
                     }
                 }
             }
-            RedirOp::Close => {
-                plan.ops.push(ChildRedirOp::Close { target });
-            }
+            RedirOp::Close => plan.ops.push(PlanOp::Close { target }),
             RedirOp::Heredoc { body, .. } => {
                 let bytes = expand_assignment(body, shell).into_bytes();
                 match spawn_heredoc_writer(&bytes) {
@@ -5899,11 +5794,10 @@ fn build_child_redir_plan(
                         plan.heredoc_writers.push(pid);
                         let rfd = relocate_high_cloexec(rfd);
                         let owned = unsafe { OwnedFd::from_raw_fd(rfd) };
-                        plan.ops.push(ChildRedirOp::Dup {
+                        plan.ops.push(PlanOp::InstallOwned {
                             target,
-                            source: rfd,
+                            source: owned,
                         });
-                        plan.held.push(owned);
                     }
                     Err(e) => {
                         {
@@ -5916,7 +5810,7 @@ fn build_child_redir_plan(
                                 crate::bash_io_error(&e)
                             );
                         }
-                        return Err(1);
+                        fail!(1);
                     }
                 }
             }
@@ -5928,11 +5822,10 @@ fn build_child_redir_plan(
                         plan.heredoc_writers.push(pid);
                         let rfd = relocate_high_cloexec(rfd);
                         let owned = unsafe { OwnedFd::from_raw_fd(rfd) };
-                        plan.ops.push(ChildRedirOp::Dup {
+                        plan.ops.push(PlanOp::InstallOwned {
                             target,
-                            source: rfd,
+                            source: owned,
                         });
-                        plan.held.push(owned);
                     }
                     Err(e) => {
                         {
@@ -5945,13 +5838,212 @@ fn build_child_redir_plan(
                                 crate::bash_io_error(&e)
                             );
                         }
-                        return Err(1);
+                        fail!(1);
                     }
                 }
             }
         }
     }
     Ok(plan)
+}
+
+/// Lower a `{var}` named-fd redirection. Allocates a free high fd (>= 10,
+/// non-CLOEXEC) duped from the resolved source and emits a `NamedFd` op; a move
+/// also emits a `Close` of the original source. `{var}>&-` emits a `Close` of the
+/// fd currently named by `$name`. Mirrors the old `apply_var` /
+/// `build_child_redir_plan` `{var}` arms exactly.
+fn lower_named_fd(
+    name: &str,
+    redir: &Redirection,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+    plan: &mut RedirPlan,
+) -> Result<(), i32> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    if matches!(&redir.op, RedirOp::Close) {
+        let cur = shell.lookup_var(name).unwrap_or_default();
+        let fd: RawFd = match cur.trim().parse::<i32>() {
+            Ok(n) if n >= 0 => n,
+            _ => {
+                {
+                    let mut err = err_writer(err_sink, sink);
+                    crate::sh_error_to!(shell, &mut *err, None, "{name}: ambiguous redirect");
+                }
+                return Err(1);
+            }
+        };
+        plan.ops.push(PlanOp::Close { target: fd });
+        return Ok(());
+    }
+    let is_move = matches!(&redir.op, RedirOp::Move { .. });
+    // Resolve the source fd. `owned_src` holds an fd we opened (File / heredoc /
+    // here-string read end) that must be closed after duping to `high`; `dup_src`
+    // is a borrowed shell fd number (a Dup/Move source) left alone.
+    let mut owned_src: Option<OwnedFd> = None;
+    let mut dup_src: Option<RawFd> = None;
+    match &redir.op {
+        RedirOp::File { mode, target: word } => {
+            let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
+                Ok(p) => p,
+                Err(()) => return Err(1),
+            };
+            if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
+                return Err(1);
+            }
+            // RawLow: the {var}-fd relocation happens once below via dup_to_high_fd.
+            match open_redirect_file(
+                mode,
+                &path,
+                shell.shell_options.noclobber,
+                FdPlacement::RawLow,
+            ) {
+                Ok(fd) => owned_src = Some(fd),
+                Err(e) => {
+                    redir_open_error(shell, err_sink, sink, &path, &e);
+                    return Err(1);
+                }
+            }
+        }
+        RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
+            let src = resolve_dup_source(source, shell, sink, err_sink).map_err(|()| 1)?;
+            dup_src = Some(src);
+        }
+        RedirOp::Heredoc { body, .. } => {
+            let bytes = expand_assignment(body, shell).into_bytes();
+            match spawn_heredoc_writer(&bytes) {
+                Ok((rfd, pid)) => {
+                    plan.heredoc_writers.push(pid);
+                    owned_src = Some(unsafe { OwnedFd::from_raw_fd(rfd) });
+                }
+                Err(e) => {
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(
+                            shell,
+                            &mut *err,
+                            None,
+                            "heredoc: {}",
+                            crate::bash_io_error(&e)
+                        );
+                    }
+                    return Err(1);
+                }
+            }
+        }
+        RedirOp::HereString(w) => {
+            let mut bytes = expand_assignment(w, shell).into_bytes();
+            bytes.push(b'\n');
+            match spawn_heredoc_writer(&bytes) {
+                Ok((rfd, pid)) => {
+                    plan.heredoc_writers.push(pid);
+                    owned_src = Some(unsafe { OwnedFd::from_raw_fd(rfd) });
+                }
+                Err(e) => {
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(
+                            shell,
+                            &mut *err,
+                            None,
+                            "heredoc: {}",
+                            crate::bash_io_error(&e)
+                        );
+                    }
+                    return Err(1);
+                }
+            }
+        }
+        RedirOp::Close => unreachable!("Close handled above"),
+    }
+    let raw_src: RawFd = match (&owned_src, dup_src) {
+        (Some(o), _) => o.as_raw_fd(),
+        (None, Some(s)) => s,
+        _ => unreachable!("resolved exactly one source"),
+    };
+    let high = match crate::child_fd::dup_to_high_fd(raw_src, 10, false) {
+        Ok(h) => h,
+        Err(e) => {
+            // owned_src drops here (closes it); a dup_src is the shell's, left open.
+            {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(
+                    shell,
+                    &mut *err,
+                    None,
+                    "{name}: {}",
+                    crate::bash_io_error(&e)
+                );
+            }
+            return Err(1);
+        }
+    };
+    // Close the owned source now that it's been duped to `high`.
+    drop(owned_src);
+    plan.ops.push(PlanOp::NamedFd {
+        high: unsafe { OwnedFd::from_raw_fd(high) },
+        name: name.to_string(),
+    });
+    if is_move {
+        // Move: close the original source (a shell fd) after the dup. Only a
+        // Dup/Move source reaches here (owned sources aren't moves).
+        if let Some(s) = dup_src {
+            plan.ops.push(PlanOp::Close { target: s });
+        }
+    }
+    Ok(())
+}
+
+/// Lower `redirects` into a `ChildRedirPlan` for an external (forked) command by
+/// running the shared `lower_redirects` lowering and translating the neutral
+/// `RedirPlan` into the child dup2/close replay plan.
+fn build_child_redir_plan(
+    redirects: &[Redirection],
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> Result<ChildRedirPlan, i32> {
+    Ok(redir_plan_to_child(lower_redirects(
+        redirects, shell, sink, err_sink,
+    )?))
+}
+
+/// Translate a neutral `RedirPlan` into the child dup2/close replay plan. Owned
+/// temps move into `held` (kept alive until the fork); `{var}` high fds replay a
+/// defensive same-fd op and are held (the child inherits them non-CLOEXEC).
+/// `$var` is NOT assigned — bash doesn't for an external command.
+fn redir_plan_to_child(plan: RedirPlan) -> ChildRedirPlan {
+    use std::os::fd::AsRawFd;
+    let mut child = ChildRedirPlan {
+        ops: Vec::new(),
+        held: Vec::new(),
+        heredoc_writers: plan.heredoc_writers,
+    };
+    for op in plan.ops {
+        match op {
+            PlanOp::InstallOwned { target, source } => {
+                let raw = source.as_raw_fd();
+                child.ops.push(ChildRedirOp::Dup {
+                    target,
+                    source: raw,
+                });
+                child.held.push(source);
+            }
+            PlanOp::InstallDup { target, source } => {
+                child.ops.push(ChildRedirOp::Dup { target, source });
+            }
+            PlanOp::Close { target } => child.ops.push(ChildRedirOp::Close { target }),
+            PlanOp::NamedFd { high, name: _ } => {
+                let raw = high.as_raw_fd();
+                child.ops.push(ChildRedirOp::Dup {
+                    target: raw,
+                    source: raw,
+                });
+                child.held.push(high);
+            }
+        }
+    }
+    child
 }
 
 /// Additive (pipeline-stage) variant of `build_child_redir_plan`: lowers ONLY
