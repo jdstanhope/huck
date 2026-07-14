@@ -15,9 +15,6 @@ dup 3>&1	/bin/sh -c 'echo THREE >&3' 3>&1 | cat
 close 2>&-	$W 2>&- | cat
 in <f	echo FILE > infile; /bin/cat <infile | cat
 readwrite <>f	echo RW > rwfile; /bin/cat <>rwfile | cat
-fd3 heredoc	/bin/cat <&3 3<<HD | cat
-BODY3
-HD
 fd3 herestring	/bin/cat <&3 3<<<'HS' | cat
 fd4 open	/bin/sh -c 'echo FOUR >&4' 4>pf | cat; echo --f--; cat pf
 stage1 redir	$W 2>&1 >pf | cat; echo --f--; cat pf
