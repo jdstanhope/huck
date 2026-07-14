@@ -127,7 +127,7 @@ pub(crate) fn err_writer<'a>(
 /// `<prologue>{path}: {strerror}` via `sh_error_to!` — the non-interactive
 /// prologue (`<src>: line N: `) or interactive `huck: `, the offending path,
 /// and `bash_io_error` (strerror with no Rust `(os error N)` suffix). Single
-/// home for every `File::open`/`open_resolved`/`OpenOptions` redirect-open
+/// home for every `open_redirect_file` redirect-open
 /// error so the format stays identical across execution contexts. Routes
 /// through the CALLER's redirect-aware writer (built from `err_sink`/`out_sink`)
 /// rather than the thread-local sink, so an inner `2>&1`/capture on the
@@ -1034,69 +1034,33 @@ impl RedirectScope {
                 if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
                     return Err(ExecOutcome::Continue(1));
                 }
-                let new_fd: RawFd = match mode {
-                    FileMode::ReadOnly => match File::open(&path) {
-                        Ok(f) => f.into_raw_fd(),
+                let new_fd: RawFd =
+                    match open_redirect_file(mode, &path, shell.shell_options.noclobber) {
+                        Ok(owned) => owned.into_raw_fd(),
                         Err(e) => {
                             redir_open_error(shell, err_sink, sink, &path, &e);
                             return Err(ExecOutcome::Continue(1));
                         }
-                    },
-                    FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
-                        let resolved = match mode {
-                            FileMode::Append => ResolvedRedirect::Append(path),
-                            FileMode::Clobber => ResolvedRedirect::Truncate(path),
-                            // Truncate honors noclobber (`set -C`).
-                            _ if shell.shell_options.noclobber => {
-                                ResolvedRedirect::NoclobberTruncate(path)
-                            }
-                            _ => ResolvedRedirect::Truncate(path),
-                        };
-                        match open_resolved(&resolved) {
-                            Ok(f) => f.into_raw_fd(),
-                            Err(e) => {
-                                redir_open_error(
-                                    shell,
-                                    err_sink,
-                                    sink,
-                                    &resolved_path(&resolved),
-                                    &e,
-                                );
-                                return Err(ExecOutcome::Continue(1));
-                            }
-                        }
-                    }
-                    FileMode::ReadWrite => {
-                        // `<>`: O_RDWR|O_CREAT — open in place, do NOT truncate
-                        // (bash keeps existing content for read-write access).
-                        match OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .create(true)
-                            .truncate(false)
-                            .open(&path)
-                        {
-                            Ok(f) => f.into_raw_fd(),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                return Err(ExecOutcome::Continue(1));
-                            }
-                        }
-                    }
-                };
+                    };
                 if new_fd == target {
-                    // The kernel placed the opened file directly at the target fd,
-                    // which means target was previously free/closed (lowest-free
-                    // fd == target). Leave the file in place and record a
-                    // "was-closed" restore (-1) so Drop closes target back when
-                    // the scope ends. Do NOT dup2 and do NOT close new_fd (it IS
-                    // the target now).
+                    // The relocated file landed directly on `target` (only
+                    // possible for target >= 10 with 10..target busy). Leave it
+                    // in place and record a "was-closed" restore (-1). It is
+                    // CLOEXEC'd (from open_redirect_file), and a no-op dup2 would
+                    // NOT clear that — so clear FD_CLOEXEC in place, exactly as
+                    // replay_redir_ops' source==target arm does, or it vanishes
+                    // on a later exec (this is the #135 mechanism generalized).
+                    unsafe {
+                        let flags = libc::fcntl(target, libc::F_GETFD);
+                        if flags >= 0 {
+                            let _ = libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                        }
+                    }
                     self.saved.push((target, -1));
                 } else {
                     // Normal case: save the prior target state (or -1 if it was
-                    // closed), dup2 the opened file onto the target, then close
-                    // the temp fd. `redirect()` already records saved=-1 when
-                    // dup(target) returns EBADF (target was free but not lowest).
+                    // closed), dup2 the opened file onto the target (which clears
+                    // FD_CLOEXEC on target), then close the temp fd.
                     if self
                         .redirect(shell, new_fd, target, sink, err_sink)
                         .is_err()
@@ -1148,6 +1112,7 @@ impl RedirectScope {
                 match spawn_heredoc_writer(&bytes) {
                     Ok((rfd, pid)) => {
                         self.heredoc_writers.push(pid);
+                        let rfd = relocate_high_cloexec(rfd);
                         if self.redirect(shell, rfd, target, sink, err_sink).is_err() {
                             unsafe { libc::close(rfd) };
                             return Err(ExecOutcome::Continue(1));
@@ -1176,6 +1141,7 @@ impl RedirectScope {
                 match spawn_heredoc_writer(&bytes) {
                     Ok((rfd, pid)) => {
                         self.heredoc_writers.push(pid);
+                        let rfd = relocate_high_cloexec(rfd);
                         if self.redirect(shell, rfd, target, sink, err_sink).is_err() {
                             unsafe { libc::close(rfd) };
                             return Err(ExecOutcome::Continue(1));
@@ -1251,51 +1217,12 @@ impl RedirectScope {
                 if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
                     return Err(ExecOutcome::Continue(1));
                 }
-                let fd: RawFd = match mode {
-                    FileMode::ReadOnly => match File::open(&path) {
-                        Ok(f) => f.into_raw_fd(),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            return Err(ExecOutcome::Continue(1));
-                        }
-                    },
-                    FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
-                        let resolved = match mode {
-                            FileMode::Append => ResolvedRedirect::Append(path),
-                            FileMode::Clobber => ResolvedRedirect::Truncate(path),
-                            _ if shell.shell_options.noclobber => {
-                                ResolvedRedirect::NoclobberTruncate(path)
-                            }
-                            _ => ResolvedRedirect::Truncate(path),
-                        };
-                        match open_resolved(&resolved) {
-                            Ok(f) => f.into_raw_fd(),
-                            Err(e) => {
-                                redir_open_error(
-                                    shell,
-                                    err_sink,
-                                    sink,
-                                    &resolved_path(&resolved),
-                                    &e,
-                                );
-                                return Err(ExecOutcome::Continue(1));
-                            }
-                        }
-                    }
-                    FileMode::ReadWrite => {
-                        match OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .create(true)
-                            .truncate(false)
-                            .open(&path)
-                        {
-                            Ok(f) => f.into_raw_fd(),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                return Err(ExecOutcome::Continue(1));
-                            }
-                        }
+                let fd: RawFd = match open_redirect_file(mode, &path, shell.shell_options.noclobber)
+                {
+                    Ok(owned) => owned.into_raw_fd(),
+                    Err(e) => {
+                        redir_open_error(shell, err_sink, sink, &path, &e);
+                        return Err(ExecOutcome::Continue(1));
                     }
                 };
                 (fd, true)
@@ -3390,7 +3317,7 @@ fn run_background_sequence(
                             );
                         }
                     };
-                    match File::open(&path) {
+                    match open_redirect_file(&FileMode::ReadOnly, &path, false) {
                         Ok(f) => ChildFd::from(f),
                         Err(e) => {
                             redir_open_error(shell, err_sink, sink, &path, &e);
@@ -3559,7 +3486,7 @@ fn run_background_sequence(
                         };
                         let guard =
                             shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                        match open_writable(&path, guard) {
+                        match open_redirect_file(&FileMode::Truncate, &path, guard) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -3588,7 +3515,7 @@ fn run_background_sequence(
                                 );
                             }
                         };
-                        match OpenOptions::new().create(true).append(true).open(&path) {
+                        match open_redirect_file(&FileMode::Append, &path, false) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -3629,7 +3556,7 @@ fn run_background_sequence(
                         };
                         let guard =
                             shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                        match open_writable(&path, guard) {
+                        match open_redirect_file(&FileMode::Truncate, &path, guard) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -3658,7 +3585,7 @@ fn run_background_sequence(
                                 );
                             }
                         };
-                        match OpenOptions::new().create(true).append(true).open(&path) {
+                        match open_redirect_file(&FileMode::Append, &path, false) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -4111,12 +4038,6 @@ struct ResolvedCommand {
     decl_args: Option<Vec<crate::command::DeclArg>>,
 }
 
-enum ResolvedRedirect {
-    Truncate(String),
-    NoclobberTruncate(String),
-    Append(String),
-}
-
 fn expand_single(
     word: &crate::lexer::Word,
     shell: &mut Shell,
@@ -4360,12 +4281,32 @@ fn spawn_heredoc_writer(bytes: &[u8]) -> Result<(RawFd, libc::pid_t), io::Error>
     Ok((r, pid))
 }
 
-fn open_resolved(redirect: &ResolvedRedirect) -> io::Result<File> {
-    match redirect {
-        ResolvedRedirect::Truncate(path) => open_writable(path, false),
-        ResolvedRedirect::NoclobberTruncate(path) => open_writable(path, true),
-        ResolvedRedirect::Append(path) => OpenOptions::new().create(true).append(true).open(path),
-    }
+/// THE redirect file-open matrix: open `path` per `mode` (ReadOnly / Truncate
+/// honoring `noclobber` / Clobber / Append / ReadWrite-no-truncate), then
+/// relocate the fd >= 10 with FD_CLOEXEC (best-effort on EMFILE, via
+/// relocate_high_cloexec) so a parent-opened redirect *source* can never land
+/// in the 0..9 range that redirect *targets* operate on (#135, #132-class).
+/// Callers report failures via `redir_open_error(path, ..)` as today.
+fn open_redirect_file(
+    mode: &FileMode,
+    path: &str,
+    noclobber: bool,
+) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+    let file: File = match mode {
+        FileMode::ReadOnly => File::open(path)?,
+        FileMode::Truncate => open_writable(path, noclobber)?,
+        FileMode::Clobber => open_writable(path, false)?,
+        FileMode::Append => OpenOptions::new().create(true).append(true).open(path)?,
+        FileMode::ReadWrite => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?,
+    };
+    let raw = relocate_high_cloexec(file.into_raw_fd());
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
 /// Opens `path` for writing, truncating. When `guard_noclobber` is true
@@ -4395,14 +4336,6 @@ fn open_writable(path: &str, guard_noclobber: bool) -> io::Result<File> {
             }
         }
         Err(e) => Err(e),
-    }
-}
-
-fn resolved_path(redirect: &ResolvedRedirect) -> &str {
-    match redirect {
-        ResolvedRedirect::Truncate(p)
-        | ResolvedRedirect::NoclobberTruncate(p)
-        | ResolvedRedirect::Append(p) => p,
     }
 }
 
@@ -5727,54 +5660,15 @@ fn build_child_redir_plan(
                     if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
                         return Err(1);
                     }
-                    let file: File = match mode {
-                        FileMode::ReadOnly => match File::open(&path) {
-                            Ok(f) => f,
+                    let fd: RawFd =
+                        match open_redirect_file(mode, &path, shell.shell_options.noclobber) {
+                            Ok(owned) => owned.into_raw_fd(),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
                                 return Err(1);
                             }
-                        },
-                        FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
-                            let resolved = match mode {
-                                FileMode::Append => ResolvedRedirect::Append(path),
-                                FileMode::Clobber => ResolvedRedirect::Truncate(path),
-                                _ if shell.shell_options.noclobber => {
-                                    ResolvedRedirect::NoclobberTruncate(path)
-                                }
-                                _ => ResolvedRedirect::Truncate(path),
-                            };
-                            match open_resolved(&resolved) {
-                                Ok(f) => f,
-                                Err(e) => {
-                                    redir_open_error(
-                                        shell,
-                                        err_sink,
-                                        sink,
-                                        &resolved_path(&resolved),
-                                        &e,
-                                    );
-                                    return Err(1);
-                                }
-                            }
-                        }
-                        FileMode::ReadWrite => {
-                            match OpenOptions::new()
-                                .read(true)
-                                .write(true)
-                                .create(true)
-                                .truncate(false)
-                                .open(&path)
-                            {
-                                Ok(f) => f,
-                                Err(e) => {
-                                    redir_open_error(shell, err_sink, sink, &path, &e);
-                                    return Err(1);
-                                }
-                            }
-                        }
-                    };
-                    (file.into_raw_fd(), true)
+                        };
+                    (fd, true)
                 }
                 RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
                     // Dup and move resolve the source identically; a move's extra
@@ -5892,57 +5786,15 @@ fn build_child_redir_plan(
                 if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
                     return Err(1);
                 }
-                let file: File = match mode {
-                    FileMode::ReadOnly => match File::open(&path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            return Err(1);
-                        }
-                    },
-                    FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
-                        let resolved = match mode {
-                            FileMode::Append => ResolvedRedirect::Append(path),
-                            FileMode::Clobber => ResolvedRedirect::Truncate(path),
-                            _ if shell.shell_options.noclobber => {
-                                ResolvedRedirect::NoclobberTruncate(path)
-                            }
-                            _ => ResolvedRedirect::Truncate(path),
-                        };
-                        match open_resolved(&resolved) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                redir_open_error(
-                                    shell,
-                                    err_sink,
-                                    sink,
-                                    &resolved_path(&resolved),
-                                    &e,
-                                );
-                                return Err(1);
-                            }
-                        }
-                    }
-                    FileMode::ReadWrite => {
-                        match OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .create(true)
-                            .truncate(false)
-                            .open(&path)
-                        {
-                            Ok(f) => f,
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                return Err(1);
-                            }
-                        }
+                let owned = match open_redirect_file(mode, &path, shell.shell_options.noclobber) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        redir_open_error(shell, err_sink, sink, &path, &e);
+                        return Err(1);
                     }
                 };
-                // Relocate above fd 9 so the source never collides with a low
-                // explicit-redirect target (e.g. `2>file 3>&2`).
-                let raw = relocate_high_cloexec(file.into_raw_fd());
-                let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+                use std::os::fd::AsRawFd;
+                let raw = owned.as_raw_fd();
                 plan.ops.push(ChildRedirOp::Dup {
                     target,
                     source: raw,
@@ -6054,7 +5906,7 @@ fn build_child_extra_ops(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> Result<(Vec<ChildRedirOp>, Vec<std::os::fd::OwnedFd>), i32> {
-    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::fd::OwnedFd;
     let extra = stage_extra_redirects(redirects);
     let mut ops: Vec<ChildRedirOp> = Vec::new();
     let mut held: Vec<OwnedFd> = Vec::new();
@@ -6076,59 +5928,20 @@ fn build_child_extra_ops(
                 if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
                     return Err(1);
                 }
-                let file: File = match mode {
-                    FileMode::ReadOnly => match File::open(&path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            return Err(1);
-                        }
-                    },
-                    FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
-                        let resolved = match mode {
-                            FileMode::Append => ResolvedRedirect::Append(path),
-                            FileMode::Clobber => ResolvedRedirect::Truncate(path),
-                            _ if shell.shell_options.noclobber => {
-                                ResolvedRedirect::NoclobberTruncate(path)
-                            }
-                            _ => ResolvedRedirect::Truncate(path),
-                        };
-                        match open_resolved(&resolved) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                redir_open_error(
-                                    shell,
-                                    err_sink,
-                                    sink,
-                                    &resolved_path(&resolved),
-                                    &e,
-                                );
-                                return Err(1);
-                            }
-                        }
-                    }
-                    FileMode::ReadWrite => {
-                        match OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .create(true)
-                            .truncate(false)
-                            .open(&path)
-                        {
-                            Ok(f) => f,
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                return Err(1);
-                            }
-                        }
+                let owned = match open_redirect_file(mode, &path, shell.shell_options.noclobber) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        redir_open_error(shell, err_sink, sink, &path, &e);
+                        return Err(1);
                     }
                 };
-                let raw = relocate_high_cloexec(file.into_raw_fd());
+                use std::os::fd::AsRawFd;
+                let raw = owned.as_raw_fd();
                 ops.push(ChildRedirOp::Dup {
                     target,
                     source: raw,
                 });
-                held.push(unsafe { OwnedFd::from_raw_fd(raw) });
+                held.push(owned);
             }
             RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
                 // `>&w` (dup) / `>&w-` (move): resolve in the parent (the fd is
@@ -6990,7 +6803,7 @@ fn run_multi_stage(
                             return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     };
-                    match File::open(&path) {
+                    match open_redirect_file(&FileMode::ReadOnly, &path, false) {
                         Ok(f) => ChildFd::from(f),
                         Err(e) => {
                             redir_open_error(shell, err_sink, sink, &path, &e);
@@ -7106,7 +6919,7 @@ fn run_multi_stage(
                         };
                         let guard =
                             shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                        match open_writable(&path, guard) {
+                        match open_redirect_file(&FileMode::Truncate, &path, guard) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -7123,7 +6936,7 @@ fn run_multi_stage(
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         };
-                        match OpenOptions::new().create(true).append(true).open(&path) {
+                        match open_redirect_file(&FileMode::Append, &path, false) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -7152,7 +6965,7 @@ fn run_multi_stage(
                         };
                         let guard =
                             shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                        match open_writable(&path, guard) {
+                        match open_redirect_file(&FileMode::Truncate, &path, guard) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
@@ -7169,7 +6982,7 @@ fn run_multi_stage(
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         };
-                        match OpenOptions::new().create(true).append(true).open(&path) {
+                        match open_redirect_file(&FileMode::Append, &path, false) {
                             Ok(f) => Some(ChildFd::from(f)),
                             Err(e) => {
                                 redir_open_error(shell, err_sink, sink, &path, &e);
