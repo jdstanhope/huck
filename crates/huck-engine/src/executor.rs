@@ -1204,49 +1204,6 @@ fn final_dests_for_1_2(redirs: &[Redirection], shell: &mut Shell) -> (RedirectDe
     (fd1, fd2)
 }
 
-/// Returns the redirections NOT consumed by the pipeline-stage 0/1/2 slot
-/// fast-path (`slots_for_simple_path`): fd>2, `<&` dup-in, `N>&-` close, `<>`
-/// ReadWrite, and the cross-direction combos the fast-path drops. The fast-path
-/// consumes:
-///   fd 0: File{ReadOnly}, Heredoc, HereString
-///   fd 1/2: File{Truncate|Append|Clobber}, Dup{output:true}
-/// A redirection is "extra" iff it is NOT one the fast-path consumes. ALL
-/// fast-path-consumed entries are excluded — including earlier same-fd entries
-/// the fast-path shadowed (they would be a no-op or, worse, double-applied, so we
-/// drop every fast-path-eligible entry regardless of position).
-/// Used ONLY by the pipeline-external additive path (`build_child_extra_ops`);
-/// the single-command builtin/external paths now apply the full ordered list.
-fn stage_extra_redirects(redirs: &[Redirection]) -> Vec<Redirection> {
-    redirs
-        .iter()
-        .filter(|r| !slot_consumes(r))
-        .cloned()
-        .collect()
-}
-
-/// True if the pipeline-stage 0/1/2 slot fast-path consumes this redirection into
-/// a slot (so the additive extra-op list must skip it to avoid double-applying).
-fn slot_consumes(r: &Redirection) -> bool {
-    match r.target_fd() {
-        Some(0) => matches!(
-            &r.op,
-            RedirOp::File {
-                mode: FileMode::ReadOnly,
-                ..
-            } | RedirOp::Heredoc { .. }
-                | RedirOp::HereString(_)
-        ),
-        Some(1) | Some(2) => matches!(
-            &r.op,
-            RedirOp::File {
-                mode: FileMode::Truncate | FileMode::Append | FileMode::Clobber,
-                ..
-            } | RedirOp::Dup { output: true, .. }
-        ),
-        _ => false,
-    }
-}
-
 /// Applies redirects at the real-fd level (saved/restored via `RedirectScope`),
 /// forcing a `Terminal` inner sink when a stdout redirect is present so the
 /// redirect wins over an outer capture, then runs `run_inner(shell, inner_sink)`
@@ -3607,7 +3564,7 @@ fn run_background_sequence(
                 child_stdio,
                 pgid_target,
                 &fds_to_close_in_child,
-                external_plan,
+                external_plan.expect("external stage always has a ChildRedirPlan"),
             ),
             StageKind::InProcess(cmd) => fork_and_run_in_subshell(
                 cmd,
@@ -5931,95 +5888,6 @@ fn redir_plan_to_child(plan: RedirPlan) -> ChildRedirPlan {
     child
 }
 
-/// Additive (pipeline-stage) variant of `build_child_redir_plan`: lowers ONLY
-/// the redirects the 0/1/2 slot fast-path does NOT consume (fd>2 File/Dup/Close,
-/// `<&` dup-in, `N>&-` close, `<>` ReadWrite) into a replay list, opening files
-/// in the PARENT. The fast-path-consumed 0/1/2 file/dup ops are applied by the
-/// caller's existing pipe/stdio mechanism BEFORE this replay; the extra ops then
-/// add the higher / cross-direction fds on top.
-///
-/// RESIDUAL LIMITATION (v156 task 7): this is the ONLY path still on the slot
-/// fast-path. Source ordering between a 0/1/2 op and an extra op is NOT preserved
-/// for pipeline stages (`cmd 2>&1 >file | …` is last-wins, unlike a single
-/// command), and a heredoc/here-string on an fd>2 of a *pipeline-stage* external
-/// is dropped (it would need a reaped writer threaded through the pipeline wait
-/// point). The single-command builtin/external paths do NOT use this — they apply
-/// the full ordered `cmd.redirects` (so L-08 + fd>2 heredoc are fixed there).
-fn build_child_extra_ops(
-    redirects: &[Redirection],
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> Result<(Vec<ChildRedirOp>, Vec<std::os::fd::OwnedFd>), i32> {
-    use std::os::fd::OwnedFd;
-    let extra = stage_extra_redirects(redirects);
-    let mut ops: Vec<ChildRedirOp> = Vec::new();
-    let mut held: Vec<OwnedFd> = Vec::new();
-    for redir in &extra {
-        let Some(target) = redir.target_fd() else {
-            {
-                let mut err = err_writer(err_sink, sink);
-                crate::sh_error_to!(shell, &mut *err, None, "ambiguous redirect");
-            }
-            return Err(1);
-        };
-        let target = target as i32;
-        match &redir.op {
-            RedirOp::File { mode, target: word } => {
-                let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
-                    Ok(p) => p,
-                    Err(()) => return Err(1),
-                };
-                if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
-                    return Err(1);
-                }
-                let owned = match open_redirect_file(
-                    mode,
-                    &path,
-                    shell.shell_options.noclobber,
-                    FdPlacement::Relocated,
-                ) {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        redir_open_error(shell, err_sink, sink, &path, &e);
-                        return Err(1);
-                    }
-                };
-                use std::os::fd::AsRawFd;
-                let raw = owned.as_raw_fd();
-                ops.push(ChildRedirOp::Dup {
-                    target,
-                    source: raw,
-                });
-                held.push(owned);
-            }
-            RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
-                // `>&w` (dup) / `>&w-` (move): resolve in the parent (the fd is
-                // valid in the child after fork). A move also replays a `Close` of
-                // the source in the child, except for the degenerate `N>&N-`
-                // (source == target), which bash treats as a pure no-op.
-                let is_move = matches!(&redir.op, RedirOp::Move { .. });
-                let src = resolve_dup_source(source, shell, sink, err_sink).map_err(|()| 1)?;
-                if !(is_move && src == target) {
-                    ops.push(ChildRedirOp::Dup {
-                        target,
-                        source: src,
-                    });
-                    if is_move {
-                        ops.push(ChildRedirOp::Close { target: src });
-                    }
-                }
-            }
-            RedirOp::Close => ops.push(ChildRedirOp::Close { target }),
-            RedirOp::Heredoc { .. } | RedirOp::HereString(_) => {
-                // Documented additive gap (see fn doc): an fd>2 heredoc on a
-                // pipeline-stage external. The bridge dropped this already.
-            }
-        }
-    }
-    Ok((ops, held))
-}
-
 /// Emit a spawn-failure diagnostic (command-not-found / exec error) for an
 /// external command whose redirects were lowered into a CHILD-only replay
 /// plan (`ChildRedirPlan`) that never ran (the fork never happened). Since
@@ -7335,7 +7203,7 @@ fn run_multi_stage(
                 child_stdio,
                 pgid_target,
                 &fds_to_close_in_child,
-                external_plan,
+                external_plan.expect("external stage always has a ChildRedirPlan"),
             ),
             StageKind::InProcess(cmd) => fork_and_run_in_subshell(
                 cmd,
@@ -8454,7 +8322,7 @@ fn spawn_external_with_fds(
     stdio: ChildStdio,
     pgid_target: i32,
     parent_fds_to_close: &[RawFd],
-    plan: Option<ChildRedirPlan>,
+    plan: ChildRedirPlan,
 ) -> Result<i32, io::Error> {
     // Flush pending parent stdout before spawning an external stage so its output
     // does not race ahead of buffered parent bytes (M-118 sibling: ordering).
@@ -8482,53 +8350,13 @@ fn spawn_external_with_fds(
         ));
     }
 
-    // Unify: `replay_ops` are replayed in the child pre_exec (source order),
-    // `held` keeps parent-opened files alive until after spawn, `extra_targets`
-    // (derived below) are fds a replay op installs (must be excluded from the
-    // close list).
-    let stdout_dup_target: Option<i32>;
-    let stderr_dup_target: Option<i32>;
-    let replay_ops: Vec<ChildRedirOp>;
-    let held: Vec<std::os::fd::OwnedFd>;
-    if let Some(p) = plan {
-        // Full-plan path (external pipeline stages, foreground AND background):
-        // the whole ordered redirect list is in the plan; no slot dup-targets,
-        // no extra_ops.
-        stdout_dup_target = None;
-        stderr_dup_target = None;
-        replay_ops = p.ops;
-        held = p.held;
-        // p.heredoc_writers: the foreground caller drains this before calling;
-        // the background caller leaves it in the plan and it drops here as a
-        // no-op Vec<pid_t> (bg heredoc writers are SIGCHLD-reaped). Either way
-        // the spawner ignores the field.
-    } else {
-        // LEGACY slot path: retained but no longer reached — after v294 both
-        // pipeline callers pass Some(plan) for external stages (single external
-        // commands still use run_subprocess). Kept until the slot-machinery
-        // retirement follow-up. slot dup-targets + build_child_extra_ops for
-        // fd>2/dup-in/close/<>.
-        // Resolve Dup targets pre-fork (Word expansion may allocate; not
-        // async-signal-safe). stdout-dup BEFORE stderr-dup matches canonical
-        // `>file 2>&1` semantics.
-        stdout_dup_target = match &exec.slot_stdout() {
-            Some(RedirectSlot::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
-            _ => None,
-        };
-        stderr_dup_target = match &exec.slot_stderr() {
-            Some(RedirectSlot::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
-            _ => None,
-        };
-
-        // v156 task 4 (additive): lower the redirects the 0/1/2 bridge does NOT
-        // consume (fd>2, `<&` dup-in, `N>&-` close, `<>`) into an ordered replay
-        // applied in the child AFTER the bridge stdio/dup. `held` keeps the
-        // parent-opened files alive (FD_CLOEXEC) until after spawn.
-        let (extra_ops, extra_held) = build_child_extra_ops(&exec.redirects, shell, sink, err_sink)
-            .map_err(|code| io::Error::other(format!("redirect failed with code {code}")))?;
-        replay_ops = extra_ops;
-        held = extra_held;
-    }
+    // External pipeline stages replay their full ordered ChildRedirPlan; no slot
+    // dup-targets, no extra_ops. (heredoc_writers: the fg caller drains them; the
+    // bg caller leaves them in the plan to drop as a no-op — SIGCHLD reaps.)
+    let stdout_dup_target: Option<i32> = None;
+    let stderr_dup_target: Option<i32> = None;
+    let replay_ops: Vec<ChildRedirOp> = plan.ops;
+    let held: Vec<std::os::fd::OwnedFd> = plan.held;
 
     let mut process = ProcessCommand::new(&resolved.program);
     process.args(&resolved.args);
