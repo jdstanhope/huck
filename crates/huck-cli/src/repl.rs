@@ -113,7 +113,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
         if huck_engine::builtins::set_o_option_by_name(&mut shell_cell.borrow_mut(), name, *enable)
             .is_err()
         {
-            eprintln!("huck: {name}: invalid option name");
+            emit_cli_error(&prog, format_args!("{name}: invalid option name"));
             std::process::exit(2);
         }
     }
