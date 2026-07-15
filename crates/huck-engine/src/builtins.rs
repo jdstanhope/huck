@@ -5148,6 +5148,19 @@ fn leading_invalid_option(args: &[String]) -> Option<char> {
     rest.chars().next()
 }
 
+/// #162: true if the resolved job has already completed (Done/Signaled) — the
+/// entry-reap consumed its terminal status. bash reaps and removes such a job
+/// before `fg`/`bg` look it up, so both builtins must treat it as gone rather
+/// than acting on a phantom entry with a dead process group.
+fn job_already_terminal(shell: &Shell, id: u32) -> bool {
+    shell.jobs.iter().find(|j| j.id == id).is_some_and(|j| {
+        matches!(
+            j.state,
+            crate::jobs::JobState::Done(_) | crate::jobs::JobState::Signaled(_)
+        )
+    })
+}
+
 fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     // #158: drain pending STOP/CONT before resolving/acting on the job.
     crate::jobs::reap_completed(shell);
@@ -5175,6 +5188,16 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
             return ExecOutcome::Continue(2);
         }
     };
+    // #162: if the entry-reap already completed this job, it is gone as far as
+    // fg is concerned — match bash: report "no such job", drop the phantom
+    // entry, and return 1 (rather than clobbering it back to Running and racing
+    // waitpid(-pgid) into ECHILD, which leaked a Running entry with a dead pgid).
+    if job_already_terminal(shell, id) {
+        let spec = args.first().map(String::as_str).unwrap_or("current");
+        crate::sh_error_to!(shell, err, None, "fg: {spec}: no such job");
+        shell.jobs.jobs_mut().retain(|j| j.id != id);
+        return ExecOutcome::Continue(1);
+    }
     let (pgid, pids, command) = {
         if let Some(job) = shell.jobs.jobs_mut().iter_mut().find(|j| j.id == id) {
             job.state = crate::jobs::JobState::Running;
@@ -5280,6 +5303,15 @@ fn builtin_bg(
                 Ok(id) => id,
                 Err(outcome) => return outcome,
             };
+            // #162: a job the entry-reap already completed is gone — match bash's
+            // "no such job" + drop the phantom entry, before the not-stopped
+            // check below would misreport it as "already running".
+            if job_already_terminal(shell, id) {
+                let spec = &args[0];
+                crate::sh_error_to!(shell, err, None, "bg: {spec}: no such job");
+                shell.jobs.jobs_mut().retain(|j| j.id != id);
+                return ExecOutcome::Continue(1);
+            }
             // Verify the resolved job is actually Stopped.
             let is_stopped = shell
                 .jobs
