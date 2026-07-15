@@ -7900,6 +7900,55 @@ fn classify_stage<'a>(cmd: &'a Command, shell: &Shell) -> StageKind<'a> {
     StageKind::InProcess(cmd)
 }
 
+/// Whether an external pipeline stage's program can be run, and if not, the
+/// bash diagnostic body + exit code (127 not-found, 126 found-but-not-executable).
+#[derive(Debug)]
+enum StageRunnability {
+    Runnable,
+    NotRunnable { body: String, code: i32 },
+}
+
+/// Classify a resolved program string the way bash's command search + `execve`
+/// would, so an unrunnable stage becomes a 126/127 diagnostic child (#78).
+fn classify_stage_runnability(program: &str, shell: &Shell) -> StageRunnability {
+    if program.contains('/') {
+        match std::fs::metadata(program) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => StageRunnability::NotRunnable {
+                body: format!("{program}: No such file or directory"),
+                code: 127,
+            },
+            Err(e) => StageRunnability::NotRunnable {
+                body: format!("{program}: {}", crate::bash_io_error(&e)),
+                code: 126,
+            },
+            Ok(md) if md.is_dir() => StageRunnability::NotRunnable {
+                body: format!("{program}: Is a directory"),
+                code: 126,
+            },
+            Ok(_) => {
+                // Executable bit? Use a real access(X_OK) so the errno text matches libc.
+                let c = std::ffi::CString::new(program).unwrap_or_default();
+                if unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0 {
+                    StageRunnability::Runnable
+                } else {
+                    let e = std::io::Error::last_os_error();
+                    StageRunnability::NotRunnable {
+                        body: format!("{program}: {}", crate::bash_io_error(&e)),
+                        code: 126,
+                    }
+                }
+            }
+        }
+    } else if builtins::search_path_for(program, shell).is_some() {
+        StageRunnability::Runnable
+    } else {
+        StageRunnability::NotRunnable {
+            body: format!("{program}: command not found"),
+            code: 127,
+        }
+    }
+}
+
 /// Spawns an external command with a pre-built `ChildStdio`.
 ///
 /// Consumes `stdio`: each `ChildFd::Owned` slot becomes a `Stdio` (ownership
