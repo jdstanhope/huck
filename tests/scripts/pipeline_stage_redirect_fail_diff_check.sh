@@ -56,8 +56,10 @@ check 'blt-first'    'read x </no/such/file | wc -c'
 check 'blt-last'     'true | read x </no/such/file'
 # --- compound stage fails (regression guard: already correct) ---
 check 'cmp-middle'   'true | { cat; } </no/such/file | cat'
-# --- two stages fail ---
-check 'two-fail'     'cat </no/a | cat </no/b | wc -c'
+# --- two stages fail (both stages print an error; bash's two failed children
+#     race on stderr ORDER, so compare structurally — rc+stdout+PIPESTATUS are
+#     deterministic (1 1 0) in both) ---
+check_ps 'two-fail'  'cat </no/a | cat </no/b | wc -c'
 # --- upstream floods a dead reader -> SIGPIPE 141 (yes never exits, so its
 #     141 is deterministic; a `head -N` middle stage would race 0-vs-141) ---
 check 'sigpipe-up'   'yes | cat </no/such/file | wc -l'
