@@ -4245,6 +4245,10 @@ fn builtin_jobs(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
+    // #158: observe any pending STOP/CONT reports before reading job state, so
+    // non-interactive `jobs` reflects Stopped/Running like the interactive REPL
+    // (which reaps pre-prompt). Non-blocking + idempotent.
+    crate::jobs::reap_completed(shell);
     let parsed = match parse_jobs_args(args, err, shell) {
         Ok(p) => p,
         Err(outcome) => return outcome,
@@ -5122,6 +5126,8 @@ fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Ex
 }
 
 fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    // #158: drain pending STOP/CONT before resolving/acting on the job.
+    crate::jobs::reap_completed(shell);
     let id = match args.len() {
         0 => match shell.jobs.current_id() {
             Some(id) => id,
@@ -5222,6 +5228,8 @@ fn builtin_bg(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
+    // #158: drain pending STOP/CONT so `bg` finds a newly-stopped job.
+    crate::jobs::reap_completed(shell);
     let id = match args.len() {
         0 => match shell.jobs.current_stopped_id() {
             Some(id) => id,
