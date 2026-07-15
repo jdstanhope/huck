@@ -140,6 +140,17 @@ impl JobTable {
                     }
                     return;
                 }
+                if libc::WIFCONTINUED(raw_status) {
+                    // A WCONTINUED report: a previously-Stopped job resumed
+                    // (e.g. `kill -s CONT` / `bg`). Flip it back to Running. A
+                    // continue is NOT a terminal reap, so do not touch
+                    // `job.reaped[idx]`. Idempotent: no-op if already Running.
+                    if matches!(job.state, JobState::Stopped(_)) {
+                        job.state = JobState::Running;
+                        job.notified = false;
+                    }
+                    return;
+                }
                 if job.reaped[idx] {
                     return;
                 }
@@ -301,7 +312,13 @@ pub fn reap_completed(shell: &mut crate::shell_state::Shell) {
         .store(false, std::sync::atomic::Ordering::Relaxed);
     loop {
         let mut raw_status: libc::c_int = 0;
-        let pid = unsafe { libc::waitpid(-1, &mut raw_status, libc::WNOHANG | libc::WUNTRACED) };
+        let pid = unsafe {
+            libc::waitpid(
+                -1,
+                &mut raw_status,
+                libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED,
+            )
+        };
         if pid <= 0 {
             // 0 = no children changed state; -1 = no children at all (ECHILD)
             break;
@@ -309,8 +326,10 @@ pub fn reap_completed(shell: &mut crate::shell_state::Shell) {
         shell.jobs.reap(pid as i32, raw_status);
         // If the reaped child is a live coproc that actually exited, close its
         // fds + unset NAME/NAME_PID. A WIFSTOPPED (WUNTRACED) report means the
-        // coproc is merely stopped and still alive — do NOT reap it.
-        if !libc::WIFSTOPPED(raw_status) {
+        // coproc is merely stopped, and a WIFCONTINUED (WCONTINUED) report means
+        // it just resumed — in BOTH cases it is still alive, so do NOT reap it
+        // (reap_coproc tears the coproc down unconditionally by pid).
+        if !libc::WIFSTOPPED(raw_status) && !libc::WIFCONTINUED(raw_status) {
             shell.reap_coproc(pid as i32);
         }
     }
@@ -680,6 +699,44 @@ mod tests {
             !j.notified,
             "stopped jobs must be visible to the next notification pass"
         );
+    }
+
+    // A raw waitpid status for which WIFCONTINUED is true. On Linux/glibc
+    // WIFCONTINUED(status) is `status == 0xffff` (the __W_CONTINUED sentinel).
+    fn fake_continued_raw() -> libc::c_int {
+        0xffff
+    }
+
+    #[test]
+    fn reap_continued_transitions_stopped_job_to_running() {
+        let mut t = JobTable::new();
+        let _ = t.add(4242, vec![4242], "sleep 100".to_string());
+        // First stop it.
+        let stopped: libc::c_int = (libc::SIGTSTP << 8) | 0x7f;
+        t.reap(4242, stopped);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(_)));
+        // A continued report flips it back to Running (not reaped/Done).
+        t.reap(4242, fake_continued_raw());
+        let j = &t.jobs_mut()[0];
+        assert!(
+            matches!(j.state, JobState::Running),
+            "continued job must be Running, got {:?}",
+            j.state
+        );
+        assert!(!j.reaped[0], "a continue is not a terminal reap");
+        assert!(
+            !j.notified,
+            "a resumed job must be visible to the next pass"
+        );
+    }
+
+    #[test]
+    fn reap_continued_on_running_job_is_noop() {
+        let mut t = JobTable::new();
+        let _ = t.add(4242, vec![4242], "sleep 100".to_string());
+        t.reap(4242, fake_continued_raw());
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Running));
+        assert!(!t.jobs_mut()[0].reaped[0]);
     }
 
     #[test]
