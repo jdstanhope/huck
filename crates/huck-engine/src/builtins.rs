@@ -4325,6 +4325,12 @@ fn parse_wait_args(
                 wait_any = true;
                 idx += 1;
             }
+            "-f" => {
+                // #160: "wait for full termination rather than a status change".
+                // huck's wait has no return-on-stop path (it already blocks to
+                // termination), so accept-and-conform: no state to record.
+                idx += 1;
+            }
             "-p" => {
                 if idx + 1 >= args.len() {
                     crate::sh_error_to!(
@@ -4344,7 +4350,7 @@ fn parse_wait_args(
             }
             s if s.starts_with('-') && s.len() > 1 => {
                 crate::sh_error_to!(shell, err, None, "wait: {s}: invalid option");
-                e!(err, "wait: usage: wait [-n] [-p var] [id ...]");
+                e!(err, "wait: usage: wait [-fn] [-p var] [id ...]");
                 return Err(ExecOutcome::Continue(2));
             }
             _ => break,
@@ -7129,11 +7135,12 @@ static HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "wait",
-        synopsis: "wait [-n] [-p VAR] [PID|JOB_SPEC ...]",
+        synopsis: "wait [-fn] [-p VAR] [PID|JOB_SPEC ...]",
         description: "Wait for processes to complete.\n\
                       With no args, wait for all known jobs. With PID/JOB_SPEC, wait for\n\
                       each. -n waits for any one to finish (returns its status). -p VAR\n\
-                      stores the finishing job's PID in VAR.",
+                      stores the finishing job's PID in VAR. -f waits for full\n\
+                      termination (huck's wait always does; accepted for compatibility).",
     },
     HelpEntry {
         name: "while",
