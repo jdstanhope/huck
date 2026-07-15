@@ -23,6 +23,22 @@ check() {
   fi
 }
 
+# Structural check: compare rc + stdout + PIPESTATUS only (stderr discarded).
+# For cases where huck's ERROR TEXT diverges from bash for an orthogonal reason
+# (e.g. the ambiguous-redirect message omits the target word) but the per-stage
+# continue-semantics — rc, stdout, PIPESTATUS — must match. See issue #152
+# tracking the ambiguous-redirect message gap.
+check_ps() {
+  local label=$1 frag=$2 b h
+  b=$(timeout 10 bash -c "$frag"'; echo "rc=$? PIPESTATUS=(${PIPESTATUS[@]})"' 2>/dev/null)
+  h=$(timeout 10 "$HUCK" -c "$frag"'; echo "rc=$? PIPESTATUS=(${PIPESTATUS[@]})"' 2>/dev/null)
+  if [ "$b" != "$h" ]; then
+    echo "FAIL [$label]"; echo "  bash: $b"; echo "  huck: $h"; FAIL=1
+  else
+    echo "PASS [$label]"
+  fi
+}
+
 # NOTE ON UPSTREAMS: a stage feeding a FAILED stage must be either silent
 # (`true`, deterministically exits 0) or an infinite writer (`yes`,
 # deterministically SIGPIPEs 141). A FINITE writer (`echo A`) races the failed
@@ -50,6 +66,14 @@ check 'stdin-away'   'yes | read x </no/such/file | cat'
 # --- bad-fd source-order (message fixed in v293; only rc/continue diverged) ---
 check 'badfd-simple' 'cat <&7 | cat'
 check 'badfd-heredoc' "/bin/cat <&3 3<<<'HS' | cat"
+# --- in-process ambiguous-redirect (expansion) failure: continue, rc+PIPESTATUS
+#     match bash; stderr text diverges orthogonally (see issue #152, the
+#     ambiguous-redirect message gap), so compare structurally. ---
+check_ps 'amb-stdin-mid'  'true | read x <$(echo a b) | cat'
+check_ps 'amb-stdin-last' 'true | read x <$(echo a b)'
+check_ps 'amb-stdout-mid' 'true | read x >$(echo a b) | cat'
+check_ps 'amb-stderr-mid' 'true | read x 2>$(echo a b) | cat'
+check_ps 'amb-ext-guard'  'true | cat >$(echo a b) | wc -c'   # external (already worked): regression guard
 
 if [ $FAIL -ne 0 ]; then echo "pipeline_stage_redirect_fail_diff_check FAILED" >&2; exit 1; fi
 echo "pipeline_stage_redirect_fail_diff_check OK"
