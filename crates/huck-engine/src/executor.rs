@@ -7640,6 +7640,59 @@ fn reset_job_control_signals_in_child() -> std::io::Result<()> {
 
 // ----- fork subshell helper -------------------------------------------------
 
+/// Install a `ChildStdio` onto fds 0/1/2 inside a just-forked child, overlap-safe.
+///
+/// Returns the ORIGINAL raw source fd numbers (pre-move; `-1` for `Inherit`) so the
+/// caller can exclude this child's own stdio sources when closing parent-held pipe
+/// fds. async-signal-safe: `into_raw()` first (no `OwnedFd` Drop in the child), then
+/// pure `fcntl`/`dup2`/`close`.
+///
+/// # Safety
+/// Must be called only in the child after `fork()`, before any `OwnedFd` could drop.
+unsafe fn install_child_stdio(stdio: ChildStdio) -> [RawFd; 3] {
+    let ChildStdio {
+        stdin,
+        stdout,
+        stderr,
+    } = stdio;
+    let mut plan: [(Option<RawFd>, RawFd); 3] = [
+        (stdin.into_raw(), 0),
+        (stdout.into_raw(), 1),
+        (stderr.into_raw(), 2),
+    ];
+    let original_raws: [RawFd; 3] = [
+        plan[0].0.unwrap_or(-1),
+        plan[1].0.unwrap_or(-1),
+        plan[2].0.unwrap_or(-1),
+    ];
+    // Pass 1 (PRE-MOVE): move any owned source in 0..=2 up to >=3, so pass 2's
+    // dup2 always has source != target (clears FD_CLOEXEC): the moved copy must
+    // survive exec if its install no-ops.
+    for (src, _) in plan.iter_mut() {
+        if let Some(s) = *src
+            && s <= 2
+        {
+            let moved = unsafe { libc::fcntl(s, libc::F_DUPFD, 3) };
+            if moved >= 0 {
+                unsafe { libc::close(s) };
+                *src = Some(moved);
+            }
+        }
+    }
+    // Pass 2 (INSTALL): sources now all >=3 and pairwise distinct (except the
+    // pathological case where a pass-1 F_DUPFD failed and left an owned source at
+    // its own slot — a no-op dup2 we must NOT then close).
+    for (src, slot) in plan {
+        if let Some(s) = src {
+            unsafe { libc::dup2(s, slot) };
+            if s != slot {
+                unsafe { libc::close(s) };
+            }
+        }
+    }
+    original_raws
+}
+
 /// Forks a subshell and runs `cmd` in the child with the supplied stdio
 /// fds dup2'd to 0/1/2. After the body runs, the child `_exit`s with the
 /// resulting status. Returns the child pid in the parent.
@@ -7690,56 +7743,9 @@ pub fn fork_and_run_in_subshell(
             if pgid_target >= 0 {
                 libc::setpgid(0, pgid_target);
             }
-            // 3-5. Install stdio from ChildStdio. Convert to raw NOW so no
-            // OwnedFd destructor can run in the forked child (Drop safety).
-            let ChildStdio {
-                stdin,
-                stdout,
-                stderr,
-            } = stdio;
-            let mut plan: [(Option<RawFd>, RawFd); 3] = [
-                (stdin.into_raw(), 0),
-                (stdout.into_raw(), 1),
-                (stderr.into_raw(), 2),
-            ];
-            let original_raws: [RawFd; 3] = {
-                // fd numbers this child owns as stdio sources, -1 for Inherit.
-                [
-                    plan[0].0.unwrap_or(-1),
-                    plan[1].0.unwrap_or(-1),
-                    plan[2].0.unwrap_or(-1),
-                ]
-            };
-            // Pass 1 (PRE-MOVE): move any owned source in 0..=2 up to >=3, so
-            // pass 2's dup2 always has source != target (clears FD_CLOEXEC ->
-            // the §H2b fix) and installs are order-independent. F_DUPFD (not
-            // _CLOEXEC): the moved copy must survive exec if its install no-ops.
-            for (src, _) in plan.iter_mut() {
-                if let Some(s) = *src
-                    && s <= 2
-                {
-                    let moved = libc::fcntl(s, libc::F_DUPFD, 3);
-                    if moved >= 0 {
-                        libc::close(s);
-                        *src = Some(moved);
-                    }
-                    // On failure keep s: the pass-2 `s != slot` guard below is
-                    // what makes this truly never-worse — a same-slot owned
-                    // source is installed by a no-op dup2 and left open,
-                    // matching the old behavior.
-                }
-            }
-            // Pass 2 (INSTALL): sources now all >=3 and pairwise distinct (except
-            // the pathological case where a pass-1 F_DUPFD failed and left an
-            // owned source at its own slot — a no-op dup2 we must NOT then close).
-            for (src, slot) in plan {
-                if let Some(s) = src {
-                    libc::dup2(s, slot);
-                    if s != slot {
-                        libc::close(s);
-                    }
-                }
-            }
+            // 3-5. Install stdio onto 0/1/2 (overlap-safe). Returns the original
+            // raw source fds for the pass-3 close-exclusion below.
+            let original_raws = install_child_stdio(stdio);
             // Pass 3: close every parent-held pipe fd, skipping this child's own
             // stdio sources by their ORIGINAL numbers.
             for &fd in parent_fds_to_close {
