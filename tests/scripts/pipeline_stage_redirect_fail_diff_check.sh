@@ -74,7 +74,9 @@ check 'badfd-heredoc' "/bin/cat <&3 3<<<'HS' | cat"
 check_ps 'amb-stdin-mid'  'true | read x <$(echo a b) | cat'
 check_ps 'amb-stdin-last' 'true | read x <$(echo a b)'
 check_ps 'amb-stdout-mid' 'true | read x >$(echo a b) | cat'
+check_ps 'amb-append-mid' 'true | read x >>$(echo a b) | cat'
 check_ps 'amb-stderr-mid' 'true | read x 2>$(echo a b) | cat'
+check_ps 'amb-serr-app'   'true | read x 2>>$(echo a b) | cat'
 check_ps 'amb-ext-guard'  'true | cat >$(echo a b) | wc -c'   # external (already worked): regression guard
 
 if [ $FAIL -ne 0 ]; then echo "pipeline_stage_redirect_fail_diff_check FAILED" >&2; exit 1; fi
