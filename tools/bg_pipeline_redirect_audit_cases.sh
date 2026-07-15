@@ -20,4 +20,8 @@ emit_bg_cases() {
   printf '%s\t%s\t%s\n' "stage0 nodir"   "po" "/bin/cat | cat >po &"
   printf '%s\t%s\t%s\n' "close 2>&-"     "po" "$W 2>&- | cat >po &"
   printf '%s\t%s\t%s\n' "last redir"     "pf po" "/bin/echo A | /bin/sh -c 'cat; echo E >&2' 2>&1 >pf | cat >po &"
+  # A stage whose redirect fails must not abort the bg pipeline: the consumer
+  # still runs and creates its result file (empty via EOF), matching bash.
+  printf '%s\t%s\t%s\n' "fail-continue"  "po" "cat </no/such/file | { cat; echo DONE; } >po &"
+  printf '%s\t%s\t%s\n' "fail-mid"       "po" "echo A | cat </no/such/file | { cat; echo DONE; } >po &"
 }

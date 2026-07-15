@@ -5972,6 +5972,13 @@ fn spawn_pipeline(
         let kind = classify_stage(stage_cmd, shell);
         let stage_is_external = matches!(&kind, StageKind::External(_));
 
+        // #145: a stage's OWN redirect setup failing must fail only this stage,
+        // not the whole pipeline. On such a failure we print (already done), set
+        // this flag, drop the partial fd, and fall through to spawn a wired
+        // exit-1 child at the spawn point (spawn_failed_stage) instead of the
+        // real command. Infrastructure failures (make_pipe) still bail.
+        let mut redirect_failed = false;
+
         // ---- Build stdin fd --------------------------------------------------
         // Priority: explicit redirect on ExecCommand > prev_pipe_read > STDIN_FILENO.
         // For InProcess compound stages, there are no explicit redirects at the
@@ -5987,49 +5994,59 @@ fn spawn_pipeline(
         {
             match &exec.slot_stdin() {
                 Some(RedirectSlot::Read(word)) => {
-                    // Discard the previous stage's pipe read-end: this stage
-                    // overrides stdin, so that pipe would otherwise be leaked
-                    // into parent_held, keeping the write-end alive and
-                    // deadlocking the previous stage's writer.
-                    if let Some(r) = prev_pipe_read.take() {
+                    // Take the previous stage's pipe read-end out of parent_held.
+                    // On a successful open we CLOSE it (this stage overrides stdin,
+                    // so that pipe would otherwise leak into parent_held, keeping
+                    // the write-end alive and deadlocking the previous writer). On
+                    // an open FAILURE (#145) the exit-1 dummy INHERITS it instead,
+                    // so upstream does not SIGPIPE prematurely: a small upstream
+                    // write buffers and succeeds exactly as in bash
+                    // (`echo A | read x </no | cat` -> PIPESTATUS (0 1 0)), while a
+                    // flooding upstream (`yes | …`) still SIGPIPEs once the dummy
+                    // exits and closes the read end.
+                    let prev = prev_pipe_read.take();
+                    if let Some(r) = prev {
                         parent_held.retain(|&fd| fd != r);
-                        unsafe {
-                            libc::close(r);
-                        }
                     }
-                    let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
+                    let expanded = expand_single(word, shell, &mut *err_writer(err_sink, sink));
+                    match expanded {
                         Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            return Err(bail_teardown_pipeline(
-                                mode,
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &stages,
-                                &mut parent_held,
-                            ));
+                            // #145: ambiguous-redirect / expansion failure on this
+                            // stage's stdin fails ONLY this stage (error already
+                            // printed). Hand the previous stage's pipe read-end to
+                            // the exit-1 dummy, exactly like the open-failure arm.
+                            redirect_failed = true;
+                            match prev {
+                                Some(r) => unsafe { ChildFd::owned_raw(r) },
+                                None => ChildFd::Inherit,
+                            }
                         }
-                    };
-                    match open_redirect_file(
-                        &FileMode::ReadOnly,
-                        &path,
-                        false,
-                        FdPlacement::Relocated,
-                    ) {
-                        Ok(f) => ChildFd::from(f),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            return Err(bail_teardown_pipeline(
-                                mode,
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &stages,
-                                &mut parent_held,
-                            ));
-                        }
+                        Ok(path) => match open_redirect_file(
+                            &FileMode::ReadOnly,
+                            &path,
+                            false,
+                            FdPlacement::Relocated,
+                        ) {
+                            Ok(f) => {
+                                if let Some(r) = prev {
+                                    unsafe {
+                                        libc::close(r);
+                                    }
+                                }
+                                ChildFd::from(f)
+                            }
+                            Err(e) => {
+                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                // #145: fail ONLY this stage; hand the previous
+                                // stage's pipe read-end to the exit-1 dummy (holds
+                                // it until _exit, matching bash's failed stage).
+                                redirect_failed = true;
+                                match prev {
+                                    Some(r) => unsafe { ChildFd::owned_raw(r) },
+                                    None => ChildFd::Inherit,
+                                }
+                            }
+                        },
                     }
                 }
                 Some(RedirectSlot::Heredoc { body, .. }) => {
@@ -6193,83 +6210,70 @@ fn spawn_pipeline(
         };
 
         // ---- Determine stdout redirect (from ExecCommand if Simple) ----------
+        // #145: skip opening a later redirect once an earlier one on this stage
+        // failed (first-failure-wins; avoids a second error message).
         let explicit_stdout: Option<ChildFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
             stage_cmd
             && !stage_is_external
+            && !redirect_failed
         {
             match &exec.slot_stdout() {
                 Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
+                    let expanded = expand_single(w, shell, &mut *err_writer(err_sink, sink));
+                    match expanded {
                         Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            return Err(bail_teardown_pipeline(
-                                mode,
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &stages,
-                                &mut parent_held,
-                            ));
+                            // #145: ambiguous-redirect / expansion failure fails ONLY
+                            // this stage (error already printed). None -> phase 5
+                            // builds the inter-stage pipe for the exit-1 child.
+                            redirect_failed = true;
+                            None
                         }
-                    };
-                    let guard =
-                        shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                    match open_redirect_file(
-                        &FileMode::Truncate,
-                        &path,
-                        guard,
-                        FdPlacement::Relocated,
-                    ) {
-                        Ok(f) => Some(ChildFd::from(f)),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            return Err(bail_teardown_pipeline(
-                                mode,
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &stages,
-                                &mut parent_held,
-                            ));
+                        Ok(path) => {
+                            let guard = shell.shell_options.noclobber
+                                && !matches!(r, RedirectSlot::Clobber(_));
+                            match open_redirect_file(
+                                &FileMode::Truncate,
+                                &path,
+                                guard,
+                                FdPlacement::Relocated,
+                            ) {
+                                Ok(f) => Some(ChildFd::from(f)),
+                                Err(e) => {
+                                    redir_open_error(shell, err_sink, sink, &path, &e);
+                                    // #145: fail ONLY this stage; None -> phase 5
+                                    // builds the inter-stage pipe for the child.
+                                    redirect_failed = true;
+                                    None
+                                }
+                            }
                         }
                     }
                 }
                 Some(RedirectSlot::Append(w)) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
+                    let expanded = expand_single(w, shell, &mut *err_writer(err_sink, sink));
+                    match expanded {
                         Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            return Err(bail_teardown_pipeline(
-                                mode,
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &stages,
-                                &mut parent_held,
-                            ));
+                            // #145: ambiguous-redirect / expansion failure fails ONLY
+                            // this stage (error already printed). None -> phase 5
+                            // builds the inter-stage pipe for the exit-1 child.
+                            redirect_failed = true;
+                            None
                         }
-                    };
-                    match open_redirect_file(
-                        &FileMode::Append,
-                        &path,
-                        false,
-                        FdPlacement::Relocated,
-                    ) {
-                        Ok(f) => Some(ChildFd::from(f)),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            return Err(bail_teardown_pipeline(
-                                mode,
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &stages,
-                                &mut parent_held,
-                            ));
-                        }
+                        Ok(path) => match open_redirect_file(
+                            &FileMode::Append,
+                            &path,
+                            false,
+                            FdPlacement::Relocated,
+                        ) {
+                            Ok(f) => Some(ChildFd::from(f)),
+                            Err(e) => {
+                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                // #145: fail ONLY this stage; None -> phase 5
+                                // builds the inter-stage pipe for the child.
+                                redirect_failed = true;
+                                None
+                            }
+                        },
                     }
                 }
                 _ => None,
@@ -6279,83 +6283,69 @@ fn spawn_pipeline(
         };
 
         // ---- Determine stderr redirect (from ExecCommand if Simple) ----------
+        // #145: skip once an earlier redirect on this stage failed.
         let explicit_stderr: Option<ChildFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
             stage_cmd
             && !stage_is_external
+            && !redirect_failed
         {
             match &exec.slot_stderr() {
                 Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
+                    let expanded = expand_single(w, shell, &mut *err_writer(err_sink, sink));
+                    match expanded {
                         Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            return Err(bail_teardown_pipeline(
-                                mode,
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &stages,
-                                &mut parent_held,
-                            ));
+                            // #145: ambiguous-redirect / expansion failure fails ONLY
+                            // this stage (error already printed). None -> phase 5
+                            // builds the inter-stage pipe for the exit-1 child.
+                            redirect_failed = true;
+                            None
                         }
-                    };
-                    let guard =
-                        shell.shell_options.noclobber && !matches!(r, RedirectSlot::Clobber(_));
-                    match open_redirect_file(
-                        &FileMode::Truncate,
-                        &path,
-                        guard,
-                        FdPlacement::Relocated,
-                    ) {
-                        Ok(f) => Some(ChildFd::from(f)),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            return Err(bail_teardown_pipeline(
-                                mode,
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &stages,
-                                &mut parent_held,
-                            ));
+                        Ok(path) => {
+                            let guard = shell.shell_options.noclobber
+                                && !matches!(r, RedirectSlot::Clobber(_));
+                            match open_redirect_file(
+                                &FileMode::Truncate,
+                                &path,
+                                guard,
+                                FdPlacement::Relocated,
+                            ) {
+                                Ok(f) => Some(ChildFd::from(f)),
+                                Err(e) => {
+                                    redir_open_error(shell, err_sink, sink, &path, &e);
+                                    // #145: fail ONLY this stage; None -> phase 5
+                                    // builds the inter-stage pipe for the child.
+                                    redirect_failed = true;
+                                    None
+                                }
+                            }
                         }
                     }
                 }
                 Some(RedirectSlot::Append(w)) => {
-                    let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
-                        Ok(p) => p,
+                    let expanded = expand_single(w, shell, &mut *err_writer(err_sink, sink));
+                    match expanded {
                         Err(()) => {
-                            restore_inline_assignments(snap, shell);
-                            return Err(bail_teardown_pipeline(
-                                mode,
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &stages,
-                                &mut parent_held,
-                            ));
+                            // #145: ambiguous-redirect / expansion failure fails ONLY
+                            // this stage (error already printed). None -> phase 5
+                            // builds the inter-stage pipe for the exit-1 child.
+                            redirect_failed = true;
+                            None
                         }
-                    };
-                    match open_redirect_file(
-                        &FileMode::Append,
-                        &path,
-                        false,
-                        FdPlacement::Relocated,
-                    ) {
-                        Ok(f) => Some(ChildFd::from(f)),
-                        Err(e) => {
-                            redir_open_error(shell, err_sink, sink, &path, &e);
-                            restore_inline_assignments(snap, shell);
-                            return Err(bail_teardown_pipeline(
-                                mode,
-                                shell,
-                                procsub_base,
-                                first_pid,
-                                &stages,
-                                &mut parent_held,
-                            ));
-                        }
+                        Ok(path) => match open_redirect_file(
+                            &FileMode::Append,
+                            &path,
+                            false,
+                            FdPlacement::Relocated,
+                        ) {
+                            Ok(f) => Some(ChildFd::from(f)),
+                            Err(e) => {
+                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                // #145: fail ONLY this stage; None -> phase 5
+                                // builds the inter-stage pipe for the child.
+                                redirect_failed = true;
+                                None
+                            }
+                        },
                     }
                 }
                 _ => None,
@@ -6376,7 +6366,7 @@ fn spawn_pipeline(
         // would keep it open and the downstream stage would never see EOF (hang).
         // The existing slot-heredoc path forks its writer during stdin construction
         // for the same reason.
-        let external_plan: Option<ChildRedirPlan> = if stage_is_external {
+        let external_plan: Option<ChildRedirPlan> = if stage_is_external && !redirect_failed {
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 // #69: stamp the stage's line so a redirect-open error carries
                 // `line N:` (mirrors the single-command path at executor.rs:4550).
@@ -6392,15 +6382,10 @@ fn spawn_pipeline(
                         Some(p)
                     }
                     Err(_) => {
-                        restore_inline_assignments(snap, shell);
-                        return Err(bail_teardown_pipeline(
-                            mode,
-                            shell,
-                            procsub_base,
-                            first_pid,
-                            &stages,
-                            &mut parent_held,
-                        ));
+                        // #145: error already reported by build_child_redir_plan;
+                        // fail ONLY this stage and fall through to the exit-1 child.
+                        redirect_failed = true;
+                        None
                     }
                 }
             } else {
@@ -6646,74 +6631,68 @@ fn spawn_pipeline(
         // allocate; not async-signal-safe). External stages handle this inside
         // spawn_external_with_fds itself (via the replayed ChildRedirPlan), so
         // skip the expansion entirely for them.
-        let (stdout_dup_target, stderr_dup_target) =
-            if !stage_is_external && let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                let sdt = match &exec.slot_stdout() {
-                    Some(RedirectSlot::Dup { source, .. }) => {
-                        match resolve_fd_target(source, shell) {
-                            Ok(fd) => Some(fd),
-                            Err(e) => {
-                                {
-                                    let mut err = err_writer(err_sink, sink);
-                                    crate::sh_error_to!(
-                                        shell,
-                                        &mut *err,
-                                        None,
-                                        "{}",
-                                        crate::bash_io_error(&e)
-                                    );
-                                }
-                                restore_inline_assignments(snap, shell);
-                                // stdin / stdout / stderr ChildFds drop on return;
-                                // capture_read_fd stays in parent_held (drained).
-                                return Err(bail_teardown_pipeline(
-                                    mode,
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &stages,
-                                    &mut parent_held,
-                                ));
-                            }
+        let (stdout_dup_target, stderr_dup_target) = if !stage_is_external
+            && !redirect_failed
+            && let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd
+        {
+            // #145: an InProcess stage's own Dup-target resolution failing
+            // (`>&<non-numeric>` etc.) is a stage-own redirect failure, so it
+            // fails only this stage (redirect_failed -> spawn_failed_stage)
+            // rather than aborting the pipeline, consistent with the other
+            // converted sites. (Numeric-but-closed targets like `>&9` resolve
+            // OK here and fail later in the child instead.)
+            let sdt = match &exec.slot_stdout() {
+                Some(RedirectSlot::Dup { source, .. }) => match resolve_fd_target(source, shell) {
+                    Ok(fd) => Some(fd),
+                    Err(e) => {
+                        {
+                            let mut err = err_writer(err_sink, sink);
+                            crate::sh_error_to!(
+                                shell,
+                                &mut *err,
+                                None,
+                                "{}",
+                                crate::bash_io_error(&e)
+                            );
                         }
+                        redirect_failed = true;
+                        None
                     }
-                    _ => None,
-                };
-                let sedt = match &exec.slot_stderr() {
-                    Some(RedirectSlot::Dup { source, .. }) => {
-                        match resolve_fd_target(source, shell) {
-                            Ok(fd) => Some(fd),
-                            Err(e) => {
-                                {
-                                    let mut err = err_writer(err_sink, sink);
-                                    crate::sh_error_to!(
-                                        shell,
-                                        &mut *err,
-                                        None,
-                                        "{}",
-                                        crate::bash_io_error(&e)
-                                    );
-                                }
-                                restore_inline_assignments(snap, shell);
-                                // stdin / stdout / stderr ChildFds drop on return;
-                                // capture_read_fd stays in parent_held (drained).
-                                return Err(bail_teardown_pipeline(
-                                    mode,
-                                    shell,
-                                    procsub_base,
-                                    first_pid,
-                                    &stages,
-                                    &mut parent_held,
-                                ));
-                            }
-                        }
-                    }
-                    _ => None,
-                };
-                (sdt, sedt)
-            } else {
-                (None, None)
+                },
+                _ => None,
             };
+            // If stdout's Dup already failed, don't also try stderr's (one
+            // error, first failure wins — matching the phase-guard order).
+            let sedt = if redirect_failed {
+                None
+            } else {
+                match &exec.slot_stderr() {
+                    Some(RedirectSlot::Dup { source, .. }) => {
+                        match resolve_fd_target(source, shell) {
+                            Ok(fd) => Some(fd),
+                            Err(e) => {
+                                {
+                                    let mut err = err_writer(err_sink, sink);
+                                    crate::sh_error_to!(
+                                        shell,
+                                        &mut *err,
+                                        None,
+                                        "{}",
+                                        crate::bash_io_error(&e)
+                                    );
+                                }
+                                redirect_failed = true;
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            (sdt, sedt)
+        } else {
+            (None, None)
+        };
 
         // Build the child's fd environment ONCE; move it into whichever spawner.
         // Both spawners consume the ChildStdio and close the parent's owned
@@ -6722,52 +6701,75 @@ fn spawn_pipeline(
         // (never entered parent_held); the READ end stays in parent_held for the
         // next stage to consume.
         let child_stdio = ChildStdio::new(stdin, stdout, stderr);
-        let spawn_result = match kind {
-            StageKind::External(simple) => spawn_external_with_fds(
-                simple,
-                shell,
-                sink,
-                err_sink,
-                child_stdio,
-                pgid_target,
-                &fds_to_close_in_child,
-                external_plan.expect("external stage always has a ChildRedirPlan"),
-            ),
-            StageKind::InProcess(cmd) => fork_and_run_in_subshell(
-                cmd,
-                shell,
-                child_stdio,
-                pgid_target,
-                &fds_to_close_in_child,
-                stdout_dup_target,
-                stderr_dup_target,
-            ),
+        let pid = if redirect_failed {
+            // #145: the stage's own redirect setup failed (error already printed).
+            // Fork a child wired to this stage's inter-stage pipe ends that exits
+            // 1, so downstream reads EOF, upstream (if it fed this stage) gets
+            // SIGPIPE, and $PIPESTATUS records 1 — matching bash's per-stage
+            // failure. child_stdio is consumed HERE (not by the real spawners).
+            match spawn_failed_stage(shell, child_stdio, pgid_target, &fds_to_close_in_child) {
+                Ok(pid) => pid,
+                Err(_) => {
+                    // fork() failed => genuine infrastructure failure: abort.
+                    restore_inline_assignments(snap, shell);
+                    return Err(bail_teardown_pipeline(
+                        mode,
+                        shell,
+                        procsub_base,
+                        first_pid,
+                        &stages,
+                        &mut parent_held,
+                    ));
+                }
+            }
+        } else {
+            let spawn_result = match kind {
+                StageKind::External(simple) => spawn_external_with_fds(
+                    simple,
+                    shell,
+                    sink,
+                    err_sink,
+                    child_stdio,
+                    pgid_target,
+                    &fds_to_close_in_child,
+                    external_plan.expect("external stage always has a ChildRedirPlan"),
+                ),
+                StageKind::InProcess(cmd) => fork_and_run_in_subshell(
+                    cmd,
+                    shell,
+                    child_stdio,
+                    pgid_target,
+                    &fds_to_close_in_child,
+                    stdout_dup_target,
+                    stderr_dup_target,
+                ),
+            };
+            match spawn_result {
+                Ok(p) => p,
+                Err(e) => {
+                    {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e));
+                    }
+                    // child_stdio (with all owned stdio fds) was consumed by the
+                    // failed call and already dropped. Close every remaining
+                    // parent-held fd (inter-stage read ends + capture read ends);
+                    // Background additionally kills+reaps the already-spawned stages.
+                    restore_inline_assignments(snap, shell);
+                    return Err(bail_teardown_pipeline(
+                        mode,
+                        shell,
+                        procsub_base,
+                        first_pid,
+                        &stages,
+                        &mut parent_held,
+                    ));
+                }
+            }
         };
 
         // ---- Restore inline assignments (v23 scoping) -----------------------
         restore_inline_assignments(snap, shell);
-
-        let pid = match spawn_result {
-            Ok(p) => p,
-            Err(e) => {
-                {
-                    let mut err = err_writer(err_sink, sink);
-                    crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e));
-                }
-                // child_stdio (with all owned stdio fds) was consumed by the
-                // failed call and already dropped. Close every remaining
-                // parent-held fd (inter-stage read ends + capture read ends);
-                // Background additionally kills+reaps the already-spawned stages.
-                return Err(bail_teardown_pipeline(
-                    mode,
-                    shell,
-                    procsub_base,
-                    first_pid,
-                    &stages,
-                    &mut parent_held,
-                ));
-            }
-        };
 
         // (A heredoc/herestring body, if any, is written by the forked writer
         // process spawned above; the parent holds no write end here.)
@@ -7834,6 +7836,59 @@ pub fn fork_and_run_in_subshell(
     }
     // PARENT: defensive setpgid to close the race with the child's setpgid.
     // Skipped when pgid_target == NO_PGROUP (job control off — stay in shell group).
+    if pgid_target >= 0 {
+        unsafe {
+            libc::setpgid(pid, pgid_target);
+        }
+    }
+    Ok(pid)
+}
+
+/// Fork a "failed pipeline stage": a child that inherits this stage's stdio
+/// (its inter-stage pipe ends), joins the job's process group, closes every
+/// OTHER parent-held pipe fd, and immediately `_exit(1)`. It runs no command and
+/// prints nothing — the redirect error was already reported by the parent. Its
+/// exit closes the pipe ends it holds, giving downstream EOF and upstream
+/// SIGPIPE, reproducing bash's per-stage redirect failure (#145). Unlike
+/// `fork_and_run_in_subshell` it does NOT dup2 stdio to 0/1/2: the child never
+/// reads or writes, it only has to hold its pipe ends open until exit.
+fn spawn_failed_stage(
+    shell: &mut Shell,
+    stdio: ChildStdio,
+    pgid_target: i32,
+    parent_fds_to_close: &[RawFd],
+) -> Result<i32, io::Error> {
+    let _ = shell; // reserved for symmetry with the other spawners
+    flush_stdout();
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pid == 0 {
+        unsafe {
+            if pgid_target >= 0 {
+                libc::setpgid(0, pgid_target);
+            }
+            let ChildStdio {
+                stdin,
+                stdout,
+                stderr,
+            } = stdio;
+            // Convert to raw so no OwnedFd Drop runs in the forked child; keep
+            // the fds OPEN (they close on _exit -> the pipe topology reacts).
+            let own: [RawFd; 3] = [
+                stdin.into_raw().unwrap_or(-1),
+                stdout.into_raw().unwrap_or(-1),
+                stderr.into_raw().unwrap_or(-1),
+            ];
+            for &fd in parent_fds_to_close {
+                if fd != own[0] && fd != own[1] && fd != own[2] {
+                    libc::close(fd);
+                }
+            }
+            libc::_exit(1);
+        }
+    }
     if pgid_target >= 0 {
         unsafe {
             libc::setpgid(pid, pgid_target);
