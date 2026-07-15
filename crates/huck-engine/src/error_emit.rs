@@ -35,6 +35,11 @@ pub enum Diag<'a> {
     /// `<name>: [-c: ]line N: ` — the `-c:` segment present iff
     /// `Shell::is_command_string`.
     Syntax { line: u32 },
+    /// A runtime error that bash emits WITHOUT a `line N:` segment (bash's
+    /// `redirection_error()` class, e.g. `redirection error: cannot duplicate
+    /// fd: …`). Prologue: `<name>: [cmd: ]` — identical to [`Diag::Runtime`]
+    /// minus the line. `cmd` = builtin/context (`Some("cd")`) or `None`.
+    RuntimeNoLine(Option<&'a str>),
 }
 
 /// Emit one bash diagnostic to the current error sink for a RUNTIME error.
@@ -114,6 +119,30 @@ pub fn emit_error_to(
 macro_rules! sh_error_to {
     ($shell:expr, $w:expr, $cmd:expr, $($arg:tt)*) => {
         $crate::emit_error_to($shell, $w, $cmd, format_args!($($arg)*))
+    };
+}
+
+/// Like [`emit_error_to`] but WITHOUT the `line N:` segment — for the bash
+/// `redirection_error()` class that bash prints as `<name>: [cmd: ]body` with no
+/// line number (e.g. the leading `redirection error: cannot duplicate fd: …`
+/// line of a `{var}>&<badfd>` double message). Uses [`Diag::RuntimeNoLine`].
+pub fn emit_error_noline_to(
+    shell: &Shell,
+    w: &mut dyn std::io::Write,
+    cmd: Option<&str>,
+    body: std::fmt::Arguments,
+) {
+    let _ = write!(w, "{}", shell.error_prefix(Diag::RuntimeNoLine(cmd)));
+    let _ = w.write_fmt(body);
+    let _ = w.write_all(b"\n");
+}
+
+/// `eprintln!`-shaped wrapper around [`emit_error_noline_to`]:
+/// `sh_error_noline_to!(shell, w, cmd, "fmt", args...)`.
+#[macro_export]
+macro_rules! sh_error_noline_to {
+    ($shell:expr, $w:expr, $cmd:expr, $($arg:tt)*) => {
+        $crate::emit_error_noline_to($shell, $w, $cmd, format_args!($($arg)*))
     };
 }
 

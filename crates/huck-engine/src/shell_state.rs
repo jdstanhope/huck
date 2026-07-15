@@ -1219,6 +1219,13 @@ impl Shell {
                     out.push_str(&format!("{c}: "));
                 }
             }
+            // Same as `Runtime` but never pushes a `line N:` — for bash's
+            // `redirection_error()` class, which omits the line number.
+            Diag::RuntimeNoLine(cmd) => {
+                if let Some(c) = cmd {
+                    out.push_str(&format!("{c}: "));
+                }
+            }
             Diag::Syntax { line } => {
                 if !self.is_interactive {
                     if self.source_depth == 0 && self.is_command_string {

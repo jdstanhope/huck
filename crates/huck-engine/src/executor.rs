@@ -3031,7 +3031,13 @@ fn expand_single(
     if fields.len() == 1 {
         Ok(fields.into_iter().next().unwrap().chars)
     } else {
-        crate::sh_error_to!(shell, err, None, "ambiguous redirect");
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "{}: ambiguous redirect",
+            crate::expand::reconstruct_word_source(word)
+        );
         Err(())
     }
 }
@@ -3059,11 +3065,22 @@ fn resolve_dup_source(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> Result<RawFd, ()> {
-    match resolve_fd_target(source, shell) {
+    // bash: a dup source that word-splits to 0 or >1 fields (e.g. `$v` unset,
+    // `>&` empty) is an *ambiguous redirect* naming the raw word; a single
+    // non-numeric field is `bad fd`. The error names the UN-expanded source
+    // word (`$v`), not the expansion result.
+    let fields = expand(source, shell);
+    let word_src = crate::expand::reconstruct_word_source(source);
+    if fields.len() != 1 {
+        let mut err = err_writer(err_sink, sink);
+        crate::sh_error_to!(shell, &mut *err, None, "{word_src}: ambiguous redirect");
+        return Err(());
+    }
+    match fields.into_iter().next().unwrap().chars.parse::<i32>() {
         Ok(fd) => Ok(fd),
-        Err(e) => {
+        Err(_) => {
             let mut err = err_writer(err_sink, sink);
-            crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e));
+            crate::sh_error_to!(shell, &mut *err, None, "bad fd: {word_src}");
             Err(())
         }
     }
@@ -3077,10 +3094,11 @@ fn validate_fd_open(
     shell: &mut Shell,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
+    label: &str,
 ) -> Result<(), ()> {
     if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
         let mut err = err_writer(err_sink, sink);
-        crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor");
+        crate::sh_error_to!(shell, &mut *err, None, "{label}: Bad file descriptor");
         return Err(());
     }
     Ok(())
@@ -3099,6 +3117,7 @@ fn validate_plan_source(
     shell: &mut Shell,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
+    label: &str,
 ) -> Result<(), i32> {
     let open = match fd_state.get(&src) {
         Some(&state) => state,
@@ -3106,10 +3125,24 @@ fn validate_plan_source(
     };
     if !open {
         let mut err = err_writer(err_sink, sink);
-        crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor");
+        crate::sh_error_to!(shell, &mut *err, None, "{label}: Bad file descriptor");
         return Err(1);
     }
     Ok(())
+}
+
+/// Non-emitting open-check mirroring [`validate_plan_source`]/[`validate_fd_open`].
+/// Used by the `{var}` dup path to decide whether to emit bash's extra leading
+/// `redirection error: cannot duplicate fd: …` line BEFORE the standard
+/// `<label>: Bad file descriptor`, without double-emitting.
+fn validate_source_is_open(
+    src: RawFd,
+    fd_state: Option<&std::collections::HashMap<RawFd, bool>>,
+) -> bool {
+    match fd_state.and_then(|st| st.get(&src)) {
+        Some(&open) => open,
+        None => (unsafe { libc::fcntl(src, libc::F_GETFD) }) >= 0,
+    }
 }
 
 /// Validate a dup/move source. In-process (interleaved) passes `None` and we
@@ -3122,10 +3155,11 @@ fn validate_source(
     shell: &mut Shell,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
+    label: &str,
 ) -> Result<(), i32> {
     match fd_state {
-        Some(state) => validate_plan_source(src, state, shell, sink, err_sink),
-        None => validate_fd_open(src, shell, sink, err_sink).map_err(|()| 1),
+        Some(state) => validate_plan_source(src, state, shell, sink, err_sink, label),
+        None => validate_fd_open(src, shell, sink, err_sink, label).map_err(|()| 1),
     }
 }
 
@@ -4730,6 +4764,9 @@ fn lower_one_redirect(
         // is a borrowed shell fd number (a Dup/Move source) left alone.
         let mut owned_src: Option<OwnedFd> = None;
         let mut dup_src: Option<RawFd> = None;
+        // The raw Dup/Move source word, threaded out of the match so the dup
+        // validation below can name it in bash's error (`$v: Bad file descriptor`).
+        let mut dup_source_word: Option<&crate::lexer::Word> = None;
         match &redir.op {
             RedirOp::File { mode, target: word } => {
                 let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
@@ -4756,6 +4793,7 @@ fn lower_one_redirect(
             RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
                 let src = resolve_dup_source(source, shell, sink, err_sink).map_err(|()| 1)?;
                 dup_src = Some(src);
+                dup_source_word = Some(source);
             }
             RedirOp::Heredoc { body, .. } => {
                 let bytes = expand_assignment(body, shell).into_bytes();
@@ -4807,7 +4845,28 @@ fn lower_one_redirect(
         // Validate a Dup/Move source at lower time. No owned file has been opened
         // for a Dup/Move (`owned_src` is None), so an error here truncates nothing.
         if let Some(s) = dup_src {
-            validate_source(s, fd_state.as_deref(), shell, sink, err_sink)?;
+            let label = dup_source_word
+                .map(crate::expand::reconstruct_word_source)
+                .unwrap_or_else(|| s.to_string());
+            // #140a: a `{var}` dup of a bad fd prints TWO lines in bash — a leading
+            // `redirection error: cannot duplicate fd: <strerror>` (bash's
+            // redirection_error path, which omits `line N:`) followed by the standard
+            // `<word>: Bad file descriptor`. Emit the leading line via the no-line
+            // emitter (so huck also omits `line N:`, matching bash's raw bytes), then
+            // let the normal validation emit the second (line-prefixed) and return Err.
+            if !validate_source_is_open(s, fd_state.as_deref()) {
+                {
+                    let mut err = err_writer(err_sink, sink);
+                    crate::sh_error_noline_to!(
+                        shell,
+                        &mut *err,
+                        None,
+                        "redirection error: cannot duplicate fd: {}",
+                        crate::bash_io_error(&std::io::Error::from_raw_os_error(libc::EBADF))
+                    );
+                }
+            }
+            validate_source(s, fd_state.as_deref(), shell, sink, err_sink, &label)?;
         }
         let raw_src: RawFd = match (&owned_src, dup_src) {
             (Some(o), _) => o.as_raw_fd(),
@@ -4852,6 +4911,10 @@ fn lower_one_redirect(
         }
         return Ok(ops);
     }
+    // UNREACHABLE: `target_fd()` returns `None` only for `RedirFd::Var`, and the
+    // `RedirFd::Var` block above returns on every path — so `target` is always
+    // `Some` here. Left as a bare message (no source word is in scope to name for
+    // #152); a future reader should not puzzle over why it wasn't updated.
     let Some(target) = redir.target_fd() else {
         {
             let mut err = err_writer(err_sink, sink);
@@ -4900,8 +4963,12 @@ fn lower_one_redirect(
             if !(is_move && src == target) {
                 // Validate the source NOW (before any later file opens) so an invalid
                 // dup errors without truncating a later `>file`. Same-plan targets are
-                // recorded open in fd_state, so `3>g 4>&3` still passes.
-                if let Err(code) = validate_source(src, fd_state.as_deref(), shell, sink, err_sink)
+                // recorded open in fd_state, so `3>g 4>&3` still passes. bash names the
+                // raw source word (`>&$v` -> `$v: Bad file descriptor`); a numeric
+                // literal (`>&9`) reconstructs back to its own number, unchanged.
+                let label = crate::expand::reconstruct_word_source(source);
+                if let Err(code) =
+                    validate_source(src, fd_state.as_deref(), shell, sink, err_sink, &label)
                 {
                     return Err(code);
                 }
@@ -6642,23 +6709,18 @@ fn spawn_pipeline(
             // converted sites. (Numeric-but-closed targets like `>&9` resolve
             // OK here and fail later in the child instead.)
             let sdt = match &exec.slot_stdout() {
-                Some(RedirectSlot::Dup { source, .. }) => match resolve_fd_target(source, shell) {
-                    Ok(fd) => Some(fd),
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "{}",
-                                crate::bash_io_error(&e)
-                            );
+                Some(RedirectSlot::Dup { source, .. }) => {
+                    // resolve_dup_source distinguishes an *ambiguous redirect*
+                    // (0/>1 fields, e.g. unset `$v`) from a `bad fd`, emitting the
+                    // matching bash message itself.
+                    match resolve_dup_source(source, shell, sink, err_sink) {
+                        Ok(fd) => Some(fd),
+                        Err(()) => {
+                            redirect_failed = true;
+                            None
                         }
-                        redirect_failed = true;
-                        None
                     }
-                },
+                }
                 _ => None,
             };
             // If stdout's Dup already failed, don't also try stderr's (one
@@ -6668,19 +6730,9 @@ fn spawn_pipeline(
             } else {
                 match &exec.slot_stderr() {
                     Some(RedirectSlot::Dup { source, .. }) => {
-                        match resolve_fd_target(source, shell) {
+                        match resolve_dup_source(source, shell, sink, err_sink) {
                             Ok(fd) => Some(fd),
-                            Err(e) => {
-                                {
-                                    let mut err = err_writer(err_sink, sink);
-                                    crate::sh_error_to!(
-                                        shell,
-                                        &mut *err,
-                                        None,
-                                        "{}",
-                                        crate::bash_io_error(&e)
-                                    );
-                                }
+                            Err(()) => {
                                 redirect_failed = true;
                                 None
                             }
