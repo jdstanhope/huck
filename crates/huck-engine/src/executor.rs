@@ -7867,6 +7867,74 @@ fn spawn_failed_stage(
     Ok(pid)
 }
 
+/// #78: fork a stand-in child for an external stage whose program can't be run.
+/// It installs the stage's stdio + replays the stage's redirect plan (so fd 2
+/// points wherever `2>&1`/`2>file`/the pipe put it), writes the bash-formatted
+/// `diag` to fd 2, and `_exit`s `exit_code` (127 not-found / 126 not-executable).
+/// This mirrors bash's child-side diagnostic and lets the pipeline continue with
+/// a populated PIPESTATUS. `held` (the plan's opened redirect-target fds) is
+/// inherited by the child and dropped in the parent after fork.
+fn spawn_command_error_stage(
+    stdio: ChildStdio,
+    pgid_target: i32,
+    parent_fds_to_close: &[RawFd],
+    replay_ops: Vec<ChildRedirOp>,
+    held: Vec<std::os::fd::OwnedFd>,
+    diag: Vec<u8>,
+    exit_code: i32,
+) -> Result<i32, io::Error> {
+    flush_stdout();
+    // Compute the replay targets BEFORE fork so the child branch is strictly
+    // alloc-free (async-signal-safety hygiene; matches the runnable path).
+    let extra_targets: Vec<RawFd> = replay_ops
+        .iter()
+        .map(|op| match *op {
+            ChildRedirOp::Dup { target, .. } | ChildRedirOp::Close { target } => target,
+        })
+        .collect();
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pid == 0 {
+        unsafe {
+            if pgid_target >= 0 {
+                libc::setpgid(0, pgid_target);
+            }
+            // Install stdio onto 0/1/2 (overlap-safe); returns original sources
+            // for the parent-fd close-exclusion.
+            let original_raws = install_child_stdio(stdio);
+            // Replay the stage's redirects (2>&1 / 2>file / fd>2 / close) in
+            // source order, AFTER stdio install so 2>&1 sees the piped fd 1.
+            let _ = replay_redir_ops(&replay_ops);
+            // Close parent-held pipe fds except our own stdio sources and the
+            // replay targets (extra_targets, computed pre-fork above).
+            for &fd in parent_fds_to_close {
+                if fd != original_raws[0]
+                    && fd != original_raws[1]
+                    && fd != original_raws[2]
+                    && !extra_targets.contains(&fd)
+                {
+                    libc::close(fd);
+                }
+            }
+            // Write the diagnostic to fd 2 (now redirected as the stage asked).
+            if !diag.is_empty() {
+                libc::write(2, diag.as_ptr() as *const libc::c_void, diag.len());
+            }
+            libc::_exit(exit_code);
+        }
+    }
+    // PARENT: the child inherited its own copies of `held`; drop ours.
+    drop(held);
+    if pgid_target >= 0 {
+        unsafe {
+            libc::setpgid(pid, pgid_target);
+        }
+    }
+    Ok(pid)
+}
+
 // ----- stage classification + raw-fd external spawn (Task 4) ---------------
 
 /// Decides whether a pipeline stage should run via `std::process::Command`
@@ -7992,6 +8060,26 @@ fn spawn_external_with_fds(
     // Resolve (expand) the command — same path as run_exec_single / run_multi_stage.
     let resolved = resolve(exec, shell, &mut *err_writer(err_sink, sink))
         .map_err(|code| io::Error::other(format!("resolve failed with code {code}")))?;
+
+    // #78: if the program can't be run, don't spawn — fork a diagnostic child
+    // that prints `<name>: <reason>` to the stage's own (redirected) fd 2 and
+    // exits 126/127, so the message routes correctly and PIPESTATUS is populated
+    // (matching bash) instead of leaking a raw error and aborting the pipeline.
+    if let StageRunnability::NotRunnable { body, code } =
+        classify_stage_runnability(&resolved.program, shell)
+    {
+        let mut diag: Vec<u8> = Vec::new();
+        crate::emit_error_to(shell, &mut diag, None, format_args!("{body}"));
+        return spawn_command_error_stage(
+            stdio,
+            pgid_target,
+            parent_fds_to_close,
+            plan.ops,
+            plan.held,
+            diag,
+            code,
+        );
+    }
 
     if shell.shell_options.xtrace {
         let p4 = ps4(shell);
