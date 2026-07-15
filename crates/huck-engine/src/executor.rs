@@ -1044,7 +1044,11 @@ impl RedirectScope {
                 }
             }
             PlanOp::Close { target } => self.close_target(target),
-            PlanOp::NamedFd { high, name } => {
+            PlanOp::NamedFd {
+                high,
+                name,
+                virtual_fd: _,
+            } => {
                 let fd = high.into_raw_fd();
                 shell.set(&name, fd.to_string());
             }
@@ -4680,17 +4684,23 @@ enum PlanOp {
     InstallDup { target: RawFd, source: RawFd },
     /// `N>&-`, and the source-close half of a move (`>&w-`).
     Close { target: RawFd },
-    /// `{var}` named-fd. `high` is the live descriptor the command sees, already
-    /// allocated non-CLOEXEC (>= 10). In-process: assign `$name = high` and let it
-    /// persist (take it out of the plan; do NOT save/restore). Child: keep `high`
-    /// held (inherited, non-CLOEXEC), replay a defensive `dup2(high, high)`, and
-    /// do NOT assign `$name` (bash doesn't for an external command).
+    /// `{var}` named-fd. `high` is the parent-parked live descriptor (already
+    /// allocated non-CLOEXEC, >= 10). In-process: assign `$name = high` and let it
+    /// persist (take it out of the plan; do NOT save/restore) — `virtual_fd` is
+    /// `high` there and is ignored. Child: `dup2(high -> virtual_fd)` then
+    /// `close(high)` (unless equal), keeping `high` held until fork; `$name` is set
+    /// to `virtual_fd` DURING batch lowering (so a later sibling `2>&$v` resolves
+    /// to it) but restored by `lower_redirects` — bash doesn't persist `{var}` to
+    /// the parent for an external command.
     NamedFd {
         high: std::os::fd::OwnedFd,
         // Read by the in-process applier (`RedirectScope::apply_one`) to assign
-        // `$name`; the child path (`redir_plan_to_child`) intentionally ignores it
-        // (bash does not assign `$var` for an external command).
+        // `$name`; the child path (`redir_plan_to_child`) assigns `virtual_fd`.
         name: String,
+        /// Child path: the virtual destination the parked `high` is duped onto
+        /// (lowest fd >= 10 not used as an earlier plan target / earlier `{var}`
+        /// virtual). Equals `high` on the in-process build (where it is unused).
+        virtual_fd: RawFd,
     },
 }
 
@@ -4892,13 +4902,33 @@ fn lower_one_redirect(
         };
         // Close the owned source now that it's been duped to `high`.
         drop(owned_src);
+        // Child (batch, `fd_state = Some`) path: allocate a VIRTUAL destination fd
+        // — the lowest number >= 10 that is not already used as a target by an
+        // earlier plan op and not an earlier `{var}`'s virtual number (both are
+        // recorded `true` in `fd_state`). Child replay dup2s the parked `high`
+        // onto `virtual_fd` and closes `high`, so `cmd 3>a {v}>x` sees fd 10 like
+        // bash rather than the parked 11 (#141). Set `$name = virtual_fd` DURING
+        // lowering so a later sibling `2>&$v` resolves to it (#140d) — the caller
+        // (`lower_redirects`) snapshots/restores `$name`, since bash does not
+        // persist a `{var}` to the parent for an external command. In-process
+        // (`fd_state = None`): `virtual_fd == high` and `$name` is assigned by
+        // `apply_one` at apply time, so nothing changes here.
+        let virtual_fd = if let Some(st) = fd_state.as_deref_mut() {
+            let mut v: RawFd = 10;
+            while st.get(&v) == Some(&true) {
+                v += 1;
+            }
+            st.insert(v, true);
+            shell.set(name, v.to_string());
+            v
+        } else {
+            high
+        };
         ops.push(PlanOp::NamedFd {
             high: unsafe { OwnedFd::from_raw_fd(high) },
             name: name.to_string(),
+            virtual_fd,
         });
-        if let Some(st) = fd_state.as_deref_mut() {
-            st.insert(high, true);
-        }
         if is_move {
             // Move: close the original source (a shell fd) after the dup. Only a
             // Dup/Move source reaches here (owned sources aren't moves).
@@ -5071,6 +5101,27 @@ fn lower_redirects(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> Result<RedirPlan, i32> {
+    // Snapshot every `{var}` name a redirect in this batch will assign. During
+    // lowering `lower_one_redirect` sets `$name` to the virtual fd so a later
+    // sibling `2>&$v` resolves against it (#140d), but bash does NOT persist a
+    // `{var}` to the parent for an external command — so restore the prior value
+    // (unset or otherwise) before returning, on both the success and error paths.
+    // Mirrors the inline-assignment snapshot/restore. Snapshot each name once
+    // (its pre-command value); restore LIFO.
+    let mut var_snaps: Vec<(String, Option<crate::shell_state::Variable>)> = Vec::new();
+    for redir in redirects {
+        if let RedirFd::Var(name) = &redir.fd {
+            if !var_snaps.iter().any(|(n, _)| n == name) {
+                var_snaps.push((name.clone(), shell.snapshot_var(name)));
+            }
+        }
+    }
+    let restore = |shell: &mut Shell,
+                   snaps: Vec<(String, Option<crate::shell_state::Variable>)>| {
+        for (name, prior) in snaps.into_iter().rev() {
+            shell.restore_var(&name, prior);
+        }
+    };
     let mut fd_state: std::collections::HashMap<RawFd, bool> = std::collections::HashMap::new();
     let mut plan = RedirPlan {
         ops: Vec::new(),
@@ -5094,10 +5145,12 @@ fn lower_redirects(
                     let mut st = 0;
                     unsafe { libc::waitpid(pid, &mut st, 0) };
                 }
+                restore(shell, var_snaps);
                 return Err(code);
             }
         }
     }
+    restore(shell, var_snaps);
     Ok(plan)
 }
 
@@ -5140,12 +5193,24 @@ fn redir_plan_to_child(plan: RedirPlan) -> ChildRedirPlan {
                 child.ops.push(ChildRedirOp::Dup { target, source });
             }
             PlanOp::Close { target } => child.ops.push(ChildRedirOp::Close { target }),
-            PlanOp::NamedFd { high, name: _ } => {
+            PlanOp::NamedFd {
+                high,
+                name: _,
+                virtual_fd,
+            } => {
                 let raw = high.as_raw_fd();
+                // dup2(high -> virtual_fd) wires the command's inherited `{var}`
+                // fd to the bash-matching low number; close the parked `high`
+                // afterwards (unless it already IS the virtual fd, in which case
+                // the `source == target` Dup arm just clears FD_CLOEXEC). `high`
+                // stays `held` so the parent keeps it alive across the fork.
                 child.ops.push(ChildRedirOp::Dup {
-                    target: raw,
+                    target: virtual_fd,
                     source: raw,
                 });
+                if virtual_fd != raw {
+                    child.ops.push(ChildRedirOp::Close { target: raw });
+                }
                 child.held.push(high);
             }
         }
@@ -6702,6 +6767,31 @@ fn spawn_pipeline(
             && !redirect_failed
             && let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd
         {
+            // Source-order `{var}` visibility (#140d): a `{v}>f` earlier in this
+            // stage's redirect list assigns `$v`, and a later `2>&$v` dup slot must
+            // see it when we resolve that slot pre-fork. The forked child body
+            // re-applies the FULL redirect list itself (that wiring is
+            // authoritative and produces the correct final fd — its own
+            // `apply_redirects` reassigns `$v`), so this pre-assignment only exists
+            // to let `resolve_dup_source` find `$v` here instead of erroring
+            // `$v: ambiguous redirect`. bash does not persist a `{var}` to the
+            // parent for a pipeline stage, so snapshot/restore around the
+            // resolution (mirrors `lower_redirects`). The numbers are placeholders
+            // (>=10, allocation order) — only their presence matters; the child's
+            // re-application determines the observed fd.
+            let mut var_snaps: Vec<(String, Option<crate::shell_state::Variable>)> = Vec::new();
+            let mut next_virtual: RawFd = 10;
+            for r in &exec.redirects {
+                if let RedirFd::Var(name) = &r.fd
+                    && !matches!(&r.op, RedirOp::Close)
+                {
+                    if !var_snaps.iter().any(|(n, _)| n == name) {
+                        var_snaps.push((name.clone(), shell.snapshot_var(name)));
+                    }
+                    shell.set(name, next_virtual.to_string());
+                    next_virtual += 1;
+                }
+            }
             // #145: an InProcess stage's own Dup-target resolution failing
             // (`>&<non-numeric>` etc.) is a stage-own redirect failure, so it
             // fails only this stage (redirect_failed -> spawn_failed_stage)
@@ -6741,6 +6831,11 @@ fn spawn_pipeline(
                     _ => None,
                 }
             };
+            // Restore `$v` (unset or prior) — a pipeline-stage `{var}` must not
+            // persist to the parent (LIFO, mirrors the inline-assignment restore).
+            for (name, prior) in var_snaps.into_iter().rev() {
+                shell.restore_var(&name, prior);
+            }
             (sdt, sedt)
         } else {
             (None, None)
