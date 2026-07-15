@@ -39,6 +39,16 @@ rm -f f 2>/dev/null
 
 # #140a -- {var}>&badfd double message
 check 'var-dup-bad' '{v}>&9'
+# #140a raw guard: bash's leading "redirection error" line carries NO `line N:`
+# (huck adds line numbers uniformly; a RuntimeNoLine regression would restore it).
+# norm() strips `line N:` so the check above can't see line-number PRESENCE — assert
+# it directly on the raw first line, matching bash's selective omission.
+_h1=$("$HUCK" -c '{v}>&9' 2>&1 | head -1)
+if printf '%s' "$_h1" | grep -q 'line [0-9]'; then
+  echo "FAIL [var-dup-bad-noline]"; echo "  huck first line should have NO 'line N:': $_h1"; FAIL=1
+else
+  echo "PASS [var-dup-bad-noline]"
+fi
 
 # #140b -- >&$v echoes the literal word, not the resolved number
 check 'var-echo-word' 'exec {v}>f; exec {v}>&-; echo x >&$v'
