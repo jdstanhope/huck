@@ -4376,9 +4376,10 @@ fn parse_wait_args(
                         shell,
                         err,
                         None,
-                        "wait: {arg}: not a pid or valid job spec"
+                        "wait: `{arg}': not a pid or valid job spec"
                     );
-                    return Err(ExecOutcome::Continue(2));
+                    // bash returns 1 for a malformed spec (not 2/usage).
+                    return Err(ExecOutcome::Continue(1));
                 }
             }
         }
@@ -5048,7 +5049,10 @@ fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Ex
                     'h' => mark_nohup = true,
                     _ => {
                         crate::sh_error_to!(shell, err, None, "disown: -{c}: invalid option");
-                        e!(err, "disown: usage: disown [-ahr] [%job ...]");
+                        e!(
+                            err,
+                            "disown: usage: disown [-h] [-ar] [jobspec ... | pid ...]"
+                        );
                         return ExecOutcome::Continue(2);
                     }
                 }
@@ -5131,9 +5135,29 @@ fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Ex
     ExecOutcome::Continue(0)
 }
 
+/// For builtins that accept no options (`fg`/`bg`), return the first invalid
+/// option character if the first argument is a `-`-prefixed token other than
+/// `-` or `--`. bash's getopt reports the first such character (`fg -sx` →
+/// `-s`), so callers format it as `-{c}: invalid option`.
+fn leading_invalid_option(args: &[String]) -> Option<char> {
+    let first = args.first()?;
+    if first == "--" {
+        return None;
+    }
+    let rest = first.strip_prefix('-')?;
+    rest.chars().next()
+}
+
 fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     // #158: drain pending STOP/CONT before resolving/acting on the job.
     crate::jobs::reap_completed(shell);
+    // #161: fg takes no options; a leading-dash argument (other than `--`) is
+    // reported as an invalid option before the usage line, matching bash.
+    if let Some(c) = leading_invalid_option(args) {
+        crate::sh_error_to!(shell, err, None, "fg: -{c}: invalid option");
+        e!(err, "fg: usage: fg [job_spec]");
+        return ExecOutcome::Continue(2);
+    }
     let id = match args.len() {
         0 => match shell.jobs.current_id() {
             Some(id) => id,
@@ -5147,7 +5171,7 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
             Err(outcome) => return outcome,
         },
         _ => {
-            e!(err, "fg: usage: fg [%job]");
+            e!(err, "fg: usage: fg [job_spec]");
             return ExecOutcome::Continue(2);
         }
     };
@@ -5236,6 +5260,13 @@ fn builtin_bg(
 ) -> ExecOutcome {
     // #158: drain pending STOP/CONT so `bg` finds a newly-stopped job.
     crate::jobs::reap_completed(shell);
+    // #161: bg takes no options; a leading-dash argument (other than `--`) is
+    // reported as an invalid option before the usage line, matching bash.
+    if let Some(c) = leading_invalid_option(args) {
+        crate::sh_error_to!(shell, err, None, "bg: -{c}: invalid option");
+        e!(err, "bg: usage: bg [job_spec ...]");
+        return ExecOutcome::Continue(2);
+    }
     let id = match args.len() {
         0 => match shell.jobs.current_stopped_id() {
             Some(id) => id,
@@ -5263,7 +5294,7 @@ fn builtin_bg(
             id
         }
         _ => {
-            e!(err, "bg: usage: bg [%job]");
+            e!(err, "bg: usage: bg [job_spec ...]");
             return ExecOutcome::Continue(2);
         }
     };
@@ -6754,7 +6785,7 @@ static HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "bg",
-        synopsis: "bg [JOB_SPEC ...]",
+        synopsis: "bg [job_spec ...]",
         description: "Resume jobs in the background.\n\
                       Each JOB_SPEC names a stopped job to resume without bringing it to\n\
                       the foreground. With no args, the current job (%+) is resumed.",
@@ -6815,7 +6846,7 @@ static HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "disown",
-        synopsis: "disown [-ahr] [JOB_SPEC ...]",
+        synopsis: "disown [-h] [-ar] [jobspec ... | pid ...]",
         description: "Remove jobs from the active jobs table.\n\
                       -a all jobs; -r only running; -h mark for no SIGHUP on exit (the job\n\
                       stays in the table). Without flags, removes the named (or current)\n\
@@ -6886,7 +6917,7 @@ static HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "fg",
-        synopsis: "fg [JOB_SPEC]",
+        synopsis: "fg [job_spec]",
         description: "Resume a job in the foreground.\n\
                       Brings the named (or current) job into the foreground and waits for\n\
                       it to finish or stop.",

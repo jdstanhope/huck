@@ -202,8 +202,8 @@ fn wait_with_no_such_spec_errors_status_1() {
 }
 
 #[test]
-fn wait_multiarg_unparseable_returns_usage_status_2() {
-    // Multi-arg wait is now valid; only bad arg syntax should usage-error.
+fn wait_multiarg_unparseable_returns_status_1() {
+    // A malformed spec is a spec error, not a usage error: bash returns 1 (#161).
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -213,11 +213,12 @@ fn wait_multiarg_unparseable_returns_usage_status_2() {
         &mut std::io::stderr(),
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
 }
 
 #[test]
-fn wait_with_unparseable_pid_arg_returns_usage_status_2() {
+fn wait_with_unparseable_pid_arg_returns_status_1() {
+    // bash: `wait: `abc': not a pid or valid job spec` → rc 1 (#161).
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -227,7 +228,7 @@ fn wait_with_unparseable_pid_arg_returns_usage_status_2() {
         &mut std::io::stderr(),
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
 }
 
 #[test]
@@ -290,7 +291,8 @@ fn wait_multiarg_unparseable_rejects_before_waiting() {
         &mut std::io::stderr(),
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    // Rejected on the bad spec (rc 1, #161) before waiting on %1.
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
 }
 
 #[test]
