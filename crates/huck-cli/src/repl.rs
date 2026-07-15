@@ -106,6 +106,18 @@ pub fn run(args: &[String], version: &str) -> i32 {
         shell_cell.borrow_mut().shell_options.posix = posix;
     }
 
+    // `-o <name>` / `+o <name>` command-line options (#159): apply in argv order
+    // through the engine's `set -o` table, before any program/interactive
+    // dispatch, so they govern the whole session.
+    for (name, enable) in &opts.o_options {
+        if huck_engine::builtins::set_o_option_by_name(&mut shell_cell.borrow_mut(), name, *enable)
+            .is_err()
+        {
+            emit_cli_error(&prog, format_args!("{name}: invalid option name"));
+            std::process::exit(2);
+        }
+    }
+
     // Non-interactive program modes bypass the REPL entirely.
     match opts.mode {
         RunMode::Command {

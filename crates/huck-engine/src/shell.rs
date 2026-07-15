@@ -39,6 +39,9 @@ pub struct CliOptions {
     /// `--posix` CLI flag — start in POSIX mode (also set later for invocation
     /// as `sh` or with `POSIXLY_CORRECT`; see `startup_posix`).
     pub posix: bool,
+    /// `-o <name>` / `+o <name>` command-line options, in argv order. `bool` is
+    /// enable (`-o` = true, `+o` = false). Applied at startup like `set -o`.
+    pub o_options: Vec<(String, bool)>,
     pub mode: RunMode,
 }
 
@@ -49,6 +52,7 @@ impl Default for CliOptions {
             norc: false,
             noexec: false,
             posix: false,
+            o_options: Vec::new(),
             mode: RunMode::Interactive,
         }
     }
@@ -59,6 +63,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
     let mut norc = false;
     let mut noexec = false;
     let mut posix = false;
+    let mut o_options: Vec<(String, bool)> = Vec::new();
     let mut command: Option<String> = None;
     let mut i = 0;
 
@@ -75,6 +80,18 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
             }
             "--posix" => {
                 posix = true;
+                i += 1;
+            }
+            "-o" | "+o" => {
+                let enable = args[i] == "-o";
+                i += 1;
+                if i >= args.len() {
+                    return Err(format!(
+                        "{}: option requires an argument",
+                        if enable { "-o" } else { "+o" }
+                    ));
+                }
+                o_options.push((args[i].clone(), enable));
                 i += 1;
             }
             "--rcfile" => {
@@ -108,6 +125,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                     norc: false,
                     noexec: false,
                     posix: false,
+                    o_options: Vec::new(),
                     mode: RunMode::PrintVersion,
                 });
             }
@@ -139,6 +157,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
         norc,
         noexec,
         posix,
+        o_options,
         mode,
     })
 }
@@ -644,6 +663,28 @@ mod rc_tests {
     }
 
     #[test]
+    fn parse_cli_o_options_collected_in_order() {
+        let o = parse_cli(&[
+            "-o".into(),
+            "errexit".into(),
+            "+o".into(),
+            "posix".into(),
+            "-c".into(),
+            "echo hi".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            o.o_options,
+            vec![("errexit".to_string(), true), ("posix".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn parse_cli_o_missing_arg_errors() {
+        assert!(parse_cli(&["-o".into()]).is_err());
+    }
+
+    #[test]
     fn parse_cli_posix_flag() {
         let o = parse_cli(&["--posix".into(), "script.sh".into()]).unwrap();
         assert!(o.posix);
@@ -850,6 +891,7 @@ mod rc_tests {
             norc: true,
             noexec: false,
             posix: false,
+            o_options: Vec::new(),
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
@@ -867,6 +909,7 @@ mod rc_tests {
             norc: false,
             noexec: false,
             posix: false,
+            o_options: Vec::new(),
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
@@ -884,6 +927,7 @@ mod rc_tests {
             norc: false,
             noexec: false,
             posix: false,
+            o_options: Vec::new(),
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
@@ -905,6 +949,7 @@ mod rc_tests {
             norc: false,
             noexec: false,
             posix: false,
+            o_options: Vec::new(),
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), Some(1));
@@ -920,6 +965,7 @@ mod rc_tests {
             norc: false,
             noexec: false,
             posix: false,
+            o_options: Vec::new(),
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), Some(42));
