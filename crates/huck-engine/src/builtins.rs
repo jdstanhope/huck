@@ -6180,6 +6180,17 @@ fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetEr
     Ok(())
 }
 
+/// Public entry for applying a command-line `-o <name>` / `+o <name>` option
+/// (#159). Wraps the private `option_set` table so the CLI layer (huck-cli)
+/// doesn't duplicate the option list. `Err(())` means the name is not a
+/// recognized `set -o` option (the caller renders `<name>: invalid option name`).
+pub fn set_o_option_by_name(shell: &mut Shell, name: &str, enable: bool) -> Result<(), ()> {
+    match option_set(shell, name, enable) {
+        Ok(()) => Ok(()),
+        Err(OptSetErr::Unknown) => Err(()),
+    }
+}
+
 fn print_options_table(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     for opt in SETO_TABLE {
         let val = option_get(shell, opt.name).unwrap_or(opt.default);
