@@ -55,6 +55,65 @@ fn bg_on_running_job_returns_no_current_job() {
 }
 
 #[test]
+fn fg_on_terminal_job_reports_no_such_job_and_drops_it() {
+    // #162: a job the entry-reap already completed (Done) must be treated as
+    // gone — bash reports "no such job" + removes it — rather than clobbered
+    // back to Running (which leaked a phantom entry and returned 1 via a
+    // waitpid(-pgid) ECHILD race).
+    let mut shell = Shell::new();
+    shell.jobs.add_synthetic_done("sleep 0.05".to_string(), 0);
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = run_builtin("fg", &["%1".to_string()], &mut out, &mut err, &mut shell);
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    assert!(
+        String::from_utf8_lossy(&err).contains("fg: %1: no such job"),
+        "stderr: {}",
+        String::from_utf8_lossy(&err)
+    );
+    assert!(
+        shell.jobs.iter().next().is_none(),
+        "the completed job must be removed, not left as a phantom Running entry"
+    );
+}
+
+#[test]
+fn fg_on_signaled_job_reports_no_such_job_and_drops_it() {
+    // Same as above for a Signaled terminal state.
+    let mut shell = Shell::new();
+    shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
+    shell.jobs.jobs_mut()[0].state = crate::jobs::JobState::Signaled(libc::SIGKILL);
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = run_builtin("fg", &["%1".to_string()], &mut out, &mut err, &mut shell);
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    assert!(
+        String::from_utf8_lossy(&err).contains("fg: %1: no such job"),
+        "stderr: {}",
+        String::from_utf8_lossy(&err)
+    );
+    assert!(shell.jobs.iter().next().is_none());
+}
+
+#[test]
+fn bg_on_terminal_job_reports_no_such_job_and_drops_it() {
+    // #162: bg on a job the entry-reap completed must report "no such job" +
+    // remove it, not misreport "already running" (the pre-fix behavior).
+    let mut shell = Shell::new();
+    shell.jobs.add_synthetic_done("sleep 0.05".to_string(), 0);
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = run_builtin("bg", &["%1".to_string()], &mut out, &mut err, &mut shell);
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    assert!(
+        String::from_utf8_lossy(&err).contains("bg: %1: no such job"),
+        "stderr: {}",
+        String::from_utf8_lossy(&err)
+    );
+    assert!(shell.jobs.iter().next().is_none());
+}
+
+#[test]
 fn is_builtin_recognizes_fg_and_bg() {
     assert!(is_builtin("fg"));
     assert!(is_builtin("bg"));
