@@ -1,17 +1,17 @@
 # bash 5.2.21 test-suite baseline
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
-huck commit: f8068b6 (v268: sever the lexer→parser cycle — command-word subscript lvalue).
-Sweep date: 2026-07-07 UTC (v268 full re-sweep after the v266–v268 parser-driven front-end rearchitecture — oracle deletion, history prune, cycle-sever). Two rows drifted vs the prior recorded sweep and are updated below; all other categories carried forward (their FAIL notes below predate v268 and may have drifted in detail — this refresh updated the STATUS column via a full 82-category re-run, not a full re-triage of the 68 FAIL notes). Prior sweep provenance: 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers; v219 cprint+herestr flip to PASS; v220 herestr flip; v225 func flip).
+huck commit: 2fc140c (v298: builtin write-error #137 + InProcess pipeline-stage redirect order #144).
+Sweep date: 2026-07-15 UTC (v298 full re-sweep — first bash-suite run since v268; verifies the v269–v298 arc, error-emitter consolidation, fd-plumbing remediation (v289–v295), pipeline-stage redirect-failure (v296), redirect diagnostics (v297), and #137/#144 (v298), regressed NOTHING). **NO regression: all 10 previously-PASS categories still PASS; PASS 10→15 (+getopts, input-test, iquote, nquote1, tilde), TIMEOUT 4→2 (read + redir no longer hang — the foreground-wait/move-fd fixes).** STATUS column re-run across all 82 categories; the 65 FAIL notes are NOT fully re-triaged (they may have drifted in detail since v268). Prior sweep provenance: 2026-07-07 UTC (v268 full re-sweep); 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers; v219 cprint+herestr flip; v220 herestr; v225 func).
 
 Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven front-end (oracle deletion, `${…}`/subscript/assignment paths) cost zero bash-suite compatibility — every previously-passing category still passes, no new TIMEOUTs, and the array/subscript/assignment categories (`array`, `array2`, `assoc`, `appendop`, `tilde`, `posixpat`) stay FAIL for the same pre-existing non-front-end reasons recorded below.
 
 ## Summary
 
 - Categories run: 82
-- PASS: 10
-- FAIL: 68
-- TIMEOUT: 4
+- PASS: 15
+- FAIL: 65
+- TIMEOUT: 2
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
 
@@ -51,7 +51,7 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 | extglob2 | PASS | |
 | extglob3 | PASS | |
 | func | PASS | All blockers cleared across v221–v225: v221 prefix-assignment leak; v222 redirected-brace-body + nested-`function`-keyword reconstruction; v223 `declare -xF` export filter/format + FUNCNAME write protection; v224 FUNCNEST enforcement + recursion backstop (func4.sub byte-identical); v225 posix-gated special-builtin prefix-assignment persistence + the inline_scopes enclosing-restore-survival fix (func3.sub line 155). 0-diff PASS (verified via the runner 2026-06-26). |
-| getopts | FAIL | Usage-message format divergence — huck omits the trailing ellipsis from the optional-argument notation and uses its own name as message prefix. Pre-existing L-26 class divergence. |
+| getopts | PASS | v298 re-sweep: 0-diff PASS (the L-26 usage-message-format blocker recorded at v268 is resolved). |
 | glob-test | FAIL | A missing locale warning appears in huck's output but not bash's (locale check position differs). Multibyte character handling diverges: a Unicode character is rendered differently (huck produces different byte sequences vs bash). Globbing correctness diverges for some patterns — cases that should fail to match succeed in huck, and vice versa. Backslash-escaped glob metacharacters passed as arguments are handled differently. Glob results omit the `./` prefix that bash includes when the pattern starts with `./`. L-04/L-11 (character vs byte in multibyte globbing) class divergence remains. |
 | globstar | FAIL | Test environment mismatch — `globstar.tests` expects to run from the bash build directory (where compiled object files are present to glob over); huck runs it from the tests directory, where those files do not exist. Also M-53 (bare `**` globstar matches directories only, not files). |
 | heredoc | FAIL | Several heredoc edge cases: a `$PS4` literal appears in huck's heredoc output where bash expects an expanded (or empty) value; fd-based heredoc reads via an `exec`-opened descriptor generate bad-fd errors; and an unterminated heredoc inside a complex script aborts where bash would continue. |
@@ -60,9 +60,9 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 | history | FAIL | M-46 (`history -d/-w/-r/-a` not supported), M-47 (`history N` numeric argument not supported), `fc` not found as a command, `set: history: not yet supported`. Multiple history-command gaps. |
 | ifs | PASS | Flipped FAIL→PASS since the v220 sweep: the v220-recorded divergence (joining `${a[*]}`/`$*` with a space instead of the first `IFS` character when `IFS` is non-whitespace) is resolved; the category is now byte-identical. |
 | ifs-posix | FAIL | IFS splitting semantics with the `read` builtin diverge when IFS contains both whitespace and non-whitespace characters — huck does not correctly handle certain adjacent mixed-class IFS-separator edge cases. New bug, separate from the unimplemented posix set option. |
-| input-test | FAIL | A line piped to a sub-script via a process pipeline is not read correctly — the sub-script's `read` sees an empty value instead of the piped content. New bug in how huck passes piped input to a child script invocation. |
+| input-test | PASS | v298 re-sweep: 0-diff PASS (the v268 piped-input-to-child-script `read` divergence is resolved). |
 | invert | PASS | |
-| iquote | FAIL | `$'...'` escape sequences for certain control-character and high-byte values (e.g., `\x00`, `\x7f`) are not correctly expanded — huck outputs the literal character `x` instead of the corresponding byte. |
+| iquote | PASS | v298 re-sweep: 0-diff PASS (the v268 `$'...'` control-char/high-byte escape-expansion divergence is resolved). |
 | jobs | TIMEOUT | Tests include deliberate multi-second `sleep` waits for process-synchronization; the accumulated sleep time exceeds the 30-second per-category timeout. Job-control behavior not fully assessed due to timeout. |
 | lastpipe | FAIL | `shopt -s lastpipe` not implemented — with lastpipe enabled bash runs the final pipeline stage in the current shell so its assignments are visible after the pipe. Huck always forks all pipeline stages; variables set in the last stage are not visible. New missing feature. |
 | mapfile | FAIL | L-34 (`mapfile -C` callback and `mapfile -u` fd-argument flags not implemented). Documented deferred gap from v140. |
@@ -71,7 +71,7 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 | nameref | FAIL | L-47 (nameref follow-on gaps). A `declare -p` call on a nameref variable dumps the entire variable table instead of just the named variable — new bug in the nameref plus `declare -p` interaction path. |
 | new-exp | FAIL | A parse or expansion error early in the test file (involving `}` as an unexpected token in an arith/expansion context) causes huck to abort the script, losing nearly all expected output. Error-message format also differs (huck says `unexpected character: '}'` while bash says `syntax error: operand expected (error token is "}")`). The `set: posix: not yet supported` issue is gone but the early-abort prevents the remainder from running. |
 | nquote | FAIL | Several divergences: `$'\t'` and similar `$'...'` escape sequences produce the literal escape notation rather than the actual character in some contexts; `set: history` and `set: -H` are not supported, causing format divergences; an unterminated `${...}` inside a multi-line quoted string errors in huck while bash produces output; byte-level differences in high-byte character sequences passed through quoting operations; and a helper glue-file source operation fails in huck. |
-| nquote1 | FAIL | A string containing embedded Ctrl-A characters is dropped or becomes empty in huck where bash passes it through as a separate argument; the word-count diverges in one place, producing an empty field instead of the expected control-character-containing string. |
+| nquote1 | PASS | v298 re-sweep: 0-diff PASS (the v268 embedded-Ctrl-A word-count/empty-field divergence is resolved). |
 | nquote2 | FAIL | When `IFS` includes Ctrl-A (`^A`), joining and splitting strings that contain embedded Ctrl-A characters produces empty results in huck rather than the expected per-character word sequences. The `${a[*]}` and `${a[@]}` expansions with Ctrl-A IFS diverge significantly. |
 | nquote3 | FAIL | Same Ctrl-A IFS class as nquote2: substring extraction and quoting operations on strings with embedded Ctrl-A characters produce empty arguments in huck where bash produces the expected Ctrl-A-containing substrings. |
 | nquote4 | FAIL | The braced hex-escape form `\x{NN}` inside `$'...'` strings is not implemented in huck: the sequence is passed through literally while bash expands it to the corresponding byte. Unbraced `\xNN` and other escape forms may have separate issues. |
@@ -87,15 +87,15 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 | procsub | FAIL | L-39 (process-substitution edge cases) — the FIFO fallback path produces permission-denied errors when the test environment lacks writable `/dev/fd`. Core `<(cmd)` on standard fds also fails with a permission error in this run. |
 | quote | FAIL | Backslash quoting edge cases — an escaped space inside a word is treated differently, and a backslash-newline line continuation produces two separate values rather than joining the words. New bugs in backslash-quote-in-word handling. |
 | quotearray | FAIL | Assoc-array keys containing escaped special characters (brackets, dollar signs, backslashes) cannot be used as arithmetic subscripts — the arith parser fails on the key content. New bug in special-character key handling in arithmetic array contexts. |
-| read | TIMEOUT | `read -t` (timeout option) not implemented (L-34) — tests that issue `read -t N` with a pipeline or tty source block indefinitely instead of timing out. `read -u` (fd argument) also not implemented (L-34). |
-| redir | TIMEOUT | The `<&N-` and `>&N-` dup-and-close fd redirect operators are not supported — huck rejects the close modifier, leaves fd state in an inconsistent condition, and a subsequent unconditional `read` blocks on terminal input indefinitely. New bug in dup-and-close redirect syntax. |
+| read | FAIL | v298 re-sweep: no longer TIMEOUT (the v268 hang — the foreground-wait latency / `read -t` block — is resolved; the category now runs to completion). Now FAILs with remaining output divergences (residual `read -t`/`read -u` fd-source edge cases, L-34 class); needs re-triage. |
+| redir | FAIL | v298 re-sweep: no longer TIMEOUT (the v268 hang — `<&N-`/`>&N-` dup-and-close leaving fd state inconsistent so a later `read` blocked on the tty — is resolved; move-fd redirects now supported and the category runs to completion). Now FAILs with remaining output divergences; needs re-triage. |
 | rhs-exp | FAIL | In pattern-substitution replacement strings, huck retains backslashes before characters that bash removes them before (e.g., `\'` stays as `\'` in huck's output but becomes `'` in bash's). Also one missing empty-string trailing argument. |
 | set-e | FAIL | `set -e` interaction with `&&`/`||` compound lists, `!` negation, and `eval` diverges — some cases where bash would abort the script huck continues (or vice versa). New bug area in `set -e` compound-list abort semantics. |
 | set-x | FAIL | Minor xtrace format difference: `(( expr ))` trace emits no trailing space in huck but bash includes one. Pre-existing L-21 residual. |
 | shopt | FAIL | Error-message prefix format difference. Many `set -o <option>: not yet supported` rejections (allexport, braceexpand, hashall, histexpand, keyword, monitor, notify, onecmd, privileged, history, ignoreeof, interactive-comments, posix, emacs, vi). Significant missing set-option surface. |
 | strip | PASS | |
 | test | FAIL | `test <` and `test >` lexicographic string-comparison operators not supported — huck rejects them with "unexpected argument". Also `/dev/tty` inaccessible in the test runner environment (test infrastructure). |
-| tilde | FAIL | `set: posix: not yet supported` misconfigures the test environment. Also tilde expansion inside colon-delimited variable-assignment values diverges in some posix-mode edge cases. |
+| tilde | PASS | v298 re-sweep: 0-diff PASS (the v268 `set -o posix` preamble rejection + colon-delimited-assignment tilde divergence are resolved). |
 | tilde2 | FAIL | Tilde expansion timing diverges from bash in two directions: huck expands `~` in assignment-RHS contexts where bash stores the literal `~` (so `declare -p` shows the expanded path while bash shows `~`), and in one test huck fails to expand `~` where bash does produce the expanded path. The `set: posix: not yet supported` issue is no longer the primary cause. |
 | trap | FAIL | `trap -p` display format divergence — huck prints bare signal names (`HUP`, `INT`, etc.) while bash prints them with the `SIG` prefix (`SIGHUP`, `SIGINT`, etc.). Subshell EXIT trap not firing when expected. Signal-number display differences in job-notification lines. Multiple trap formatting gaps. |
 | type | FAIL | Error-message prefix format difference (L-class), `set: posix: not yet supported`, and `declare -f` output format issues cascade into function-display comparisons. |
