@@ -1116,6 +1116,16 @@ impl Drop for RedirectScope {
                 }
             }
         }
+        // #142: reap heredoc/here-string writers ONLY AFTER restoring the fds
+        // above. Restoring closes the installed read end of each heredoc pipe, so
+        // a writer still blocked on a full pipe (a >64KB body whose reader never
+        // ran — e.g. a later redirect in the same list failed, so the body was
+        // skipped) gets EPIPE/SIGPIPE and exits. Reaping before restore would
+        // `waitpid` a writer that can never make progress → hang. On success the
+        // body already drained the read end, so the writer has exited and this
+        // reap is instant. Centralizing here makes every in-process applier
+        // restore-then-reap by construction.
+        self.reap_heredoc_writers();
     }
 }
 
@@ -1244,7 +1254,9 @@ where
     // back the entries already applied (atomic, matching pre-v156 behavior).
     let force_terminal = redirs_write_stdout(redirs);
     if let Err(outcome) = scope.apply_redirects(redirs, shell, sink, err_sink) {
-        scope.reap_heredoc_writers();
+        // #142: `drop` restores the fds THEN reaps the heredoc writers (see
+        // `Drop for RedirectScope`); reaping before restore would hang on a
+        // >64KB body whose reader never ran.
         drop(scope);
         drain_procsubs(shell, procsub_base);
         return outcome;
@@ -1270,10 +1282,9 @@ where
     };
     let outcome = run_inner(shell, inner_sink, err_sink);
     let _ = io::stdout().flush();
-    // Reap the forked heredoc/herestring writers now that the inner body has run
-    // (the consumer has drained and closed its read end, so the writers have
-    // finished). ECHILD or any error is fine — they are transient helpers.
-    scope.reap_heredoc_writers();
+    // The heredoc/here-string writers are reaped by the scope's Drop (below),
+    // after it restores the fds — see `Drop for RedirectScope` (#142). By now the
+    // body has drained each read end, so those writers have already exited.
     // Restore the real fds BEFORE draining redirect-target process substitutions.
     // For an OUTPUT procsub (`cmd > >(consumer)`), the redirect dup'd the procsub's
     // write end onto fd 1; `drain_procsubs` blocks waiting for the inner consumer
@@ -1353,7 +1364,8 @@ fn run_builtin_with_redirects(
 
     let mut scope = RedirectScope::new();
     if let Err(outcome) = scope.apply_redirects(redirs, shell, sink, err_sink) {
-        scope.reap_heredoc_writers();
+        // #142: restore fds (which closes any installed heredoc read end) THEN
+        // reap the writers — both handled by `drop` via `Drop for RedirectScope`.
         drop(scope);
         drain_procsubs(shell, procsub_base);
         return outcome;
@@ -1589,7 +1601,8 @@ fn run_builtin_with_redirects(
     } else {
         outcome
     };
-    scope.reap_heredoc_writers();
+    // Heredoc writers are reaped by the scope's Drop (below), after it restores
+    // the fds (#142); the builtin has already drained each read end by now.
     // Restore the real fds BEFORE draining redirect-target process substitutions.
     // For an OUTPUT procsub (`builtin > >(cat)`), the redirect dup'd the procsub's
     // write end onto fd 1; `drain_procsubs` blocks waiting for the inner consumer
@@ -4520,11 +4533,11 @@ fn apply_redirects_permanently(
         .apply_redirects(&cmd.redirects, shell, sink, err_sink)
         .is_err()
     {
-        // Reap any heredoc writers spawned by already-applied redirs before the
-        // scope drops (Drop is writer-agnostic) — else a zombie until shell
-        // exit. Mirrors with_redirect_scope's path.
-        scope.reap_heredoc_writers();
-        return Err(()); // scope Drop restores partial → atomic rollback
+        // #142: scope Drop restores the partially-applied redirects (atomic
+        // rollback) and THEN reaps the heredoc writers — restoring first closes
+        // any installed read end so a writer blocked on a >64KB body unblocks,
+        // instead of hanging waitpid.
+        return Err(());
     }
 
     // SUCCESS → make the redirections permanent.
@@ -4536,6 +4549,13 @@ fn apply_redirects_permanently(
     // For heredoc writers: reap them NOW (before forget) so the writer
     // process doesn't become a zombie. The write end was installed onto the
     // target fd; the writer will finish and exit once its data is consumed.
+    //
+    // KNOWN LIMITATION (#169): for a PERMANENT redirect the reader is a *later*
+    // command, so a >64KB body has no one draining fd N yet — this synchronous
+    // reap then hangs on the still-blocked writer. Unlike the temporary appliers
+    // (fixed for #142 by restore-then-reap in Drop), `exec` cannot reorder its
+    // way out; the proper fix is temp-file spooling or lazy reaping, tracked in
+    // #169.
     scope.reap_heredoc_writers();
 
     // Close each saved-original fd (or skip -1 = "was closed before us") so
