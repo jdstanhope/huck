@@ -1044,7 +1044,11 @@ impl RedirectScope {
                 }
             }
             PlanOp::Close { target } => self.close_target(target),
-            PlanOp::NamedFd { high, name } => {
+            PlanOp::NamedFd {
+                high,
+                name,
+                virtual_fd: _,
+            } => {
                 let fd = high.into_raw_fd();
                 shell.set(&name, fd.to_string());
             }
@@ -3031,7 +3035,13 @@ fn expand_single(
     if fields.len() == 1 {
         Ok(fields.into_iter().next().unwrap().chars)
     } else {
-        crate::sh_error_to!(shell, err, None, "ambiguous redirect");
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "{}: ambiguous redirect",
+            crate::expand::reconstruct_word_source(word)
+        );
         Err(())
     }
 }
@@ -3059,11 +3069,22 @@ fn resolve_dup_source(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> Result<RawFd, ()> {
-    match resolve_fd_target(source, shell) {
+    // bash: a dup source that word-splits to 0 or >1 fields (e.g. `$v` unset,
+    // `>&` empty) is an *ambiguous redirect* naming the raw word; a single
+    // non-numeric field is `bad fd`. The error names the UN-expanded source
+    // word (`$v`), not the expansion result.
+    let fields = expand(source, shell);
+    let word_src = crate::expand::reconstruct_word_source(source);
+    if fields.len() != 1 {
+        let mut err = err_writer(err_sink, sink);
+        crate::sh_error_to!(shell, &mut *err, None, "{word_src}: ambiguous redirect");
+        return Err(());
+    }
+    match fields.into_iter().next().unwrap().chars.parse::<i32>() {
         Ok(fd) => Ok(fd),
-        Err(e) => {
+        Err(_) => {
             let mut err = err_writer(err_sink, sink);
-            crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e));
+            crate::sh_error_to!(shell, &mut *err, None, "bad fd: {word_src}");
             Err(())
         }
     }
@@ -3077,10 +3098,11 @@ fn validate_fd_open(
     shell: &mut Shell,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
+    label: &str,
 ) -> Result<(), ()> {
     if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
         let mut err = err_writer(err_sink, sink);
-        crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor");
+        crate::sh_error_to!(shell, &mut *err, None, "{label}: Bad file descriptor");
         return Err(());
     }
     Ok(())
@@ -3099,6 +3121,7 @@ fn validate_plan_source(
     shell: &mut Shell,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
+    label: &str,
 ) -> Result<(), i32> {
     let open = match fd_state.get(&src) {
         Some(&state) => state,
@@ -3106,10 +3129,24 @@ fn validate_plan_source(
     };
     if !open {
         let mut err = err_writer(err_sink, sink);
-        crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor");
+        crate::sh_error_to!(shell, &mut *err, None, "{label}: Bad file descriptor");
         return Err(1);
     }
     Ok(())
+}
+
+/// Non-emitting open-check mirroring [`validate_plan_source`]/[`validate_fd_open`].
+/// Used by the `{var}` dup path to decide whether to emit bash's extra leading
+/// `redirection error: cannot duplicate fd: …` line BEFORE the standard
+/// `<label>: Bad file descriptor`, without double-emitting.
+fn validate_source_is_open(
+    src: RawFd,
+    fd_state: Option<&std::collections::HashMap<RawFd, bool>>,
+) -> bool {
+    match fd_state.and_then(|st| st.get(&src)) {
+        Some(&open) => open,
+        None => (unsafe { libc::fcntl(src, libc::F_GETFD) }) >= 0,
+    }
 }
 
 /// Validate a dup/move source. In-process (interleaved) passes `None` and we
@@ -3122,10 +3159,11 @@ fn validate_source(
     shell: &mut Shell,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
+    label: &str,
 ) -> Result<(), i32> {
     match fd_state {
-        Some(state) => validate_plan_source(src, state, shell, sink, err_sink),
-        None => validate_fd_open(src, shell, sink, err_sink).map_err(|()| 1),
+        Some(state) => validate_plan_source(src, state, shell, sink, err_sink, label),
+        None => validate_fd_open(src, shell, sink, err_sink, label).map_err(|()| 1),
     }
 }
 
@@ -4646,17 +4684,23 @@ enum PlanOp {
     InstallDup { target: RawFd, source: RawFd },
     /// `N>&-`, and the source-close half of a move (`>&w-`).
     Close { target: RawFd },
-    /// `{var}` named-fd. `high` is the live descriptor the command sees, already
-    /// allocated non-CLOEXEC (>= 10). In-process: assign `$name = high` and let it
-    /// persist (take it out of the plan; do NOT save/restore). Child: keep `high`
-    /// held (inherited, non-CLOEXEC), replay a defensive `dup2(high, high)`, and
-    /// do NOT assign `$name` (bash doesn't for an external command).
+    /// `{var}` named-fd. `high` is the parent-parked live descriptor (already
+    /// allocated non-CLOEXEC, >= 10). In-process: assign `$name = high` and let it
+    /// persist (take it out of the plan; do NOT save/restore) — `virtual_fd` is
+    /// `high` there and is ignored. Child: `dup2(high -> virtual_fd)` then
+    /// `close(high)` (unless equal), keeping `high` held until fork; `$name` is set
+    /// to `virtual_fd` DURING batch lowering (so a later sibling `2>&$v` resolves
+    /// to it) but restored by `lower_redirects` — bash doesn't persist `{var}` to
+    /// the parent for an external command.
     NamedFd {
         high: std::os::fd::OwnedFd,
         // Read by the in-process applier (`RedirectScope::apply_one`) to assign
-        // `$name`; the child path (`redir_plan_to_child`) intentionally ignores it
-        // (bash does not assign `$var` for an external command).
+        // `$name`; the child path (`redir_plan_to_child`) assigns `virtual_fd`.
         name: String,
+        /// Child path: the virtual destination the parked `high` is duped onto
+        /// (lowest fd >= 10 not used as an earlier plan target / earlier `{var}`
+        /// virtual). Equals `high` on the in-process build (where it is unused).
+        virtual_fd: RawFd,
     },
 }
 
@@ -4730,6 +4774,9 @@ fn lower_one_redirect(
         // is a borrowed shell fd number (a Dup/Move source) left alone.
         let mut owned_src: Option<OwnedFd> = None;
         let mut dup_src: Option<RawFd> = None;
+        // The raw Dup/Move source word, threaded out of the match so the dup
+        // validation below can name it in bash's error (`$v: Bad file descriptor`).
+        let mut dup_source_word: Option<&crate::lexer::Word> = None;
         match &redir.op {
             RedirOp::File { mode, target: word } => {
                 let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
@@ -4756,6 +4803,7 @@ fn lower_one_redirect(
             RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
                 let src = resolve_dup_source(source, shell, sink, err_sink).map_err(|()| 1)?;
                 dup_src = Some(src);
+                dup_source_word = Some(source);
             }
             RedirOp::Heredoc { body, .. } => {
                 let bytes = expand_assignment(body, shell).into_bytes();
@@ -4807,7 +4855,28 @@ fn lower_one_redirect(
         // Validate a Dup/Move source at lower time. No owned file has been opened
         // for a Dup/Move (`owned_src` is None), so an error here truncates nothing.
         if let Some(s) = dup_src {
-            validate_source(s, fd_state.as_deref(), shell, sink, err_sink)?;
+            let label = dup_source_word
+                .map(crate::expand::reconstruct_word_source)
+                .unwrap_or_else(|| s.to_string());
+            // #140a: a `{var}` dup of a bad fd prints TWO lines in bash — a leading
+            // `redirection error: cannot duplicate fd: <strerror>` (bash's
+            // redirection_error path, which omits `line N:`) followed by the standard
+            // `<word>: Bad file descriptor`. Emit the leading line via the no-line
+            // emitter (so huck also omits `line N:`, matching bash's raw bytes), then
+            // let the normal validation emit the second (line-prefixed) and return Err.
+            if !validate_source_is_open(s, fd_state.as_deref()) {
+                {
+                    let mut err = err_writer(err_sink, sink);
+                    crate::sh_error_noline_to!(
+                        shell,
+                        &mut *err,
+                        None,
+                        "redirection error: cannot duplicate fd: {}",
+                        crate::bash_io_error(&std::io::Error::from_raw_os_error(libc::EBADF))
+                    );
+                }
+            }
+            validate_source(s, fd_state.as_deref(), shell, sink, err_sink, &label)?;
         }
         let raw_src: RawFd = match (&owned_src, dup_src) {
             (Some(o), _) => o.as_raw_fd(),
@@ -4833,13 +4902,33 @@ fn lower_one_redirect(
         };
         // Close the owned source now that it's been duped to `high`.
         drop(owned_src);
+        // Child (batch, `fd_state = Some`) path: allocate a VIRTUAL destination fd
+        // — the lowest number >= 10 that is not already used as a target by an
+        // earlier plan op and not an earlier `{var}`'s virtual number (both are
+        // recorded `true` in `fd_state`). Child replay dup2s the parked `high`
+        // onto `virtual_fd` and closes `high`, so `cmd 3>a {v}>x` sees fd 10 like
+        // bash rather than the parked 11 (#141). Set `$name = virtual_fd` DURING
+        // lowering so a later sibling `2>&$v` resolves to it (#140d) — the caller
+        // (`lower_redirects`) snapshots/restores `$name`, since bash does not
+        // persist a `{var}` to the parent for an external command. In-process
+        // (`fd_state = None`): `virtual_fd == high` and `$name` is assigned by
+        // `apply_one` at apply time, so nothing changes here.
+        let virtual_fd = if let Some(st) = fd_state.as_deref_mut() {
+            let mut v: RawFd = 10;
+            while st.get(&v) == Some(&true) {
+                v += 1;
+            }
+            st.insert(v, true);
+            shell.set(name, v.to_string());
+            v
+        } else {
+            high
+        };
         ops.push(PlanOp::NamedFd {
             high: unsafe { OwnedFd::from_raw_fd(high) },
             name: name.to_string(),
+            virtual_fd,
         });
-        if let Some(st) = fd_state.as_deref_mut() {
-            st.insert(high, true);
-        }
         if is_move {
             // Move: close the original source (a shell fd) after the dup. Only a
             // Dup/Move source reaches here (owned sources aren't moves).
@@ -4852,6 +4941,10 @@ fn lower_one_redirect(
         }
         return Ok(ops);
     }
+    // UNREACHABLE: `target_fd()` returns `None` only for `RedirFd::Var`, and the
+    // `RedirFd::Var` block above returns on every path — so `target` is always
+    // `Some` here. Left as a bare message (no source word is in scope to name for
+    // #152); a future reader should not puzzle over why it wasn't updated.
     let Some(target) = redir.target_fd() else {
         {
             let mut err = err_writer(err_sink, sink);
@@ -4900,8 +4993,12 @@ fn lower_one_redirect(
             if !(is_move && src == target) {
                 // Validate the source NOW (before any later file opens) so an invalid
                 // dup errors without truncating a later `>file`. Same-plan targets are
-                // recorded open in fd_state, so `3>g 4>&3` still passes.
-                if let Err(code) = validate_source(src, fd_state.as_deref(), shell, sink, err_sink)
+                // recorded open in fd_state, so `3>g 4>&3` still passes. bash names the
+                // raw source word (`>&$v` -> `$v: Bad file descriptor`); a numeric
+                // literal (`>&9`) reconstructs back to its own number, unchanged.
+                let label = crate::expand::reconstruct_word_source(source);
+                if let Err(code) =
+                    validate_source(src, fd_state.as_deref(), shell, sink, err_sink, &label)
                 {
                     return Err(code);
                 }
@@ -5004,6 +5101,27 @@ fn lower_redirects(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> Result<RedirPlan, i32> {
+    // Snapshot every `{var}` name a redirect in this batch will assign. During
+    // lowering `lower_one_redirect` sets `$name` to the virtual fd so a later
+    // sibling `2>&$v` resolves against it (#140d), but bash does NOT persist a
+    // `{var}` to the parent for an external command — so restore the prior value
+    // (unset or otherwise) before returning, on both the success and error paths.
+    // Mirrors the inline-assignment snapshot/restore. Snapshot each name once
+    // (its pre-command value); restore LIFO.
+    let mut var_snaps: Vec<(String, Option<crate::shell_state::Variable>)> = Vec::new();
+    for redir in redirects {
+        if let RedirFd::Var(name) = &redir.fd {
+            if !var_snaps.iter().any(|(n, _)| n == name) {
+                var_snaps.push((name.clone(), shell.snapshot_var(name)));
+            }
+        }
+    }
+    let restore = |shell: &mut Shell,
+                   snaps: Vec<(String, Option<crate::shell_state::Variable>)>| {
+        for (name, prior) in snaps.into_iter().rev() {
+            shell.restore_var(&name, prior);
+        }
+    };
     let mut fd_state: std::collections::HashMap<RawFd, bool> = std::collections::HashMap::new();
     let mut plan = RedirPlan {
         ops: Vec::new(),
@@ -5027,10 +5145,12 @@ fn lower_redirects(
                     let mut st = 0;
                     unsafe { libc::waitpid(pid, &mut st, 0) };
                 }
+                restore(shell, var_snaps);
                 return Err(code);
             }
         }
     }
+    restore(shell, var_snaps);
     Ok(plan)
 }
 
@@ -5073,12 +5193,24 @@ fn redir_plan_to_child(plan: RedirPlan) -> ChildRedirPlan {
                 child.ops.push(ChildRedirOp::Dup { target, source });
             }
             PlanOp::Close { target } => child.ops.push(ChildRedirOp::Close { target }),
-            PlanOp::NamedFd { high, name: _ } => {
+            PlanOp::NamedFd {
+                high,
+                name: _,
+                virtual_fd,
+            } => {
                 let raw = high.as_raw_fd();
+                // dup2(high -> virtual_fd) wires the command's inherited `{var}`
+                // fd to the bash-matching low number; close the parked `high`
+                // afterwards (unless it already IS the virtual fd, in which case
+                // the `source == target` Dup arm just clears FD_CLOEXEC). `high`
+                // stays `held` so the parent keeps it alive across the fork.
                 child.ops.push(ChildRedirOp::Dup {
-                    target: raw,
+                    target: virtual_fd,
                     source: raw,
                 });
+                if virtual_fd != raw {
+                    child.ops.push(ChildRedirOp::Close { target: raw });
+                }
                 child.held.push(high);
             }
         }
@@ -6635,6 +6767,31 @@ fn spawn_pipeline(
             && !redirect_failed
             && let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd
         {
+            // Source-order `{var}` visibility (#140d): a `{v}>f` earlier in this
+            // stage's redirect list assigns `$v`, and a later `2>&$v` dup slot must
+            // see it when we resolve that slot pre-fork. The forked child body
+            // re-applies the FULL redirect list itself (that wiring is
+            // authoritative and produces the correct final fd — its own
+            // `apply_redirects` reassigns `$v`), so this pre-assignment only exists
+            // to let `resolve_dup_source` find `$v` here instead of erroring
+            // `$v: ambiguous redirect`. bash does not persist a `{var}` to the
+            // parent for a pipeline stage, so snapshot/restore around the
+            // resolution (mirrors `lower_redirects`). The numbers are placeholders
+            // (>=10, allocation order) — only their presence matters; the child's
+            // re-application determines the observed fd.
+            let mut var_snaps: Vec<(String, Option<crate::shell_state::Variable>)> = Vec::new();
+            let mut next_virtual: RawFd = 10;
+            for r in &exec.redirects {
+                if let RedirFd::Var(name) = &r.fd
+                    && !matches!(&r.op, RedirOp::Close)
+                {
+                    if !var_snaps.iter().any(|(n, _)| n == name) {
+                        var_snaps.push((name.clone(), shell.snapshot_var(name)));
+                    }
+                    shell.set(name, next_virtual.to_string());
+                    next_virtual += 1;
+                }
+            }
             // #145: an InProcess stage's own Dup-target resolution failing
             // (`>&<non-numeric>` etc.) is a stage-own redirect failure, so it
             // fails only this stage (redirect_failed -> spawn_failed_stage)
@@ -6642,23 +6799,18 @@ fn spawn_pipeline(
             // converted sites. (Numeric-but-closed targets like `>&9` resolve
             // OK here and fail later in the child instead.)
             let sdt = match &exec.slot_stdout() {
-                Some(RedirectSlot::Dup { source, .. }) => match resolve_fd_target(source, shell) {
-                    Ok(fd) => Some(fd),
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "{}",
-                                crate::bash_io_error(&e)
-                            );
+                Some(RedirectSlot::Dup { source, .. }) => {
+                    // resolve_dup_source distinguishes an *ambiguous redirect*
+                    // (0/>1 fields, e.g. unset `$v`) from a `bad fd`, emitting the
+                    // matching bash message itself.
+                    match resolve_dup_source(source, shell, sink, err_sink) {
+                        Ok(fd) => Some(fd),
+                        Err(()) => {
+                            redirect_failed = true;
+                            None
                         }
-                        redirect_failed = true;
-                        None
                     }
-                },
+                }
                 _ => None,
             };
             // If stdout's Dup already failed, don't also try stderr's (one
@@ -6668,19 +6820,9 @@ fn spawn_pipeline(
             } else {
                 match &exec.slot_stderr() {
                     Some(RedirectSlot::Dup { source, .. }) => {
-                        match resolve_fd_target(source, shell) {
+                        match resolve_dup_source(source, shell, sink, err_sink) {
                             Ok(fd) => Some(fd),
-                            Err(e) => {
-                                {
-                                    let mut err = err_writer(err_sink, sink);
-                                    crate::sh_error_to!(
-                                        shell,
-                                        &mut *err,
-                                        None,
-                                        "{}",
-                                        crate::bash_io_error(&e)
-                                    );
-                                }
+                            Err(()) => {
                                 redirect_failed = true;
                                 None
                             }
@@ -6689,6 +6831,11 @@ fn spawn_pipeline(
                     _ => None,
                 }
             };
+            // Restore `$v` (unset or prior) — a pipeline-stage `{var}` must not
+            // persist to the parent (LIFO, mirrors the inline-assignment restore).
+            for (name, prior) in var_snaps.into_iter().rev() {
+                shell.restore_var(&name, prior);
+            }
             (sdt, sedt)
         } else {
             (None, None)
