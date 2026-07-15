@@ -22,21 +22,33 @@ Confirmed identically for `printf "end\n"`, `echo -n end`, and `echo hi >&-`.
 **Mechanism.** `builtin_echo` (`builtins.rs:679/683`) and `builtin_printf` (`builtins.rs:4143`)
 DO check their `out.write_all(...)` result and return `Continue(1)` on `Err`. But `out` for the
 Terminal sink is Rust's line-buffered `io::stdout()`: a `write_all` that does not force a flush
-(no trailing newline, or a full-line write whose buffer copy succeeds) returns `Ok` **without the
-`write(2)` syscall**. The real OS error (EBADF on a closed fd, ENOSPC on a full disk) only surfaces
-at the next `flush()`, and every flush site does `let _ = ...flush()` — discarding it. The
-authoritative site is the `run_builtin_with_redirects` epilogue flush (`executor.rs:1531`, run
-immediately after the builtin returns, while its own redirect scope is still installed so fd 1 is
-the redirected target).
+returns `Ok` **without the `write(2)` syscall**, so the real error only surfaces at the next
+`flush()`, which every site discards (`let _ = ...flush()`).
 
-**Fix.** At the `run_builtin_with_redirects` epilogue, capture the stdout flush `Result` instead of
-discarding it. On `Err(e)`, if the builtin's own outcome status is still 0 (it did not already
-report the error itself — the **double-emit guard**), emit `"<name>: write error: <bash_io_error(e)>"`
-to the stage's error writer and override the outcome to `Continue(1)`. `<name>` is the builtin
-program name (`echo`/`printf`/…) that `run_builtin_with_redirects` already holds. Use
-`bash_io_error(&e)` so the suffix matches bash (`Bad file descriptor`, not Rust's
-`… (os error 9)`); this also fixes printf's pre-existing raw-`{e}` inconsistency at its own
-write-check site if that path ever fires.
+**CORRECTION (found during implementation, verified against std source + strace).** For the
+**closed-fd** case — issue #137's own repro `exec >&-; echo end` — capturing the flush `Result`
+still does NOT reveal the error: Rust's `std::io::Stdout`/`StdoutRaw` routes every write/flush
+through `handle_ebadf`, which **converts `EBADF` into `Ok`**. So a write to a closed real fd 1
+reports success even though the underlying `write(2)` returned `-1 EBADF`. Only *other* IO errors
+(e.g. `ENOSPC` on a full disk, fd still open) propagate through the flush `Result` normally. The
+flush-`Result` check therefore handles the full-disk half but is a no-op for the closed-fd half.
+
+**Fix (as implemented).** In the `run_builtin_with_redirects` epilogue (`executor.rs:1531`, run
+while the builtin's redirect scope is still installed so fd 1 is the redirected target), detect a
+failed stdout write two ways, both under the existing `write_to_fd1` gate and a `Continue(0)`
+**double-emit guard** (don't override a builtin that already reported a different failure):
+1. **Closed fd (EBADF):** right after `write_to_fd1` is computed, probe real fd 1 with
+   `libc::fcntl(1, F_GETFD) < 0` (the established closed-fd idiom already used elsewhere in this
+   file). When closed, route the builtin's writes into a throwaway `Vec<u8>` instead of the
+   EBADF-swallowing `io::stdout()`; a non-empty buffer means the builtin *attempted* output, which
+   for a closed fd is a genuine write failure. Synthesize the strerror via
+   `bash_io_error(&io::Error::from_raw_os_error(libc::EBADF))` → `"Bad file descriptor"`.
+2. **Other errors (ENOSPC etc., fd open):** capture the epilogue `io::stdout().flush()` `Result`
+   and treat `Err(e)` as a write failure with `bash_io_error(&e)`.
+On either, emit `"<name>: write error: <strerror>"` (`<name>` = `resolved.program`) to the stage's
+redirect-aware error writer and override the outcome to `Continue(1)`. A builtin that writes
+nothing under a closed fd (`exec >&-; true`, `echo -n ""`) leaves the buffer empty → stays rc 0,
+matching bash.
 
 **Scope.** The flush-driven check is builtin-agnostic and catches the write failure uniformly for
 **non-pipe** destinations (closed fd, file/disk errors). Pipe destinations are unchanged: a builtin
