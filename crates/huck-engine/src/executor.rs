@@ -1370,6 +1370,20 @@ fn run_builtin_with_redirects(
     // route_out_to_err` arm below handles this; suppress `write_to_fd1` here.
     let write_to_fd1 =
         !route_out_to_err && (redirs_write_stdout(redirs) || matches!(sink, StdoutSink::Terminal));
+    // #137: Rust's `io::stdout()` deliberately SWALLOWS EBADF (see
+    // `std::io::stdio::handle_ebadf` upstream) — a write to a closed real fd 1
+    // reports success (`Ok`) even though the underlying `write(2)` genuinely
+    // failed, so `io::stdout().flush()`'s `Result` can never reveal a closed-fd
+    // write failure (only OTHER errors, e.g. ENOSPC on a full disk, propagate
+    // normally and are still caught by the flush-Result check below). Detect
+    // the closed-fd case separately: by the time we reach here, an `exec >&-`
+    // or this command's own `>&-`/move-close redirect has already closed real
+    // fd 1 via `scope.apply_redirects` above, so a cheap `fcntl` probe reveals
+    // it BEFORE the builtin runs. When closed, route the builtin's writes into
+    // a throwaway buffer instead of the swallowing `io::stdout()`, so we can
+    // still tell whether the builtin attempted any output.
+    let fd1_closed = write_to_fd1 && unsafe { libc::fcntl(1, libc::F_GETFD) } < 0;
+    let mut fd1_discard: Vec<u8> = Vec::new();
     let run = |out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, shell: &mut Shell| {
         if let Some(da) = resolved.decl_args.as_deref() {
             builtins::run_declaration_builtin(&resolved.program, da, out, err, shell)
@@ -1472,9 +1486,16 @@ fn run_builtin_with_redirects(
             StdoutSink::Terminal => unreachable!("route_err_to_out requires Capture stdout"),
         }
     } else if write_to_fd1 {
-        let mut out = io::stdout();
         let mut err = err_writer(err_sink, sink);
-        run(&mut out, &mut *err, shell)
+        if fd1_closed {
+            // Real fd 1 is already closed — see the `fd1_closed` comment above.
+            // Route through a throwaway buffer rather than the EBADF-swallowing
+            // `io::stdout()` so the epilogue can detect an attempted write.
+            run(&mut fd1_discard, &mut *err, shell)
+        } else {
+            let mut out = io::stdout();
+            run(&mut out, &mut *err, shell)
+        }
     } else {
         // Capture stdout sink with no fd-1 redirect. Mirror `err_writer` inline
         // so the `*buf` borrow for `out` doesn't fight the err_sink construction.
@@ -1528,8 +1549,46 @@ fn run_builtin_with_redirects(
             },
         }
     };
-    let _ = io::stdout().flush();
+    // #137: a builtin's stdout write failure (closed fd, full disk) only
+    // surfaces at flush — line-buffered io::stdout() defers the write(2), so the
+    // builtins' own write_all checks miss it. Detect it here and emit bash's
+    // `<name>: write error: <strerror>` + exit 1. Guards:
+    //  - `write_to_fd1`: only the branch where the builtin wrote to real fd 1
+    //    (the capture branches write to a buffer, so an io::stdout() flush error
+    //    there is unrelated to this builtin).
+    //  - double-emit guard `Continue(0)`: don't override a builtin that already
+    //    reported a different failure, and don't re-report over a nonzero status.
+    // A CLOSED real fd 1 is detected separately via `fd1_closed`/`fd1_discard`
+    // (set up above the `run` closure): `io::stdout().flush()`'s `Result` can
+    // never reveal that case because Rust's `Stdout` deliberately swallows
+    // EBADF (reports success). `stdout_flush`'s `Err` still catches other,
+    // non-EBADF write failures (e.g. ENOSPC) on an fd that was open when the
+    // builtin ran.
+    let stdout_flush = io::stdout().flush();
     let _ = std::io::Write::flush(&mut std::io::stderr());
+    let fd1_write_failed =
+        matches!(&stdout_flush, Err(_)) || (fd1_closed && !fd1_discard.is_empty());
+    let outcome = if write_to_fd1 && fd1_write_failed && matches!(outcome, ExecOutcome::Continue(0))
+    {
+        let err_desc = match &stdout_flush {
+            Err(e) => crate::bash_io_error(e),
+            Ok(()) => crate::bash_io_error(&io::Error::from_raw_os_error(libc::EBADF)),
+        };
+        {
+            let mut ew = err_writer(err_sink, sink);
+            crate::sh_error_to!(
+                shell,
+                &mut *ew,
+                None,
+                "{}: write error: {}",
+                resolved.program,
+                err_desc
+            );
+        }
+        ExecOutcome::Continue(1)
+    } else {
+        outcome
+    };
     scope.reap_heredoc_writers();
     // Restore the real fds BEFORE draining redirect-target process substitutions.
     // For an OUTPUT procsub (`builtin > >(cat)`), the redirect dup'd the procsub's
