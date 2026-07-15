@@ -2157,15 +2157,3 @@ fn compound_stdout_redirect_writes_to_file() {
     );
     let _ = std::fs::remove_file(&p);
 }
-
-#[test]
-fn make_orphan_pipe_for_eof_reader_yields_immediate_eof() {
-    use std::io::Read;
-    use std::os::unix::io::FromRawFd;
-    let r = make_orphan_pipe_for_eof_reader().expect("pipe");
-    // Read should return 0 bytes (EOF) immediately, not block.
-    let mut f = unsafe { std::fs::File::from_raw_fd(r) };
-    let mut buf = [0u8; 8];
-    let n = f.read(&mut buf).expect("read");
-    assert_eq!(n, 0, "expected EOF, got {n} bytes");
-}

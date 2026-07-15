@@ -5819,21 +5819,6 @@ fn run_coproc(
     ExecOutcome::Continue(0)
 }
 
-/// Create an inter-stage pipe for a downstream pipeline reader, where
-/// the upstream stage's stdout is going elsewhere (an explicit file
-/// redirect). Closes the write-end immediately so the downstream reader
-/// sees EOF instead of inheriting parent stdin or blocking on an
-/// orphaned write-end. Returns the read-end fd to thread into
-/// `prev_pipe_read`. On `make_pipe` failure, the caller propagates the
-/// error.
-fn make_orphan_pipe_for_eof_reader() -> io::Result<RawFd> {
-    let (r, w) = crate::child_fd::make_pipe(false)?;
-    unsafe {
-        libc::close(w);
-    }
-    Ok(r)
-}
-
 /// Rewrites `run_multi_stage` around raw `libc::pipe` fds.
 ///
 /// Each stage is classified via `classify_stage`:
@@ -6400,151 +6385,14 @@ fn spawn_pipeline(
             }
         };
 
-        // ---- Determine stdout redirect (from ExecCommand if Simple) ----------
-        // #145: skip opening a later redirect once an earlier one on this stage
-        // failed (first-failure-wins; avoids a second error message).
-        let explicit_stdout: Option<ChildFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
-            stage_cmd
-            && !stage_is_external
-            && !redirect_failed
-        {
-            match &exec.slot_stdout() {
-                Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
-                    let expanded = expand_single(w, shell, &mut *err_writer(err_sink, sink));
-                    match expanded {
-                        Err(()) => {
-                            // #145: ambiguous-redirect / expansion failure fails ONLY
-                            // this stage (error already printed). None -> phase 5
-                            // builds the inter-stage pipe for the exit-1 child.
-                            redirect_failed = true;
-                            None
-                        }
-                        Ok(path) => {
-                            let guard = shell.shell_options.noclobber
-                                && !matches!(r, RedirectSlot::Clobber(_));
-                            match open_redirect_file(
-                                &FileMode::Truncate,
-                                &path,
-                                guard,
-                                FdPlacement::Relocated,
-                            ) {
-                                Ok(f) => Some(ChildFd::from(f)),
-                                Err(e) => {
-                                    redir_open_error(shell, err_sink, sink, &path, &e);
-                                    // #145: fail ONLY this stage; None -> phase 5
-                                    // builds the inter-stage pipe for the child.
-                                    redirect_failed = true;
-                                    None
-                                }
-                            }
-                        }
-                    }
-                }
-                Some(RedirectSlot::Append(w)) => {
-                    let expanded = expand_single(w, shell, &mut *err_writer(err_sink, sink));
-                    match expanded {
-                        Err(()) => {
-                            // #145: ambiguous-redirect / expansion failure fails ONLY
-                            // this stage (error already printed). None -> phase 5
-                            // builds the inter-stage pipe for the exit-1 child.
-                            redirect_failed = true;
-                            None
-                        }
-                        Ok(path) => match open_redirect_file(
-                            &FileMode::Append,
-                            &path,
-                            false,
-                            FdPlacement::Relocated,
-                        ) {
-                            Ok(f) => Some(ChildFd::from(f)),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                // #145: fail ONLY this stage; None -> phase 5
-                                // builds the inter-stage pipe for the child.
-                                redirect_failed = true;
-                                None
-                            }
-                        },
-                    }
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        // ---- Determine stderr redirect (from ExecCommand if Simple) ----------
-        // #145: skip once an earlier redirect on this stage failed.
-        let explicit_stderr: Option<ChildFd> = if let Command::Simple(SimpleCommand::Exec(exec)) =
-            stage_cmd
-            && !stage_is_external
-            && !redirect_failed
-        {
-            match &exec.slot_stderr() {
-                Some(r @ (RedirectSlot::Truncate(w) | RedirectSlot::Clobber(w))) => {
-                    let expanded = expand_single(w, shell, &mut *err_writer(err_sink, sink));
-                    match expanded {
-                        Err(()) => {
-                            // #145: ambiguous-redirect / expansion failure fails ONLY
-                            // this stage (error already printed). None -> phase 5
-                            // builds the inter-stage pipe for the exit-1 child.
-                            redirect_failed = true;
-                            None
-                        }
-                        Ok(path) => {
-                            let guard = shell.shell_options.noclobber
-                                && !matches!(r, RedirectSlot::Clobber(_));
-                            match open_redirect_file(
-                                &FileMode::Truncate,
-                                &path,
-                                guard,
-                                FdPlacement::Relocated,
-                            ) {
-                                Ok(f) => Some(ChildFd::from(f)),
-                                Err(e) => {
-                                    redir_open_error(shell, err_sink, sink, &path, &e);
-                                    // #145: fail ONLY this stage; None -> phase 5
-                                    // builds the inter-stage pipe for the child.
-                                    redirect_failed = true;
-                                    None
-                                }
-                            }
-                        }
-                    }
-                }
-                Some(RedirectSlot::Append(w)) => {
-                    let expanded = expand_single(w, shell, &mut *err_writer(err_sink, sink));
-                    match expanded {
-                        Err(()) => {
-                            // #145: ambiguous-redirect / expansion failure fails ONLY
-                            // this stage (error already printed). None -> phase 5
-                            // builds the inter-stage pipe for the exit-1 child.
-                            redirect_failed = true;
-                            None
-                        }
-                        Ok(path) => match open_redirect_file(
-                            &FileMode::Append,
-                            &path,
-                            false,
-                            FdPlacement::Relocated,
-                        ) {
-                            Ok(f) => Some(ChildFd::from(f)),
-                            Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
-                                // #145: fail ONLY this stage; None -> phase 5
-                                // builds the inter-stage pipe for the child.
-                                redirect_failed = true;
-                                None
-                            }
-                        },
-                    }
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
+        // #144: InProcess stages get a NEUTRAL stdout/stderr base
+        // (pipe/capture/inherit); the forked child re-applies the stage's own
+        // `>file` / `2>file` / `2>&n` redirects in source order via run_command,
+        // so `2>&1 >f` binds stderr to the pipe like bash. (External stages replay
+        // their ChildRedirPlan; both now share the neutral-base model.) No pre-wired
+        // `explicit_stdout`/`explicit_stderr` base fd and no dup-target
+        // pre-resolution — the child is the single authoritative pass.
+        //
         // For an EXTERNAL stage, lower the FULL ordered redirect list once (v292
         // machinery) and replay it in the child over the pipe/capture base. #69: set
         // current_lineno so a stage redirect-open error carries `line N:` like a
@@ -6588,42 +6436,7 @@ fn spawn_pipeline(
 
         // ---- Build stdout fd -------------------------------------------------
         // Priority: explicit redirect > inter-stage pipe > Capture sink pipe > STDOUT_FILENO.
-        let stdout: ChildFd = if let Some(cf) = explicit_stdout {
-            // Upstream stdout goes to the file. For a non-final stage we
-            // STILL need to create an inter-stage pipe so the downstream
-            // stage reads EOF instead of inheriting parent stdin (M-125).
-            if !is_last {
-                match make_orphan_pipe_for_eof_reader() {
-                    Ok(r) => {
-                        prev_pipe_read = Some(r);
-                        parent_held.push(r);
-                    }
-                    Err(e) => {
-                        {
-                            let mut err = err_writer(err_sink, sink);
-                            crate::sh_error_to!(
-                                shell,
-                                &mut *err,
-                                None,
-                                "pipe: {}",
-                                crate::bash_io_error(&e)
-                            );
-                        }
-                        restore_inline_assignments(snap, shell);
-                        // stdin / cf (the open file) / explicit_stderr drop here.
-                        return Err(bail_teardown_pipeline(
-                            mode,
-                            shell,
-                            procsub_base,
-                            first_pid,
-                            &stages,
-                            &mut parent_held,
-                        ));
-                    }
-                }
-            }
-            cf
-        } else if !is_last {
+        let stdout: ChildFd = if !is_last {
             // Create the inter-stage pipe.
             match crate::child_fd::make_pipe(false) {
                 Ok((r, w)) => {
@@ -6644,7 +6457,7 @@ fn spawn_pipeline(
                         );
                     }
                     restore_inline_assignments(snap, shell);
-                    // stdin / explicit_stderr drop here.
+                    // stdin / stderr drop here.
                     return Err(bail_teardown_pipeline(
                         mode,
                         shell,
@@ -6680,7 +6493,7 @@ fn spawn_pipeline(
                                 );
                             }
                             restore_inline_assignments(snap, shell);
-                            // stdin / explicit_stderr drop here.
+                            // stdin / stderr drop here.
                             return Err(bail_teardown_pipeline(
                                 mode,
                                 shell,
@@ -6715,11 +6528,9 @@ fn spawn_pipeline(
             // Background never derives stderr from the sink (no capture, no
             // kernel-level merge wiring at spawn); it inherits unless an explicit
             // 2>… redirect was opened above.
-            SpawnMode::Background => explicit_stderr.unwrap_or(ChildFd::Inherit),
+            SpawnMode::Background => ChildFd::Inherit,
             SpawnMode::Foreground => {
-                if let Some(cf) = explicit_stderr {
-                    cf
-                } else {
+                {
                     match err_sink {
                         StderrSink::Terminal => ChildFd::Inherit,
                         // Kernel-level 2>&1: stderr := a distinct dup of whatever stdout
@@ -6818,87 +6629,14 @@ fn spawn_pipeline(
             fds_to_close_in_child.push(d);
         }
 
-        // Resolve Dup targets pre-fork for InProcess stages (Word expansion may
-        // allocate; not async-signal-safe). External stages handle this inside
-        // spawn_external_with_fds itself (via the replayed ChildRedirPlan), so
-        // skip the expansion entirely for them.
-        let (stdout_dup_target, stderr_dup_target) = if !stage_is_external
-            && !redirect_failed
-            && let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd
-        {
-            // Source-order `{var}` visibility (#140d): a `{v}>f` earlier in this
-            // stage's redirect list assigns `$v`, and a later `2>&$v` dup slot must
-            // see it when we resolve that slot pre-fork. The forked child body
-            // re-applies the FULL redirect list itself (that wiring is
-            // authoritative and produces the correct final fd — its own
-            // `apply_redirects` reassigns `$v`), so this pre-assignment only exists
-            // to let `resolve_dup_source` find `$v` here instead of erroring
-            // `$v: ambiguous redirect`. bash does not persist a `{var}` to the
-            // parent for a pipeline stage, so snapshot/restore around the
-            // resolution (mirrors `lower_redirects`). The numbers are placeholders
-            // (>=10, allocation order) — only their presence matters; the child's
-            // re-application determines the observed fd.
-            let mut var_snaps: Vec<(String, Option<crate::shell_state::Variable>)> = Vec::new();
-            let mut next_virtual: RawFd = 10;
-            for r in &exec.redirects {
-                if let RedirFd::Var(name) = &r.fd
-                    && !matches!(&r.op, RedirOp::Close)
-                {
-                    if !var_snaps.iter().any(|(n, _)| n == name) {
-                        var_snaps.push((name.clone(), shell.snapshot_var(name)));
-                    }
-                    shell.set(name, next_virtual.to_string());
-                    next_virtual += 1;
-                }
-            }
-            // #145: an InProcess stage's own Dup-target resolution failing
-            // (`>&<non-numeric>` etc.) is a stage-own redirect failure, so it
-            // fails only this stage (redirect_failed -> spawn_failed_stage)
-            // rather than aborting the pipeline, consistent with the other
-            // converted sites. (Numeric-but-closed targets like `>&9` resolve
-            // OK here and fail later in the child instead.)
-            let sdt = match &exec.slot_stdout() {
-                Some(RedirectSlot::Dup { source, .. }) => {
-                    // resolve_dup_source distinguishes an *ambiguous redirect*
-                    // (0/>1 fields, e.g. unset `$v`) from a `bad fd`, emitting the
-                    // matching bash message itself.
-                    match resolve_dup_source(source, shell, sink, err_sink) {
-                        Ok(fd) => Some(fd),
-                        Err(()) => {
-                            redirect_failed = true;
-                            None
-                        }
-                    }
-                }
-                _ => None,
-            };
-            // If stdout's Dup already failed, don't also try stderr's (one
-            // error, first failure wins — matching the phase-guard order).
-            let sedt = if redirect_failed {
-                None
-            } else {
-                match &exec.slot_stderr() {
-                    Some(RedirectSlot::Dup { source, .. }) => {
-                        match resolve_dup_source(source, shell, sink, err_sink) {
-                            Ok(fd) => Some(fd),
-                            Err(()) => {
-                                redirect_failed = true;
-                                None
-                            }
-                        }
-                    }
-                    _ => None,
-                }
-            };
-            // Restore `$v` (unset or prior) — a pipeline-stage `{var}` must not
-            // persist to the parent (LIFO, mirrors the inline-assignment restore).
-            for (name, prior) in var_snaps.into_iter().rev() {
-                shell.restore_var(&name, prior);
-            }
-            (sdt, sedt)
-        } else {
-            (None, None)
-        };
+        // #144/#140d: no dup-target pre-resolution. The forked child re-applies
+        // the FULL redirect list in source order — a `{v}>f` earlier in the stage
+        // assigns `$v` before a later `2>&$v` reads it, so the child derives the
+        // correct fd natively (no parent-side snapshot/restore, no spurious
+        // `$v: ambiguous redirect`). Matches how stdin `<file` redirects and
+        // compound stages already behave. (#147 will drop the now-unused
+        // dup_target parameters from fork_and_run_in_subshell.)
+        let (stdout_dup_target, stderr_dup_target): (Option<RawFd>, Option<RawFd>) = (None, None);
 
         // Build the child's fd environment ONCE; move it into whichever spawner.
         // Both spawners consume the ChildStdio and close the parent's owned
