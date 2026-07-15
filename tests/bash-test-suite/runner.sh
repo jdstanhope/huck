@@ -7,11 +7,30 @@
 #   BASH_SOURCE_DIR             (required) path to extracted bash-5.2.21/ source
 #   HUCK_BASH_TEST_CATEGORY     (optional) single category name to run; default: all
 #   HUCK_TEST_TIMEOUT           (optional) per-category timeout in seconds; default: 30
+#   HUCK_TEST_TIMEOUT_LONG      (optional) timeout for INHERENTLY-long categories
+#                               (jobs, minimal); default: 180. See LONG_CATEGORIES.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SKIPS_FILE="$ROOT/tests/bash-test-suite/known-skips.txt"
 TIMEOUT=${HUCK_TEST_TIMEOUT:-30}
+
+# A few upstream categories are INHERENTLY long-running — their .tests contain
+# real foreground `sleep`/`wait` calls or deliberate `read -t` timeout tests, so
+# they take far longer than 30s in ANY shell (jobs.tests alone runs ~60s in bash
+# 5.2.21; minimal's read.tests spends ~17s in its own `read -t` waits). These are
+# NOT huck hangs — huck is as-fast-or-faster than bash on them (verified v299) —
+# so the default 30s cap mislabels them TIMEOUT (which reads like a hang). Give
+# them a generous per-category timeout so the runner reports their TRUE PASS/FAIL
+# status; the default still catches real hangs quickly for every other category.
+LONG_TIMEOUT=${HUCK_TEST_TIMEOUT_LONG:-180}
+LONG_CATEGORIES=" jobs minimal "
+category_timeout() {
+    case "$LONG_CATEGORIES" in
+        *" $1 "*) echo "$LONG_TIMEOUT" ;;
+        *) echo "$TIMEOUT" ;;
+    esac
+}
 
 # ---- Preflight -----------------------------------------------------
 
@@ -181,10 +200,13 @@ for cat in "${CATEGORIES[@]}"; do
     diff_file="$SCRATCH/$cat.diff"
 
     # bash's runners expect $THIS_SH and $BASH_TSTOUT.
-    # Run with `timeout` to bound hangs.
+    # Run with `timeout` to bound hangs. Inherently-long categories get a
+    # generous cap (see category_timeout / LONG_CATEGORIES) so they are not
+    # mislabeled TIMEOUT.
+    cat_timeout=$(category_timeout "$cat")
     (
         cd "$SCRATCH/tests"
-        THIS_SH="$HUCK" BASH_TSTOUT="$out_file" timeout "$TIMEOUT" sh "./run-$cat" \
+        THIS_SH="$HUCK" BASH_TSTOUT="$out_file" timeout "$cat_timeout" sh "./run-$cat" \
             > "$diff_file" 2> "$err_file"
     )
     rc=$?

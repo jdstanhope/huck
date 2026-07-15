@@ -10,10 +10,19 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 
 - Categories run: 82
 - PASS: 15
-- FAIL: 65
-- TIMEOUT: 2
+- FAIL: 67
+- TIMEOUT: 0
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
+
+**v299 harness correction:** the two categories previously recorded as TIMEOUT
+(`jobs`, `minimal`) were NOT hangs and NOT huck performance bugs — they are
+inherently long-running (real `sleep`/`wait` in `jobs.tests`, ~62s in bash
+itself; deliberate `read -t` timeout tests in `minimal`/`read.tests`, ~17s in
+both shells; huck is as-fast-or-faster than bash on both). They exceeded only
+the harness's 30s default cap. `runner.sh` now gives such categories
+(`LONG_CATEGORIES`) a 180s cap, so they report their true FAIL status. No
+remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 
 ## Per-category status
 
@@ -63,10 +72,10 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 | input-test | PASS | v298 re-sweep: 0-diff PASS (the v268 piped-input-to-child-script `read` divergence is resolved). |
 | invert | PASS | |
 | iquote | PASS | v298 re-sweep: 0-diff PASS (the v268 `$'...'` control-char/high-byte escape-expansion divergence is resolved). |
-| jobs | TIMEOUT | Tests include deliberate multi-second `sleep` waits for process-synchronization; the accumulated sleep time exceeds the 30-second per-category timeout. Job-control behavior not fully assessed due to timeout. |
+| jobs | FAIL | v299: NOT a hang. `jobs.tests` is inherently long — its real foreground `sleep`/`wait` budget runs **~62s in bash 5.2.21 itself** vs ~43s in huck (huck is *faster*). It only showed TIMEOUT because the harness default cap was 30s; it is now in `LONG_CATEGORIES` (180s cap) and reports its true status. Now FAILs on job-control output divergences (non-interactive job-control message formats, `%job` notation, `disown`/`bg`/`fg` error wording) — needs triage. |
 | lastpipe | FAIL | `shopt -s lastpipe` not implemented — with lastpipe enabled bash runs the final pipeline stage in the current shell so its assignments are visible after the pipe. Huck always forks all pipeline stages; variables set in the last stage are not visible. New missing feature. |
 | mapfile | FAIL | L-34 (`mapfile -C` callback and `mapfile -u` fd-argument flags not implemented). Documented deferred gap from v140. |
-| minimal | TIMEOUT | Compound runner that includes `run-read` (which hangs on `read -t` blocking indefinitely); when that sub-test hangs, the entire minimal suite times out. |
+| minimal | FAIL | v299: NOT a hang. `minimal` is a meta-runner (~25 sub-runners); its time is dominated by `read.tests`' deliberate `read -t` timeout tests (~17s in **both** huck and bash — `read -t` sleeps for its timeout by design, it does NOT block indefinitely), plus func (~5s) and dynvar (~2s), all within ~0.1s of bash. It only showed TIMEOUT because the ~25s+ inherent runtime exceeded the harness's 30s default cap; it is now in `LONG_CATEGORIES` (180s cap). Now FAILs on the aggregate output divergences of its sub-runners — needs triage. |
 | more-exp | FAIL | Several remaining divergences: `${a[@]}` in contexts where IFS-splitting interacts with leading-space preservation produces fewer fields than bash; tilde in certain variable assignment contexts is not expanded when it should be (or expands to an unrelated value); a backslash at the end of a word in `"$@"` contexts splits incorrectly; an unterminated command substitution causes an abort where bash would produce output; and word-splitting with embedded bracket characters diverges. |
 | nameref | FAIL | L-47 (nameref follow-on gaps). A `declare -p` call on a nameref variable dumps the entire variable table instead of just the named variable — new bug in the nameref plus `declare -p` interaction path. |
 | new-exp | FAIL | A parse or expansion error early in the test file (involving `}` as an unexpected token in an arith/expansion context) causes huck to abort the script, losing nearly all expected output. Error-message format also differs (huck says `unexpected character: '}'` while bash says `syntax error: operand expected (error token is "}")`). The `set: posix: not yet supported` issue is gone but the early-abort prevents the remainder from running. |

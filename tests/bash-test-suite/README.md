@@ -76,13 +76,23 @@ To change the per-category timeout (default 30s):
 HUCK_TEST_TIMEOUT=60 bash tests/bash-test-suite/runner.sh
 ```
 
+A few categories are **inherently long-running** — their `.tests` contain
+real foreground `sleep`/`wait` calls or deliberate `read -t` timeout tests,
+so they take far longer than 30s in *any* shell (`jobs.tests` runs ~60s in
+bash 5.2.21 itself; `minimal` spends ~17s in `read.tests`' `read -t` waits).
+These are **not huck hangs** — huck is as-fast-or-faster than bash on them —
+so the runner gives them a generous timeout (default 180s, override with
+`HUCK_TEST_TIMEOUT_LONG`) via the `LONG_CATEGORIES` list, letting them report
+their true PASS/FAIL status instead of a misleading TIMEOUT. The 30s default
+still applies to every other category, so real hangs are caught quickly.
+
 ## Interpreting the output
 
 | Status | Meaning |
 |---|---|
 | PASS | huck's output is byte-identical to bash's `.right` for the category. |
 | FAIL | huck completed but its output diffs from `.right`. |
-| TIMEOUT | The category exceeded the per-test timeout. Often a real hang in huck. |
+| TIMEOUT | The category exceeded its timeout (default 30s; 180s for `LONG_CATEGORIES`). For a normal category this usually means a real hang in huck; the two known inherently-long categories (`jobs`, `minimal`) are exempted via a generous timeout so a TIMEOUT there would signal a genuine regression, not their normal runtime. |
 | ERROR | The runner couldn't classify the result (e.g. huck crashed). |
 | SKIP | Listed in `known-skips.txt`; not run. |
 
