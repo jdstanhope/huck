@@ -4571,10 +4571,12 @@ fn apply_redirects_permanently(
         // no original fd to restore, so we leave the target fd open (permanent).
     }
 
-    // Belt-and-suspenders: forget the scope so its Drop never runs the
-    // (now-empty) restore loop, and the (already-drained) heredoc_writers
-    // vec is not re-reaped.
-    std::mem::forget(scope);
+    // Drop the scope normally: `saved` was drained+closed above and
+    // `heredoc_writers` was reaped, so Drop's restore loop and reap are both
+    // no-ops — but dropping (rather than `mem::forget`) FREES the scope's heap
+    // (the `saved`/`heredoc_writers` Vec buffers). Forgetting leaked ~100 bytes
+    // per `exec` redirect, unbounded over a long-running process (#178).
+    drop(scope);
     Ok(())
 }
 

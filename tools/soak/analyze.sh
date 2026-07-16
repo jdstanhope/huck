@@ -22,13 +22,18 @@ TOL_CHILDREN=1
 TOL_ZOMBIES=0
 TOL_DELETED=0
 TOL_TMPFILES=1
-# RSS: flag if the median grows more than this many KB per hour.
-TOL_RSS_KB_PER_HR=8192
+# RSS: a healthy steady state does not drift at all (a leak-free run is often
+# byte-identical across samples). Flag a sustained early->late median RISE that
+# clears BOTH an absolute floor (noise / one-time cache fill) AND a relative
+# fraction of the early median — regardless of the absolute per-hour rate, since
+# even a slow leak (well under any KB/hr threshold) is a real unbounded leak.
+TOL_RSS_RISE_KB=3072      # ignore rises smaller than this (allocator noise / one-time)
+TOL_RSS_RISE_FRAC=0.10    # ...and require the rise to exceed 10% of the early median
 
 awk -F, -v tol_fds="$TOL_FDS" -v tol_threads="$TOL_THREADS" \
         -v tol_children="$TOL_CHILDREN" -v tol_zombies="$TOL_ZOMBIES" \
         -v tol_deleted="$TOL_DELETED" -v tol_tmp="$TOL_TMPFILES" \
-        -v tol_rss="$TOL_RSS_KB_PER_HR" '
+        -v rss_rise="$TOL_RSS_RISE_KB" -v rss_frac="$TOL_RSS_RISE_FRAC" '
 function median(arr, m,   a,b,key) {
   for (a=2;a<=m;a++){ key=arr[a]; b=a-1; while(b>=1 && arr[b]>key){arr[b+1]=arr[b];b--}; arr[b+1]=key }
   return (m%2) ? arr[int(m/2)+1] : (arr[m/2]+arr[m/2+1])/2
@@ -65,10 +70,13 @@ END {
     floord=lmin-emin
 
     if (k=="rss_kb") {
-      perhr=(hours>0)?(lmed-emed)/hours:0
-      cell=sprintf("%+.0fKB/hr", perhr)
-      if (perhr>tol_rss) { verdict="LEAK-SUSPECTED"; reason=reason " rss/hr"; cell=cell " LEAK" }
-      printf "%-10s %9d %9d %8d %8d %9.0f %11s\n", k, emin, lmin, floord, omax, lmed, cell
+      rise=lmed-emed
+      perhr=(hours>0)?rise/hours:0
+      cell=sprintf("%+.0fKB(%+.0f/hr)", rise, perhr)
+      if (rise>rss_rise && rise>rss_frac*emed) {
+        verdict="LEAK-SUSPECTED"; reason=reason sprintf(" rss+%.0fKB", rise); cell=cell " LEAK"
+      }
+      printf "%-10s %9d %9d %8d %8d %9.0f %18s\n", k, emin, lmin, floord, omax, lmed, cell
       continue
     }
     tol=-1
