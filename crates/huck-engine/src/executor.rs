@@ -245,7 +245,7 @@ pub fn execute_with_sink(
 fn execute_with_sink_inner(
     seq: &Sequence,
     shell: &mut Shell,
-    source: &str,
+    _source: &str,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
@@ -257,12 +257,15 @@ fn execute_with_sink_inner(
     let has_amp_separator = seq.rest.iter().any(|(c, _)| matches!(c, Connector::Amp));
     if seq.background && !has_amp_separator {
         if seq.rest.is_empty() {
-            // Single-pipeline or subshell backgrounded — existing paths.
+            // Single-pipeline or subshell backgrounded — existing paths. Deparse
+            // the unit for the normalized `jobs` display (#80).
             if let Command::Pipeline(p) = &seq.first {
-                return run_background_sequence(p, shell, sink, err_sink, source);
+                let display = render_job_command(&seq.first);
+                return run_background_sequence(p, shell, sink, err_sink, &display);
             }
             if let Command::Subshell { .. } = &seq.first {
-                return run_background_subshell(&seq.first, shell, sink, err_sink, false, source);
+                let display = render_job_command(&seq.first);
+                return run_background_subshell(&seq.first, shell, sink, err_sink, false, &display);
             }
         } else if seq
             .rest
@@ -280,10 +283,13 @@ fn execute_with_sink_inner(
                 rest: seq.rest.clone(),
                 background: false,
             };
+            // Deparse the and-or group itself (not the synthetic subshell wrapper)
+            // so `jobs` shows `a && b`, matching bash (#80).
+            let display = render_job_sequence(&inner);
             let subshell = Command::Subshell {
                 body: Box::new(inner),
             };
-            return run_background_subshell(&subshell, shell, sink, err_sink, false, source);
+            return run_background_subshell(&subshell, shell, sink, err_sink, false, &display);
         }
     }
     execute_sequence_body(seq, shell, sink, err_sink)
@@ -551,21 +557,20 @@ fn execute_sequence_body(
                     .collect(),
                 background: false,
             };
-            // Best-effort job-display label for the backgrounded group. The
-            // original source text isn't threaded down to this point, so derive
-            // a label from the group's first command's static program name when
-            // possible (good enough for `jobs` listings — not byte-diffed).
+            // Deparse the whole backgrounded and-or group to a normalized
+            // bash-style command line for the `jobs` display (#80). Rendered from
+            // the AST (pre-expansion), so `sleep $x && echo hi` shows unexpanded.
             // bash: a bare multi-stage pipeline backgrounded via `&` keeps the
             // shell's stdin on stage 0; every other async unit gets /dev/null.
             let inherit_stdin = group.rest.is_empty()
                 && matches!(group.first, Command::Pipeline(p) if p.commands.len() > 1);
-            let source = group_display_label(group.first);
+            let display = render_job_sequence(&inner);
             let subshell = Command::Subshell {
                 body: Box::new(inner),
             };
             // Launch; ignore the Continue(0) it returns — the foreground status
             // is unchanged by a background launch.
-            run_background_subshell(&subshell, shell, sink, err_sink, inherit_stdin, &source);
+            run_background_subshell(&subshell, shell, sink, err_sink, inherit_stdin, &display);
         } else {
             last_status = run_andor_group(group.first, &group.rest, shell, sink, err_sink);
             // Propagate control-flow outcomes immediately.
@@ -2829,9 +2834,9 @@ fn run_background_subshell(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
     inherit_stdin: bool,
-    source: &str,
+    display: &str,
 ) -> ExecOutcome {
-    let display = display_command(source);
+    let display = display.to_string();
     let job_control = shell.job_control_active();
     // bash: an async command's stdin defaults to /dev/null (non-interactive, no
     // explicit input redirect) so it can't steal the terminal; a bare
@@ -2880,9 +2885,9 @@ fn run_background_sequence(
     shell: &mut Shell,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
-    source: &str,
+    display: &str,
 ) -> ExecOutcome {
-    let display = display_command(source);
+    let display = display.to_string();
     let job_control = shell.job_control_active();
 
     // Spawn every stage via the shared pipeline core in Background mode. This
@@ -3041,35 +3046,167 @@ fn cleanup_partial_pipeline_raw(pgid: Option<i32>, pids: &[i32]) {
     }
 }
 
-/// Strips a trailing `&` and surrounding whitespace from the source line for
-/// display in the job table.
-fn display_command(source: &str) -> String {
-    source
-        .trim_end()
-        .trim_end_matches('&')
-        .trim_end()
-        .to_string()
+/// Render a `Command` back to a normalized bash-style source line for the
+/// `jobs`/`fg`/`bg` display: whitespace collapsed to single spaces (already done
+/// by the lexer), quotes preserved, and words shown UNEXPANDED — matching how
+/// bash re-renders a job's command from its parsed form (it does not store the
+/// literal source). This is an AST→source deparse, not source slicing. The
+/// trailing `&` is appended by the `jobs` formatter, not here.
+///
+/// Byte-identical to bash 5.2.21 for the common simple/pipeline/and-or/redirect/
+/// quoted forms. Documented best-effort residuals: exotic mixed quoting
+/// re-renders canonically with `"…"` (huck retains `quoted: bool`, not the
+/// original quote char), `&>`/`&>>` render as their desugared `> f 2>&1` form,
+/// and full compound commands (if/for/while/case/…) fall back to a label rather
+/// than bash's multi-line re-render.
+fn render_job_command(cmd: &Command) -> String {
+    match cmd {
+        Command::Simple(s) => render_job_simple(s),
+        Command::Pipeline(p) => p
+            .commands
+            .iter()
+            .map(render_job_command)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        Command::Subshell { body } => format!("( {} )", render_job_sequence(body)),
+        Command::BraceGroup(body) => format!("{{ {}; }}", render_job_sequence(body)),
+        Command::Redirected { inner, redirects } => {
+            let mut out = render_job_command(inner);
+            for r in redirects {
+                out.push(' ');
+                out.push_str(&render_job_redirection(r));
+            }
+            out
+        }
+        // Full compound commands (if/for/while/case/select/[[…]]/((…))/coproc/
+        // function) are rare as direct background jobs and bash re-renders them
+        // multi-line; best-effort label rather than a byte-exact match.
+        _ => render_job_compound_fallback(cmd),
+    }
 }
 
-/// Best-effort `jobs`-listing label for a backgrounded and-or group produced by
-/// a mid-list `&` separator (where the original source text isn't available at
-/// the executor partition site). Uses the first command's static program name
-/// when it is a plain literal; otherwise falls back to a generic label.
-fn group_display_label(first: &Command) -> String {
-    // Look through a single-stage pipeline wrapper (the parser wraps even a
-    // lone simple command in a Pipeline at some sites).
-    let simple = match first {
-        Command::Simple(s) => Some(s),
-        Command::Pipeline(p) if p.commands.len() == 1 => {
-            if let Command::Simple(s) = &p.commands[0] {
-                Some(s)
-            } else {
-                None
+/// Render a `Sequence` (an and-or / `;`-joined list) for the job display,
+/// joining commands with their real connectors.
+fn render_job_sequence(seq: &Sequence) -> String {
+    let mut s = render_job_command(&seq.first);
+    for (conn, cmd) in &seq.rest {
+        s.push_str(match conn {
+            Connector::Semi => "; ",
+            Connector::And => " && ",
+            Connector::Or => " || ",
+            Connector::Amp => " & ",
+        });
+        s.push_str(&render_job_command(cmd));
+    }
+    s
+}
+
+fn render_job_simple(s: &SimpleCommand) -> String {
+    match s {
+        SimpleCommand::Assign(assigns, _) => assigns
+            .iter()
+            .map(render_job_assignment)
+            .collect::<Vec<_>>()
+            .join(" "),
+        SimpleCommand::Exec(e) => {
+            let mut parts: Vec<String> = Vec::new();
+            for a in &e.inline_assignments {
+                parts.push(render_job_assignment(a));
             }
+            parts.push(crate::expand::reconstruct_word_source(&e.program));
+            for arg in &e.args {
+                parts.push(crate::expand::reconstruct_word_source(arg));
+            }
+            let mut out = parts.join(" ");
+            for r in &e.redirects {
+                out.push(' ');
+                out.push_str(&render_job_redirection(r));
+            }
+            out
         }
-        _ => None,
+    }
+}
+
+fn render_job_assignment(a: &crate::command::Assignment) -> String {
+    use crate::command::AssignTarget;
+    let mut s = String::new();
+    match &a.target {
+        AssignTarget::Bare(n) => s.push_str(n),
+        AssignTarget::Indexed { name, subscript } => {
+            s.push_str(name);
+            s.push('[');
+            s.push_str(&crate::expand::reconstruct_word_source_inner(subscript));
+            s.push(']');
+        }
+    }
+    s.push_str(if a.append { "+=" } else { "=" });
+    s.push_str(&crate::expand::reconstruct_word_source(&a.value));
+    s
+}
+
+/// Render one redirection as bash's job display does: file redirects put a space
+/// before the target (`> /dev/null`, `2> f`, `0<> f`), dup/move/close redirects
+/// glue the source with no space (`2>&1`, `1>&2`), and bash makes the default fd
+/// explicit for `<>`/`>&`/`<&` but not for plain `<`/`>`/`>>`/`>|`.
+fn render_job_redirection(r: &Redirection) -> String {
+    let fd_prefix = |explicit_default: Option<u16>| -> String {
+        match &r.fd {
+            RedirFd::Number(n) => n.to_string(),
+            RedirFd::Var(name) => format!("{{{name}}}"),
+            RedirFd::Default => explicit_default.map(|d| d.to_string()).unwrap_or_default(),
+        }
     };
-    if let Some(SimpleCommand::Exec(e)) = simple
+    let word = crate::expand::reconstruct_word_source;
+    match &r.op {
+        RedirOp::File { mode, target } => {
+            let (op, show_default) = match mode {
+                FileMode::ReadOnly => ("<", false),
+                FileMode::Truncate => (">", false),
+                FileMode::Append => (">>", false),
+                FileMode::Clobber => (">|", false),
+                FileMode::ReadWrite => ("<>", true),
+            };
+            let default = show_default.then(|| r.op.default_fd());
+            format!("{}{} {}", fd_prefix(default), op, word(target))
+        }
+        RedirOp::Dup { source, output } => {
+            let op = if *output { ">&" } else { "<&" };
+            format!(
+                "{}{}{}",
+                fd_prefix(Some(r.op.default_fd())),
+                op,
+                word(source)
+            )
+        }
+        RedirOp::Move { source, output } => {
+            let op = if *output { ">&" } else { "<&" };
+            format!(
+                "{}{}{}-",
+                fd_prefix(Some(r.op.default_fd())),
+                op,
+                word(source)
+            )
+        }
+        RedirOp::Close => {
+            // Direction (`>&-` vs `<&-`) isn't retained on `Close`; the explicit
+            // target fd survives in `r.fd`. Best-effort `<&-` (exotic as a bg job).
+            format!("{}<&-", fd_prefix(Some(r.op.default_fd())))
+        }
+        RedirOp::HereString(w) => format!("{}<<< {}", fd_prefix(None), word(w)),
+        RedirOp::Heredoc { .. } => {
+            // A heredoc on a backgrounded command is exotic; the delimiter isn't
+            // retained (only the collected body), so render a best-effort marker.
+            format!("{}<< (heredoc)", fd_prefix(None))
+        }
+    }
+}
+
+/// Best-effort `jobs`-listing label for a backgrounded compound command
+/// (if/for/while/case/…) where a byte-exact multi-line re-render is out of
+/// scope. Uses the leading command's static program name when it looks through
+/// to a plain simple command, else a generic label.
+fn render_job_compound_fallback(cmd: &Command) -> String {
+    if let Command::Simple(SimpleCommand::Exec(e)) = cmd
         && let Some(name) = e.program_static_text()
     {
         return name;

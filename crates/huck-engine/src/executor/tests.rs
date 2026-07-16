@@ -2304,3 +2304,95 @@ fn classify_runnability_bare_directory_in_path_is_not_found() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── #80: render_job_command AST→source deparser (jobs/fg/bg display) ─────────
+
+/// Parse a snippet to a `Sequence` for deparser tests.
+fn parse_job_seq(src: &str) -> Sequence {
+    crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
+        src,
+        &Default::default(),
+        crate::lexer::LexerOptions::default(),
+    ))
+    .expect("parse")
+    .expect("seq")
+}
+
+/// Deparse the first command of a snippet.
+fn render_job_cmd(src: &str) -> String {
+    render_job_command(&parse_job_seq(src).first)
+}
+
+#[test]
+fn render_job_command_simple_with_args() {
+    assert_eq!(render_job_cmd("sleep 0.3 aa bb"), "sleep 0.3 aa bb");
+}
+
+#[test]
+fn render_job_command_collapses_whitespace() {
+    // The lexer already drops inter-word whitespace, so the deparse is normalized.
+    assert_eq!(render_job_cmd("sleep   0.3    aa"), "sleep 0.3 aa");
+}
+
+#[test]
+fn render_job_command_pipeline() {
+    assert_eq!(render_job_cmd("sleep 0.3 | cat"), "sleep 0.3 | cat");
+    assert_eq!(
+        render_job_cmd("sleep 0.3 | cat | cat"),
+        "sleep 0.3 | cat | cat"
+    );
+}
+
+#[test]
+fn render_job_command_andor_sequence() {
+    // The whole and-or group is rendered via render_job_sequence.
+    assert_eq!(
+        render_job_sequence(&parse_job_seq("sleep 0.3 && echo hi")),
+        "sleep 0.3 && echo hi"
+    );
+    assert_eq!(render_job_sequence(&parse_job_seq("a || b")), "a || b");
+}
+
+#[test]
+fn render_job_command_redirect_has_space() {
+    // File redirects render with a space before the target (bash-normalized).
+    assert_eq!(
+        render_job_cmd("sleep 0.3 >/dev/null"),
+        "sleep 0.3 > /dev/null"
+    );
+    assert_eq!(
+        render_job_cmd("sleep 0.3 2>/dev/null"),
+        "sleep 0.3 2> /dev/null"
+    );
+    // Dup redirects glue the source with no space; default fd made explicit.
+    assert_eq!(render_job_cmd("sleep 0.3 2>&1"), "sleep 0.3 2>&1");
+    assert_eq!(render_job_cmd("sleep 0.3 >&2"), "sleep 0.3 1>&2");
+}
+
+#[test]
+fn render_job_command_double_quoted_arg() {
+    assert_eq!(render_job_cmd("sleep 0.3 \"a b\""), "sleep 0.3 \"a b\"");
+}
+
+#[test]
+fn render_job_command_variable_unexpanded() {
+    // Rendered from the AST word, so `$x` is shown pre-expansion.
+    assert_eq!(render_job_cmd("sleep $x"), "sleep $x");
+}
+
+#[test]
+fn render_job_command_inline_assignments() {
+    assert_eq!(render_job_cmd("A=1 B=2 sleep 0.3"), "A=1 B=2 sleep 0.3");
+}
+
+#[test]
+fn render_job_command_subshell_and_brace_group() {
+    assert_eq!(
+        render_job_cmd("( sleep 0.3; echo hi )"),
+        "( sleep 0.3; echo hi )"
+    );
+    assert_eq!(
+        render_job_cmd("{ sleep 0.3; echo hi; }"),
+        "{ sleep 0.3; echo hi; }"
+    );
+}
