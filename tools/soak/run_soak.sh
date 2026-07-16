@@ -80,10 +80,15 @@ WLOG="$RUN/workload.log"
 echo "soak run: $RUN"
 echo "$$" > "$RUN/soak.pid"   # this orchestrator's pid (send SIGTERM here to stop)
 
+# Copy the workload into the run dir and execute the copy, so a days-long
+# detached run is immune to the working tree changing under it (branch switch,
+# edit) mid-flight.
+cp "$HERE/workload.huck" "$RUN/workload.huck"
+
 # Launch the workload as its own session/pgroup leader so we can tear the whole
 # process tree (background sleeps, procsub children) down on exit.
 SOAK_DIR="$RUN" SOAK_SLEEP="$SLEEP" SOAK_HEARTBEAT=25 \
-  setsid "$HUCK" "$ROOT/tools/soak/workload.huck" >"$WLOG" 2>&1 &
+  setsid "$HUCK" "$RUN/workload.huck" >"$WLOG" 2>&1 &
 HPID=$!
 echo "$HPID" > "$RUN/huck.pid"
 echo "huck pid:  $HPID   (workload log: $WLOG)"
