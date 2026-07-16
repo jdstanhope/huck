@@ -3500,6 +3500,196 @@ fn resolve(
 
 // ----- redirect file handling -----------------------------------------------
 
+/// bash's `HEREDOC_PIPESIZE` (redir.c). A body at or below this goes to a pipe,
+/// a larger one to a temp file. 65536 is the Linux default pipe capacity, which
+/// is precisely why bash can write the pipe case from the parent without ever
+/// blocking. Verified against bash 5.2.21: a 65536-byte body yields a pipe, a
+/// 65537-byte body yields `/tmp/sh-thd.XXXXXX (deleted)`.
+const HEREDOC_PIPESIZE: usize = 65536;
+
+/// Deliver an expanded heredoc/here-string body and return a fresh READ-ONLY fd
+/// positioned at offset 0, with the body ALREADY fully delivered — no forked
+/// writer, matching bash's `here_document_to_fd`.
+///
+/// This is what makes #169 unreachable: a permanent (`exec`) redirect has no
+/// reader until a LATER command runs, so any writer process still blocked on a
+/// full pipe could never be reaped. With no writer, there is nothing to wait on.
+///
+/// `bytes.len()` is bash's `herelen` — here-string callers append the trailing
+/// newline BEFORE calling, so it is included in the size decision.
+///
+/// `tmpdir` is the shell's `$TMPDIR` variable (NOT the process env: bash honors
+/// an in-shell `TMPDIR=/x` whether exported or not, and huck does not sync
+/// exports to the process env). An unusable value silently falls back to `/tmp`,
+/// as bash does.
+///
+/// The caller owns the returned fd (and typically hands it to
+/// `relocate_high_cloexec`). The contract is only "a fresh readable fd at offset
+/// 0" — true of a pipe read end and a rewound file alike — so no call site needs
+/// to know which path produced it.
+fn heredoc_body_to_fd(bytes: &[u8], tmpdir: Option<&str>) -> Result<RawFd, io::Error> {
+    // Size check FIRST so a large body does no wasted pipe work (bash's exact
+    // behavior on Linux). The nonblocking probe inside `heredoc_body_to_pipe` is
+    // the portability guard: bash hardcodes 65536 and writes BLOCKING, which is
+    // safe only where a pipe holds 64KB. On macOS pipes start at 16KB, so that
+    // same code has nothing to stop it wedging — we degrade to a temp file
+    // instead of inheriting the hang (cf. #97, already a macOS-only hang).
+    if bytes.len() <= HEREDOC_PIPESIZE {
+        if let Some(fd) = heredoc_body_to_pipe(bytes) {
+            return Ok(fd);
+        }
+    }
+    heredoc_body_to_file(bytes, tmpdir)
+}
+
+/// Try to deliver `bytes` entirely into a pipe buffer, returning the read end.
+/// `None` means "did not fit / could not" — the caller falls back to a temp file.
+/// Never blocks: the write end is O_NONBLOCK, which is a property of THIS open
+/// file description, so the reader's end (a distinct description) stays blocking
+/// and the probe is invisible downstream.
+fn heredoc_body_to_pipe(bytes: &[u8]) -> Option<RawFd> {
+    let (r, w) = crate::child_fd::make_pipe(false).ok()?;
+    // SAFETY: `r`/`w` are freshly-opened fds owned by us; every path below closes
+    // both or returns `r` to the caller.
+    unsafe {
+        let fl = libc::fcntl(w, libc::F_GETFL);
+        if fl < 0 || libc::fcntl(w, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+            libc::close(r);
+            libc::close(w);
+            return None;
+        }
+    }
+    let mut off = 0usize;
+    while off < bytes.len() {
+        // SAFETY: writing from a live slice into an open fd.
+        let n = unsafe {
+            libc::write(
+                w,
+                bytes[off..].as_ptr() as *const libc::c_void,
+                bytes.len() - off,
+            )
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // EAGAIN: this platform's pipe is smaller than the body. Anything
+            // else: let the temp-file path have a go. Either way, discard.
+            unsafe {
+                libc::close(r);
+                libc::close(w);
+            }
+            return None;
+        }
+        if n == 0 {
+            unsafe {
+                libc::close(r);
+                libc::close(w);
+            }
+            return None;
+        }
+        off += n as usize;
+    }
+    // Close the write end so the reader sees EOF after the body. An empty body
+    // lands here directly — a pipe that is immediately at EOF.
+    unsafe { libc::close(w) };
+    Some(r)
+}
+
+/// Spool `bytes` to an unlinked temp file and return a read-only fd at offset 0.
+/// Tries `$TMPDIR` then `/tmp`, mirroring bash's silent fallback for an unset or
+/// unusable `TMPDIR`.
+fn heredoc_body_to_file(bytes: &[u8], tmpdir: Option<&str>) -> Result<RawFd, io::Error> {
+    let mut candidates: Vec<&str> = Vec::new();
+    if let Some(d) = tmpdir {
+        if !d.is_empty() {
+            candidates.push(d);
+        }
+    }
+    if !candidates.contains(&"/tmp") {
+        candidates.push("/tmp");
+    }
+    let mut last_err: Option<io::Error> = None;
+    for dir in candidates {
+        match heredoc_body_to_file_in(bytes, dir) {
+            Ok(fd) => return Ok(fd),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::from_raw_os_error(libc::ENOENT)))
+}
+
+/// One `mkstemp`-in-`dir` attempt. Follows bash's deliberate, race-conscious
+/// order: open the read-only fd BEFORE closing the writable one, and only then
+/// unlink — so nothing can substitute the name in between. `mkstemp` creates the
+/// file 0600 (owner-only) and the unlink makes it unreachable by name at once,
+/// so it also cannot survive a crash.
+fn heredoc_body_to_file_in(bytes: &[u8], dir: &str) -> Result<RawFd, io::Error> {
+    let mut tmpl: Vec<u8> = Vec::with_capacity(dir.len() + 16);
+    tmpl.extend_from_slice(dir.as_bytes());
+    if !tmpl.ends_with(b"/") {
+        tmpl.push(b'/');
+    }
+    tmpl.extend_from_slice(b"sh-thd.XXXXXX\0");
+
+    // SAFETY: `tmpl` is a NUL-terminated, writable buffer of the exact shape
+    // mkstemp requires; it overwrites the trailing XXXXXX in place.
+    let rw = unsafe { libc::mkstemp(tmpl.as_mut_ptr() as *mut libc::c_char) };
+    if rw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let path = tmpl.as_ptr() as *const libc::c_char;
+
+    let mut off = 0usize;
+    while off < bytes.len() {
+        // SAFETY: writing from a live slice into an open fd.
+        let n = unsafe {
+            libc::write(
+                rw,
+                bytes[off..].as_ptr() as *const libc::c_void,
+                bytes.len() - off,
+            )
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            unsafe {
+                libc::unlink(path);
+                libc::close(rw);
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            unsafe {
+                libc::unlink(path);
+                libc::close(rw);
+            }
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
+        off += n as usize;
+    }
+
+    // bash's order: second fd opened before the first is closed, then unlink.
+    // The fresh O_RDONLY fd starts at offset 0 — no lseek needed.
+    let ro = unsafe { libc::open(path, libc::O_RDONLY) };
+    let err = if ro < 0 {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe {
+        libc::unlink(path);
+        libc::close(rw);
+    }
+    match err {
+        Some(e) => Err(e),
+        None => Ok(ro),
+    }
+}
+
 /// Feed `bytes` (an expanded heredoc/herestring body) to a child's stdin WITHOUT
 /// the parent ever blocking on a full pipe. Forks a writer process that owns the
 /// pipe's write end, writes the whole body, then `_exit`s. The parent closes the
@@ -8484,3 +8674,6 @@ mod g3_dbracket_extglob_noshopt_tests;
 
 #[cfg(test)]
 mod errexit_andor_tests;
+
+#[cfg(test)]
+mod heredoc_body_tests;
