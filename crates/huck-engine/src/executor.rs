@@ -6619,14 +6619,13 @@ fn spawn_pipeline(
         // current_lineno so a stage redirect-open error carries `line N:` like a
         // single command; the plan's opens route through redir_open_error.
         //
-        // This MUST run BEFORE the inter-stage pipe / capture write end is created
-        // below: `build_child_redir_plan` opens heredoc/here-string bodies via
-        // `heredoc_body_to_fd` (no forked writer since #169), whose pipe-path
-        // write end is closed again before returning — but it still opens fds in
-        // this process, so keeping it ahead of the inter-stage pipe avoids handing
-        // it an fd number the pipe/capture setup below would otherwise claim.
-        // The existing slot-heredoc path resolves its body during stdin
-        // construction for the same reason.
+        // Ordering note: this runs before the inter-stage pipe / capture write end
+        // is created below, but that ordering is now incidental. It used to be
+        // load-bearing — `build_child_redir_plan` forked a heredoc writer, which
+        // would inherit an already-created pipe write end and keep the downstream
+        // stage from ever seeing EOF. Since #169 there is no fork:
+        // `heredoc_body_to_fd` delivers the body in this process and returns a
+        // single read-only fd. Nothing here depends on running first.
         let external_plan: Option<ChildRedirPlan> = if stage_is_external && !redirect_failed {
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 // #69: stamp the stage's line so a redirect-open error carries
