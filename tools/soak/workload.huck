@@ -1,0 +1,141 @@
+# huck soak-test workload — run by tools/soak/run_soak.sh.
+#
+# An infinite loop; each iteration runs one "batch" that exercises the
+# resource-sensitive constructs (pipelines, command/process substitution,
+# heredocs incl. a >64KB body, background jobs + wait, subshells, fd>2 and
+# 2>&1/2>file redirects, spawn-failure diagnostics, functions/locals, arrays,
+# traps) and ASSERTS its own output. A mismatch prints `SOAK-FAIL: …` to stderr
+# and exits 1 — so the monitor detects both resource leaks (via /proc counters)
+# AND behavioral drift/corruption over a long run.
+#
+# The assertions encode huck's OWN current outputs (not bash's): this is a
+# stability test, so any drift from today's behavior is the signal.
+#
+# Environment (set by run_soak.sh):
+#   SOAK_DIR        run directory (holds the scratch file + progress file)
+#   SOAK_SLEEP      seconds to sleep between batches (throttle; "" or 0 = none)
+#   SOAK_HEARTBEAT  write the iteration counter to the progress file every N batches
+
+set -u
+
+DIR=${SOAK_DIR:-/tmp}
+SLEEP=${SOAK_SLEEP:-0}
+HEARTBEAT=${SOAK_HEARTBEAT:-1000}
+TMPF="$DIR/scratch"
+PROGRESS="$DIR/progress"
+
+# A >64KB body, built once, to drive the heredoc/here-string writer-fork (and
+# #169 temp-spool) path every batch without rebuilding the string each time.
+BIG=$(printf 'x%.0s' $(seq 1 70000))
+BIG_LEN=70001   # 70000 bytes + trailing newline that <<< adds
+
+fail() {
+  # $1 = what, $2 = got, $3 = want
+  printf 'SOAK-FAIL: %s got=[%s] want=[%s] at iter %s\n' "$1" "$2" "$3" "$i" >&2
+  exit 1
+}
+want() {
+  # $1 = label, $2 = got, $3 = want
+  [ "$2" = "$3" ] || fail "$1" "$2" "$3"
+}
+
+batch() {
+  local got
+
+  # 1. Multi-stage external pipeline (forks + reaps externals; fd/zombie path).
+  got=$(printf 'a\nb\nc\n' | grep b | tr 'a-z' 'A-Z')
+  want pipeline "$got" "B"
+
+  # 2. Command substitution, incl. nested (subshell fork + capture pipe).
+  got=$(echo "$(echo z)")
+  want comsub "$got" "z"
+
+  # 3. Input process substitution (procsub child + fd wiring).
+  got=""
+  while read -r l; do got="$got$l"; done < <(printf 'x\ny\n')
+  want procsub_in "$got" "xy"
+
+  # 4. Output process substitution (procsub child writes a file we read back).
+  : > "$TMPF"
+  echo data > >(cat > "$TMPF")
+  wait
+  got=$(cat "$TMPF")
+  want procsub_out "$got" "data"
+
+  # 5. Small heredoc.
+  got=$(cat <<EOF
+line
+EOF
+)
+  want heredoc "$got" "line"
+
+  # 6. >64KB here-string → writer fork / temp spool → wc -c.
+  got=$(wc -c <<< "$BIG")
+  want herestring_big "$(echo $got)" "$BIG_LEN"
+
+  # 7. Background job + wait (job-table add/reap, fd + pid-registry path).
+  # `disown -a` prunes the terminal entry each batch so the known non-interactive
+  # job-table leak (#175) does not accumulate and mask other leaks; asserting the
+  # table is empty afterwards also guards that the prune path stays healthy.
+  sleep 0 &
+  wait $!
+  want bgwait_rc "$?" "0"
+  disown -a 2>/dev/null
+  got=$(jobs)
+  want jobs_empty "$got" ""
+
+  # 8. Subshell exit status.
+  ( exit 3 )
+  want subshell_rc "$?" "3"
+
+  # 9. fd>2 redirect via exec, then release it.
+  : > "$TMPF"
+  exec 9>"$TMPF"
+  echo hi >&9
+  exec 9>&-
+  got=$(cat "$TMPF")
+  want fd9 "$got" "hi"
+
+  # 10. 2>&1 merge inside a capture. Uses an external stage (kernel-ordered):
+  # the in-process brace-group variant mis-orders/leaks under 2>&1 in comsub
+  # (#176), so it is unsuitable for a byte-assert here.
+  got=$(sh -c 'echo out; echo er >&2' 2>&1)
+  want merge "$got" "out
+er"
+
+  # 11. Spawn-failure diagnostics (soak the v304/v305 code): 127 + 126.
+  nosuchcmd_xyz 2>/dev/null
+  want notfound_rc "$?" "127"
+  /etc 2>/dev/null
+  want isdir_rc "$?" "126"
+
+  # 12. Function with local; local must not leak to the caller scope.
+  f9() { local a=inner; echo "$a"; }
+  got=$(f9)
+  want local_val "$got" "inner"
+  want local_unset "${a-unset}" "unset"
+
+  # 13. Arrays.
+  local arr=(a b c)
+  want array_idx "${arr[1]}" "b"
+  want array_len "${#arr[@]}" "3"
+
+  # 14. EXIT trap inside a subshell/comsub (trap install + teardown per batch).
+  got=$(trap 'echo T' EXIT; echo body)
+  want trap_exit "$got" "body"
+
+  # Optional throttle to keep the box usable during a multi-day run.
+  [ -n "$SLEEP" ] && [ "$SLEEP" != "0" ] && sleep "$SLEEP"
+}
+
+i=0
+# Prime the progress file so the monitor can read iter 0 immediately.
+echo "$i" > "$PROGRESS"
+while :; do
+  batch
+  i=$((i + 1))
+  if [ $((i % HEARTBEAT)) -eq 0 ]; then
+    # Truncating write keeps the progress file one line (bounded over days).
+    echo "$i" > "$PROGRESS"
+  fi
+done
