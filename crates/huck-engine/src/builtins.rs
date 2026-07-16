@@ -7906,6 +7906,53 @@ fn is_executable_file(p: &std::path::Path) -> bool {
     }
 }
 
+/// Outcome of a PATH search for command runnability classification (#172).
+/// Distinguishes "found an executable" from "found only a non-executable file"
+/// (bash reports the latter as 126 "Permission denied") from "found nothing"
+/// (127 "command not found"). `search_path_for` collapses the last two to `None`.
+pub(crate) enum PathClassify {
+    /// A PATH segment yielded an executable regular file (the resolved path is
+    /// not carried — the caller re-searches PATH via `execvp` on the bare name).
+    Executable,
+    /// No executable, but at least one PATH segment yielded a non-executable
+    /// regular file; carries the FIRST such resolved path (bash reports the
+    /// first match in PATH order).
+    NonExecutable(std::path::PathBuf),
+    /// Nothing runnable and no non-executable regular-file match.
+    NotFound,
+}
+
+/// Walk PATH the way bash's command search does, for runnability classification.
+/// The first executable regular file wins (returns `Executable`); a directory or
+/// other non-regular entry named `name` never matches; if only non-executable
+/// regular files are found, the FIRST one is remembered and returned as
+/// `NonExecutable`. Bare names only — callers handle slash-paths separately.
+pub(crate) fn classify_path_search(name: &str, shell: &Shell) -> PathClassify {
+    use std::os::unix::fs::PermissionsExt;
+    let path_val = shell.lookup_var("PATH").unwrap_or_default();
+    let mut first_nonexec: Option<std::path::PathBuf> = None;
+    for segment in path_val.split(':') {
+        if segment.is_empty() {
+            continue;
+        }
+        let candidate = std::path::Path::new(segment).join(name);
+        match std::fs::metadata(&candidate) {
+            Ok(md) if md.is_file() => {
+                if md.permissions().mode() & 0o111 != 0 {
+                    return PathClassify::Executable;
+                } else if first_nonexec.is_none() {
+                    first_nonexec = Some(candidate);
+                }
+            }
+            _ => {}
+        }
+    }
+    match first_nonexec {
+        Some(p) => PathClassify::NonExecutable(p),
+        None => PathClassify::NotFound,
+    }
+}
+
 pub(crate) fn search_path_for(name: &str, shell: &Shell) -> Option<std::path::PathBuf> {
     if name.contains('/') {
         let p = std::path::PathBuf::from(name);

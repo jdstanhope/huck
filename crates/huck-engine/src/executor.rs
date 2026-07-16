@@ -5431,6 +5431,31 @@ fn run_subprocess(
         }
     }
 
+    // #172: if the program can't be run, don't leave the diagnostic to the
+    // parent-side `Err` arms below — they emit in the PARENT (so a `2>file`
+    // redirect, applied only in the child, is missed) and always return rc 1.
+    // Instead classify BEFORE spawn and, when unrunnable, install a final
+    // `pre_exec` (registered last → runs after the redirect replay) that writes
+    // the bash-formatted diagnostic to the child's own — now redirected — fd 2
+    // and `_exit`s 126/127. `execvp` is never reached, so the message routes to
+    // `2>file` / the `$(… 2>&1)` capture pipe / the terminal exactly like a real
+    // command, and the existing capture/wait/reap machinery collects the right
+    // exit code. Mirrors the pipeline path's child-side emit (#78), reusing this
+    // path's ProcessCommand scaffolding rather than a separate diagnostic fork.
+    if let StageRunnability::NotRunnable { body, code } =
+        classify_command_runnability(&cmd.program, shell)
+    {
+        let mut diag: Vec<u8> = Vec::new();
+        crate::emit_error_to(shell, &mut diag, None, format_args!("{body}"));
+        unsafe {
+            process.pre_exec(move || {
+                // async-signal-safe: raw write + _exit, no allocation.
+                libc::write(2, diag.as_ptr() as *const libc::c_void, diag.len());
+                libc::_exit(code);
+            });
+        }
+    }
+
     // Flush pending parent stdout before spawning so the child's output is
     // ordered after buffered parent bytes (M-118 sibling: ordering).
     flush_stdout();
@@ -7968,8 +7993,8 @@ fn classify_stage<'a>(cmd: &'a Command, shell: &Shell) -> StageKind<'a> {
     StageKind::InProcess(cmd)
 }
 
-/// Whether an external pipeline stage's program can be run, and if not, the
-/// bash diagnostic body + exit code (127 not-found, 126 found-but-not-executable).
+/// Whether an external command's program can be run, and if not, the bash
+/// diagnostic body + exit code (127 not-found, 126 found-but-not-executable).
 #[derive(Debug)]
 enum StageRunnability {
     Runnable,
@@ -7977,8 +8002,10 @@ enum StageRunnability {
 }
 
 /// Classify a resolved program string the way bash's command search + `execve`
-/// would, so an unrunnable stage becomes a 126/127 diagnostic child (#78).
-fn classify_stage_runnability(program: &str, shell: &Shell) -> StageRunnability {
+/// would, so an unrunnable command becomes a 126/127 diagnostic (the pipeline
+/// path forks a diagnostic child, #78; the single-command path emits from a
+/// `pre_exec` that `_exit`s, #172). Shared by both paths.
+fn classify_command_runnability(program: &str, shell: &Shell) -> StageRunnability {
     if program.contains('/') {
         match std::fs::metadata(program) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => StageRunnability::NotRunnable {
@@ -8007,12 +8034,20 @@ fn classify_stage_runnability(program: &str, shell: &Shell) -> StageRunnability 
                 }
             }
         }
-    } else if builtins::search_path_for(program, shell).is_some() {
-        StageRunnability::Runnable
     } else {
-        StageRunnability::NotRunnable {
-            body: format!("{program}: command not found"),
-            code: 127,
+        // Bare name: walk PATH. A non-executable regular file found in PATH is
+        // 126 "Permission denied" (reported with the resolved path, matching
+        // bash's first-match-in-PATH-order); nothing found is 127 (#172).
+        match builtins::classify_path_search(program, shell) {
+            builtins::PathClassify::Executable => StageRunnability::Runnable,
+            builtins::PathClassify::NonExecutable(p) => StageRunnability::NotRunnable {
+                body: format!("{}: Permission denied", p.display()),
+                code: 126,
+            },
+            builtins::PathClassify::NotFound => StageRunnability::NotRunnable {
+                body: format!("{program}: command not found"),
+                code: 127,
+            },
         }
     }
 }
@@ -8066,7 +8101,7 @@ fn spawn_external_with_fds(
     // exits 126/127, so the message routes correctly and PIPESTATUS is populated
     // (matching bash) instead of leaking a raw error and aborting the pipeline.
     if let StageRunnability::NotRunnable { body, code } =
-        classify_stage_runnability(&resolved.program, shell)
+        classify_command_runnability(&resolved.program, shell)
     {
         let mut diag: Vec<u8> = Vec::new();
         crate::emit_error_to(shell, &mut diag, None, format_args!("{body}"));
