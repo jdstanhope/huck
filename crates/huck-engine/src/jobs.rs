@@ -63,6 +63,20 @@ pub struct JobTable {
     /// consulted by `wait`'s ECHILD fallback. Drop-oldest bounded at
     /// `SAVED_STATUS_CAP`.
     last_statuses: Vec<(i32, i32)>,
+    /// #183: pids of LIVE children this shell forked, tracked independently of
+    /// the visible `jobs` list. `reap_completed` walks this set instead of
+    /// calling `waitpid(-1)`, which reaps ANY child of the process — fine for a
+    /// standalone shell that owns its process, but huck-engine is a LIBRARY, so
+    /// a wildcard wait steals children the EMBEDDER spawned (and, in the
+    /// multithreaded cargo test binary, children of concurrently running tests).
+    ///
+    /// Deliberately NOT derived from `jobs`: a bare `disown` removes the job
+    /// (`builtins::builtin_disown`) while its child lives on, so a set keyed on
+    /// table membership would leave disowned children as zombies — trading one
+    /// leak for another. Entries are released on terminal reap (or on ECHILD,
+    /// when something else got there first), so this stays bounded by the number
+    /// of LIVE children and cannot re-introduce a #175-style leak.
+    owned_pids: Vec<i32>,
 }
 
 impl JobTable {
@@ -73,6 +87,20 @@ impl JobTable {
     /// Read-only view of the current jobs. Used by `compgen -A job/running/stopped`.
     pub fn jobs(&self) -> &[Job] {
         &self.jobs
+    }
+
+    /// #183: pids of live children this shell forked — the reap set walked by
+    /// `reap_completed` in place of `waitpid(-1)`. Survives `disown` (which drops
+    /// the visible job but not our duty to reap its child).
+    pub fn owned_pids(&self) -> &[i32] {
+        &self.owned_pids
+    }
+
+    /// #183: forget `pid` — it has been reaped (by us or by someone else, e.g.
+    /// the `wait` builtin), so it is no longer a live child. Keeps `owned_pids`
+    /// bounded by the number of LIVE children.
+    pub fn release_owned_pid(&mut self, pid: i32) {
+        self.owned_pids.retain(|&p| p != pid);
     }
 
     /// Inserts a new Running job that owns its process group (the common case:
@@ -93,6 +121,14 @@ impl JobTable {
     ) -> u32 {
         let id = self.next_id();
         let n = pids.len();
+        // #183: every registered pid is a live child we own and must reap
+        // ourselves. This is the single registration choke point (`add` delegates
+        // here), so it is the only place ownership needs recording.
+        for &p in &pids {
+            if p > 0 && !self.owned_pids.contains(&p) {
+                self.owned_pids.push(p);
+            }
+        }
         let job = Job {
             id,
             pgid,
@@ -392,35 +428,76 @@ impl JobTable {
     }
 }
 
-/// Drains all reapable children via non-blocking `waitpid(WNOHANG)`, feeding
-/// each into the shell's job table. Also resets the SIGCHLD flag.
+/// Reaps this shell's OWN reapable children via non-blocking `waitpid(WNOHANG)`,
+/// feeding each into the shell's job table. Also resets the SIGCHLD flag.
+///
+/// #183: walks `jobs.owned_pids()` + `shell.coprocs` rather than calling
+/// `waitpid(-1)`. A wildcard wait reaps ANY child of the process, which is right
+/// for a standalone shell that owns its process but WRONG for huck-engine, which
+/// is a library: it silently steals children the embedder spawned, taking their
+/// exit status with it. The same theft breaks the multithreaded cargo test binary
+/// (tests steal each other's children), where it surfaces either as ECHILD from a
+/// one-shot `waitpid(pid)` or as an infinite hang in `stream_loop`'s poll loop.
 pub fn reap_completed(shell: &mut crate::shell_state::Shell) {
     shell
         .sigchld_flag
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    loop {
+    reap_owned_once(shell);
+}
+
+/// One bounded reap pass over this shell's OWN children. Returns true if any
+/// reported a state change (so a polling caller knows whether to sleep).
+///
+/// #183: the single implementation of "reap without `waitpid(-1)`". The `wait`
+/// builtin's poll loops each had their own copy of a `waitpid(-1)` +
+/// sleep-50ms block; they all call this instead, so the no-wildcard rule holds
+/// by construction rather than per-site vigilance.
+pub fn reap_owned_once(shell: &mut crate::shell_state::Shell) -> bool {
+    // Snapshot the reap set first: the loop below mutates the job table (and the
+    // coproc list) as it reaps. Coproc pids are tracked on the Shell, not the job
+    // table, so they are unioned in here.
+    let mut targets: Vec<i32> = shell.jobs.owned_pids().to_vec();
+    targets.extend(shell.coprocs.iter().map(|c| c.pid as i32));
+    targets.sort_unstable();
+    targets.dedup();
+
+    let mut reaped_any = false;
+    for pid in targets {
         let mut raw_status: libc::c_int = 0;
-        let pid = unsafe {
+        let r = unsafe {
             libc::waitpid(
-                -1,
+                pid,
                 &mut raw_status,
                 libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED,
             )
         };
-        if pid <= 0 {
-            // 0 = no children changed state; -1 = no children at all (ECHILD)
-            break;
+        if r == 0 {
+            // Still running, no state change to report.
+            continue;
         }
-        shell.jobs.reap(pid as i32, raw_status);
+        if r < 0 {
+            // ECHILD: already reaped by someone else (e.g. the `wait` builtin's
+            // targeted wait, or a synchronous executor waiter). It is no longer a
+            // live child, so drop it from the reap set to keep that set bounded.
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                shell.jobs.release_owned_pid(pid);
+            }
+            continue;
+        }
+        reaped_any = true;
+        shell.jobs.reap(r, raw_status);
         // If the reaped child is a live coproc that actually exited, close its
         // fds + unset NAME/NAME_PID. A WIFSTOPPED (WUNTRACED) report means the
         // coproc is merely stopped, and a WIFCONTINUED (WCONTINUED) report means
         // it just resumed — in BOTH cases it is still alive, so do NOT reap it
         // (reap_coproc tears the coproc down unconditionally by pid).
         if !libc::WIFSTOPPED(raw_status) && !libc::WIFCONTINUED(raw_status) {
-            shell.reap_coproc(pid as i32);
+            // Terminal: no longer a live child.
+            shell.jobs.release_owned_pid(r);
+            shell.reap_coproc(r);
         }
     }
+    reaped_any
 }
 
 /// Reaps and then prints `[N]<flag> <state> <cmd> &` for any newly-completed

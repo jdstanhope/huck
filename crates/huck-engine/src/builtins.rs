@@ -4421,14 +4421,12 @@ fn wait_all(shell: &mut Shell) -> ExecOutcome {
         if let Some(o) = crate::executor::check_interrupt(shell) {
             return o;
         }
-        let mut status: libc::c_int = 0;
-        let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
-        if r > 0 {
-            shell.jobs.reap(r, status);
-            if !libc::WIFSTOPPED(status) {
-                shell.reap_coproc(r);
-            }
-        } else {
+        // #183: reap only children we OWN. This used to be `waitpid(-1)`, which
+        // reaps ANY child of the process — right for a standalone shell, wrong for
+        // huck-engine as a library (it steals the embedder's children) and fatal in
+        // the multithreaded test binary, where it drained other tests' children and
+        // wedged them. `reap_owned_once` is the single bounded implementation.
+        if !crate::jobs::reap_owned_once(shell) {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
@@ -4459,14 +4457,12 @@ fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
         if let Some(o) = crate::executor::check_interrupt(shell) {
             return o;
         }
-        let mut status: libc::c_int = 0;
-        let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
-        if r > 0 {
-            shell.jobs.reap(r, status);
-            if !libc::WIFSTOPPED(status) {
-                shell.reap_coproc(r);
-            }
-        } else {
+        // #183: reap only children we OWN. This used to be `waitpid(-1)`, which
+        // reaps ANY child of the process — right for a standalone shell, wrong for
+        // huck-engine as a library (it steals the embedder's children) and fatal in
+        // the multithreaded test binary, where it drained other tests' children and
+        // wedged them. `reap_owned_once` is the single bounded implementation.
+        if !crate::jobs::reap_owned_once(shell) {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
@@ -4598,14 +4594,12 @@ fn wait_any_pending(pid_var: Option<String>, shell: &mut Shell) -> ExecOutcome {
         if let Some(o) = crate::executor::check_interrupt(shell) {
             return o;
         }
-        let mut status: libc::c_int = 0;
-        let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
-        if r > 0 {
-            shell.jobs.reap(r, status);
-            if !libc::WIFSTOPPED(status) {
-                shell.reap_coproc(r);
-            }
-        } else {
+        // #183: reap only children we OWN. This used to be `waitpid(-1)`, which
+        // reaps ANY child of the process — right for a standalone shell, wrong for
+        // huck-engine as a library (it steals the embedder's children) and fatal in
+        // the multithreaded test binary, where it drained other tests' children and
+        // wedged them. `reap_owned_once` is the single bounded implementation.
+        if !crate::jobs::reap_owned_once(shell) {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
@@ -4671,14 +4665,12 @@ fn wait_any_of(
         if let Some(o) = crate::executor::check_interrupt(shell) {
             return o;
         }
-        let mut status: libc::c_int = 0;
-        let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
-        if r > 0 {
-            shell.jobs.reap(r, status);
-            if !libc::WIFSTOPPED(status) {
-                shell.reap_coproc(r);
-            }
-        } else {
+        // #183: reap only children we OWN. This used to be `waitpid(-1)`, which
+        // reaps ANY child of the process — right for a standalone shell, wrong for
+        // huck-engine as a library (it steals the embedder's children) and fatal in
+        // the multithreaded test binary, where it drained other tests' children and
+        // wedged them. `reap_owned_once` is the single bounded implementation.
+        if !crate::jobs::reap_owned_once(shell) {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
