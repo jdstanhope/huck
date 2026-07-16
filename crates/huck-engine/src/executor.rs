@@ -963,19 +963,13 @@ fn run_command(
 /// differs from `>file 2>&1` and a `{var}`'s side effects (assign `$v`, allocate a
 /// persistent fd) are visible to the next redirection. A failure mid-list returns
 /// `Err(outcome)`; Drop then rolls back the entries already applied (atomic).
-/// Heredoc/here-string writer pids spawned during resolution are tracked in
-/// `heredoc_writers` and reaped by `reap_heredoc_writers` after the body has run.
 struct RedirectScope {
     saved: Vec<(RawFd, RawFd)>,
-    heredoc_writers: Vec<libc::pid_t>,
 }
 
 impl RedirectScope {
     fn new() -> Self {
-        RedirectScope {
-            saved: Vec::new(),
-            heredoc_writers: Vec::new(),
-        }
+        RedirectScope { saved: Vec::new() }
     }
 
     /// Replace `target_fd` with a dup of `new_fd`, saving the original so Drop
@@ -1092,33 +1086,13 @@ impl RedirectScope {
         err_sink: &mut StderrSink,
     ) -> Result<(), ExecOutcome> {
         for redir in redirs {
-            let ops = lower_one_redirect(
-                redir,
-                shell,
-                sink,
-                err_sink,
-                None,
-                &mut self.heredoc_writers,
-            )
-            .map_err(ExecOutcome::Continue)?;
+            let ops = lower_one_redirect(redir, shell, sink, err_sink, None)
+                .map_err(ExecOutcome::Continue)?;
             for op in ops {
                 self.apply_one(op, shell, sink, err_sink)?;
             }
         }
         Ok(())
-    }
-
-    /// Reap any forked heredoc/here-string writers spawned during redirect
-    /// resolution (`lower_one_redirect`). Call after the body has run (its
-    /// consumer has drained + closed the read end, so the writer has finished).
-    /// ECHILD or any error is fine.
-    fn reap_heredoc_writers(&mut self) {
-        for pid in self.heredoc_writers.drain(..) {
-            let mut st = 0;
-            unsafe {
-                libc::waitpid(pid, &mut st, 0);
-            }
-        }
     }
 }
 
@@ -1140,16 +1114,11 @@ impl Drop for RedirectScope {
                 }
             }
         }
-        // #142: reap heredoc/here-string writers ONLY AFTER restoring the fds
-        // above. Restoring closes the installed read end of each heredoc pipe, so
-        // a writer still blocked on a full pipe (a >64KB body whose reader never
-        // ran — e.g. a later redirect in the same list failed, so the body was
-        // skipped) gets EPIPE/SIGPIPE and exits. Reaping before restore would
-        // `waitpid` a writer that can never make progress → hang. On success the
-        // body already drained the read end, so the writer has exited and this
-        // reap is instant. Centralizing here makes every in-process applier
-        // restore-then-reap by construction.
-        self.reap_heredoc_writers();
+        // #169/v307: there is nothing to reap here any more. Heredoc bodies are
+        // delivered by `heredoc_body_to_fd` (pipe or temp file) with no forked
+        // writer, so the restore-then-reap ordering #142 needed — restore first so
+        // a writer blocked on a full pipe gets EPIPE and can be waited on — is
+        // moot. The guard remains in heredoc_redirect_fail_hang_diff_check.sh.
     }
 }
 
@@ -1278,9 +1247,6 @@ where
     // back the entries already applied (atomic, matching pre-v156 behavior).
     let force_terminal = redirs_write_stdout(redirs);
     if let Err(outcome) = scope.apply_redirects(redirs, shell, sink, err_sink) {
-        // #142: `drop` restores the fds THEN reaps the heredoc writers (see
-        // `Drop for RedirectScope`); reaping before restore would hang on a
-        // >64KB body whose reader never ran.
         drop(scope);
         drain_procsubs(shell, procsub_base);
         return outcome;
@@ -1306,9 +1272,6 @@ where
     };
     let outcome = run_inner(shell, inner_sink, err_sink);
     let _ = io::stdout().flush();
-    // The heredoc/here-string writers are reaped by the scope's Drop (below),
-    // after it restores the fds — see `Drop for RedirectScope` (#142). By now the
-    // body has drained each read end, so those writers have already exited.
     // Restore the real fds BEFORE draining redirect-target process substitutions.
     // For an OUTPUT procsub (`cmd > >(consumer)`), the redirect dup'd the procsub's
     // write end onto fd 1; `drain_procsubs` blocks waiting for the inner consumer
@@ -1388,8 +1351,6 @@ fn run_builtin_with_redirects(
 
     let mut scope = RedirectScope::new();
     if let Err(outcome) = scope.apply_redirects(redirs, shell, sink, err_sink) {
-        // #142: restore fds (which closes any installed heredoc read end) THEN
-        // reap the writers — both handled by `drop` via `Drop for RedirectScope`.
         drop(scope);
         drain_procsubs(shell, procsub_base);
         return outcome;
@@ -1625,8 +1586,6 @@ fn run_builtin_with_redirects(
     } else {
         outcome
     };
-    // Heredoc writers are reaped by the scope's Drop (below), after it restores
-    // the fds (#142); the builtin has already drained each read end by now.
     // Restore the real fds BEFORE draining redirect-target process substitutions.
     // For an OUTPUT procsub (`builtin > >(cat)`), the redirect dup'd the procsub's
     // write end onto fd 1; `drain_procsubs` blocks waiting for the inner consumer
@@ -2910,13 +2869,12 @@ fn run_background_sequence(
     let job_control = shell.job_control_active();
 
     // Spawn every stage via the shared pipeline core in Background mode. This
-    // applies the async stdin default (#129) for stage 0, drops heredoc writers
-    // to the SIGCHLD reaper, never captures/merges the last stage's stdout/stderr
-    // (a `pipeline &` writes to the terminal), sets `first_pid` to the job's
-    // leader pid, and on a spawn failure kills+reaps the partial pipeline via
-    // bail_teardown_pipeline(Background, …). All that's left here is registering
-    // the job and returning immediately (no wait) — that's what makes it
-    // "background".
+    // applies the async stdin default (#129) for stage 0, never captures/merges
+    // the last stage's stdout/stderr (a `pipeline &` writes to the terminal),
+    // sets `first_pid` to the job's leader pid, and on a spawn failure kills+
+    // reaps the partial pipeline via bail_teardown_pipeline(Background, …). All
+    // that's left here is registering the job and returning immediately (no
+    // wait) — that's what makes it "background".
     let sp = match spawn_pipeline(
         &pipeline.commands,
         SpawnMode::Background,
@@ -3500,71 +3458,194 @@ fn resolve(
 
 // ----- redirect file handling -----------------------------------------------
 
-/// Feed `bytes` (an expanded heredoc/herestring body) to a child's stdin WITHOUT
-/// the parent ever blocking on a full pipe. Forks a writer process that owns the
-/// pipe's write end, writes the whole body, then `_exit`s. The parent closes the
-/// write end immediately, so no later in-process forked stage inherits it (a
-/// writer *thread* would fail there — CLOEXEC only fires on exec, and InProcess
-/// stages fork without exec). Returns the READ end (→ consumer stdin) and the
-/// writer PID (reap it at the consumer's wait point; ECHILD is fine).
-fn spawn_heredoc_writer(bytes: &[u8]) -> Result<(RawFd, libc::pid_t), io::Error> {
-    let (r, w) = crate::child_fd::make_pipe(false)?;
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        let e = io::Error::last_os_error();
-        unsafe {
-            libc::close(r);
-            libc::close(w);
-        }
-        return Err(e);
-    }
-    if pid == 0 {
-        // CHILD: async-signal-safe only. Close read end; write the body; _exit.
-        // v137: keep SIGPIPE ignored here (the process is otherwise SIG_DFL now)
-        // so the writer retains its manual EPIPE handling and closes cleanly,
-        // preserving v134 large-heredoc behavior exactly.
-        unsafe {
-            libc::close(r);
-            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-        }
-        let mut off = 0usize;
-        while off < bytes.len() {
-            let n = unsafe {
-                libc::write(
-                    w,
-                    bytes[off..].as_ptr() as *const libc::c_void,
-                    bytes.len() - off,
-                )
-            };
-            if n < 0 {
-                // Read errno directly (async-signal-safe; no Rust io::Error
-                // wrapper between fork and _exit). EINTR → retry; EPIPE (consumer
-                // gone) or anything else → stop, body delivery is moot.
-                // Symbol differs by platform: glibc/musl/Android expose
-                // `__errno_location`, the BSDs and Apple expose `__error`.
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                let errno = unsafe { *libc::__errno_location() };
-                #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                let errno = unsafe { *libc::__error() };
-                if errno == libc::EINTR {
-                    continue;
-                }
-                break;
-            }
-            if n == 0 {
-                break;
-            }
-            off += n as usize;
-        }
-        unsafe {
-            libc::close(w);
-            libc::_exit(0);
+/// bash's `HEREDOC_PIPESIZE` (redir.c). A body at or below this goes to a pipe,
+/// a larger one to a temp file. 65536 is the Linux default pipe capacity, which
+/// is precisely why bash can write the pipe case from the parent without ever
+/// blocking. Verified against bash 5.2.21: a 65536-byte body yields a pipe, a
+/// 65537-byte body yields `/tmp/sh-thd.XXXXXX (deleted)`.
+const HEREDOC_PIPESIZE: usize = 65536;
+
+/// Deliver an expanded heredoc/here-string body and return a fresh READ-ONLY fd
+/// positioned at offset 0, with the body ALREADY fully delivered — no forked
+/// writer, matching bash's `here_document_to_fd`.
+///
+/// This is what makes #169 unreachable: a permanent (`exec`) redirect has no
+/// reader until a LATER command runs, so any writer process still blocked on a
+/// full pipe could never be reaped. With no writer, there is nothing to wait on.
+///
+/// `bytes.len()` is bash's `herelen` — here-string callers append the trailing
+/// newline BEFORE calling, so it is included in the size decision.
+///
+/// `tmpdir` is the shell's `$TMPDIR` variable (NOT the process env: bash honors
+/// an in-shell `TMPDIR=/x` whether exported or not, and huck does not sync
+/// exports to the process env). An unusable value silently falls back to `/tmp`,
+/// as bash does.
+///
+/// The caller owns the returned fd (and typically hands it to
+/// `relocate_high_cloexec`). The contract is only "a fresh readable fd at offset
+/// 0" — true of a pipe read end and a rewound file alike — so no call site needs
+/// to know which path produced it.
+fn heredoc_body_to_fd(bytes: &[u8], tmpdir: Option<&str>) -> Result<RawFd, io::Error> {
+    // Size check FIRST so a large body does no wasted pipe work (bash's exact
+    // behavior on Linux). The nonblocking probe inside `heredoc_body_to_pipe` is
+    // the portability guard: bash hardcodes 65536 and writes BLOCKING, which is
+    // safe only where a pipe holds 64KB. On macOS pipes start at 16KB, so that
+    // same code has nothing to stop it wedging — we degrade to a temp file
+    // instead of inheriting the hang (cf. #97, already a macOS-only hang).
+    if bytes.len() <= HEREDOC_PIPESIZE {
+        if let Some(fd) = heredoc_body_to_pipe(bytes) {
+            return Ok(fd);
         }
     }
+    heredoc_body_to_file(bytes, tmpdir)
+}
+
+/// Try to deliver `bytes` entirely into a pipe buffer, returning the read end.
+/// `None` means "did not fit / could not" — the caller falls back to a temp file.
+/// Never blocks: the write end is O_NONBLOCK, which is a property of THIS open
+/// file description, so the reader's end (a distinct description) stays blocking
+/// and the probe is invisible downstream.
+fn heredoc_body_to_pipe(bytes: &[u8]) -> Option<RawFd> {
+    let (r, w) = crate::child_fd::make_pipe(false).ok()?;
+    // SAFETY: `r`/`w` are freshly-opened fds owned by us; every path below closes
+    // both or returns `r` to the caller.
     unsafe {
-        libc::close(w);
+        let fl = libc::fcntl(w, libc::F_GETFL);
+        if fl < 0 || libc::fcntl(w, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+            libc::close(r);
+            libc::close(w);
+            return None;
+        }
     }
-    Ok((r, pid))
+    let mut off = 0usize;
+    while off < bytes.len() {
+        // SAFETY: writing from a live slice into an open fd.
+        let n = unsafe {
+            libc::write(
+                w,
+                bytes[off..].as_ptr() as *const libc::c_void,
+                bytes.len() - off,
+            )
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // EAGAIN: this platform's pipe is smaller than the body. Anything
+            // else: let the temp-file path have a go. Either way, discard.
+            unsafe {
+                libc::close(r);
+                libc::close(w);
+            }
+            return None;
+        }
+        if n == 0 {
+            unsafe {
+                libc::close(r);
+                libc::close(w);
+            }
+            return None;
+        }
+        off += n as usize;
+    }
+    // Close the write end so the reader sees EOF after the body. An empty body
+    // lands here directly — a pipe that is immediately at EOF.
+    unsafe { libc::close(w) };
+    Some(r)
+}
+
+/// Spool `bytes` to an unlinked temp file and return a read-only fd at offset 0.
+/// Tries `$TMPDIR` then `/tmp`, mirroring bash's silent fallback for an unset or
+/// unusable `TMPDIR`.
+fn heredoc_body_to_file(bytes: &[u8], tmpdir: Option<&str>) -> Result<RawFd, io::Error> {
+    let mut candidates: Vec<&str> = Vec::new();
+    if let Some(d) = tmpdir {
+        if !d.is_empty() {
+            candidates.push(d);
+        }
+    }
+    if !candidates.contains(&"/tmp") {
+        candidates.push("/tmp");
+    }
+    let mut last_err: Option<io::Error> = None;
+    for dir in candidates {
+        match heredoc_body_to_file_in(bytes, dir) {
+            Ok(fd) => return Ok(fd),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::from_raw_os_error(libc::ENOENT)))
+}
+
+/// One `mkstemp`-in-`dir` attempt. Follows bash's deliberate, race-conscious
+/// order: open the read-only fd BEFORE closing the writable one, and only then
+/// unlink — so nothing can substitute the name in between. `mkstemp` creates the
+/// file 0600 (owner-only) and the unlink makes it unreachable by name at once,
+/// so it also cannot survive a crash.
+fn heredoc_body_to_file_in(bytes: &[u8], dir: &str) -> Result<RawFd, io::Error> {
+    let mut tmpl: Vec<u8> = Vec::with_capacity(dir.len() + 16);
+    tmpl.extend_from_slice(dir.as_bytes());
+    if !tmpl.ends_with(b"/") {
+        tmpl.push(b'/');
+    }
+    tmpl.extend_from_slice(b"sh-thd.XXXXXX\0");
+
+    // SAFETY: `tmpl` is a NUL-terminated, writable buffer of the exact shape
+    // mkstemp requires; it overwrites the trailing XXXXXX in place.
+    let rw = unsafe { libc::mkstemp(tmpl.as_mut_ptr() as *mut libc::c_char) };
+    if rw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let path = tmpl.as_ptr() as *const libc::c_char;
+
+    let mut off = 0usize;
+    while off < bytes.len() {
+        // SAFETY: writing from a live slice into an open fd.
+        let n = unsafe {
+            libc::write(
+                rw,
+                bytes[off..].as_ptr() as *const libc::c_void,
+                bytes.len() - off,
+            )
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            unsafe {
+                libc::unlink(path);
+                libc::close(rw);
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            unsafe {
+                libc::unlink(path);
+                libc::close(rw);
+            }
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
+        off += n as usize;
+    }
+
+    // bash's order: second fd opened before the first is closed, then unlink.
+    // The fresh O_RDONLY fd starts at offset 0 — no lseek needed.
+    let ro = unsafe { libc::open(path, libc::O_RDONLY) };
+    let err = if ro < 0 {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe {
+        libc::unlink(path);
+        libc::close(rw);
+    }
+    match err {
+        Some(e) => Err(e),
+        None => Ok(ro),
+    }
 }
 
 /// Where a freshly-opened redirect-source fd should land.
@@ -4517,8 +4598,9 @@ fn run_exec_single_inner(
     } else {
         // v156 task 4: lower the FULL ordered redirect list (on the original
         // ExecCommand, not the bridged ResolvedCommand) into a child replay plan.
-        // Files are opened (and heredoc writers forked) in the parent here; the
-        // child replays the dup2/close ops in source order. This handles fd>2,
+        // Files are opened (and heredoc bodies delivered via `heredoc_body_to_fd`)
+        // in the parent here; the child replays the dup2/close ops in source
+        // order. This handles fd>2,
         // `<&` dup-in, `N>&-` close, and `<>` uniformly with fds 0/1/2.
         match build_child_redir_plan(&cmd.redirects, shell, sink, err_sink) {
             Ok(plan) => run_subprocess(&resolved, plan, shell, sink, err_sink),
@@ -4689,10 +4771,7 @@ fn apply_redirects_permanently(
         .apply_redirects(&cmd.redirects, shell, sink, err_sink)
         .is_err()
     {
-        // #142: scope Drop restores the partially-applied redirects (atomic
-        // rollback) and THEN reaps the heredoc writers — restoring first closes
-        // any installed read end so a writer blocked on a >64KB body unblocks,
-        // instead of hanging waitpid.
+        // scope Drop restores the partially-applied redirects (atomic rollback).
         return Err(());
     }
 
@@ -4702,17 +4781,10 @@ fn apply_redirects_permanently(
     // does NOT register it in `scope.saved`, so it already persists beyond this
     // function — no special-casing needed.
     //
-    // For heredoc writers: reap them NOW (before forget) so the writer
-    // process doesn't become a zombie. The write end was installed onto the
-    // target fd; the writer will finish and exit once its data is consumed.
-    //
-    // KNOWN LIMITATION (#169): for a PERMANENT redirect the reader is a *later*
-    // command, so a >64KB body has no one draining fd N yet — this synchronous
-    // reap then hangs on the still-blocked writer. Unlike the temporary appliers
-    // (fixed for #142 by restore-then-reap in Drop), `exec` cannot reorder its
-    // way out; the proper fix is temp-file spooling or lazy reaping, tracked in
-    // #169.
-    scope.reap_heredoc_writers();
+    // #169: a heredoc/here-string body is delivered via `heredoc_body_to_fd`
+    // (pipe or temp file) with no forked writer, so a PERMANENT redirect (whose
+    // reader is a *later* command) has nothing left to hang on — the body is
+    // already fully written before this function returns.
 
     // Close each saved-original fd (or skip -1 = "was closed before us") so
     // Drop's restore loop has nothing to do. Draining first means Drop sees an
@@ -4727,10 +4799,9 @@ fn apply_redirects_permanently(
         // no original fd to restore, so we leave the target fd open (permanent).
     }
 
-    // Drop the scope normally: `saved` was drained+closed above and
-    // `heredoc_writers` was reaped, so Drop's restore loop and reap are both
-    // no-ops — but dropping (rather than `mem::forget`) FREES the scope's heap
-    // (the `saved`/`heredoc_writers` Vec buffers). Forgetting leaked ~100 bytes
+    // Drop the scope normally: `saved` was drained+closed above, so Drop's
+    // restore loop is a no-op — but dropping (rather than `mem::forget`) FREES
+    // the scope's heap (the `saved` Vec buffer). Forgetting leaked ~100 bytes
     // per `exec` redirect, unbounded over a long-running process (#178).
     drop(scope);
     Ok(())
@@ -4842,8 +4913,9 @@ fn run_exec_builtin(
 
 /// A single pure-fd operation replayed in a child `pre_exec` (v156 task 4).
 /// Both variants use only async-signal-safe libc calls (`dup2`/`close`). File
-/// opens and heredoc-writer forks happen in the PARENT before the spawn; the
-/// resulting source fd is inherited across fork and named here by number.
+/// opens and heredoc body delivery (`heredoc_body_to_fd`) happen in the PARENT
+/// before the spawn; the resulting source fd is inherited across fork and
+/// named here by number.
 #[derive(Clone, Copy)]
 enum ChildRedirOp {
     /// `dup2(source, target)` — wire `target` to whatever `source` points at.
@@ -4900,7 +4972,6 @@ unsafe fn replay_redir_ops(ops: &[ChildRedirOp]) -> std::io::Result<()> {
 /// the ops, so a lowering error drops them (no leak; P1 discipline).
 struct RedirPlan {
     ops: Vec<PlanOp>,
-    heredoc_writers: Vec<libc::pid_t>,
 }
 
 /// One resolved, ordered redirect action. Source order is preserved.
@@ -4945,12 +5016,10 @@ enum PlanOp {
 /// list for an external (forked) command. `ops` is applied IN ORDER in the
 /// child's `pre_exec`. `held` keeps the parent-opened files / heredoc read-ends
 /// alive (and FD_CLOEXEC'd, so they vanish on the child's exec while the dup2'd
-/// targets survive) until after `spawn`. `heredoc_writers` are forked body
-/// writers to reap after the child finishes.
+/// targets survive) until after `spawn`.
 struct ChildRedirPlan {
     ops: Vec<ChildRedirOp>,
     held: Vec<std::os::fd::OwnedFd>,
-    heredoc_writers: Vec<libc::pid_t>,
 }
 
 /// Relocate a freshly-opened parent fd to a high number (>= 10) with FD_CLOEXEC,
@@ -4969,8 +5038,8 @@ fn relocate_high_cloexec(fd: RawFd) -> RawFd {
 }
 
 /// Resolve a SINGLE redirection into 0-2 neutral `PlanOp`s: opens files (as
-/// OwnedFd), spawns heredoc writers (pushing the writer pid onto `writers`),
-/// resolves dup WORDS to fd NUMBERS, and allocates `{var}` high fds. Shared by
+/// OwnedFd), delivers heredoc bodies via `heredoc_body_to_fd`, resolves dup
+/// WORDS to fd NUMBERS, and allocates `{var}` high fds. Shared by
 /// the batch `lower_redirects` (child path, `fd_state: Some(..)`, validating
 /// dup sources against the plan simulation) and the in-process interleaved
 /// applier (`fd_state: None`, validating dup sources against the real fd
@@ -4982,7 +5051,6 @@ fn lower_one_redirect(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
     mut fd_state: Option<&mut std::collections::HashMap<RawFd, bool>>,
-    writers: &mut Vec<libc::pid_t>,
 ) -> Result<Vec<PlanOp>, i32> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let mut ops: Vec<PlanOp> = Vec::new();
@@ -5044,9 +5112,9 @@ fn lower_one_redirect(
             }
             RedirOp::Heredoc { body, .. } => {
                 let bytes = expand_assignment(body, shell).into_bytes();
-                match spawn_heredoc_writer(&bytes) {
-                    Ok((rfd, pid)) => {
-                        writers.push(pid);
+                let tmpdir = shell.lookup_var("TMPDIR");
+                match heredoc_body_to_fd(&bytes, tmpdir.as_deref()) {
+                    Ok(rfd) => {
                         owned_src = Some(unsafe { OwnedFd::from_raw_fd(rfd) });
                     }
                     Err(e) => {
@@ -5067,9 +5135,9 @@ fn lower_one_redirect(
             RedirOp::HereString(w) => {
                 let mut bytes = expand_assignment(w, shell).into_bytes();
                 bytes.push(b'\n');
-                match spawn_heredoc_writer(&bytes) {
-                    Ok((rfd, pid)) => {
-                        writers.push(pid);
+                let tmpdir = shell.lookup_var("TMPDIR");
+                match heredoc_body_to_fd(&bytes, tmpdir.as_deref()) {
+                    Ok(rfd) => {
                         owned_src = Some(unsafe { OwnedFd::from_raw_fd(rfd) });
                     }
                     Err(e) => {
@@ -5262,9 +5330,9 @@ fn lower_one_redirect(
         }
         RedirOp::Heredoc { body, .. } => {
             let bytes = expand_assignment(body, shell).into_bytes();
-            match spawn_heredoc_writer(&bytes) {
-                Ok((rfd, pid)) => {
-                    writers.push(pid);
+            let tmpdir = shell.lookup_var("TMPDIR");
+            match heredoc_body_to_fd(&bytes, tmpdir.as_deref()) {
+                Ok(rfd) => {
                     let rfd = relocate_high_cloexec(rfd);
                     let owned = unsafe { OwnedFd::from_raw_fd(rfd) };
                     ops.push(PlanOp::InstallOwned {
@@ -5293,9 +5361,9 @@ fn lower_one_redirect(
         RedirOp::HereString(w) => {
             let mut bytes = expand_assignment(w, shell).into_bytes();
             bytes.push(b'\n');
-            match spawn_heredoc_writer(&bytes) {
-                Ok((rfd, pid)) => {
-                    writers.push(pid);
+            let tmpdir = shell.lookup_var("TMPDIR");
+            match heredoc_body_to_fd(&bytes, tmpdir.as_deref()) {
+                Ok(rfd) => {
                     let rfd = relocate_high_cloexec(rfd);
                     let owned = unsafe { OwnedFd::from_raw_fd(rfd) };
                     ops.push(PlanOp::InstallOwned {
@@ -5329,9 +5397,8 @@ fn lower_one_redirect(
 /// `lower_one_redirect` for the child (fork) path. Walks `redirects` in
 /// source order, threading a `fd_state` simulation (fds this plan opens/closes)
 /// through each item so a same-plan dup source (e.g. `3>g 4>&3`) validates
-/// correctly. On any error it closes every fd opened so far (so heredoc
-/// writers hit EOF/EPIPE) then reaps those writers, and returns Err(code) with
-/// the diagnostic already printed.
+/// correctly. On any error it closes every fd opened so far (dropping
+/// `plan.ops`) and returns Err(code) with the diagnostic already printed.
 fn lower_redirects(
     redirects: &[Redirection],
     shell: &mut Shell,
@@ -5360,28 +5427,14 @@ fn lower_redirects(
         }
     };
     let mut fd_state: std::collections::HashMap<RawFd, bool> = std::collections::HashMap::new();
-    let mut plan = RedirPlan {
-        ops: Vec::new(),
-        heredoc_writers: Vec::new(),
-    };
+    let mut plan = RedirPlan { ops: Vec::new() };
     for redir in redirects {
-        match lower_one_redirect(
-            redir,
-            shell,
-            sink,
-            err_sink,
-            Some(&mut fd_state),
-            &mut plan.heredoc_writers,
-        ) {
+        match lower_one_redirect(redir, shell, sink, err_sink, Some(&mut fd_state)) {
             Ok(ops) => plan.ops.extend(ops),
             Err(code) => {
-                // Close opened fds first (heredoc read ends -> writer EOF/EPIPE),
-                // then reap — hang-free even for >64KB bodies (the C fail! order).
+                // Dropping `plan.ops` closes every fd opened so far (heredoc
+                // read ends included). No writers exist to reap (#169).
                 plan.ops.clear();
-                for pid in plan.heredoc_writers.drain(..) {
-                    let mut st = 0;
-                    unsafe { libc::waitpid(pid, &mut st, 0) };
-                }
                 restore(shell, var_snaps);
                 return Err(code);
             }
@@ -5414,7 +5467,6 @@ fn redir_plan_to_child(plan: RedirPlan) -> ChildRedirPlan {
     let mut child = ChildRedirPlan {
         ops: Vec::new(),
         held: Vec::new(),
-        heredoc_writers: plan.heredoc_writers,
     };
     for op in plan.ops {
         match op {
@@ -5488,12 +5540,13 @@ fn emit_exec_spawn_diag(
 
 /// v156 task 4: the single (non-pipeline) external command path. `plan` is the
 /// ordered `dup2`/`close` replay list lowered from `cmd.redirects` by
-/// `build_child_redir_plan` in the PARENT (files already opened, heredoc writers
-/// already forked). The child replays `plan.ops` IN SOURCE ORDER in a `pre_exec`
-/// after the signal-reset hook, so e.g. `3>&1 1>&2 2>&3` performs the fd swap
-/// correctly. fds 0/1/2 and fd>2 are all handled uniformly by the replay; this
-/// function no longer wires `.stdin/.stdout/.stderr` from opened files (only the
-/// capture pipe, which any explicit fd-1 redirect in the replay then overrides).
+/// `build_child_redir_plan` in the PARENT (files already opened, heredoc bodies
+/// already delivered via `heredoc_body_to_fd`). The child replays `plan.ops` IN
+/// SOURCE ORDER in a `pre_exec` after the signal-reset hook, so e.g.
+/// `3>&1 1>&2 2>&3` performs the fd swap correctly. fds 0/1/2 and fd>2 are all
+/// handled uniformly by the replay; this function no longer wires
+/// `.stdin/.stdout/.stderr` from opened files (only the capture pipe, which
+/// any explicit fd-1 redirect in the replay then overrides).
 fn run_subprocess(
     cmd: &ResolvedCommand,
     mut plan: ChildRedirPlan,
@@ -5556,9 +5609,9 @@ fn run_subprocess(
         process.process_group(0);
     }
 
-    // The heredoc/herestring writers were forked by build_child_redir_plan; their
-    // read-ends are in `plan.held` (FD_CLOEXEC, inherited across fork, replayed by
-    // the ops above) and their pids are reaped after the child's status.
+    // A heredoc/here-string body was delivered by `build_child_redir_plan` via
+    // `heredoc_body_to_fd`; its read end is in `plan.held` (FD_CLOEXEC,
+    // inherited across fork, replayed by the ops above).
     let want_capture = matches!(sink, StdoutSink::Capture(_));
     let want_capture_err = matches!(err_sink, StderrSink::Capture(_));
     let merged_err = matches!(err_sink, StderrSink::Merged);
@@ -5622,13 +5675,8 @@ fn run_subprocess(
     // `plan.held` (FD_CLOEXEC). Drop the parent's copies so they don't leak and
     // so heredoc/here-string read-ends fully close once the child exits.
     drop(plan.held);
-    let heredoc_writers = plan.heredoc_writers;
     match spawn_result {
         Ok(mut child) => {
-            // The heredoc/herestring body (if any) is written by the forked
-            // writer process whose read end is the child's stdin; nothing to
-            // write here. The writer pids are reaped after the child's status.
-
             let pid = child.id() as i32;
 
             // Register pid in the live-children registry so the timeout timer
@@ -5776,24 +5824,9 @@ fn run_subprocess(
                     }
                 }
             };
-            // Reap the forked heredoc/herestring writers now the consumer has
-            // exited (M-120). They are internal helpers — not jobs, not $!.
-            for wpid in heredoc_writers {
-                let mut st = 0;
-                unsafe {
-                    libc::waitpid(wpid, &mut st, 0);
-                }
-            }
             outcome
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            // Spawn failed: reap any heredoc writers so they don't linger.
-            for wpid in heredoc_writers {
-                let mut st = 0;
-                unsafe {
-                    libc::waitpid(wpid, &mut st, 0);
-                }
-            }
             // bash format: `<src>: line N: <name>: command not found` (the name
             // precedes the phrase; error_prefix supplies the prologue + mode split).
             emit_exec_spawn_diag(
@@ -5806,12 +5839,6 @@ fn run_subprocess(
             ExecOutcome::Continue(127)
         }
         Err(e) => {
-            for wpid in heredoc_writers {
-                let mut st = 0;
-                unsafe {
-                    libc::waitpid(wpid, &mut st, 0);
-                }
-            }
             emit_exec_spawn_diag(
                 shell,
                 sink,
@@ -5834,7 +5861,7 @@ enum PipelineStage {
 /// Which caller a pipeline is being spawned for. Foreground (`run_multi_stage`)
 /// is a strict superset of Background (`run_background_sequence`): the mode-guards
 /// in `spawn_pipeline` disable the foreground-only bits (capture wiring, live-pid
-/// registry, heredoc-writer accumulation, stage-0 inherit) for Background.
+/// registry, stage-0 inherit) for Background.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SpawnMode {
     Foreground,
@@ -5848,7 +5875,6 @@ enum SpawnMode {
 struct SpawnedPipeline {
     first_pid: Option<i32>,
     stages: Vec<PipelineStage>,
-    heredoc_writers: Vec<i32>,
     /// The pipeline's target process group (job-control leader pid, else
     /// `NO_PGROUP`). Consumed by the background wrapper (v295 Task 3) to re-assert
     /// the job's process group; the foreground wrapper tracks the terminal handoff
@@ -6135,12 +6161,6 @@ fn spawn_pipeline(
             (None, None)
         };
 
-    // PIDs of forked heredoc/herestring writer processes (M-120); reaped at the
-    // pipeline wait point. They are internal helpers — never jobs, never $!,
-    // never part of $PIPESTATUS. Only accumulated in Foreground; Background lets
-    // the SIGCHLD reaper collect them.
-    let mut heredoc_writers: Vec<libc::pid_t> = Vec::new();
-
     // Stage-0 stdin default. Foreground inherits the shell's stdin (equivalent to
     // the prior ChildFd::Inherit). Background applies the async rule (#129):
     // /dev/null for a single async command when non-interactive, inherit for a
@@ -6373,11 +6393,11 @@ fn spawn_pipeline(
         // For InProcess compound stages, there are no explicit redirects at the
         // stage level; the child handles them internally via run_command.
 
-        // A heredoc/herestring stdin is fed by a forked writer process (M-120):
-        // the body is expanded NOW (while inline assignments are applied so that
-        // $var references see the stage's own inline assignments — v24 deferred-
-        // heredoc contract), handed to `spawn_heredoc_writer`, and the read end
-        // becomes this stage's stdin. The parent never holds the pipe write end.
+        // A heredoc/herestring stdin is delivered via a pipe or temp file, never a
+        // forked writer (#169): the body is expanded NOW (while inline assignments
+        // are applied so that $var references see the stage's own inline
+        // assignments — v24 deferred-heredoc contract), handed to
+        // `heredoc_body_to_fd`, and the read end becomes this stage's stdin.
         let stdin: ChildFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd
             && !stage_is_external
         {
@@ -6450,18 +6470,11 @@ fn spawn_pipeline(
                         }
                     }
                     // Expand the body NOW while inline assignments are still applied,
-                    // then hand it to a forked writer process (M-120): a body larger
-                    // than the pipe buffer must not block the parent before the
-                    // consumer drains. The parent never holds the write end.
+                    // then deliver it (pipe or temp file — no forked writer, #169).
                     let bytes = expand_assignment(body, shell).into_bytes();
-                    match spawn_heredoc_writer(&bytes) {
-                        Ok((r, pid)) => {
-                            match mode {
-                                SpawnMode::Foreground => heredoc_writers.push(pid),
-                                SpawnMode::Background => { /* SIGCHLD reaps writers */ }
-                            }
-                            unsafe { ChildFd::owned_raw(r) }
-                        }
+                    let tmpdir = shell.lookup_var("TMPDIR");
+                    match heredoc_body_to_fd(&bytes, tmpdir.as_deref()) {
+                        Ok(r) => unsafe { ChildFd::owned_raw(r) },
                         Err(e) => {
                             {
                                 let mut err = err_writer(err_sink, sink);
@@ -6495,17 +6508,12 @@ fn spawn_pipeline(
                         }
                     }
                     // Expand NOW (inline assignments still applied) + trailing newline,
-                    // then feed via a forked writer (M-120).
+                    // then deliver it (pipe or temp file — no forked writer, #169).
                     let mut bytes = expand_assignment(body, shell).into_bytes();
                     bytes.push(b'\n');
-                    match spawn_heredoc_writer(&bytes) {
-                        Ok((r, pid)) => {
-                            match mode {
-                                SpawnMode::Foreground => heredoc_writers.push(pid),
-                                SpawnMode::Background => { /* SIGCHLD reaps writers */ }
-                            }
-                            unsafe { ChildFd::owned_raw(r) }
-                        }
+                    let tmpdir = shell.lookup_var("TMPDIR");
+                    match heredoc_body_to_fd(&bytes, tmpdir.as_deref()) {
+                        Ok(r) => unsafe { ChildFd::owned_raw(r) },
                         Err(e) => {
                             {
                                 let mut err = err_writer(err_sink, sink);
@@ -6611,13 +6619,13 @@ fn spawn_pipeline(
         // current_lineno so a stage redirect-open error carries `line N:` like a
         // single command; the plan's opens route through redir_open_error.
         //
-        // This MUST run BEFORE the inter-stage pipe / capture write end is created
-        // below: `build_child_redir_plan` forks heredoc/here-string writer
-        // processes (spawn_heredoc_writer), which inherit every fd the parent holds
-        // at fork time. If the inter-stage pipe write end already existed, a writer
-        // would keep it open and the downstream stage would never see EOF (hang).
-        // The existing slot-heredoc path forks its writer during stdin construction
-        // for the same reason.
+        // Ordering note: this runs before the inter-stage pipe / capture write end
+        // is created below, but that ordering is now incidental. It used to be
+        // load-bearing — `build_child_redir_plan` forked a heredoc writer, which
+        // would inherit an already-created pipe write end and keep the downstream
+        // stage from ever seeing EOF. Since #169 there is no fork:
+        // `heredoc_body_to_fd` delivers the body in this process and returns a
+        // single read-only fd. Nothing here depends on running first.
         let external_plan: Option<ChildRedirPlan> = if stage_is_external && !redirect_failed {
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 // #69: stamp the stage's line so a redirect-open error carries
@@ -6626,13 +6634,7 @@ fn spawn_pipeline(
                     shell.current_lineno = exec.line;
                 }
                 match build_child_redir_plan(&exec.redirects, shell, sink, err_sink) {
-                    Ok(mut p) => {
-                        match mode {
-                            SpawnMode::Foreground => heredoc_writers.append(&mut p.heredoc_writers),
-                            SpawnMode::Background => { /* SIGCHLD reaps writers */ }
-                        }
-                        Some(p)
-                    }
+                    Ok(p) => Some(p),
                     Err(_) => {
                         // #145: error already reported by build_child_redir_plan;
                         // fail ONLY this stage and fall through to the exit-1 child.
@@ -6967,7 +6969,6 @@ fn spawn_pipeline(
     Ok(SpawnedPipeline {
         first_pid,
         stages,
-        heredoc_writers,
         pgid_target,
         procsub_base,
         capture_read_fd,
@@ -6977,7 +6978,7 @@ fn spawn_pipeline(
 
 /// Foreground pipeline: spawn every stage via `spawn_pipeline`, then drain any
 /// capture pipes, hand back the terminal, wait for all stages (setting
-/// `$PIPESTATUS`), reap the heredoc writers, and drain process substitutions.
+/// `$PIPESTATUS`), and drain process substitutions.
 fn run_multi_stage(
     commands: &[Command],
     shell: &mut Shell,
@@ -6988,7 +6989,6 @@ fn run_multi_stage(
     let SpawnedPipeline {
         first_pid,
         stages,
-        heredoc_writers,
         pgid_target: _,
         procsub_base,
         mut capture_read_fd,
@@ -7074,16 +7074,6 @@ fn run_multi_stage(
         guard.retain(|p| !stage_pids.iter().any(|s| (*s as libc::pid_t) == *p));
     }
 
-    // Reap any forked heredoc/herestring writer processes (M-120). They are not
-    // pipeline stages, so they are excluded from $PIPESTATUS and the wait above;
-    // ECHILD or any error is fine — they are transient helpers.
-    for wpid in heredoc_writers {
-        let mut st = 0;
-        unsafe {
-            libc::waitpid(wpid, &mut st, 0);
-        }
-    }
-
     if interactive {
         if stdin_is_tty() {
             give_terminal_to(shell.shell_pgid);
@@ -7116,9 +7106,9 @@ fn run_multi_stage(
         PipelineWaitResult::Stopped(sig) => 128 + sig,
     };
     // Drain any process substitutions realized during stage word expansion.
-    // We drain here (after wait_pipeline_raw + heredoc_writers reap), not
-    // per-stage, because the parent_fd must stay open until all stages that
-    // reference /dev/fd/N have run.
+    // We drain here (after wait_pipeline_raw), not per-stage, because the
+    // parent_fd must stay open until all stages that reference /dev/fd/N have
+    // run.
     drain_procsubs(shell, procsub_base);
     ExecOutcome::Continue(status)
 }
@@ -8310,8 +8300,7 @@ fn spawn_external_with_fds(
     }
 
     // External pipeline stages replay their full ordered ChildRedirPlan; no slot
-    // dup-targets, no extra_ops. (heredoc_writers: the fg caller drains them; the
-    // bg caller leaves them in the plan to drop as a no-op — SIGCHLD reaps.)
+    // dup-targets, no extra_ops.
     let stdout_dup_target: Option<i32> = None;
     let stderr_dup_target: Option<i32> = None;
     let replay_ops: Vec<ChildRedirOp> = plan.ops;
@@ -8484,3 +8473,6 @@ mod g3_dbracket_extglob_noshopt_tests;
 
 #[cfg(test)]
 mod errexit_andor_tests;
+
+#[cfg(test)]
+mod heredoc_body_tests;

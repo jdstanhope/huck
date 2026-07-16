@@ -1,5 +1,8 @@
-//! v134: heredoc/herestring bodies are fed by a forked writer, so large bodies
-//! (> pipe buffer) and backpressuring consumers no longer deadlock (M-120).
+//! Large heredoc/herestring bodies (> pipe buffer) and backpressuring consumers
+//! must not deadlock, on every exec path: compound, pipeline, and captured.
+//! v134 achieved this with a forked writer (M-120); v307 (#169) replaced that
+//! with bash's pipe-or-tempfile delivery (`heredoc_body_to_fd`). The behavior
+//! asserted here is mechanism-agnostic and must hold either way.
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
