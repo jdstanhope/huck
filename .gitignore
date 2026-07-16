@@ -5,6 +5,9 @@
 /tools/*.tsv
 tools/run_results.tsv
 
+# Soak-harness per-run output (samples.csv, rollup.log, workload.log, …)
+/tools/soak/runs/
+
 # huck website (Next.js app)
 site/node_modules
 site/.next
