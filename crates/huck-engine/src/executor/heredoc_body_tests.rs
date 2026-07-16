@@ -151,3 +151,17 @@ fn unusable_tmpdir_falls_back_to_tmp() {
     assert_eq!(fd_kind(fd), libc::S_IFREG);
     assert_eq!(read_all(fd), b);
 }
+
+#[test]
+fn heredoc_pipesize_matches_bash_verified_boundary() {
+    // The other tests in this file derive their body size FROM `HEREDOC_PIPESIZE`,
+    // so they would still pass if the constant drifted. This pins the literal
+    // value against bash 5.2.21, which was measured directly: a here-string body
+    // of 65535 bytes (herelen 65536, including the appended newline) yields a
+    // pipe, and 65536 bytes (herelen 65537) yields `/tmp/sh-thd.XXXXXX (deleted)`.
+    // Do NOT "fix" a failure here by changing the literal — re-measure bash first.
+    assert_eq!(
+        HEREDOC_PIPESIZE, 65536,
+        "HEREDOC_PIPESIZE must match bash's herelen<=65536 pipe boundary"
+    );
+}
