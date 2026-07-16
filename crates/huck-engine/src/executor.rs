@@ -3690,73 +3690,6 @@ fn heredoc_body_to_file_in(bytes: &[u8], dir: &str) -> Result<RawFd, io::Error> 
     }
 }
 
-/// Feed `bytes` (an expanded heredoc/herestring body) to a child's stdin WITHOUT
-/// the parent ever blocking on a full pipe. Forks a writer process that owns the
-/// pipe's write end, writes the whole body, then `_exit`s. The parent closes the
-/// write end immediately, so no later in-process forked stage inherits it (a
-/// writer *thread* would fail there — CLOEXEC only fires on exec, and InProcess
-/// stages fork without exec). Returns the READ end (→ consumer stdin) and the
-/// writer PID (reap it at the consumer's wait point; ECHILD is fine).
-fn spawn_heredoc_writer(bytes: &[u8]) -> Result<(RawFd, libc::pid_t), io::Error> {
-    let (r, w) = crate::child_fd::make_pipe(false)?;
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        let e = io::Error::last_os_error();
-        unsafe {
-            libc::close(r);
-            libc::close(w);
-        }
-        return Err(e);
-    }
-    if pid == 0 {
-        // CHILD: async-signal-safe only. Close read end; write the body; _exit.
-        // v137: keep SIGPIPE ignored here (the process is otherwise SIG_DFL now)
-        // so the writer retains its manual EPIPE handling and closes cleanly,
-        // preserving v134 large-heredoc behavior exactly.
-        unsafe {
-            libc::close(r);
-            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-        }
-        let mut off = 0usize;
-        while off < bytes.len() {
-            let n = unsafe {
-                libc::write(
-                    w,
-                    bytes[off..].as_ptr() as *const libc::c_void,
-                    bytes.len() - off,
-                )
-            };
-            if n < 0 {
-                // Read errno directly (async-signal-safe; no Rust io::Error
-                // wrapper between fork and _exit). EINTR → retry; EPIPE (consumer
-                // gone) or anything else → stop, body delivery is moot.
-                // Symbol differs by platform: glibc/musl/Android expose
-                // `__errno_location`, the BSDs and Apple expose `__error`.
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                let errno = unsafe { *libc::__errno_location() };
-                #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                let errno = unsafe { *libc::__error() };
-                if errno == libc::EINTR {
-                    continue;
-                }
-                break;
-            }
-            if n == 0 {
-                break;
-            }
-            off += n as usize;
-        }
-        unsafe {
-            libc::close(w);
-            libc::_exit(0);
-        }
-    }
-    unsafe {
-        libc::close(w);
-    }
-    Ok((r, pid))
-}
-
 /// Where a freshly-opened redirect-source fd should land.
 enum FdPlacement {
     /// Relocate to >= 10 and set FD_CLOEXEC. Used for redirect *targets* on real
@@ -5234,9 +5167,9 @@ fn lower_one_redirect(
             }
             RedirOp::Heredoc { body, .. } => {
                 let bytes = expand_assignment(body, shell).into_bytes();
-                match spawn_heredoc_writer(&bytes) {
-                    Ok((rfd, pid)) => {
-                        writers.push(pid);
+                let tmpdir = shell.lookup_var("TMPDIR");
+                match heredoc_body_to_fd(&bytes, tmpdir.as_deref()) {
+                    Ok(rfd) => {
                         owned_src = Some(unsafe { OwnedFd::from_raw_fd(rfd) });
                     }
                     Err(e) => {
@@ -5257,9 +5190,9 @@ fn lower_one_redirect(
             RedirOp::HereString(w) => {
                 let mut bytes = expand_assignment(w, shell).into_bytes();
                 bytes.push(b'\n');
-                match spawn_heredoc_writer(&bytes) {
-                    Ok((rfd, pid)) => {
-                        writers.push(pid);
+                let tmpdir = shell.lookup_var("TMPDIR");
+                match heredoc_body_to_fd(&bytes, tmpdir.as_deref()) {
+                    Ok(rfd) => {
                         owned_src = Some(unsafe { OwnedFd::from_raw_fd(rfd) });
                     }
                     Err(e) => {
@@ -5452,9 +5385,9 @@ fn lower_one_redirect(
         }
         RedirOp::Heredoc { body, .. } => {
             let bytes = expand_assignment(body, shell).into_bytes();
-            match spawn_heredoc_writer(&bytes) {
-                Ok((rfd, pid)) => {
-                    writers.push(pid);
+            let tmpdir = shell.lookup_var("TMPDIR");
+            match heredoc_body_to_fd(&bytes, tmpdir.as_deref()) {
+                Ok(rfd) => {
                     let rfd = relocate_high_cloexec(rfd);
                     let owned = unsafe { OwnedFd::from_raw_fd(rfd) };
                     ops.push(PlanOp::InstallOwned {
@@ -5483,9 +5416,9 @@ fn lower_one_redirect(
         RedirOp::HereString(w) => {
             let mut bytes = expand_assignment(w, shell).into_bytes();
             bytes.push(b'\n');
-            match spawn_heredoc_writer(&bytes) {
-                Ok((rfd, pid)) => {
-                    writers.push(pid);
+            let tmpdir = shell.lookup_var("TMPDIR");
+            match heredoc_body_to_fd(&bytes, tmpdir.as_deref()) {
+                Ok(rfd) => {
                     let rfd = relocate_high_cloexec(rfd);
                     let owned = unsafe { OwnedFd::from_raw_fd(rfd) };
                     ops.push(PlanOp::InstallOwned {
@@ -6563,11 +6496,11 @@ fn spawn_pipeline(
         // For InProcess compound stages, there are no explicit redirects at the
         // stage level; the child handles them internally via run_command.
 
-        // A heredoc/herestring stdin is fed by a forked writer process (M-120):
-        // the body is expanded NOW (while inline assignments are applied so that
-        // $var references see the stage's own inline assignments — v24 deferred-
-        // heredoc contract), handed to `spawn_heredoc_writer`, and the read end
-        // becomes this stage's stdin. The parent never holds the pipe write end.
+        // A heredoc/herestring stdin is delivered via a pipe or temp file, never a
+        // forked writer (#169): the body is expanded NOW (while inline assignments
+        // are applied so that $var references see the stage's own inline
+        // assignments — v24 deferred-heredoc contract), handed to
+        // `heredoc_body_to_fd`, and the read end becomes this stage's stdin.
         let stdin: ChildFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd
             && !stage_is_external
         {
@@ -6640,18 +6573,11 @@ fn spawn_pipeline(
                         }
                     }
                     // Expand the body NOW while inline assignments are still applied,
-                    // then hand it to a forked writer process (M-120): a body larger
-                    // than the pipe buffer must not block the parent before the
-                    // consumer drains. The parent never holds the write end.
+                    // then deliver it (pipe or temp file — no forked writer, #169).
                     let bytes = expand_assignment(body, shell).into_bytes();
-                    match spawn_heredoc_writer(&bytes) {
-                        Ok((r, pid)) => {
-                            match mode {
-                                SpawnMode::Foreground => heredoc_writers.push(pid),
-                                SpawnMode::Background => { /* SIGCHLD reaps writers */ }
-                            }
-                            unsafe { ChildFd::owned_raw(r) }
-                        }
+                    let tmpdir = shell.lookup_var("TMPDIR");
+                    match heredoc_body_to_fd(&bytes, tmpdir.as_deref()) {
+                        Ok(r) => unsafe { ChildFd::owned_raw(r) },
                         Err(e) => {
                             {
                                 let mut err = err_writer(err_sink, sink);
@@ -6685,17 +6611,12 @@ fn spawn_pipeline(
                         }
                     }
                     // Expand NOW (inline assignments still applied) + trailing newline,
-                    // then feed via a forked writer (M-120).
+                    // then deliver it (pipe or temp file — no forked writer, #169).
                     let mut bytes = expand_assignment(body, shell).into_bytes();
                     bytes.push(b'\n');
-                    match spawn_heredoc_writer(&bytes) {
-                        Ok((r, pid)) => {
-                            match mode {
-                                SpawnMode::Foreground => heredoc_writers.push(pid),
-                                SpawnMode::Background => { /* SIGCHLD reaps writers */ }
-                            }
-                            unsafe { ChildFd::owned_raw(r) }
-                        }
+                    let tmpdir = shell.lookup_var("TMPDIR");
+                    match heredoc_body_to_fd(&bytes, tmpdir.as_deref()) {
+                        Ok(r) => unsafe { ChildFd::owned_raw(r) },
                         Err(e) => {
                             {
                                 let mut err = err_writer(err_sink, sink);
@@ -6802,12 +6723,13 @@ fn spawn_pipeline(
         // single command; the plan's opens route through redir_open_error.
         //
         // This MUST run BEFORE the inter-stage pipe / capture write end is created
-        // below: `build_child_redir_plan` forks heredoc/here-string writer
-        // processes (spawn_heredoc_writer), which inherit every fd the parent holds
-        // at fork time. If the inter-stage pipe write end already existed, a writer
-        // would keep it open and the downstream stage would never see EOF (hang).
-        // The existing slot-heredoc path forks its writer during stdin construction
-        // for the same reason.
+        // below: `build_child_redir_plan` opens heredoc/here-string bodies via
+        // `heredoc_body_to_fd` (no forked writer since #169), whose pipe-path
+        // write end is closed again before returning — but it still opens fds in
+        // this process, so keeping it ahead of the inter-stage pipe avoids handing
+        // it an fd number the pipe/capture setup below would otherwise claim.
+        // The existing slot-heredoc path resolves its body during stdin
+        // construction for the same reason.
         let external_plan: Option<ChildRedirPlan> = if stage_is_external && !redirect_failed {
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 // #69: stamp the stage's line so a redirect-open error carries
