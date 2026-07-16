@@ -225,3 +225,15 @@ huck enforces `FUNCNEST` exactly like bash, but additionally clamps the effectiv
 - **Workaround**: none needed; completed jobs are still pruned (no leak) and `wait $pid` still resolves a completed job's exit status (huck retains terminal statuses in a bounded ring). The only difference is the one-time `[1]+ Done` echo in script/stdin mode.
 
 ---
+
+### heredoc body delivery: size check + `O_NONBLOCK` probe with temp-file fallback
+
+[Issue #188 · by-design](https://github.com/jdstanhope/huck/issues/188)
+
+- **huck**: applies bash's size check (`herelen <= 65536` → pipe, above → unlinked temp file), but before committing to the pipe it **probes the write with `O_NONBLOCK`** and falls back to the temp file if the body does not fit. So huck can use a temp file where bash would use a pipe — only on a platform whose pipe capacity is below 65536, and only for bodies between that capacity and 65536.
+- **bash**: decides by size alone. A body of `<= 65536` bytes is written into a pipe **blocking**, from the parent, with no fork.
+- **Why intentional**: bash's constant is not a policy choice, it is a platform fact — 65536 is Linux's default pipe capacity, which is the only reason a blocking parent write of `<= 65536` bytes cannot deadlock. Ported verbatim, that write hangs wherever the pipe is smaller (macOS pipes start at 16KB — the shape of the existing macOS-only hang in #97). Since v307/#169 was itself a heredoc hang, matching bash byte-for-byte here would trade the bug just fixed for a portable version of it. `O_NONBLOCK` is set per open-file-description on the write end only, so the reader's end stays blocking.
+- **Observability**: none on huck's compat target. On ubuntu-24.04 the pipe capacity is 65536, so the probe never fails for a body that passed the size check and huck's delivery is identical to bash's at every size. The fd is read-only at offset 0 on both paths regardless, so a script would have to `fstat` it and check `S_IFIFO` vs `S_IFREG` to observe the difference even where it occurs.
+- **Workaround**: none needed.
+
+---
