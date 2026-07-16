@@ -448,36 +448,6 @@ fn wait_n_p_without_var_name_is_usage_error() {
 }
 
 #[test]
-fn reap_and_notify_prunes_done_job_non_interactively() {
-    // #175: a completed (Done) job is silently removed from the table by the
-    // between-command maintenance pass (`reap_and_notify`), matching bash's
-    // non-interactive pruning. No print because the shell is non-interactive.
-    let mut shell = Shell::new();
-    shell.is_interactive = false;
-    shell.jobs.add_synthetic_done("sleep 0".to_string(), 0);
-    assert_eq!(shell.jobs.iter().count(), 1);
-    crate::jobs::reap_and_notify(&mut shell);
-    assert!(
-        shell.jobs.iter().next().is_none(),
-        "the Done job must be pruned by reap_and_notify"
-    );
-}
-
-#[test]
-fn reap_and_notify_keeps_stopped_job() {
-    // #175: Running/Stopped jobs are retained across the maintenance pass.
-    let mut shell = Shell::new();
-    shell.is_interactive = false;
-    let id = shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
-    shell.jobs.jobs_mut()[0].state = crate::jobs::JobState::Stopped(libc::SIGTSTP);
-    crate::jobs::reap_and_notify(&mut shell);
-    assert!(
-        shell.jobs.iter().any(|j| j.id == id),
-        "a Stopped job must be kept, not pruned"
-    );
-}
-
-#[test]
 fn saved_status_ring_records_looks_up_and_evicts_oldest() {
     // #175 follow-up: the saved-status ring retains a completed job's exit code
     // by pid so `wait $pid` resolves after the visible job was pruned. It is
@@ -510,27 +480,10 @@ fn saved_status_ring_records_looks_up_and_evicts_oldest() {
     assert_eq!(table.saved_status(1000 + 4095), Some(1), "newest kept");
 }
 
-#[test]
-fn remove_notified_records_terminal_status_for_later_wait() {
-    // A Done job pruned by the between-command maintenance pass leaves its
-    // exit status waitable by pid.
-    let mut shell = Shell::new();
-    shell.is_interactive = false;
-    // Build a Running job with a real leader pid, then mark it Done so the prune
-    // path records (pid -> code). add_synthetic_done has no pids, so use add.
-    shell.jobs.add(555, vec![555], "sleep 0".to_string());
-    shell.jobs.jobs_mut()[0].state = crate::jobs::JobState::Done(4);
-    crate::jobs::reap_and_notify(&mut shell);
-    assert!(
-        shell.jobs.iter().next().is_none(),
-        "the Done job must be pruned"
-    );
-    assert_eq!(
-        shell.jobs.saved_status(555),
-        Some(4),
-        "pruned job's status must be retained for wait $pid"
-    );
-}
+// NOTE: the three `reap_and_notify` pruning tests (#175) live in
+// `crates/huck-engine/tests/jobs_reap_prune.rs`, NOT here. They call a
+// process-GLOBAL `waitpid(-1)` reaper, which in this shared multithreaded
+// binary steals children forked by concurrent tests. See that file.
 
 #[test]
 fn wait_for_job_removes_its_id_from_table() {
