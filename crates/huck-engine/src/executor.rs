@@ -542,6 +542,18 @@ fn execute_sequence_body(
     // backgrounded group reports the launch status 0.
     let mut last_status = ExecOutcome::Continue(0);
     for group in &groups {
+        // #175: non-interactive between-command job-table maintenance. bash
+        // silently prunes completed (Done/Signaled) background jobs at each
+        // command boundary; Running/Stopped are kept. The interactive REPL
+        // already prunes per-prompt (repl.rs) and prints its async notices
+        // there, so restrict this to non-interactive shells to avoid emitting
+        // mid-line notices — `reap_and_notify`'s printing is also gated on
+        // `is_interactive`, so this prunes silently. (The driver loop in
+        // `run_sourced_contents_in_sinks` only iterates per newline-terminated
+        // unit, so `;`/`&`-separated commands on one line are pruned here.)
+        if !shell.is_interactive {
+            crate::jobs::reap_and_notify(shell);
+        }
         if group.backgrounded {
             // Background the group: wrap its commands into a synthetic
             // foreground `Sequence`, then a `Subshell`, and reuse the existing

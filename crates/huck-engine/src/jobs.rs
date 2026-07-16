@@ -43,10 +43,26 @@ pub struct Job {
     pub own_pgroup: bool,
 }
 
+/// Cap on the saved terminal-status ring (`last_statuses`). Bounded so that
+/// #175's whole point — no unbounded job-table growth — is preserved: a script
+/// that backgrounds millions of jobs without `wait`ing them cannot leak memory
+/// through the saved-status side table either. On overflow the oldest entry is
+/// dropped. bash keeps completed statuses waitable until they age out; 4096 is
+/// far more than any realistic `wait $pid`-after-the-fact working set.
+const SAVED_STATUS_CAP: usize = 4096;
+
 #[derive(Debug, Clone, Default)]
 pub struct JobTable {
     jobs: Vec<Job>,
     next_created_at: u64,
+    /// Terminal exit statuses of jobs that have already been pruned from
+    /// `jobs`, keyed by (pid, decoded-status). bash prunes completed jobs from
+    /// the visible `jobs` list but RETAINS their exit status so a later
+    /// `wait $pid` still resolves (repeatedly, until it ages out). Populated by
+    /// every prune path (`remove_notified`, `remove_job_recording_status`);
+    /// consulted by `wait`'s ECHILD fallback. Drop-oldest bounded at
+    /// `SAVED_STATUS_CAP`.
+    last_statuses: Vec<(i32, i32)>,
 }
 
 impl JobTable {
@@ -185,10 +201,80 @@ impl JobTable {
         out
     }
 
-    /// Drops all jobs that are non-Running AND notified.
+    /// Drops all jobs that are non-Running AND notified. Before dropping each
+    /// one, its terminal exit status is recorded in the saved-status ring so a
+    /// later `wait $pid` still resolves it (bash retains completed statuses even
+    /// after pruning the visible `jobs` entry).
     pub fn remove_notified(&mut self) {
+        let to_record: Vec<(i32, i32)> = self
+            .jobs
+            .iter()
+            .filter(|j| !matches!(j.state, JobState::Running | JobState::Stopped(_)) && j.notified)
+            .filter_map(|j| Self::terminal_code(&j.state).map(|code| (j, code)))
+            .flat_map(|(j, code)| j.pids.iter().map(move |&pid| (pid, code)))
+            .collect();
+        for (pid, code) in to_record {
+            self.record_terminal_status(pid, code);
+        }
         self.jobs
             .retain(|j| matches!(j.state, JobState::Running | JobState::Stopped(_)) || !j.notified);
+    }
+
+    /// The decoded terminal exit code for a completed job: `Done(c)` → `c`,
+    /// `Signaled(s)` → `128 + s`. `None` for a still-live (Running/Stopped) job.
+    fn terminal_code(state: &JobState) -> Option<i32> {
+        match state {
+            JobState::Done(c) => Some(*c),
+            JobState::Signaled(s) => Some(128 + *s),
+            JobState::Running | JobState::Stopped(_) => None,
+        }
+    }
+
+    /// Records a to-be-pruned job's terminal status against each of its pids
+    /// (so `$!` — the leader pid — resolves via `wait`). No-op if the job is not
+    /// terminal. A synthetic Done job has no pids, so nothing is recorded — it
+    /// was never a real child, so `wait $pid` on it could not resolve anyway.
+    fn record_pruned_job(&mut self, job: &Job) {
+        if let Some(code) = Self::terminal_code(&job.state) {
+            for &pid in &job.pids {
+                self.record_terminal_status(pid, code);
+            }
+        }
+    }
+
+    /// Records one `(pid, code)` in the bounded saved-status ring. If `pid` is
+    /// already present its code is refreshed in place; otherwise it is appended,
+    /// evicting the oldest entry when the cap is exceeded.
+    pub fn record_terminal_status(&mut self, pid: i32, code: i32) {
+        if let Some(slot) = self.last_statuses.iter_mut().find(|(p, _)| *p == pid) {
+            slot.1 = code;
+            return;
+        }
+        if self.last_statuses.len() >= SAVED_STATUS_CAP {
+            self.last_statuses.remove(0);
+        }
+        self.last_statuses.push((pid, code));
+    }
+
+    /// Looks up a saved terminal status by pid. Does NOT remove it — bash
+    /// resolves `wait $pid` repeatedly until the entry ages out.
+    pub fn saved_status(&self, pid: i32) -> Option<i32> {
+        self.last_statuses
+            .iter()
+            .rev()
+            .find(|(p, _)| *p == pid)
+            .map(|(_, code)| *code)
+    }
+
+    /// Removes the job with id `id`, first recording its terminal status in the
+    /// saved-status ring (so a later `wait $pid` still resolves). Used by the
+    /// `wait %n` path, which prunes the waited job immediately (matching bash).
+    pub fn remove_job_recording_status(&mut self, id: u32) {
+        if let Some(job) = self.jobs.iter().find(|j| j.id == id) {
+            let job = job.clone();
+            self.record_pruned_job(&job);
+        }
+        self.jobs.retain(|j| j.id != id);
     }
 
     /// Returns the most-recent and previous job ids (for `+`/`-` markers).

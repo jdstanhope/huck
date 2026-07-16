@@ -448,6 +448,113 @@ fn wait_n_p_without_var_name_is_usage_error() {
 }
 
 #[test]
+fn reap_and_notify_prunes_done_job_non_interactively() {
+    // #175: a completed (Done) job is silently removed from the table by the
+    // between-command maintenance pass (`reap_and_notify`), matching bash's
+    // non-interactive pruning. No print because the shell is non-interactive.
+    let mut shell = Shell::new();
+    shell.is_interactive = false;
+    shell.jobs.add_synthetic_done("sleep 0".to_string(), 0);
+    assert_eq!(shell.jobs.iter().count(), 1);
+    crate::jobs::reap_and_notify(&mut shell);
+    assert!(
+        shell.jobs.iter().next().is_none(),
+        "the Done job must be pruned by reap_and_notify"
+    );
+}
+
+#[test]
+fn reap_and_notify_keeps_stopped_job() {
+    // #175: Running/Stopped jobs are retained across the maintenance pass.
+    let mut shell = Shell::new();
+    shell.is_interactive = false;
+    let id = shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
+    shell.jobs.jobs_mut()[0].state = crate::jobs::JobState::Stopped(libc::SIGTSTP);
+    crate::jobs::reap_and_notify(&mut shell);
+    assert!(
+        shell.jobs.iter().any(|j| j.id == id),
+        "a Stopped job must be kept, not pruned"
+    );
+}
+
+#[test]
+fn saved_status_ring_records_looks_up_and_evicts_oldest() {
+    // #175 follow-up: the saved-status ring retains a completed job's exit code
+    // by pid so `wait $pid` resolves after the visible job was pruned. It is
+    // bounded (drop-oldest) so it cannot re-introduce an unbounded leak.
+    let mut table = crate::jobs::JobTable::new();
+    table.record_terminal_status(100, 0);
+    table.record_terminal_status(101, 7);
+    assert_eq!(table.saved_status(100), Some(0));
+    assert_eq!(table.saved_status(101), Some(7));
+    assert_eq!(table.saved_status(999), None);
+    // Re-recording a known pid refreshes its code in place (no duplicate).
+    table.record_terminal_status(100, 3);
+    assert_eq!(table.saved_status(100), Some(3));
+    // Overflow past the cap (4096) evicts the oldest entries first. pid 100/101
+    // were the two oldest, so after inserting 4096 fresh pids they are gone but
+    // recent ones survive.
+    for pid in 1000..(1000 + 4096) {
+        table.record_terminal_status(pid, 1);
+    }
+    assert_eq!(
+        table.saved_status(100),
+        None,
+        "oldest entry must be evicted"
+    );
+    assert_eq!(
+        table.saved_status(101),
+        None,
+        "oldest entry must be evicted"
+    );
+    assert_eq!(table.saved_status(1000 + 4095), Some(1), "newest kept");
+}
+
+#[test]
+fn remove_notified_records_terminal_status_for_later_wait() {
+    // A Done job pruned by the between-command maintenance pass leaves its
+    // exit status waitable by pid.
+    let mut shell = Shell::new();
+    shell.is_interactive = false;
+    // Build a Running job with a real leader pid, then mark it Done so the prune
+    // path records (pid -> code). add_synthetic_done has no pids, so use add.
+    shell.jobs.add(555, vec![555], "sleep 0".to_string());
+    shell.jobs.jobs_mut()[0].state = crate::jobs::JobState::Done(4);
+    crate::jobs::reap_and_notify(&mut shell);
+    assert!(
+        shell.jobs.iter().next().is_none(),
+        "the Done job must be pruned"
+    );
+    assert_eq!(
+        shell.jobs.saved_status(555),
+        Some(4),
+        "pruned job's status must be retained for wait $pid"
+    );
+}
+
+#[test]
+fn wait_for_job_removes_its_id_from_table() {
+    // #175: `wait %n` on a terminal job returns its status and removes the
+    // entry, so a following `jobs` does not show it.
+    let mut shell = Shell::new();
+    shell.is_interactive = false;
+    let id = shell.jobs.add_synthetic_done("echo hi".to_string(), 0);
+    let mut buf: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "wait",
+        &[format!("%{id}")],
+        &mut buf,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    assert!(
+        !shell.jobs.iter().any(|j| j.id == id),
+        "wait_for_job must remove the waited job's id"
+    );
+}
+
+#[test]
 fn wait_invalid_flag_is_usage_error() {
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
