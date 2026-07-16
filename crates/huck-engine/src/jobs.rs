@@ -437,12 +437,8 @@ pub fn reap_and_notify(shell: &mut crate::shell_state::Shell) {
         } else {
             ' '
         };
-        // bash prints async job-completion notices when job control is active —
-        // interactively OR under `set -m` (#167) — but suppresses them inside a
-        // subshell environment / completion func. `job_control_active()` encodes
-        // exactly `(is_interactive || monitor) && !in_subshell && !in_completion`,
-        // so non-interactive shells without `set -m` still prune silently.
-        if shell.job_control_active() {
+        // bash suppresses automatic job notices inside a subshell environment / completion funcs
+        if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
             with_err(|err| e!(err, "{}", notification_line(&job, flag)));
         }
     }
