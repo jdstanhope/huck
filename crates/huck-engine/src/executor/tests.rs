@@ -2161,7 +2161,7 @@ fn compound_stdout_redirect_writes_to_file() {
 #[test]
 fn classify_runnability_bare_not_found_is_127() {
     let shell = Shell::new();
-    match classify_stage_runnability("definitely_no_such_cmd_xyz", &shell) {
+    match classify_command_runnability("definitely_no_such_cmd_xyz", &shell) {
         StageRunnability::NotRunnable { body, code } => {
             assert_eq!(code, 127);
             assert_eq!(body, "definitely_no_such_cmd_xyz: command not found");
@@ -2173,7 +2173,7 @@ fn classify_runnability_bare_not_found_is_127() {
 #[test]
 fn classify_runnability_slash_not_found_is_127_no_such_file() {
     let shell = Shell::new();
-    match classify_stage_runnability("/no/such/path/xyz", &shell) {
+    match classify_command_runnability("/no/such/path/xyz", &shell) {
         StageRunnability::NotRunnable { body, code } => {
             assert_eq!(code, 127);
             assert_eq!(body, "/no/such/path/xyz: No such file or directory");
@@ -2185,7 +2185,7 @@ fn classify_runnability_slash_not_found_is_127_no_such_file() {
 #[test]
 fn classify_runnability_directory_is_126_is_a_directory() {
     let shell = Shell::new();
-    match classify_stage_runnability("/etc", &shell) {
+    match classify_command_runnability("/etc", &shell) {
         StageRunnability::NotRunnable { body, code } => {
             assert_eq!(code, 126);
             assert_eq!(body, "/etc: Is a directory");
@@ -2207,7 +2207,7 @@ fn classify_runnability_non_executable_is_126_permission_denied() {
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
     let shell = Shell::new();
     let ps = p.to_str().unwrap();
-    match classify_stage_runnability(ps, &shell) {
+    match classify_command_runnability(ps, &shell) {
         StageRunnability::NotRunnable { body, code } => {
             assert_eq!(code, 126);
             assert_eq!(body, format!("{ps}: Permission denied"));
@@ -2222,12 +2222,85 @@ fn classify_runnability_existing_binary_is_runnable() {
     let shell = Shell::new();
     // /bin/sh exists and is executable on the CI target.
     assert!(matches!(
-        classify_stage_runnability("/bin/sh", &shell),
+        classify_command_runnability("/bin/sh", &shell),
         StageRunnability::Runnable
     ));
     // and a bare name found on PATH
     assert!(matches!(
-        classify_stage_runnability("sh", &shell),
+        classify_command_runnability("sh", &shell),
         StageRunnability::Runnable
     ));
+}
+
+#[test]
+fn classify_runnability_bare_non_executable_in_path_is_126() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    // A non-executable regular file named `foo` in a PATH dir → 126 "Permission
+    // denied", reported with the RESOLVED path (bash's first-match-in-PATH order).
+    let dir = std::env::temp_dir().join("huck_classify_bare_noexec_dir");
+    let _ = std::fs::create_dir_all(&dir);
+    let foo = dir.join("foo");
+    {
+        let mut f = std::fs::File::create(&foo).unwrap();
+        writeln!(f, "#x").unwrap();
+    }
+    std::fs::set_permissions(&foo, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut shell = Shell::new();
+    shell.set("PATH", dir.to_str().unwrap().to_string());
+    match classify_command_runnability("foo", &shell) {
+        StageRunnability::NotRunnable { body, code } => {
+            assert_eq!(code, 126);
+            assert_eq!(body, format!("{}: Permission denied", foo.display()));
+        }
+        other => panic!("expected NotRunnable, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn classify_runnability_bare_executable_later_in_path_wins() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    // Non-executable `foo` in the first PATH dir, executable `foo` in the second:
+    // the executable wins → Runnable (bash runs it), so no 126.
+    let d1 = std::env::temp_dir().join("huck_classify_wins_d1");
+    let d2 = std::env::temp_dir().join("huck_classify_wins_d2");
+    let _ = std::fs::create_dir_all(&d1);
+    let _ = std::fs::create_dir_all(&d2);
+    {
+        let mut f = std::fs::File::create(d1.join("foo")).unwrap();
+        writeln!(f, "#x").unwrap();
+    }
+    std::fs::set_permissions(&d1.join("foo"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    {
+        let mut f = std::fs::File::create(d2.join("foo")).unwrap();
+        writeln!(f, "#!/bin/sh\n").unwrap();
+    }
+    std::fs::set_permissions(&d2.join("foo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut shell = Shell::new();
+    shell.set("PATH", format!("{}:{}", d1.display(), d2.display()));
+    assert!(matches!(
+        classify_command_runnability("foo", &shell),
+        StageRunnability::Runnable
+    ));
+    let _ = std::fs::remove_dir_all(&d1);
+    let _ = std::fs::remove_dir_all(&d2);
+}
+
+#[test]
+fn classify_runnability_bare_directory_in_path_is_not_found() {
+    // A DIRECTORY named `foo` in PATH is not a command match → 127, not 126.
+    let dir = std::env::temp_dir().join("huck_classify_dirmatch");
+    let _ = std::fs::create_dir_all(dir.join("foo"));
+    let mut shell = Shell::new();
+    shell.set("PATH", dir.to_str().unwrap().to_string());
+    match classify_command_runnability("foo", &shell) {
+        StageRunnability::NotRunnable { body, code } => {
+            assert_eq!(code, 127);
+            assert_eq!(body, "foo: command not found");
+        }
+        other => panic!("expected NotRunnable, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
