@@ -4450,6 +4450,10 @@ fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
                 _ => None,
             });
         if let Some(code) = terminal {
+            // #175: bash removes a waited job immediately, so a following
+            // `jobs` does not show it — but it retains the terminal status so a
+            // later `wait $pid` on the same job still resolves.
+            shell.jobs.remove_job_recording_status(id);
             return ExecOutcome::Continue(code);
         }
         if let Some(o) = crate::executor::check_interrupt(shell) {
@@ -4493,12 +4497,24 @@ fn wait_for_pid(pid: i32, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome
             } else {
                 1
             };
+            // #175: retain the terminal status so a second `wait $pid` on the
+            // same (now-reaped) pid resolves to the same code instead of
+            // ECHILD-ing, matching bash. Independent of whether a between-command
+            // prune has recorded it yet.
+            shell.jobs.record_terminal_status(r, code);
             return ExecOutcome::Continue(code);
         }
         if r < 0 {
-            // ECHILD: not a child (or already reaped). On the first call,
-            // surface as "not a child." On a subsequent call, treat as a
-            // race we can't recover from.
+            // ECHILD: not a (live) child. #175: the job may have already
+            // completed and been auto-pruned from the visible `jobs` list; bash
+            // retains its terminal status so `wait $pid` still resolves (even
+            // repeatedly). Consult the saved-status ring before erroring.
+            if let Some(code) = shell.jobs.saved_status(pid) {
+                return ExecOutcome::Continue(code);
+            }
+            // Genuinely not a child (or already reaped without a saved status).
+            // On the first call, surface as "not a child." On a subsequent call,
+            // treat as a race we can't recover from.
             if first {
                 crate::sh_error_to!(
                     shell,
@@ -5211,8 +5227,13 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
 
     e!(err, "{command}");
 
+    // #167: hand the terminal to the job's group only when stdin is a
+    // controlling tty. Under `set -m` in a script/pipe there is no tty, but the
+    // SIGCONT + waitpid(-pgid) below still resume and wait on the job's group.
     unsafe {
-        libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+        if libc::isatty(libc::STDIN_FILENO) == 1 {
+            libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+        }
         libc::killpg(pgid, libc::SIGCONT);
     }
 
@@ -5248,7 +5269,9 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
     }
 
     unsafe {
-        libc::tcsetpgrp(libc::STDIN_FILENO, shell.shell_pgid);
+        if libc::isatty(libc::STDIN_FILENO) == 1 {
+            libc::tcsetpgrp(libc::STDIN_FILENO, shell.shell_pgid);
+        }
     }
 
     if let Some(sig) = stopped_sig {
@@ -7585,6 +7608,13 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     }
                 }
             }
+            // #175: between-command job-table maintenance. Before parsing and
+            // executing the next unit, reap completed background children and
+            // silently prune Done/Signaled entries (Running/Stopped are kept),
+            // mirroring the interactive REPL's per-prompt cadence (`repl.rs`).
+            // Printing is gated on `is_interactive`, so this prunes silently
+            // non-interactively — matching bash's non-interactive pruning.
+            crate::jobs::reap_and_notify(&mut *shell);
             // Byte offset of this unit's first token, read straight from its span.
             // peek_span cannot error here: the newline-skip above broke on an Ok
             // peek of this same token, so it is already scanned into history.

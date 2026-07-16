@@ -1,6 +1,6 @@
 # huck vs bash 5.x — Intentional Divergences
 
-**Last updated:** 2026-07-09.
+**Last updated:** 2026-07-16.
 
 This document lists ONLY the divergences from bash 5.x that huck keeps **on
 purpose** — deliberate design choices we do not intend to "fix." Each one is
@@ -212,5 +212,16 @@ huck enforces `FUNCNEST` exactly like bash, but additionally clamps the effectiv
 - **bash**: keeps a here-document body opaque at parse time and defers command-substitution parsing to **runtime**, so the same input parses (`bash -n` rc 0) and the unterminated `$(` errors only when the heredoc is instantiated (rc 1, `unexpected EOF while looking for matching ')'`).
 - **Why intentional**: for every VALID heredoc body huck's eager parse and bash's runtime parse produce identical results — the divergence is confined to genuinely malformed expansion bodies (exotic, sev:low), where huck still errors cleanly (no panic), just at parse time with rc 2 instead of runtime with rc 1. Full parity requires runtime-deferred heredoc-body expansion (storing the body as raw text and parsing+expanding it at runtime), a major rework of a hot, heavily-tested happy path; the risk is not justified for a malformed-input edge. (Surfaced by the bash test-suite `comsub-eof6.sub`.)
 - **Workaround**: none needed; write terminated command substitutions in heredoc bodies.
+
+---
+
+### non-interactive job pruning matches bash `-c` mode, not script/stdin `[1]+ Done` echo
+
+[Issue #179 · by-design](https://github.com/jdstanhope/huck/issues/179)
+
+- **huck**: non-interactively, huck reaps and prunes completed background jobs at every command boundary (v306, #175). This exactly matches bash **`-c` mode**: `huck -c 'sleep 0.1 & sleep 0.3; jobs'` prints nothing, because the job was pruned before `jobs` ran.
+- **bash**: has TWO non-interactive cadences. Under `-c` it prunes at the command boundary (huck matches). Under a **script file** (`bash script.sh`) or **stdin** (`… | bash`) it instead *retains* the completed job silently across command boundaries — it does NOT async-notify — and the first `jobs`/`wait` that observes it prints `[1]+ Done  sleep 0.1` **once**, then prunes it. huck prunes uniformly, so `huck script.sh` does not echo that one-time `[1]+ Done` line. The exact retained set is also timing-dependent in bash itself (20 quick bg jobs → `jobs` shows 20 Done lines; 500 → shows 1), i.e. not byte-stable.
+- **Why intentional**: the difference is cosmetic (whether one `[1]+ Done` line echoes for a job that completed before `jobs`). Matching script/stdin mode too would require `-c`-vs-script mode detection plus a report-then-prune notified-state machine, and it is racy/unmatchable in bash for the common multi-job case anyway — real complexity and risk in the job-control subsystem for a display-only edge. huck's uniform boundary prune is *strictly safer* for #175's actual goal (no unbounded job-table growth) than bash's timing-dependent retention.
+- **Workaround**: none needed; completed jobs are still pruned (no leak) and `wait $pid` still resolves a completed job's exit status (huck retains terminal statuses in a bounded ring). The only difference is the one-time `[1]+ Done` echo in script/stdin mode.
 
 ---

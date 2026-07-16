@@ -1130,13 +1130,19 @@ impl Shell {
     }
 
     /// True when this shell should use job control (own process groups +
-    /// terminal handoff) for the commands it forks: an interactive shell not
-    /// inside a subshell environment or a completion function. The single source
-    /// of truth — replaces the inline `matches!(sink, Terminal) && !in_subshell
-    /// && !in_completion` copies that had drifted (they omitted `is_interactive`).
-    /// Foreground callers additionally require a `StdoutSink::Terminal` sink.
+    /// terminal handoff) for the commands it forks: an interactive shell OR one
+    /// with `set -m` (`monitor`) active, not inside a subshell environment or a
+    /// completion function. The single source of truth — replaces the inline
+    /// `matches!(sink, Terminal) && !in_subshell && !in_completion` copies that
+    /// had drifted (they omitted `is_interactive`). Foreground callers
+    /// additionally require a `StdoutSink::Terminal` sink. #167: `set -m` makes
+    /// this true non-interactively so scripted `fg`/`bg` on a live job get their
+    /// own process group and can `waitpid(-pgid)` for the real status; terminal
+    /// handoff is separately gated on a controlling tty at the call sites.
     pub fn job_control_active(&self) -> bool {
-        self.is_interactive && !self.in_subshell && !self.in_completion
+        (self.is_interactive || self.shell_options.monitor)
+            && !self.in_subshell
+            && !self.in_completion
     }
 
     /// Returns the value of `$-` — alphabetical concatenation of
