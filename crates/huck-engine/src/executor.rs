@@ -827,7 +827,12 @@ fn run_command(
                 // parent; this is belt-and-suspenders to guarantee the pgrp
                 // exists before give_terminal_to, mirroring the pipeline path.)
                 setpgid_self(pid);
-                give_terminal_to(pid);
+                // #167: only hand the terminal to the job group when we own a
+                // controlling tty. Under `set -m` in a pipe the setpgid + wait
+                // still happen, matching bash's non-interactive job control.
+                if stdin_is_tty() {
+                    give_terminal_to(pid);
+                }
                 let outcome = match wait_with_untraced(pid) {
                     Ok((raw_status, true)) => {
                         let sig = libc::WSTOPSIG(raw_status);
@@ -854,7 +859,9 @@ fn run_command(
                     Ok((raw_status, false)) => raw_status_to_exit_code(raw_status, shell),
                     Err(()) => 1,
                 };
-                give_terminal_to(shell.shell_pgid);
+                if stdin_is_tty() {
+                    give_terminal_to(shell.shell_pgid);
+                }
                 shell.set_pipestatus(&[outcome]);
                 ExecOutcome::Continue(outcome)
             } else {
@@ -5638,7 +5645,11 @@ fn run_subprocess(
                 // Race-close: also setpgid in the parent so the child's pgrp
                 // is guaranteed to exist before we call tcsetpgrp.
                 setpgid_self(pid);
-                give_terminal_to(pid);
+                // #167: hand the terminal to the child's group only when we own
+                // a controlling tty. `set -m` under a pipe still groups + waits.
+                if stdin_is_tty() {
+                    give_terminal_to(pid);
+                }
 
                 // wait_with_untraced already waitpid'd the child, so each arm
                 // mem::forget's the Child to keep its Drop from re-reaping
@@ -5670,19 +5681,25 @@ fn run_subprocess(
                         // run_exec_single's epilogue must be non-blocking.
                         shell.fg_stopped = true;
                         std::mem::forget(child);
-                        give_terminal_to(shell.shell_pgid);
+                        if stdin_is_tty() {
+                            give_terminal_to(shell.shell_pgid);
+                        }
                         ExecOutcome::Continue(128 + sig)
                     }
                     Ok((raw_status, false)) => {
                         // Child exited or was killed by a signal.
                         let code = raw_status_to_exit_code(raw_status, shell);
                         std::mem::forget(child);
-                        give_terminal_to(shell.shell_pgid);
+                        if stdin_is_tty() {
+                            give_terminal_to(shell.shell_pgid);
+                        }
                         ExecOutcome::Continue(code)
                     }
                     Err(()) => {
                         std::mem::forget(child);
-                        give_terminal_to(shell.shell_pgid);
+                        if stdin_is_tty() {
+                            give_terminal_to(shell.shell_pgid);
+                        }
                         ExecOutcome::Continue(1)
                     }
                 }
@@ -7029,7 +7046,12 @@ fn run_multi_stage(
     }
 
     // Give the terminal to the pipeline's process group if interactive.
-    if interactive && let Some(pgid) = first_pid {
+    // #167: only when we own a controlling tty (set -m under a pipe skips the
+    // handoff but still groups + waits on the pipeline's process group).
+    if interactive
+        && stdin_is_tty()
+        && let Some(pgid) = first_pid
+    {
         give_terminal_to(pgid);
     }
 
@@ -7063,7 +7085,9 @@ fn run_multi_stage(
     }
 
     if interactive {
-        give_terminal_to(shell.shell_pgid);
+        if stdin_is_tty() {
+            give_terminal_to(shell.shell_pgid);
+        }
         if let PipelineWaitResult::Stopped(sig) = &last_status {
             let sig = *sig;
             // Intentionally do NOT set $PIPESTATUS here: bash does not set it
@@ -7779,6 +7803,16 @@ fn build_array_map(
 }
 
 // ----- job-control helpers -------------------------------------------------
+
+/// #167: true when the shell's stdin is a controlling terminal. Foreground job
+/// paths gate `give_terminal_to`/`tcsetpgrp` on this so that `set -m` job
+/// control under a pipe (no tty) still sets up process groups and waits on the
+/// job's group, but never tries to hand terminal control to a job group when
+/// there is no controlling tty. Interactive shells run on a tty, so their
+/// terminal-handoff behavior is unchanged.
+fn stdin_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+}
 
 /// Best-effort: give the controlling terminal to `pgid`. Swallows ENOTTY
 /// (non-tty environments like cargo test) and EPERM (race: pgrp already

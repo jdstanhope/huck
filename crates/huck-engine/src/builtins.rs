@@ -5227,8 +5227,13 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
 
     e!(err, "{command}");
 
+    // #167: hand the terminal to the job's group only when stdin is a
+    // controlling tty. Under `set -m` in a script/pipe there is no tty, but the
+    // SIGCONT + waitpid(-pgid) below still resume and wait on the job's group.
     unsafe {
-        libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+        if libc::isatty(libc::STDIN_FILENO) == 1 {
+            libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+        }
         libc::killpg(pgid, libc::SIGCONT);
     }
 
@@ -5264,7 +5269,9 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
     }
 
     unsafe {
-        libc::tcsetpgrp(libc::STDIN_FILENO, shell.shell_pgid);
+        if libc::isatty(libc::STDIN_FILENO) == 1 {
+            libc::tcsetpgrp(libc::STDIN_FILENO, shell.shell_pgid);
+        }
     }
 
     if let Some(sig) = stopped_sig {

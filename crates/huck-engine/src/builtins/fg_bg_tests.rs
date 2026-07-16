@@ -567,3 +567,39 @@ fn wait_invalid_flag_is_usage_error() {
     );
     assert!(matches!(outcome, ExecOutcome::Continue(2)));
 }
+
+// ---- #167: `set -m` activates job control non-interactively -----------------
+
+#[test]
+fn job_control_active_true_under_monitor_noninteractive() {
+    let mut shell = Shell::new();
+    shell.is_interactive = false;
+    shell.shell_options.monitor = true;
+    assert!(
+        shell.job_control_active(),
+        "set -m must activate job control even when non-interactive"
+    );
+}
+
+#[test]
+fn job_control_active_false_when_neither_interactive_nor_monitor() {
+    let mut shell = Shell::new();
+    shell.is_interactive = false;
+    shell.shell_options.monitor = false;
+    assert!(
+        !shell.job_control_active(),
+        "job control must be inert with neither -i nor -m"
+    );
+}
+
+#[test]
+fn job_control_active_false_under_monitor_inside_subshell() {
+    let mut shell = Shell::new();
+    shell.is_interactive = false;
+    shell.shell_options.monitor = true;
+    shell.in_subshell = true;
+    assert!(
+        !shell.job_control_active(),
+        "set -m job control must stay inert inside a subshell environment"
+    );
+}
