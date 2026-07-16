@@ -442,6 +442,17 @@ pub fn reap_completed(shell: &mut crate::shell_state::Shell) {
     shell
         .sigchld_flag
         .store(false, std::sync::atomic::Ordering::Relaxed);
+    reap_owned_once(shell);
+}
+
+/// One bounded reap pass over this shell's OWN children. Returns true if any
+/// reported a state change (so a polling caller knows whether to sleep).
+///
+/// #183: the single implementation of "reap without `waitpid(-1)`". The `wait`
+/// builtin's poll loops each had their own copy of a `waitpid(-1)` +
+/// sleep-50ms block; they all call this instead, so the no-wildcard rule holds
+/// by construction rather than per-site vigilance.
+pub fn reap_owned_once(shell: &mut crate::shell_state::Shell) -> bool {
     // Snapshot the reap set first: the loop below mutates the job table (and the
     // coproc list) as it reaps. Coproc pids are tracked on the Shell, not the job
     // table, so they are unioned in here.
@@ -450,6 +461,7 @@ pub fn reap_completed(shell: &mut crate::shell_state::Shell) {
     targets.sort_unstable();
     targets.dedup();
 
+    let mut reaped_any = false;
     for pid in targets {
         let mut raw_status: libc::c_int = 0;
         let r = unsafe {
@@ -472,6 +484,7 @@ pub fn reap_completed(shell: &mut crate::shell_state::Shell) {
             }
             continue;
         }
+        reaped_any = true;
         shell.jobs.reap(r, raw_status);
         // If the reaped child is a live coproc that actually exited, close its
         // fds + unset NAME/NAME_PID. A WIFSTOPPED (WUNTRACED) report means the
@@ -484,6 +497,7 @@ pub fn reap_completed(shell: &mut crate::shell_state::Shell) {
             shell.reap_coproc(r);
         }
     }
+    reaped_any
 }
 
 /// Reaps and then prints `[N]<flag> <state> <cmd> &` for any newly-completed
