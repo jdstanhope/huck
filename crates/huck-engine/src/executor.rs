@@ -7640,6 +7640,59 @@ fn reset_job_control_signals_in_child() -> std::io::Result<()> {
 
 // ----- fork subshell helper -------------------------------------------------
 
+/// Install a `ChildStdio` onto fds 0/1/2 inside a just-forked child, overlap-safe.
+///
+/// Returns the ORIGINAL raw source fd numbers (pre-move; `-1` for `Inherit`) so the
+/// caller can exclude this child's own stdio sources when closing parent-held pipe
+/// fds. async-signal-safe: `into_raw()` first (no `OwnedFd` Drop in the child), then
+/// pure `fcntl`/`dup2`/`close`.
+///
+/// # Safety
+/// Must be called only in the child after `fork()`, before any `OwnedFd` could drop.
+unsafe fn install_child_stdio(stdio: ChildStdio) -> [RawFd; 3] {
+    let ChildStdio {
+        stdin,
+        stdout,
+        stderr,
+    } = stdio;
+    let mut plan: [(Option<RawFd>, RawFd); 3] = [
+        (stdin.into_raw(), 0),
+        (stdout.into_raw(), 1),
+        (stderr.into_raw(), 2),
+    ];
+    let original_raws: [RawFd; 3] = [
+        plan[0].0.unwrap_or(-1),
+        plan[1].0.unwrap_or(-1),
+        plan[2].0.unwrap_or(-1),
+    ];
+    // Pass 1 (PRE-MOVE): move any owned source in 0..=2 up to >=3, so pass 2's
+    // dup2 always has source != target (clears FD_CLOEXEC): the moved copy must
+    // survive exec if its install no-ops.
+    for (src, _) in plan.iter_mut() {
+        if let Some(s) = *src
+            && s <= 2
+        {
+            let moved = unsafe { libc::fcntl(s, libc::F_DUPFD, 3) };
+            if moved >= 0 {
+                unsafe { libc::close(s) };
+                *src = Some(moved);
+            }
+        }
+    }
+    // Pass 2 (INSTALL): sources now all >=3 and pairwise distinct (except the
+    // pathological case where a pass-1 F_DUPFD failed and left an owned source at
+    // its own slot — a no-op dup2 we must NOT then close).
+    for (src, slot) in plan {
+        if let Some(s) = src {
+            unsafe { libc::dup2(s, slot) };
+            if s != slot {
+                unsafe { libc::close(s) };
+            }
+        }
+    }
+    original_raws
+}
+
 /// Forks a subshell and runs `cmd` in the child with the supplied stdio
 /// fds dup2'd to 0/1/2. After the body runs, the child `_exit`s with the
 /// resulting status. Returns the child pid in the parent.
@@ -7690,56 +7743,9 @@ pub fn fork_and_run_in_subshell(
             if pgid_target >= 0 {
                 libc::setpgid(0, pgid_target);
             }
-            // 3-5. Install stdio from ChildStdio. Convert to raw NOW so no
-            // OwnedFd destructor can run in the forked child (Drop safety).
-            let ChildStdio {
-                stdin,
-                stdout,
-                stderr,
-            } = stdio;
-            let mut plan: [(Option<RawFd>, RawFd); 3] = [
-                (stdin.into_raw(), 0),
-                (stdout.into_raw(), 1),
-                (stderr.into_raw(), 2),
-            ];
-            let original_raws: [RawFd; 3] = {
-                // fd numbers this child owns as stdio sources, -1 for Inherit.
-                [
-                    plan[0].0.unwrap_or(-1),
-                    plan[1].0.unwrap_or(-1),
-                    plan[2].0.unwrap_or(-1),
-                ]
-            };
-            // Pass 1 (PRE-MOVE): move any owned source in 0..=2 up to >=3, so
-            // pass 2's dup2 always has source != target (clears FD_CLOEXEC ->
-            // the §H2b fix) and installs are order-independent. F_DUPFD (not
-            // _CLOEXEC): the moved copy must survive exec if its install no-ops.
-            for (src, _) in plan.iter_mut() {
-                if let Some(s) = *src
-                    && s <= 2
-                {
-                    let moved = libc::fcntl(s, libc::F_DUPFD, 3);
-                    if moved >= 0 {
-                        libc::close(s);
-                        *src = Some(moved);
-                    }
-                    // On failure keep s: the pass-2 `s != slot` guard below is
-                    // what makes this truly never-worse — a same-slot owned
-                    // source is installed by a no-op dup2 and left open,
-                    // matching the old behavior.
-                }
-            }
-            // Pass 2 (INSTALL): sources now all >=3 and pairwise distinct (except
-            // the pathological case where a pass-1 F_DUPFD failed and left an
-            // owned source at its own slot — a no-op dup2 we must NOT then close).
-            for (src, slot) in plan {
-                if let Some(s) = src {
-                    libc::dup2(s, slot);
-                    if s != slot {
-                        libc::close(s);
-                    }
-                }
-            }
+            // 3-5. Install stdio onto 0/1/2 (overlap-safe). Returns the original
+            // raw source fds for the pass-3 close-exclusion below.
+            let original_raws = install_child_stdio(stdio);
             // Pass 3: close every parent-held pipe fd, skipping this child's own
             // stdio sources by their ORIGINAL numbers.
             for &fd in parent_fds_to_close {
@@ -7861,6 +7867,74 @@ fn spawn_failed_stage(
     Ok(pid)
 }
 
+/// #78: fork a stand-in child for an external stage whose program can't be run.
+/// It installs the stage's stdio + replays the stage's redirect plan (so fd 2
+/// points wherever `2>&1`/`2>file`/the pipe put it), writes the bash-formatted
+/// `diag` to fd 2, and `_exit`s `exit_code` (127 not-found / 126 not-executable).
+/// This mirrors bash's child-side diagnostic and lets the pipeline continue with
+/// a populated PIPESTATUS. `held` (the plan's opened redirect-target fds) is
+/// inherited by the child and dropped in the parent after fork.
+fn spawn_command_error_stage(
+    stdio: ChildStdio,
+    pgid_target: i32,
+    parent_fds_to_close: &[RawFd],
+    replay_ops: Vec<ChildRedirOp>,
+    held: Vec<std::os::fd::OwnedFd>,
+    diag: Vec<u8>,
+    exit_code: i32,
+) -> Result<i32, io::Error> {
+    flush_stdout();
+    // Compute the replay targets BEFORE fork so the child branch is strictly
+    // alloc-free (async-signal-safety hygiene; matches the runnable path).
+    let extra_targets: Vec<RawFd> = replay_ops
+        .iter()
+        .map(|op| match *op {
+            ChildRedirOp::Dup { target, .. } | ChildRedirOp::Close { target } => target,
+        })
+        .collect();
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pid == 0 {
+        unsafe {
+            if pgid_target >= 0 {
+                libc::setpgid(0, pgid_target);
+            }
+            // Install stdio onto 0/1/2 (overlap-safe); returns original sources
+            // for the parent-fd close-exclusion.
+            let original_raws = install_child_stdio(stdio);
+            // Replay the stage's redirects (2>&1 / 2>file / fd>2 / close) in
+            // source order, AFTER stdio install so 2>&1 sees the piped fd 1.
+            let _ = replay_redir_ops(&replay_ops);
+            // Close parent-held pipe fds except our own stdio sources and the
+            // replay targets (extra_targets, computed pre-fork above).
+            for &fd in parent_fds_to_close {
+                if fd != original_raws[0]
+                    && fd != original_raws[1]
+                    && fd != original_raws[2]
+                    && !extra_targets.contains(&fd)
+                {
+                    libc::close(fd);
+                }
+            }
+            // Write the diagnostic to fd 2 (now redirected as the stage asked).
+            if !diag.is_empty() {
+                libc::write(2, diag.as_ptr() as *const libc::c_void, diag.len());
+            }
+            libc::_exit(exit_code);
+        }
+    }
+    // PARENT: the child inherited its own copies of `held`; drop ours.
+    drop(held);
+    if pgid_target >= 0 {
+        unsafe {
+            libc::setpgid(pid, pgid_target);
+        }
+    }
+    Ok(pid)
+}
+
 // ----- stage classification + raw-fd external spawn (Task 4) ---------------
 
 /// Decides whether a pipeline stage should run via `std::process::Command`
@@ -7892,6 +7966,55 @@ fn classify_stage<'a>(cmd: &'a Command, shell: &Shell) -> StageKind<'a> {
         return StageKind::External(simple);
     }
     StageKind::InProcess(cmd)
+}
+
+/// Whether an external pipeline stage's program can be run, and if not, the
+/// bash diagnostic body + exit code (127 not-found, 126 found-but-not-executable).
+#[derive(Debug)]
+enum StageRunnability {
+    Runnable,
+    NotRunnable { body: String, code: i32 },
+}
+
+/// Classify a resolved program string the way bash's command search + `execve`
+/// would, so an unrunnable stage becomes a 126/127 diagnostic child (#78).
+fn classify_stage_runnability(program: &str, shell: &Shell) -> StageRunnability {
+    if program.contains('/') {
+        match std::fs::metadata(program) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => StageRunnability::NotRunnable {
+                body: format!("{program}: No such file or directory"),
+                code: 127,
+            },
+            Err(e) => StageRunnability::NotRunnable {
+                body: format!("{program}: {}", crate::bash_io_error(&e)),
+                code: 126,
+            },
+            Ok(md) if md.is_dir() => StageRunnability::NotRunnable {
+                body: format!("{program}: Is a directory"),
+                code: 126,
+            },
+            Ok(_) => {
+                // Executable bit? Use a real access(X_OK) so the errno text matches libc.
+                let c = std::ffi::CString::new(program).unwrap_or_default();
+                if unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0 {
+                    StageRunnability::Runnable
+                } else {
+                    let e = std::io::Error::last_os_error();
+                    StageRunnability::NotRunnable {
+                        body: format!("{program}: {}", crate::bash_io_error(&e)),
+                        code: 126,
+                    }
+                }
+            }
+        }
+    } else if builtins::search_path_for(program, shell).is_some() {
+        StageRunnability::Runnable
+    } else {
+        StageRunnability::NotRunnable {
+            body: format!("{program}: command not found"),
+            code: 127,
+        }
+    }
 }
 
 /// Spawns an external command with a pre-built `ChildStdio`.
@@ -7937,6 +8060,26 @@ fn spawn_external_with_fds(
     // Resolve (expand) the command — same path as run_exec_single / run_multi_stage.
     let resolved = resolve(exec, shell, &mut *err_writer(err_sink, sink))
         .map_err(|code| io::Error::other(format!("resolve failed with code {code}")))?;
+
+    // #78: if the program can't be run, don't spawn — fork a diagnostic child
+    // that prints `<name>: <reason>` to the stage's own (redirected) fd 2 and
+    // exits 126/127, so the message routes correctly and PIPESTATUS is populated
+    // (matching bash) instead of leaking a raw error and aborting the pipeline.
+    if let StageRunnability::NotRunnable { body, code } =
+        classify_stage_runnability(&resolved.program, shell)
+    {
+        let mut diag: Vec<u8> = Vec::new();
+        crate::emit_error_to(shell, &mut diag, None, format_args!("{body}"));
+        return spawn_command_error_stage(
+            stdio,
+            pgid_target,
+            parent_fds_to_close,
+            plan.ops,
+            plan.held,
+            diag,
+            code,
+        );
+    }
 
     if shell.shell_options.xtrace {
         let p4 = ps4(shell);

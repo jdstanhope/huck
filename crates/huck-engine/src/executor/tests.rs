@@ -2157,3 +2157,77 @@ fn compound_stdout_redirect_writes_to_file() {
     );
     let _ = std::fs::remove_file(&p);
 }
+
+#[test]
+fn classify_runnability_bare_not_found_is_127() {
+    let shell = Shell::new();
+    match classify_stage_runnability("definitely_no_such_cmd_xyz", &shell) {
+        StageRunnability::NotRunnable { body, code } => {
+            assert_eq!(code, 127);
+            assert_eq!(body, "definitely_no_such_cmd_xyz: command not found");
+        }
+        _ => panic!("expected NotRunnable"),
+    }
+}
+
+#[test]
+fn classify_runnability_slash_not_found_is_127_no_such_file() {
+    let shell = Shell::new();
+    match classify_stage_runnability("/no/such/path/xyz", &shell) {
+        StageRunnability::NotRunnable { body, code } => {
+            assert_eq!(code, 127);
+            assert_eq!(body, "/no/such/path/xyz: No such file or directory");
+        }
+        _ => panic!("expected NotRunnable"),
+    }
+}
+
+#[test]
+fn classify_runnability_directory_is_126_is_a_directory() {
+    let shell = Shell::new();
+    match classify_stage_runnability("/etc", &shell) {
+        StageRunnability::NotRunnable { body, code } => {
+            assert_eq!(code, 126);
+            assert_eq!(body, "/etc: Is a directory");
+        }
+        _ => panic!("expected NotRunnable"),
+    }
+}
+
+#[test]
+fn classify_runnability_non_executable_is_126_permission_denied() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    let mut p = std::env::temp_dir();
+    p.push("huck_classify_noexec_test");
+    {
+        let mut f = std::fs::File::create(&p).unwrap();
+        writeln!(f, "#x").unwrap();
+    }
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let shell = Shell::new();
+    let ps = p.to_str().unwrap();
+    match classify_stage_runnability(ps, &shell) {
+        StageRunnability::NotRunnable { body, code } => {
+            assert_eq!(code, 126);
+            assert_eq!(body, format!("{ps}: Permission denied"));
+        }
+        other => panic!("expected NotRunnable, got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn classify_runnability_existing_binary_is_runnable() {
+    let shell = Shell::new();
+    // /bin/sh exists and is executable on the CI target.
+    assert!(matches!(
+        classify_stage_runnability("/bin/sh", &shell),
+        StageRunnability::Runnable
+    ));
+    // and a bare name found on PATH
+    assert!(matches!(
+        classify_stage_runnability("sh", &shell),
+        StageRunnability::Runnable
+    ));
+}
