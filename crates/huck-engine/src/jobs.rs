@@ -206,15 +206,17 @@ impl JobTable {
     /// later `wait $pid` still resolves it (bash retains completed statuses even
     /// after pruning the visible `jobs` entry).
     pub fn remove_notified(&mut self) {
-        let to_record: Vec<(i32, i32)> = self
+        // Clone the to-be-pruned jobs first so we can reuse `record_pruned_job`
+        // (which borrows `self` mutably) without holding an immutable borrow of
+        // `self.jobs` across it; these jobs are about to be dropped anyway.
+        let pruned: Vec<Job> = self
             .jobs
             .iter()
             .filter(|j| !matches!(j.state, JobState::Running | JobState::Stopped(_)) && j.notified)
-            .filter_map(|j| Self::terminal_code(&j.state).map(|code| (j, code)))
-            .flat_map(|(j, code)| j.pids.iter().map(move |&pid| (pid, code)))
+            .cloned()
             .collect();
-        for (pid, code) in to_record {
-            self.record_terminal_status(pid, code);
+        for job in &pruned {
+            self.record_pruned_job(job);
         }
         self.jobs
             .retain(|j| matches!(j.state, JobState::Running | JobState::Stopped(_)) || !j.notified);

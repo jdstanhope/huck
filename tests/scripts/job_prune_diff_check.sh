@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # #175: completed background jobs are pruned non-interactively (matching bash):
 # after wait, after each command, and via `wait $!`; running/stopped kept.
+#
+# NOTE: these cases run under `-c` mode (`bash -c` / `huck -c`) ON PURPOSE.
+# bash has two non-interactive cadences: `-c` prunes completed jobs at the
+# command boundary (huck matches this), but script-file/stdin mode retains a
+# completed job until the first `jobs`/`wait` reports it (a one-time `[1]+ Done`
+# echo, then prune). huck prunes uniformly and does NOT reproduce that one-time
+# echo — a documented by-design divergence (#179, docs/bash-divergences.md).
+# Do NOT convert these cases to script-file mode; they would diverge by design.
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 HUCK=target/debug/huck
