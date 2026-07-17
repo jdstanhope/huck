@@ -1064,15 +1064,10 @@ mod tests {
         assert!(flag.load(Ordering::Relaxed));
     }
 
-    #[test]
-    fn on_stdout_line_pipeline_last_stage() {
-        let mut lines: Vec<String> = Vec::new();
-        let mut e = Engine::new();
-        e.prepare("echo hi | tr a-z A-Z")
-            .on_stdout_line(|line| lines.push(line.to_string()))
-            .capture();
-        assert_eq!(lines, vec!["HI"]);
-    }
+    // NOTE: `on_stdout_line_pipeline_last_stage` moved to
+    // `tests/forking_execution_serial.rs` as
+    // `pipeline_last_stage_dispatches_on_stdout_line` (in-process fork; unsafe
+    // to run concurrently with other tests — issue #184).
 
     // NOTE: `on_stdout_line_merge_stderr_routes_through_stdout` moved to
     // `tests/streaming_fd_serial.rs` (process-global fd swap; races the parallel

@@ -19,15 +19,6 @@ fn invalid_coproc_name_rejected_at_runtime() {
     );
 }
 
-#[test]
-fn valid_coproc_name_still_starts() {
-    // Regression guard: a valid name is unaffected — the coprocess starts and
-    // its record is published (status 0).
-    let mut s = Shell::new();
-    run(&mut s, "coproc MYCO { :; }");
-    assert_eq!(s.last_status(), 0, "valid coproc name → exit status 0");
-    assert_eq!(s.coprocs.len(), 1, "one coproc should be live");
-    assert_eq!(s.coprocs[0].name, "MYCO");
-    // Reap the child to avoid leaking it into other tests.
-    run(&mut s, "wait 2>/dev/null");
-}
+// NOTE: `valid_coproc_name_still_starts` moved to
+// `tests/forking_execution_serial.rs` as `valid_coproc_name_starts_and_publishes`
+// (in-process fork; unsafe to run concurrently with other tests — issue #184).
