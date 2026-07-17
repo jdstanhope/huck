@@ -25,6 +25,7 @@ pub mod engine;
 pub(crate) mod err_thread_local;
 pub mod error_emit;
 pub mod exec_builder;
+pub(crate) mod exec_guard;
 pub(crate) mod executor;
 pub(crate) mod expand;
 pub(crate) mod fd_writer;
