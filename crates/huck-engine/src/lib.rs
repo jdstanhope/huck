@@ -27,6 +27,7 @@ pub mod error_emit;
 pub mod exec_builder;
 pub(crate) mod executor;
 pub(crate) mod expand;
+pub(crate) mod fd_writer;
 pub(crate) mod glob_match;
 #[doc(hidden)]
 pub mod history;
