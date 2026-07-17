@@ -588,8 +588,8 @@ fn builtin_cd_as(
     shell.export_set("PWD", new_pwd.clone());
 
     // 5. `cd -` prints the new directory.
-    if print_new_pwd && let Err(e) = writeln!(out, "{new_pwd}") {
-        crate::sh_error_to!(shell, err, Some(caller), "{}", crate::bash_io_error(&e));
+    if print_new_pwd && writeln!(out, "{new_pwd}").is_err() {
+        // v308: reported once by the run_builtin_with_redirects epilogue.
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -662,8 +662,8 @@ fn builtin_pwd(
 fn builtin_echo(
     args: &[String],
     out: &mut dyn Write,
-    err: &mut dyn Write,
-    shell: &Shell,
+    _err: &mut dyn Write,
+    _shell: &Shell,
 ) -> ExecOutcome {
     let (mut suppress_newline, process_escapes, consumed) = parse_echo_flags(args);
     let joined = args[consumed..].join(" ");
@@ -1150,7 +1150,7 @@ fn format_declare_bare_line(name: &str, var: &crate::shell_state::Variable) -> S
 /// Lists every EXPORTED variable, sorted by name, as bash's
 /// `declare -x NAME="value"` (reuses `format_declare_line` for attr order +
 /// value quoting). Used by bare `export` / `export -p`.
-fn list_exported(out: &mut dyn Write, err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
+fn list_exported(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     let mut entries: Vec<(&String, &crate::shell_state::Variable)> =
         shell.iter_vars().filter(|(_, v)| v.exported).collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
@@ -1382,7 +1382,7 @@ fn builtin_export_decl(
         if saw_a && !saw_p {
             return ExecOutcome::Continue(0);
         }
-        return list_exported(out, err, shell);
+        return list_exported(out, shell);
     }
 
     let mut any_error = false;
