@@ -652,7 +652,13 @@ fn builtin_pwd(
     };
 
     if let Err(e) = writeln!(out, "{path}") {
-        crate::sh_error_to!(shell, err, None, "pwd: {}", crate::bash_io_error(&e));
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "pwd: write error: {}",
+            crate::bash_io_error(&e)
+        );
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -677,11 +683,23 @@ fn builtin_echo(
     };
 
     if let Err(e) = out.write_all(&bytes) {
-        crate::sh_error_to!(shell, err, None, "echo: {}", crate::bash_io_error(&e));
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "echo: write error: {}",
+            crate::bash_io_error(&e)
+        );
         return ExecOutcome::Continue(1);
     }
     if !suppress_newline && let Err(e) = out.write_all(b"\n") {
-        crate::sh_error_to!(shell, err, None, "echo: {}", crate::bash_io_error(&e));
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "echo: write error: {}",
+            crate::bash_io_error(&e)
+        );
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -1156,7 +1174,13 @@ fn list_exported(out: &mut dyn Write, err: &mut dyn Write, shell: &Shell) -> Exe
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (name, var) in entries {
         if let Err(e) = writeln!(out, "{}", format_declare_line(name, var)) {
-            crate::sh_error_to!(shell, err, None, "export: {}", crate::bash_io_error(&e));
+            crate::sh_error_to!(
+                shell,
+                err,
+                None,
+                "export: write error: {}",
+                crate::bash_io_error(&e)
+            );
             return ExecOutcome::Continue(1);
         }
     }
@@ -1822,7 +1846,13 @@ fn builtin_readonly_decl(
                 }
             };
             if let Err(e) = writeln!(out, "{line}") {
-                crate::sh_error_to!(shell, err, None, "readonly: {}", crate::bash_io_error(&e));
+                crate::sh_error_to!(
+                    shell,
+                    err,
+                    None,
+                    "readonly: write error: {}",
+                    crate::bash_io_error(&e)
+                );
                 return ExecOutcome::Continue(1);
             }
         }
@@ -4141,7 +4171,13 @@ fn builtin_printf(
             return ExecOutcome::Continue(1);
         }
     } else if let Err(e) = out.write_all(&buf) {
-        crate::sh_error_to!(shell, err, None, "printf: {e}");
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "printf: write error: {}",
+            crate::bash_io_error(&e)
+        );
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(exit)
@@ -4281,7 +4317,13 @@ fn builtin_jobs(
             writeln!(out, "{}", crate::jobs::notification_line(job, flag))
         };
         if let Err(e) = write_result {
-            crate::sh_error_to!(shell, err, None, "jobs: {}", crate::bash_io_error(&e));
+            crate::sh_error_to!(
+                shell,
+                err,
+                None,
+                "jobs: write error: {}",
+                crate::bash_io_error(&e)
+            );
             return ExecOutcome::Continue(1);
         }
         printed_ids.push(job.id);

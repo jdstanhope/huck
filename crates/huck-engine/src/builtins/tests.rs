@@ -1,4 +1,28 @@
 use super::*;
+use std::io::{self, Write};
+
+struct WriteError;
+
+impl Write for WriteError {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::ENOSPC))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn assert_write_error(outcome: ExecOutcome, err: &[u8], builtin: &str) {
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    assert!(
+        std::str::from_utf8(err).unwrap().ends_with(&format!(
+            "{builtin}: write error: No space left on device\n"
+        )),
+        "stderr: {}",
+        std::str::from_utf8(err).unwrap()
+    );
+}
 
 #[test]
 fn declare_scalar_quote_matches_bash_listing() {
@@ -291,6 +315,32 @@ fn exit_masks_exact_256_to_zero() {
         builtin_exit(&["256".to_string()], &mut std::io::stderr(), &shell),
         ExecOutcome::Exit(0)
     ));
+}
+
+#[test]
+fn builtins_report_consistent_write_errors() {
+    let mut shell = Shell::new();
+
+    let mut err = Vec::new();
+    assert_write_error(
+        builtin_pwd(&[], &mut WriteError, &mut err, &mut shell),
+        &err,
+        "pwd",
+    );
+
+    let mut err = Vec::new();
+    assert_write_error(
+        builtin_echo(&["x".to_string()], &mut WriteError, &mut err, &shell),
+        &err,
+        "echo",
+    );
+
+    let mut err = Vec::new();
+    assert_write_error(
+        builtin_printf(&["x".to_string()], &mut WriteError, &mut err, &mut shell),
+        &err,
+        "printf",
+    );
 }
 
 #[test]
