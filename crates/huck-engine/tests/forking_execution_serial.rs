@@ -107,24 +107,37 @@ fn background_chain_registers_one_job() {
 }
 
 /// executor::coproc_name_tests::valid_coproc_name_still_starts — a valid coproc
-/// name starts the coprocess (status 0) and publishes NAME_PID.
+/// name starts the coprocess (status 0) and publishes NAME_PID. Maps
+/// `last_status()==0` + `coprocs[0].name=="MYCO"` from the original lib test
+/// to the public `$?`/`$MYCO_PID`. The coproc body is `read _` (not `:`) so
+/// it blocks and stays alive — a `:` body exits instantly and huck auto-reaps
+/// a finished coproc at the next command boundary (v306 / #185), which raced
+/// against the `$MYCO_PID` read; `$?`/`$MYCO_PID` are captured into variables
+/// synchronously right after `coproc` to inspect state before any reap.
 fn valid_coproc_name_starts_and_publishes() {
     let mut e = Engine::new();
-    let out = e.capture("coproc MYCO { :; }; echo rc=$?; echo pid=$MYCO_PID; wait 2>/dev/null");
-    assert!(
-        out.stdout.contains("rc=0"),
+    let out = e.capture(
+        "coproc MYCO { read _; }; rc=$?; pid=$MYCO_PID; echo \"rc=$rc pid=$pid\"; kill \"$pid\" 2>/dev/null; wait 2>/dev/null",
+    );
+    let line = out
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("rc="))
+        .unwrap_or("rc= pid=");
+    let rc: i64 = line
+        .strip_prefix("rc=")
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(-1);
+    assert_eq!(
+        rc, 0,
         "coproc should start, status 0; stdout: {:?}",
         out.stdout
     );
-    let pid_line = out
-        .stdout
-        .lines()
-        .find(|l| l.starts_with("pid="))
-        .unwrap_or("pid=");
-    let pid: i64 = pid_line
-        .trim_start_matches("pid=")
-        .trim()
-        .parse()
+    let pid: i64 = line
+        .split("pid=")
+        .nth(1)
+        .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
     assert!(
         pid > 0,
