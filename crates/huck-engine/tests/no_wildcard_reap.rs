@@ -15,17 +15,28 @@
 //! infinite hang in `stream_loop`'s poll loop, which has no `-1` case and spins
 //! forever once its child is gone.
 //!
-//! In its own binary (own process) so a concurrent test cannot perturb the
-//! embedder-child bookkeeping this asserts on.
+//! The second scenario here (`sleep 0 & sleep 0.3; jobs | wc -l`) runs `jobs`
+//! as a non-last pipeline stage, which forks in-process (huck runs pipeline
+//! stages and background jobs by forking WITHOUT exec — memory-safe only in a
+//! single-threaded process). A concurrent sibling `#[test]` executing at the
+//! same instant trips the exec_guard panic (issue #184). So both scenarios run
+//! sequentially as ONE `#[test]`, the sole test in this binary — a separate
+//! binary alone does NOT prevent its own two tests from running concurrently
+//! under libtest, only running them sequentially does.
 
 use huck_engine::Engine;
 use std::process::Command;
 use std::time::Duration;
 
+#[test]
+fn no_wildcard_reap_scenarios() {
+    engine_does_not_reap_the_embedders_child();
+    engine_still_reaps_its_own_background_children();
+}
+
 /// Spawn an embedder-owned child, let it exit so it is sitting reapable, run a
 /// non-interactive script through the engine, then require that WE can still
 /// reap our own child and observe its exit status.
-#[test]
 fn engine_does_not_reap_the_embedders_child() {
     let mut child = Command::new("/bin/sh")
         .arg("-c")
@@ -57,7 +68,6 @@ fn engine_does_not_reap_the_embedders_child() {
 
 /// The engine must still reap its OWN background children — the bounded reap
 /// must not regress #175's pruning into a zombie leak.
-#[test]
 fn engine_still_reaps_its_own_background_children() {
     let mut e = Engine::new();
     // Background job completes, then a later command boundary prunes it.
