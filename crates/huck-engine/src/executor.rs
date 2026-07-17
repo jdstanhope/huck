@@ -1563,15 +1563,21 @@ fn run_builtin_with_redirects(
     let _ = io::stdout().flush();
     let _ = std::io::Write::flush(&mut std::io::stderr());
     // The SINGLE reporter for every builtin write failure. `FdWriter` recorded
-    // the first errno, which matters because 84 of the ~98 builtin write
-    // sites in this file discard their own `Result` (`let _ = writeln!(out,
-    // …)`) — only 14 check it (cd 591, pwd 654, echo 680/684, export 1158,
-    // export -f 1170/1171, readonly 1824, printf 4143, jobs 4271/4275/4282,
-    // history 5535/5559) — so a per-builtin check could never cover
-    // `declare -p x >&3` and friends. The 14 that check keep their early
-    // return, but none of them still emits its own diagnostic; this epilogue
-    // is the only place a write error is worded, which is what keeps #190
-    // fixed.
+    // the first errno, and that recording is what makes this work: the great
+    // majority of builtin write sites in builtins.rs discard their own `Result`
+    // (`let _ = writeln!(out, …)`), so a per-builtin check could never cover
+    // `declare -p x >&3` and friends — nor would it survive the next builtin
+    // someone adds. A discarded `Result` no longer means a discarded error.
+    //
+    // The handful of sites that DO check keep their early return (stop writing
+    // once the fd is broken) but emit nothing: this is the only place a write
+    // error is worded, which is what keeps #190 fixed. Adding an emit at one of
+    // those sites would double-report — `cd` and `export -f` both did, and both
+    // were caught only by running them against bash.
+    //
+    // (No exact site count here on purpose: it depends on what you call a site
+    // — the count in this comment has already been wrong twice, and the
+    // argument does not need a number.)
     let outcome = match fd1_writer.first_error() {
         Some(e) => {
             {
