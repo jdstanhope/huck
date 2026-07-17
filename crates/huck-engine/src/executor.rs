@@ -1139,10 +1139,10 @@ fn has_any_redirect(cmd: &ExecCommand) -> bool {
 /// forcing a `Terminal` inner sink so the redirect wins over an outer capture.
 /// Any output File, a Dup (`>&N`), a Move (`>&N-`), OR a Close (`>&-`) on fd 1
 /// qualifies: in all cases the command's real fd 1 is redirected (to a file,
-/// another fd, or closed), so an in-process builtin must write through
-/// `io::stdout()` (= fd 1 =
-/// the redirect target) rather than into the capture buffer — otherwise `>&-`'s
-/// discard / `>&N`'s dup would be silently ignored by the buffer. A stdin-only
+/// another fd, or closed), so an in-process builtin must write to real fd 1
+/// via `FdWriter` (unbuffered; = the redirect target) rather than into the
+/// capture buffer — otherwise `>&-`'s discard / `>&N`'s dup would be silently
+/// ignored by the buffer. A stdin-only
 /// redirect does not force Terminal. `RedirFd::Var` (target_fd None) is ignored.
 fn redirs_write_stdout(redirs: &[Redirection]) -> bool {
     redirs.iter().any(|r| {
@@ -1269,10 +1269,11 @@ where
     // If a stdout redirect (`>`/`>>`/`>&`/`&>`) is present, fd 1 now points at
     // the redirect target. In capture mode (`$(...)`) the outer `sink` would
     // otherwise steer the inner command's stdout into the capture buf/pipe,
-    // ignoring the redirect entirely. Force `Terminal` so builtins write via
-    // `io::stdout()` (= fd 1 = the target) and externals inherit the redirected
-    // fd 1 — the capture then correctly receives nothing for the diverted
-    // stream. This is a no-op when the outer sink is already `Terminal`. A
+    // ignoring the redirect entirely. Force `Terminal` so builtins write to
+    // real fd 1 via `FdWriter` (unbuffered; = the target) and externals
+    // inherit the redirected fd 1 — the capture then correctly receives
+    // nothing for the diverted stream. This is a no-op when the outer sink
+    // is already `Terminal`. A
     // compound with only a stdin/stderr redirect keeps the outer sink so its
     // stdout is still captured.
     let mut terminal_sink = StdoutSink::Terminal;
@@ -1313,10 +1314,11 @@ where
 /// partially-applied redirects).
 ///
 /// Sink handling mirrors `with_redirect_scope`: when any redirect writes to
-/// stdout (fd 1), force a `Terminal` sink so the builtin writes through
-/// `io::stdout()` (= fd 1 = the redirect target) and an outer capture correctly
-/// receives nothing for the diverted stream. Otherwise the enclosing `sink` is
-/// kept, so `r=$(builtin)` still captures the builtin's stdout into the buffer.
+/// stdout (fd 1), force a `Terminal` sink so the builtin writes to real fd 1
+/// via `FdWriter` (unbuffered; = the redirect target) and an outer capture
+/// correctly receives nothing for the diverted stream. Otherwise the
+/// enclosing `sink` is kept, so `r=$(builtin)` still captures the builtin's
+/// stdout into the buffer.
 ///
 /// **In-memory `>&2` / `2>&1` routing (v205):** A `>&2` (fd 1 → fd 2) under a
 /// `StderrSink::Capture` or `StderrSink::Merged` sink — and the symmetric
@@ -1339,6 +1341,13 @@ fn run_builtin_with_redirects(
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     let procsub_base = shell.procsub_pending.len();
+    // Flush buffered terminal/builtin output BEFORE applying the real-fd
+    // redirect scope below, for two reasons. (1) Prior output must not be
+    // diverted into the redirect target. (2) The builtin's own stdout goes
+    // straight to real fd 1 via `FdWriter` (unbuffered) further down in this
+    // function, so anything still sitting in `io::stdout()`'s buffer would be
+    // overtaken by those raw writes and surface out of order. Emptying the
+    // buffer here is what keeps the two writers in step.
     let _ = io::stdout().flush();
 
     // Detect in-memory dup re-routing BEFORE applying the real-fd scope.
@@ -1554,11 +1563,15 @@ fn run_builtin_with_redirects(
     let _ = io::stdout().flush();
     let _ = std::io::Write::flush(&mut std::io::stderr());
     // The SINGLE reporter for every builtin write failure. `FdWriter` recorded
-    // the first errno, which matters because ~82 builtin write sites discard
-    // their own `Result` (`let _ = writeln!(out, …)`) — only 8 check it — so a
-    // per-builtin check could never cover `declare -p x >&3` and friends. The 8
-    // that check keep their early return but no longer emit; this is the only
-    // place a write error is worded, which is what keeps #190 fixed.
+    // the first errno, which matters because 84 of the ~98 builtin write
+    // sites in this file discard their own `Result` (`let _ = writeln!(out,
+    // …)`) — only 14 check it (cd 591, pwd 654, echo 680/684, export 1158,
+    // export -f 1170/1171, readonly 1824, printf 4143, jobs 4271/4275/4282,
+    // history 5535/5559) — so a per-builtin check could never cover
+    // `declare -p x >&3` and friends. The 14 that check keep their early
+    // return, but none of them still emits its own diagnostic; this epilogue
+    // is the only place a write error is worded, which is what keeps #190
+    // fixed.
     let outcome = match fd1_writer.first_error() {
         Some(e) => {
             {

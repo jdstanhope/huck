@@ -119,7 +119,13 @@ fn zero_byte_output_is_silent_and_succeeds() {
 /// A writable fd must not be reported (guards against false positives).
 #[test]
 fn writable_fd_is_not_reported() {
-    let (_, err, rc) = run("exec 3<>/tmp/huck-v308-rw.txt; echo x >&3");
+    // PID-unique path + cleanup: a fixed `/tmp` path left behind by a prior
+    // run (possibly owned by a different UID on a shared `/tmp`) makes
+    // `exec 3<>` fail with EACCES, which fails this test for a reason
+    // unrelated to the thing it's testing.
+    let path = format!("/tmp/huck-v308-rw.{}.txt", std::process::id());
+    let (_, err, rc) = run(&format!("exec 3<>{path}; echo x >&3"));
+    let _ = std::fs::remove_file(&path);
     assert!(!err.contains("write error"), "stderr was: {err:?}");
     assert_eq!(rc, 0);
 }
