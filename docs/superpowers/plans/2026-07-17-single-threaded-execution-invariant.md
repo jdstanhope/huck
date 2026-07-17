@@ -556,7 +556,7 @@ EOF
 - [ ] `cargo fmt --all --check` — clean.
 - [ ] `cargo build -p huck --locked` and `cargo build --release -p huck --locked`.
 - [ ] `cargo test -p huck-syntax --jobs 1 --lib -- --test-threads 1` and `cargo test -p huck-engine --jobs 1 --lib -- --test-threads 1`.
-- [ ] `cargo test -p huck-engine --test subshell_capture --jobs 1 -- --test-threads 1` — passes.
+- [ ] `cargo test -p huck-engine --test forking_execution_serial --jobs 1 -- --test-threads 1` — passes.
 - [ ] **The repro gate**: the frozen lib binary at `--test-threads 4`, 8× alone, all `OK` (0 wedge, 0 panic). This is the #184 fix, proven.
 - [ ] Every `-p huck` integration binary, each single-threaded with a `ulimit -v` guard (behavior unchanged, but confirm no fallout).
 - [ ] `tests/scripts/run_diff_checks.sh` on both binaries — green (this is test-harness + a guard on a cold path; no shell behavior changes, so no diff expected).
