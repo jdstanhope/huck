@@ -159,7 +159,10 @@ fn dollar_bang_set_after_backgrounded_pure_builtin() {
     // ran echo synchronously in the parent without forking; last_bg_pid
     // stayed unset/stale. Post-fix: echo runs in a forked subshell and $!
     // returns that pid.
-    let (out, _) = run("echo hi &\necho \"[$!]\"\nwait\nexit\n");
+    // #200: redirect the backgrounded command's stdout so its `hi` cannot race
+    // and interleave onto the foreground `[$!]` line (deterministic; the `hi`
+    // output is incidental to what this test asserts).
+    let (out, _) = run("echo hi >/dev/null &\necho \"[$!]\"\nwait\nexit\n");
     let bracketed = out
         .lines()
         .find(|l| l.starts_with('[') && l.ends_with(']') && l.len() > 2)
