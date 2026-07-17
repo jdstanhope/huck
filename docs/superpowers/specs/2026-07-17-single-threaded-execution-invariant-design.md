@@ -31,11 +31,15 @@ one with the identical signature — `subshell_stderr_is_captured` plus three
 `expand::tests::glob_*` victims blocked behind the shared `CWD_LOCK` the stuck
 forker never released.
 
-The three production in-process fork sites are all reached through
-`fork_and_run_in_subshell` (`executor.rs:7919`) and the two sibling forks at
-`executor.rs:8042` and `:8104`. The two other `libc::fork()` sites
-(`wait_loop.rs:372`, `stream_loop.rs:337`) are test-only and the child calls
-`libc::_exit` immediately — async-signal-safe, not a hazard.
+There is exactly **one** production fork whose child runs shell code in-process:
+`fork_and_run_in_subshell` (`executor.rs:7919`), whose child dives into
+`run_command`. The two other production `libc::fork()` sites —
+`spawn_failed_stage` (`executor.rs:8042`) and `spawn_command_error_stage`
+(`executor.rs:8104`) — are async-signal-safe: their children do only
+`dup2`/`close`/`libc::write` then `libc::_exit`, alloc-free, so they cannot
+deadlock on an inherited lock and need **no** guard. The two remaining
+`libc::fork()` sites (`wait_loop.rs:372`, `stream_loop.rs:337`) are test-only and
+also `_exit` immediately. So the guard check has a single home.
 
 ## Why the obvious fixes are wrong
 
@@ -68,17 +72,25 @@ static GLOBAL_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 thread_local! { static LOCAL_DEPTH: Cell<usize> = const { Cell::new(0) }; }
 ```
 
-- **RAII guard** around the shared top-level execution core,
-  `shell.rs::run_program_in_sinks` (verified: `engine.rs::run_with_label` at
-  `engine.rs:229` and the `ExecBuilder` path at `exec_builder.rs:495` both call
-  it, and it is the single "run a whole program string" driver): on construction
-  `GLOBAL_ACTIVE.fetch_add(1)` and `LOCAL_DEPTH += 1`; on drop the reverse.
-  `eval` and `source` re-enter *below* this level (`process_line_in_sinks`, or a
-  recursive `run_program_in_sinks` for a sourced file) on the same thread; either
-  way both counters move together, so `GLOBAL == LOCAL` is preserved — handled
-  correctly by the check below.
-- **Fork-site check**, immediately before each in-process `libc::fork()` (the
-  three sites reached via `fork_and_run_in_subshell` and the two siblings):
+- **RAII guard** around the universal executor entry,
+  `executor::execute_with_sink` (`executor.rs:231`). This is the one function
+  *every* execution path funnels through: the public API
+  (`run_program_in_sinks` → `run_sourced_contents_in_sinks` → per-line
+  `process_line_in_sinks` → `execute_with_sink`) **and** the lib unit tests, which
+  call `execute_with_sink` directly. Guarding here — rather than at the public
+  entry — is what lets the guard see the lib tests and so drive Part 2. On
+  construction `GLOBAL_ACTIVE.fetch_add(1)` and `LOCAL_DEPTH += 1`; on drop the
+  reverse. The function is re-entrant (nested constructs, `eval`/`source`
+  per-line, function bodies), but every re-entry bumps *both* counters on the
+  *same* thread, so `GLOBAL == LOCAL` is preserved for a single thread regardless
+  of nesting depth — handled correctly by the check below. (The subshell child
+  runs its body via `run_command`, not `execute_with_sink`, so it does not
+  re-bump; it does not need to — the parent's frame is what is active at the
+  fork.)
+- **Fork-site check**, immediately before the in-process `libc::fork()` in
+  `fork_and_run_in_subshell` (`executor.rs:7932`) — the sole fork whose child
+  runs shell code. The two `spawn_*_stage` forks are async-signal-safe
+  (`write`+`_exit`) and are deliberately *not* checked:
 
 ```rust
 if GLOBAL_ACTIVE.load(Ordering::SeqCst) > LOCAL_DEPTH.with(|d| d.get()) {
@@ -91,11 +103,21 @@ if GLOBAL_ACTIVE.load(Ordering::SeqCst) > LOCAL_DEPTH.with(|d| d.get()) {
 ```
 
 **Why `GLOBAL > LOCAL` is the exact condition:** `LOCAL_DEPTH` counts this
-thread's active top-level executions (≥1 at a fork, more under `eval`/`source`
-nesting). `GLOBAL_ACTIVE` counts all threads'. They are equal iff this thread is
-the only one executing — including all same-thread re-entrancy. `GLOBAL > LOCAL`
-means some *other* thread is mid-execution, which is precisely the multithreaded-
-fork hazard.
+thread's active `execute_with_sink` frames (≥1 at a fork, more under nesting).
+`GLOBAL_ACTIVE` counts all threads'. They are equal iff this thread is the only
+one executing — including all same-thread re-entrancy. `GLOBAL > LOCAL` means some
+*other* thread is mid-execution, which is exactly "another shell is executing
+concurrently on another thread" — the condition the user asked to detect.
+
+**What it detects, precisely.** The guard fires when an in-process subshell fork
+coincides with *another thread executing shell code*. That is the user's target
+("two shells at once in different threads") and it is what makes concurrent
+multi-`Engine` misuse panic instead of deadlock. It is deliberately *not* a proof
+that no other thread holds a lock: a fork racing a thread that is allocating
+*outside* `execute_with_sink` would not be counted. That residual does not matter
+here, because after Part 2 the lib suite contains no in-process fork at all, and
+a production embedder's concurrent engines are, by definition, both executing. So
+the guard is exact for the condition that matters and honest about its edge.
 
 **Properties:**
 - *Production-silent*: a lone engine is always `GLOBAL == LOCAL == 1` at its
@@ -121,10 +143,13 @@ and the spec says so rather than implying broader safety.
 
 ### Part 2 — isolate the forking tests (guard-driven)
 
-With Part 1 in place, run the lib binary at `--test-threads 4`. Every test that
-forks an in-process subshell while another thread executes now **panics with the
-#184 message** instead of deadlocking, naming itself. That panic list — not a
-grep guess — is the authoritative set of tests to move.
+With Part 1 in place, run the lib binary at `--test-threads 4` a handful of
+times. A test that forks an in-process subshell while another thread is executing
+now **panics with the #184 message**, naming itself — the fast, common case. If
+in some run the fork happens to coincide with a *non-executing* thread's
+allocation, that run still hangs with the old signature, whose "still running"
+list also names the forker. Either way the offender is named, not grep-guessed;
+run until a clean pass yields no new name.
 
 Each named test moves into a dedicated integration binary,
 `crates/huck-engine/tests/subshell_capture.rs`, rewritten against the **public**
