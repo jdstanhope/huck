@@ -80,7 +80,7 @@ mod tests {
     // NOTE: a "no panic when lone" assertion is NOT reliable in this
     // multithreaded lib binary — a concurrent test's `ExecActive` inflates
     // `GLOBAL_ACTIVE`. That direction is verified in the single-threaded
-    // integration binary (`tests/subshell_capture.rs`), where a real subshell
+    // integration binary (`tests/forking_execution_serial.rs`), where a real subshell
     // forks without panicking. Here we test only the PANIC direction, which is
     // robust: forcing another thread to hold an `ExecActive` guarantees
     // `GLOBAL_ACTIVE > LOCAL_DEPTH` no matter what else runs.
