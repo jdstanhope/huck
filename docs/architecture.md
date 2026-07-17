@@ -320,9 +320,17 @@ it **panics** (citing #184) rather than let the forked child deadlock on an
 inherited lock. A lone engine never trips it.
 
 Consequences: running two `Engine`s concurrently on different threads is
-unsupported and will panic at the first subshell fork. Tests that fork an
-in-process subshell must run single-threaded — see
-`crates/huck-engine/tests/forking_execution_serial.rs`. The guard covers only the
+unsupported and will panic at the first subshell fork. **Any test binary that
+drives the in-process `Engine` API AND runs anything that forks in-process (a
+`( … )` subshell, a `&` background job, a `coproc`, or a builtin as a non-last
+pipeline stage) must expose ONE `#[test]` whose scenarios run sequentially** —
+libtest runs multiple `#[test]`s on parallel threads, so a second `#[test]`
+executing while the first forks trips the guard (this is #184 in miniature; a
+*separate binary* alone does NOT help — its own two tests still race). See
+`crates/huck-engine/tests/forking_execution_serial.rs`,
+`foreground_wait_latency.rs`, `no_wildcard_reap.rs`. **When verifying such a
+binary locally, run it at `--test-threads 2` or more — `--test-threads 1` hides
+the guard because nothing runs concurrently.** The guard covers only the
 fork/deadlock hazard; the cwd, signal/job-control, and fd-table state are also
 process-global and would need per-engine virtualization for true multi-engine
 support (out of scope; declined in the #184 design).
