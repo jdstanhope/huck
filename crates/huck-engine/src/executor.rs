@@ -114,6 +114,13 @@ pub(crate) fn err_writer<'a>(
             stream: LineStream::Stderr,
         }),
         StderrSink::Merged => match out_sink {
+            // v308: builtin DIAGNOSTICS still go through `io::stdout()` while a
+            // builtin's stdout now reaches the same fd 1 raw, via `FdWriter`.
+            // Order holds only because every `sh_error_to!` diagnostic ends in a
+            // newline, so this `LineWriter` flushes each one before the next raw
+            // write. An unterminated diagnostic written here WOULD sit in the
+            // buffer and be overtaken. Deliberate: bash cannot report a failed
+            // diagnostic either, so this path stays on the swallowing sink.
             StdoutSink::Terminal => Box::new(std::io::stdout()),
             StdoutSink::Capture(buf) => Box::new(LineDispatchWriter {
                 inner: buf,
@@ -1548,8 +1555,8 @@ fn run_builtin_with_redirects(
     let _ = std::io::Write::flush(&mut std::io::stderr());
     // The SINGLE reporter for every builtin write failure. `FdWriter` recorded
     // the first errno, which matters because ~82 builtin write sites discard
-    // their own `Result` (`let _ = writeln!(out, …)`) — only 6 check it — so a
-    // per-builtin check could never cover `declare -p x >&3` and friends. The 6
+    // their own `Result` (`let _ = writeln!(out, …)`) — only 8 check it — so a
+    // per-builtin check could never cover `declare -p x >&3` and friends. The 8
     // that check keep their early return but no longer emit; this is the only
     // place a write error is worded, which is what keeps #190 fixed.
     let outcome = match fd1_writer.first_error() {
