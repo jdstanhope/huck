@@ -669,8 +669,9 @@ pub struct Shell {
     /// Wrapped in `Rc` for copy-on-write: `clone()` (used for every
     /// `$(…)` subshell isolation) is O(1) — just a refcount bump. A
     /// write (`define_function`/`remove_function`) calls `Rc::make_mut`,
-    /// which copies the map only when the `Rc` is shared. huck is
-    /// single-threaded so `Rc` (not `Arc`) is correct here.
+    /// which copies the map only when the `Rc` is shared. `Rc` (not
+    /// `Arc`) is correct here because of the single-threaded execution
+    /// invariant — enforced by exec_guard; see docs/architecture.md.
     pub functions: Rc<HashMap<String, Box<crate::command::Command>>>,
     /// Names of functions marked `export -f`. Parallel to `functions` (no attribute
     /// slot). Re-defining a function keeps its export mark.
