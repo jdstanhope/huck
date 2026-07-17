@@ -77,7 +77,7 @@ check 'ro-cd'           "$RO"' cd /tmp >&3'
 # reports only its own error — no write error.
 check 'ro-declare-nope' "$RO"' declare -p NOPE >&3'
 # Control: an O_RDWR fd is writable — no error, no false positive.
-check 'rw-ok'           'exec 3<>/tmp/huck-v308-rw.txt; echo x >&3'
+check 'rw-ok'           'exec 3<>/tmp/huck-v308-rw.txt; echo x >&3; rm -f /tmp/huck-v308-rw.txt'
 
 # --- v308 #190: ENOSPC via /dev/full. The wording must NOT depend on a trailing
 # newline (before v308 the newline chose the reporter and the two disagreed —
@@ -93,6 +93,12 @@ check_stdout 'leak-echo'      'echo x > /dev/full'
 check_stdout 'leak-echo-n'    'echo -n x > /dev/full'
 check_stdout 'leak-printf'    'printf "x" > /dev/full'
 check_stdout 'leak-declare'   'x=1; declare -p x > /dev/full'
+# Unlike the four above, this one is a CONTROL, not a #191 regression gate: it
+# passed even before v308. EBADF never leaked — Rust's handle_ebadf discards the
+# payload while reporting success — whereas ENOSPC left the bytes in the
+# LineWriter buffer to surface later. Kept so a future leak on the
+# redirect-via-dup path would still be caught; do not read its passing as
+# evidence the leak fix works (the four /dev/full cases are that evidence).
 check_stdout 'leak-ro-echo'   'exec 3</etc/hostname; echo x >&3'
 
 if [ $FAIL -ne 0 ]; then echo "builtin_write_error_diff_check FAILED" >&2; exit 1; fi
