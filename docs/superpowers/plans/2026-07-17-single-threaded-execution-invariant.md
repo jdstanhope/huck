@@ -33,7 +33,7 @@
 | `crates/huck-engine/src/lib.rs` | Register the module. |
 | `crates/huck-engine/src/executor.rs` | Hold an `ExecActive` across `execute_with_sink`; call the check before the fork in `fork_and_run_in_subshell`; replace the on-faith comment. |
 | `crates/huck-engine/src/executor/tests.rs` | Remove the relocated forking test(s). |
-| `crates/huck-engine/tests/subshell_capture.rs` | **New.** The relocated subshell capture checks, via the public `Engine` API, as ONE single-threaded `#[test]`. |
+| `crates/huck-engine/tests/forking_execution_serial.rs` | **New.** The relocated subshell capture checks, via the public `Engine` API, as ONE single-threaded `#[test]`. |
 | `docs/architecture.md` | A short "Single-threaded execution" section. |
 
 ---
@@ -137,7 +137,7 @@ mod tests {
     // NOTE: a "no panic when lone" assertion is NOT reliable in this
     // multithreaded lib binary — a concurrent test's `ExecActive` inflates
     // `GLOBAL_ACTIVE`. That direction is verified in the single-threaded
-    // integration binary (`tests/subshell_capture.rs`), where a real subshell
+    // integration binary (`tests/forking_execution_serial.rs`), where a real subshell
     // forks without panicking. Here we test only the PANIC direction, which is
     // robust: forcing another thread to hold an `ExecActive` guarantees
     // `GLOBAL_ACTIVE > LOCAL_DEPTH` no matter what else runs.
@@ -304,59 +304,66 @@ EOF
 
 ---
 
-### Task 3: relocate the forking test(s), guard-driven
+### Task 3: relocate the 7 forking tests to a single-threaded binary, via behavioral proxies
+
+The guard (Task 2) flagged **7** in-process-forking lib tests, not one. All 7 move to a single-threaded integration binary; the ones asserting internal state are rewritten as public-API behavioral proxies (user-approved). The binary is named `forking_execution_serial.rs` (it covers subshells, background jobs, coproc, and pipeline stages — not just subshell capture).
+
+**The 7 tests and their homes:**
+| test | current file | assertion → behavioral proxy |
+|---|---|---|
+| `subshell_stderr_is_captured` | `executor/tests.rs` | subshell stdout/stderr captured separately (direct) |
+| `on_stdout_line_pipeline_last_stage` | `engine.rs` | on_stdout_line callback fires for last stage (already public — move verbatim) |
+| `fork_and_run_in_subshell_echo_stage_writes_to_pipe` | `executor/tests.rs` | raw fork writes to a pipe → in-process subshell pipeline stage writes through the pipe |
+| `background_pure_builtin_does_not_mutate_parent_env` | `executor/tests.rs` | `Shell.get` is None → `& wait; echo [${X-unset}]` is `[unset]` |
+| `background_pure_builtin_forks_and_registers_job` | `executor/tests.rs` | `last_bg_pid > 0` → `$! -gt 0` |
+| `execute_bg_chain_registers_job` | `executor/tests.rs` | `shell.jobs.count()==1` → `jobs` shows one `[…]` line |
+| `valid_coproc_name_still_starts` | `executor/coproc_name_tests.rs` | `last_status()==0`, `coprocs[0].name=="MYCO"` → `$?==0`, `$MYCO_PID > 0` |
 
 **Files:**
-- Create: `crates/huck-engine/tests/subshell_capture.rs`
-- Modify: `crates/huck-engine/src/executor/tests.rs` (remove the relocated test)
+- Create: `crates/huck-engine/tests/forking_execution_serial.rs`
+- Modify: `crates/huck-engine/src/executor/tests.rs`, `crates/huck-engine/src/executor/coproc_name_tests.rs`, `crates/huck-engine/src/engine.rs` (remove the relocated tests)
 
 **Interfaces:**
-- Consumes: the live guard (Task 2); the public `huck_engine::Engine` with `fn new() -> Engine` and `fn capture(&mut self, src: &str) -> Output`, where `Output { stdout: String, stderr: String, exit_code: i32 }`.
+- Consumes: the live guard (Task 2); the public `huck_engine::Engine` — `fn new() -> Engine`, `fn capture(&mut self, src: &str) -> Output` where `Output { stdout: String, stderr: String, exit_code: i32 }`, and `fn prepare(&mut self, src: &str) -> ExecBuilder` with `.on_stdout_line(FnMut(&str))` and `.capture()`.
 - Produces: a green reproduction gate.
 
-- [ ] **Step 1: Enumerate the offenders with the guard**
+- [ ] **Step 1: Create the integration binary**
 
-Run the frozen 4-thread binary ~8× and collect every test named by a panic (`issue #184`) or by the "still running" hang list:
-
-```bash
-BIN=$(ls -t target/debug/deps/huck_engine-* | grep -v '\.d$' | head -1)
-for i in $(seq 1 8); do
-  timeout 90 "$BIN" --test-threads 4 2>&1 \
-    | grep -E 'issue #184|has been running' | sed 's/^/  /'
-  echo "--- run $i done ---"
-done
-```
-The confirmed member is `executor::tests::subshell_stderr_is_captured`. Record every distinct test name that appears. If any test OTHER than `subshell_stderr_is_captured` appears, treat it the same way in the steps below (move it too), and note it in your report — the guard is the authority here, not this plan's guess.
-
-- [ ] **Step 2: Create the integration binary**
-
-Create `crates/huck-engine/tests/subshell_capture.rs`:
+Create `crates/huck-engine/tests/forking_execution_serial.rs`:
 
 ```rust
-//! Single-threaded isolation for subshell output-capture checks (issue #184).
+//! Single-threaded isolation for tests that fork in-process (issue #184).
 //!
-//! huck runs `( … )` subshells by forking WITHOUT exec — the child continues
-//! in-process through run_command (malloc, stdio), which is memory-safe only in
-//! a single-threaded process. Under a parallel harness a concurrent thread can
-//! hold the malloc/stdout lock at the fork instant and the child deadlocks; the
-//! exec_guard now turns that into a panic. So these checks CANNOT be parallel
-//! `#[test]`s. They live here as ONE `#[test]` running scenarios sequentially —
-//! the sole test in this binary, so no sibling execution overlaps a fork and
-//! the guard stays silent. (Precedent: #90 / tee_inherit.rs;
+//! huck runs subshells, background jobs, coprocesses, and in-process pipeline
+//! stages by forking WITHOUT exec — the child continues in-process through
+//! run_command (malloc, stdio), which is memory-safe only in a single-threaded
+//! process. Under a parallel harness a concurrent thread can hold the
+//! malloc/stdout lock at the fork instant and the child deadlocks; the
+//! exec_guard turns that into a panic. So these CANNOT be parallel `#[test]`s —
+//! each would fork while the others execute and trip the guard. They live here
+//! as ONE `#[test]` running sequentially, the sole test in this binary, so no
+//! sibling execution overlaps a fork. (Precedent: #90 / tee_inherit.rs;
 //! streaming_fd_serial.rs.)
 //!
-//! Moved from `executor::tests::subshell_stderr_is_captured`, rewritten against
-//! the public `Engine` API. Coverage is preserved, only relocated.
+//! Moved from lib #[cfg(test)] modules. Internal-state assertions (Shell.jobs,
+//! Shell.get, the raw fork_and_run_in_subshell contract) are rewritten as
+//! public-API behavioral proxies — same code paths, observed through Engine.
 
 use huck_engine::Engine;
 
 #[test]
-fn subshell_capture_scenarios() {
+fn forking_execution_scenarios() {
     subshell_stdout_and_stderr_captured_separately();
     nested_subshell_forks_single_threaded_without_tripping_the_guard();
+    pipeline_last_stage_dispatches_on_stdout_line();
+    subshell_pipeline_stage_writes_through_the_pipe();
+    background_assignment_does_not_leak_to_parent();
+    background_pure_builtin_sets_bang_pid();
+    background_chain_registers_one_job();
+    valid_coproc_name_starts_and_publishes();
 }
 
-/// A subshell's stdout and stderr are captured to their separate sinks.
+/// executor::tests::subshell_stderr_is_captured — stdout and stderr to separate sinks.
 fn subshell_stdout_and_stderr_captured_separately() {
     let mut e = Engine::new();
     let out = e.capture("( echo out; echo err >&2 )");
@@ -364,52 +371,111 @@ fn subshell_stdout_and_stderr_captured_separately() {
     assert_eq!(out.stderr, "err\n");
 }
 
-/// A nested subshell forks twice on one thread — the guard's same-thread
-/// re-entrancy path (GLOBAL == LOCAL at each fork). Must not panic.
+/// Guard same-thread re-entrancy: a nested subshell forks twice on one thread
+/// (GLOBAL == LOCAL at each fork). Must not panic.
 fn nested_subshell_forks_single_threaded_without_tripping_the_guard() {
     let mut e = Engine::new();
     let out = e.capture("( ( echo deep ) )");
     assert_eq!(out.stdout, "deep\n");
 }
+
+/// engine::tests::on_stdout_line_pipeline_last_stage — the on_stdout_line
+/// callback fires for a pipeline's last stage. Moved verbatim (already public).
+fn pipeline_last_stage_dispatches_on_stdout_line() {
+    let mut lines: Vec<String> = Vec::new();
+    let mut e = Engine::new();
+    e.prepare("echo hi | tr a-z A-Z")
+        .on_stdout_line(|line| lines.push(line.to_string()))
+        .capture();
+    assert_eq!(lines, vec!["HI"]);
+}
+
+/// executor::tests::fork_and_run_in_subshell_echo_stage_writes_to_pipe —
+/// behavioral proxy: an in-process subshell stage writes through a real pipe to
+/// the next stage, driving fork_and_run_in_subshell with stdout → pipe.
+fn subshell_pipeline_stage_writes_through_the_pipe() {
+    let mut e = Engine::new();
+    let out = e.capture("( echo hi-from-subshell ) | cat");
+    assert_eq!(out.stdout, "hi-from-subshell\n");
+}
+
+/// executor::tests::background_pure_builtin_does_not_mutate_parent_env — a `&`
+/// assignment runs in a forked subshell and must not leak to the parent.
+fn background_assignment_does_not_leak_to_parent() {
+    let mut e = Engine::new();
+    let out = e.capture("HUCK_TEST_BG_ASSIGN=v & wait; echo [${HUCK_TEST_BG_ASSIGN-unset}]");
+    assert_eq!(out.stdout, "[unset]\n");
+}
+
+/// executor::tests::background_pure_builtin_forks_and_registers_job — a
+/// pure-builtin `&` forks and sets $! to a real positive pid.
+fn background_pure_builtin_sets_bang_pid() {
+    let mut e = Engine::new();
+    let out = e.capture("echo hi >/dev/null & [ \"$!\" -gt 0 ] && echo haspid; wait");
+    assert_eq!(out.stdout, "haspid\n");
+}
+
+/// executor::tests::execute_bg_chain_registers_job — `cmd && cmd &` registers
+/// exactly one job. Cleans up the still-running sleep.
+fn background_chain_registers_one_job() {
+    let mut e = Engine::new();
+    let out = e.capture("sleep 30 && true & jobs; kill %1 2>/dev/null; wait 2>/dev/null");
+    let job_lines = out.stdout.lines().filter(|l| l.starts_with('[')).count();
+    assert_eq!(job_lines, 1, "expected exactly one job; stdout: {:?}", out.stdout);
+}
+
+/// executor::coproc_name_tests::valid_coproc_name_still_starts — a valid coproc
+/// name starts the coprocess (status 0) and publishes NAME_PID.
+fn valid_coproc_name_starts_and_publishes() {
+    let mut e = Engine::new();
+    let out = e.capture("coproc MYCO { :; }; echo rc=$?; echo pid=$MYCO_PID; wait 2>/dev/null");
+    assert!(out.stdout.contains("rc=0"), "coproc should start, status 0; stdout: {:?}", out.stdout);
+    let pid_line = out.stdout.lines().find(|l| l.starts_with("pid=")).unwrap_or("pid=");
+    let pid: i64 = pid_line.trim_start_matches("pid=").trim().parse().unwrap_or(0);
+    assert!(pid > 0, "MYCO_PID should be a positive pid; stdout: {:?}", out.stdout);
+}
 ```
 
-If Step 1 surfaced additional forking tests, add each as another helper called from `subshell_capture_scenarios`, rewritten via `Engine::capture` to assert the same thing it asserted in the lib.
+**On the proxies:** each is intended to assert the SAME behavior as the lib test it replaces, observed through the public API. Run each and confirm it passes against huck's ACTUAL output. If huck's real output differs cosmetically (e.g. the `jobs` line format, `$!` availability), adjust the assertion to match huck's genuine behavior — do NOT invent output. But if a proxy fails in a way that reveals a real behavioral divergence (e.g. `$!` unset after a pure-builtin `&`, or the bg assignment leaking to the parent), STOP and report it — that is a real bug, not a test to bend.
 
-- [ ] **Step 3: Run the new integration binary**
+- [ ] **Step 2: Run the new integration binary**
 
-Run: `ulimit -v 6000000; cargo test -p huck-engine --test subshell_capture --jobs 1 -- --test-threads 1`
-Expected: PASS, 1 passed. (The real subshell forks single-threaded, so the guard is silent — this is the "no false positive" verification the lib unit test could not do.)
+Run: `ulimit -v 6000000; cargo test -p huck-engine --test forking_execution_serial --jobs 1 -- --test-threads 1`
+Expected: PASS, 1 passed. (Real forks, single-threaded → guard silent — the "no false positive" verification the lib tests could not do.)
 
-- [ ] **Step 4: Remove the relocated test from the lib**
+- [ ] **Step 3: Remove the 7 relocated tests from the lib**
 
-In `crates/huck-engine/src/executor/tests.rs`, delete the whole `#[test] fn subshell_stderr_is_captured() { … }` (and any other test Step 1 flagged). If deleting it leaves `use` imports unused (e.g. an import only that test needed), remove those too — the branch must build warning-clean.
+Delete the 7 `#[test] fn` bodies named in the table above from their three source files (`executor/tests.rs` ×5, `executor/coproc_name_tests.rs` ×1, `engine.rs` ×1). After deleting, if any `use` import or test helper is now unused, remove it — the branch must build warning-clean. Run `cargo build -p huck-engine 2>&1 | grep -c warning` after a `touch` of each edited file; expect 0.
 
-- [ ] **Step 5: THE GATE — the repro loop must be clean**
+- [ ] **Step 4: THE GATE — the repro loop must be clean**
 
-Rebuild the frozen binary and run 8× at 4 threads, alone:
+Rebuild the frozen binary and run 8× at 4 threads, alone (nothing else on the box):
 
 ```bash
 cargo test -p huck-engine --lib --no-run --jobs 1
 BIN=$(ls -t target/debug/deps/huck_engine-* | grep -v '\.d$' | head -1)
 for i in $(seq 1 8); do
-  timeout 90 "$BIN" --test-threads 4 >/dev/null 2>&1 && echo "run $i: OK" || echo "run $i: FAIL/HANG rc=$?"
+  timeout 90 "$BIN" --test-threads 4 >/dev/null 2>&1 && echo "run $i: OK" || echo "run $i: FAIL/HANG/PANIC rc=$?"
 done
 ```
-Expected: `run N: OK` for all 8 (0 wedges, 0 panics). It was 3/8 wedged before. If any run still panics or hangs, Step 1 missed a test — read its name from the output, move it (back to Step 2), and repeat. Do NOT weaken the guard or the timeout to get green.
+Expected: `run N: OK` for all 8 (0 wedge, 0 panic). It was 3/8 wedged before. If any run still panics or hangs, the guard found an 8th forker: read its name from `timeout 90 "$BIN" --test-threads 4 2>&1 | grep -E 'issue #184|has been running'`, move it too (back to Step 1's binary), and repeat. Do NOT weaken the guard or the timeout to get green.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 cargo fmt --all
-git add crates/huck-engine/tests/subshell_capture.rs crates/huck-engine/src/executor/tests.rs
+git add crates/huck-engine/tests/forking_execution_serial.rs crates/huck-engine/src/executor/tests.rs crates/huck-engine/src/executor/coproc_name_tests.rs crates/huck-engine/src/engine.rs
 git commit -m "$(cat <<'EOF'
-test: isolate the in-process-forking subshell test to its own binary (#184)
+test: isolate the 7 in-process-forking tests to a single-threaded binary (#184)
 
-The exec_guard flagged executor::tests::subshell_stderr_is_captured as forking
-an in-process subshell while other threads execute. Moved to a single-threaded
-integration binary (tests/subshell_capture.rs) via the public Engine::capture
-API, where the fork runs like production — one thread — so it is safe by
-construction. The lib binary no longer wedges at --test-threads 4 (was 3/8).
+The exec_guard flagged 7 lib tests that fork in-process (subshells, background
+jobs, a coproc, a pipeline stage) while other threads execute — not just the one
+found empirically. All move to tests/forking_execution_serial.rs, one #[test]
+run sequentially, driven through the public Engine API where the fork runs like
+production (single-threaded) and is safe by construction. Internal-state
+assertions (Shell.jobs, Shell.get, the raw fork contract) become public-API
+behavioral proxies. The lib binary no longer wedges at --test-threads 4 (was
+3/8).
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
@@ -456,7 +522,7 @@ inherited lock. A lone engine never trips it.
 Consequences: running two `Engine`s concurrently on different threads is
 unsupported and will panic at the first subshell fork. Tests that fork an
 in-process subshell must run single-threaded — see
-`crates/huck-engine/tests/subshell_capture.rs`. The guard covers only the
+`crates/huck-engine/tests/forking_execution_serial.rs`. The guard covers only the
 fork/deadlock hazard; the cwd, signal/job-control, and fd-table state are also
 process-global and would need per-engine virtualization for true multi-engine
 support (out of scope; declined in the #184 design).
