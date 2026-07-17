@@ -80,10 +80,17 @@ failed, and no write happens for empty output.
 process-global `io::stdout()`.** (Builtin *stderr* is deliberately excluded — see
 Scope boundaries.)
 
-A new unbuffered `Fd1Writer` implements `std::io::Write` over raw fd 1:
+A new unbuffered `FdWriter` implements `std::io::Write` over a raw fd:
 
-- `write` loops on `libc::write(1, …)`, retrying `EINTR` and handling partial
-  writes, and returns the true errno.
+It takes the fd as a **parameter** rather than hardcoding 1. That is a
+testability requirement, not generality for its own sake: a unit test that swaps
+the process-global fd 1 cannot be reliable in a `#[cfg(test)]` module, because
+`dup2` clears `O_CLOEXEC` and concurrently forking tests inherit it — a hazard
+this repo has already been bitten by (`tests/tee_inherit.rs`, #90). With an fd
+parameter the tests point at a temporary fd and the hazard never arises.
+
+- `write` calls `libc::write(fd, …)`, retrying `EINTR` and returning the true
+  errno. A short count is returned as-is; `write_all` loops.
 - **Empty input short-circuits to `Ok(0)` without a syscall.** A zero-byte
   `write(2)` to a bad fd returns EBADF (measured above), so without this
   `echo -n '' >&3` would report where bash is silent. This is bash's
@@ -140,9 +147,12 @@ discarded error.
 
 The 6 checking sites (`echo` ×2 at `builtins.rs:680`/`684`, `pwd` at `655`,
 `export` at `1159`, `readonly` at `1825`, `jobs` at `4284`) **keep their early
-return** — stop writing once the fd is broken — but **drop their message**. The
-two raw-`io::Error` sites (`printf` at `builtins.rs:4025`/`4144`, source of
-`(os error 28)`) get the same treatment.
+return** — stop writing once the fd is broken — but **drop their message**.
+`printf`'s write site (`builtins.rs:4144`), which reports the raw `io::Error` and
+is the source of `(os error 28)`, gets the same treatment — making 8 sites in
+all. **`builtins.rs:4025` is NOT one of them**: despite its identical
+`"printf: {e}"` shape it reports a *format-parse* failure, not a write, and is
+not part of this surface.
 
 That makes #190 unrepresentable: one formatter, one wording, no newline-dependent
 path selection.
@@ -164,7 +174,7 @@ path selection.
 
 ## Testing
 
-- **Unit tests** for `Fd1Writer` against real fds: EBADF surfaces (read-only and
+- **Unit tests** for `FdWriter` against real fds: EBADF surfaces (read-only and
   closed), ENOSPC surfaces, partial writes complete, EINTR retries, and
   **`write(b"")` performs no syscall and returns `Ok(0)`** — pinned against the
   measured `write(ro_fd, "", 0)` → EBADF, so the test fails if the
