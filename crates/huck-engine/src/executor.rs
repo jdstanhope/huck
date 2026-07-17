@@ -235,6 +235,11 @@ pub fn execute_with_sink(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
+    // #184: mark this thread as executing for the duration of this call, so the
+    // fork check in `fork_and_run_in_subshell` can tell whether any OTHER thread
+    // is executing. Re-entrant (nested constructs, eval/source, function
+    // bodies); the counters stay balanced. Dropped last, on scope exit/panic.
+    let _exec_active = crate::exec_guard::ExecActive::enter();
     // Install the sinks as the thread-local err sinks so deep call chains
     // (`expand`, `param_expansion`, `Shell` methods, `jobs`) route their
     // diagnostics through `with_err` to the active sink. The Guard inside
@@ -7928,6 +7933,11 @@ pub fn fork_and_run_in_subshell(
     // Flush buffered parent stdout BEFORE forking so the child does not inherit
     // (and then re-flush, duplicating) any pending partial line, and so pending
     // parent bytes are ordered ahead of the child's output.
+    // #184: huck runs this subshell by forking WITHOUT exec — the child
+    // continues in-process through `run_command`, which is memory-safe only in
+    // a single-threaded process (see `exec_guard`). Panic loudly here rather
+    // than let the forked child deadlock on a lock another thread holds.
+    crate::exec_guard::assert_single_threaded_fork();
     flush_stdout();
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -7935,7 +7945,8 @@ pub fn fork_and_run_in_subshell(
     }
     if pid == 0 {
         // CHILD: async-signal-safe-ish operations only until we dive into
-        // `run_command`. huck is single-threaded so this is fine.
+        // `run_command`. Safe because the single-threaded-execution invariant
+        // (enforced by `exec_guard`, checked just above the fork) holds.
         unsafe {
             // 1. Reset job-control signals.
             libc::signal(libc::SIGTSTP, libc::SIG_DFL);

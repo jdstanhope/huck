@@ -304,6 +304,37 @@ These appear in many call-site signatures; learn them once.
   `tests/scripts/error_message_diff_check.sh` harness (incl. a `$(err 2>&1)`
   capture matrix) is the objective guard against a mis-routed emitter site.
 
+### Single-threaded execution (invariant, enforced)
+
+huck executes subshells, background jobs, and in-process pipeline stages by
+`fork()`ing **without a following `exec`** — the child continues in the same
+address space through `run_command`. POSIX allows only async-signal-safe calls
+between `fork` and `exec` in a multithreaded process, so this is memory-safe
+**only while the process is single-threaded.** huck is, in production.
+
+This is enforced, not assumed. `exec_guard` (`crates/huck-engine/src/exec_guard.rs`)
+counts active executions globally and per-thread; `execute_with_sink` holds an
+`ExecActive` for its duration, and `fork_and_run_in_subshell` calls
+`assert_single_threaded_fork()` before the fork. If another thread is executing,
+it **panics** (citing #184) rather than let the forked child deadlock on an
+inherited lock. A lone engine never trips it.
+
+Consequences: running two `Engine`s concurrently on different threads is
+unsupported and will panic at the first subshell fork. **Any test binary that
+drives the in-process `Engine` API AND runs anything that forks in-process (a
+`( … )` subshell, a `&` background job, a `coproc`, or a builtin as a non-last
+pipeline stage) must expose ONE `#[test]` whose scenarios run sequentially** —
+libtest runs multiple `#[test]`s on parallel threads, so a second `#[test]`
+executing while the first forks trips the guard (this is #184 in miniature; a
+*separate binary* alone does NOT help — its own two tests still race). See
+`crates/huck-engine/tests/forking_execution_serial.rs`,
+`foreground_wait_latency.rs`, `no_wildcard_reap.rs`. **When verifying such a
+binary locally, run it at `--test-threads 2` or more — `--test-threads 1` hides
+the guard because nothing runs concurrently.** The guard covers only the
+fork/deadlock hazard; the cwd, signal/job-control, and fd-table state are also
+process-global and would need per-engine virtualization for true multi-engine
+support (out of scope; declined in the #184 design).
+
 ## Naming conventions
 
 Function-name verbs follow these conventions (codified v170; see the 2026-06-16

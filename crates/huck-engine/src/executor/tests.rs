@@ -354,75 +354,11 @@ fn execute_capturing_empty_echo() {
     assert_eq!(status, 0);
 }
 
-#[test]
-fn execute_capturing_builtin_pipeline_captures_terminal_stage() {
-    // Two-stage pipeline: `echo first | echo second`. The terminal stage
-    // is a builtin (echo) whose output should land in the capture buffer.
-    // The first stage's output is discarded by echo (which doesn't read
-    // stdin), so we just confirm the terminal echo's output is captured.
-    let seq = Sequence {
-        first: Command::Pipeline(Pipeline {
-            negate: false,
-            commands: vec![
-                Command::Simple(exec("echo", &["first"])),
-                Command::Simple(exec("echo", &["second"])),
-            ],
-        }),
-        rest: vec![],
-        background: false,
-    };
-    let mut shell = Shell::new();
-    let (out, status) = execute_capturing(&seq, &mut shell);
-    assert_eq!(out, "second\n");
-    assert_eq!(status, 0);
-}
-
-#[test]
-fn background_pure_builtin_forks_and_registers_job() {
-    // Post-fix: `echo hi &` (a single-stage pure-builtin pipeline) now forks
-    // a subshell rather than running synchronously in the parent. The job
-    // should appear in the table immediately after execute() returns (before
-    // wait/reap), because the fork registered it as Running.
-    let seq = Sequence {
-        first: Command::Pipeline(Pipeline {
-            negate: false,
-            commands: vec![Command::Simple(exec("echo", &["hi"]))],
-        }),
-        rest: vec![],
-        background: true,
-    };
-    let mut shell = Shell::new();
-    let outcome = execute(&seq, &mut shell, "echo hi &");
-    assert!(matches!(outcome, ExecOutcome::Continue(0)));
-    // last_bg_pid must have been set to a real forked pid.
-    assert!(
-        shell.last_bg_pid.is_some(),
-        "last_bg_pid should be set after pure-builtin &"
-    );
-    let pid = shell.last_bg_pid.unwrap();
-    assert!(pid > 0, "pid should be positive, got {pid}");
-}
-
-#[test]
-fn background_pure_builtin_does_not_mutate_parent_env() {
-    // Post-fix: `HUCK_TEST_BG_ASSIGN=v &` runs in a forked subshell, so
-    // the assignment must NOT leak back to the parent shell's environment.
-    let seq = Sequence {
-        first: Command::Pipeline(Pipeline {
-            negate: false,
-            commands: vec![Command::Simple(SimpleCommand::Assign(
-                vec![bare_assign("HUCK_TEST_BG_ASSIGN", lit_word("v"))],
-                0,
-            ))],
-        }),
-        rest: vec![],
-        background: true,
-    };
-    let mut shell = Shell::new();
-    let _ = execute(&seq, &mut shell, "HUCK_TEST_BG_ASSIGN=v &");
-    // The assignment ran in a forked subshell — should NOT be visible in parent.
-    assert_eq!(shell.get("HUCK_TEST_BG_ASSIGN"), None);
-}
+// NOTE: `execute_capturing_builtin_pipeline_captures_terminal_stage` moved to
+// `tests/forking_execution_serial.rs` as
+// `builtin_pipeline_capture_returns_terminal_stage_output` (a capture-context
+// builtin pipeline forks its non-terminal stage in-process; unsafe to run
+// concurrently with other tests — issue #184).
 
 #[test]
 fn execute_capturing_ignores_background_flag_runs_synchronously() {
@@ -1281,80 +1217,6 @@ fn export_prefix_persists_in_default_mode() {
     assert_eq!(shell.get("FOO"), Some("val"), "export keeps its named var");
 }
 
-/// Canonical "fork_and_run_in_subshell works" test.
-///
-/// Pattern for future helpers: create a libc::pipe pair, fork via the
-/// helper with stdout = pipe.write, in the parent read pipe.read and
-/// waitpid the child, assert the buffer contains the expected output.
-#[test]
-fn fork_and_run_in_subshell_echo_stage_writes_to_pipe() {
-    // 1. Create a pipe pair.
-    let mut pipe_fds: [libc::c_int; 2] = [-1; 2];
-    let rc = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
-    assert_eq!(rc, 0, "libc::pipe failed");
-    let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
-
-    // 2. Build `echo hi-from-subshell` as a Command.
-    let cmd = Command::Simple(exec("echo", &["hi-from-subshell"]));
-
-    // 3. Fork: child writes to write_fd; parent keeps read_fd.
-    //    pass write_fd in parent_fds_to_close so the child closes its
-    //    own copy (it dup2'd it to fd 1, so the original > 2 copy is dead).
-    let mut shell = Shell::new();
-    let child_pid = fork_and_run_in_subshell(
-        &cmd,
-        &mut shell,
-        ChildStdio::new(
-            ChildFd::Inherit,                        // stdin = terminal
-            unsafe { ChildFd::owned_raw(write_fd) }, // stdout → pipe write end
-            ChildFd::Inherit,                        // stderr = terminal
-        ),
-        0,          // pgid_target: become own pgrp leader
-        &[read_fd], // close the read end in the child
-        None,       // no Dup redirect
-        None,
-    )
-    .expect("fork_and_run_in_subshell failed");
-
-    // 4. The pipe write end was owned by the moved ChildStdio and closed in the
-    //    parent by the call, so reading will eventually see EOF.
-
-    // 5. Read from the pipe into a buffer.
-    let mut buf = vec![0u8; 256];
-    let mut total = 0usize;
-    loop {
-        let n = unsafe {
-            libc::read(
-                read_fd,
-                buf.as_mut_ptr().add(total).cast(),
-                buf.len() - total,
-            )
-        };
-        if n <= 0 {
-            break;
-        }
-        total += n as usize;
-    }
-    unsafe { libc::close(read_fd) };
-    let output = std::str::from_utf8(&buf[..total])
-        .expect("utf8")
-        .to_string();
-
-    // 6. Reap the child.
-    let mut raw_status: libc::c_int = 0;
-    let r = unsafe { libc::waitpid(child_pid, &mut raw_status, 0) };
-    assert_eq!(r, child_pid, "waitpid returned unexpected pid");
-    assert!(libc::WIFEXITED(raw_status), "child did not exit normally");
-    let exit_code = libc::WEXITSTATUS(raw_status);
-    assert_eq!(exit_code, 0);
-
-    // 7. Check output.
-    assert!(
-        output.contains("hi-from-subshell"),
-        "expected 'hi-from-subshell' in pipe output, got: {output:?}"
-    );
-}
-
 /// A `for`/`select` loop may use a `{ … }` brace group in place of
 /// `do … done` (ksh-derived, accepted by bash). The loop must actually
 /// iterate, and `break`/`continue` must work inside the brace body.
@@ -1479,34 +1341,6 @@ fn pipeline_stage_stderr_is_captured() {
         execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
     }
     assert_eq!(String::from_utf8_lossy(&buf_out), "");
-    assert_eq!(String::from_utf8_lossy(&buf_err), "err\n");
-}
-
-/// `( echo out; echo err >&2 )` — a Subshell command, not an external. The
-/// subshell branch of `run_command` forks via `fork_and_run_in_subshell`;
-/// this test exercises the per-fork-site stderr pipe + threaded drain that
-/// mirrors the stdout-capture pipe pattern. Bash-equivalent: `( … ) 1>out 2>err`.
-#[test]
-#[cfg(unix)]
-fn subshell_stderr_is_captured() {
-    let _g = CWD_LOCK.lock().unwrap();
-    let mut buf_out: Vec<u8> = Vec::new();
-    let mut buf_err: Vec<u8> = Vec::new();
-    let mut shell = Shell::new();
-    {
-        let mut out = StdoutSink::Capture(&mut buf_out);
-        let mut err = StderrSink::Capture(&mut buf_err);
-        let src = "( echo out; echo err >&2 )";
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
-            src,
-            &Default::default(),
-            crate::lexer::LexerOptions::default(),
-        ))
-        .expect("parse")
-        .expect("seq");
-        execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
-    }
-    assert_eq!(String::from_utf8_lossy(&buf_out), "out\n");
     assert_eq!(String::from_utf8_lossy(&buf_err), "err\n");
 }
 
@@ -2005,52 +1839,11 @@ fn run_background_sequence_sets_last_bg_pid() {
     }
 }
 
-#[test]
-fn execute_bg_chain_returns_immediately_status_0() {
-    // `true && true &` — parent should return Continue(0) without
-    // waiting for the child.
-    use crate::shell_state::Shell;
-    let mut shell = Shell::new();
-    let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
-        "true && true &",
-        &Default::default(),
-        crate::lexer::LexerOptions::default(),
-    ))
-    .unwrap()
-    .unwrap();
-    let outcome = execute(&seq, &mut shell, "true && true &");
-    assert!(matches!(outcome, ExecOutcome::Continue(0)));
-    // Cleanup: SIGTERM any bg job so the test doesn't leak.
-    for job in shell.jobs.iter() {
-        unsafe {
-            libc::kill(job.pgid, libc::SIGTERM);
-        }
-    }
-}
-
-#[test]
-fn execute_bg_chain_registers_job() {
-    // After `sleep 30 && true &`, the bg sequence should register
-    // as one job entry. The sleep ensures the child is alive long
-    // enough to observe.
-    use crate::shell_state::Shell;
-    let mut shell = Shell::new();
-    let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
-        "sleep 30 && true &",
-        &Default::default(),
-        crate::lexer::LexerOptions::default(),
-    ))
-    .unwrap()
-    .unwrap();
-    let _ = execute(&seq, &mut shell, "sleep 30 && true &");
-    assert_eq!(shell.jobs.iter().count(), 1, "expected exactly one job");
-    // Cleanup.
-    for job in shell.jobs.iter() {
-        unsafe {
-            libc::kill(job.pgid, libc::SIGTERM);
-        }
-    }
-}
+// NOTE: `execute_bg_chain_returns_immediately_status_0` moved to
+// `tests/forking_execution_serial.rs` as
+// `background_chain_returns_immediately_status_zero` (a background `&&` chain
+// forks in-process; unsafe to run concurrently with other tests — issue
+// #184).
 
 // ----- v54: readonly enforcement at executor-layer write paths ----------
 
