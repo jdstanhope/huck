@@ -341,6 +341,41 @@ fn builtins_report_consistent_write_errors() {
         &err,
         "printf",
     );
+
+    shell.export_set("WRITE_ERROR_EXPORT", "x".to_string());
+    let mut err = Vec::new();
+    assert_write_error(
+        builtin_export_decl(&[], &mut WriteError, &mut err, &mut shell),
+        &err,
+        "export",
+    );
+
+    let _ = crate::shell::process_line("write_error_fn() { :; }", &mut shell, false);
+    shell.mark_function_exported("write_error_fn");
+    let mut err = Vec::new();
+    assert_write_error(
+        builtin_export_decl(&[dp("-f")], &mut WriteError, &mut err, &mut shell),
+        &err,
+        "export",
+    );
+
+    shell.mark_readonly("WRITE_ERROR_READONLY");
+    let mut err = Vec::new();
+    assert_write_error(
+        builtin_readonly_decl(&[], &mut WriteError, &mut err, &mut shell),
+        &err,
+        "readonly",
+    );
+
+    let _ = shell
+        .jobs
+        .add_synthetic_done("write-error-job".to_string(), 0);
+    let mut err = Vec::new();
+    assert_write_error(
+        builtin_jobs(&[], &mut WriteError, &mut err, &mut shell),
+        &err,
+        "jobs",
+    );
 }
 
 #[test]

@@ -1190,11 +1190,19 @@ fn list_exported(out: &mut dyn Write, err: &mut dyn Write, shell: &Shell) -> Exe
 /// Lists exported functions (sorted) as `generate` body + `declare -fx NAME`.
 fn list_exported_functions(out: &mut dyn Write, err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     for name in shell.exported_function_names() {
-        if let Some(body) = shell.functions.get(&name)
-            && (writeln!(out, "{}", crate::generate::function_to_source(&name, body)).is_err()
-                || writeln!(out, "declare -fx {name}").is_err())
-        {
-            crate::sh_error_to!(shell, err, None, "export: write error");
+        let Some(body) = shell.functions.get(&name) else {
+            continue;
+        };
+        let write_result = writeln!(out, "{}", crate::generate::function_to_source(&name, body))
+            .and_then(|()| writeln!(out, "declare -fx {name}"));
+        if let Err(e) = write_result {
+            crate::sh_error_to!(
+                shell,
+                err,
+                None,
+                "export: write error: {}",
+                crate::bash_io_error(&e)
+            );
             return ExecOutcome::Continue(1);
         }
     }
