@@ -1164,13 +1164,13 @@ fn list_exported(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
 }
 
 /// Lists exported functions (sorted) as `generate` body + `declare -fx NAME`.
-fn list_exported_functions(out: &mut dyn Write, err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
+fn list_exported_functions(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     for name in shell.exported_function_names() {
         if let Some(body) = shell.functions.get(&name)
             && (writeln!(out, "{}", crate::generate::function_to_source(&name, body)).is_err()
                 || writeln!(out, "declare -fx {name}").is_err())
         {
-            crate::sh_error_to!(shell, err, None, "export: write error");
+            // v308: reported once by the epilogue.
             return ExecOutcome::Continue(1);
         }
     }
@@ -1377,7 +1377,7 @@ fn builtin_export_decl(
         // accommodation) suppresses the var listing: rc 0, no output.
         // Otherwise list exported variables (bare `export` or `-p`).
         if func && !saw_p {
-            return list_exported_functions(out, err, shell);
+            return list_exported_functions(out, shell);
         }
         if saw_a && !saw_p {
             return ExecOutcome::Continue(0);
@@ -2058,7 +2058,7 @@ fn builtin_declare_decl(
             })
             .collect();
         if plain_names.is_empty() {
-            return list_exported_functions(out, err, shell);
+            return list_exported_functions(out, shell);
         }
         let mut any_error = false;
         for name in &plain_names {
