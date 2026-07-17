@@ -1223,6 +1223,17 @@ fn final_dests_for_1_2(redirs: &[Redirection], shell: &mut Shell) -> (RedirectDe
     (fd1, fd2)
 }
 
+/// True when `redirs` makes fd 2 follow fd 1 (`2>&1`) with fd 1's FINAL
+/// destination still the software sink — i.e. stderr should be merged into the
+/// (captured) stdout IN MEMORY, not sent to a real fd. Shared by the
+/// simple-command path (`run_builtin_with_redirects`) and the compound-redirect
+/// path (`with_redirect_scope`). Deliberately returns false for `2>&1 >file`
+/// (fd 1's final dest is the file, not the sink) — that ordering case is #195.
+fn redirs_merge_err_into_out(redirs: &[Redirection], shell: &mut Shell) -> bool {
+    let (final_1, final_2) = final_dests_for_1_2(redirs, shell);
+    matches!(final_1, RedirectDest::Sink) && matches!(final_2, RedirectDest::Follows(1))
+}
+
 /// Applies redirects at the real-fd level (saved/restored via `RedirectScope`),
 /// forcing a `Terminal` inner sink when a stdout redirect is present so the
 /// redirect wins over an outer capture, then runs `run_inner(shell, inner_sink)`
@@ -1281,13 +1292,24 @@ where
     // is already `Terminal`. A
     // compound with only a stdin/stderr redirect keeps the outer sink so its
     // stdout is still captured.
+    // v310 (#176): a captured group with `2>&1` (fd 2 follows fd 1, fd 1 still
+    // the sink) must route the inner body's stderr INTO the capture, in program
+    // order — the same software Merged routing the simple-command path does.
+    // The comsub capture has no single real fd, so the real dup2 above points
+    // stderr at the terminal; Merged sends builtins to the capture buf and
+    // externals to the capture pipe (executor.rs:672) instead. Terminal /
+    // non-`2>&1` cases keep the passed-in err_sink unchanged.
+    let merge_err =
+        matches!(*sink, StdoutSink::Capture(_)) && redirs_merge_err_into_out(redirs, shell);
+    let mut merged_err = StderrSink::Merged;
     let mut terminal_sink = StdoutSink::Terminal;
     let inner_sink: &mut StdoutSink = if force_terminal {
         &mut terminal_sink
     } else {
         sink
     };
-    let outcome = run_inner(shell, inner_sink, err_sink);
+    let inner_err_sink: &mut StderrSink = if merge_err { &mut merged_err } else { err_sink };
+    let outcome = run_inner(shell, inner_sink, inner_err_sink);
     let _ = io::stdout().flush();
     // Restore the real fds BEFORE draining redirect-target process substitutions.
     // For an OUTPUT procsub (`cmd > >(consumer)`), the redirect dup'd the procsub's
@@ -1370,9 +1392,8 @@ fn run_builtin_with_redirects(
     let route_out_to_err = matches!(err_sink, StderrSink::Capture(_) | StderrSink::Merged)
         && matches!(final_2, RedirectDest::Sink)
         && matches!(final_1, RedirectDest::Follows(2));
-    let route_err_to_out = matches!(sink, StdoutSink::Capture(_))
-        && matches!(final_1, RedirectDest::Sink)
-        && matches!(final_2, RedirectDest::Follows(1));
+    let route_err_to_out =
+        matches!(sink, StdoutSink::Capture(_)) && redirs_merge_err_into_out(redirs, shell);
 
     let mut scope = RedirectScope::new();
     if let Err(outcome) = scope.apply_redirects(redirs, shell, sink, err_sink) {
@@ -5615,17 +5636,9 @@ fn run_subprocess(
         });
         last_2_from_1 && !fd1_overridden
     };
-    unsafe {
-        process.pre_exec(move || replay_redir_ops(&ops));
-    }
-
-    if interactive {
-        process.process_group(0);
-    }
-
     // A heredoc/here-string body was delivered by `build_child_redir_plan` via
     // `heredoc_body_to_fd`; its read end is in `plan.held` (FD_CLOEXEC,
-    // inherited across fork, replayed by the ops above).
+    // inherited across fork, replayed by the ops below).
     let want_capture = matches!(sink, StdoutSink::Capture(_));
     let want_capture_err = matches!(err_sink, StderrSink::Capture(_));
     let merged_err = matches!(err_sink, StderrSink::Merged);
@@ -5646,6 +5659,15 @@ fn run_subprocess(
         // analog of `2>&1`: a single ordered byte stream into whatever fd 1 is
         // (the inherited terminal OR the capture pipe set by `process.stdout`
         // above). Bash-compatible byte ordering falls out naturally.
+        //
+        // v310 (#176): this MUST be registered (and therefore run) BEFORE
+        // `replay_redir_ops` below. `replay_redir_ops` replays this COMMAND's
+        // OWN redirects (e.g. a trailing `>&2` inside a `2>&1`-merged group),
+        // which may use fd 2 as a *source*. Under `StderrSink::Merged` there is
+        // no real fd 2 wired to anything meaningful yet — only this dup2
+        // establishes fd 2 = fd 1 — so it has to land first, or the command's
+        // own `>&2` would dup2 fd 1 from the process's stale inherited fd 2
+        // (e.g. the terminal) instead of the correctly-wired fd 1.
         unsafe {
             process.pre_exec(|| {
                 if libc::dup2(1, 2) < 0 {
@@ -5654,6 +5676,14 @@ fn run_subprocess(
                 Ok(())
             });
         }
+    }
+
+    unsafe {
+        process.pre_exec(move || replay_redir_ops(&ops));
+    }
+
+    if interactive {
+        process.process_group(0);
     }
 
     // #172: if the program can't be run, don't leave the diagnostic to the
