@@ -1236,8 +1236,12 @@ where
     // subset captured later), so the two layers cover disjoint ranges.
     let procsub_base = shell.procsub_pending.len();
 
-    // Flush buffered terminal/builtin output BEFORE swapping fds so prior
-    // output is not diverted into the redirect target.
+    // Flush buffered terminal/builtin output BEFORE swapping fds, for two
+    // reasons. (1) Prior output must not be diverted into the redirect target.
+    // (2) v308: the builtin's own stdout now goes straight to real fd 1 via
+    // `FdWriter` (unbuffered), so anything still sitting in `io::stdout()`'s
+    // buffer would be overtaken by those raw writes and surface out of order.
+    // Emptying the buffer here is what keeps the two writers in step.
     let _ = io::stdout().flush();
 
     let mut scope = RedirectScope::new();
@@ -1367,20 +1371,17 @@ fn run_builtin_with_redirects(
     // route_out_to_err` arm below handles this; suppress `write_to_fd1` here.
     let write_to_fd1 =
         !route_out_to_err && (redirs_write_stdout(redirs) || matches!(sink, StdoutSink::Terminal));
-    // #137: Rust's `io::stdout()` deliberately SWALLOWS EBADF (see
-    // `std::io::stdio::handle_ebadf` upstream) — a write to a closed real fd 1
-    // reports success (`Ok`) even though the underlying `write(2)` genuinely
-    // failed, so `io::stdout().flush()`'s `Result` can never reveal a closed-fd
-    // write failure (only OTHER errors, e.g. ENOSPC on a full disk, propagate
-    // normally and are still caught by the flush-Result check below). Detect
-    // the closed-fd case separately: by the time we reach here, an `exec >&-`
-    // or this command's own `>&-`/move-close redirect has already closed real
-    // fd 1 via `scope.apply_redirects` above, so a cheap `fcntl` probe reveals
-    // it BEFORE the builtin runs. When closed, route the builtin's writes into
-    // a throwaway buffer instead of the swallowing `io::stdout()`, so we can
-    // still tell whether the builtin attempted any output.
-    let fd1_closed = write_to_fd1 && unsafe { libc::fcntl(1, libc::F_GETFD) } < 0;
-    let mut fd1_discard: Vec<u8> = Vec::new();
+    // #186/#190/#191: builtin stdout bound for a real fd goes through
+    // `FdWriter`, NOT the process-global `io::stdout()`. `io::stdout()` swallows
+    // EBADF (`std::io::stdio::handle_ebadf` upstream reports success for a write
+    // that genuinely failed), it is a `LineWriter` — so a trailing newline
+    // decides whether an error surfaces at `write_all` or at a later `flush` —
+    // and it RETAINS failed bytes, which then reach whatever fd 1 is restored
+    // to. `FdWriter` returns the true errno, buffers nothing, and records the
+    // first error for the epilogue below. This replaces v298's (#137) `fcntl`
+    // closed-fd probe and throwaway-buffer workaround: a raw write(2) reports
+    // EBADF for a closed fd on its own.
+    let mut fd1_writer = crate::fd_writer::FdWriter::new(libc::STDOUT_FILENO);
     let run = |out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, shell: &mut Shell| {
         if let Some(da) = resolved.decl_args.as_deref() {
             builtins::run_declaration_builtin(&resolved.program, da, out, err, shell)
@@ -1446,10 +1447,10 @@ fn run_builtin_with_redirects(
             (StdoutSink::Terminal, StderrSink::Merged) => {
                 // Merged + terminal stdout: writes go to real fd 1 (which the
                 // redirect dup'd from real fd 2, so → real fd 2). This matches
-                // the non-routed path, so just fall back to the standard write.
-                let mut out = io::stdout();
+                // the non-routed path, so use the same `FdWriter` — it is a real
+                // fd, and a sibling of the `write_to_fd1` branch below.
                 let mut err = err_writer(err_sink, sink);
-                run(&mut out, &mut *err, shell)
+                run(&mut fd1_writer, &mut *err, shell)
             }
             (_, StderrSink::Terminal) => {
                 unreachable!("route_out_to_err requires non-Terminal err_sink")
@@ -1484,15 +1485,7 @@ fn run_builtin_with_redirects(
         }
     } else if write_to_fd1 {
         let mut err = err_writer(err_sink, sink);
-        if fd1_closed {
-            // Real fd 1 is already closed — see the `fd1_closed` comment above.
-            // Route through a throwaway buffer rather than the EBADF-swallowing
-            // `io::stdout()` so the epilogue can detect an attempted write.
-            run(&mut fd1_discard, &mut *err, shell)
-        } else {
-            let mut out = io::stdout();
-            run(&mut out, &mut *err, shell)
-        }
+        run(&mut fd1_writer, &mut *err, shell)
     } else {
         // Capture stdout sink with no fd-1 redirect. Mirror `err_writer` inline
         // so the `*buf` borrow for `out` doesn't fight the err_sink construction.
@@ -1546,45 +1539,35 @@ fn run_builtin_with_redirects(
             },
         }
     };
-    // #137: a builtin's stdout write failure (closed fd, full disk) only
-    // surfaces at flush — line-buffered io::stdout() defers the write(2), so the
-    // builtins' own write_all checks miss it. Detect it here and emit bash's
-    // `<name>: write error: <strerror>` + exit 1. Guards:
-    //  - `write_to_fd1`: only the branch where the builtin wrote to real fd 1
-    //    (the capture branches write to a buffer, so an io::stdout() flush error
-    //    there is unrelated to this builtin).
-    //  - double-emit guard `Continue(0)`: don't override a builtin that already
-    //    reported a different failure, and don't re-report over a nonzero status.
-    // A CLOSED real fd 1 is detected separately via `fd1_closed`/`fd1_discard`
-    // (set up above the `run` closure): `io::stdout().flush()`'s `Result` can
-    // never reveal that case because Rust's `Stdout` deliberately swallows
-    // EBADF (reports success). `stdout_flush`'s `Err` still catches other,
-    // non-EBADF write failures (e.g. ENOSPC) on an fd that was open when the
-    // builtin ran.
-    let stdout_flush = io::stdout().flush();
+    // Keep flushing `io::stdout()` here even though builtin stdout no longer
+    // goes through it: `err_writer`'s `StderrSink::Merged` arm still writes
+    // DIAGNOSTICS through it, and those must land before `drop(scope)` restores
+    // fd 1 — otherwise they would be flushed to the restored fd, i.e. the wrong
+    // destination (#191's failure mode, on the stderr side).
+    let _ = io::stdout().flush();
     let _ = std::io::Write::flush(&mut std::io::stderr());
-    let fd1_write_failed =
-        matches!(&stdout_flush, Err(_)) || (fd1_closed && !fd1_discard.is_empty());
-    let outcome = if write_to_fd1 && fd1_write_failed && matches!(outcome, ExecOutcome::Continue(0))
-    {
-        let err_desc = match &stdout_flush {
-            Err(e) => crate::bash_io_error(e),
-            Ok(()) => crate::bash_io_error(&io::Error::from_raw_os_error(libc::EBADF)),
-        };
-        {
-            let mut ew = err_writer(err_sink, sink);
-            crate::sh_error_to!(
-                shell,
-                &mut *ew,
-                None,
-                "{}: write error: {}",
-                resolved.program,
-                err_desc
-            );
+    // The SINGLE reporter for every builtin write failure. `FdWriter` recorded
+    // the first errno, which matters because ~82 builtin write sites discard
+    // their own `Result` (`let _ = writeln!(out, …)`) — only 6 check it — so a
+    // per-builtin check could never cover `declare -p x >&3` and friends. The 6
+    // that check keep their early return but no longer emit; this is the only
+    // place a write error is worded, which is what keeps #190 fixed.
+    let outcome = match fd1_writer.first_error() {
+        Some(e) => {
+            {
+                let mut ew = err_writer(err_sink, sink);
+                crate::sh_error_to!(
+                    shell,
+                    &mut *ew,
+                    None,
+                    "{}: write error: {}",
+                    resolved.program,
+                    crate::bash_io_error(&e)
+                );
+            }
+            ExecOutcome::Continue(1)
         }
-        ExecOutcome::Continue(1)
-    } else {
-        outcome
+        None => outcome,
     };
     // Restore the real fds BEFORE draining redirect-target process substitutions.
     // For an OUTPUT procsub (`builtin > >(cat)`), the redirect dup'd the procsub's

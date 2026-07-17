@@ -651,8 +651,9 @@ fn builtin_pwd(
         })
     };
 
-    if let Err(e) = writeln!(out, "{path}") {
-        crate::sh_error_to!(shell, err, None, "pwd: {}", crate::bash_io_error(&e));
+    if writeln!(out, "{path}").is_err() {
+        // v308: the write error is reported once, by the run_builtin_with_redirects
+        // epilogue (it holds the recorded errno). Stop writing; stay silent.
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -676,12 +677,11 @@ fn builtin_echo(
         joined.into_bytes()
     };
 
-    if let Err(e) = out.write_all(&bytes) {
-        crate::sh_error_to!(shell, err, None, "echo: {}", crate::bash_io_error(&e));
+    if out.write_all(&bytes).is_err() {
+        // v308: reported once by the epilogue (see pwd above).
         return ExecOutcome::Continue(1);
     }
-    if !suppress_newline && let Err(e) = out.write_all(b"\n") {
-        crate::sh_error_to!(shell, err, None, "echo: {}", crate::bash_io_error(&e));
+    if !suppress_newline && out.write_all(b"\n").is_err() {
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -1155,8 +1155,8 @@ fn list_exported(out: &mut dyn Write, err: &mut dyn Write, shell: &Shell) -> Exe
         shell.iter_vars().filter(|(_, v)| v.exported).collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (name, var) in entries {
-        if let Err(e) = writeln!(out, "{}", format_declare_line(name, var)) {
-            crate::sh_error_to!(shell, err, None, "export: {}", crate::bash_io_error(&e));
+        if writeln!(out, "{}", format_declare_line(name, var)).is_err() {
+            // v308: reported once by the epilogue.
             return ExecOutcome::Continue(1);
         }
     }
@@ -1821,8 +1821,8 @@ fn builtin_readonly_decl(
                     format!("declare -r {name}")
                 }
             };
-            if let Err(e) = writeln!(out, "{line}") {
-                crate::sh_error_to!(shell, err, None, "readonly: {}", crate::bash_io_error(&e));
+            if writeln!(out, "{line}").is_err() {
+                // v308: reported once by the epilogue.
                 return ExecOutcome::Continue(1);
             }
         }
@@ -4140,8 +4140,9 @@ fn builtin_printf(
             crate::sh_error_to!(shell, err, None, "printf: {var}: readonly variable");
             return ExecOutcome::Continue(1);
         }
-    } else if let Err(e) = out.write_all(&buf) {
-        crate::sh_error_to!(shell, err, None, "printf: {e}");
+    } else if out.write_all(&buf).is_err() {
+        // v308: reported once by the epilogue, with bash's wording. This site
+        // used the raw io::Error Display, which appended Rust's "(os error N)".
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(exit)
@@ -4280,8 +4281,8 @@ fn builtin_jobs(
         } else {
             writeln!(out, "{}", crate::jobs::notification_line(job, flag))
         };
-        if let Err(e) = write_result {
-            crate::sh_error_to!(shell, err, None, "jobs: {}", crate::bash_io_error(&e));
+        if write_result.is_err() {
+            // v308: reported once by the epilogue.
             return ExecOutcome::Continue(1);
         }
         printed_ids.push(job.id);
