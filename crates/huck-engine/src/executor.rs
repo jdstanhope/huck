@@ -2781,6 +2781,18 @@ fn run_pipeline(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
+    // #1: a `!`-negated pipeline's failure is EXPECTED (it is being tested), so
+    // `set -e`/ERR must not fire for anything the body runs — including inner
+    // executions like `eval` and brace groups that are NOT their own boundary.
+    // Raise the shared errexit-suppression counter (the same mechanism a
+    // while/if condition uses) around the body only; the outer and-or gate
+    // already exempts the negated pipeline itself. A real `exit` still
+    // propagates: it returns `ExecOutcome::Exit` directly, never through the
+    // errexit gate the counter controls, and the negation below only rewrites
+    // `Continue`.
+    if pipeline.negate {
+        shell.err_suppressed_depth += 1;
+    }
     let outcome = if pipeline.commands.len() == 1 {
         // Single-stage pipeline: run directly in the parent shell (no fork needed).
         // This covers both Simple commands and compound commands as single stages.
@@ -2789,6 +2801,7 @@ fn run_pipeline(
         run_multi_stage(&pipeline.commands, shell, sink, err_sink)
     };
     if pipeline.negate {
+        shell.err_suppressed_depth -= 1;
         // Negate the exit status only; $PIPESTATUS (set by the stage(s) above)
         // stays raw, and control-flow outcomes propagate unchanged.
         if let ExecOutcome::Continue(s) = outcome {
