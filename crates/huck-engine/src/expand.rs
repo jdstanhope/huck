@@ -1208,7 +1208,7 @@ fn expand_part(
                     // 5.2.21 --posix). The empty contribution matches bash's
                     // empty $((..)) value on error either way.
                     crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&src, &e));
-                    if shell.shell_options.posix {
+                    if shell.shell_options.posix && !shell.is_interactive {
                         shell.posix_fatal(127);
                     } else {
                         shell.pending_discard = true;
@@ -1829,7 +1829,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                             "{}",
                             crate::arith::render_error_body(&src, &e)
                         );
-                        if shell.shell_options.posix {
+                        if shell.shell_options.posix && !shell.is_interactive {
                             shell.posix_fatal(127);
                         } else {
                             shell.pending_discard = true;
