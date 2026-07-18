@@ -12,6 +12,14 @@ use crate::shell_state::{SHOPT_TABLE, Shell};
 pub enum InterruptReason {
     Sigint,
     Timeout,
+    /// v312 (#3/#49): a fatal arithmetic EXPANSION error (`$(( ))` syntax /
+    /// division). Bash's `jump_to_top_level(DISCARD)`: unwind the current
+    /// top-level command (out of loops/functions), status 1, but DO NOT exit
+    /// the shell. A SYNCHRONOUS discard, not a signal — it reuses the
+    /// `Interrupted` unwind channel because the propagation is identical; only
+    /// the boundary/decoder sites treat it differently (contain at a comsub;
+    /// continue at the driver loop).
+    FatalExpansion,
 }
 
 /// The result of running a command — either the shell continues (carrying the
@@ -7688,6 +7696,14 @@ pub(crate) fn run_sourced_contents_in_sinks(
                         }
                         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => {
                             last_status = 0;
+                        }
+                        // v312 (#3/#49): a fatal arithmetic-expansion DISCARD
+                        // unwinds only THIS unit (bash `jump_to_top_level(DISCARD)`,
+                        // status 1) — it does NOT exit the shell. Record status 1
+                        // and keep reading the next unit (a later script line still
+                        // runs). Sigint/Timeout still terminate the whole run.
+                        ExecOutcome::Interrupted(InterruptReason::FatalExpansion) => {
+                            last_status = 1;
                         }
                         ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
                     }

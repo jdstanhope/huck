@@ -1198,13 +1198,21 @@ fn expand_part(
                     *has_emitted = true;
                 }
                 Err(e) => {
-                    // Print the error. Default mode: NON-fatal (v215) — prints
-                    // and continues; the empty contribution matches bash's empty
-                    // $((..)) value on error. (-c mode divergence: L-55 in
-                    // bash-divergences.md.) POSIX non-interactive: the shell
-                    // exits (127) via posix_fatal (a no-op in default mode).
+                    // Print the error, then raise the fatality flavor. v312
+                    // (#3/#49): default mode DISCARDS the current top-level
+                    // command (bash `jump_to_top_level(DISCARD)`, status 1,
+                    // shell NOT exited) — set `pending_discard`, converted to
+                    // `Interrupted(FatalExpansion)` at the executor's
+                    // post-expansion check points. POSIX non-interactive EXITS
+                    // the shell (127) via `posix_fatal` (verified against bash
+                    // 5.2.21 --posix). The empty contribution matches bash's
+                    // empty $((..)) value on error either way.
                     crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&src, &e));
-                    shell.posix_fatal(127);
+                    if shell.shell_options.posix {
+                        shell.posix_fatal(127);
+                    } else {
+                        shell.pending_discard = true;
+                    }
                     *has_emitted = true;
                 }
             }
@@ -1806,16 +1814,26 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 match res {
                     Ok(n) => result.push_str(&n.to_string()),
                     Err(e) => {
-                        // Print the error but DO NOT halt — bash script-file
-                        // mode prints and continues. Empty contribution to
-                        // the assignment value matches bash. (-c mode
-                        // divergence: L-55.)
+                        // Print the error, then raise the fatality flavor. v312
+                        // (#3/#49): an arith error in an assignment RHS / case
+                        // subject / other non-splitting expansion DISCARDS the
+                        // current top-level command in default mode (status 1,
+                        // shell NOT exited) — set `pending_discard`, converted at
+                        // the executor's post-expansion check points. POSIX
+                        // non-interactive EXITS (127) via `posix_fatal` (verified
+                        // against bash 5.2.21 --posix). Empty contribution to the
+                        // value matches bash either way.
                         crate::sh_error!(
                             shell,
                             None,
                             "{}",
                             crate::arith::render_error_body(&src, &e)
                         );
+                        if shell.shell_options.posix {
+                            shell.posix_fatal(127);
+                        } else {
+                            shell.pending_discard = true;
+                        }
                     }
                 }
             }

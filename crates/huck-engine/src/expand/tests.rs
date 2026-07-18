@@ -951,16 +951,19 @@ fn expand_arith_part_renders_decimal_result() {
 }
 
 #[test]
-fn expand_arith_part_division_by_zero_is_nonfatal() {
-    // An arith eval error (e.g. division by zero) in $((…)) is NO LONGER
-    // a fatal expansion error — bash script-file mode prints the error
-    // and continues. The error still surfaces via stderr;
-    // pending_fatal_status stays None so the surrounding command list
-    // runs to completion. The `-c` mode divergence is tracked as L-55.
+fn expand_arith_part_division_by_zero_raises_discard() {
+    // v312 (#3/#49): an arith eval error (e.g. division by zero) in $((…))
+    // raises `pending_discard` in default mode — bash's
+    // jump_to_top_level(DISCARD), which the executor converts to
+    // Interrupted(FatalExpansion) to unwind the current top-level command.
+    // It is the DISCARD flavor, NOT exit-shell, so `pending_fatal_status`
+    // stays None (that is the set -u/${x?} flavor). Resolves the old L-55
+    // "non-fatal, keep going" divergence.
     let mut shell = Shell::new();
     let word = Word(vec![arith_part("1 / 0")]);
     let _ = expand(&word, &mut shell);
     assert_eq!(shell.pending_fatal_status, None);
+    assert!(shell.pending_discard);
 }
 
 #[test]
@@ -974,14 +977,15 @@ fn expand_arith_error_is_posix_fatal() {
 }
 
 #[test]
-fn expand_arith_part_invalid_lhs_assignment_is_nonfatal() {
-    // A parse-time arith error (e.g. assignment to a non-lvalue) is also
-    // non-fatal. The expansion contributes empty; pending_fatal_status
-    // stays None.
+fn expand_arith_part_invalid_lhs_assignment_raises_discard() {
+    // v312 (#3/#49): a parse-time arith error (e.g. assignment to a
+    // non-lvalue) also raises `pending_discard` in default mode (not
+    // pending_fatal_status). The expansion contributes empty.
     let mut shell = Shell::new();
     let word = Word(vec![arith_part("1 + 2 = 3")]);
     let _ = expand(&word, &mut shell);
     assert_eq!(shell.pending_fatal_status, None);
+    assert!(shell.pending_discard);
 }
 
 #[test]
