@@ -295,6 +295,9 @@ pub fn run_program_in_sinks(
         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
         ExecOutcome::Interrupted(InterruptReason::Sigint) => 130,
         ExecOutcome::Interrupted(InterruptReason::Timeout) => 124,
+        // v312 (#3/#49): a discard that reaches the top-level reducer decodes to
+        // 1 (the driver loop normally consumes it and continues; defensive).
+        ExecOutcome::Interrupted(InterruptReason::FatalExpansion) => 1,
     };
     crate::traps::fire_exit_trap(&mut shell);
     shell.hangup_jobs();

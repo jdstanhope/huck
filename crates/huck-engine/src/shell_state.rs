@@ -742,6 +742,11 @@ pub struct Shell {
     /// `take_pending_fatal_status` to decide whether to exit (in
     /// non-interactive mode) or return to prompt (interactive).
     pub pending_fatal_status: Option<i32>,
+    /// v312 (#3/#49): a fatal arithmetic expansion error is pending — the current
+    /// command must be DISCARDED (converted to `Interrupted(FatalExpansion)`).
+    /// Sibling of `pending_fatal_status` but the DISCARD flavor (unwind the
+    /// current top-level command, status 1) rather than exit-shell.
+    pub pending_discard: bool,
     /// Set by a POSIX special builtin when it hits a usage / bad-option /
     /// bad-assignment error (NOT a runtime error). Consumed by the executor's
     /// bare special-builtin dispatch to fire `posix_fatal`. Cleared per command.
@@ -1073,6 +1078,7 @@ impl Shell {
             inline_scalar_export: Vec::new(),
             function_source: std::collections::HashMap::new(),
             pending_fatal_status: None,
+            pending_discard: false,
             builtin_usage_error: None,
             is_interactive: std::io::stdin().is_terminal(),
             is_command_string: false,
@@ -3004,6 +3010,11 @@ impl Shell {
     /// Returns and clears the pending fatal-PE-error flag.
     pub fn take_pending_fatal_status(&mut self) -> Option<i32> {
         self.pending_fatal_status.take()
+    }
+
+    /// Returns and clears the pending arithmetic-discard flag (v312 #3/#49).
+    pub fn take_pending_discard(&mut self) -> bool {
+        std::mem::take(&mut self.pending_discard)
     }
 
     /// Mark a POSIX-mode fatal error: a non-interactive posix shell exits with

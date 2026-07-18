@@ -394,6 +394,12 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     124
                 }
+                // v312 (#3/#49): a comsub boundary CONTAINS the discard — return
+                // 1 WITHOUT re-raising a flag, so the enclosing command
+                // CONTINUES (bash: `x=$( echo $((3.5)) ); echo after` runs
+                // `after`). Unlike the Sigint/Timeout arms above, no flag is
+                // re-stored: the discard died at this boundary.
+                InterruptReason::FatalExpansion => 1,
             }
         }
     };
@@ -433,6 +439,15 @@ fn run_andor_group(
     // would see a stale value.
     if let ExecOutcome::Continue(c) = status {
         shell.set_last_status(c);
+        // v312 (#3/#49): a pending arithmetic-discard converts this command's
+        // outcome into the Interrupted(FatalExpansion) unwind — the current
+        // top-level command is discarded (out of loops/functions), contained at
+        // a comsub boundary, and continued (not exited) at the driver loop.
+        // Checked BEFORE pending_fatal_status: the discard flavor wins if both
+        // were somehow raised by the same command.
+        if shell.take_pending_discard() {
+            return ExecOutcome::Interrupted(InterruptReason::FatalExpansion);
+        }
         if shell.pending_fatal_status.is_some() {
             return ExecOutcome::Continue(c);
         }
@@ -476,6 +491,11 @@ fn run_andor_group(
             }
             if let ExecOutcome::Continue(c) = status {
                 shell.set_last_status(c);
+                // v312 (#3/#49): pending arithmetic-discard → unwind (see the
+                // sibling conversion above for the `first` command).
+                if shell.take_pending_discard() {
+                    return ExecOutcome::Interrupted(InterruptReason::FatalExpansion);
+                }
                 if shell.pending_fatal_status.is_some() {
                     return ExecOutcome::Continue(c);
                 }
@@ -2313,6 +2333,11 @@ fn run_case(
     while i < clause.items.len() {
         let item = &clause.items[i];
         let run_this = fall_through || case_item_matches(item, &subject, shell);
+        // v312 (#3/#49): a `$(( ))` arith error in the case subject discards the
+        // whole `case` command (unwind), mirroring pending_fatal_status below.
+        if shell.take_pending_discard() {
+            return ExecOutcome::Interrupted(InterruptReason::FatalExpansion);
+        }
         if let Some(status) = shell.pending_fatal_status {
             return ExecOutcome::Continue(status);
         }
@@ -3439,6 +3464,12 @@ fn resolve(
     if let Some(status) = shell.pending_fatal_status {
         return Err(status);
     }
+    // v312 (#3/#49): a `$(( ))` arith error while expanding the program word
+    // discards the command — skip resolution so it never runs (converted to
+    // Interrupted(FatalExpansion) at the and-or conversion points).
+    if shell.pending_discard {
+        return Err(1);
+    }
     if prog_fields.is_empty() {
         crate::sh_error_to!(shell, err, None, "command not found:");
         return Err(127);
@@ -3483,6 +3514,11 @@ fn resolve(
         };
         if let Some(status) = shell.pending_fatal_status {
             return Err(status);
+        }
+        // v312 (#3/#49): a `$(( ))` arith error while expanding an argument word
+        // discards the command — skip so it never runs.
+        if shell.pending_discard {
+            return Err(1);
         }
         if let Some(da) = decl_args.as_mut() {
             for s in fields {
@@ -7683,7 +7719,13 @@ pub(crate) fn apply_one_assignment(
             let idx = match crate::expand::eval_subscript(subscript, shell, name) {
                 Ok(i) => i,
                 Err(msg) => {
-                    crate::sh_error_to!(shell, err, None, "{msg}");
+                    // v312 (#3/#49): if a `$(( ))` arith error in the subscript
+                    // already raised the discard, the command is being unwound —
+                    // suppress the secondary "bad array subscript" diagnostic
+                    // (bash prints only the arith error, then discards).
+                    if !shell.pending_discard {
+                        crate::sh_error_to!(shell, err, None, "{msg}");
+                    }
                     return Err(());
                 }
             };
@@ -7822,7 +7864,7 @@ fn expand_array_elements(
                 };
                 map.insert(idx, value);
                 implicit = idx + 1;
-                if shell.pending_fatal_status.is_some() {
+                if shell.pending_fatal_status.is_some() || shell.pending_discard {
                     return Err(());
                 }
             }
@@ -7831,7 +7873,7 @@ fn expand_array_elements(
                     map.insert(implicit, field);
                     implicit += 1;
                 }
-                if shell.pending_fatal_status.is_some() {
+                if shell.pending_fatal_status.is_some() || shell.pending_discard {
                     return Err(());
                 }
             }
@@ -8057,6 +8099,9 @@ pub fn fork_and_run_in_subshell(
             ExecOutcome::FunctionReturn(n) => n,
             ExecOutcome::Interrupted(InterruptReason::Sigint) => 130,
             ExecOutcome::Interrupted(InterruptReason::Timeout) => 124,
+            // v312 (#3/#49): a discard reaching a subshell/child reducer decodes
+            // to 1 (the driver normally handles it; defensive here).
+            ExecOutcome::Interrupted(InterruptReason::FatalExpansion) => 1,
         };
         let status = status.rem_euclid(256);
         // Flush the builtin's buffered stdout to the dup2'd fd 1 (pipe or

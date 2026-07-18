@@ -252,6 +252,15 @@ pub fn run(args: &[String], version: &str) -> i32 {
                         let mut shell = shell_cell.borrow_mut();
                         shell.set_last_status(0)
                     }
+                    // v312 (#3/#49): a fatal arithmetic-expansion DISCARD unwound
+                    // to the prompt — set $?=1 and reprompt (bash discards the
+                    // line, no ^C newline). SIGINT/Timeout keep the 130 + newline.
+                    ExecOutcome::Interrupted(
+                        huck_engine::builtins::InterruptReason::FatalExpansion,
+                    ) => {
+                        let mut shell = shell_cell.borrow_mut();
+                        shell.set_last_status(1);
+                    }
                     ExecOutcome::Interrupted(_) => {
                         let mut shell = shell_cell.borrow_mut();
                         shell.set_last_status(130);
