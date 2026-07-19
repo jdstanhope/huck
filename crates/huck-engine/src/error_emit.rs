@@ -23,6 +23,8 @@
 
 use crate::err_thread_local::with_err;
 use crate::shell_state::Shell;
+use huck_syntax::command::{Delim, ExpectFailure, Found, ParseError};
+use huck_syntax::spell::{spell_delim, spell_token};
 
 /// Selects which bash prologue form [`Shell::error_prefix`](crate::shell_state::Shell::error_prefix)
 /// composes — see the design spec's §3 matrix.
@@ -59,13 +61,187 @@ pub fn emit_error(shell: &Shell, cmd: Option<&str>, body: std::fmt::Arguments) {
 /// Emit a SYNTAX/parser diagnostic. Prologue: `<name>: [-c: ]line N: `. The
 /// `line` comes from the `ParseError`/`LexError`'s own location, not
 /// `Shell::current_lineno`; there is never a `cmd:` segment (the parser has
-/// no builtin context).
+/// no builtin context). Thin delegate to [`emit_syntax_error_ex`] with no
+/// source-echo line.
 pub fn emit_syntax_error(shell: &Shell, line: u32, body: std::fmt::Arguments) {
+    emit_syntax_error_ex(shell, line, body, None);
+}
+
+/// General syntax-error emitter (v314, #211). `echo` = the source line to
+/// reproduce on a second `<prefix>`-line (bash's Shape 1: `near unexpected
+/// token` followed by the offending source line quoted in backticks). The
+/// `<name>: [-c: ]line N: ` prologue is always built by
+/// [`Shell::error_prefix`](crate::shell_state::Shell::error_prefix) and is
+/// reused verbatim for the echo line (bash repeats the identical prologue).
+pub fn emit_syntax_error_ex(
+    shell: &Shell,
+    line: u32,
+    body: std::fmt::Arguments,
+    echo: Option<&str>,
+) {
     with_err(|err| {
-        let _ = write!(err, "{}", shell.error_prefix(Diag::Syntax { line }));
+        let prefix = shell.error_prefix(Diag::Syntax { line });
+        let _ = write!(err, "{prefix}");
         let _ = err.write_fmt(body);
         let _ = err.write_all(b"\n");
+        if let Some(src) = echo {
+            let _ = write!(err, "{prefix}`{src}'\n");
+        }
     });
+}
+
+/// Classify a `ParseError` into bash's three syntax-error shapes and emit it
+/// (v314, #211):
+///
+/// 1. **Near-token**: a real token is present but misplaced —
+///    `syntax error near unexpected token `X'` followed by the offending
+///    source line quoted in backticks.
+/// 2. **Unexpected EOF**: a keyword/paren construct (`if`, `while`, `case`,
+///    `(`, `{`, `function`) is still open when input runs out —
+///    `syntax error: unexpected end of file`.
+/// 3. **Unterminated quote/expansion**: EOF inside an open quote or
+///    expansion delimiter (`"`, `'`, `` ` ``, `$(`, `$((`, `${`, `[[`) —
+///    `unexpected EOF while looking for matching `X'`.
+///
+/// `source` is the full input text; `token_line` is the pre-computed 1-based
+/// line of the error position (used for Shape 1's echoed source line). v314:
+/// top-level only — no eval/comsub markers (Task 4+ wires the driver; this
+/// renderer is not yet called from production code).
+pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_line: u32) {
+    // bash's EOF line counter is "one past the last line read", regardless
+    // of whether the source ends in a trailing newline (verified against
+    // real bash 5.2.21: `bash -c 'if true'` and `bash -c $'if true\n'` both
+    // report `line 2`) — so this counts LOGICAL lines via `str::lines()`,
+    // not raw `\n` bytes (a byte count under-counts by one for the common
+    // no-trailing-newline case).
+    let eof_line = 1 + source.lines().count() as u32;
+    let echo_line = source_logical_line(source, token_line);
+    match err {
+        // Shape 1: a real token is present but misplaced.
+        ParseError::Unexpected(f) if matches!(f.found, Found::Token(_)) => {
+            let Found::Token(k) = &f.found else {
+                unreachable!()
+            };
+            let tok = spell_token(k);
+            emit_syntax_error_ex(
+                shell,
+                token_line,
+                format_args!("syntax error near unexpected token `{tok}'"),
+                Some(&echo_line),
+            );
+        }
+        // Shape 3: EOF inside an open quote/delimiter.
+        ParseError::Unexpected(ExpectFailure {
+            found: Found::Eof,
+            matching: Some(d),
+            ..
+        }) if is_matching_delim(*d) => {
+            emit_matching(shell, *d, source);
+        }
+        ParseError::Lex(le) => match lex_is_shape3(le) {
+            Some(d) => emit_matching(shell, d, source),
+            None => {
+                emit_syntax_error_ex(shell, token_line, format_args!("syntax error: {err}"), None);
+            }
+        },
+        // Shape 2: EOF while a keyword/paren construct is open.
+        ParseError::UnterminatedIf
+        | ParseError::UnterminatedLoop
+        | ParseError::UnterminatedCase
+        | ParseError::UnterminatedSubshell
+        | ParseError::UnterminatedBrace
+        | ParseError::UnterminatedFunction
+        | ParseError::Unexpected(ExpectFailure {
+            found: Found::Eof, ..
+        }) => {
+            emit_syntax_error_ex(
+                shell,
+                eof_line,
+                format_args!("syntax error: unexpected end of file"),
+                None,
+            );
+        }
+        // Fallback: keep the descriptive message (unmigrated / non-top-level).
+        other => {
+            emit_syntax_error_ex(
+                shell,
+                token_line,
+                format_args!("syntax error: {other}"),
+                None,
+            );
+        }
+    }
+}
+
+/// Emits Shape 3 (`unexpected EOF while looking for matching `X'`) for
+/// delimiter `d`. Bash's line number for this shape depends on the
+/// delimiter: a quote/`$((`/`${`/backtick is reported at the line the
+/// delimiter itself OPENED on (v314 top-level-only: always line 1, since
+/// this renderer has no per-token line tracking below the top level yet);
+/// `$(` — an unterminated command substitution — is reported at the EOF
+/// line instead (bash keeps scanning to the end of input before giving up
+/// on a `$(`).
+fn emit_matching(shell: &Shell, d: Delim, source: &str) {
+    let eof_line = 1 + source.lines().count() as u32;
+    let line = match d {
+        Delim::DollarParen | Delim::Paren => eof_line,
+        _ => 1,
+    };
+    let spelled = spell_delim(d);
+    // DBracket renders as `]]`.
+    let matchtxt = if matches!(d, Delim::DBracket) {
+        "]]".to_string()
+    } else {
+        spelled.to_string()
+    };
+    emit_syntax_error_ex(
+        shell,
+        line,
+        format_args!("unexpected EOF while looking for matching `{matchtxt}'"),
+        None,
+    );
+}
+
+/// Returns the `line`-th (1-based) logical line of `source`, trailing `\n`
+/// stripped (`str::lines()` already excludes it). Out-of-range lines return
+/// `""`.
+fn source_logical_line(source: &str, line: u32) -> String {
+    source
+        .lines()
+        .nth(line.saturating_sub(1) as usize)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// True for delimiters bash reports as `unexpected EOF while looking for
+/// matching `X'` (Shape 3: quotes, backtick, `$(`, `$((`, `${`, `[[`).
+/// False for `Paren`/`Brace` — those are keyword/subshell constructs bash
+/// reports as the generic `unexpected end of file` (Shape 2) instead.
+fn is_matching_delim(d: Delim) -> bool {
+    !matches!(d, Delim::Paren | Delim::Brace)
+}
+
+/// Maps a lex-level "ran out of input" error to the Shape-3 delimiter it was
+/// looking for, if any (`None` for lex errors that aren't an open-delimiter
+/// EOF, e.g. `InvalidVarName`).
+///
+/// NOTE (quote char, v314 Task 3): `LexError::UnterminatedQuote` is a unit
+/// variant — it does not record WHICH quote (`'` vs `"`) was left open. This
+/// defaults to `Delim::DQuote` (`"`) for both; Task 5 refines this against
+/// the bash-diff harness (which exercises both quote chars) by either
+/// threading the quote char into the variant or disambiguating some other
+/// way. Recorded in the task report.
+fn lex_is_shape3(le: &huck_syntax::lexer::LexError) -> Option<Delim> {
+    use huck_syntax::lexer::LexError;
+    match le {
+        LexError::UnterminatedQuote => Some(Delim::DQuote),
+        LexError::UnterminatedSubstitution => Some(Delim::DollarParen),
+        LexError::UnterminatedArith
+        | LexError::UnterminatedLegacyArith
+        | LexError::UnterminatedArithBlock => Some(Delim::DollarDParen),
+        LexError::UnterminatedBrace => Some(Delim::DollarBrace),
+        _ => None,
+    }
 }
 
 /// Emit a diagnostic with no `Shell` in scope: `<prog>: <msg>` — no line, no
@@ -201,6 +377,80 @@ mod tests {
             sh_error!(&sh, None, "readonly variable");
         });
         assert_eq!(buf, b"huck: readonly variable\n");
+    }
+
+    /// Builds a non-interactive `-c`-mode `Shell` mirroring
+    /// `emit_syntax_error_carries_its_own_line`'s setup, but with
+    /// `is_command_string = true` / `shell_argv0 = "huck"` so
+    /// `Shell::error_prefix` emits the `-c: ` segment the v314 renderer
+    /// shape tests assert against.
+    fn shape_test_shell() -> Shell {
+        let mut sh = Shell::new();
+        sh.is_interactive = false;
+        sh.is_command_string = true;
+        sh.shell_argv0 = "huck".to_string();
+        sh
+    }
+
+    #[test]
+    fn shape1_near_token_with_echo() {
+        use huck_syntax::command::{ExpectFailure, Found, ParseError};
+        use huck_syntax::lexer::{Operator, TokenKind};
+
+        let sh = shape_test_shell();
+        let mut out = StdoutSink::Terminal;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut err = StderrSink::Capture(&mut buf);
+        let e = ParseError::Unexpected(ExpectFailure {
+            found: Found::Token(TokenKind::Op(Operator::RParen)),
+            matching: None,
+            pos: 5,
+        });
+        install_err_sinks(&mut out, &mut err, || {
+            render_syntax_diag(&sh, &e, "echo )", 1);
+        });
+        assert_eq!(
+            buf,
+            b"huck: -c: line 1: syntax error near unexpected token `)'\n\
+              huck: -c: line 1: `echo )'\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn shape2_unexpected_eof() {
+        use huck_syntax::command::ParseError;
+
+        let sh = shape_test_shell();
+        let mut out = StdoutSink::Terminal;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut err = StderrSink::Capture(&mut buf);
+        install_err_sinks(&mut out, &mut err, || {
+            render_syntax_diag(&sh, &ParseError::UnterminatedIf, "if true", 1);
+        });
+        assert_eq!(
+            buf,
+            b"huck: -c: line 2: syntax error: unexpected end of file\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn shape3_matching_dquote() {
+        use huck_syntax::command::ParseError;
+        use huck_syntax::lexer::LexError;
+
+        let sh = shape_test_shell();
+        let mut out = StdoutSink::Terminal;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut err = StderrSink::Capture(&mut buf);
+        let e = ParseError::Lex(Box::new(LexError::UnterminatedQuote));
+        install_err_sinks(&mut out, &mut err, || {
+            render_syntax_diag(&sh, &e, "echo \"hi", 1);
+        });
+        assert_eq!(
+            buf,
+            b"huck: -c: line 1: unexpected EOF while looking for matching `\"'\n".to_vec()
+        );
     }
 }
 
