@@ -4,6 +4,54 @@ bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
 Sweep date: 2026-07-19 UTC (v313 full re-sweep — verifies the v299–v313 arc: the job-control batch (v299–v306), the heredoc-in-process / builtin write-error work (v307–v308), the huck-engine fork-guard (v309), in-process group stderr under `2>&1` in `$()` (v310), and the three error-fatality-funnel fixes — negated-pipeline errexit (v311/#1), arithmetic-expansion discard (v312/#3), readonly-assignment discard (v313/#31)). **NO change and NO regression: PASS holds at 15/82, TIMEOUT 0, ERROR 0 — the same 15 categories pass, none regressed, no new hangs.** Why no category flipped despite real fixes: each failing category is gated by SEVERAL independent divergences, and the arc fixed narrow ones that shrink diffs below the flip threshold. Case in point — v313 resolved L-43 (readonly-assignment abort), the note previously cited as `case`'s SOLE blocker, but the current `case` diff exposes two more live divergences (see its row), so it stays FAIL. **The 67 FAIL notes below have drifted since v268/v298 — treat them as approximate; the count is the authoritative signal.** Near-miss ranking (smallest current diffs, closest to PASS): `posix2` (5 lines — error-diagnostic format on `case esac in esac)`, [#209](https://github.com/jdstanhope/huck/issues/209)), `procsub` (9), `dbg-support2`/`nquote`/`rhs-exp` (12). Prior sweep provenance: 2026-07-15 UTC (v298 re-sweep, PASS 10→15: +getopts, input-test, iquote, nquote1, tilde; TIMEOUT 4→2 then 2→0 via v299 harness correction); 2026-07-07 UTC (v268 full re-sweep); 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers; v219 cprint+herestr flip; v220 herestr; v225 func).
 
+**v314 targeted re-sweep** (2026-07-19 UTC, syntax-error 3-shape alignment
+#211 — top-level `ParseError`/`LexError` diagnostics now render as one of
+bash's three shapes: near-token (`syntax error near unexpected token
+`X'`), unexpected-EOF (`syntax error: unexpected end of file`), or
+unterminated-quote/delimiter (`unexpected EOF while looking for matching
+`X'`); `tests/scripts/syntax_error_diag_diff_check.sh` is 27/27
+byte-identical incl. exit code, and the full sweep is 209/209).
+Re-swept only the categories most likely to move
+(`parser`, `errors`, `comsub`, `comsub-posix`, `array`, `posix2`) rather
+than the full 82 — **no category flipped**, matching the pattern the
+v299–v313 arc already established (a shrunk diff below the flip
+threshold, not a flip, unless a category's diff was ENTIRELY the fixed
+class). Per-category evidence:
+- `parser`: diff shrank to 13 lines. The `for`/`case`-in-`for` fragments'
+  wording now matches bash's Shape 1/2 text; the residual is (a) an
+  unrelated `not a valid identifier` diagnostic that wrongly carries a
+  `line N:` prefix (not a top-level syntax error, so out of `render_syntax_diag`'s
+  scope) and (b) a line-alignment artifact from an earlier divergence in
+  the same fixture file.
+- `posix2`: the `case esac in esac) ...` fragment's MESSAGE TEXT and
+  echoed source line now match bash exactly (`syntax error near
+  unexpected token `)'` / the quoted line) — the sole remaining diff is
+  the diagnostic prefix: bash prints `./posix2.tests: line 1:`, huck
+  prints `./posix2.tests: eval: line 199:` (the error occurs inside an
+  `eval`; huck's prefix leaks its internal `eval:`-marker + eval-body line
+  number instead of the calling script's physical line). This is exactly
+  the gap [#209](https://github.com/jdstanhope/huck/issues/209) attributes
+  to v315's planned `eval:` marker — confirms the diagnosis, not yet fixed.
+- `comsub` / `comsub-posix`: diffs (25 / 41 lines) are dominated by
+  unrelated pre-existing gaps — a structural over-acceptance inside a
+  nested `case`/`$(` fixture, `unsupported expansion` fallback wording on
+  an unimplemented expansion form, and a `$THIS_SH`-path test-fixture
+  mismatch — none are 3-shape wording. Not moved by v314 (expected).
+- `errors`: diff (230 lines) is still dominated by unimplemented
+  `alias -x`/`unalias -x`/`readonly -f`/`declare +r` option surface, as
+  the existing row's note already describes; unaffected by v314.
+- `array`: diff (793 lines) unaffected — the existing row's note (missing
+  `set +a`, array-literal-with-`&` parsing) already covers its causes,
+  none of which are top-level syntax-error wording.
+
+**Side effect resolved:** `tests/scripts/cmdsub_comment_diff_check.sh`
+(a comment-only `$()` body at EOF, previously a known pre-existing gap —
+see MEMORY.md's `huck-cmdsub-comment-only-body-eof` entry, 1/8 PASS) is
+now 8/8 — the old `MissingCommand`-fallback wording for that case is
+superseded by the aligned Shape 3 (`unexpected EOF while looking for
+matching`) rendering, which happens to match bash's actual behavior for
+this fragment too.
+
 Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven front-end (oracle deletion, `${…}`/subscript/assignment paths) cost zero bash-suite compatibility — every previously-passing category still passes, no new TIMEOUTs, and the array/subscript/assignment categories (`array`, `array2`, `assoc`, `appendop`, `tilde`, `posixpat`) stay FAIL for the same pre-existing non-front-end reasons recorded below.
 
 ## Summary
@@ -85,8 +133,8 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | nquote3 | FAIL | Same Ctrl-A IFS class as nquote2: substring extraction and quoting operations on strings with embedded Ctrl-A characters produce empty arguments in huck where bash produces the expected Ctrl-A-containing substrings. |
 | nquote4 | FAIL | The braced hex-escape form `\x{NN}` inside `$'...'` strings is not implemented in huck: the sequence is passed through literally while bash expands it to the corresponding byte. Unbraced `\xNN` and other escape forms may have separate issues. |
 | nquote5 | PASS | |
-| parser | FAIL | Error-message format divergence — huck uses its own name as prefix rather than the invoking-script-and-line form bash uses. Same L-class format divergence as execscript/type/dirstack. |
-| posix2 | FAIL | Three POSIX compliance failures: OPTIND initial value, variable-quoting edge cases, and the `case esac` pattern (using the keyword `esac` as a pattern value, which is L-20 class — case pattern inside a complex context). |
+| parser | FAIL | v314 (#211) shrank the diff to 13 lines: the `for`/`case`-in-`for` syntax-error TEXT now matches bash's near-token/unexpected-EOF shapes byte-for-byte. Remaining: an unrelated `not a valid identifier` diagnostic wrongly carries a `line N:` prefix (not a top-level parse error, outside `render_syntax_diag`'s scope), plus a line-alignment artifact downstream of it. |
+| posix2 | FAIL | v314 (#211): the `case esac in esac) ...` fragment's error TEXT now matches bash exactly; the sole remaining diff on that line is the diagnostic PREFIX — huck emits `eval: line 199:` (leaking its internal eval-body line count) where bash emits `line 1:` (the calling script's physical line). Confirms [#209](https://github.com/jdstanhope/huck/issues/209)'s diagnosis; needs v315's `eval:`-marker work. Other pre-existing POSIX compliance failures (OPTIND initial value, variable-quoting edge cases) remain, unrelated to v314. |
 | posixexp | FAIL | Multiple real divergences: quoting-aware pattern removal (`${var//pattern}`) strips more content than bash; an unterminated `${...}` form that bash accepts causes a syntax error in huck; `$*` with a non-whitespace IFS joins with a space instead of the IFS character (producing `1 2` where bash produces `12`); IFS-splitting at word boundaries diverges (huck splits where bash keeps tokens joined); and the test-case label printed for IFS diagnostic output shows `(null)` in huck versus the actual IFS value in bash for some edge cases. |
 | posixexp2 | FAIL | `set: posix: not yet supported` misconfigures the test environment; also an unterminated `${...}` handling difference when posix mode is presumed active. |
 | posixpat | FAIL | POSIX bracket-expression edge cases — specifically certain character-range and negated-bracket patterns where huck and bash produce different match results. New bug in the POSIX-ERE-adjacent glob matching path. |

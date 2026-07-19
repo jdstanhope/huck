@@ -8,9 +8,10 @@ FAIL=0
 norm() { sed -E "s#^(bash|.*/huck|huck): #SH: #"; }
 check() {
   local label=$1 frag=$2 b h br hr
-  b=$(bash -c "$frag" 2>&1 >/dev/null | norm); br=$?
-  h=$("$HUCK" -c "$frag" 2>&1 >/dev/null | norm); hr=$?
-  if [ "$b" != "$h" ]; then echo "FAIL [$label]"; echo "  bash: [$b]"; echo "  huck: [$h]"; FAIL=1
+  b=$(bash -c "$frag" 2>&1 >/dev/null | norm); br=${PIPESTATUS[0]}
+  h=$("$HUCK" -c "$frag" 2>&1 >/dev/null | norm); hr=${PIPESTATUS[0]}
+  if [ "$b" != "$h" ] || [ "$br" != "$hr" ]; then
+    echo "FAIL [$label]"; echo "  bash(rc=$br): [$b]"; echo "  huck(rc=$hr): [$h]"; FAIL=1
   else echo "PASS [$label]"; fi
 }
 # Shape 1 — near unexpected token
