@@ -743,7 +743,7 @@ pub struct Shell {
     /// non-interactive mode) or return to prompt (interactive).
     pub pending_fatal_status: Option<i32>,
     /// v312 (#3/#49): a fatal arithmetic expansion error is pending — the current
-    /// command must be DISCARDED (converted to `Interrupted(FatalExpansion)`).
+    /// command must be DISCARDED (converted to `Interrupted(DiscardCommand)`).
     /// Sibling of `pending_fatal_status` but the DISCARD flavor (unwind the
     /// current top-level command, status 1) rather than exit-shell.
     pub pending_discard: bool,

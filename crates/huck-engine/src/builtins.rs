@@ -12,14 +12,12 @@ use crate::shell_state::{SHOPT_TABLE, Shell};
 pub enum InterruptReason {
     Sigint,
     Timeout,
-    /// v312 (#3/#49): a fatal arithmetic EXPANSION error (`$(( ))` syntax /
-    /// division). Bash's `jump_to_top_level(DISCARD)`: unwind the current
-    /// top-level command (out of loops/functions), status 1, but DO NOT exit
-    /// the shell. A SYNCHRONOUS discard, not a signal — it reuses the
-    /// `Interrupted` unwind channel because the propagation is identical; only
-    /// the boundary/decoder sites treat it differently (contain at a comsub;
-    /// continue at the driver loop).
-    FatalExpansion,
+    /// v312/v313: a fatal error that DISCARDS the current top-level command
+    /// (bash `jump_to_top_level(DISCARD)`) — unwind out of loops/functions,
+    /// status 1, but the shell is NOT exited. Raised by a fatal `$(( ))`
+    /// expansion error (#3) and a readonly-variable assignment error (#31);
+    /// contained at execution boundaries; the driver loop continues on it.
+    DiscardCommand,
 }
 
 /// The result of running a command — either the shell continues (carrying the
@@ -7702,7 +7700,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                         // status 1) — it does NOT exit the shell. Record status 1
                         // and keep reading the next unit (a later script line still
                         // runs). Sigint/Timeout still terminate the whole run.
-                        ExecOutcome::Interrupted(InterruptReason::FatalExpansion) => {
+                        ExecOutcome::Interrupted(InterruptReason::DiscardCommand) => {
                             last_status = 1;
                         }
                         ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
