@@ -399,7 +399,7 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
                 // CONTINUES (bash: `x=$( echo $((3.5)) ); echo after` runs
                 // `after`). Unlike the Sigint/Timeout arms above, no flag is
                 // re-stored: the discard died at this boundary.
-                InterruptReason::FatalExpansion => 1,
+                InterruptReason::DiscardCommand => 1,
             }
         }
     };
@@ -440,13 +440,13 @@ fn run_andor_group(
     if let ExecOutcome::Continue(c) = status {
         shell.set_last_status(c);
         // v312 (#3/#49): a pending arithmetic-discard converts this command's
-        // outcome into the Interrupted(FatalExpansion) unwind — the current
+        // outcome into the Interrupted(DiscardCommand) unwind — the current
         // top-level command is discarded (out of loops/functions), contained at
         // a comsub boundary, and continued (not exited) at the driver loop.
         // Checked BEFORE pending_fatal_status: the discard flavor wins if both
         // were somehow raised by the same command.
         if shell.take_pending_discard() {
-            return ExecOutcome::Interrupted(InterruptReason::FatalExpansion);
+            return ExecOutcome::Interrupted(InterruptReason::DiscardCommand);
         }
         if shell.pending_fatal_status.is_some() {
             return ExecOutcome::Continue(c);
@@ -494,7 +494,7 @@ fn run_andor_group(
                 // v312 (#3/#49): pending arithmetic-discard → unwind (see the
                 // sibling conversion above for the `first` command).
                 if shell.take_pending_discard() {
-                    return ExecOutcome::Interrupted(InterruptReason::FatalExpansion);
+                    return ExecOutcome::Interrupted(InterruptReason::DiscardCommand);
                 }
                 if shell.pending_fatal_status.is_some() {
                     return ExecOutcome::Continue(c);
@@ -2336,7 +2336,7 @@ fn run_case(
         // v312 (#3/#49): a `$(( ))` arith error in the case subject discards the
         // whole `case` command (unwind), mirroring pending_fatal_status below.
         if shell.take_pending_discard() {
-            return ExecOutcome::Interrupted(InterruptReason::FatalExpansion);
+            return ExecOutcome::Interrupted(InterruptReason::DiscardCommand);
         }
         if let Some(status) = shell.pending_fatal_status {
             return ExecOutcome::Continue(status);
@@ -3466,7 +3466,7 @@ fn resolve(
     }
     // v312 (#3/#49): a `$(( ))` arith error while expanding the program word
     // discards the command — skip resolution so it never runs (converted to
-    // Interrupted(FatalExpansion) at the and-or conversion points).
+    // Interrupted(DiscardCommand) at the and-or conversion points).
     if shell.pending_discard {
         return Err(1);
     }
@@ -4120,12 +4120,20 @@ fn run_assignment_list(
                 let mut err = err_writer(err_sink, sink);
                 crate::sh_error_to!(shell, &mut *err, None, "{name}: readonly variable");
             }
-            shell.posix_fatal(127);
+            if shell.shell_options.posix && !shell.is_interactive {
+                shell.posix_fatal(127); // EXITPROG (v226): POSIX non-interactive exits 127
+            } else {
+                shell.pending_discard = true; // DISCARD (v312/#31): discard the current command, rc 1
+            }
             st = 1;
             break;
         }
         if apply_one_assignment(a, shell, &mut *err_writer(err_sink, sink)).is_err() {
-            shell.posix_fatal(127);
+            if shell.shell_options.posix && !shell.is_interactive {
+                shell.posix_fatal(127); // EXITPROG (v226): POSIX non-interactive exits 127
+            } else {
+                shell.pending_discard = true; // DISCARD (v312/#31): discard the current command, rc 1
+            }
             st = 1;
             break;
         }
@@ -8101,7 +8109,7 @@ pub fn fork_and_run_in_subshell(
             ExecOutcome::Interrupted(InterruptReason::Timeout) => 124,
             // v312 (#3/#49): a discard reaching a subshell/child reducer decodes
             // to 1 (the driver normally handles it; defensive here).
-            ExecOutcome::Interrupted(InterruptReason::FatalExpansion) => 1,
+            ExecOutcome::Interrupted(InterruptReason::DiscardCommand) => 1,
         };
         let status = status.rem_euclid(256);
         // Flush the builtin's buffered stdout to the dup2'd fd 1 (pipe or

@@ -82,8 +82,12 @@ fn platform_and_host_present() {
 
 #[test]
 fn uid_is_readonly() {
+    // A readonly-var assignment error DISCARDS the current top-level command
+    // (v313/#31, matching bash), so `UID=99999; echo $UID` on one line would
+    // never reach the echo. Contain the failed assignment in a subshell so the
+    // parent's `echo $UID` still runs and can prove UID is unchanged.
     let real = huck("echo $UID");
-    let after = huck("UID=99999 2>/dev/null; echo $UID");
+    let after = huck("( UID=99999 ) 2>/dev/null; echo $UID");
     assert_eq!(
         after.trim(),
         real.trim(),
