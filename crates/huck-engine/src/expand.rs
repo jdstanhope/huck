@@ -1202,7 +1202,7 @@ fn expand_part(
                     // (#3/#49): default mode DISCARDS the current top-level
                     // command (bash `jump_to_top_level(DISCARD)`, status 1,
                     // shell NOT exited) — set `pending_discard`, converted to
-                    // `Interrupted(FatalExpansion)` at the executor's
+                    // `Interrupted(DiscardCommand)` at the executor's
                     // post-expansion check points. POSIX non-interactive EXITS
                     // the shell (127) via `posix_fatal` (verified against bash
                     // 5.2.21 --posix). The empty contribution matches bash's

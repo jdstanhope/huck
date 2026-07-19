@@ -955,7 +955,7 @@ fn expand_arith_part_division_by_zero_raises_discard() {
     // v312 (#3/#49): an arith eval error (e.g. division by zero) in $((…))
     // raises `pending_discard` in default mode — bash's
     // jump_to_top_level(DISCARD), which the executor converts to
-    // Interrupted(FatalExpansion) to unwind the current top-level command.
+    // Interrupted(DiscardCommand) to unwind the current top-level command.
     // It is the DISCARD flavor, NOT exit-shell, so `pending_fatal_status`
     // stays None (that is the set -u/${x?} flavor). Resolves the old L-55
     // "non-fatal, keep going" divergence.

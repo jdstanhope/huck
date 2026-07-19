@@ -256,7 +256,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
                     // to the prompt — set $?=1 and reprompt (bash discards the
                     // line, no ^C newline). SIGINT/Timeout keep the 130 + newline.
                     ExecOutcome::Interrupted(
-                        huck_engine::builtins::InterruptReason::FatalExpansion,
+                        huck_engine::builtins::InterruptReason::DiscardCommand,
                     ) => {
                         let mut shell = shell_cell.borrow_mut();
                         shell.set_last_status(1);
