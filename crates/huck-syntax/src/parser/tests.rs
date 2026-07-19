@@ -2781,8 +2781,22 @@ fn cs_comment_only_body_at_eof_is_unterminated() {
 #[test]
 fn process_sub_comment_only_body_at_eof_is_unterminated() {
     // #109 sibling: `<(` with a comment-only body at EOF is likewise unterminated.
+    //
+    // v314 Task 5 (#211): bash reports this as Shape 3 (`unexpected EOF
+    // while looking for matching `)'`), the same `$(`-style
+    // `Found::Eof`/`Delim::DollarParen` shape `parse_command_sub` uses — NOT
+    // the bare-`(` subshell's `UnterminatedSubshell` — verified against real
+    // bash 5.2.21 (`bash -c 'cat <(# c'` -> `line 2: unexpected EOF while
+    // looking for matching `)'`).
     assert!(
-        matches!(new_seq("cat <(# c"), Err(ParseError::UnterminatedSubshell)),
+        matches!(
+            new_seq("cat <(# c"),
+            Err(ParseError::Unexpected(ExpectFailure {
+                found: Found::Eof,
+                matching: Some(Delim::DollarParen),
+                ..
+            }))
+        ),
         "procsub comment-only body: got {:?}",
         new_seq("cat <(# c")
     );

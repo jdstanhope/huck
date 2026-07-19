@@ -1,7 +1,13 @@
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[non_exhaustive]
 pub enum LexError {
-    UnterminatedQuote,
+    /// EOF while a quoted span (`'…'`, `"…"`, or `$'…'`) was still open.
+    /// `double` is `true` for a `"…"` span, `false` for `'…'`/`$'…'` — bash
+    /// reports the matching delimiter as `` `"' `` vs `` `'' `` respectively
+    /// (v314 Task 5, #211).
+    UnterminatedQuote {
+        double: bool,
+    },
     InvalidVarName,
     UnterminatedBrace,
     UnterminatedSubstitution,
@@ -2318,7 +2324,7 @@ impl<'a> Lexer<'a> {
         if in_dquote {
             // ── Inside a double-quoted span ───────────────────────────────────
             match self.cursor.peek().copied() {
-                None => return Err(LexError::UnterminatedQuote),
+                None => return Err(LexError::UnterminatedQuote { double: true }),
 
                 // Closing `"` — flip frame back to unquoted; no token emitted this call.
                 // Returning `Step::Produced` is safe: the cursor advanced, so no spin.
@@ -2644,7 +2650,7 @@ impl<'a> Lexer<'a> {
                     let mut text = String::new();
                     loop {
                         match self.cursor.next() {
-                            None => return Err(LexError::UnterminatedQuote),
+                            None => return Err(LexError::UnterminatedQuote { double: false }),
                             Some('\'') => break,
                             Some(ch) => text.push(ch),
                         }
@@ -2689,7 +2695,7 @@ impl<'a> Lexer<'a> {
                     let in_l = self.cursor.line();
                     let in_c = self.cursor.column();
                     match self.cursor.peek().copied() {
-                        None => return Err(LexError::UnterminatedQuote),
+                        None => return Err(LexError::UnterminatedQuote { double: true }),
 
                         // Empty `""` — emit empty quoted Lit (preserves `""` = empty-string
                         // semantics); in_dquote stays false.
@@ -4640,7 +4646,7 @@ impl<'a> Lexer<'a> {
                 let mut text = String::new();
                 loop {
                     match self.cursor.next() {
-                        None => return Err(LexError::UnterminatedQuote),
+                        None => return Err(LexError::UnterminatedQuote { double: false }),
                         Some('\'') => break,
                         Some(ch) => text.push(ch),
                     }
@@ -5121,7 +5127,7 @@ impl<'a> Lexer<'a> {
         let l = self.cursor.line();
         let c = self.cursor.column();
         match self.cursor.peek().copied() {
-            None => Err(LexError::UnterminatedQuote),
+            None => Err(LexError::UnterminatedQuote { double: true }),
 
             // Closing `"` — emit EndDquote; the parser pops the DoubleQuote frame.
             Some('"') => {
@@ -5362,7 +5368,7 @@ impl<'a> Lexer<'a> {
                 let mut text = String::new();
                 loop {
                     match self.cursor.next() {
-                        None => return Err(LexError::UnterminatedQuote),
+                        None => return Err(LexError::UnterminatedQuote { double: false }),
                         Some('\'') => break,
                         Some(ch) => text.push(ch),
                     }
@@ -5536,7 +5542,7 @@ impl<'a> Lexer<'a> {
                 let mut text = String::new();
                 loop {
                     match self.cursor.next() {
-                        None => return Err(LexError::UnterminatedQuote),
+                        None => return Err(LexError::UnterminatedQuote { double: false }),
                         Some('\'') => break,
                         Some(ch) => text.push(ch),
                     }
@@ -6477,7 +6483,7 @@ fn scan_ansi_c_quoted(chars: &mut CharCursor<'_>) -> Result<String, LexError> {
     let mut out = String::new();
     loop {
         match chars.next() {
-            None => return Err(LexError::UnterminatedQuote),
+            None => return Err(LexError::UnterminatedQuote { double: false }),
             Some('\'') => return Ok(out),
             Some('\\') => decode_ansi_c_escape(chars, &mut out)?,
             Some(c) => out.push(c),
@@ -6509,7 +6515,7 @@ pub fn decode_ansi_c_escapes(v: &str) -> String {
 /// result to `out`. The leading `\` has already been consumed.
 fn decode_ansi_c_escape(chars: &mut CharCursor<'_>, out: &mut String) -> Result<(), LexError> {
     match chars.next() {
-        None => return Err(LexError::UnterminatedQuote),
+        None => return Err(LexError::UnterminatedQuote { double: false }),
         Some('a') => out.push('\x07'),
         Some('b') => out.push('\x08'),
         Some('e') | Some('E') => out.push('\x1B'),

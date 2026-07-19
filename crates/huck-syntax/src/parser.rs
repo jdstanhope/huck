@@ -1699,6 +1699,18 @@ fn unterminated_cmdsub(pos: usize) -> ParseError {
     })
 }
 
+/// Builds the Shape-3 `ParseError` for an unterminated `` `…` `` backtick
+/// substitution reaching real EOF before its closing `` ` `` — bash's
+/// `unexpected EOF while looking for matching ```'` (v314 Task 5, #211; see
+/// the note at `parse_backtick_sub`'s raw-capture loop, the only raise site).
+fn unterminated_backtick(pos: usize) -> ParseError {
+    ParseError::Unexpected(ExpectFailure {
+        found: Found::Eof,
+        matching: Some(Delim::Backtick),
+        pos,
+    })
+}
+
 /// v251: assemble a `WordPart::ProcessSub` for a `<(…)`/`>(…)` process
 /// substitution. Mirrors `parse_command_sub`: the body is a paren-delimited
 /// command sequence lexed under `Mode::CommandSub` (the lexer's bare-`(` opener
@@ -1727,9 +1739,17 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
     }
     // #109: same guard as parse_command_sub — a comment-only/empty body at EOF
     // is an unterminated process substitution.
+    //
+    // v314 Task 5 (#211): bash reports `<(`/`>(` at real EOF the same way it
+    // reports `$(` — Shape 3 (`unexpected EOF while looking for matching
+    // `)'`), not the bare-`(` subshell's Shape 2 (`unexpected end of file`) —
+    // verified against real bash 5.2.21 (`bash -c 'cat <(foo'`). Reuse
+    // `unterminated_cmdsub` (the same `$(`-style mapping `parse_command_sub`
+    // uses) rather than the raw `UnterminatedSubshell`.
     if iter.peek_kind()?.is_none() {
+        let pos = iter.cursor_pos();
         iter.pop_mode();
-        return Err(ParseError::UnterminatedSubshell);
+        return Err(unterminated_cmdsub(pos));
     }
     let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
         iter.next_kind()?; // consume `)`
@@ -1748,9 +1768,15 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
                 seq
             }
             Err(e) => {
+                // v314 Task 5 (#211): same `$(`-vs-bare-`(` remap as
+                // `parse_command_sub` — `parse_subshell_sequence` can't tell a
+                // process-sub `<( … `/`>( … ` from a real subshell `( … `, but
+                // bash reports the two differently at EOF.
+                let pos = iter.cursor_pos();
                 iter.pop_mode();
                 let mapped = match e {
                     ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
+                    ParseError::UnterminatedSubshell => unterminated_cmdsub(pos),
                     other => other,
                 };
                 return Err(mapped);
@@ -1956,7 +1982,12 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
             match iter.next_kind()? {
                 Some(TokenKind::BacktickRawText(s)) => raw.push_str(&s),
                 Some(TokenKind::EndBacktick) => return Ok(raw),
-                None => return Err(ParseError::UnterminatedSubshell), // unterminated `...`
+                // v314 Task 5 (#211): bash reports an unterminated `` `...` ``
+                // at real EOF as Shape 3 (`unexpected EOF while looking for
+                // matching ```'`) — verified against real bash 5.2.21
+                // (`bash -c 'echo `foo'`). Mirror `unterminated_cmdsub`'s
+                // `$(`-style mapping with `Delim::Backtick`.
+                None => return Err(unterminated_backtick(iter.cursor_pos())),
                 _ => return Err(ParseError::UnsupportedExpansion),
             }
         }

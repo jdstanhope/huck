@@ -30,7 +30,7 @@ pub enum Completeness {
 fn is_unterminated_lex(e: &LexError) -> bool {
     matches!(
         e,
-        LexError::UnterminatedQuote
+        LexError::UnterminatedQuote { .. }
             | LexError::UnterminatedBrace
             | LexError::UnterminatedSubstitution
             | LexError::UnterminatedArith

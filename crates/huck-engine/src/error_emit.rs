@@ -230,16 +230,15 @@ fn is_matching_delim(d: Delim) -> bool {
 /// looking for, if any (`None` for lex errors that aren't an open-delimiter
 /// EOF, e.g. `InvalidVarName`).
 ///
-/// NOTE (quote char, v314 Task 3): `LexError::UnterminatedQuote` is a unit
-/// variant — it does not record WHICH quote (`'` vs `"`) was left open. This
-/// defaults to `Delim::DQuote` (`"`) for both; Task 5 refines this against
-/// the bash-diff harness (which exercises both quote chars) by either
-/// threading the quote char into the variant or disambiguating some other
-/// way. Recorded in the task report.
+/// v314 Task 5 (#211): `LexError::UnterminatedQuote` carries a `double` flag
+/// (set at each lexer raise site) so an unterminated `'…'`/`$'…'` reports
+/// `Delim::SQuote` (`` `'' ``) and an unterminated `"…"` reports
+/// `Delim::DQuote` (`` `"' ``), matching bash's per-quote-char wording.
 fn lex_is_shape3(le: &huck_syntax::lexer::LexError) -> Option<Delim> {
     use huck_syntax::lexer::LexError;
     match le {
-        LexError::UnterminatedQuote => Some(Delim::DQuote),
+        LexError::UnterminatedQuote { double: true } => Some(Delim::DQuote),
+        LexError::UnterminatedQuote { double: false } => Some(Delim::SQuote),
         LexError::UnterminatedSubstitution => Some(Delim::DollarParen),
         LexError::UnterminatedArith
         | LexError::UnterminatedLegacyArith
@@ -448,13 +447,61 @@ mod tests {
         let mut out = StdoutSink::Terminal;
         let mut buf: Vec<u8> = Vec::new();
         let mut err = StderrSink::Capture(&mut buf);
-        let e = ParseError::Lex(Box::new(LexError::UnterminatedQuote));
+        let e = ParseError::Lex(Box::new(LexError::UnterminatedQuote { double: true }));
         install_err_sinks(&mut out, &mut err, || {
             render_syntax_diag(&sh, &e, "echo \"hi", 1);
         });
         assert_eq!(
             buf,
             b"huck: -c: line 1: unexpected EOF while looking for matching `\"'\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn shape3_matching_squote() {
+        use huck_syntax::command::ParseError;
+        use huck_syntax::lexer::LexError;
+
+        let sh = shape_test_shell();
+        let mut out = StdoutSink::Terminal;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut err = StderrSink::Capture(&mut buf);
+        let e = ParseError::Lex(Box::new(LexError::UnterminatedQuote { double: false }));
+        install_err_sinks(&mut out, &mut err, || {
+            render_syntax_diag(&sh, &e, "echo 'hi", 1);
+        });
+        // Verified against real bash 5.2.21: `bash -c "echo 'hi"` →
+        // `unexpected EOF while looking for matching `'''` (the SQuote
+        // delimiter char, not DQuote's `"`).
+        assert_eq!(
+            buf,
+            b"huck: -c: line 1: unexpected EOF while looking for matching `''\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn shape3_matching_backtick() {
+        use huck_syntax::command::{ExpectFailure, Found, ParseError};
+
+        let sh = shape_test_shell();
+        let mut out = StdoutSink::Terminal;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut err = StderrSink::Capture(&mut buf);
+        // Mirrors `parser::unterminated_backtick`'s shape: `Found::Eof` +
+        // `matching: Some(Delim::Backtick)`.
+        let e = ParseError::Unexpected(ExpectFailure {
+            found: Found::Eof,
+            matching: Some(Delim::Backtick),
+            pos: 9,
+        });
+        install_err_sinks(&mut out, &mut err, || {
+            render_syntax_diag(&sh, &e, "echo `foo", 1);
+        });
+        // Verified against real bash 5.2.21: `bash -c 'echo `foo'` →
+        // `unexpected EOF while looking for matching ```'`.
+        assert_eq!(
+            buf,
+            b"huck: -c: line 1: unexpected EOF while looking for matching `\x60'\n".to_vec()
         );
     }
 }

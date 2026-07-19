@@ -40,5 +40,8 @@ check s3-squote   "echo 'hi"
 check s3-cmdsub   'echo $(foo'
 check s3-arith    'echo $((1+'
 check s3-paramexp 'echo ${x'
+check s3-procsub-in  'cat <(foo'
+check s3-procsub-out 'cat >(foo'
+check s3-backtick 'echo `foo'
 if [ $FAIL -ne 0 ]; then echo "syntax_error_diag_diff_check FAILED" >&2; exit 1; fi
 echo "syntax_error_diag_diff_check OK"
