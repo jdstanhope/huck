@@ -2534,42 +2534,6 @@ pub(crate) enum Keyword {
     Coproc,
 }
 
-impl Keyword {
-    // v314 (#211): both former call sites (the command-position keyword
-    // fallthrough and the connector-loop "other" arm) now route through
-    // `ParseError::Unexpected`/`spell_token` instead of building an
-    // `UnexpectedKeyword(name)` string directly — `spell_token` names a bare
-    // `Lit`/`Word` keyword the same way without needing this lookup. Kept
-    // (not deleted) for the one remaining literal `UnexpectedKeyword` site
-    // (`coproc`, parser.rs ~3555) and any future caller needing the bash
-    // spelling of a `Keyword` in isolation.
-    #[allow(dead_code)]
-    fn name(self) -> &'static str {
-        match self {
-            Keyword::If => "if",
-            Keyword::Then => "then",
-            Keyword::Elif => "elif",
-            Keyword::Else => "else",
-            Keyword::Fi => "fi",
-            Keyword::While => "while",
-            Keyword::Until => "until",
-            Keyword::Do => "do",
-            Keyword::Done => "done",
-            Keyword::For => "for",
-            Keyword::In => "in",
-            Keyword::Case => "case",
-            Keyword::Esac => "esac",
-            Keyword::LBrace => "{",
-            Keyword::RBrace => "}",
-            Keyword::DoubleBracketOpen => "[[",
-            Keyword::DoubleBracketClose => "]]",
-            Keyword::Function => "function",
-            Keyword::Select => "select",
-            Keyword::Coproc => "coproc",
-        }
-    }
-}
-
 /// Returns the keyword a `TokenKind` represents, or `None`.  A token is a
 /// keyword only when it is a `Word` of exactly one part — an *unquoted*
 /// `Literal` whose text equals the keyword.  Mirrors `keyword_of` in

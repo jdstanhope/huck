@@ -119,17 +119,22 @@ pub fn classify(buffer: &str, extglob: bool) -> Completeness {
         Err(ParseError::UnterminatedSubshell) => {
             Completeness::Incomplete(ContinuationReason::Subshell)
         }
-        // v314 (#211): an unterminated `$( … ` now surfaces as its own
-        // `$(`-specific shape (`Unexpected(ExpectFailure{Eof, DollarParen})`,
+        // v314 (#211): an unterminated `$( … ` or `` ` … `` now surfaces as
+        // its own delim-specific shape
+        // (`Unexpected(ExpectFailure{Eof, DollarParen | Backtick})`),
         // distinct from the plain-subshell `UnterminatedSubshell` above — see
         // `parser::unterminated_cmdsub`/`parse_command_sub`) rather than the
         // shared `UnterminatedSubshell` this classifier used to see for BOTH
         // constructs. Still an open construct waiting on more input, so it is
         // STILL a `Subshell`-reason continuation (same REPL behavior as
         // before the reclassification — only the underlying error TYPE moved).
+        // Regression note: the initial v314 landing matched only
+        // `DollarParen`, missing `Backtick` — an unterminated backtick
+        // cmdsub wrongly fell to `Error` instead of reading a continuation
+        // line. Fixed by widening this arm's pattern.
         Err(ParseError::Unexpected(ExpectFailure {
             found: Found::Eof,
-            matching: Some(Delim::DollarParen),
+            matching: Some(Delim::DollarParen | Delim::Backtick),
             ..
         })) => Completeness::Incomplete(ContinuationReason::Subshell),
         Err(
@@ -228,6 +233,22 @@ mod tests {
         // REPL behavior is identical — only the reason variant changed.
         assert_eq!(
             classify("echo $(date", false),
+            Completeness::Incomplete(ContinuationReason::Subshell)
+        );
+    }
+
+    #[test]
+    fn open_backtick_command_substitution_is_incomplete() {
+        // v314 (#211) regression: the atom parser reports an unterminated
+        // backtick command sub the same way as `$( … ` — an
+        // `Unexpected(ExpectFailure{Eof, matching: Some(Delim::Backtick)})`
+        // — but the arm below only matched `Delim::DollarParen`, so this
+        // fell through to `Err(_) => Completeness::Error` and the REPL
+        // reported a syntax error instead of reading a continuation line
+        // (bash keeps reading until the closing backtick). Must be
+        // Incomplete(Subshell), same as the `$(` case above.
+        assert_eq!(
+            classify("echo `date", false),
             Completeness::Incomplete(ContinuationReason::Subshell)
         );
     }
