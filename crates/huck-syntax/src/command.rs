@@ -738,6 +738,41 @@ pub struct Sequence {
     pub background: bool,
 }
 
+/// v314 (#211): what was found at the point a parse expectation failed —
+/// either a concrete token, or end-of-input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Found {
+    Token(crate::lexer::TokenKind),
+    Eof,
+}
+
+/// v314 (#211): the opening delimiter (if any) an `ExpectFailure` is
+/// unmatched against, for rendering bash's "unexpected EOF while looking
+/// for matching `X'" shape downstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delim {
+    Paren,        // ( subshell
+    Brace,        // { group
+    DQuote,       // "
+    SQuote,       // '
+    Backtick,     // `
+    DollarParen,  // $(
+    DollarDParen, // $((
+    DollarBrace,  // ${
+    DBracket,     // [[
+}
+
+/// v314 (#211): captures the context of a parse expectation failure —
+/// what was found, what (if anything) it was supposed to close, and where
+/// in the input it occurred. Rendered into bash's near-token /
+/// unexpected-EOF message shapes downstream (Task 3's engine renderer).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectFailure {
+    pub found: Found,
+    pub matching: Option<Delim>,
+    pub pos: usize,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[non_exhaustive]
 pub enum ParseError {
@@ -775,6 +810,9 @@ pub enum ParseError {
     /// A command-level construct the parser-driven flat command parser does not
     /// model yet (subshell, arith command, compound command, heredoc, …). v242 boundary.
     UnsupportedCommand,
+    /// v314 (#211): a syntax error carrying the offending token / EOF context,
+    /// rendered into bash's near-token / unexpected-EOF shapes downstream.
+    Unexpected(ExpectFailure),
 }
 
 impl std::fmt::Display for ParseError {
@@ -1322,5 +1360,18 @@ mod tests {
         ));
         // A non-numeric source ending in `-` stays a Dup (bash: move needs digits).
         assert!(matches!(dup_op(lit_word("x-"), true), RedirOp::Dup { .. }));
+    }
+
+    // ── v314 (#211) ExpectFailure capture types ─────────────────────────────
+
+    #[test]
+    fn expect_failure_roundtrips() {
+        use crate::lexer::{Operator, TokenKind};
+        let e = ParseError::Unexpected(ExpectFailure {
+            found: Found::Token(TokenKind::Op(Operator::RParen)),
+            matching: None,
+            pos: 5,
+        });
+        assert!(matches!(e, ParseError::Unexpected(ref f) if f.pos == 5));
     }
 }

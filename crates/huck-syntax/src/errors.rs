@@ -49,6 +49,7 @@ pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
         }
         ParseError::UnsupportedExpansion => "unsupported expansion".to_string(),
         ParseError::UnsupportedCommand => "unsupported command".to_string(),
+        ParseError::Unexpected(_) => "syntax error near unexpected token".to_string(),
     }
 }
 
