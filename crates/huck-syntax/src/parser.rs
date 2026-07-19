@@ -5,9 +5,10 @@
 
 use crate::command::{
     ArithForClause, AssignTarget, Assignment, CaseClause, CaseItem, CaseTerminator, Command,
-    Connector, ElifBranch, ExecCommand, ForClause, IfClause, ParseError, Pipeline, RedirOp,
-    Redirection, SelectClause, Sequence, SimpleCommand, TestBinaryOp, TestExpr, TestUnaryOp,
-    WhileClause, is_compound_opener, skip_test_newlines, try_unary_op, word_literal_text,
+    Connector, Delim, ElifBranch, ExecCommand, ExpectFailure, ForClause, Found, IfClause,
+    ParseError, Pipeline, RedirOp, Redirection, SelectClause, Sequence, SimpleCommand,
+    TestBinaryOp, TestExpr, TestUnaryOp, WhileClause, is_compound_opener, skip_test_newlines,
+    try_unary_op, word_literal_text,
 };
 use crate::lexer::{
     ArithDelim, ArrayLiteralElement, Lexer, Mode, Operator, ParamModifier, ParamOpKind, ProcDir,
@@ -479,8 +480,13 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                 // first, so it panics rather than hangs — a clean error is strictly
                 // better.)
                 if parts.is_empty() && acc.is_none() {
+                    // Capture the offending token BEFORE consuming it —
+                    // `unexpected_here` peeks the CURRENT token, so it must run
+                    // before the `next_kind()` consume below or it would report
+                    // whatever token comes AFTER this one instead.
+                    let f = iter.unexpected_here(None)?;
                     iter.next_kind()?;
-                    return Err(ParseError::UnexpectedToken);
+                    return Err(ParseError::Unexpected(f));
                 }
                 break;
             }
@@ -1620,8 +1626,9 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
     // an UNTERMINATED substitution, not a missing command — mirror
     // parse_subshell's guard (~4664) so the REPL/stdin reader keeps reading.
     if iter.peek_kind()?.is_none() {
+        let pos = iter.cursor_pos();
         iter.pop_mode();
-        return Err(ParseError::UnterminatedSubshell);
+        return Err(unterminated_cmdsub(pos));
     }
     let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
         // Empty (or whitespace/newline-only) body `$()`/`$( )`/`$(\n)` —
@@ -1652,9 +1659,20 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
                 // so parse_command_sub has a consistent return type for all
                 // deferrals. (`[[`, function-def, coproc bodies, and legacy `$[expr]`
                 // arith are no longer deferred — v253/v248/v257/v258.)
+                //
+                // v314 (#211): `parse_subshell_sequence` is BESPOKE-shared by
+                // both a real subshell `( … ` and a command substitution
+                // `$( … ` — its own `UnterminatedSubshell` return can't tell
+                // them apart. bash reports the two differently at EOF: a bare
+                // `(` is Shape 2 (`unexpected end of file`), but `$(` is
+                // Shape 3 (`unexpected EOF while looking for matching `)'`) —
+                // verified against real bash 5.2.21. Re-map here, in the ONE
+                // caller that knows it's the `$(` context.
+                let pos = iter.cursor_pos();
                 iter.pop_mode();
                 let mapped = match e {
                     ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
+                    ParseError::UnterminatedSubshell => unterminated_cmdsub(pos),
                     other => other,
                 };
                 return Err(mapped);
@@ -1665,6 +1683,20 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
     // 3. Pop the CommandSub frame.
     iter.pop_mode();
     Ok(WordPart::CommandSub { sequence, quoted })
+}
+
+/// Builds the Shape-3 `ParseError` for an unterminated `$( … ` command
+/// substitution reaching real EOF before its closing `)` — bash's
+/// `unexpected EOF while looking for matching `)'` (see the v314 (#211) note
+/// at `parse_command_sub`'s two call sites, which both hit real EOF via the
+/// shared `parse_subshell_sequence`/whitespace-only-body checks that can't
+/// tell a `$(` apart from a bare `(`).
+fn unterminated_cmdsub(pos: usize) -> ParseError {
+    ParseError::Unexpected(ExpectFailure {
+        found: Found::Eof,
+        matching: Some(Delim::DollarParen),
+        pos,
+    })
 }
 
 /// v251: assemble a `WordPart::ProcessSub` for a `<(…)`/`>(…)` process
@@ -2472,6 +2504,15 @@ pub(crate) enum Keyword {
 }
 
 impl Keyword {
+    // v314 (#211): both former call sites (the command-position keyword
+    // fallthrough and the connector-loop "other" arm) now route through
+    // `ParseError::Unexpected`/`spell_token` instead of building an
+    // `UnexpectedKeyword(name)` string directly — `spell_token` names a bare
+    // `Lit`/`Word` keyword the same way without needing this lookup. Kept
+    // (not deleted) for the one remaining literal `UnexpectedKeyword` site
+    // (`coproc`, parser.rs ~3555) and any future caller needing the bash
+    // spelling of a `Keyword` in isolation.
+    #[allow(dead_code)]
     fn name(self) -> &'static str {
         match self {
             Keyword::If => "if",
@@ -2698,7 +2739,25 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
             }
             let target = match iter.peek_kind()? {
                 Some(TokenKind::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
-                Some(TokenKind::Newline) | None => return Err(ParseError::MissingRedirectTarget),
+                Some(TokenKind::Newline) => {
+                    return Err(ParseError::Unexpected(iter.unexpected_here(None)?));
+                }
+                // v314 (#211): bash spells a MISSING redirect target at real
+                // EOF (no more input at all, not even a newline — the common
+                // `-c`-string shape) the SAME as an explicit trailing newline:
+                // `near unexpected token 'newline'` (verified against real
+                // bash 5.2.21: `bash -c 'echo <>'` — Shape 1, not the generic
+                // "unexpected end of file" every OTHER trailing-operator-at-
+                // EOF site reports). Synthesize a `Newline` token rather than
+                // deferring to `unexpected_here`'s `Found::Eof`, which the
+                // renderer would classify as Shape 2 instead.
+                None => {
+                    return Err(ParseError::Unexpected(ExpectFailure {
+                        found: Found::Token(TokenKind::Newline),
+                        matching: None,
+                        pos: iter.cursor_pos(),
+                    }));
+                }
                 Some(TokenKind::Heredoc { .. }) => {
                     return Err(ParseError::RedirectTargetIsOperator);
                 }
@@ -2718,7 +2777,7 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
             // A bare fd-prefix with no following redirect operator: defensively
             // guard (the lexer only emits RedirFd glued to an op, but be safe).
             if fd_prefix.is_some() {
-                return Err(ParseError::MissingRedirectTarget);
+                return Err(ParseError::Unexpected(iter.unexpected_here(None)?));
             }
             // Should not be reached (caller checks next_is_redirect first).
             Err(ParseError::UnsupportedCommand)
@@ -2978,13 +3037,31 @@ fn parse_simple_with_leading_word(
                 {
                     return Err(ParseError::UnsupportedCommand);
                 }
-                return Err(ParseError::UnexpectedToken);
+                // `kind` (the `(` itself) was already consumed above (line
+                // 2951) before this match ran, so `iter.unexpected_here` would
+                // report the token AFTER the `(` instead — build the
+                // `ExpectFailure` directly from the already-owned `kind`.
+                return Err(ParseError::Unexpected(ExpectFailure {
+                    found: Found::Token(kind.clone()),
+                    matching: None,
+                    pos: iter.cursor_pos(),
+                }));
             }
             _ => return Err(ParseError::UnsupportedCommand),
         }
     }
 
     if all_words.is_empty() && redirects.is_empty() {
+        // A real token (operator) sitting where a command was expected — the
+        // word loop above breaks WITHOUT consuming at any stage/list
+        // terminator (`|`/`;`/`&&`/`||`/`&`/`)`/`;;`/`;&`/`;;&`/newline) or
+        // EOF, so the cursor is still ON that token here. If it's a real
+        // token, bash names it (Shape 1); if it's EOF, this falls through to
+        // the plain `MissingCommand` (handled by the unterminated-construct
+        // fallback elsewhere).
+        if iter.peek_kind()?.is_some() {
+            return Err(ParseError::Unexpected(iter.unexpected_here(None)?));
+        }
         return Err(ParseError::MissingCommand);
     }
 
@@ -3011,6 +3088,17 @@ fn parse_simple_with_leading_word(
             .iter()
             .all(crate::command::is_assignment_word);
         if !in_leading_prefix && !command_word_is_decl_builtin {
+            // v314 (#211) NOT migrated: bash names the array literal's OWN
+            // `(` here (`echo x=(1 2)` -> `near unexpected token '('`), but
+            // that token was consumed well before this point — inside the
+            // `parse_word_command`/`parse_array_literal` call that produced
+            // `w` (this loop runs AFTER the whole word list is assembled).
+            // `iter.unexpected_here` at this point would report whatever
+            // token comes NEXT in the stream, not the `(` — capturing the
+            // right token needs threading its position out of the array-
+            // literal parse, which is out of scope for this task (no harness
+            // case exercises this site). Left as the untyped `UnexpectedToken`
+            // (handled by the renderer's descriptive fallback).
             return Err(ParseError::UnexpectedToken);
         }
     }
@@ -3090,7 +3178,10 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     // the ArithBlock/LParen/keyword dispatch below so `alias x=if` expands to
     // the reserved word before the reserved-word check runs.
     iter.expand_command_alias()?;
-    // EOF with no token.
+    // EOF with no token. v314 (#211): NOT a near-token guard candidate — this
+    // branch's own condition IS the EOF check (`peek_kind().is_none()`), so a
+    // "real token present" guard here would never fire; stays `MissingCommand`
+    // (handled by the Shape 2/3 unterminated-construct fallback upstream).
     if iter.peek_kind()?.is_none() {
         return Err(ParseError::MissingCommand);
     }
@@ -3159,7 +3250,7 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
         // rule now accepts any single non-keyword word, so `coproc 123 { :; }`
         // parses as named and no longer reaches here — but the arm's behaviour
         // is unchanged and still correct for genuine terminator keywords).
-        Some(other) => return Err(ParseError::UnexpectedKeyword(other.name().to_string())),
+        Some(_) => return Err(ParseError::Unexpected(iter.unexpected_here(None)?)),
         None => {}
     }
     // Function definition `name() compound` (POSIX form). The oracle consumes
@@ -3645,7 +3736,7 @@ fn parse_and_or_opts(
                     }
                     // Another `&` with no preceding command → `cmd & &` is invalid.
                     Some(TokenKind::Op(Operator::Background)) => {
-                        return Err(ParseError::UnexpectedBackground);
+                        return Err(ParseError::Unexpected(iter.unexpected_here(None)?));
                     }
                     // A command follows → `&` is a separator.
                     Some(_) => {
@@ -3700,10 +3791,19 @@ fn parse_and_or_opts(
 
             // ── anything else (e.g. stray word / `|` after a closed block) ──
             other => {
-                if let Some(kw) = keyword_of_consumed(&other) {
-                    return Err(ParseError::UnexpectedKeyword(kw.name().to_string()));
-                }
-                return Err(ParseError::UnexpectedToken);
+                // `other` (== `token`) was already consumed above (line 3652)
+                // before this match ran, so `iter.unexpected_here` would
+                // report the token AFTER it instead — build the
+                // `ExpectFailure` directly from the already-owned `other`.
+                // `spell_token` names a bare-keyword `Lit`/`Word` the same
+                // way whether or not `keyword_of_consumed` recognizes it, so
+                // one `Unexpected` arm covers both the former
+                // `UnexpectedKeyword`/`UnexpectedToken` split.
+                return Err(ParseError::Unexpected(ExpectFailure {
+                    found: Found::Token(other),
+                    matching: None,
+                    pos: iter.cursor_pos(),
+                }));
             }
         }
     }
@@ -4018,7 +4118,7 @@ pub fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> 
     // A stray terminator (`;;`/`;&`/`;;&`) left after the top-level
     // sequence → `UnexpectedToken`.
     if iter.peek_kind()?.is_some() {
-        return Err(ParseError::UnexpectedToken);
+        return Err(ParseError::Unexpected(iter.unexpected_here(None)?));
     }
     // v250 T3: attach every heredoc body collected along the way (in source
     // order == emission order) to its still-empty placeholder.
@@ -4431,7 +4531,9 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
                 break;
             }
             match iter.peek_kind()? {
-                Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
+                Some(TokenKind::Op(_)) => {
+                    return Err(ParseError::Unexpected(iter.unexpected_here(None)?));
+                }
                 // v264 flip-fix (Finding 1): for-loop in-list words brace-expand
                 // (oracle: `emit_word_with_braces` is called for for/select lists).
                 _ => {
@@ -4495,7 +4597,9 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
                 break;
             }
             match iter.peek_kind()? {
-                Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
+                Some(TokenKind::Op(_)) => {
+                    return Err(ParseError::Unexpected(iter.unexpected_here(None)?));
+                }
                 // v264 flip-fix (Finding 1): select in-list words brace-expand too.
                 _ => {
                     let w = parse_word_command(iter, false)?;
@@ -4524,7 +4628,7 @@ fn parse_case(iter: &mut Lexer) -> Result<Command, ParseError> {
     // Subject word (assembled from atoms — e.g. `$x`, `x`).
     let subject = match iter.peek_kind()? {
         None => return Err(ParseError::UnterminatedCase),
-        Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
+        Some(TokenKind::Op(_)) => return Err(ParseError::Unexpected(iter.unexpected_here(None)?)),
         _ => consume_command_word(iter)?,
     };
 
@@ -4562,7 +4666,9 @@ fn parse_case_item(iter: &mut Lexer) -> Result<CaseItem, ParseError> {
         skip_newlines(iter)?;
         match iter.peek_kind()? {
             None => return Err(ParseError::UnterminatedCase),
-            Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
+            Some(TokenKind::Op(_)) => {
+                return Err(ParseError::Unexpected(iter.unexpected_here(None)?));
+            }
             _ => patterns.push(parse_word_command(iter, false)?),
         }
         while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
@@ -4577,7 +4683,7 @@ fn parse_case_item(iter: &mut Lexer) -> Result<CaseItem, ParseError> {
                 iter.next_kind()?;
                 break;
             }
-            Some(_) => return Err(ParseError::UnexpectedToken),
+            Some(_) => return Err(ParseError::Unexpected(iter.unexpected_here(None)?)),
         }
     }
 

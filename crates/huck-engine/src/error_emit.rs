@@ -104,9 +104,12 @@ pub fn emit_syntax_error_ex(
 ///    `unexpected EOF while looking for matching `X'`.
 ///
 /// `source` is the full input text; `token_line` is the pre-computed 1-based
-/// line of the error position (used for Shape 1's echoed source line). v314:
-/// top-level only — no eval/comsub markers (Task 4+ wires the driver; this
-/// renderer is not yet called from production code).
+/// line of the error position — used for Shape 1's echoed source line AND
+/// (Task 4) as the delimiter's opening line for the quote/`` ` ``/`$((`/`${`
+/// family of Shape 3 errors (`$(`/`(` still use the EOF line instead — see
+/// `emit_matching`). v314 Task 4 wires this into both top-level drivers
+/// (`shell::process_line_in_sinks`, `builtins::run_sourced_contents_in_sinks`)
+/// — no eval/comsub markers yet (still a known gap for nested contexts).
 pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_line: u32) {
     // bash's EOF line counter is "one past the last line read", regardless
     // of whether the source ends in a trailing newline (verified against
@@ -136,10 +139,10 @@ pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_l
             matching: Some(d),
             ..
         }) if is_matching_delim(*d) => {
-            emit_matching(shell, *d, source);
+            emit_matching(shell, *d, source, token_line);
         }
         ParseError::Lex(le) => match lex_is_shape3(le) {
-            Some(d) => emit_matching(shell, d, source),
+            Some(d) => emit_matching(shell, d, source, token_line),
             None => {
                 emit_syntax_error_ex(shell, token_line, format_args!("syntax error: {err}"), None);
             }
@@ -176,16 +179,18 @@ pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_l
 /// Emits Shape 3 (`unexpected EOF while looking for matching `X'`) for
 /// delimiter `d`. Bash's line number for this shape depends on the
 /// delimiter: a quote/`$((`/`${`/backtick is reported at the line the
-/// delimiter itself OPENED on (v314 top-level-only: always line 1, since
-/// this renderer has no per-token line tracking below the top level yet);
-/// `$(` — an unterminated command substitution — is reported at the EOF
-/// line instead (bash keeps scanning to the end of input before giving up
-/// on a `$(`).
-fn emit_matching(shell: &Shell, d: Delim, source: &str) {
+/// delimiter itself OPENED on — `token_line`, exactly as the caller computed
+/// it for every other shape (verified against real bash 5.2.21: a
+/// multi-line script with `'unterminated` on line 3 reports `line 3:`, not
+/// an EOF-relative line). `$(` — an unterminated command substitution — is
+/// reported at the EOF line instead (bash keeps scanning to the end of
+/// input before giving up on a `$(`; verified the same way: `line 5:` for a
+/// 4-physical-line file).
+fn emit_matching(shell: &Shell, d: Delim, source: &str, token_line: u32) {
     let eof_line = 1 + source.lines().count() as u32;
     let line = match d {
         Delim::DollarParen | Delim::Paren => eof_line,
-        _ => 1,
+        _ => token_line,
     };
     let spelled = spell_delim(d);
     // DBracket renders as `]]`.

@@ -3,7 +3,7 @@
 //! real lexer and parser and classifies the outcome, so it can never
 //! disagree with them.
 
-use crate::command::ParseError;
+use crate::command::{Delim, ExpectFailure, Found, ParseError};
 use crate::lexer::{self, LexError, Operator, TokenKind, ends_with_continuation_backslash};
 use crate::parser;
 
@@ -119,6 +119,19 @@ pub fn classify(buffer: &str, extglob: bool) -> Completeness {
         Err(ParseError::UnterminatedSubshell) => {
             Completeness::Incomplete(ContinuationReason::Subshell)
         }
+        // v314 (#211): an unterminated `$( … ` now surfaces as its own
+        // `$(`-specific shape (`Unexpected(ExpectFailure{Eof, DollarParen})`,
+        // distinct from the plain-subshell `UnterminatedSubshell` above — see
+        // `parser::unterminated_cmdsub`/`parse_command_sub`) rather than the
+        // shared `UnterminatedSubshell` this classifier used to see for BOTH
+        // constructs. Still an open construct waiting on more input, so it is
+        // STILL a `Subshell`-reason continuation (same REPL behavior as
+        // before the reclassification — only the underlying error TYPE moved).
+        Err(ParseError::Unexpected(ExpectFailure {
+            found: Found::Eof,
+            matching: Some(Delim::DollarParen),
+            ..
+        })) => Completeness::Incomplete(ContinuationReason::Subshell),
         Err(
             ParseError::UnterminatedIf
             | ParseError::UnterminatedLoop
