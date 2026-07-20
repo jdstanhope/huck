@@ -465,9 +465,7 @@ fn builtin_cd_as(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    if crate::restricted::is_restricted(shell)
-        && let Err(msg) = crate::restricted::check_cd()
-    {
+    if let Err(msg) = shell.policy.check(crate::policy::Op::Cd) {
         crate::sh_error_to!(shell, err, None, "{msg}");
         return ExecOutcome::Continue(1);
     }
@@ -872,7 +870,12 @@ fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
                 continue;
             }
             if shell.is_readonly(arg) {
-                crate::sh_error_to!(shell, err, None, "unset: {arg}: readonly variable");
+                crate::sh_error_to!(
+                    shell,
+                    err,
+                    None,
+                    "unset: {arg}: cannot unset: readonly variable"
+                );
                 any_error = true;
                 continue;
             }
@@ -955,7 +958,7 @@ fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
                 shell,
                 err,
                 None,
-                "unset: {effective_arg}: readonly variable"
+                "unset: {effective_arg}: cannot unset: readonly variable"
             );
             any_error = true;
             continue;
@@ -2335,7 +2338,7 @@ fn builtin_declare_decl(
                 continue;
             }
             if shell.is_readonly(name) {
-                crate::sh_error_to!(shell, err, None, "{name}: readonly variable");
+                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
                 exit = 1;
                 continue;
             }
@@ -6324,11 +6327,18 @@ fn builtin_set_inner(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    if crate::restricted::is_restricted(shell)
-        && args.iter().any(|a| a == "+r")
-        && let Err(msg) = crate::restricted::check_set_plus_r()
-    {
-        crate::sh_error_to!(shell, err, None, "{msg}");
+    // STOPGAP (v319 task 2): preserves today's wording/status verbatim so the
+    // `restricted` module has no callers left and can be deleted. bash actually
+    // refuses `set +r` with `set: +r: invalid option` plus set's usage line —
+    // task 5 replaces this with that mechanism. Deliberately not an `Op`: a
+    // policy message body cannot carry a usage line (see policy.rs's header).
+    if shell.policy.is_restricted() && args.iter().any(|a| a == "+r") {
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "restricted: cannot turn off restricted mode"
+        );
         return ExecOutcome::Continue(1);
     }
     if args.is_empty() {
@@ -7364,9 +7374,8 @@ pub(crate) fn source_in_sink(
     sink: &mut crate::executor::StdoutSink,
     err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
-    if crate::restricted::is_restricted(shell)
-        && let Some(path) = args.first()
-        && let Err(msg) = crate::restricted::check_source_path(path)
+    if let Some(path) = args.first()
+        && let Err(msg) = shell.policy.check(crate::policy::Op::SourcePath(path))
     {
         let mut err = crate::executor::err_writer(err_sink, sink);
         crate::sh_error_to!(shell, &mut *err, None, "{msg}");

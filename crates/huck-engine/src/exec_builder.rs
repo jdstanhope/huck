@@ -466,7 +466,14 @@ fn run_cwd_inner(
     })
 }
 
-/// Snapshot+set `Shell.restricted`, run the inner script, restore on exit (RAII).
+/// Snapshot+set `Shell.policy`, run the inner script, restore on exit (RAII).
+///
+/// The restore puts back the previous POLICY only. It deliberately does NOT
+/// unmark the variables `apply_restricted_readonly` made readonly: restriction
+/// is one-way for the variables it protects, so a shell that has once been
+/// restricted never regains writability of SHELL/PATH/HISTFILE/ENV/BASH_ENV.
+/// bash behaves the same way (its `set -r` marks are permanent for the shell's
+/// life). This is intentional, not a leak.
 fn run_restricted_then_inner(
     cell: &Rc<RefCell<Shell>>,
     restricted: bool,
@@ -474,20 +481,25 @@ fn run_restricted_then_inner(
     out: &mut StdoutSink,
     err: &mut StderrSink,
 ) -> i32 {
-    let prev_restricted = cell.borrow().restricted;
-    cell.borrow_mut().restricted = restricted || prev_restricted;
+    let prev_policy = cell.borrow().policy;
+    if restricted {
+        let mut sh = cell.borrow_mut();
+        sh.policy = crate::policy::Policy::Sandbox;
+        sh.apply_restricted_readonly();
+    }
     struct R<'c> {
         cell: &'c Rc<RefCell<Shell>>,
-        prev: bool,
+        prev: crate::policy::Policy,
     }
     impl Drop for R<'_> {
         fn drop(&mut self) {
-            self.cell.borrow_mut().restricted = self.prev;
+            // Policy only — see the fn doc on why the readonly marks stay.
+            self.cell.borrow_mut().policy = self.prev;
         }
     }
     let _r = R {
         cell,
-        prev: prev_restricted,
+        prev: prev_policy,
     };
 
     let label = cell.borrow().shell_argv0.clone();

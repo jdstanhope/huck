@@ -39,11 +39,9 @@ pub enum StderrSink<'a> {
 /// per call site — stderr is best-effort and small, so the heap hit is fine.
 /// Each call-site brace-scopes the writer to release the `err_sink` / `sink`
 /// borrows before subsequent code runs (`{ let mut err = err_writer(...); e!(...) }`).
-/// Restricted-mode gate for a write-style redirect target path. Returns
-/// `Err(())` after emitting the diagnostic when the shell is in restricted
-/// mode, the `mode` is write-style (Truncate/Append/Clobber/ReadWrite), and
-/// the path is absolute or contains a `..` component. Input-only modes
-/// (`ReadOnly`) are NEVER refused.
+/// Refuse a file-target output redirect under a restricted policy. Input-only
+/// (`ReadOnly`) is never refused, and fd-duplication never reaches here — both
+/// match bash, where `<`, `>&2`, and `2>&1` stay permitted under `-r`.
 #[inline]
 fn check_restricted_redirect(
     mode: &FileMode,
@@ -52,16 +50,13 @@ fn check_restricted_redirect(
     sink: &mut StdoutSink<'_>,
     err_sink: &mut StderrSink<'_>,
 ) -> Result<(), ()> {
-    if !crate::restricted::is_restricted(shell) {
-        return Ok(());
-    }
     if !matches!(
         mode,
         FileMode::Truncate | FileMode::Append | FileMode::Clobber | FileMode::ReadWrite
     ) {
         return Ok(());
     }
-    if let Err(msg) = crate::restricted::check_redirect_path(path) {
+    if let Err(msg) = shell.policy.check(crate::policy::Op::RedirectFile { path }) {
         let mut err = err_writer(err_sink, sink);
         crate::sh_error_to!(shell, &mut *err, None, "{msg}");
         return Err(());
@@ -4616,9 +4611,7 @@ fn run_exec_single_inner(
     // after xtrace, but before the dispatch machinery. Its inline assignments
     // persist (special builtin), so no restore on return.
     if resolved.program == "exec" {
-        if crate::restricted::is_restricted(shell)
-            && let Err(msg) = crate::restricted::check_exec()
-        {
+        if let Err(msg) = shell.policy.check(crate::policy::Op::Exec) {
             {
                 let mut err = err_writer(err_sink, sink);
                 crate::sh_error_to!(shell, &mut *err, None, "{msg}");
@@ -4658,8 +4651,9 @@ fn run_exec_single_inner(
         .inline_scopes
         .push(snap.vars.iter().map(|(n, _)| n.clone()).collect());
 
-    if crate::restricted::is_restricted(shell)
-        && let Err(msg) = crate::restricted::check_command_name(&resolved.program)
+    if let Err(msg) = shell
+        .policy
+        .check(crate::policy::Op::CommandName(&resolved.program))
     {
         {
             let mut err = err_writer(err_sink, sink);

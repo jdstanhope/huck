@@ -14,7 +14,7 @@ use std::path::Path;
 
 #[inline]
 pub fn is_restricted(shell: &Shell) -> bool {
-    shell.restricted
+    shell.policy.is_restricted()
 }
 
 pub fn check_cd() -> Result<(), &'static str> {

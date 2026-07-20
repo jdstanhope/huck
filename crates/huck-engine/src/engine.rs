@@ -775,6 +775,44 @@ mod tests {
     }
 
     #[test]
+    fn restricted_marks_all_five_vars_readonly() {
+        let mut e = Engine::new();
+        // Every write path must report through readonly machinery, not a
+        // restriction-specific message. HISTFILE is included (bash does).
+        for name in ["SHELL", "PATH", "HISTFILE", "ENV", "BASH_ENV"] {
+            let out = e
+                .prepare(&format!("{name}=/tmp; echo done"))
+                .restricted()
+                .capture();
+            assert!(
+                out.stderr.contains(&format!("{name}: readonly variable")),
+                "{name}: expected readonly diagnostic, got {:?}",
+                out.stderr
+            );
+        }
+    }
+
+    #[test]
+    fn restricted_covers_non_assignment_write_paths() {
+        let mut e = Engine::new();
+        // These four paths escape the old check_special_assign sites entirely.
+        let cases = [
+            ("export PATH=/tmp", "PATH: readonly variable"),
+            ("PATH+=/tmp", "PATH: readonly variable"),
+            ("declare PATH=/tmp", "declare: PATH: readonly variable"),
+            ("unset PATH", "unset: PATH: cannot unset: readonly variable"),
+        ];
+        for (src, want) in cases {
+            let out = e.prepare(src).restricted().capture();
+            assert!(
+                out.stderr.contains(want),
+                "{src}: expected {want:?}, got {:?}",
+                out.stderr
+            );
+        }
+    }
+
+    #[test]
     fn restricted_refuses_set_plus_r() {
         let _g = crate::test_support::CWD_LOCK
             .lock()

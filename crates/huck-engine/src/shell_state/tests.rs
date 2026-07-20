@@ -511,9 +511,10 @@ fn new_initializes_live_external_children_empty() {
 }
 
 #[test]
-fn new_initializes_restricted_to_false() {
+fn new_initializes_policy_to_unrestricted() {
     let s = Shell::new();
-    assert!(!s.restricted);
+    assert_eq!(s.policy, crate::policy::Policy::Unrestricted);
+    assert!(!s.policy.is_restricted());
 }
 
 #[test]
