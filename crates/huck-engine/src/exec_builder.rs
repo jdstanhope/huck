@@ -488,12 +488,19 @@ fn run_cwd_inner(
 
 /// Snapshot+set `Shell.policy`, run the inner script, restore on exit (RAII).
 ///
-/// The restore puts back the previous POLICY only. It deliberately does NOT
-/// unmark the variables `apply_restricted_readonly` made readonly: restriction
-/// is one-way for the variables it protects, so a shell that has once been
-/// restricted never regains writability of SHELL/PATH/HISTFILE/ENV/BASH_ENV.
-/// bash behaves the same way (its `set -r` marks are permanent for the shell's
-/// life). This is intentional, not a leak.
+/// Restriction is ONE-WAY, and the restore honors that in two ways:
+///
+/// * It does NOT unmark the variables `apply_restricted_readonly` made
+///   readonly: a shell that has once been restricted never regains
+///   writability of SHELL/PATH/HISTFILE/ENV/BASH_ENV. bash behaves the same
+///   way (its `set -r` marks are permanent for the shell's life).
+/// * It puts the previous policy back only when the policy is still the one
+///   this guard installed. If the INNER script raised it — `set -r` — that
+///   elevation survives the guard, exactly as the readonly marks do.
+///   Reverting it would leave a half-restricted shell (`cd` permitted again
+///   while PATH stays readonly) that bash never produces.
+///
+/// This is intentional, not a leak.
 fn run_restricted_then_inner(
     cell: &Rc<RefCell<Shell>>,
     restricted: bool,
@@ -511,22 +518,30 @@ fn run_restricted_then_inner(
         sh.restricted_at_startup = true;
         sh.apply_restricted_readonly();
     }
+    // The policy in effect once the prologue is done. If the inner script has
+    // moved away from it by the time we unwind, it raised the policy itself
+    // (`set -r`) and that elevation must survive — see the fn doc.
+    let installed_policy = cell.borrow().policy;
     struct R<'c> {
         cell: &'c Rc<RefCell<Shell>>,
+        installed: crate::policy::Policy,
         prev: crate::policy::Policy,
         prev_startup: bool,
     }
     impl Drop for R<'_> {
         fn drop(&mut self) {
             // Policy + provenance only — see the fn doc on why the readonly
-            // marks stay.
+            // marks stay, and why an inner-script elevation is left alone.
             let mut sh = self.cell.borrow_mut();
-            sh.policy = self.prev;
-            sh.restricted_at_startup = self.prev_startup;
+            if sh.policy == self.installed {
+                sh.policy = self.prev;
+                sh.restricted_at_startup = self.prev_startup;
+            }
         }
     }
     let _r = R {
         cell,
+        installed: installed_policy,
         prev: prev_policy,
         prev_startup,
     };

@@ -2364,6 +2364,20 @@ impl Shell {
         }
     }
 
+    /// Engage bash's restricted shell as a STARTUP entry (`-r` or invocation
+    /// as `rbash`): policy, provenance, and the readonly marks in one step.
+    /// `restricted_at_startup` is what makes `shopt restricted_shell` report
+    /// `on`, which a later `set -r` deliberately does not do.
+    ///
+    /// WHEN to call this is bash's rule, not ours: "these restrictions are
+    /// enforced after any startup files are read". See the single ordering
+    /// comment in `huck-cli`'s `repl::run`.
+    pub fn engage_startup_restriction(&mut self) {
+        self.policy = crate::policy::Policy::Rbash;
+        self.restricted_at_startup = true;
+        self.apply_restricted_readonly();
+    }
+
     /// True if `name` is set and marked integer (v65). Unset names are
     /// trivially not integer.
     pub fn is_integer(&self, name: &str) -> bool {

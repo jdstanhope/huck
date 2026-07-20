@@ -106,19 +106,28 @@ pub fn run(args: &[String], version: &str) -> i32 {
         shell_cell.borrow_mut().shell_options.posix = posix;
     }
 
-    // Restricted mode: -r, or invocation as `rbash`. Applied before any
-    // program/interactive dispatch so it governs the whole session, and before
-    // any user code runs so the readonly marks are already in place. Both are
-    // STARTUP entries, so `shopt restricted_shell` reports `on` (unlike a
-    // later `set -r`).
-    {
+    // Restricted mode: -r, or invocation as `rbash`. Both are STARTUP entries,
+    // so `shopt restricted_shell` reports `on` (unlike a later `set -r`).
+    //
+    // ORDERING RULE (bash's, stated once, here): "These restrictions are
+    // enforced AFTER any startup files are read." That ordering is the whole
+    // mechanism by which an administrator configures a locked-down rbash — the
+    // rc file runs UNRESTRICTED and may set PATH, `cd` to a working directory
+    // and define functions; only then does the cage close. So restriction
+    // engages at exactly one of two points, chosen by whether this session
+    // reads a startup file at all:
+    //
+    //   * interactive: AFTER `maybe_source_rc_file` (see below);
+    //   * `-c` / script-file: right here, since neither reads an rc file and
+    //     restriction must be in force before the first user command.
+    //
+    // Both points call the same `Shell::engage_startup_restriction`.
+    let restrict_at_startup = {
         let argv0 = std::env::args().next().unwrap_or_default();
-        if huck_engine::shell::startup_restricted(opts.restricted, &argv0) {
-            let mut sh = shell_cell.borrow_mut();
-            sh.policy = huck_engine::policy::Policy::Rbash;
-            sh.restricted_at_startup = true;
-            sh.apply_restricted_readonly();
-        }
+        huck_engine::shell::startup_restricted(opts.restricted, &argv0)
+    };
+    if restrict_at_startup && !matches!(opts.mode, RunMode::Interactive) {
+        shell_cell.borrow_mut().engage_startup_restriction();
     }
 
     // `-o <name>` / `+o <name>` command-line options (#159): apply in argv order
@@ -199,6 +208,12 @@ pub fn run(args: &[String], version: &str) -> i32 {
         let mut shell = shell_cell.borrow_mut();
         if let Some(exit_code) = maybe_source_rc_file(&mut shell, &opts) {
             return shell_exit(&mut shell, exit_code);
+        }
+        // The interactive half of the ordering rule stated at the top of
+        // `run`: the rc file above ran unrestricted; the cage closes now,
+        // before the first prompt.
+        if restrict_at_startup {
+            shell.engage_startup_restriction();
         }
         // v139: re-apply the in-memory cap now that ~/.huckrc may have set HISTSIZE
         // (history was loaded before rc). Nets out to bash's rc-then-history effect.

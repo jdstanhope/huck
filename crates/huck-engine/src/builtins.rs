@@ -6597,9 +6597,7 @@ fn fmt_opt_line(name: &str, on: bool) -> String {
     format!("{:<15}\t{}", name, if on { "on" } else { "off" })
 }
 
-/// `shopt` builtin. Operates on the `shopt` option namespace, or — with
-/// `-o` — bridges to the `set -o` namespace (`SETO_TABLE`).
-/// `restricted_shell` is not a stored bit — bash computes it, and it is
+/// The one shopt name that is not a stored bit — bash computes it, and it is
 /// READ-ONLY: `shopt -s`/`-u` on it are silent no-ops in both directions, so
 /// it can neither enter nor escape restriction.
 const RESTRICTED_SHELL_OPT: &str = "restricted_shell";
@@ -6614,6 +6612,8 @@ fn shopt_get(shell: &Shell, name: &str) -> Option<bool> {
     shell.shopt_options.get(name)
 }
 
+/// `shopt` builtin. Operates on the `shopt` option namespace, or — with
+/// `-o` — bridges to the `set -o` namespace (`SETO_TABLE`).
 fn builtin_shopt(
     args: &[String],
     out: &mut dyn Write,

@@ -656,6 +656,42 @@ mod tests {
         );
     }
 
+    /// `set -r` in one `prepare()` call must survive into the NEXT one on the
+    /// same Engine. The `restricted()` RAII guard restores the policy it
+    /// installed; it must not revert an elevation the inner script made itself,
+    /// or the shell lands in a half-restricted state (`cd` allowed again while
+    /// PATH stays readonly) that bash never produces.
+    #[test]
+    fn inner_set_dash_r_survives_the_exec_guard() {
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        let out = e.prepare("set -r").capture();
+        assert_eq!(out.exit_code, 0, "stderr: {:?}", out.stderr);
+
+        // The policy half: `cd` is still refused on a later, plain call.
+        let out = e.prepare("cd /tmp").capture();
+        assert!(
+            out.stderr.contains("cd: restricted"),
+            "policy reverted: {:?}",
+            out.stderr
+        );
+
+        // The readonly half, in the same shell — read the value BACK rather
+        // than grepping stdout: a refused assignment aborts the rest of the
+        // script, so a trailing `echo` would never run and any "does not
+        // contain" assertion would pass vacuously.
+        let before = e.var("PATH");
+        let out = e.prepare("PATH=/hijacked").capture();
+        assert!(
+            out.stderr.contains("PATH: readonly variable"),
+            "PATH writable again: {:?}",
+            out.stderr
+        );
+        assert_eq!(e.var("PATH"), before, "PATH was actually overwritten");
+    }
+
     #[test]
     fn set_plus_r_is_an_invalid_option_while_restricted() {
         // bash makes +r an INVALID OPTION under restriction (usage + rc 1),
@@ -726,6 +762,9 @@ mod tests {
             out.stderr
         );
         // ...and -s is a silent no-op that does NOT enter restricted mode.
+        // A FRESH Engine: the `set -r` above restricted `e` permanently (one-way,
+        // as in bash), so reusing it here would prove nothing about `shopt -s`.
+        let mut e = Engine::new();
         let out = e
             .prepare("shopt -s restricted_shell; echo rc=$?; cd /tmp && echo escaped")
             .capture();
