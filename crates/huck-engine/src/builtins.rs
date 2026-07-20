@@ -673,7 +673,7 @@ fn builtin_echo(
 ) -> ExecOutcome {
     let (mut suppress_newline, process_escapes, consumed) = parse_echo_flags(args);
     let joined = args[consumed..].join(" ");
-    let bytes = if process_escapes {
+    let mut bytes = if process_escapes {
         let (b, hit_c) = process_echo_escapes(&joined);
         if hit_c {
             suppress_newline = true;
@@ -683,11 +683,15 @@ fn builtin_echo(
         joined.into_bytes()
     };
 
+    // #208: the whole line (content + newline) must reach the fd in ONE
+    // write(2) call, or two concurrent backgrounded `echo`s can interleave
+    // between the content write and the newline write. Append the newline
+    // to the buffer instead of writing it separately.
+    if !suppress_newline {
+        bytes.push(b'\n');
+    }
     if out.write_all(&bytes).is_err() {
         // v308: reported once by the epilogue (see pwd above).
-        return ExecOutcome::Continue(1);
-    }
-    if !suppress_newline && out.write_all(b"\n").is_err() {
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -773,6 +777,60 @@ fn process_echo_escapes(s: &str) -> (Vec<u8>, bool) {
         }
     }
     (out, false)
+}
+
+#[cfg(test)]
+mod echo_atomic_tests {
+    use super::*;
+
+    struct RecordingWriter {
+        calls: Vec<Vec<u8>>,
+    }
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn echo_calls(args: &[&str]) -> Vec<Vec<u8>> {
+        let shell = Shell::new();
+        // `args[0]` is the pseudo-argv0 ("echo"), for readability at call
+        // sites; `builtin_echo` itself takes only the arguments after the
+        // command name (see `run_builtin`'s `"echo" => builtin_echo(args,
+        // ...)` dispatch, where `args` is already name-stripped).
+        let owned: Vec<String> = args[1..].iter().map(|s| s.to_string()).collect();
+        let mut rec = RecordingWriter { calls: Vec::new() };
+        let mut sink: Vec<u8> = Vec::new();
+        let _ = builtin_echo(&owned, &mut rec, &mut sink, &shell);
+        rec.calls
+    }
+
+    #[test]
+    fn echo_writes_line_in_one_call() {
+        // The whole line (content + newline) must arrive in ONE write() call, so
+        // concurrent backgrounded echoes can't interleave between them (#208).
+        assert_eq!(echo_calls(&["echo", "hi"]), vec![b"hi\n".to_vec()]);
+    }
+
+    #[test]
+    fn echo_n_writes_content_only_one_call() {
+        assert_eq!(echo_calls(&["echo", "-n", "hi"]), vec![b"hi".to_vec()]);
+    }
+
+    #[test]
+    fn echo_no_args_writes_just_newline_one_call() {
+        assert_eq!(echo_calls(&["echo"]), vec![b"\n".to_vec()]);
+    }
+
+    #[test]
+    fn echo_n_empty_issues_no_write() {
+        // v308 zero-byte rule: empty output must not issue a write() at all.
+        assert_eq!(echo_calls(&["echo", "-n", ""]), Vec::<Vec<u8>>::new());
+    }
 }
 
 fn builtin_exit(args: &[String], err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
