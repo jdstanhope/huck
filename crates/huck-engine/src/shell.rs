@@ -470,10 +470,12 @@ pub fn process_line_in_sinks(
             // (bash counts lines across the whole non-interactive input, which
             // huck's per-command REPL loop does not track today).
             let off = lx.cursor_pos().min(line.len());
-            let ln = 1 + line.as_bytes()[..off]
-                .iter()
-                .filter(|&&b| b == b'\n')
-                .count() as u32;
+            let ln = shell.line_base()
+                + 1
+                + line.as_bytes()[..off]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count() as u32;
             crate::err_thread_local::install_err_sinks(sink, err_sink, || {
                 crate::render_syntax_diag(shell, &e, line, ln);
             });
