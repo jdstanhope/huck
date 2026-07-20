@@ -673,7 +673,7 @@ fn builtin_echo(
 ) -> ExecOutcome {
     let (mut suppress_newline, process_escapes, consumed) = parse_echo_flags(args);
     let joined = args[consumed..].join(" ");
-    let bytes = if process_escapes {
+    let mut bytes = if process_escapes {
         let (b, hit_c) = process_echo_escapes(&joined);
         if hit_c {
             suppress_newline = true;
@@ -683,11 +683,15 @@ fn builtin_echo(
         joined.into_bytes()
     };
 
+    // #208: the whole line (content + newline) must reach the fd in ONE
+    // write(2) call, or two concurrent backgrounded `echo`s can interleave
+    // between the content write and the newline write. Append the newline
+    // to the buffer instead of writing it separately.
+    if !suppress_newline {
+        bytes.push(b'\n');
+    }
     if out.write_all(&bytes).is_err() {
         // v308: reported once by the epilogue (see pwd above).
-        return ExecOutcome::Continue(1);
-    }
-    if !suppress_newline && out.write_all(b"\n").is_err() {
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
