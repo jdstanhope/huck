@@ -1014,6 +1014,13 @@ mod tests {
         // Sandbox blocks ESCAPE, not local work — this is the one place it
         // deliberately diverges from bash's rbash, which refuses every file
         // target. See docs/superpowers/specs/2026-07-20-restricted-policy-design.md.
+        //
+        // `.cwd()` sets the PROCESS-global cwd, so this takes CWD_LOCK like
+        // every other cwd test here — this box's single core serializes tests
+        // and would hide the race that CI's 4 cores surface.
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("huck-v319-sandbox-rel");
         let _ = std::fs::create_dir_all(&dir);
         let mut e = Engine::new();

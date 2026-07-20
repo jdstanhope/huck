@@ -709,7 +709,7 @@ mod prologue_literal_invariant {
 
     /// Drops whole-line comments (`///`, `//!`, `//`) so prose that mentions
     /// `"huck: "` (design notes, e.g. `builtins.rs`'s job-spec-resolution doc
-    /// or the `restricted.rs`/`history.rs` reworked comments) doesn't
+    /// or the `policy.rs`/`history.rs` reworked comments) doesn't
     /// false-positive. Does not attempt trailing end-of-line `//` comments —
     /// none of these files use that style for prose mentioning the prefix.
     fn strip_comment_lines(src: &str) -> String {
