@@ -4,9 +4,24 @@
 bash-suite category is a 2-divergence near-miss; fixing both flips it to PASS.
 
 **Goal:** (1) a process substitution sets `$!` to its child PID and that child
-stays waitable (`wait "$!"` returns the child's exit status); (2) a process
-substitution captured in an assignment RHS (`f=<(…)`) keeps its `/dev/fd/N` fd
-open past the assignment so a later `cat $f` works.
+stays waitable (`wait "$!"` returns the child's exit status); (2) `f=<(…)`
+process-substitution assignment works (see the correction below).
+
+> **CORRECTION (v318 implementation, verified against bash 5.2.21):** Divergence 2's
+> premise below — that bash keeps an assignment-RHS procsub's fd open "until the
+> scope" so a later `cat $f` works — is **WRONG**. Measured: `f=<(echo hi); cat "$f"`
+> errors identically in BOTH shells (`/dev/fd/N: No such file`); bash closes the fd
+> at the assignment command's end, exactly like every other command. The
+> `procsub.tests` `eval f=<(echo test4) "; cat $f"` case works because the procsub
+> is realized in **`eval`'s own argv expansion**, not via assignment-RHS lifetime.
+> So the `procsub_deferred` "defer to scope" design (below) was built and reverted;
+> the real bug was that `f=<(…)` didn't parse/expand as a procsub at all — the
+> lexer split `<(` off the assignment value, and `expand_assignment` no-op'd
+> `WordPart::ProcessSub`. The shipped fix glues `<(…)`/`>(…)` onto the assignment
+> value in the lexer (guarded so `x=<foo` stays a redirect), realizes it in
+> `expand_assignment`, and drains it per-command like any other procsub (same
+> point bash closes it). Fix 1 (`$!`) is unchanged and correct. The
+> `procsub_deferred` / `process_line_in_sinks` sections below are superseded.
 
 ---
 
