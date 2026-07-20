@@ -668,7 +668,7 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare("cd /tmp; echo \"$PWD\"").restricted().capture();
         assert!(
-            out.stderr.contains("restricted: cd"),
+            out.stderr.contains("cd: restricted"),
             "stderr={:?}",
             out.stderr
         );
@@ -681,7 +681,7 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare("exec /bin/true").restricted().capture();
         assert!(
-            out.stderr.contains("restricted: exec"),
+            out.stderr.contains("exec: restricted"),
             "stderr={:?}",
             out.stderr
         );
@@ -692,7 +692,8 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare("/bin/echo hi").restricted().capture();
         assert!(
-            out.stderr.contains("restricted:"),
+            out.stderr
+                .contains("/bin/echo: restricted: cannot specify `/' in command names"),
             "stderr={:?}",
             out.stderr
         );
@@ -711,7 +712,7 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare(". /etc/profile").restricted().capture();
         assert!(
-            out.stderr.contains("restricted: source"),
+            out.stderr.contains(".: /etc/profile: restricted"),
             "stderr={:?}",
             out.stderr
         );
@@ -725,7 +726,8 @@ mod tests {
             .restricted()
             .capture();
         assert!(
-            out.stderr.contains("restricted:"),
+            out.stderr
+                .contains("/tmp/v206-restricted-test: restricted: cannot redirect output"),
             "stderr={:?}",
             out.stderr
         );
@@ -743,7 +745,8 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare("echo hi > ../escape").restricted().capture();
         assert!(
-            out.stderr.contains("restricted:"),
+            out.stderr
+                .contains("../escape: restricted: cannot redirect output"),
             "stderr={:?}",
             out.stderr
         );
@@ -754,7 +757,7 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare("PATH=/tmp; echo done").restricted().capture();
         assert!(
-            out.stderr.contains("restricted: PATH"),
+            out.stderr.contains("PATH: readonly variable"),
             "stderr={:?}",
             out.stderr
         );
@@ -768,7 +771,7 @@ mod tests {
             .restricted()
             .capture();
         assert!(
-            out.stderr.contains("restricted: SHELL"),
+            out.stderr.contains("SHELL: readonly variable"),
             "stderr={:?}",
             out.stderr
         );
@@ -974,7 +977,7 @@ mod tests {
         );
         // cd should STILL be refused after the refused `set +r`.
         assert!(
-            out.stderr.contains("restricted: cd"),
+            out.stderr.contains("cd: restricted"),
             "stderr={:?}",
             out.stderr
         );
@@ -988,7 +991,7 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare("f() { cd /tmp; }; f").restricted().capture();
         assert!(
-            out.stderr.contains("restricted: cd"),
+            out.stderr.contains("cd: restricted"),
             "stderr={:?}",
             out.stderr
         );
@@ -1004,6 +1007,23 @@ mod tests {
         // Next call, no restricted: cd works.
         let out = e.prepare("cd /; pwd").capture();
         assert_eq!(out.stdout, "/\n", "stderr={:?}", out.stderr);
+    }
+
+    #[test]
+    fn sandbox_permits_relative_redirect() {
+        // Sandbox blocks ESCAPE, not local work — this is the one place it
+        // deliberately diverges from bash's rbash, which refuses every file
+        // target. See docs/superpowers/specs/2026-07-20-restricted-policy-design.md.
+        let dir = std::env::temp_dir().join("huck-v319-sandbox-rel");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut e = Engine::new();
+        let out = e
+            .prepare("echo hi > local_log; cat local_log")
+            .cwd(&dir)
+            .restricted()
+            .capture();
+        assert_eq!(out.stdout, "hi\n", "stderr: {:?}", out.stderr);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ============== TIMEOUT ==============
@@ -1112,7 +1132,7 @@ mod tests {
             .restricted()
             .capture();
         assert!(
-            out.stderr.contains("restricted: cd"),
+            out.stderr.contains("cd: restricted"),
             "stderr={:?}",
             out.stderr
         );
@@ -1328,7 +1348,7 @@ mod tests {
             .restricted()
             .on_stderr_line(|line| err_lines.push(line.to_string()))
             .capture();
-        assert!(err_lines.iter().any(|l| l.contains("restricted: cd")));
+        assert!(err_lines.iter().any(|l| l.contains("cd: restricted")));
     }
 
     #[test]
