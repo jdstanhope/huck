@@ -37,6 +37,7 @@ pub(crate) mod job_spec;
 pub mod jobs;
 pub(crate) mod line_buf;
 pub(crate) mod param_expansion;
+pub mod policy;
 pub(crate) mod procsub;
 #[doc(hidden)]
 pub mod prompt;
