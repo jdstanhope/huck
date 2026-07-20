@@ -177,12 +177,21 @@ impl<'a> ExecBuilder<'a> {
         self
     }
 
-    /// Enable restricted mode for this call (bash `rbash` subset: refuses
-    /// `cd`, `exec`, command-names containing `/`, `source` of paths
-    /// containing `/`, write-redirects to absolute or `..` paths, and
-    /// `set +r`). Refused operations emit a diagnostic via the active stderr
-    /// sink and return a non-zero exit; the script keeps running unless
-    /// `set -e` propagates the failure.
+    /// Enable restricted mode for this call by selecting `Policy::Sandbox`
+    /// (`policy.rs`) — huck's embedding policy, distinct from bash's `rbash`
+    /// (`Policy::Rbash`, reachable via `-r` / `set -r` / `argv[0] == "rbash"`).
+    /// `Sandbox` denies `cd`, `exec`, command names containing `/`, `source`
+    /// of paths containing `/`, and `set +r`, same as `Rbash`. It differs from
+    /// `Rbash` in exactly one place: a file-target write-redirect is denied
+    /// only when the target **escapes the working directory** (an absolute
+    /// path, or one with a `..` component) — a relative write like `> out.txt`
+    /// stays permitted, so a hosted script can still do local work, while
+    /// `Rbash` denies every file-target redirect regardless of path shape.
+    /// Refused operations emit a diagnostic via the active stderr sink and
+    /// return a non-zero exit; the script keeps running unless `set -e`
+    /// propagates the failure. See
+    /// `docs/superpowers/specs/2026-07-20-restricted-policy-design.md` for the
+    /// full design and the bash-vs-huck rationale.
     ///
     /// # The protected variables are marked readonly, and that OUTLIVES the call
     ///
