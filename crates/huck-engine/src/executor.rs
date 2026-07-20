@@ -4061,7 +4061,9 @@ fn array_literal_elements(w: &crate::lexer::Word) -> Option<&[crate::lexer::Arra
 fn drain_procsubs(shell: &mut Shell, base: usize) {
     while shell.procsub_pending.len() > base {
         if let Some(ps) = shell.procsub_pending.pop() {
-            crate::procsub::cleanup(ps);
+            if let Some((pid, code)) = crate::procsub::cleanup(ps) {
+                shell.jobs.record_terminal_status(pid, code);
+            }
         }
     }
 }
@@ -4089,8 +4091,16 @@ fn drain_procsubs_nonblocking(shell: &mut Shell, base: usize) {
             // (e.g. a long-running producer used with a background consumer),
             // skip the wait — it will be reaped by SIGCHLD handling or shell exit.
             let mut status = 0;
-            unsafe {
-                libc::waitpid(ps.pid, &mut status, libc::WNOHANG);
+            let r = unsafe { libc::waitpid(ps.pid, &mut status, libc::WNOHANG) };
+            if r > 0 {
+                let code = if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else if libc::WIFSIGNALED(status) {
+                    128 + libc::WTERMSIG(status)
+                } else {
+                    0
+                };
+                shell.jobs.record_terminal_status(ps.pid, code);
             }
         }
     }
