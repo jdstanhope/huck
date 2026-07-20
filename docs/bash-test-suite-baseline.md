@@ -32,13 +32,16 @@ class). Per-category evidence:
   the same fixture file.
 - `posix2`: the `case esac in esac) ...` fragment's MESSAGE TEXT and
   echoed source line now match bash exactly (`syntax error near
-  unexpected token `)'` / the quoted line) — the sole remaining diff is
-  the diagnostic prefix: bash prints `./posix2.tests: line 1:`, huck
-  prints `./posix2.tests: eval: line 199:` (the error occurs inside an
-  `eval`; huck's prefix leaks its internal `eval:`-marker + eval-body line
-  number instead of the calling script's physical line). This is exactly
-  the gap [#209](https://github.com/jdstanhope/huck/issues/209) attributes
-  to v315's planned `eval:` marker — confirms the diagnosis, not yet fixed.
+  unexpected token `)'` / the quoted line) — the sole remaining diff was
+  the diagnostic prefix: bash prints `./posix2.tests: eval: line 199:`
+  (the `eval:` marker plus the outer calling script's physical line
+  number), while huck printed `./posix2.tests: line 1:` (no `eval:`
+  marker; the error occurs inside an `eval`, and huck's prefix was
+  numbering from the eval-body's own internal line count instead of the
+  calling script's physical line). This was exactly the gap
+  [#209](https://github.com/jdstanhope/huck/issues/209) attributed to
+  v315's planned `eval:` marker — confirms the diagnosis. **(v315/#209
+  RESOLVED this — posix2 now 0-diff PASS; see the v315 note below.)**
 - `comsub` / `comsub-posix`: diffs (25 / 41 lines) are dominated by
   unrelated pre-existing gaps — a structural over-acceptance inside a
   nested `case`/`$(` fixture, `unsupported expansion` fallback wording on
@@ -67,10 +70,10 @@ count, and `$LINENO` reads correctly inside `eval` too, both via a
 shell-global `eval_frame`/`line_base()` that `render_syntax_diag`'s
 `Diag::Syntax` arm consults). Re-ran `posix2` in isolation (single
 category, `HUCK_BASH_TEST_CATEGORY=posix2`): the diagnostic-prefix diff
-v314 confirmed as the sole remaining line — huck's `eval: line 199:` vs
-bash's `line 1:` — is gone; **`posix2` is now a byte-identical 0-diff
-PASS**, closing out the near-miss #209 opened (the "other pre-existing
-POSIX compliance failures" the earlier row speculated about did not
+v314 confirmed as the sole remaining line — huck's `line 1:` (no `eval:`
+marker) vs bash's `eval: line 199:` — is gone; **`posix2` is now a
+byte-identical 0-diff PASS**, closing out the near-miss #209 opened (the
+"other pre-existing POSIX compliance failures" the earlier row speculated about did not
 materialize as separate diff lines once the prefix was fixed). This is
 the one category the v315 change was expected to move; the harness-level
 guard (`syntax_error_diag_diff_check.sh`, 27/27) and the full 82-category
