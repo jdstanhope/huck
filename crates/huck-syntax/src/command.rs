@@ -813,6 +813,15 @@ pub enum ParseError {
     /// v314 (#211): a syntax error carrying the offending token / EOF context,
     /// rendered into bash's near-token / unexpected-EOF shapes downstream.
     Unexpected(ExpectFailure),
+    /// v316 (#213): a syntax error re-parsing a backtick command-substitution
+    /// body. `inner` = the body error (already body-relative), `body` = the
+    /// cooked backtick body (for the echo + body-local line), `err_pos` = the
+    /// body-relative error offset. Rendered with `command substitution:`.
+    InCommandSub {
+        inner: Box<ParseError>,
+        body: String,
+        err_pos: usize,
+    },
 }
 
 impl std::fmt::Display for ParseError {

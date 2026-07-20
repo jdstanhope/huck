@@ -242,7 +242,33 @@ fn render_diag_inner(
                 marker,
             );
         }
-        // ParseError::InCommandSub arm is added in Task 2.
+        // v316 (#213): a nested backtick command-substitution reparse error.
+        // Re-derive the body-local line from `err_pos` (the fresh sub-lexer's
+        // cursor into `body`, not `source`) and recurse with `source = body`
+        // so the near-token echo quotes the backtick BODY, not the outer
+        // line — and with `Marker::CommandSub` so the prologue always reads
+        // `command substitution: line N:` regardless of the outer marker.
+        ParseError::InCommandSub {
+            inner,
+            body,
+            err_pos,
+        } => {
+            // The backtick sits at display line `line_base + local_line`; the
+            // body numbers from 1, so offset it by that line minus one.
+            let comsub_base = line_base + local_line.saturating_sub(1);
+            let body_local = 1 + body.as_bytes()[..(*err_pos).min(body.len())]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count() as u32;
+            render_diag_inner(
+                shell,
+                inner,
+                body,
+                body_local,
+                Marker::CommandSub,
+                comsub_base,
+            );
+        }
         // Fallback: keep the descriptive message (unmigrated / non-top-level).
         other => {
             emit_syntax_error_ex(
