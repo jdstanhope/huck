@@ -138,10 +138,13 @@ pub(crate) fn emit_syntax_error_ex(
 /// pushes an `eval_frame` so `shell.line_base()` is non-zero for the
 /// duration, and the `Diag::Syntax` arm consults it to print an `eval: line
 /// N:` marker (suppressing the `-c:`/script-name prefix) with the outer
-/// line number. A nested command-substitution context is still a known
-/// gap: expansion-time comsub reparse errors (e.g. an unterminated
-/// backtick body) report the top-level `-c:`/script-name prefix instead of
-/// bash's `command substitution: line N:` marker.
+/// line number. A nested command-substitution context is handled too (v316,
+/// #213): a backtick body's syntax error surfaces as
+/// `ParseError::InCommandSub`, whose render arm recurses `render_diag_inner`
+/// against the body with `Marker::CommandSub`, producing bash's `command
+/// substitution: line N:` marker. `$()` bodies parse at the top level (not
+/// through this nested-reparse path), so they keep the `-c:`/script-name
+/// prefix — matching bash.
 pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_line: u32) {
     // `token_line` is already offset by `shell.line_base()` (v315, #209: the
     // outer line an `eval` sits on) for DISPLAY purposes, but `source` here is
@@ -285,13 +288,13 @@ fn render_diag_inner(
 /// Emits Shape 3 (`unexpected EOF while looking for matching `X'`) for
 /// delimiter `d`. Bash's line number for this shape depends on the
 /// delimiter: a quote/`$((`/`${`/backtick is reported at the line the
-/// delimiter itself OPENED on — `token_line`, exactly as the caller computed
-/// it for every other shape (verified against real bash 5.2.21: a
-/// multi-line script with `'unterminated` on line 3 reports `line 3:`, not
-/// an EOF-relative line). `$(` — an unterminated command substitution — is
-/// reported at the EOF line instead (bash keeps scanning to the end of
-/// input before giving up on a `$(`; verified the same way: `line 5:` for a
-/// 4-physical-line file).
+/// delimiter itself OPENED on — `line_base + local_line`, i.e. the caller's
+/// local (body-relative) line re-based onto the display line, same as every
+/// other shape (verified against real bash 5.2.21: a multi-line script with
+/// `'unterminated` on line 3 reports `line 3:`, not an EOF-relative line).
+/// `$(` — an unterminated command substitution — is reported at the EOF
+/// line instead (bash keeps scanning to the end of input before giving up
+/// on a `$(`; verified the same way: `line 5:` for a 4-physical-line file).
 fn emit_matching(
     shell: &Shell,
     d: Delim,
