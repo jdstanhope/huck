@@ -2319,6 +2319,24 @@ fn run_case(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
+    // v318 (#218): the subject can be a process substitution (`case <(cmd)
+    // in …`). `expand_assignment` realizes it and pushes onto
+    // `procsub_pending`, but `case` — unlike a plain command — has no
+    // enclosing per-command drain of its own. Snapshot here and drain on
+    // every exit path (bash realizes AND closes the fd / reaps the child for
+    // the `case` command). The inner body owns all the early returns.
+    let procsub_base = shell.procsub_pending.len();
+    let outcome = run_case_inner(clause, shell, sink, err_sink);
+    drain_procsubs(shell, procsub_base);
+    outcome
+}
+
+fn run_case_inner(
+    clause: &CaseClause,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     let subject = expand_assignment(&clause.subject, shell);
     xtrace_compound(
         shell,
@@ -2438,6 +2456,15 @@ fn run_double_bracket(
             return ExecOutcome::Continue(1);
         }
     };
+    // v318 (#218): a `[[ … ]]` operand can be a process substitution
+    // (`[[ -e <(cmd) ]]`, `[[ <(a) == … ]]`). Each operand expansion in
+    // `eval_test_expr` / `render_test_leaf` realizes it and pushes onto
+    // `procsub_pending`, but `[[ ]]` has no per-command drain of its own.
+    // Snapshot before evaluation and drain after — one wrap covers every
+    // internal operand site (including `render_test_leaf`'s second realize
+    // under `set -x`) and runs on the success, false, and error paths alike
+    // (bash realizes AND closes/reaps for the `[[ ]]` command).
+    let procsub_base = shell.procsub_pending.len();
     let result = match eval_test_expr(expr, shell) {
         Ok(true) => ExecOutcome::Continue(0),
         Ok(false) => ExecOutcome::Continue(1),
@@ -2449,6 +2476,7 @@ fn run_double_bracket(
             ExecOutcome::Continue(2)
         }
     };
+    drain_procsubs(shell, procsub_base);
     restore_inline_assignments(snap, shell);
     result
 }

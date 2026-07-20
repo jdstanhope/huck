@@ -1907,11 +1907,23 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 // command to consume the fd"), which undersold it — bash
                 // itself only keeps the fd alive for the assignment's own
                 // command (never past it, even inside a group/function/
-                // subshell/`$()`), so every caller of `expand_assignment`
-                // realizing here and relying on its enclosing per-command
-                // `procsub_pending` snapshot/drain (same scope the ordinary
-                // command-argument path below already uses) matches bash
-                // exactly — no separate lifetime extension needed.
+                // subshell/`$()`).
+                //
+                // IMPORTANT: realizing here pushes onto `procsub_pending`, but
+                // this arm is GLOBAL — it fires for EVERY caller of
+                // `expand_assignment`, and not all of them are draining
+                // callers. So each construct that expands an
+                // assignment-shaped word MUST snapshot `procsub_pending.len()`
+                // before and `drain_procsubs(shell, base)` after, to close the
+                // fd and reap the child per-command (bash-correct):
+                //   - a bare `f=<(cmd)` assignment (the ordinary
+                //     command-execution path already scopes+drains),
+                //   - a `case <(cmd) in …` subject (`run_case`),
+                //   - a `[[ … <(cmd) … ]]` operand (`run_double_bracket`).
+                // Without that snapshot+drain the fd and the inner child leak
+                // (fd exhaustion + zombies) — the v318 whole-branch review
+                // Critical. Heredoc-body callers never reach this arm (a `<(`
+                // in a heredoc body stays literal, not a `ProcessSub` part).
                 match crate::procsub::realize(sequence, dir.clone(), shell) {
                     Ok((path, ps)) => {
                         shell.procsub_pending.push(ps);

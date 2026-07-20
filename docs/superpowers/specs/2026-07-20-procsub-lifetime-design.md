@@ -18,10 +18,27 @@ process-substitution assignment works (see the correction below).
 > the real bug was that `f=<(…)` didn't parse/expand as a procsub at all — the
 > lexer split `<(` off the assignment value, and `expand_assignment` no-op'd
 > `WordPart::ProcessSub`. The shipped fix glues `<(…)`/`>(…)` onto the assignment
-> value in the lexer (guarded so `x=<foo` stays a redirect), realizes it in
-> `expand_assignment`, and drains it per-command like any other procsub (same
-> point bash closes it). Fix 1 (`$!`) is unchanged and correct. The
+> value in the lexer (guarded so `x=<foo` stays a redirect) and realizes it in
+> `expand_assignment`. Fix 1 (`$!`) is unchanged and correct. The
 > `procsub_deferred` / `process_line_in_sinks` sections below are superseded.
+>
+> **FURTHER CORRECTION (v318 whole-branch review):** the `expand_assignment`
+> `ProcessSub` realize arm is **global** — it fires for EVERY caller. It is NOT
+> true that "every caller relies on its enclosing per-command drain and matches
+> bash exactly": most callers (bare assignment, command args/redirects, builtin
+> RHS) DO run inside a per-command procsub scope (`run_single`'s `Assign` arm and
+> `run_exec_single_inner` snapshot+drain), but two constructs that expand an
+> assignment-shaped word had NO drain of their own and leaked the fd + zombie
+> child per iteration: the `case <(cmd) in …` subject (`run_case`) and a
+> `[[ … <(cmd) … ]]` operand (`run_double_bracket`). The correct model is: bash
+> realizes AND closes/reaps a procsub for the command that expands it, so each
+> such construct must snapshot `procsub_pending.len()` before expanding and
+> `drain_procsubs(shell, base)` after. `run_case` and `run_double_bracket` now do
+> (drain on every exit path). Heredoc bodies never reach the arm (`<(` stays
+> literal). Follow-on: under `set -x`, `[[ ]]` realizes an operand procsub twice
+> (`render_test_leaf` re-expands for the trace) — both are drained (no leak), but
+> the inner command runs twice vs bash's once; a clean single-realize needs
+> deeper plumbing (tracked as follow-on #220).
 
 ---
 

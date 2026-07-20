@@ -28,5 +28,16 @@ check 'assign-plain'      'f=<(echo hi); cat "$f"'
 # --- control: consuming-command procsub still works (per-command drain)
 check 'consume-two'       'cat <(echo a) <(echo b)'
 check 'consume-func'      'f2(){ cat "$1"; }; f2 <(echo x)'
+# --- v318 whole-branch fix: case subject + [[ ]] operand realize AND close a
+# procsub per-command (both realize; the /dev/fd/N path is real for the match).
+check 'case-subject'      'case <(echo x) in /dev/fd/*) echo m;; *) echo n;; esac'
+check 'bracket-exists'    '[[ -e <(echo x) ]] && echo yes || echo no'
+check 'bracket-eq-fdpat'  '[[ <(echo a) == /dev/fd/* ]] && echo yes || echo no'
+# --- leak / fd-stability guard: with the fd + zombie leak, a tight loop under a
+# low fd ceiling exhausts fds and fails; both shells complete rc 0 "done" once
+# each iteration closes its own procsub fd. (Constant fd offset between shells
+# is irrelevant — only completion is asserted.)
+check 'case-loop-nofdleak'    'ulimit -n 60; for i in $(seq 1 100); do case <(echo x) in *) :;; esac; done; echo done'
+check 'bracket-loop-nofdleak' 'ulimit -n 60; for i in $(seq 1 100); do [[ -e <(echo x) ]]; done; echo done'
 if [ $FAIL -ne 0 ]; then echo "procsub_lifetime_diff_check FAILED" >&2; exit 1; fi
 echo "procsub_lifetime_diff_check OK"
