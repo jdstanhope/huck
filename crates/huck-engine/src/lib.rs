@@ -43,7 +43,6 @@ pub(crate) mod procsub;
 pub mod prompt;
 #[doc(hidden)]
 pub mod readline_bind;
-pub(crate) mod restricted;
 #[doc(hidden)]
 pub mod shell;
 #[doc(hidden)]

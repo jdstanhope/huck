@@ -650,7 +650,6 @@ mod prologue_literal_invariant {
             include_str!("completion_builtins.rs"),
         ),
         ("shell_state.rs", include_str!("shell_state.rs")),
-        ("restricted.rs", include_str!("restricted.rs")),
         ("shell.rs", include_str!("shell.rs")),
         ("stdin_pipe.rs", include_str!("stdin_pipe.rs")),
         ("history.rs", include_str!("history.rs")),
