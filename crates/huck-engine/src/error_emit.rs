@@ -108,8 +108,15 @@ pub fn emit_syntax_error_ex(
 /// (Task 4) as the delimiter's opening line for the quote/`` ` ``/`$((`/`${`
 /// family of Shape 3 errors (`$(`/`(` still use the EOF line instead — see
 /// `emit_matching`). v314 Task 4 wires this into both top-level drivers
-/// (`shell::process_line_in_sinks`, `builtins::run_sourced_contents_in_sinks`)
-/// — no eval/comsub markers yet (still a known gap for nested contexts).
+/// (`shell::process_line_in_sinks`, `builtins::run_sourced_contents_in_sinks`).
+/// A nested `eval` context is handled (v315, #209): `eval`'s parse driver
+/// pushes an `eval_frame` so `shell.line_base()` is non-zero for the
+/// duration, and the `Diag::Syntax` arm consults it to print an `eval: line
+/// N:` marker (suppressing the `-c:`/script-name prefix) with the outer
+/// line number. A nested command-substitution context is still a known
+/// gap: expansion-time comsub reparse errors (e.g. an unterminated
+/// backtick body) report the top-level `-c:`/script-name prefix instead of
+/// bash's `command substitution: line N:` marker.
 pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_line: u32) {
     // `token_line` is already offset by `shell.line_base()` (v315, #209: the
     // outer line an `eval` sits on) for DISPLAY purposes, but `source` here is

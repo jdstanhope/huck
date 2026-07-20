@@ -2,6 +2,13 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v315 (#209, 2026-07-20 UTC):** the `eval:` context marker +
+eval line base flipped `posix2` to PASS — see the "v315 targeted
+re-sweep" paragraph below and the Summary block (PASS 15→16, FAIL 67→66).
+The v313/v314 full/targeted-sweep narrative below is left as the
+historical record of those sweeps and is otherwise unchanged by v315
+(confirmed via the harness-level `syntax_error_diag_diff_check.sh` and
+the full `run_diff_checks.sh` sweep — no other category's output moved).
 Sweep date: 2026-07-19 UTC (v313 full re-sweep — verifies the v299–v313 arc: the job-control batch (v299–v306), the heredoc-in-process / builtin write-error work (v307–v308), the huck-engine fork-guard (v309), in-process group stderr under `2>&1` in `$()` (v310), and the three error-fatality-funnel fixes — negated-pipeline errexit (v311/#1), arithmetic-expansion discard (v312/#3), readonly-assignment discard (v313/#31)). **NO change and NO regression: PASS holds at 15/82, TIMEOUT 0, ERROR 0 — the same 15 categories pass, none regressed, no new hangs.** Why no category flipped despite real fixes: each failing category is gated by SEVERAL independent divergences, and the arc fixed narrow ones that shrink diffs below the flip threshold. Case in point — v313 resolved L-43 (readonly-assignment abort), the note previously cited as `case`'s SOLE blocker, but the current `case` diff exposes two more live divergences (see its row), so it stays FAIL. **The 67 FAIL notes below have drifted since v268/v298 — treat them as approximate; the count is the authoritative signal.** Near-miss ranking (smallest current diffs, closest to PASS): `posix2` (5 lines — error-diagnostic format on `case esac in esac)`, [#209](https://github.com/jdstanhope/huck/issues/209)), `procsub` (9), `dbg-support2`/`nquote`/`rhs-exp` (12). Prior sweep provenance: 2026-07-15 UTC (v298 re-sweep, PASS 10→15: +getopts, input-test, iquote, nquote1, tilde; TIMEOUT 4→2 then 2→0 via v299 harness correction); 2026-07-07 UTC (v268 full re-sweep); 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers; v219 cprint+herestr flip; v220 herestr; v225 func).
 
 **v314 targeted re-sweep** (2026-07-19 UTC, syntax-error 3-shape alignment
@@ -52,13 +59,32 @@ superseded by the aligned Shape 3 (`unexpected EOF while looking for
 matching`) rendering, which happens to match bash's actual behavior for
 this fragment too.
 
+**v315 targeted re-sweep** (2026-07-20 UTC, `eval:` nested-context marker
++ `$LINENO`/error-line base #209 — a syntax error raised while parsing an
+`eval` string now prints an `eval: line N:` marker with the OUTER
+(calling) line number instead of leaking the eval-body's internal line
+count, and `$LINENO` reads correctly inside `eval` too, both via a
+shell-global `eval_frame`/`line_base()` that `render_syntax_diag`'s
+`Diag::Syntax` arm consults). Re-ran `posix2` in isolation (single
+category, `HUCK_BASH_TEST_CATEGORY=posix2`): the diagnostic-prefix diff
+v314 confirmed as the sole remaining line — huck's `eval: line 199:` vs
+bash's `line 1:` — is gone; **`posix2` is now a byte-identical 0-diff
+PASS**, closing out the near-miss #209 opened (the "other pre-existing
+POSIX compliance failures" the earlier row speculated about did not
+materialize as separate diff lines once the prefix was fixed). This is
+the one category the v315 change was expected to move; the harness-level
+guard (`syntax_error_diag_diff_check.sh`, 27/27) and the full 82-category
+sweep confirm no other category's output changed (the whole behavioral
+change is `line_base()` being non-zero only inside `eval`, which is a
+no-op everywhere else).
+
 Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven front-end (oracle deletion, `${…}`/subscript/assignment paths) cost zero bash-suite compatibility — every previously-passing category still passes, no new TIMEOUTs, and the array/subscript/assignment categories (`array`, `array2`, `assoc`, `appendop`, `tilde`, `posixpat`) stay FAIL for the same pre-existing non-front-end reasons recorded below.
 
 ## Summary
 
 - Categories run: 82
-- PASS: 15
-- FAIL: 67
+- PASS: 16
+- FAIL: 66
 - TIMEOUT: 0
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
@@ -134,7 +160,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | nquote4 | FAIL | The braced hex-escape form `\x{NN}` inside `$'...'` strings is not implemented in huck: the sequence is passed through literally while bash expands it to the corresponding byte. Unbraced `\xNN` and other escape forms may have separate issues. |
 | nquote5 | PASS | |
 | parser | FAIL | v314 (#211) shrank the diff to 13 lines: the `for`/`case`-in-`for` syntax-error TEXT now matches bash's near-token/unexpected-EOF shapes byte-for-byte. Remaining: an unrelated `not a valid identifier` diagnostic wrongly carries a `line N:` prefix (not a top-level parse error, outside `render_syntax_diag`'s scope), plus a line-alignment artifact downstream of it. |
-| posix2 | FAIL | v314 (#211): the `case esac in esac) ...` fragment's error TEXT now matches bash exactly; the sole remaining diff on that line is the diagnostic PREFIX — huck emits `eval: line 199:` (leaking its internal eval-body line count) where bash emits `line 1:` (the calling script's physical line). Confirms [#209](https://github.com/jdstanhope/huck/issues/209)'s diagnosis; needs v315's `eval:`-marker work. Other pre-existing POSIX compliance failures (OPTIND initial value, variable-quoting edge cases) remain, unrelated to v314. |
+| posix2 | PASS | v315 (#209): the `eval:` marker + eval line base resolved the diagnostic-prefix diff v314 (#211) had narrowed this to — huck now prints `eval: line 199:` with the correct outer line number, matching bash exactly. 0-diff PASS. |
 | posixexp | FAIL | Multiple real divergences: quoting-aware pattern removal (`${var//pattern}`) strips more content than bash; an unterminated `${...}` form that bash accepts causes a syntax error in huck; `$*` with a non-whitespace IFS joins with a space instead of the IFS character (producing `1 2` where bash produces `12`); IFS-splitting at word boundaries diverges (huck splits where bash keeps tokens joined); and the test-case label printed for IFS diagnostic output shows `(null)` in huck versus the actual IFS value in bash for some edge cases. |
 | posixexp2 | FAIL | `set: posix: not yet supported` misconfigures the test environment; also an unterminated `${...}` handling difference when posix mode is presumed active. |
 | posixpat | FAIL | POSIX bracket-expression edge cases — specifically certain character-range and negated-bracket patterns where huck and bash produce different match results. New bug in the POSIX-ERE-adjacent glob matching path. |
