@@ -108,17 +108,33 @@ pub fn emit_syntax_error_ex(
 /// (Task 4) as the delimiter's opening line for the quote/`` ` ``/`$((`/`${`
 /// family of Shape 3 errors (`$(`/`(` still use the EOF line instead — see
 /// `emit_matching`). v314 Task 4 wires this into both top-level drivers
-/// (`shell::process_line_in_sinks`, `builtins::run_sourced_contents_in_sinks`)
-/// — no eval/comsub markers yet (still a known gap for nested contexts).
+/// (`shell::process_line_in_sinks`, `builtins::run_sourced_contents_in_sinks`).
+/// A nested `eval` context is handled (v315, #209): `eval`'s parse driver
+/// pushes an `eval_frame` so `shell.line_base()` is non-zero for the
+/// duration, and the `Diag::Syntax` arm consults it to print an `eval: line
+/// N:` marker (suppressing the `-c:`/script-name prefix) with the outer
+/// line number. A nested command-substitution context is still a known
+/// gap: expansion-time comsub reparse errors (e.g. an unterminated
+/// backtick body) report the top-level `-c:`/script-name prefix instead of
+/// bash's `command substitution: line N:` marker.
 pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_line: u32) {
+    // `token_line` is already offset by `shell.line_base()` (v315, #209: the
+    // outer line an `eval` sits on) for DISPLAY purposes, but `source` here is
+    // always the LOCAL text being parsed (e.g. the eval string alone) — so
+    // indexing into it (the echoed source line) must subtract the base back
+    // out first. `eof_line` is computed fresh from local `source` and needs
+    // the base added the other way, to land in the same display space as
+    // `token_line`.
+    let base = shell.line_base();
+    let local_line = token_line.saturating_sub(base);
     // bash's EOF line counter is "one past the last line read", regardless
     // of whether the source ends in a trailing newline (verified against
     // real bash 5.2.21: `bash -c 'if true'` and `bash -c $'if true\n'` both
     // report `line 2`) — so this counts LOGICAL lines via `str::lines()`,
     // not raw `\n` bytes (a byte count under-counts by one for the common
     // no-trailing-newline case).
-    let eof_line = 1 + source.lines().count() as u32;
-    let echo_line = source_logical_line(source, token_line);
+    let eof_line = base + 1 + source.lines().count() as u32;
+    let echo_line = source_logical_line(source, local_line);
     match err {
         // Shape 1: a real token is present but misplaced.
         ParseError::Unexpected(f) if matches!(f.found, Found::Token(_)) => {
@@ -187,7 +203,7 @@ pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_l
 /// input before giving up on a `$(`; verified the same way: `line 5:` for a
 /// 4-physical-line file).
 fn emit_matching(shell: &Shell, d: Delim, source: &str, token_line: u32) {
-    let eof_line = 1 + source.lines().count() as u32;
+    let eof_line = shell.line_base() + 1 + source.lines().count() as u32;
     let line = match d {
         Delim::DollarParen | Delim::Paren => eof_line,
         _ => token_line,

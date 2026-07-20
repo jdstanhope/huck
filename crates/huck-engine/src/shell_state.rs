@@ -863,6 +863,12 @@ pub struct Shell {
     /// `ExecCommand.line`. Zero means "unknown / not yet set".
     pub current_lineno: u32,
 
+    /// Set to Some(outer_line) while executing an `eval` string: the line where
+    /// the `eval` command was invoked. Drives the `eval:` syntax-error marker
+    /// and the line base for inner error lines and `$LINENO`. None at top level.
+    /// v315 (#209).
+    pub eval_frame: Option<u32>,
+
     /// LCG state for `$RANDOM`. Uses interior mutability so `lookup_var`
     /// (&self) can advance the state on each read. Seeded at startup from
     /// PID + nanoseconds; reseedable via `RANDOM=n`.
@@ -1101,6 +1107,7 @@ impl Shell {
             current_completion_spec: None,
             procsub_pending: Vec::new(),
             current_lineno: 0,
+            eval_frame: None,
             random_state: std::cell::Cell::new({
                 let pid = shell_pid as u64;
                 let nanos = std::time::SystemTime::now()
@@ -1206,6 +1213,12 @@ impl Shell {
         self.shopt_options.get("extglob").unwrap_or(false)
     }
 
+    /// Line offset added to an eval string's local (1-based) line numbers so
+    /// they reflect the outer line where `eval` sits. 0 outside eval. v315 (#209).
+    pub fn line_base(&self) -> u32 {
+        self.eval_frame.map_or(0, |n| n.saturating_sub(1))
+    }
+
     /// Bash-compatible error prologue — the complete matrix of
     /// `docs/superpowers/specs/2026-07-07-unified-error-emitter-design.md` §3.
     /// Mirrors bash `get_name_for_error` + `error_prolog`/`builtin_error_prolog`.
@@ -1241,7 +1254,9 @@ impl Shell {
             }
             Diag::Syntax { line } => {
                 if !self.is_interactive {
-                    if self.source_depth == 0 && self.is_command_string {
+                    if self.eval_frame.is_some() {
+                        out.push_str("eval: ");
+                    } else if self.source_depth == 0 && self.is_command_string {
                         out.push_str("-c: ");
                     }
                     out.push_str(&format!("line {line}: "));
