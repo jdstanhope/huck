@@ -502,24 +502,33 @@ fn run_restricted_then_inner(
     err: &mut StderrSink,
 ) -> i32 {
     let prev_policy = cell.borrow().policy;
+    let prev_startup = cell.borrow().restricted_at_startup;
     if restricted {
         let mut sh = cell.borrow_mut();
         sh.policy = crate::policy::Policy::Sandbox;
+        // An invocation-time choice by the embedder, analogous to `-r` rather
+        // than to `set -r` — so `shopt restricted_shell` reports `on`.
+        sh.restricted_at_startup = true;
         sh.apply_restricted_readonly();
     }
     struct R<'c> {
         cell: &'c Rc<RefCell<Shell>>,
         prev: crate::policy::Policy,
+        prev_startup: bool,
     }
     impl Drop for R<'_> {
         fn drop(&mut self) {
-            // Policy only — see the fn doc on why the readonly marks stay.
-            self.cell.borrow_mut().policy = self.prev;
+            // Policy + provenance only — see the fn doc on why the readonly
+            // marks stay.
+            let mut sh = self.cell.borrow_mut();
+            sh.policy = self.prev;
+            sh.restricted_at_startup = self.prev_startup;
         }
     }
     let _r = R {
         cell,
         prev: prev_policy,
+        prev_startup,
     };
 
     let label = cell.borrow().shell_argv0.clone();

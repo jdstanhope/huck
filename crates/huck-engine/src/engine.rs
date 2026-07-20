@@ -643,6 +643,125 @@ mod tests {
     // ============== RESTRICTED ==============
 
     #[test]
+    fn set_dash_r_enters_restricted_mode() {
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        let out = e.prepare("set -r; cd /tmp").capture();
+        assert!(
+            out.stderr.contains("cd: restricted"),
+            "stderr: {:?}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn set_plus_r_is_an_invalid_option_while_restricted() {
+        // bash makes +r an INVALID OPTION under restriction (usage + rc 1),
+        // rather than emitting a restriction-specific refusal.
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        let out = e.prepare("set -r; set +r; cd /tmp").capture();
+        assert!(
+            out.stderr.contains("set: +r: invalid option"),
+            "stderr: {:?}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains(
+                "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]"
+            ),
+            "usage line missing: {:?}",
+            out.stderr
+        );
+        // ...and the restriction is still in force afterwards.
+        assert!(
+            out.stderr.contains("cd: restricted"),
+            "restriction leaked off: {:?}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn set_plus_r_succeeds_in_a_normal_shell() {
+        // Verified against bash 5.2.21: rc 0, no diagnostic.
+        let mut e = Engine::new();
+        let out = e.prepare("set +r; echo ok").capture();
+        assert_eq!(out.stdout, "ok\n", "stderr: {:?}", out.stderr);
+        assert!(out.stderr.is_empty(), "stderr: {:?}", out.stderr);
+    }
+
+    /// `shopt restricted_shell` records HOW the shell was entered — startup vs
+    /// runtime — NOT whether it is currently restricted. Verified against bash
+    /// 5.2.21: `bash -r` and `rbash` report `on`, but a shell that ran `set -r`
+    /// reports `off` while still refusing `cd`. The `off` case below is the
+    /// whole point: `off` does not mean unrestricted.
+    #[test]
+    fn shopt_restricted_shell_is_a_readonly_indicator() {
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        // A startup entry (the embedding API, analogous to -r) reports on...
+        let out = e.prepare("shopt restricted_shell").restricted().capture();
+        assert!(out.stdout.contains("on"), "stdout: {:?}", out.stdout);
+        // ...an unrestricted shell reports off...
+        let out = e.prepare("shopt restricted_shell").capture();
+        assert!(out.stdout.contains("off"), "stdout: {:?}", out.stdout);
+        // ...and `set -r` ALSO reports off, while being genuinely restricted.
+        let out = e
+            .prepare("set -r; shopt restricted_shell; cd /tmp")
+            .capture();
+        assert!(
+            out.stdout.contains("off"),
+            "set -r must report off: {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.contains("cd: restricted"),
+            "off must NOT mean unrestricted: {:?}",
+            out.stderr
+        );
+        // ...and -s is a silent no-op that does NOT enter restricted mode.
+        let out = e
+            .prepare("shopt -s restricted_shell; echo rc=$?; cd /tmp && echo escaped")
+            .capture();
+        assert!(out.stdout.contains("rc=0"), "stdout: {:?}", out.stdout);
+        assert!(
+            out.stdout.contains("escaped"),
+            "shopt -s must not restrict: {:?}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn shopt_minus_u_restricted_shell_cannot_escape() {
+        // bash: silent no-op, rc 0, option stays on, restriction still enforced.
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        let out = e
+            .prepare("shopt -u restricted_shell; echo rc=$?; shopt restricted_shell; cd /tmp")
+            .restricted()
+            .capture();
+        assert!(out.stdout.contains("rc=0"), "stdout: {:?}", out.stdout);
+        assert!(
+            out.stdout.contains("on"),
+            "-u must not clear the indicator: {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.contains("cd: restricted"),
+            "escaped via shopt -u: {:?}",
+            out.stderr
+        );
+    }
+
+    #[test]
     fn restricted_off_by_default() {
         let _g = crate::test_support::CWD_LOCK
             .lock()
@@ -969,9 +1088,12 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
         let out = e.prepare("set +r; cd /tmp").restricted().capture();
+        // The Sandbox policy refuses `+r` by the same mechanism as Rbash:
+        // bash's ordinary invalid-option path, not a restriction-specific
+        // message. (Task 2's stopgap wording, "restricted: cannot turn off
+        // restricted mode", was never bash's — see task 5.)
         assert!(
-            out.stderr.contains("restricted: cannot turn off")
-                || out.stderr.contains("restricted:"),
+            out.stderr.contains("set: +r: invalid option"),
             "stderr={:?}",
             out.stderr
         );

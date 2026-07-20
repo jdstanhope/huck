@@ -42,6 +42,9 @@ pub struct CliOptions {
     /// `-o <name>` / `+o <name>` command-line options, in argv order. `bool` is
     /// enable (`-o` = true, `+o` = false). Applied at startup like `set -o`.
     pub o_options: Vec<(String, bool)>,
+    /// `-r`: start the shell restricted (also set for invocation as `rbash`;
+    /// see `startup_restricted`).
+    pub restricted: bool,
     pub mode: RunMode,
 }
 
@@ -53,6 +56,7 @@ impl Default for CliOptions {
             noexec: false,
             posix: false,
             o_options: Vec::new(),
+            restricted: false,
             mode: RunMode::Interactive,
         }
     }
@@ -64,6 +68,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
     let mut noexec = false;
     let mut posix = false;
     let mut o_options: Vec<(String, bool)> = Vec::new();
+    let mut restricted = false;
     let mut command: Option<String> = None;
     let mut i = 0;
 
@@ -80,6 +85,10 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
             }
             "--posix" => {
                 posix = true;
+                i += 1;
+            }
+            "-r" => {
+                restricted = true;
                 i += 1;
             }
             "-o" | "+o" => {
@@ -126,6 +135,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                     noexec: false,
                     posix: false,
                     o_options: Vec::new(),
+                    restricted: false,
                     mode: RunMode::PrintVersion,
                 });
             }
@@ -158,6 +168,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
         noexec,
         posix,
         o_options,
+        restricted,
         mode,
     })
 }
@@ -171,6 +182,21 @@ pub fn startup_posix(cli_posix: bool, argv0: &str, posixly_correct: bool) -> boo
         || std::path::Path::new(argv0)
             .file_name()
             .is_some_and(|n| n == "sh")
+}
+
+/// Whether the shell starts restricted: the `-r` invocation flag, or an
+/// `argv[0]` whose basename is `rbash`. Same flag-or-argv0 shape as
+/// `startup_posix`.
+///
+/// This answers only "was restriction requested AT INVOCATION" — a distinct
+/// question from "is this shell restricted NOW", which is `Shell::policy`'s.
+/// `set -r` restricts a running shell without being a startup entry, and bash
+/// distinguishes the two: `shopt restricted_shell` reports `on` only for the
+/// startup entries. See `Shell::restricted_at_startup`.
+pub fn startup_restricted(flag: bool, argv0: &str) -> bool {
+    flag || std::path::Path::new(argv0)
+        .file_name()
+        .is_some_and(|n| n == "rbash")
 }
 
 fn default_rc_path(shell: &Shell) -> Option<std::path::PathBuf> {
@@ -709,6 +735,30 @@ mod rc_tests {
     }
 
     #[test]
+    fn parse_cli_dash_r_sets_restricted() {
+        assert!(
+            parse_cli(&["-r".into(), "script.sh".into()])
+                .unwrap()
+                .restricted
+        );
+        assert!(!parse_cli(&["script.sh".into()]).unwrap().restricted);
+    }
+
+    #[test]
+    fn startup_restricted_from_flag_or_argv0() {
+        // -r at invocation.
+        assert!(startup_restricted(true, "/usr/bin/huck"));
+        // argv[0] basename is rbash.
+        assert!(startup_restricted(false, "rbash"));
+        assert!(startup_restricted(false, "/usr/local/bin/rbash"));
+        // Neither.
+        assert!(!startup_restricted(false, "huck"));
+        assert!(!startup_restricted(false, "/usr/bin/huck"));
+        // A name merely CONTAINING rbash is not a match.
+        assert!(!startup_restricted(false, "/usr/bin/rbash-wrapper"));
+    }
+
+    #[test]
     fn startup_posix_sources() {
         assert!(startup_posix(true, "/usr/bin/huck", false), "--posix");
         assert!(startup_posix(false, "/bin/sh", false), "invoked as sh");
@@ -897,6 +947,7 @@ mod rc_tests {
             noexec: false,
             posix: false,
             o_options: Vec::new(),
+            restricted: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
@@ -915,6 +966,7 @@ mod rc_tests {
             noexec: false,
             posix: false,
             o_options: Vec::new(),
+            restricted: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
@@ -933,6 +985,7 @@ mod rc_tests {
             noexec: false,
             posix: false,
             o_options: Vec::new(),
+            restricted: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
@@ -955,6 +1008,7 @@ mod rc_tests {
             noexec: false,
             posix: false,
             o_options: Vec::new(),
+            restricted: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), Some(1));
@@ -971,6 +1025,7 @@ mod rc_tests {
             noexec: false,
             posix: false,
             o_options: Vec::new(),
+            restricted: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), Some(42));

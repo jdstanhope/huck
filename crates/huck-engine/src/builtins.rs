@@ -6371,26 +6371,19 @@ fn builtin_set(
     builtin_set_inner(args, out, err, shell)
 }
 
+/// bash's `set` usage line, verbatim from 5.2.21. Currently reached only by
+/// the `+r` refusal; huck's unknown-flag path still says "not yet supported"
+/// instead of bash's `invalid option` + usage, so when that is aligned it
+/// should print this same constant.
+const SET_USAGE: &str =
+    "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]";
+
 fn builtin_set_inner(
     args: &[String],
     out: &mut dyn Write,
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    // STOPGAP (v319 task 2): preserves today's wording/status verbatim so the
-    // `restricted` module has no callers left and can be deleted. bash actually
-    // refuses `set +r` with `set: +r: invalid option` plus set's usage line —
-    // task 5 replaces this with that mechanism. Deliberately not an `Op`: a
-    // policy message body cannot carry a usage line (see policy.rs's header).
-    if shell.policy.is_restricted() && args.iter().any(|a| a == "+r") {
-        crate::sh_error_to!(
-            shell,
-            err,
-            None,
-            "restricted: cannot turn off restricted mode"
-        );
-        return ExecOutcome::Continue(1);
-    }
     if args.is_empty() {
         let mut names: Vec<String> = shell.var_names().map(|s| s.to_string()).collect();
         names.sort();
@@ -6473,6 +6466,14 @@ fn builtin_set_inner(
                     b'P' => shell.shell_options.physical = true,
                     b'T' => shell.shell_options.functrace = true,
                     b'p' => shell.shell_options.privileged = true,
+                    // `set -r` restricts a RUNNING shell. Not a startup entry,
+                    // so `restricted_at_startup` deliberately stays false —
+                    // bash reports `shopt restricted_shell` as `off` here even
+                    // though the shell is now fully restricted.
+                    b'r' => {
+                        shell.policy = crate::policy::Policy::Rbash;
+                        shell.apply_restricted_readonly();
+                    }
                     b'o' => {
                         i += 1;
                         if i >= args.len() {
@@ -6530,6 +6531,18 @@ fn builtin_set_inner(
                     b'P' => shell.shell_options.physical = false,
                     b'T' => shell.shell_options.functrace = false,
                     b'p' => shell.shell_options.privileged = false,
+                    // Restriction is one-way. bash does not emit a
+                    // restriction-specific refusal here: it routes `+r` through
+                    // the ordinary invalid-option path (usage line, rc 1 —
+                    // note NOT the rc 2 an unknown flag like `+Z` gets).
+                    // Unrestricted, `set +r` is simply accepted at rc 0.
+                    b'r' => {
+                        if shell.policy.is_restricted() {
+                            crate::sh_error_to!(shell, err, None, "set: +r: invalid option");
+                            e!(err, "{}", SET_USAGE);
+                            return ExecOutcome::Continue(1);
+                        }
+                    }
                     b'o' => {
                         i += 1;
                         if i >= args.len() {
@@ -6586,6 +6599,21 @@ fn fmt_opt_line(name: &str, on: bool) -> String {
 
 /// `shopt` builtin. Operates on the `shopt` option namespace, or — with
 /// `-o` — bridges to the `set -o` namespace (`SETO_TABLE`).
+/// `restricted_shell` is not a stored bit — bash computes it, and it is
+/// READ-ONLY: `shopt -s`/`-u` on it are silent no-ops in both directions, so
+/// it can neither enter nor escape restriction.
+const RESTRICTED_SHELL_OPT: &str = "restricted_shell";
+
+/// Read a shopt bit. `restricted_shell` reports the shell's startup PROVENANCE
+/// (see `Shell::restricted_at_startup`), not its current policy: bash says
+/// `off` after `set -r` even though that shell is restricted.
+fn shopt_get(shell: &Shell, name: &str) -> Option<bool> {
+    if name == RESTRICTED_SHELL_OPT {
+        return Some(shell.restricted_at_startup);
+    }
+    shell.shopt_options.get(name)
+}
+
 fn builtin_shopt(
     args: &[String],
     out: &mut dyn Write,
@@ -6643,7 +6671,7 @@ fn builtin_shopt(
             return ExecOutcome::Continue(0);
         }
         for opt in SHOPT_TABLE {
-            let on = shell.shopt_options.get(opt.name).unwrap_or(false);
+            let on = shopt_get(shell, opt.name).unwrap_or(false);
             if set_f && !on {
                 continue;
             }
@@ -6662,6 +6690,11 @@ fn builtin_shopt(
     if set_f || unset_f {
         let mut rc = 0;
         for name in names {
+            if name == RESTRICTED_SHELL_OPT {
+                // Silent no-op, rc 0 — `-u` must not lift the restriction and
+                // `-s` must not impose one. Verified against bash 5.2.21.
+                continue;
+            }
             if !shell.shopt_options.set(name, set_f) {
                 crate::sh_error_to!(shell, err, None, "shopt: {name}: invalid shell option name");
                 rc = 1;
@@ -6673,7 +6706,7 @@ fn builtin_shopt(
     // query mode
     let mut all_set = true;
     for name in names {
-        match shell.shopt_options.get(name) {
+        match shopt_get(shell, name) {
             Some(on) => {
                 if !on {
                     all_set = false;

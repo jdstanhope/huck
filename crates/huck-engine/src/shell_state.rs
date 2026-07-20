@@ -695,6 +695,18 @@ pub struct Shell {
     /// `ExecBuilder`; inherited by functions, subshells, and command
     /// substitutions because `Shell` carries it by value.
     pub policy: crate::policy::Policy,
+    /// PROVENANCE ONLY — how the shell became restricted, never WHETHER it is.
+    /// `policy` is the sole authority on what is allowed; this flag records
+    /// only that restriction was requested at INVOCATION time (`-r`, argv[0]
+    /// `rbash`, or `ExecBuilder::restricted()`), as opposed to at runtime via
+    /// `set -r`. Do not read it to decide whether an operation is permitted.
+    ///
+    /// It exists because bash 5.2.21 distinguishes the two: `shopt
+    /// restricted_shell` reports `on` for a startup entry and `off` after
+    /// `set -r` — while that `set -r` shell still refuses `cd` and still
+    /// rejects `set +r`. So `off` does NOT mean unrestricted, and the two
+    /// questions genuinely need two fields.
+    pub restricted_at_startup: bool,
     pub shell_pgid: i32,
     /// Command history. `Rc` so cloning the Shell (per command substitution) is
     /// O(1); the rare mutation (append/load/clear) uses `Rc::make_mut` (COW).
@@ -1073,6 +1085,7 @@ impl Shell {
             timeout_flag: Arc::new(AtomicBool::new(false)),
             live_external_children: Arc::new(Mutex::new(Vec::new())),
             policy: crate::policy::Policy::Unrestricted,
+            restricted_at_startup: false,
             shell_pgid: unsafe { libc::getpgrp() },
             history: Rc::new(crate::history::History::new()),
             shell_pid,

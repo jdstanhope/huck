@@ -106,6 +106,21 @@ pub fn run(args: &[String], version: &str) -> i32 {
         shell_cell.borrow_mut().shell_options.posix = posix;
     }
 
+    // Restricted mode: -r, or invocation as `rbash`. Applied before any
+    // program/interactive dispatch so it governs the whole session, and before
+    // any user code runs so the readonly marks are already in place. Both are
+    // STARTUP entries, so `shopt restricted_shell` reports `on` (unlike a
+    // later `set -r`).
+    {
+        let argv0 = std::env::args().next().unwrap_or_default();
+        if huck_engine::shell::startup_restricted(opts.restricted, &argv0) {
+            let mut sh = shell_cell.borrow_mut();
+            sh.policy = huck_engine::policy::Policy::Rbash;
+            sh.restricted_at_startup = true;
+            sh.apply_restricted_readonly();
+        }
+    }
+
     // `-o <name>` / `+o <name>` command-line options (#159): apply in argv order
     // through the engine's `set -o` table, before any program/interactive
     // dispatch, so they govern the whole session.
