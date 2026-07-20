@@ -475,7 +475,7 @@ pub fn process_line_in_sinks(
                 .filter(|&&b| b == b'\n')
                 .count() as u32;
             crate::err_thread_local::install_err_sinks(sink, err_sink, || {
-                crate::emit_syntax_error(shell, ln, format_args!("syntax error: {e}"));
+                crate::render_syntax_diag(shell, &e, line, ln);
             });
             ExecOutcome::Continue(2)
         }

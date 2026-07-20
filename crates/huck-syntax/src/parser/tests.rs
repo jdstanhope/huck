@@ -2737,16 +2737,36 @@ fn cs_comment_only_body_at_eof_is_unterminated() {
     // #109: a `$(` body that is only a comment (or empty) reaching EOF before
     // `)` is an UNTERMINATED substitution — so the stdin/REPL reader keeps
     // reading — not a MissingCommand error. Mirrors parse_subshell's guard.
+    //
+    // v314 (#211): the error TYPE changed from the shared `UnterminatedSubshell`
+    // to a `$(`-specific `Unexpected(ExpectFailure{Eof, matching: DollarParen})`
+    // — bash reports an unterminated `$(` as `unexpected EOF while looking for
+    // matching `)'` (Shape 3), not the generic `unexpected end of file` a bare
+    // `(` gets (Shape 2). Verified against real bash 5.2.21: `bash -c 'echo $(# c'`
+    // and `bash -c 'echo $('` both print `unexpected EOF while looking for
+    // matching `)''. The "unterminated, keep reading" BEHAVIOR this test guards
+    // is unchanged — only the error's shape classification is more precise now.
     assert!(
         matches!(
             new_cs("$(# c", false),
-            Err(ParseError::UnterminatedSubshell)
+            Err(ParseError::Unexpected(ExpectFailure {
+                found: Found::Eof,
+                matching: Some(Delim::DollarParen),
+                ..
+            }))
         ),
         "comment-only body: got {:?}",
         new_cs("$(# c", false)
     );
     assert!(
-        matches!(new_cs("$(", false), Err(ParseError::UnterminatedSubshell)),
+        matches!(
+            new_cs("$(", false),
+            Err(ParseError::Unexpected(ExpectFailure {
+                found: Found::Eof,
+                matching: Some(Delim::DollarParen),
+                ..
+            }))
+        ),
         "bare $( at EOF: got {:?}",
         new_cs("$(", false)
     );
@@ -2761,8 +2781,22 @@ fn cs_comment_only_body_at_eof_is_unterminated() {
 #[test]
 fn process_sub_comment_only_body_at_eof_is_unterminated() {
     // #109 sibling: `<(` with a comment-only body at EOF is likewise unterminated.
+    //
+    // v314 Task 5 (#211): bash reports this as Shape 3 (`unexpected EOF
+    // while looking for matching `)'`), the same `$(`-style
+    // `Found::Eof`/`Delim::DollarParen` shape `parse_command_sub` uses — NOT
+    // the bare-`(` subshell's `UnterminatedSubshell` — verified against real
+    // bash 5.2.21 (`bash -c 'cat <(# c'` -> `line 2: unexpected EOF while
+    // looking for matching `)'`).
     assert!(
-        matches!(new_seq("cat <(# c"), Err(ParseError::UnterminatedSubshell)),
+        matches!(
+            new_seq("cat <(# c"),
+            Err(ParseError::Unexpected(ExpectFailure {
+                found: Found::Eof,
+                matching: Some(Delim::DollarParen),
+                ..
+            }))
+        ),
         "procsub comment-only body: got {:?}",
         new_seq("cat <(# c")
     );
@@ -4070,9 +4104,15 @@ fn prune_across_outstanding_arith_mark_does_not_corrupt() {
     // After the bail, the parser retries the `$((` opener as `$(` + `(` and
     // re-drives `parse_command_sub`, which now needs a SECOND closing paren
     // (for the outer `$(`) that this deliberately-unbalanced source never
-    // supplies — so the fixed parse legitimately errors with
-    // `UnterminatedSubshell` (determined by running the fixed build) rather
-    // than panicking. That is the outcome under test, not a vacuous pass.
+    // supplies — so the fixed parse legitimately errors with an unterminated
+    // `$(` (determined by running the fixed build) rather than panicking.
+    // That is the outcome under test, not a vacuous pass.
+    //
+    // v314 (#211): the error TYPE changed from the shared `UnterminatedSubshell`
+    // to a `$(`-specific `Unexpected(ExpectFailure{Eof, matching: DollarParen})`
+    // — see `cs_comment_only_body_at_eof_is_unterminated` for the bash-parity
+    // rationale (an unterminated `$(` is bash's Shape 3, not Shape 2). The
+    // outer construct here IS a `$(`, so the same reclassification applies.
     let empty = std::collections::HashMap::new();
     let prefix: String = (0..2000).map(|i| format!("w{i} ")).collect();
     let inner: String = std::iter::repeat(":; ")
@@ -4082,8 +4122,15 @@ fn prune_across_outstanding_arith_mark_does_not_corrupt() {
     let mut lx = Lexer::new(&src, &empty, LexerOptions::default());
     let result = parse_sequence(&mut lx);
     assert!(
-        matches!(result, Err(ParseError::UnterminatedSubshell)),
-        "expected Err(UnterminatedSubshell), got {result:?}"
+        matches!(
+            result,
+            Err(ParseError::Unexpected(ExpectFailure {
+                found: Found::Eof,
+                matching: Some(Delim::DollarParen),
+                ..
+            }))
+        ),
+        "expected Err(Unexpected{{Eof, DollarParen}}), got {result:?}"
     );
 }
 

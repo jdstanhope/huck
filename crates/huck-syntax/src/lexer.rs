@@ -1,7 +1,13 @@
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[non_exhaustive]
 pub enum LexError {
-    UnterminatedQuote,
+    /// EOF while a quoted span (`'…'`, `"…"`, or `$'…'`) was still open.
+    /// `double` is `true` for a `"…"` span, `false` for `'…'`/`$'…'` — bash
+    /// reports the matching delimiter as `` `"' `` vs `` `'' `` respectively
+    /// (v314 Task 5, #211).
+    UnterminatedQuote {
+        double: bool,
+    },
     InvalidVarName,
     UnterminatedBrace,
     UnterminatedSubstitution,
@@ -634,6 +640,27 @@ pub enum WordPart {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Word(pub Vec<WordPart>);
+
+impl Word {
+    /// The flat literal text of this `Word`, when it is exactly one
+    /// UNQUOTED `Literal` part — the shape a bare reserved word
+    /// (`done`/`esac`/`fi`/`then`/`do`/`in`/`elif`/`else`/`{`/`}`) takes
+    /// once it reaches the parser as a `Word` token. Mirrors the same
+    /// single-unquoted-literal check `parser::keyword_kind` performs.
+    /// `None` for anything with more parts, or a quoted/non-literal part
+    /// (e.g. `"done"`, `$x`, `do$x`) — those are not reserved-word spellings.
+    pub(crate) fn as_reserved_literal(&self) -> Option<&str> {
+        match self.0.as_slice() {
+            [
+                WordPart::Literal {
+                    text,
+                    quoted: false,
+                },
+            ] => Some(text.as_str()),
+            _ => None,
+        }
+    }
+}
 
 /// A token's source location. `column` is a 1-based character column
 /// (Unicode scalars from the line start; a tab is one column).
@@ -2297,7 +2324,7 @@ impl<'a> Lexer<'a> {
         if in_dquote {
             // ── Inside a double-quoted span ───────────────────────────────────
             match self.cursor.peek().copied() {
-                None => return Err(LexError::UnterminatedQuote),
+                None => return Err(LexError::UnterminatedQuote { double: true }),
 
                 // Closing `"` — flip frame back to unquoted; no token emitted this call.
                 // Returning `Step::Produced` is safe: the cursor advanced, so no spin.
@@ -2623,7 +2650,7 @@ impl<'a> Lexer<'a> {
                     let mut text = String::new();
                     loop {
                         match self.cursor.next() {
-                            None => return Err(LexError::UnterminatedQuote),
+                            None => return Err(LexError::UnterminatedQuote { double: false }),
                             Some('\'') => break,
                             Some(ch) => text.push(ch),
                         }
@@ -2668,7 +2695,7 @@ impl<'a> Lexer<'a> {
                     let in_l = self.cursor.line();
                     let in_c = self.cursor.column();
                     match self.cursor.peek().copied() {
-                        None => return Err(LexError::UnterminatedQuote),
+                        None => return Err(LexError::UnterminatedQuote { double: true }),
 
                         // Empty `""` — emit empty quoted Lit (preserves `""` = empty-string
                         // semantics); in_dquote stays false.
@@ -4619,7 +4646,7 @@ impl<'a> Lexer<'a> {
                 let mut text = String::new();
                 loop {
                     match self.cursor.next() {
-                        None => return Err(LexError::UnterminatedQuote),
+                        None => return Err(LexError::UnterminatedQuote { double: false }),
                         Some('\'') => break,
                         Some(ch) => text.push(ch),
                     }
@@ -5100,7 +5127,7 @@ impl<'a> Lexer<'a> {
         let l = self.cursor.line();
         let c = self.cursor.column();
         match self.cursor.peek().copied() {
-            None => Err(LexError::UnterminatedQuote),
+            None => Err(LexError::UnterminatedQuote { double: true }),
 
             // Closing `"` — emit EndDquote; the parser pops the DoubleQuote frame.
             Some('"') => {
@@ -5341,7 +5368,7 @@ impl<'a> Lexer<'a> {
                 let mut text = String::new();
                 loop {
                     match self.cursor.next() {
-                        None => return Err(LexError::UnterminatedQuote),
+                        None => return Err(LexError::UnterminatedQuote { double: false }),
                         Some('\'') => break,
                         Some(ch) => text.push(ch),
                     }
@@ -5515,7 +5542,7 @@ impl<'a> Lexer<'a> {
                 let mut text = String::new();
                 loop {
                     match self.cursor.next() {
-                        None => return Err(LexError::UnterminatedQuote),
+                        None => return Err(LexError::UnterminatedQuote { double: false }),
                         Some('\'') => break,
                         Some(ch) => text.push(ch),
                     }
@@ -5945,6 +5972,66 @@ impl<'a> Lexer<'a> {
     pub fn next_kind(&mut self) -> Result<Option<TokenKind>, LexError> {
         Ok(self.next()?.map(|t| t.kind))
     }
+
+    /// Peek the NEXT atom; if its kind matches one of `expected` (by
+    /// discriminant only — payload ignored), consume and return the whole
+    /// `Token`, else return a `command::ExpectFailure` capturing what was
+    /// actually there (a concrete token, or EOF). A lex error while peeking
+    /// is folded into the EOF shape — this helper never scans ahead and
+    /// never surfaces a `LexError` of its own (THE RULE: single atom only).
+    pub fn expect_next_kind(
+        &mut self,
+        expected: &[TokenKind],
+    ) -> Result<Token, crate::command::ExpectFailure> {
+        let pos = match self.peek() {
+            Ok(Some(t)) => t.span.offset,
+            _ => self.cursor_pos(),
+        };
+        let found_kind = match self.peek_kind() {
+            Ok(Some(k)) => Some(k.clone()),
+            _ => None,
+        };
+        match found_kind {
+            Some(k)
+                if expected
+                    .iter()
+                    .any(|e| std::mem::discriminant(e) == std::mem::discriminant(&k)) =>
+            {
+                Ok(self.next().ok().flatten().expect("peeked token present"))
+            }
+            Some(k) => Err(crate::command::ExpectFailure {
+                found: crate::command::Found::Token(k),
+                matching: None,
+                pos,
+            }),
+            None => Err(crate::command::ExpectFailure {
+                found: crate::command::Found::Eof,
+                matching: None,
+                pos,
+            }),
+        }
+    }
+
+    /// Capture the CURRENTLY peeked token (or EOF) as an `ExpectFailure` —
+    /// for "this token is invalid in this position" sites that don't have
+    /// an `expected` set to check against, just a `matching` opener (if
+    /// any) to report against bash's "unexpected EOF while looking for
+    /// matching `X'" shape downstream.
+    pub fn unexpected_here(
+        &mut self,
+        matching: Option<crate::command::Delim>,
+    ) -> Result<crate::command::ExpectFailure, LexError> {
+        let (found, pos) = match self.peek()? {
+            Some(t) => (crate::command::Found::Token(t.kind.clone()), t.span.offset),
+            None => (crate::command::Found::Eof, self.cursor_pos()),
+        };
+        Ok(crate::command::ExpectFailure {
+            found,
+            matching,
+            pos,
+        })
+    }
+
     pub fn peek_span(&mut self) -> Result<Option<Span>, LexError> {
         self.fill_to(self.pos)?;
         Ok(self.history.get(self.pos).map(|t| t.span))
@@ -6396,7 +6483,7 @@ fn scan_ansi_c_quoted(chars: &mut CharCursor<'_>) -> Result<String, LexError> {
     let mut out = String::new();
     loop {
         match chars.next() {
-            None => return Err(LexError::UnterminatedQuote),
+            None => return Err(LexError::UnterminatedQuote { double: false }),
             Some('\'') => return Ok(out),
             Some('\\') => decode_ansi_c_escape(chars, &mut out)?,
             Some(c) => out.push(c),
@@ -6428,7 +6515,7 @@ pub fn decode_ansi_c_escapes(v: &str) -> String {
 /// result to `out`. The leading `\` has already been consumed.
 fn decode_ansi_c_escape(chars: &mut CharCursor<'_>, out: &mut String) -> Result<(), LexError> {
     match chars.next() {
-        None => return Err(LexError::UnterminatedQuote),
+        None => return Err(LexError::UnterminatedQuote { double: false }),
         Some('a') => out.push('\x07'),
         Some('b') => out.push('\x08'),
         Some('e') | Some('E') => out.push('\x1B'),
@@ -6881,6 +6968,90 @@ mod tests {
             "D2: tilde enabled for indexed value"
         );
         assert!(!lx.cmd_at_word_start);
+    }
+
+    #[test]
+    fn expect_next_kind_matches_and_consumes() {
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new("foo", &empty, LexerOptions::default());
+        // Command words reach the atom cursor as a bare `Lit` atom (not a
+        // legacy `Word` token — see spell.rs's doc comment). Discriminant-only
+        // match: an empty-text `Lit` stand-in matches any `Lit` payload.
+        let expected = TokenKind::Lit {
+            text: String::new(),
+            quoted: false,
+        };
+        let tok = lx
+            .expect_next_kind(&[expected])
+            .expect("lit token expected");
+        assert!(matches!(tok.kind, TokenKind::Lit { quoted: false, .. }));
+        // Consumed: nothing left to peek.
+        assert_eq!(lx.peek_kind().unwrap(), None);
+    }
+
+    #[test]
+    fn expect_next_kind_mismatch_reports_found_without_consuming() {
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new(";", &empty, LexerOptions::default());
+        let expected = TokenKind::Lit {
+            text: String::new(),
+            quoted: false,
+        };
+        let err = lx
+            .expect_next_kind(&[expected])
+            .expect_err("semicolon is not a lit");
+        assert_eq!(
+            err.found,
+            crate::command::Found::Token(TokenKind::Op(Operator::Semi))
+        );
+        assert_eq!(err.matching, None);
+        // Not consumed: the `;` is still there to peek.
+        assert_eq!(
+            lx.peek_kind().unwrap(),
+            Some(&TokenKind::Op(Operator::Semi))
+        );
+    }
+
+    #[test]
+    fn expect_next_kind_at_eof_reports_eof() {
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new("", &empty, LexerOptions::default());
+        let expected = TokenKind::Lit {
+            text: String::new(),
+            quoted: false,
+        };
+        let err = lx
+            .expect_next_kind(&[expected])
+            .expect_err("nothing to find at EOF");
+        assert_eq!(err.found, crate::command::Found::Eof);
+    }
+
+    #[test]
+    fn unexpected_here_captures_current_token_without_consuming() {
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new(")", &empty, LexerOptions::default());
+        let failure = lx
+            .unexpected_here(Some(crate::command::Delim::Paren))
+            .expect("no lex error");
+        assert_eq!(
+            failure.found,
+            crate::command::Found::Token(TokenKind::Op(Operator::RParen))
+        );
+        assert_eq!(failure.matching, Some(crate::command::Delim::Paren));
+        // Not consumed: the `)` is still there to peek.
+        assert_eq!(
+            lx.peek_kind().unwrap(),
+            Some(&TokenKind::Op(Operator::RParen))
+        );
+    }
+
+    #[test]
+    fn unexpected_here_at_eof_reports_eof() {
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new("", &empty, LexerOptions::default());
+        let failure = lx.unexpected_here(None).expect("no lex error");
+        assert_eq!(failure.found, crate::command::Found::Eof);
+        assert_eq!(failure.matching, None);
     }
 
     #[test]

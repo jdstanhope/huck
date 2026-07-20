@@ -49,6 +49,7 @@ pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
         }
         ParseError::UnsupportedExpansion => "unsupported expansion".to_string(),
         ParseError::UnsupportedCommand => "unsupported command".to_string(),
+        ParseError::Unexpected(_) => "syntax error near unexpected token".to_string(),
     }
 }
 
@@ -59,7 +60,7 @@ pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
 /// rendered line reads `"syntax error in command substitution: ..."`.
 pub(crate) fn lex_error_message_impl(error: &LexError) -> String {
     match error {
-        LexError::UnterminatedQuote => ": unterminated quote".to_string(),
+        LexError::UnterminatedQuote { .. } => ": unterminated quote".to_string(),
         LexError::InvalidVarName => ": invalid variable name in '${...}'".to_string(),
         LexError::UnterminatedBrace => ": unterminated '${...}'".to_string(),
         LexError::UnterminatedSubstitution => ": unterminated command substitution".to_string(),
@@ -103,7 +104,7 @@ mod tests {
         // Display. When wrapped in ParseError::Lex, ParseError's Display
         // must strip the leading ": " so callers using "syntax error: {}"
         // produce a single separator, not a double one.
-        let err = ParseError::Lex(Box::new(LexError::UnterminatedQuote));
+        let err = ParseError::Lex(Box::new(LexError::UnterminatedQuote { double: true }));
         let msg = err.to_string();
         assert!(
             !msg.starts_with(": "),

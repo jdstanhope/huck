@@ -71,9 +71,15 @@ fn multiline_construct_points_at_first_line() {
 fn lex_error_as_only_unit_is_reported_line_one() {
     // Whole script is a single unterminated-quote token (no prior unit): the
     // newline-skip peek hits the lex error first. Must report, not stay silent.
+    //
+    // v314 (#211): an unterminated quote is bash's Shape 3 — `unexpected EOF
+    // while looking for matching `X'` — which has NO "syntax error" substring
+    // (verified against real bash 5.2.21). The wording assertion below moved
+    // off the old generic "syntax error" text onto that bash-correct phrase;
+    // the line-number guarantee this test exists for is unchanged.
     let (_o, se, c) = run_script("'unterminated\n");
     assert!(
-        se.contains("syntax error"),
+        se.contains("unexpected EOF while looking for matching"),
         "lex error must be reported: {se:?}"
     );
     assert!(se.contains("line 1:"), "expected 'line 1:', got: {se:?}");
@@ -87,8 +93,10 @@ fn lex_error_as_first_token_of_second_unit_reports_its_line() {
     // start), not line 3 (where the failed scan ran the cursor to EOF).
     let (so, se, c) = run_script("echo ok\n'unterminated\n");
     assert!(so.contains("ok"), "first unit should run: {so:?}");
+    // v314 (#211): see lex_error_as_only_unit_is_reported_line_one — bash's
+    // Shape 3 wording has no "syntax error" substring.
     assert!(
-        se.contains("syntax error"),
+        se.contains("unexpected EOF while looking for matching"),
         "lex error must be reported: {se:?}"
     );
     assert!(se.contains("line 2:"), "expected 'line 2:', got: {se:?}");
@@ -99,7 +107,12 @@ fn lex_error_as_first_token_of_second_unit_reports_its_line() {
 fn lex_error_after_blank_line_counts_the_blank() {
     // The blank line must be counted in the physical line: error on line 3.
     let (_o, se, _c) = run_script("echo a\n\n'bad\n");
-    assert!(se.contains("syntax error"), "stderr: {se:?}");
+    // v314 (#211): see lex_error_as_only_unit_is_reported_line_one — bash's
+    // Shape 3 wording has no "syntax error" substring.
+    assert!(
+        se.contains("unexpected EOF while looking for matching"),
+        "stderr: {se:?}"
+    );
     assert!(se.contains("line 3:"), "expected 'line 3:', got: {se:?}");
 }
 
@@ -113,8 +126,10 @@ fn earlier_units_run_before_a_later_parse_error() {
         so.contains("a") && so.contains("b"),
         "both units should run: {so:?}"
     );
+    // v314 (#211): see lex_error_as_only_unit_is_reported_line_one — bash's
+    // Shape 3 wording has no "syntax error" substring.
     assert!(
-        se.contains("syntax error"),
+        se.contains("unexpected EOF while looking for matching"),
         "lex error must be reported: {se:?}"
     );
     assert!(se.contains("line 3:"), "expected 'line 3:', got: {se:?}");
@@ -139,8 +154,10 @@ fn heredoc_unit_immediately_before_a_parse_error() {
     // the error is reported at the bad token's line (4), not the EOF line.
     let (so, se, c) = run_script("cat <<EOF\nhi\nEOF\n'unterminated\n");
     assert!(so.contains("hi"), "heredoc unit should run: {so:?}");
+    // v314 (#211): see lex_error_as_only_unit_is_reported_line_one — bash's
+    // Shape 3 wording has no "syntax error" substring.
     assert!(
-        se.contains("syntax error"),
+        se.contains("unexpected EOF while looking for matching"),
         "lex error must be reported: {se:?}"
     );
     assert!(se.contains("line 4:"), "expected 'line 4:', got: {se:?}");

@@ -53,9 +53,14 @@ fn shopt_extglob_then_function_with_extglob_sub() {
 #[test]
 fn malformed_line_reports_once_no_loop() {
     // genuinely un-lexable -> report once and continue, NO hang.
+    //
+    // v314 (#211): an unterminated `$(` is bash's Shape 3 — `unexpected EOF
+    // while looking for matching `)'` — which has NO "syntax error" substring
+    // (verified against real bash 5.2.21 on this exact fragment). The
+    // "report once, don't hang" guarantee this test exists for is unchanged.
     let (out, err, _c) = run("echo a\n$(\necho b\n");
     assert!(out.contains('a') || out.contains('b'));
-    assert!(err.contains("syntax error"));
+    assert!(err.contains("unexpected EOF while looking for matching"));
 }
 
 #[test]
