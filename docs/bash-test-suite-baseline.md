@@ -81,6 +81,17 @@ sweep confirm no other category's output changed (the whole behavioral
 change is `line_base()` being non-zero only inside `eval`, which is a
 no-op everywhere else).
 
+**v316 provenance note** (#213, 2026-07-20 UTC): closed the backtick
+command-substitution-body syntax-error gap — a syntax error inside a
+`` `...` `` body now prints bash's `command substitution:` marker
+(byte-identical on stderr; `$()` bodies are unaffected). No category
+flip — `posix2` was already PASS (v315/#209); this is a harness-level
+alignment (`tests/scripts/comsub_marker_diag_diff_check.sh`, 8/8) with
+no effect on the 82-category sweep. The pre-existing stdout/rc
+divergence (bash recovers with an empty substitution and continues,
+rc 0; huck aborts the `-c` string, rc 2) is out of scope for #213 and
+tracked as a follow-on, [#215](https://github.com/jdstanhope/huck/issues/215).
+
 Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven front-end (oracle deletion, `${…}`/subscript/assignment paths) cost zero bash-suite compatibility — every previously-passing category still passes, no new TIMEOUTs, and the array/subscript/assignment categories (`array`, `array2`, `assoc`, `appendop`, `tilde`, `posixpat`) stay FAIL for the same pre-existing non-front-end reasons recorded below.
 
 ## Summary
