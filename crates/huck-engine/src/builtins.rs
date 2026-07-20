@@ -2300,9 +2300,15 @@ fn builtin_declare_decl(
                 // EXISTING value as the reference target, and this check fires
                 // BEFORE the readonly check (verified on bash 5.2.21:
                 // `readonly PATH; declare -n PATH` reports the invalid-name
-                // error, while `readonly FOO; declare -n FOO` on an UNSET FOO
-                // reports `readonly variable`). An unset NAME is accepted and
-                // simply gains the `-n` attribute.
+                // error). An unset NAME is accepted and simply gains the `-n`
+                // attribute.
+                //
+                // DIVERGENCE, unset + readonly: bash reports `readonly
+                // variable` there, huck reports the invalid-name error with an
+                // empty value. Not reachable as an escape (rc 1, nothing is
+                // applied) — it falls out of huck having no attribute-without-
+                // value state, so `readonly FOO` on an unset FOO creates FOO
+                // as set-to-empty and `shell.get` returns Some(""). See #225.
                 let cur = cur.to_string();
                 let valid = is_valid_name(&cur)
                     || matches!(parse_subscripted_arg(&cur), Ok(Some((b, _))) if is_valid_name(b));
