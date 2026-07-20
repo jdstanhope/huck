@@ -36,5 +36,44 @@ check 'eval-c-marker'     'eval "case esac in esac) ;; esac"'
 check_script 'eval-script-line3' 'echo a' 'echo b' 'eval "case esac in esac) ;; esac"'
 # --- control: a non-eval top-level syntax error still uses -c:, no eval: marker
 check 'noneval-control'   'case esac in esac) ;; esac'
+
+# --- v315 follow-up (#209): `eval "source badfile"` — the SOURCED file's own
+# syntax error must NOT inherit the enclosing eval's `eval:` marker/line-shift
+# (eval_frame is per-eval-parse, not inherited by a nested `source`/`.`; bash
+# reports badfile's real name/line, no marker). This is the forward direction
+# of the bug that was fixed: prior to the fix huck spuriously printed
+# `<file>: eval: line 2: ...` with the WRONG (eval-shifted) echoed line.
+check_eval_source() {
+  local label=$1 inner b h br hr
+  inner=$(mktemp)
+  printf 'echo a\ncase esac in esac) ;; esac\n' > "$inner"
+  b=$(bash -c "eval \"source $inner\"" 2>&1); br=$?; b=$(printf '%s' "$b" | snorm)
+  h=$("$HUCK" -c "eval \"source $inner\"" 2>&1); hr=$?; h=$(printf '%s' "$h" | snorm)
+  rm -f "$inner"
+  if [ "$b" != "$h" ] || [ "$br" != "$hr" ]; then
+    echo "FAIL [$label]"; echo "  bash(rc=$br): [$b]"; echo "  huck(rc=$hr): [$h]"; FAIL=1
+  else echo "PASS [$label]"; fi
+}
+check_eval_source 'eval-wraps-source-nomarker'
+
+# --- reverse direction: a `source`d file whose OWN body contains `eval "bad"`
+# must STILL get the `eval:` marker — the fix clears eval_frame only around
+# the sourced file's own parse/exec loop, not inside a nested eval that runs
+# from within it (must NOT regress; must NOT gate the fix on source_depth==0).
+check_source_eval() {
+  local label=$1 inner outer b h br hr
+  inner=$(mktemp)
+  printf 'echo a\neval "case esac in esac) ;; esac"\n' > "$inner"
+  outer=$(mktemp)
+  printf 'echo outer\nsource %s\n' "$inner" > "$outer"
+  b=$(bash "$outer" 2>&1); br=$?; b=$(printf '%s' "$b" | snorm)
+  h=$("$HUCK" "$outer" 2>&1); hr=$?; h=$(printf '%s' "$h" | snorm)
+  rm -f "$inner" "$outer"
+  if [ "$b" != "$h" ] || [ "$br" != "$hr" ]; then
+    echo "FAIL [$label]"; echo "  bash(rc=$br): [$b]"; echo "  huck(rc=$hr): [$h]"; FAIL=1
+  else echo "PASS [$label]"; fi
+}
+check_source_eval 'source-wraps-eval-marker'
+
 if [ $FAIL -ne 0 ]; then echo "eval_line_diag_diff_check FAILED" >&2; exit 1; fi
 echo "eval_line_diag_diff_check OK"

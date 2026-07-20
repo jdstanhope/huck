@@ -7524,6 +7524,32 @@ pub(crate) fn run_sourced_contents_in_sinks(
     sink: &mut crate::executor::StdoutSink,
     err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
+    // v315 follow-up (#209): `eval_frame` is per-eval-PARSE context, not
+    // inherited by a file loaded via `source`/`.`. Without this, `eval
+    // "source badfile"` left `eval_frame` set (from the outer `eval_in_sink`)
+    // while badfile's own contents ran, so badfile's OWN syntax errors wrongly
+    // got the `eval:` marker and an eval-shifted `line_base()` — reported the
+    // wrong echoed source line. bash reports badfile's real name/line, no
+    // marker. Clear it for the duration of this file's parse/exec loop and
+    // restore on every exit path by funneling all of them through this thin
+    // wrapper (the loop below has several early `return`s). The reverse case
+    // — a `source`d file whose OWN body contains `eval "bad"` — still gets the
+    // marker: `eval_in_sink` sets `eval_frame` fresh around its own nested
+    // `process_line_in_sinks` call, independent of what this wrapper cleared.
+    let saved_eval_frame = shell.eval_frame;
+    shell.eval_frame = None;
+    let result = run_sourced_contents_in_sinks_inner(contents, _path, shell, sink, err_sink);
+    shell.eval_frame = saved_eval_frame;
+    result
+}
+
+fn run_sourced_contents_in_sinks_inner(
+    contents: &str,
+    _path: &std::path::Path,
+    shell: &mut crate::shell_state::Shell,
+    sink: &mut crate::executor::StdoutSink,
+    err_sink: &mut crate::executor::StderrSink,
+) -> ExecOutcome {
     let mut last_status = shell.last_status();
 
     let line_of = |abs: usize| -> usize {
