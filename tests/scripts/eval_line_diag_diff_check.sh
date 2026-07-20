@@ -37,6 +37,22 @@ check_script 'eval-script-line3' 'echo a' 'echo b' 'eval "case esac in esac) ;; 
 # --- control: a non-eval top-level syntax error still uses -c:, no eval: marker
 check 'noneval-control'   'case esac in esac) ;; esac'
 
+# --- $LINENO inside eval reflects the outer line (single-line eval string).
+# NOTE: with a DOUBLE-quoted eval body ("echo $LINENO"), $LINENO is expanded
+# by the OUTER command's own argument expansion (standard word expansion runs
+# before eval ever sees its argument) — it already equals the outer line
+# independent of this fix, so these two are a regression/control pair, not
+# the red/green discriminator.
+check 'lineno-c'          'eval "echo $LINENO"'
+check_script 'lineno-script-line3' 'echo a' 'echo b' 'eval "echo $LINENO"'
+# The real discriminator: a SINGLE-quoted eval body defers $LINENO expansion
+# until eval re-parses and executes it — this is what actually exercises the
+# current_lineno stamp sites inside eval's nested process_line_in_sinks call.
+check_script 'lineno-script-eval-singlequote' 'echo a' 'echo b' 'eval '\''echo $LINENO'\'''
+check 'lineno-c-singlequote' 'eval '\''echo $LINENO'\'''
+# --- control: top-level $LINENO unaffected
+check_script 'lineno-toplevel' 'echo a' 'echo $LINENO'
+
 # --- v315 follow-up (#209): `eval "source badfile"` — the SOURCED file's own
 # syntax error must NOT inherit the enclosing eval's `eval:` marker/line-shift
 # (eval_frame is per-eval-parse, not inherited by a nested `source`/`.`; bash

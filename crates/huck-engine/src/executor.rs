@@ -3834,7 +3834,7 @@ fn run_single(
         SimpleCommand::Assign(items, line) => {
             // Stamp $LINENO before expanding RHS so it reflects this assignment's line.
             if *line != 0 {
-                shell.current_lineno = *line;
+                shell.current_lineno = shell.line_base() + *line;
             }
             ExecOutcome::Continue(run_assignment_list(items, shell, sink, err_sink))
         }
@@ -4188,7 +4188,7 @@ fn run_exec_single_inner(
     // The guard prevents synthesized line-0 commands (rewrites, builtins-via-command)
     // from clobbering a real current line.
     if cmd.line != 0 {
-        shell.current_lineno = cmd.line;
+        shell.current_lineno = shell.line_base() + cmd.line;
     }
     // Snapshot the procsub stack. Any process substitutions realized during
     // argument expansion (resolve()) or redirect expansion are recorded in
@@ -6732,7 +6732,7 @@ fn spawn_pipeline(
                 // #69: stamp the stage's line so a redirect-open error carries
                 // `line N:` (mirrors the single-command path at executor.rs:4550).
                 if exec.line != 0 {
-                    shell.current_lineno = exec.line;
+                    shell.current_lineno = shell.line_base() + exec.line;
                 }
                 match build_child_redir_plan(&exec.redirects, shell, sink, err_sink) {
                     Ok(p) => Some(p),
