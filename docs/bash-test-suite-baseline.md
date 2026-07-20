@@ -2,6 +2,11 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v318 (#218, 2026-07-20 UTC):** `procsub` flipped to PASS (0-diff) —
+process substitution now sets `$!` (waitable via the saved-status ring) and
+`f=<(…)` assignment parses/expands correctly. Summary PASS 16→17, FAIL 66→65.
+Only `procsub` changed.
+
 **Updated by v315 (#209, 2026-07-20 UTC):** the `eval:` context marker +
 eval line base flipped `posix2` to PASS — see the "v315 targeted
 re-sweep" paragraph below and the Summary block (PASS 15→16, FAIL 67→66).
@@ -97,8 +102,8 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 ## Summary
 
 - Categories run: 82
-- PASS: 16
-- FAIL: 66
+- PASS: 17
+- FAIL: 65
 - TIMEOUT: 0
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
@@ -181,7 +186,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | posixpipe | FAIL | `time` builtin output format differs (huck emits the system `time(1)` format while bash uses its own built-in format with `real`/`user`/`sys` labels). Also lastpipe behavior divergence. |
 | precedence | PASS | |
 | printf | FAIL | Usage-message prefix format (`huck: printf: usage:` vs bare `printf: usage:`). Also some format-specifier differences (string width and `%b` handling). |
-| procsub | FAIL | L-39 (process-substitution edge cases) — the FIFO fallback path produces permission-denied errors when the test environment lacks writable `/dev/fd`. Core `<(cmd)` on standard fds also fails with a permission error in this run. |
+| procsub | PASS | v318 (#218): `$!` from a process substitution + `wait "$!"` resolves (saved-status ring), and `f=<(…)` process-substitution assignment now parses/expands (lexer glues `<(…)` onto the assignment value; `expand_assignment` realizes it; drained per-command like bash). 0-diff. |
 | quote | FAIL | Backslash quoting edge cases — an escaped space inside a word is treated differently, and a backslash-newline line continuation produces two separate values rather than joining the words. New bugs in backslash-quote-in-word handling. |
 | quotearray | FAIL | Assoc-array keys containing escaped special characters (brackets, dollar signs, backslashes) cannot be used as arithmetic subscripts — the arith parser fails on the key content. New bug in special-character key handling in arithmetic array contexts. |
 | read | FAIL | v298 re-sweep: no longer TIMEOUT (the v268 hang — the foreground-wait latency / `read -t` block — is resolved; the category now runs to completion). Now FAILs with remaining output divergences (residual `read -t`/`read -u` fd-source edge cases, L-34 class); needs re-triage. |

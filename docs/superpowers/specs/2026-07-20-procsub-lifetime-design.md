@@ -4,9 +4,41 @@
 bash-suite category is a 2-divergence near-miss; fixing both flips it to PASS.
 
 **Goal:** (1) a process substitution sets `$!` to its child PID and that child
-stays waitable (`wait "$!"` returns the child's exit status); (2) a process
-substitution captured in an assignment RHS (`f=<(…)`) keeps its `/dev/fd/N` fd
-open past the assignment so a later `cat $f` works.
+stays waitable (`wait "$!"` returns the child's exit status); (2) `f=<(…)`
+process-substitution assignment works (see the correction below).
+
+> **CORRECTION (v318 implementation, verified against bash 5.2.21):** Divergence 2's
+> premise below — that bash keeps an assignment-RHS procsub's fd open "until the
+> scope" so a later `cat $f` works — is **WRONG**. Measured: `f=<(echo hi); cat "$f"`
+> errors identically in BOTH shells (`/dev/fd/N: No such file`); bash closes the fd
+> at the assignment command's end, exactly like every other command. The
+> `procsub.tests` `eval f=<(echo test4) "; cat $f"` case works because the procsub
+> is realized in **`eval`'s own argv expansion**, not via assignment-RHS lifetime.
+> So the `procsub_deferred` "defer to scope" design (below) was built and reverted;
+> the real bug was that `f=<(…)` didn't parse/expand as a procsub at all — the
+> lexer split `<(` off the assignment value, and `expand_assignment` no-op'd
+> `WordPart::ProcessSub`. The shipped fix glues `<(…)`/`>(…)` onto the assignment
+> value in the lexer (guarded so `x=<foo` stays a redirect) and realizes it in
+> `expand_assignment`. Fix 1 (`$!`) is unchanged and correct. The
+> `procsub_deferred` / `process_line_in_sinks` sections below are superseded.
+>
+> **FURTHER CORRECTION (v318 whole-branch review):** the `expand_assignment`
+> `ProcessSub` realize arm is **global** — it fires for EVERY caller. It is NOT
+> true that "every caller relies on its enclosing per-command drain and matches
+> bash exactly": most callers (bare assignment, command args/redirects, builtin
+> RHS) DO run inside a per-command procsub scope (`run_single`'s `Assign` arm and
+> `run_exec_single_inner` snapshot+drain), but two constructs that expand an
+> assignment-shaped word had NO drain of their own and leaked the fd + zombie
+> child per iteration: the `case <(cmd) in …` subject (`run_case`) and a
+> `[[ … <(cmd) … ]]` operand (`run_double_bracket`). The correct model is: bash
+> realizes AND closes/reaps a procsub for the command that expands it, so each
+> such construct must snapshot `procsub_pending.len()` before expanding and
+> `drain_procsubs(shell, base)` after. `run_case` and `run_double_bracket` now do
+> (drain on every exit path). Heredoc bodies never reach the arm (`<(` stays
+> literal). Follow-on: under `set -x`, `[[ ]]` realizes an operand procsub twice
+> (`render_test_leaf` re-expands for the trace) — both are drained (no leak), but
+> the inner command runs twice vs bash's once; a clean single-realize needs
+> deeper plumbing (tracked as follow-on #220).
 
 ---
 

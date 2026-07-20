@@ -211,6 +211,10 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
     // standalone, matching the oracle flushing its buffer and starting fresh.
     let mut acc: Option<(String, bool)> = None;
     loop {
+        // v318 (#218): read before the `peek_kind` borrow below (the ProcSubOpen
+        // guard needs it, but a guard clause can't call back into `iter` while
+        // `peek_kind`'s borrow is live).
+        let in_assign = iter.in_assignment_value();
         match iter.peek_kind()? {
             None
             | Some(TokenKind::Blank)
@@ -296,10 +300,29 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
             // have trailing content glued after its close (`<(y)z`), since
             // once inside this word there is no more `<`/`>` in the way —
             // that's why the loop continues rather than breaking below.
-            Some(TokenKind::ProcSubOpen { .. }) if !(parts.is_empty() && acc.is_none()) => break,
+            //
+            // v318 (#218) EXCEPTION: an assignment RHS in progress (`f=<(cmd)`)
+            // is the SAME word as its `name=` prefix in bash — `f=<(cmd)` sets
+            // `f` to `/dev/fd/N`, it does not end the word at `<(`. The lexer's
+            // `in_assignment_value` (set by `try_scan_assign_prefix` for the
+            // `name=` atom, not reset across `<(`/`>(` — see the ProcSubOpen
+            // scan arm) distinguishes this from an ordinary already-accumulated
+            // word (`x<(y)`), which keeps the break above.
+            Some(TokenKind::ProcSubOpen { .. })
+                if !(parts.is_empty() && acc.is_none()) && !in_assign =>
+            {
+                break;
+            }
             Some(TokenKind::ProcSubOpen { dir }) => {
                 let dir = dir.clone();
                 iter.next_kind()?;            // discard the signal (cursor stays on `(`)
+                // v318 (#218): flush any pending literal run FIRST (e.g. the
+                // `name=` prefix of an in-progress assignment value) so it lands
+                // before the ProcessSub part instead of after it. Previously this
+                // arm only ever ran with an empty `acc` (fresh word start), so no
+                // flush was needed; the assignment-RHS exception above now also
+                // reaches here with `acc` non-empty.
+                flush_lit(&mut acc, &mut parts);
                 parts.push(parse_process_sub(iter, dir)?);
                 // v264 flip-fix (Finding 2): same `)`-boundary_reset leak as the
                 // cmdsub arm — force mid-word for the continuing word (`<(y)z`).

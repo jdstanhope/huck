@@ -1411,6 +1411,16 @@ impl<'a> Lexer<'a> {
         self.cmd_at_word_start = false;
     }
 
+    /// v318 (#218): true while scanning an assignment RHS value (`name=…`,
+    /// set by `try_scan_assign_prefix`/`begin_assignment_value`, cleared by
+    /// `boundary_reset`). Lets the command-word parser glue a `<(`/`>(` onto
+    /// an in-progress assignment value (`f=<(cmd)` is ONE word in bash) even
+    /// though a `<(`/`>(` after other already-accumulated word content
+    /// otherwise ends the word.
+    pub(crate) fn in_assignment_value(&self) -> bool {
+        self.in_assignment_value
+    }
+
     /// v250 T3: record one assembled heredoc body `Word` (parser-owned
     /// assembly of a `HeredocBodyBegin`…`End` atom group) in source order.
     pub(crate) fn push_heredoc_body(&mut self, w: Word) {

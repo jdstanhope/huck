@@ -103,6 +103,9 @@ fn realize_via_devfd(
     // inner_end was owned by child_stdio and closed in the parent by the call.
     let _ = inner_end;
 
+    // bash: a process substitution sets $! to its child's PID. v318 (#218).
+    shell.last_bg_pid = Some(pid);
+
     let path = format!("/dev/fd/{parent_fd}");
     Ok((
         path,
@@ -191,6 +194,9 @@ fn realize_via_fifo(
         let _ = std::fs::remove_file(&fifo_path);
     })?;
 
+    // bash: a process substitution sets $! to its child's PID. v318 (#218).
+    shell.last_bg_pid = Some(pid_child);
+
     let path = fifo_path.to_str().unwrap().to_string();
     Ok((
         path,
@@ -202,10 +208,10 @@ fn realize_via_fifo(
     ))
 }
 
-/// Tear down one realized process substitution: close the parent fd, unlink any FIFO,
-/// wait for the inner process to exit (waitpid blocks until exit — the inner may still
-/// be running when cleanup is called).
-pub fn cleanup(ps: ProcSub) {
+/// Close the parent fd, unlink any FIFO, and reap the inner child. Returns the
+/// reaped `(pid, decoded_code)` so the caller can record it in the saved-status
+/// ring (v306), letting a later `wait "$!"` resolve. `None` if nothing reaped.
+pub fn cleanup(ps: ProcSub) -> Option<(i32, i32)> {
     if ps.parent_fd >= 0 {
         unsafe {
             libc::close(ps.parent_fd);
@@ -214,8 +220,20 @@ pub fn cleanup(ps: ProcSub) {
     if let Some(p) = &ps.fifo_path {
         let _ = std::fs::remove_file(p);
     }
-    let mut status = 0;
-    unsafe {
-        libc::waitpid(ps.pid, &mut status, 0);
+    if ps.pid <= 0 {
+        return None;
     }
+    let mut status = 0;
+    let r = unsafe { libc::waitpid(ps.pid, &mut status, 0) };
+    if r <= 0 {
+        return None;
+    }
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        0
+    };
+    Some((ps.pid, code))
 }

@@ -2319,6 +2319,24 @@ fn run_case(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
+    // v318 (#218): the subject can be a process substitution (`case <(cmd)
+    // in …`). `expand_assignment` realizes it and pushes onto
+    // `procsub_pending`, but `case` — unlike a plain command — has no
+    // enclosing per-command drain of its own. Snapshot here and drain on
+    // every exit path (bash realizes AND closes the fd / reaps the child for
+    // the `case` command). The inner body owns all the early returns.
+    let procsub_base = shell.procsub_pending.len();
+    let outcome = run_case_inner(clause, shell, sink, err_sink);
+    drain_procsubs(shell, procsub_base);
+    outcome
+}
+
+fn run_case_inner(
+    clause: &CaseClause,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     let subject = expand_assignment(&clause.subject, shell);
     xtrace_compound(
         shell,
@@ -2438,6 +2456,15 @@ fn run_double_bracket(
             return ExecOutcome::Continue(1);
         }
     };
+    // v318 (#218): a `[[ … ]]` operand can be a process substitution
+    // (`[[ -e <(cmd) ]]`, `[[ <(a) == … ]]`). Each operand expansion in
+    // `eval_test_expr` / `render_test_leaf` realizes it and pushes onto
+    // `procsub_pending`, but `[[ ]]` has no per-command drain of its own.
+    // Snapshot before evaluation and drain after — one wrap covers every
+    // internal operand site (including `render_test_leaf`'s second realize
+    // under `set -x`) and runs on the success, false, and error paths alike
+    // (bash realizes AND closes/reaps for the `[[ ]]` command).
+    let procsub_base = shell.procsub_pending.len();
     let result = match eval_test_expr(expr, shell) {
         Ok(true) => ExecOutcome::Continue(0),
         Ok(false) => ExecOutcome::Continue(1),
@@ -2449,6 +2476,7 @@ fn run_double_bracket(
             ExecOutcome::Continue(2)
         }
     };
+    drain_procsubs(shell, procsub_base);
     restore_inline_assignments(snap, shell);
     result
 }
@@ -3836,7 +3864,23 @@ fn run_single(
             if *line != 0 {
                 shell.current_lineno = shell.line_base() + *line;
             }
-            ExecOutcome::Continue(run_assignment_list(items, shell, sink, err_sink))
+            // v318 (#218): a bare assignment (`f=<(cmd)`, no redirects — the
+            // `run_exec_single_inner` empty-program path handles the
+            // assignment+redirect shape and already has its own procsub_base/
+            // drain) previously had NO procsub_pending scope of its own here,
+            // so a RHS process substitution realized by `run_assignment_list`
+            // (e.g. `f=<(cmd)`) stayed pending and was only closed as
+            // collateral by whatever command's drain ran next — an
+            // uncontrolled, too-late close. Bracket it here like every other
+            // command dispatch: bash itself closes an assignment-RHS procsub's
+            // fd right after the assignment's OWN command, even inside a
+            // group/function/subshell/`$()` — never across a later command —
+            // so a plain per-command drain is the bash-matching lifetime; no
+            // extension needed.
+            let procsub_base = shell.procsub_pending.len();
+            let st = run_assignment_list(items, shell, sink, err_sink);
+            drain_procsubs(shell, procsub_base);
+            ExecOutcome::Continue(st)
         }
     };
     // $PIPESTATUS reflects this leaf command's exit status. break/continue
@@ -4061,7 +4105,9 @@ fn array_literal_elements(w: &crate::lexer::Word) -> Option<&[crate::lexer::Arra
 fn drain_procsubs(shell: &mut Shell, base: usize) {
     while shell.procsub_pending.len() > base {
         if let Some(ps) = shell.procsub_pending.pop() {
-            crate::procsub::cleanup(ps);
+            if let Some((pid, code)) = crate::procsub::cleanup(ps) {
+                shell.jobs.record_terminal_status(pid, code);
+            }
         }
     }
 }
@@ -4089,8 +4135,16 @@ fn drain_procsubs_nonblocking(shell: &mut Shell, base: usize) {
             // (e.g. a long-running producer used with a background consumer),
             // skip the wait — it will be reaped by SIGCHLD handling or shell exit.
             let mut status = 0;
-            unsafe {
-                libc::waitpid(ps.pid, &mut status, libc::WNOHANG);
+            let r = unsafe { libc::waitpid(ps.pid, &mut status, libc::WNOHANG) };
+            if r > 0 {
+                let code = if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else if libc::WIFSIGNALED(status) {
+                    128 + libc::WTERMSIG(status)
+                } else {
+                    0
+                };
+                shell.jobs.record_terminal_status(ps.pid, code);
             }
         }
     }
