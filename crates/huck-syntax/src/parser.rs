@@ -2004,12 +2004,24 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
     let mut sub_opts = iter.opts();
     sub_opts.in_dquote = false;
     let mut sub = Lexer::new(&cooked, iter.aliases(), sub_opts);
-    let sequence = match parse_sequence(&mut sub)? {
-        Some(mut seq) => {
+    let sequence = match parse_sequence(&mut sub) {
+        Ok(Some(mut seq)) => {
             zero_lines_in_sequence(&mut seq);
             seq
         }
-        None => empty_sequence(), // `` `` `` — same empty Sequence as before.
+        Ok(None) => empty_sequence(), // `` `` `` — same empty Sequence as before.
+        // v316 (#213): wrap the body-relative error so the engine renderer
+        // can report bash's `command substitution:` marker + echo the
+        // backtick body (not the outer line) instead of falling through to
+        // the generic `-c:` rendering.
+        Err(inner) => {
+            let err_pos = sub.cursor_pos();
+            return Err(ParseError::InCommandSub {
+                inner: Box::new(inner),
+                body: cooked,
+                err_pos,
+            });
+        }
     };
     Ok(WordPart::CommandSub { sequence, quoted })
 }

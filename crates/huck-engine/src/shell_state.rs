@@ -1262,6 +1262,13 @@ impl Shell {
                     out.push_str(&format!("line {line}: "));
                 }
             }
+            Diag::SyntaxNested { line, marker } => {
+                if !self.is_interactive {
+                    out.push_str(marker);
+                    out.push_str(": ");
+                    out.push_str(&format!("line {line}: "));
+                }
+            }
         }
         out
     }
