@@ -861,6 +861,105 @@ mod tests {
     }
 
     #[test]
+    fn declare_nameref_valueless_refused_on_readonly_var() {
+        // The VALUE-LESS form `declare -n NAME` is the same escape as the
+        // valued bind: bash treats NAME's existing value as the target name,
+        // so once `-n` is on, `NAME=x` resolves through the nameref and the
+        // readonly gate (which checks the RESOLVED name) never fires.
+        // Every case asserts BOTH the diagnostic AND that no write landed —
+        // a stderr-only assertion is exactly how the first round of this bug
+        // survived review.
+        let mut e = Engine::new();
+        let out = e
+            .prepare("declare -n PATH; PATH=/attacker/bin")
+            .restricted()
+            .capture();
+        // PATH's value is a real path, so bash's invalid-name check fires
+        // first (verified on bash 5.2.21); either refusal is a refusal, but
+        // the write must not land.
+        assert!(
+            out.stderr
+                .contains("invalid variable name for name reference")
+                || out.stderr.contains("declare: PATH: readonly variable"),
+            "value-less `declare -n PATH` was not refused: stderr={:?}",
+            out.stderr
+        );
+        // Read back through the Engine, not a trailing `echo` — the refused
+        // assignment is fatal to the rest of the non-interactive script, so a
+        // later in-script command would never run and a stdout assertion
+        // would pass vacuously.
+        assert_ne!(
+            e.var("PATH").as_deref(),
+            Some("/attacker/bin"),
+            "value-less nameref bind LANDED: PATH was hijacked"
+        );
+
+        // Plain readonly, no restricted policy, with a value that IS a valid
+        // identifier — here the readonly check is the ONLY thing standing
+        // between the attacker and the write.
+        let mut e = Engine::new();
+        let out = e
+            .prepare("readonly RO=safe; declare -n RO; RO=/attacker")
+            .capture();
+        assert!(
+            out.stderr.contains("declare: RO: readonly variable"),
+            "stderr={:?}",
+            out.stderr
+        );
+        // Read the value back through the Engine rather than a trailing
+        // `echo`: the refused `RO=/attacker` assignment is itself a readonly
+        // error, which is fatal to the rest of the non-interactive script, so
+        // no in-script command after it would run to observe the value.
+        assert_eq!(
+            e.var("RO").as_deref(),
+            Some("safe"),
+            "readonly value was clobbered through the nameref"
+        );
+    }
+
+    #[test]
+    fn declare_nameref_valueless_invalid_name_message() {
+        // bash validates the EXISTING value as a reference target, and this
+        // check fires regardless of readonly:
+        //   $ bash -c 'X=/some/path; declare -n X'
+        //   bash: declare: `/some/path': invalid variable name for name reference
+        let mut e = Engine::new();
+        let out = e.prepare("X=/some/path; declare -n X").capture();
+        assert!(
+            out.stderr
+                .contains("declare: `/some/path': invalid variable name for name reference"),
+            "stderr={:?}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn declare_nameref_valueless_on_unset_name_succeeds() {
+        // Do NOT over-refuse: bash applies `-n` to an unset name at rc 0.
+        //   $ bash -c 'declare -n NEWV; declare -p NEWV'  =>  declare -n NEWV
+        let mut e = Engine::new();
+        let out = e.prepare("declare -n NEWV; echo \"rc=$?\"").capture();
+        assert!(
+            out.stderr.is_empty(),
+            "unexpected diagnostic: stderr={:?}",
+            out.stderr
+        );
+        assert!(out.stdout.contains("rc=0"), "stdout={:?}", out.stdout);
+
+        // And the attribute really is applied — the nameref still works.
+        let mut e = Engine::new();
+        let out = e
+            .prepare("declare -n REF; REF=tgt; REF=hello; echo \"tgt=$tgt\"")
+            .capture();
+        assert!(
+            out.stdout.contains("tgt=hello"),
+            "nameref attribute was not applied: stdout={:?} stderr={:?}",
+            out.stdout,
+            out.stderr
+        );
+    }
+
+    #[test]
     fn restricted_refuses_set_plus_r() {
         let _g = crate::test_support::CWD_LOCK
             .lock()

@@ -2295,6 +2295,27 @@ fn builtin_declare_decl(
                     exit = 1;
                     continue;
                 }
+            } else if let Some(cur) = shell.get(name) {
+                // Value-less `declare -n NAME`: bash validates the variable's
+                // EXISTING value as the reference target, and this check fires
+                // BEFORE the readonly check (verified on bash 5.2.21:
+                // `readonly PATH; declare -n PATH` reports the invalid-name
+                // error, while `readonly FOO; declare -n FOO` on an UNSET FOO
+                // reports `readonly variable`). An unset NAME is accepted and
+                // simply gains the `-n` attribute.
+                let cur = cur.to_string();
+                let valid = is_valid_name(&cur)
+                    || matches!(parse_subscripted_arg(&cur), Ok(Some((b, _))) if is_valid_name(b));
+                if !valid {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "declare: `{cur}': invalid variable name for name reference"
+                    );
+                    exit = 1;
+                    continue;
+                }
             }
             // A nameref BIND writes through the `Shell::set` leaf, which does
             // not itself enforce readonly — so the readonly gate must live
@@ -2306,9 +2327,15 @@ fn builtin_declare_decl(
             //   $ bash -c 'readonly FOO=1; declare -n FOO=BAR; declare -p FOO'
             //   bash: declare: FOO: readonly variable
             //   declare -r FOO="1"
-            // The no-value form (`declare -n FOO`) is NOT a bind and is left
-            // alone: bash treats the existing value as the target name there.
-            if target_opt.is_some() && shell.is_readonly(name) {
+            // The value-LESS form (`declare -n FOO`) is refused too: bash
+            // treats FOO's existing value as the target name, so applying `-n`
+            // to a readonly FOO would make `FOO=x` write through to whatever
+            // that value names — the readonly gate bypassed entirely, because
+            // `resolve_assign_target` checks readonly on the RESOLVED name.
+            //   $ bash -c 'readonly RO=safe; declare -nx RO; declare -p RO'
+            //   bash: declare: RO: readonly variable
+            //   declare -r RO="safe"      # neither -n nor -x applied
+            if shell.is_readonly(name) {
                 crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
                 exit = 1;
                 continue;
