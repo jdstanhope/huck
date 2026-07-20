@@ -58,8 +58,15 @@ pub enum Op<'a> {
     },
     /// A redirect whose target resolved to a FILE. Fd-duplication (`>&2`,
     /// `2>&1`) never constructs this, which is why bash permits it.
+    ///
+    /// `path` is the resolved target — what `Sandbox` judges. `subject` is the
+    /// word bash NAMES in the diagnostic, which is not always the path: for a
+    /// `{var}`-fd redirect (`{v}> f`) bash names the VARIABLE (`v: restricted:
+    /// cannot redirect output`), not the file. Callers with a plain numeric or
+    /// default fd pass the path for both.
     RedirectFile {
         path: &'a str,
+        subject: &'a str,
     },
 }
 
@@ -95,7 +102,7 @@ impl Policy {
                     Ok(())
                 }
             }
-            Op::RedirectFile { path } => {
+            Op::RedirectFile { path, subject } => {
                 // The one place the two policies genuinely differ in logic:
                 // Rbash refuses every file target, Sandbox only escaping ones.
                 let refuse = match policy {
@@ -104,7 +111,7 @@ impl Policy {
                     Policy::Unrestricted => unreachable!("handled above"),
                 };
                 if refuse {
-                    Err(format!("{path}: restricted: cannot redirect output"))
+                    Err(format!("{subject}: restricted: cannot redirect output"))
                 } else {
                     Ok(())
                 }
@@ -140,7 +147,13 @@ mod tests {
             })
             .is_ok()
         );
-        assert!(p.check(Op::RedirectFile { path: "/tmp/x" }).is_ok());
+        assert!(
+            p.check(Op::RedirectFile {
+                path: "/tmp/x",
+                subject: "/tmp/x"
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -157,8 +170,20 @@ mod tests {
             .is_err()
         );
         // Rbash denies EVERY file-target redirect, relative ones included.
-        assert!(p.check(Op::RedirectFile { path: "log" }).is_err());
-        assert!(p.check(Op::RedirectFile { path: "/tmp/x" }).is_err());
+        assert!(
+            p.check(Op::RedirectFile {
+                path: "log",
+                subject: "log"
+            })
+            .is_err()
+        );
+        assert!(
+            p.check(Op::RedirectFile {
+                path: "/tmp/x",
+                subject: "/tmp/x"
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -179,13 +204,49 @@ mod tests {
     fn matrix_sandbox_denies_escaping_redirects_only() {
         let p = Policy::Sandbox;
         // Escape attempts refused.
-        assert!(p.check(Op::RedirectFile { path: "/tmp/x" }).is_err());
-        assert!(p.check(Op::RedirectFile { path: "../escape" }).is_err());
-        assert!(p.check(Op::RedirectFile { path: "foo/../bar" }).is_err());
+        assert!(
+            p.check(Op::RedirectFile {
+                path: "/tmp/x",
+                subject: "/tmp/x"
+            })
+            .is_err()
+        );
+        assert!(
+            p.check(Op::RedirectFile {
+                path: "../escape",
+                subject: "../escape"
+            })
+            .is_err()
+        );
+        assert!(
+            p.check(Op::RedirectFile {
+                path: "foo/../bar",
+                subject: "foo/../bar"
+            })
+            .is_err()
+        );
         // Local work permitted — this is the one behavioral difference from Rbash.
-        assert!(p.check(Op::RedirectFile { path: "log" }).is_ok());
-        assert!(p.check(Op::RedirectFile { path: "sub/log" }).is_ok());
-        assert!(p.check(Op::RedirectFile { path: "./log" }).is_ok());
+        assert!(
+            p.check(Op::RedirectFile {
+                path: "log",
+                subject: "log"
+            })
+            .is_ok()
+        );
+        assert!(
+            p.check(Op::RedirectFile {
+                path: "sub/log",
+                subject: "sub/log"
+            })
+            .is_ok()
+        );
+        assert!(
+            p.check(Op::RedirectFile {
+                path: "./log",
+                subject: "./log"
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -241,8 +302,47 @@ mod tests {
             "source: /etc/profile: restricted"
         );
         assert_eq!(
-            p.check(Op::RedirectFile { path: "f" }).unwrap_err(),
+            p.check(Op::RedirectFile {
+                path: "f",
+                subject: "f"
+            })
+            .unwrap_err(),
             "f: restricted: cannot redirect output"
+        );
+    }
+
+    /// `{v}> f`: bash judges the PATH but names the VARIABLE. The two words
+    /// are independent, so a `subject` that would itself be permitted must not
+    /// soften a refusal aimed at `path` (and vice versa).
+    #[test]
+    fn redirect_names_subject_but_judges_path() {
+        assert_eq!(
+            Policy::Rbash
+                .check(Op::RedirectFile {
+                    path: "f",
+                    subject: "v"
+                })
+                .unwrap_err(),
+            "v: restricted: cannot redirect output"
+        );
+        // Sandbox: the escaping PATH decides, even though `v` looks local.
+        assert_eq!(
+            Policy::Sandbox
+                .check(Op::RedirectFile {
+                    path: "/tmp/x",
+                    subject: "v"
+                })
+                .unwrap_err(),
+            "v: restricted: cannot redirect output"
+        );
+        // ...and a local path stays permitted however the subject reads.
+        assert!(
+            Policy::Sandbox
+                .check(Op::RedirectFile {
+                    path: "log",
+                    subject: "/tmp/x"
+                })
+                .is_ok()
         );
     }
 
@@ -252,7 +352,11 @@ mod tests {
         let p = Policy::Sandbox;
         assert_eq!(p.check(Op::Cd).unwrap_err(), "cd: restricted");
         assert_eq!(
-            p.check(Op::RedirectFile { path: "/tmp/x" }).unwrap_err(),
+            p.check(Op::RedirectFile {
+                path: "/tmp/x",
+                subject: "/tmp/x"
+            })
+            .unwrap_err(),
             "/tmp/x: restricted: cannot redirect output"
         );
     }

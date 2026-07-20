@@ -100,6 +100,20 @@ check 'exec-bare-ok'        'exec; echo ok=$?'
 check 'exec-input-fd-ok'    'exec 3</etc/hostname; echo ok=$?'
 check 'exec-dup-ok'         'exec 2>&1; echo ok=$?'
 check 'exec-optonly-ok'     'exec -c; echo ok=$?'
+# `exec REDIR CMD` — the COMBINATION. bash evaluates the redirections BEFORE
+# refusing the exec, so a denied redirect speaks first and `exec: restricted`
+# is never reached; a PERMITTED redirect (input `<`, fd-dup) leaves the exec
+# refusal to report. Asserting only the two halves separately (above) missed
+# this ordering entirely.
+check 'exec-redir-cmd-err'  'exec 2>/dev/null true'
+check 'exec-redir-cmd-file' 'exec 3> f true'
+check 'exec-redir-cmd-out'  'exec > f /bin/echo hi'
+check 'exec-redir-cmd-2nd'  'exec 2>/dev/null 3> f true'
+check 'exec-inredir-cmd'    'exec 3</etc/hostname true'
+# `exec 2>&1 true` omitted — bash APPLIES the permitted redirect (permanently,
+# as an `exec` redirect) before refusing, so its own diagnostic lands on the
+# REDIRECTED stderr; huck refuses without applying and writes to the original.
+# Message text and rc agree; only the destination differs. See #233.
 check 'command-abs-path'    '/bin/echo hi'
 check 'command-rel-path'    './foo'
 check 'command-subdir'      'bin/foo'
@@ -114,6 +128,11 @@ check 'redir-readwrite'     'echo hi <> f'
 check 'redir-amp-gt'        'echo hi &> f'
 check 'redir-numbered'      'echo hi 2> f'
 check 'redir-exec-perm'     'exec 3> f'
+# `{var}`-fd redirect: bash names the VARIABLE in the diagnostic, not the
+# resolved file. Same for an ordinary command, so both forms are pinned.
+check 'redir-varfd-exec'    'exec {v}> f'
+check 'redir-varfd-cmd'     'echo hi {v}> f'
+check 'redir-varfd-input'   'exec {v}</etc/hostname; echo ok=$?'
 # `>& f` omitted — #223 (huck: `bad fd`, independent of restricted mode).
 
 # --- redirects: PERMITTED forms — the regression guard -------------------
