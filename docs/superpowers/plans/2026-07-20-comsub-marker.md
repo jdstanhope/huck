@@ -215,10 +215,11 @@ All four must MATCH (marker `command substitution:`, and the near-token case's e
 - Create: `tests/scripts/comsub_marker_diag_diff_check.sh`
 - Modify: `docs/bash-test-suite-baseline.md` (provenance note, if warranted)
 
-- [ ] **Step 1: Write the harness** `tests/scripts/comsub_marker_diag_diff_check.sh` (model on `eval_line_diag_diff_check.sh`; capture merged stdout+stderr and rc WITHOUT a pipe so `$?` is the shell's; normalize only the name prefix):
+- [ ] **Step 1: Write the harness** `tests/scripts/comsub_marker_diag_diff_check.sh`. **Compare STDERR ONLY** (`2>&1 >/dev/null` — capture stderr, discard stdout) and **do NOT compare rc**. Rationale (verified against bash 5.2.21): a backtick-body syntax error is *recoverable* in bash — it prints the `command substitution:` diagnostic to stderr, then continues the outer command with an empty substitution (stdout differs, rc 0), while huck aborts the `-c` string (rc 2). That stdout/rc divergence is the pre-existing parse-time-vs-expansion-time behavior, **out of scope for #213** (filed as a follow-on in Step 4) — #213 is the marker text, which is on stderr and matches byte-for-byte.
 ```bash
 #!/usr/bin/env bash
 # v316 (#213): syntax error in a backtick command-sub body → `command substitution:` marker.
+# STDERR-only (the marker); stdout/rc diverge by the pre-existing recover-vs-abort gap (follow-on).
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 HUCK=target/debug/huck
@@ -226,14 +227,14 @@ HUCK=target/debug/huck
 FAIL=0
 norm() { sed -E "s#^(bash|.*/huck): #SH: #"; }
 snorm() { sed -E "s#^.*/[^:]+: #SH: #"; }
-check() { local l=$1 f=$2 b h br hr
-  b=$(bash -c "$f" 2>&1); br=$?; b=$(printf '%s' "$b" | norm)
-  h=$("$HUCK" -c "$f" 2>&1); hr=$?; h=$(printf '%s' "$h" | norm)
-  if [ "$b" != "$h" ] || [ "$br" != "$hr" ]; then echo "FAIL [$l]"; echo "  bash(rc=$br): [$b]"; echo "  huck(rc=$hr): [$h]"; FAIL=1; else echo "PASS [$l]"; fi; }
-check_script() { local l=$1; shift; local f; f=$(mktemp); printf '%s\n' "$@" > "$f"; local b h br hr
-  b=$(bash "$f" 2>&1); br=$?; b=$(printf '%s' "$b" | snorm)
-  h=$("$HUCK" "$f" 2>&1); hr=$?; h=$(printf '%s' "$h" | snorm); rm -f "$f"
-  if [ "$b" != "$h" ] || [ "$br" != "$hr" ]; then echo "FAIL [$l]"; echo "  bash(rc=$br): [$b]"; echo "  huck(rc=$hr): [$h]"; FAIL=1; else echo "PASS [$l]"; fi; }
+check() { local l=$1 f=$2 b h
+  b=$(bash -c "$f" 2>&1 >/dev/null | norm)
+  h=$("$HUCK" -c "$f" 2>&1 >/dev/null | norm)
+  if [ "$b" != "$h" ]; then echo "FAIL [$l]"; echo "  bash: [$b]"; echo "  huck: [$h]"; FAIL=1; else echo "PASS [$l]"; fi; }
+check_script() { local l=$1; shift; local f; f=$(mktemp); printf '%s\n' "$@" > "$f"; local b h
+  b=$(bash "$f" 2>&1 >/dev/null | snorm)
+  h=$("$HUCK" "$f" 2>&1 >/dev/null | snorm); rm -f "$f"
+  if [ "$b" != "$h" ]; then echo "FAIL [$l]"; echo "  bash: [$b]"; echo "  huck: [$h]"; FAIL=1; else echo "PASS [$l]"; fi; }
 # backtick bodies → command substitution: marker
 check 'bt-unterm-case'  'echo `case x in`'
 check 'bt-near-token'   'echo `case esac in esac)`'
@@ -252,8 +253,9 @@ echo "comsub_marker_diag_diff_check OK"
 
 - [ ] **Step 2: Full sweep.** `cargo test -p huck-engine --jobs 1 --lib -- --test-threads 1` (green); build both debug+release binaries; `ulimit -v 1500000; timeout 900 bash tests/scripts/run_diff_checks.sh 2>&1 | tail -6` (green — the new harness auto-included; `coproc_diff_check.sh` is a KNOWN pre-existing flake, if it's the only failure re-run it in isolation to confirm and note it, NOT a regression). Confirm `backtick_escape`/`cmdsub_comment`/`syntax_error_diag`/`eval_line_diag` all green.
 - [ ] **Step 3: Integration binaries.** Run any `-p huck` integration binary that asserts backtick or syntax-error output at `--test-threads 2` (grep `tests/*.rs` for `backtick|command substitution|syntax error`). Report each + result.
-- [ ] **Step 4: Baseline doc.** No category flips (posix2 already PASS). Add a one-line provenance note that v316 (#213) closed the backtick `command substitution:` marker gap; do NOT change any PASS count.
-- [ ] **Step 5: fmt + commit** (`v316 task 3: comsub_marker harness + sweep + close #213`).
+- [ ] **Step 4: File the follow-on issue** for the recover-vs-abort divergence: `gh issue create` (labels `divergence`, `bug`, `sev:low`), titled about huck aborting on a backtick command-substitution syntax error where bash recovers (empty substitution, continues the outer command, rc 0). Body: bash defers backtick body parsing to expansion time, so a backtick body syntax error is a *runtime, per-command-recoverable* error (stderr diagnostic + empty substitution + continue, rc 0); huck parses the backtick body up-front, so it is a *fatal parse error* aborting the `-c` string (rc 2). #213 (v316) aligned the stderr marker text; this tracks the stdout/rc behavior. Record the issue number.
+- [ ] **Step 5: Baseline doc.** No category flips (posix2 already PASS). Add a one-line provenance note that v316 (#213) closed the backtick `command substitution:` marker gap; do NOT change any PASS count.
+- [ ] **Step 6: fmt + commit** (`v316 task 3: comsub_marker harness + sweep + close #213`).
 
 ---
 
