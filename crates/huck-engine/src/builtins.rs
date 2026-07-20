@@ -1433,7 +1433,10 @@ fn builtin_export_decl(
                         continue;
                     }
                     if shell.is_readonly(name) {
-                        crate::sh_error_to!(shell, err, None, "export: {name}: readonly variable");
+                        // bash 5.2.21 emits NO `export:` prefix here:
+                        //   $ bash -c 'readonly FOO=1; export FOO=2'
+                        //   bash: line 1: FOO: readonly variable
+                        crate::sh_error_to!(shell, err, None, "{name}: readonly variable");
                         any_error = true;
                         continue;
                     }
@@ -1480,7 +1483,10 @@ fn builtin_export_decl(
                 }
                 let name = a.target.name().to_string();
                 if shell.is_readonly(&name) {
-                    crate::sh_error_to!(shell, err, None, "export: {name}: readonly variable");
+                    // bash 5.2.21 emits NO `export:` prefix here:
+                    //   $ bash -c 'readonly FOO=1; export FOO=2'
+                    //   bash: line 1: FOO: readonly variable
+                    crate::sh_error_to!(shell, err, None, "{name}: readonly variable");
                     any_error = true;
                     continue;
                 }
@@ -2290,6 +2296,23 @@ fn builtin_declare_decl(
                     continue;
                 }
             }
+            // A nameref BIND writes through the `Shell::set` leaf, which does
+            // not itself enforce readonly — so the readonly gate must live
+            // here. Without it `declare -n PATH=EVIL; EVIL=...` would let the
+            // nameref deref hand out arbitrary control of a readonly variable
+            // (a sandbox escape under a restricted policy, which marks PATH et
+            // al readonly). bash 5.2.21 refuses the bind and applies NOTHING —
+            // not even the `-n` attribute:
+            //   $ bash -c 'readonly FOO=1; declare -n FOO=BAR; declare -p FOO'
+            //   bash: declare: FOO: readonly variable
+            //   declare -r FOO="1"
+            // The no-value form (`declare -n FOO`) is NOT a bind and is left
+            // alone: bash treats the existing value as the target name there.
+            if target_opt.is_some() && shell.is_readonly(name) {
+                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
+                exit = 1;
+                continue;
+            }
             shell.set_nameref(name, true);
             // BIND: store the target name as the RAW value (not through
             // apply_one_assignment which post-Task-4 will deref namerefs).
@@ -2329,14 +2352,8 @@ fn builtin_declare_decl(
                 }
                 continue;
             }
-            // -r combined with =VALUE: must not clobber an existing
-            // readonly. Other =VALUE assignments rely on
-            // apply_one_assignment's internal readonly check.
-            if want_readonly && shell.is_readonly(name) {
-                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
-                exit = 1;
-                continue;
-            }
+            // `=VALUE` must not clobber an existing readonly, with or without
+            // a co-requested `-r`.
             if shell.is_readonly(name) {
                 crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
                 exit = 1;

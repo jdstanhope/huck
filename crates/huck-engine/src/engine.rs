@@ -796,6 +796,14 @@ mod tests {
     fn restricted_covers_non_assignment_write_paths() {
         let mut e = Engine::new();
         // These four paths escape the old check_special_assign sites entirely.
+        //
+        // NOTE on assertion strength: these are SUBSTRING checks, so what each
+        // case pins differs. The two whose expected string carries a builtin
+        // prefix (`declare:`, `unset:`) pin the exact WORDING. The two whose
+        // expected string is the bare `PATH: readonly variable` pin only that
+        // the write was REFUSED — a prefixed message such as
+        // `export: PATH: readonly variable` would also contain that substring.
+        // Exact-wording coverage for those two lives in the bash-diff harness.
         let cases = [
             ("export PATH=/tmp", "PATH: readonly variable"),
             ("PATH+=/tmp", "PATH: readonly variable"),
@@ -810,6 +818,46 @@ mod tests {
                 out.stderr
             );
         }
+    }
+
+    #[test]
+    fn declare_nameref_bind_refused_on_readonly_var() {
+        // A nameref bind writes through the `Shell::set` leaf, which does not
+        // enforce readonly. Unguarded, `declare -n PATH=EVIL` gives arbitrary
+        // control of PATH inside a restricted shell (command hijacking), so
+        // BOTH assertions matter: that it is refused AND that nothing landed.
+        let mut e = Engine::new();
+        let out = e
+            .prepare("declare -n PATH=EVIL; EVIL=/attacker; echo \"PATH=$PATH\"")
+            .restricted()
+            .capture();
+        assert!(
+            out.stderr.contains("declare: PATH: readonly variable"),
+            "stderr={:?}",
+            out.stderr
+        );
+        assert!(
+            !out.stdout.contains("PATH=/attacker"),
+            "nameref bind LANDED despite the refusal: stdout={:?}",
+            out.stdout
+        );
+
+        // Same guard, plain readonly (no restricted policy) — the check is on
+        // `is_readonly`, not on the policy, so it covers both for free.
+        let mut e = Engine::new();
+        let out = e
+            .prepare("readonly FOO=1; declare -n FOO=BAR; BAR=hijacked; echo \"FOO=$FOO\"")
+            .capture();
+        assert!(
+            out.stderr.contains("declare: FOO: readonly variable"),
+            "stderr={:?}",
+            out.stderr
+        );
+        assert!(
+            out.stdout.contains("FOO=1"),
+            "readonly value was clobbered: stdout={:?}",
+            out.stdout
+        );
     }
 
     #[test]

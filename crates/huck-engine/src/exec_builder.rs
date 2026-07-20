@@ -177,13 +177,33 @@ impl<'a> ExecBuilder<'a> {
         self
     }
 
-    /// Enable restricted mode for this call only (bash `rbash` subset:
-    /// refuses `cd`, `exec`, command-names containing `/`, `source` of paths
-    /// containing `/`, write-redirects to absolute or `..` paths, assignment
-    /// to `SHELL`/`PATH`/`ENV`/`BASH_ENV`, and `set +r`). Refused operations
-    /// emit `huck: restricted: <op>` via the active stderr sink and return
-    /// exit 1; the script keeps running unless `set -e` propagates the
-    /// failure.
+    /// Enable restricted mode for this call (bash `rbash` subset: refuses
+    /// `cd`, `exec`, command-names containing `/`, `source` of paths
+    /// containing `/`, write-redirects to absolute or `..` paths, and
+    /// `set +r`). Refused operations emit a diagnostic via the active stderr
+    /// sink and return a non-zero exit; the script keeps running unless
+    /// `set -e` propagates the failure.
+    ///
+    /// # The protected variables are marked readonly, and that OUTLIVES the call
+    ///
+    /// Entering a restricted policy marks `SHELL`, `PATH`, `HISTFILE`, `ENV`
+    /// and `BASH_ENV` readonly, so every write path (plain assignment,
+    /// `export`, `read`, `declare`, `unset`, `+=`) reports through ordinary
+    /// readonly machinery as `<name>: readonly variable` rather than a
+    /// restriction-specific message.
+    ///
+    /// Those readonly marks are **deliberately not undone** when the call
+    /// ends — matching bash, where restricted mode is one-way and cannot be
+    /// unset from within the shell. A later, *unrestricted* call on the same
+    /// `Engine` therefore still sees them:
+    ///
+    /// ```text
+    /// e.prepare("echo hi").restricted().capture();   // marks PATH readonly
+    /// e.prepare("PATH=/usr/bin").capture();          // PATH: readonly variable
+    /// ```
+    ///
+    /// If an embedder needs an unrestricted shell afterwards, construct a
+    /// fresh `Engine` rather than reusing this one.
     pub fn restricted(mut self) -> Self {
         self.restricted = true;
         self
