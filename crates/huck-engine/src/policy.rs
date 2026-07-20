@@ -45,9 +45,17 @@ pub enum Policy {
 #[derive(Debug)]
 pub enum Op<'a> {
     Cd,
+    /// `exec` WITH a command word (the replace-the-shell form). Redirect-only
+    /// `exec` never constructs this — bash permits it and checks only its
+    /// redirections. See the `exec` interception in `executor.rs`.
     Exec,
     CommandName(&'a str),
-    SourcePath(&'a str),
+    /// `.`/`source` with a path operand. `invoked` is the name the user typed
+    /// (`.` or `source`) — bash echoes it back verbatim in the diagnostic.
+    SourcePath {
+        invoked: &'a str,
+        path: &'a str,
+    },
     /// A redirect whose target resolved to a FILE. Fd-duplication (`>&2`,
     /// `2>&1`) never constructs this, which is why bash permits it.
     RedirectFile {
@@ -80,9 +88,9 @@ impl Policy {
                     Ok(())
                 }
             }
-            Op::SourcePath(path) => {
+            Op::SourcePath { invoked, path } => {
                 if path.contains('/') {
-                    Err(format!(".: {path}: restricted"))
+                    Err(format!("{invoked}: {path}: restricted"))
                 } else {
                     Ok(())
                 }
@@ -125,7 +133,13 @@ mod tests {
         assert!(p.check(Op::Cd).is_ok());
         assert!(p.check(Op::Exec).is_ok());
         assert!(p.check(Op::CommandName("/bin/echo")).is_ok());
-        assert!(p.check(Op::SourcePath("/etc/profile")).is_ok());
+        assert!(
+            p.check(Op::SourcePath {
+                invoked: ".",
+                path: "/etc/profile",
+            })
+            .is_ok()
+        );
         assert!(p.check(Op::RedirectFile { path: "/tmp/x" }).is_ok());
     }
 
@@ -135,7 +149,13 @@ mod tests {
         assert!(p.check(Op::Cd).is_err());
         assert!(p.check(Op::Exec).is_err());
         assert!(p.check(Op::CommandName("/bin/echo")).is_err());
-        assert!(p.check(Op::SourcePath("/etc/profile")).is_err());
+        assert!(
+            p.check(Op::SourcePath {
+                invoked: ".",
+                path: "/etc/profile",
+            })
+            .is_err()
+        );
         // Rbash denies EVERY file-target redirect, relative ones included.
         assert!(p.check(Op::RedirectFile { path: "log" }).is_err());
         assert!(p.check(Op::RedirectFile { path: "/tmp/x" }).is_err());
@@ -146,7 +166,13 @@ mod tests {
         let p = Policy::Rbash;
         assert!(p.check(Op::CommandName("echo")).is_ok());
         assert!(p.check(Op::CommandName("my-cmd")).is_ok());
-        assert!(p.check(Op::SourcePath("profile")).is_ok());
+        assert!(
+            p.check(Op::SourcePath {
+                invoked: ".",
+                path: "profile",
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -169,8 +195,20 @@ mod tests {
         assert!(p.check(Op::Exec).is_err());
         assert!(p.check(Op::CommandName("/bin/echo")).is_err());
         assert!(p.check(Op::CommandName("echo")).is_ok());
-        assert!(p.check(Op::SourcePath("/etc/profile")).is_err());
-        assert!(p.check(Op::SourcePath("profile")).is_ok());
+        assert!(
+            p.check(Op::SourcePath {
+                invoked: ".",
+                path: "/etc/profile",
+            })
+            .is_err()
+        );
+        assert!(
+            p.check(Op::SourcePath {
+                invoked: ".",
+                path: "profile",
+            })
+            .is_ok()
+        );
     }
 
     /// Message bodies are bash's, verbatim. These strings are asserted
@@ -186,8 +224,21 @@ mod tests {
             "/bin/echo: restricted: cannot specify `/' in command names"
         );
         assert_eq!(
-            p.check(Op::SourcePath("/etc/profile")).unwrap_err(),
+            p.check(Op::SourcePath {
+                invoked: ".",
+                path: "/etc/profile",
+            })
+            .unwrap_err(),
             ".: /etc/profile: restricted"
+        );
+        // bash echoes back the name the user TYPED, not a canonical one.
+        assert_eq!(
+            p.check(Op::SourcePath {
+                invoked: "source",
+                path: "/etc/profile",
+            })
+            .unwrap_err(),
+            "source: /etc/profile: restricted"
         );
         assert_eq!(
             p.check(Op::RedirectFile { path: "f" }).unwrap_err(),

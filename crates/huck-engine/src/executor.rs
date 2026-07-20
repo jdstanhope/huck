@@ -4611,7 +4611,22 @@ fn run_exec_single_inner(
     // after xtrace, but before the dispatch machinery. Its inline assignments
     // persist (special builtin), so no restore on return.
     if resolved.program == "exec" {
-        if let Err(msg) = shell.policy.check(crate::policy::Op::Exec) {
+        // bash refuses `exec` only when it has a COMMAND WORD to replace the
+        // shell with. Redirect-only / bare / options-only `exec` (`exec 3<f`,
+        // `exec 2>&1`, `exec -c`) is PERMITTED — its redirections are then
+        // subject to the ordinary Op::RedirectFile check, which is why
+        // `exec 3> f` reports the redirect diagnostic, not `exec: restricted`.
+        // A bad option falls through so run_exec_builtin reports the usage
+        // error, as bash does.
+        let has_command_word = parse_exec_flags(&resolved.args)
+            .map(|f| resolved.args.len() > f.operand_start)
+            .unwrap_or(false);
+        let verdict = if has_command_word {
+            shell.policy.check(crate::policy::Op::Exec)
+        } else {
+            Ok(())
+        };
+        if let Err(msg) = verdict {
             {
                 let mut err = err_writer(err_sink, sink);
                 crate::sh_error_to!(shell, &mut *err, None, "{msg}");
@@ -4714,6 +4729,7 @@ fn run_exec_single_inner(
         }
     } else if resolved.program == "source" || resolved.program == "." {
         let args = resolved.args;
+        let invoked = resolved.program.clone();
         if has_any_redirect(cmd) {
             with_redirect_scope(
                 &cmd.redirects,
@@ -4721,11 +4737,11 @@ fn run_exec_single_inner(
                 sink,
                 err_sink,
                 move |shell, inner_sink, inner_err_sink| {
-                    builtins::source_in_sink(&args, shell, inner_sink, inner_err_sink)
+                    builtins::source_in_sink(&args, &invoked, shell, inner_sink, inner_err_sink)
                 },
             )
         } else {
-            builtins::source_in_sink(&args, shell, sink, err_sink)
+            builtins::source_in_sink(&args, &invoked, shell, sink, err_sink)
         }
     } else if builtins::builtin_active(&resolved.program, shell) {
         // v156 task 7: ALL redirects flow through one ordered RedirectScope (via

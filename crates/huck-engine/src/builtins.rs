@@ -195,7 +195,7 @@ pub fn run_builtin(
         "shopt" => builtin_shopt(args, out, err, shell),
         "shift" => builtin_shift(args, err, shell),
         "getopts" => builtin_getopts(args, err, shell),
-        "." | "source" => builtin_source(args, err, shell),
+        "." | "source" => builtin_source(name, args, err, shell),
         "eval" => builtin_eval(args, shell),
         "let" => builtin_let(args, err, shell),
         "help" => builtin_help(args, out, err, shell),
@@ -3402,8 +3402,10 @@ fn builtin_read(
 
     let mut exit = base_exit;
     for (name, value) in assignments {
+        // `try_set` has already printed bash's `<name>: readonly variable`
+        // (as the `-a` path above notes for `replace_indexed`); read adds no
+        // second, `read:`-prefixed line — bash prints exactly one.
         if shell.try_set(&name, value).is_err() {
-            crate::sh_error_to!(shell, err, None, "read: {name}: readonly variable");
             exit = 1;
         }
     }
@@ -7453,12 +7455,15 @@ fn builtin_help(
 
 pub(crate) fn source_in_sink(
     args: &[String],
+    invoked: &str,
     shell: &mut Shell,
     sink: &mut crate::executor::StdoutSink,
     err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
     if let Some(path) = args.first()
-        && let Err(msg) = shell.policy.check(crate::policy::Op::SourcePath(path))
+        && let Err(msg) = shell
+            .policy
+            .check(crate::policy::Op::SourcePath { invoked, path })
     {
         let mut err = crate::executor::err_writer(err_sink, sink);
         crate::sh_error_to!(shell, &mut *err, None, "{msg}");
@@ -7567,11 +7572,16 @@ pub(crate) fn source_in_sink(
     result
 }
 
-fn builtin_source(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_source(
+    invoked: &str,
+    args: &[String],
+    err: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
     let _ = err; // err writer not used: source_in_sink materializes from sinks
     let mut sink = crate::executor::StdoutSink::Terminal;
     let mut err_sink = crate::executor::StderrSink::Terminal;
-    source_in_sink(args, shell, &mut sink, &mut err_sink)
+    source_in_sink(args, invoked, shell, &mut sink, &mut err_sink)
 }
 
 fn resolve_source_path(
