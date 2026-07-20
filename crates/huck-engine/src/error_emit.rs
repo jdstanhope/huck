@@ -26,6 +26,19 @@ use crate::shell_state::Shell;
 use huck_syntax::command::{Delim, ExpectFailure, Found, ParseError};
 use huck_syntax::spell::{spell_delim, spell_token};
 
+/// Selects which nested-context marker (if any) `render_diag_inner`/
+/// `emit_syntax_error_ex` prints for a syntax error (v316, #213). `Default`
+/// is top-level (no nested context — the ordinary `-c:`/script-name
+/// prologue). `Eval` routes through `Diag::Syntax`'s existing `eval_frame`
+/// logic unchanged. `CommandSub` routes through `Diag::SyntaxNested` and
+/// always prints `command substitution: line N:` (Task 2, #213).
+#[derive(Clone, Copy)]
+pub(crate) enum Marker {
+    Default,
+    Eval,
+    CommandSub,
+}
+
 /// Selects which bash prologue form [`Shell::error_prefix`](crate::shell_state::Shell::error_prefix)
 /// composes — see the design spec's §3 matrix.
 pub enum Diag<'a> {
@@ -42,6 +55,10 @@ pub enum Diag<'a> {
     /// fd: …`). Prologue: `<name>: [cmd: ]` — identical to [`Diag::Runtime`]
     /// minus the line. `cmd` = builtin/context (`Some("cd")`) or `None`.
     RuntimeNoLine(Option<&'a str>),
+    /// A syntax error carrying an explicit nested-context marker
+    /// (`command substitution:`), which REPLACES `-c:` and ignores
+    /// `eval_frame`. Prologue: `<name>: <marker>: line N: `. v316 (#213).
+    SyntaxNested { line: u32, marker: &'static str },
 }
 
 /// Emit one bash diagnostic to the current error sink for a RUNTIME error.
@@ -64,7 +81,7 @@ pub fn emit_error(shell: &Shell, cmd: Option<&str>, body: std::fmt::Arguments) {
 /// no builtin context). Thin delegate to [`emit_syntax_error_ex`] with no
 /// source-echo line.
 pub fn emit_syntax_error(shell: &Shell, line: u32, body: std::fmt::Arguments) {
-    emit_syntax_error_ex(shell, line, body, None);
+    emit_syntax_error_ex(shell, line, body, None, Marker::Default);
 }
 
 /// General syntax-error emitter (v314, #211). `echo` = the source line to
@@ -73,14 +90,22 @@ pub fn emit_syntax_error(shell: &Shell, line: u32, body: std::fmt::Arguments) {
 /// `<name>: [-c: ]line N: ` prologue is always built by
 /// [`Shell::error_prefix`](crate::shell_state::Shell::error_prefix) and is
 /// reused verbatim for the echo line (bash repeats the identical prologue).
-pub fn emit_syntax_error_ex(
+pub(crate) fn emit_syntax_error_ex(
     shell: &Shell,
     line: u32,
     body: std::fmt::Arguments,
     echo: Option<&str>,
+    marker: Marker,
 ) {
     with_err(|err| {
-        let prefix = shell.error_prefix(Diag::Syntax { line });
+        let prefix = match marker {
+            Marker::CommandSub => shell.error_prefix(Diag::SyntaxNested {
+                line,
+                marker: "command substitution",
+            }),
+            // Default/Eval: eval_frame logic unchanged (`Diag::Syntax`).
+            _ => shell.error_prefix(Diag::Syntax { line }),
+        };
         let _ = write!(err, "{prefix}");
         let _ = err.write_fmt(body);
         let _ = err.write_all(b"\n");
@@ -122,18 +147,47 @@ pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_l
     // outer line an `eval` sits on) for DISPLAY purposes, but `source` here is
     // always the LOCAL text being parsed (e.g. the eval string alone) — so
     // indexing into it (the echoed source line) must subtract the base back
-    // out first. `eof_line` is computed fresh from local `source` and needs
-    // the base added the other way, to land in the same display space as
-    // `token_line`.
+    // out first. The entry derives the marker + base from `eval_frame`
+    // (byte-identical to pre-v316) and hands the worker the RAW local line;
+    // the worker re-derives `display_line = line_base + local_line`, which
+    // round-trips exactly back to `token_line`.
     let base = shell.line_base();
-    let local_line = token_line.saturating_sub(base);
+    let (marker, line_base) = match shell.eval_frame {
+        Some(_) => (Marker::Eval, base),
+        None => (Marker::Default, base),
+    };
+    render_diag_inner(
+        shell,
+        err,
+        source,
+        token_line.saturating_sub(base),
+        marker,
+        line_base,
+    );
+}
+
+/// Worker for [`render_syntax_diag`]: classifies `err` into bash's three
+/// syntax-error shapes (see `render_syntax_diag`'s doc comment) and emits it,
+/// given an already-resolved `local_line`/`marker`/`line_base` triple. Split
+/// out in v316 (#213) so a nested command-substitution reparse (Task 2) can
+/// call this directly with `Marker::CommandSub` and its own `line_base`,
+/// bypassing the `eval_frame`-derived entry above.
+fn render_diag_inner(
+    shell: &Shell,
+    err: &ParseError,
+    source: &str,
+    local_line: u32,
+    marker: Marker,
+    line_base: u32,
+) {
+    let display_line = line_base + local_line;
     // bash's EOF line counter is "one past the last line read", regardless
     // of whether the source ends in a trailing newline (verified against
     // real bash 5.2.21: `bash -c 'if true'` and `bash -c $'if true\n'` both
     // report `line 2`) — so this counts LOGICAL lines via `str::lines()`,
     // not raw `\n` bytes (a byte count under-counts by one for the common
     // no-trailing-newline case).
-    let eof_line = base + 1 + source.lines().count() as u32;
+    let eof_line = line_base + 1 + source.lines().count() as u32;
     let echo_line = source_logical_line(source, local_line);
     match err {
         // Shape 1: a real token is present but misplaced.
@@ -144,9 +198,10 @@ pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_l
             let tok = spell_token(k);
             emit_syntax_error_ex(
                 shell,
-                token_line,
+                display_line,
                 format_args!("syntax error near unexpected token `{tok}'"),
                 Some(&echo_line),
+                marker,
             );
         }
         // Shape 3: EOF inside an open quote/delimiter.
@@ -155,12 +210,18 @@ pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_l
             matching: Some(d),
             ..
         }) if is_matching_delim(*d) => {
-            emit_matching(shell, *d, source, token_line);
+            emit_matching(shell, *d, source, local_line, marker, line_base);
         }
         ParseError::Lex(le) => match lex_is_shape3(le) {
-            Some(d) => emit_matching(shell, d, source, token_line),
+            Some(d) => emit_matching(shell, d, source, local_line, marker, line_base),
             None => {
-                emit_syntax_error_ex(shell, token_line, format_args!("syntax error: {err}"), None);
+                emit_syntax_error_ex(
+                    shell,
+                    display_line,
+                    format_args!("syntax error: {err}"),
+                    None,
+                    marker,
+                );
             }
         },
         // Shape 2: EOF while a keyword/paren construct is open.
@@ -178,15 +239,18 @@ pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_l
                 eof_line,
                 format_args!("syntax error: unexpected end of file"),
                 None,
+                marker,
             );
         }
+        // ParseError::InCommandSub arm is added in Task 2.
         // Fallback: keep the descriptive message (unmigrated / non-top-level).
         other => {
             emit_syntax_error_ex(
                 shell,
-                token_line,
+                display_line,
                 format_args!("syntax error: {other}"),
                 None,
+                marker,
             );
         }
     }
@@ -202,11 +266,18 @@ pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_l
 /// reported at the EOF line instead (bash keeps scanning to the end of
 /// input before giving up on a `$(`; verified the same way: `line 5:` for a
 /// 4-physical-line file).
-fn emit_matching(shell: &Shell, d: Delim, source: &str, token_line: u32) {
-    let eof_line = shell.line_base() + 1 + source.lines().count() as u32;
+fn emit_matching(
+    shell: &Shell,
+    d: Delim,
+    source: &str,
+    local_line: u32,
+    marker: Marker,
+    line_base: u32,
+) {
+    let eof_line = line_base + 1 + source.lines().count() as u32;
     let line = match d {
         Delim::DollarParen | Delim::Paren => eof_line,
-        _ => token_line,
+        _ => line_base + local_line,
     };
     let spelled = spell_delim(d);
     // DBracket renders as `]]`.
@@ -220,6 +291,7 @@ fn emit_matching(shell: &Shell, d: Delim, source: &str, token_line: u32) {
         line,
         format_args!("unexpected EOF while looking for matching `{matchtxt}'"),
         None,
+        marker,
     );
 }
 
