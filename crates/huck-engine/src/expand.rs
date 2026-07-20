@@ -1898,11 +1898,35 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
             WordPart::ArrayLiteral(elems) => {
                 result.push_str(&reconstruct_array_literal(elems, shell));
             }
-            WordPart::ProcessSub { .. } => {
-                // Process substitution is meaningful only in command-argument /
-                // redirect-target expansion (the main expand() path). Realizing
-                // it here (assignment context, no command to consume the fd)
-                // would leak an fd and a child process with no benefit. No-op.
+            WordPart::ProcessSub { sequence, dir } => {
+                // v318 (#218): realize it here too — bash sets a scalar/array
+                // element/case-subject/etc. to the real `/dev/fd/N` path
+                // (`f=<(cmd)` is a real, if unusual, assignment: `f=<(echo
+                // hi)` sets `f` to `/dev/fd/N`, even though nothing else in
+                // the same command consumes it). Previously a no-op ("no
+                // command to consume the fd"), which undersold it — bash
+                // itself only keeps the fd alive for the assignment's own
+                // command (never past it, even inside a group/function/
+                // subshell/`$()`), so every caller of `expand_assignment`
+                // realizing here and relying on its enclosing per-command
+                // `procsub_pending` snapshot/drain (same scope the ordinary
+                // command-argument path below already uses) matches bash
+                // exactly — no separate lifetime extension needed.
+                match crate::procsub::realize(sequence, dir.clone(), shell) {
+                    Ok((path, ps)) => {
+                        shell.procsub_pending.push(ps);
+                        result.push_str(&path);
+                    }
+                    Err(e) => {
+                        crate::sh_error!(
+                            shell,
+                            None,
+                            "process substitution: {}",
+                            crate::bash_io_error(&e)
+                        );
+                        // Emit nothing; the value stays empty if no other parts.
+                    }
+                }
             }
             WordPart::Quoted { parts, .. } => {
                 // Delegate to each inner part. Inner parts carry their own

@@ -3836,7 +3836,23 @@ fn run_single(
             if *line != 0 {
                 shell.current_lineno = shell.line_base() + *line;
             }
-            ExecOutcome::Continue(run_assignment_list(items, shell, sink, err_sink))
+            // v318 (#218): a bare assignment (`f=<(cmd)`, no redirects — the
+            // `run_exec_single_inner` empty-program path handles the
+            // assignment+redirect shape and already has its own procsub_base/
+            // drain) previously had NO procsub_pending scope of its own here,
+            // so a RHS process substitution realized by `run_assignment_list`
+            // (e.g. `f=<(cmd)`) stayed pending and was only closed as
+            // collateral by whatever command's drain ran next — an
+            // uncontrolled, too-late close. Bracket it here like every other
+            // command dispatch: bash itself closes an assignment-RHS procsub's
+            // fd right after the assignment's OWN command, even inside a
+            // group/function/subshell/`$()` — never across a later command —
+            // so a plain per-command drain is the bash-matching lifetime; no
+            // extension needed.
+            let procsub_base = shell.procsub_pending.len();
+            let st = run_assignment_list(items, shell, sink, err_sink);
+            drain_procsubs(shell, procsub_base);
+            ExecOutcome::Continue(st)
         }
     };
     // $PIPESTATUS reflects this leaf command's exit status. break/continue
