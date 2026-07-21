@@ -2665,6 +2665,10 @@ fn peek_leading_keyword(iter: &mut Lexer) -> Result<Option<Keyword>, ParseError>
 /// whole (non-atom path).  Callers that expect a keyword here must have already
 /// verified it via `peek_leading_keyword` (which also skips leading blanks).
 fn consume_command_word(iter: &mut Lexer) -> Result<Word, ParseError> {
+    // Recovery cursor context (Task 4): a word assembled here is command-position
+    // (the leading command word, an `if`/`while` condition command, a for/case
+    // subject, or a keyword). No-op off the recovery path.
+    iter.set_recovery_cmd_word(true);
     if matches!(iter.peek_kind()?, Some(TokenKind::Word(_))) {
         match iter.next_kind()? {
             Some(TokenKind::Word(w)) => Ok(w),
@@ -3024,6 +3028,8 @@ fn parse_simple_with_leading_word(
         ) {
             // v264 flip-fix (Finding 1): argument command words brace-expand
             // (1→N Words), matching the oracle's lex-time `emit_word_with_braces`.
+            // Recovery cursor context (Task 4): this is an argument-position word.
+            iter.set_recovery_cmd_word(false);
             let w = parse_word_command(iter, false)?;
             push_command_word_brace_expanded(&mut all_words, w, iter)?;
             continue;
@@ -4208,8 +4214,81 @@ pub(crate) fn parse_compound_section(
     unterminated: ParseError,
 ) -> Result<Sequence, ParseError> {
     match parse_and_or(iter, stop_at) {
-        Err(ParseError::MissingCommand) if iter.peek_kind()?.is_none() => Err(unterminated),
+        // An empty body at genuine EOF: under `recover_at_eof` synthesize a
+        // minimal `:` body so a truncated compound command still yields a tree;
+        // otherwise it is unterminated. The strict path (recover_at_eof ==
+        // false) is unchanged — it still returns `Err(unterminated)`.
+        Err(ParseError::MissingCommand) if iter.peek_kind()?.is_none() => {
+            if iter.recover_at_eof() {
+                Ok(synthetic_colon_sequence())
+            } else {
+                Err(unterminated)
+            }
+        }
+        // Recovery: the section body ran into a synthetic EOF-recovery closer.
+        // This happens when the truncation sits inside an enclosing lexer-mode:
+        // in `echo $(if whi` the inner `if` condition meets the `$(`'s synthetic
+        // `)` (an `Unexpected` error), never a bare EOF. Best-effort a `:` body so
+        // the enclosing compound still recovers and records its frame. Guarded by
+        // `recover_at_eof`, so the strict path is byte-for-byte unaffected.
+        Err(e) => {
+            if iter.recover_at_eof() && iter.peek_is_recovery_close()? {
+                Ok(synthetic_colon_sequence())
+            } else {
+                Err(e)
+            }
+        }
         other => other,
+    }
+}
+
+/// A synthetic no-op `:` command wrapped as a one-command `Sequence`. Used
+/// under `recover_at_eof` to fill a compound command's missing body (an `if`
+/// then-branch, a loop body, …) so the recovery tree is walkable. Only ever
+/// built on the recovery path.
+fn synthetic_colon_sequence() -> Sequence {
+    Sequence {
+        first: Command::Simple(SimpleCommand::Exec(ExecCommand {
+            inline_assignments: Vec::new(),
+            program: Word(vec![WordPart::Literal {
+                text: ":".to_string(),
+                quoted: false,
+            }]),
+            args: Vec::new(),
+            redirects: Vec::new(),
+            line: 0,
+        })),
+        rest: Vec::new(),
+        background: false,
+    }
+}
+
+/// Consume a compound command's continuation/closing keyword (`then`, `do`,
+/// `done`, `fi`, `}`, `in`, `esac`). Returns `Ok(true)` when the keyword was
+/// present and consumed, `Ok(false)` when it is ABSENT AT EOF under
+/// `recover_at_eof` (the caller then synthesizes the remainder), or
+/// `Err(on_missing)` otherwise.
+///
+/// The strict path (`recover_at_eof == false`) is byte-for-byte identical to
+/// `expect_keyword`: it consumes on a match and returns `Err(on_missing)` on a
+/// mismatch — it can never return `Ok(false)`.
+fn expect_or_recover(
+    iter: &mut Lexer,
+    expected: Keyword,
+    on_missing: ParseError,
+) -> Result<bool, ParseError> {
+    if peek_leading_keyword(iter)? == Some(expected) {
+        consume_command_word(iter)?;
+        Ok(true)
+    } else if iter.recover_at_eof() && iter.peek_is_recovery_close()? {
+        // Recover not only at bare EOF but also when the delimiter would sit past
+        // a truncated inner lexer-mode: `echo $(if whi` reaches EOF inside the
+        // `$(`, so the next token is the synthetic `)` closer, not `None`. Keying
+        // off "the next token is a synthetic EOF closer" lets the inner compound
+        // still recover (and record its frame) instead of erroring.
+        Ok(false)
+    } else {
+        Err(on_missing)
     }
 }
 
@@ -4248,7 +4327,11 @@ pub(crate) fn maybe_wrap_redirects(cmd: Command, iter: &mut Lexer) -> Result<Com
 fn parse_brace_group(iter: &mut Lexer) -> Result<Command, ParseError> {
     expect_keyword(iter, Keyword::LBrace, ParseError::UnterminatedBrace)?;
     let body = parse_compound_section(iter, &[Keyword::RBrace], ParseError::UnterminatedBrace)?;
-    expect_keyword(iter, Keyword::RBrace, ParseError::UnterminatedBrace)?;
+    // Under recovery, a missing `}` at EOF closes the group with what was parsed.
+    if !expect_or_recover(iter, Keyword::RBrace, ParseError::UnterminatedBrace)? {
+        // Recovery (Task 4): `{ …` truncated before `}` — cursor is in the group.
+        iter.push_recovery_frame(crate::recover::Frame::BraceGroup);
+    }
     maybe_wrap_redirects(Command::BraceGroup(Box::new(body)), iter)
 }
 
@@ -4262,18 +4345,34 @@ fn parse_brace_group(iter: &mut Lexer) -> Result<Command, ParseError> {
 fn parse_if(iter: &mut Lexer) -> Result<Command, ParseError> {
     expect_keyword(iter, Keyword::If, ParseError::UnterminatedIf)?;
     let condition = parse_compound_section(iter, &[Keyword::Then], ParseError::UnterminatedIf)?;
-    expect_keyword(iter, Keyword::Then, ParseError::UnterminatedIf)?;
-    let then_body = parse_compound_section(
-        iter,
-        &[Keyword::Elif, Keyword::Else, Keyword::Fi],
-        ParseError::UnterminatedIf,
-    )?;
+    // Under recovery, `if COND` with no `then` at EOF synthesizes a `:`
+    // then-branch (and skips the elif/else/fi tail, which is all at EOF).
+    let then_body = if expect_or_recover(iter, Keyword::Then, ParseError::UnterminatedIf)? {
+        parse_compound_section(
+            iter,
+            &[Keyword::Elif, Keyword::Else, Keyword::Fi],
+            ParseError::UnterminatedIf,
+        )?
+    } else {
+        // Recovery (Task 4): `if COND` truncated with no `then` — the cursor sits
+        // in the if-condition.
+        iter.push_recovery_frame(crate::recover::Frame::IfCondition);
+        synthetic_colon_sequence()
+    };
 
     let mut elif_branches = Vec::new();
     while peek_leading_keyword(iter)? == Some(Keyword::Elif) {
         consume_command_word(iter)?; // consume `elif`
         let condition = parse_compound_section(iter, &[Keyword::Then], ParseError::UnterminatedIf)?;
-        expect_keyword(iter, Keyword::Then, ParseError::UnterminatedIf)?;
+        if !expect_or_recover(iter, Keyword::Then, ParseError::UnterminatedIf)? {
+            // Recovery: `elif COND` with no `then` at EOF — synthesize its body
+            // and stop; the else/fi tail is all at EOF below.
+            elif_branches.push(ElifBranch {
+                condition,
+                body: synthetic_colon_sequence(),
+            });
+            break;
+        }
         let body = parse_compound_section(
             iter,
             &[Keyword::Elif, Keyword::Else, Keyword::Fi],
@@ -4293,7 +4392,8 @@ fn parse_if(iter: &mut Lexer) -> Result<Command, ParseError> {
         None
     };
 
-    expect_keyword(iter, Keyword::Fi, ParseError::UnterminatedIf)?;
+    // Under recovery, a missing `fi` at EOF closes the `if` with what was parsed.
+    expect_or_recover(iter, Keyword::Fi, ParseError::UnterminatedIf)?;
     let clause = IfClause {
         condition,
         then_body,
@@ -4346,12 +4446,16 @@ fn parse_do_body_done(iter: &mut Lexer) -> Result<Sequence, ParseError> {
     if peek_leading_keyword(iter)? == Some(Keyword::LBrace) {
         expect_keyword(iter, Keyword::LBrace, ParseError::UnterminatedBrace)?;
         let body = parse_compound_section(iter, &[Keyword::RBrace], ParseError::UnterminatedBrace)?;
-        expect_keyword(iter, Keyword::RBrace, ParseError::UnterminatedBrace)?;
+        expect_or_recover(iter, Keyword::RBrace, ParseError::UnterminatedBrace)?;
         return Ok(body);
     }
-    expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
+    // Under recovery, a missing `do` at EOF synthesizes a `:` loop body (and
+    // the trailing `done`, also at EOF, is skipped).
+    if !expect_or_recover(iter, Keyword::Do, ParseError::UnterminatedLoop)? {
+        return Ok(synthetic_colon_sequence());
+    }
     let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
-    expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
+    expect_or_recover(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
     Ok(body)
 }
 
@@ -4556,7 +4660,14 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
                 || matches!(
                     iter.peek_kind()?,
                     None | Some(TokenKind::Newline) | Some(TokenKind::Op(Operator::Semi))
-                );
+                )
+                // Recovery (Task 4): a for/select word-list truncated inside an
+                // enclosing lexer mode (`echo $(for x in y`) reaches EOF with the
+                // next token being the synthetic recovery-close (an `Op` stamped
+                // at the EOF offset). Treat it as end-of-list so control falls
+                // through to the `ForList` push guard instead of erroring on the
+                // `Op(_)` arm below. Gated on `recover_at_eof` → strict path dead.
+                || (iter.recover_at_eof() && iter.peek_is_recovery_close()?);
             if stop {
                 break;
             }
@@ -4566,7 +4677,9 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
                 }
                 // v264 flip-fix (Finding 1): for-loop in-list words brace-expand
                 // (oracle: `emit_word_with_braces` is called for for/select lists).
+                // Recovery cursor context (Task 4): a for-list word is argument-position.
                 _ => {
+                    iter.set_recovery_cmd_word(false);
                     let w = parse_word_command(iter, false)?;
                     push_command_word_brace_expanded(&mut words, w, iter)?;
                 }
@@ -4577,6 +4690,13 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
         false
     };
 
+    // Recovery (Task 4): `for x [in …]` truncated before `do` — the cursor sits
+    // in the loop's word list (or right after the variable). `peek_is_recovery_close`
+    // (not bare `is_none`) so a `for` truncated inside an enclosing lexer-mode
+    // (`echo $(for x in y`) still records its frame past the synthetic closer.
+    if iter.recover_at_eof() && iter.peek_is_recovery_close()? {
+        iter.push_recovery_frame(crate::recover::Frame::ForList);
+    }
     let body = parse_do_body_done(iter)?;
     maybe_wrap_redirects(
         Command::For(Box::new(ForClause {
@@ -4622,7 +4742,14 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
                 || matches!(
                     iter.peek_kind()?,
                     None | Some(TokenKind::Newline) | Some(TokenKind::Op(Operator::Semi))
-                );
+                )
+                // Recovery (Task 4): a for/select word-list truncated inside an
+                // enclosing lexer mode (`echo $(for x in y`) reaches EOF with the
+                // next token being the synthetic recovery-close (an `Op` stamped
+                // at the EOF offset). Treat it as end-of-list so control falls
+                // through to the `ForList` push guard instead of erroring on the
+                // `Op(_)` arm below. Gated on `recover_at_eof` → strict path dead.
+                || (iter.recover_at_eof() && iter.peek_is_recovery_close()?);
             if stop {
                 break;
             }
@@ -4631,7 +4758,9 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
                     return Err(ParseError::Unexpected(iter.unexpected_here(None)?));
                 }
                 // v264 flip-fix (Finding 1): select in-list words brace-expand too.
+                // Recovery cursor context (Task 4): a select-list word is argument-position.
                 _ => {
+                    iter.set_recovery_cmd_word(false);
                     let w = parse_word_command(iter, false)?;
                     push_command_word_brace_expanded(&mut list, w, iter)?;
                 }
@@ -4642,6 +4771,14 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
         None
     };
 
+    // Recovery (Task 4): `select x [in …]` truncated before `do` — mirror the
+    // `parse_for` push guard (~4690) so the `ForList` frame is recorded even when
+    // the select is nested inside a truncated lexer-mode (`echo $(select y in z`).
+    // `peek_is_recovery_close` (not bare `is_none`) so the synthetic closer past
+    // the enclosing `$(` still records the frame.
+    if iter.recover_at_eof() && iter.peek_is_recovery_close()? {
+        iter.push_recovery_frame(crate::recover::Frame::ForList);
+    }
     let body = parse_do_body_done(iter)?;
     maybe_wrap_redirects(
         Command::Select(Box::new(SelectClause { var, words, body })),
@@ -4656,28 +4793,43 @@ fn parse_case(iter: &mut Lexer) -> Result<Command, ParseError> {
     skip_newlines(iter)?;
 
     // Subject word (assembled from atoms — e.g. `$x`, `x`).
+    let recover = iter.recover_at_eof();
     let subject = match iter.peek_kind()? {
+        // Recovery: `case ` with no subject at EOF — an empty subject Word.
+        None if recover => Word(Vec::new()),
         None => return Err(ParseError::UnterminatedCase),
         Some(TokenKind::Op(_)) => return Err(ParseError::Unexpected(iter.unexpected_here(None)?)),
         _ => consume_command_word(iter)?,
     };
 
     skip_newlines(iter)?;
-    expect_keyword(iter, Keyword::In, ParseError::UnterminatedCase)?;
-    skip_newlines(iter)?;
-
     let mut items: Vec<CaseItem> = Vec::new();
-    loop {
-        skip_newlines(iter)?;
-        if peek_leading_keyword(iter)? == Some(Keyword::Esac) {
-            break;
-        }
-        if iter.peek_kind()?.is_none() {
-            return Err(ParseError::UnterminatedCase);
-        }
-        items.push(parse_case_item(iter)?);
+    // Under recovery, a missing `in` at EOF (`case whi`) closes the `case` with
+    // no clauses; otherwise parse the clause list and `esac` as usual.
+    let saw_in = expect_or_recover(iter, Keyword::In, ParseError::UnterminatedCase)?;
+    if !saw_in {
+        // Recovery (Task 4): `case SUBJ` truncated before `in` — cursor is in the
+        // case subject.
+        iter.push_recovery_frame(crate::recover::Frame::CaseSubject);
     }
-    expect_keyword(iter, Keyword::Esac, ParseError::UnterminatedCase)?;
+    if saw_in {
+        skip_newlines(iter)?;
+        loop {
+            skip_newlines(iter)?;
+            if peek_leading_keyword(iter)? == Some(Keyword::Esac) {
+                break;
+            }
+            if iter.peek_kind()?.is_none() {
+                // Recovery: EOF before `esac` — close with the clauses so far.
+                if iter.recover_at_eof() {
+                    break;
+                }
+                return Err(ParseError::UnterminatedCase);
+            }
+            items.push(parse_case_item(iter)?);
+        }
+        expect_or_recover(iter, Keyword::Esac, ParseError::UnterminatedCase)?;
+    }
     maybe_wrap_redirects(Command::Case(Box::new(CaseClause { subject, items })), iter)
 }
 
@@ -4774,9 +4926,18 @@ fn parse_while(iter: &mut Lexer) -> Result<Command, ParseError> {
     };
     consume_command_word(iter)?; // consume the `while`/`until` opener keyword
     let condition = parse_compound_section(iter, &[Keyword::Do], ParseError::UnterminatedLoop)?;
-    expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
-    let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
-    expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
+    // Under recovery, `while COND` with no `do` at EOF synthesizes a `:` body
+    // (and the trailing `done`, also at EOF, is skipped).
+    let body = if expect_or_recover(iter, Keyword::Do, ParseError::UnterminatedLoop)? {
+        let b = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
+        expect_or_recover(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
+        b
+    } else {
+        // Recovery (Task 4): `while COND` truncated with no `do` — cursor is in
+        // the loop condition.
+        iter.push_recovery_frame(crate::recover::Frame::WhileCondition);
+        synthetic_colon_sequence()
+    };
     maybe_wrap_redirects(
         Command::While(Box::new(WhileClause {
             condition,
@@ -4810,8 +4971,16 @@ fn parse_subshell(iter: &mut Lexer) -> Result<Command, ParseError> {
         return Err(ParseError::EmptySubshell);
     }
 
-    // No tokens at all → unterminated.
+    // No tokens at all → unterminated (or, under recovery, an empty `:` body).
     if iter.peek_kind()?.is_none() {
+        if iter.recover_at_eof() {
+            return maybe_wrap_redirects(
+                Command::Subshell {
+                    body: Box::new(synthetic_colon_sequence()),
+                },
+                iter,
+            );
+        }
         return Err(ParseError::UnterminatedSubshell);
     }
 
@@ -4843,8 +5012,11 @@ fn parse_subshell_sequence(iter: &mut Lexer) -> Result<Sequence, ParseError> {
         while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
             iter.next_kind()?;
         }
+        let recover = iter.recover_at_eof();
         match iter.peek_kind()? {
-            // End of tokens before `)` → unterminated.
+            // End of tokens before `)` → unterminated (or, under recovery,
+            // close the subshell body with what was parsed).
+            None if recover => break,
             None => return Err(ParseError::UnterminatedSubshell),
             // `)` terminates the subshell body — consume and return.
             Some(TokenKind::Op(Operator::RParen)) => {
@@ -4860,6 +5032,9 @@ fn parse_subshell_sequence(iter: &mut Lexer) -> Result<Sequence, ParseError> {
                     break;
                 }
                 if iter.peek_kind()?.is_none() {
+                    if iter.recover_at_eof() {
+                        break;
+                    }
                     return Err(ParseError::UnterminatedSubshell);
                 }
                 let cmd = parse_command_then_pipeline(iter)?;
@@ -4888,6 +5063,14 @@ fn parse_subshell_sequence(iter: &mut Lexer) -> Result<Sequence, ParseError> {
                     });
                 }
                 if iter.peek_kind()?.is_none() {
+                    if iter.recover_at_eof() {
+                        // Recovery: `( cmd &` at EOF — a backgrounded body.
+                        return Ok(Sequence {
+                            first,
+                            rest,
+                            background: true,
+                        });
+                    }
                     return Err(ParseError::UnterminatedSubshell);
                 }
                 // More commands follow (`(cmd1 & cmd2)` pattern): parse the

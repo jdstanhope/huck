@@ -231,12 +231,23 @@ impl<'a> CharCursor<'a> {
 
     /// Verbatim source `&s[start..=end]`. `end` is the byte offset of the last
     /// char to include (the `}` of a `${…}`). Mirrors `slice_from`'s guard.
+    ///
+    /// Under `recover_at_eof` an unterminated `${…}` gets a *synthetic* closing
+    /// atom whose span sits at EOF (`end == self.s.len()`), so the inclusive
+    /// `..=end` would index one past the end. When `end` is at or beyond EOF we
+    /// slice exclusive-to-end (`&self.s[start..]`) instead. A real `}` always
+    /// sits strictly before EOF (`end < self.s.len()`), so the strict path is
+    /// byte-for-byte unaffected.
     pub fn slice_inclusive(&self, start: usize, end: usize) -> &str {
         debug_assert!(
             self.injected.is_empty(),
             "slice_inclusive must not straddle an injected alias body"
         );
-        &self.s[start..=end]
+        if end >= self.s.len() {
+            &self.s[start..]
+        } else {
+            &self.s[start..=end]
+        }
     }
 
     /// Reposition the cursor to a byte offset with explicit line/column, clearing
@@ -972,6 +983,13 @@ pub struct LexerOptions {
     /// mark/rewound (see the `Mark` doc-comment), and the flag is immutable for a
     /// lexer's lifetime.
     pub eof_closes_heredoc: bool,
+    /// Recovery mode for completion/tooling: at genuine end-of-input with open
+    /// lexer modes (`$(`, `${`, `$((`, `"`, `'`, backtick, `<(`/`>(`, `NAME=(`),
+    /// emit the synthetic CLOSING atom for each open frame (innermost-out)
+    /// before yielding `None`, so a caller (`parse_recover`) sees a well-formed
+    /// token stream. DEFAULT `false`: strict parsing (execution) is unaffected.
+    /// Like `eof_closes_heredoc`, immutable for a lexer's lifetime.
+    pub recover_at_eof: bool,
 }
 
 /// Core tokenizer body. `brace_expand` controls whether unquoted braces are
@@ -1150,6 +1168,37 @@ pub(crate) struct Mark {
     /// v250 T6: see `Lexer::heredoc_gen`. Captured so `rewind` can assert the
     /// mark did not span an atom-path heredoc-state change.
     heredoc_gen: u64,
+    /// Recovery bookkeeping (dead unless `opts.recover_at_eof`). Captured/restored
+    /// so a speculative parse that pushes a compound frame or flips the
+    /// command-vs-argument flag and then rewinds does not leak that state past the
+    /// checkpoint. (`recovery_capture` is instead reset to `None` in `rewind` — a
+    /// rewind precedes genuine EOF, so any pending EOF snapshot is invalid.)
+    recovery_frames: Vec<(usize, crate::recover::Frame)>,
+    recovery_cmd_word: bool,
+}
+
+/// Snapshot of lexer state at the FIRST real EOF reached under
+/// `opts.recover_at_eof`, taken in `scan_step` BEFORE the parser consumes any
+/// synthetic closer and pops its frame. `parse_recover` reads it after the
+/// parse to assemble `CursorContext` — even when the tree recovers to `None`.
+/// Reset on `rewind` so the last pre-EOF state (after any speculative rewind)
+/// wins. Never populated on the strict path (`recover_at_eof == false`).
+#[derive(Debug, Clone)]
+pub(crate) struct RecoveryCapture {
+    /// The open mode stack at EOF, innermost LAST (`Command` floor included).
+    pub(crate) modes: Vec<Mode>,
+    /// Text of the trailing real word-atom run at EOF (empty at a fresh
+    /// boundary — i.e. the last real atom was a separator/opener).
+    pub(crate) word: String,
+    /// Byte offset the trailing word run started at (`src.len()` at a fresh
+    /// boundary).
+    pub(crate) word_start: usize,
+    /// The rightmost real word atom was a `$name` (`DollarName`) → the cursor
+    /// sits in a variable name.
+    pub(crate) last_is_dollar_name: bool,
+    /// The parser's command-vs-argument flag for the word being assembled at
+    /// EOF (`true` == command position). Set via `set_recovery_cmd_word`.
+    pub(crate) cmd_word: bool,
 }
 
 /// v250: lexer-internal state while emitting a heredoc body as atoms (atom path).
@@ -1286,6 +1335,33 @@ pub struct Lexer<'a> {
     /// not mark/rewind. See `atoms_heredoc_marks_dont_span_bodies` for a case
     /// that drives that rewind while a heredoc body is actively emitting.
     heredoc_gen: u64,
+    /// Recovery bookkeeping (only meaningful under `opts.recover_at_eof`): the
+    /// `modes.len()` at which the most recent synthetic EOF closer was emitted.
+    /// Guards against emitting a SECOND closer for the same still-unpopped frame
+    /// when `fill_to` scans past it for lookahead (`peek2`) before the parser has
+    /// consumed the first — depth strictly decreases as the parser pops each
+    /// frame, so equality means "already closed this frame; nothing more". Reset
+    /// on `rewind`. Transient (not captured in `Mark`, like `stall_steps`).
+    recover_last_depth: Option<usize>,
+    /// Recovery (only meaningful under `opts.recover_at_eof`): state captured at
+    /// the first real EOF, read by `parse_recover`. See `RecoveryCapture`. Reset
+    /// on `rewind`. Inert on the strict path (the capture site is guarded by
+    /// `opts.recover_at_eof`, so this stays `None`).
+    recovery_capture: Option<RecoveryCapture>,
+    /// Recovery: the parser sets this to `true` before assembling a command-word
+    /// (`consume_command_word`) and `false` before an argument/list word, so the
+    /// EOF capture records whether the cursor word is command- or arg-position.
+    /// Defaults `true` (a bare/empty line is command position). Only read when a
+    /// recovery capture is taken.
+    recovery_cmd_word: bool,
+    /// Recovery: compound-command frames the parser pushes when a Task-3
+    /// synthesis fires at EOF (`IfCondition`/`WhileCondition`/`ForList`/
+    /// `CaseSubject`/`BraceGroup`) — these are NOT lexer modes. Each is recorded
+    /// with the mode-stack depth (`self.modes.len()`) live at push time, which is
+    /// the depth at which the compound is nested; `parse_recover` merges these
+    /// into the mode-derived frames by that depth so `enclosing` reflects true
+    /// nesting order (innermost LAST) across BOTH sources.
+    recovery_frames: Vec<(usize, crate::recover::Frame)>,
 }
 
 impl<'a> Lexer<'a> {
@@ -1321,6 +1397,10 @@ impl<'a> Lexer<'a> {
             stall_steps: 0,
             heredoc_gen: 0,
             backtick_raw_started: false,
+            recover_last_depth: None,
+            recovery_capture: None,
+            recovery_cmd_word: true,
+            recovery_frames: Vec::new(),
         }
     }
 
@@ -1472,6 +1552,139 @@ impl<'a> Lexer<'a> {
         self.opts
     }
 
+    /// Whether EOF-recovery is enabled (the parser synthesizes minimal
+    /// compound-command bodies at genuine end-of-input instead of erroring).
+    pub(crate) fn recover_at_eof(&self) -> bool {
+        self.opts.recover_at_eof
+    }
+
+    /// Recovery (Task 4): the parser declares whether the word it is about to
+    /// assemble is command-position (`true`, `consume_command_word`) or an
+    /// argument/list word (`false`). The EOF capture records the last value set.
+    pub(crate) fn set_recovery_cmd_word(&mut self, is_cmd: bool) {
+        self.recovery_cmd_word = is_cmd;
+    }
+
+    /// Recovery (Task 4): the parser pushes a compound-command frame when a
+    /// Task-3 synthesis fires at EOF (these are not lexer modes). The frame is
+    /// tagged with the live mode-stack depth — the depth at which the compound is
+    /// nested — so `parse_recover` can interleave it with the mode-derived frames
+    /// in true nesting order rather than blindly appending.
+    pub(crate) fn push_recovery_frame(&mut self, frame: crate::recover::Frame) {
+        self.recovery_frames.push((self.modes.len(), frame));
+    }
+
+    /// Recovery (Task 4): the compound frames the parser recorded, each paired
+    /// with the mode-stack depth live at push time, in push order.
+    pub(crate) fn recovery_frames(&self) -> &[(usize, crate::recover::Frame)] {
+        &self.recovery_frames
+    }
+
+    /// Recovery (Task 4): true when the next token to be produced is a synthetic
+    /// EOF-recovery closer (or there is no next token at all). Real tokens always
+    /// begin strictly before end-of-input; the synthetic closers `scan_step`
+    /// emits are stamped at the EOF offset (`>= self.s.len()`). `expect_or_recover`
+    /// uses this so a compound whose delimiter would sit past a truncated inner
+    /// lexer-mode (`echo $(if whi`) still recovers — and records its frame —
+    /// instead of erroring on the synthetic closer. Always `false` off the
+    /// recovery path.
+    pub(crate) fn peek_is_recovery_close(&mut self) -> Result<bool, LexError> {
+        if !self.opts.recover_at_eof {
+            return Ok(false);
+        }
+        match self.peek_span()? {
+            None => Ok(true),
+            Some(s) => Ok(s.offset >= self.cursor.s.len()),
+        }
+    }
+
+    /// Recovery (Task 4): the cursor-context snapshot captured at the first real
+    /// EOF (before frames were popped), or `None` if EOF was never reached under
+    /// recovery. Read by `parse_recover`.
+    pub(crate) fn recovery_capture(&self) -> Option<&RecoveryCapture> {
+        self.recovery_capture.as_ref()
+    }
+
+    /// Build the cursor-context snapshot from live lexer state. Walks the token
+    /// history backward over the trailing run of real word-content atoms to find
+    /// the cursor word + its start offset (empty / `src.len()` at a fresh
+    /// boundary). Called once, at the first real EOF, before any frame is popped.
+    fn build_recovery_capture(&self) -> RecoveryCapture {
+        let end = self.cursor.offset();
+        // Collect the trailing contiguous word-content atoms (reverse order).
+        let mut pieces: Vec<(usize, String)> = Vec::new();
+        let mut last_is_dollar_name = false;
+        for tok in self.history.iter().rev() {
+            let piece = match &tok.kind {
+                TokenKind::Lit { text, .. } | TokenKind::QuoteRun { text, .. } => {
+                    Some((text.clone(), false))
+                }
+                TokenKind::DollarLit { .. } => Some(("$".to_string(), false)),
+                TokenKind::ParamName(s) | TokenKind::ParamNameDecoded(s) => {
+                    Some((s.clone(), false))
+                }
+                TokenKind::BacktickRawText(s) => Some((s.clone(), false)),
+                TokenKind::DollarName { name, .. } => Some((name.clone(), true)),
+                // Any non-word atom (separator/opener/closer/structural) ends the
+                // trailing word run.
+                _ => None,
+            };
+            match piece {
+                Some((text, is_dollar)) => {
+                    if pieces.is_empty() {
+                        // First atom seen scanning backward == the rightmost atom.
+                        last_is_dollar_name = is_dollar;
+                    }
+                    pieces.push((tok.span.offset, text));
+                }
+                None => break,
+            }
+        }
+        let (mut word, mut word_start) = if pieces.is_empty() {
+            (String::new(), end)
+        } else {
+            let start = pieces.last().expect("non-empty").0;
+            let text: String = pieces.iter().rev().map(|(_, t)| t.as_str()).collect();
+            (text, start)
+        };
+        // Arith operands (`$(( … ))` / `$[ … ]` / `(( … ))`) emit operators and
+        // spaces as Lit-family atoms, so the trailing word-run above glues the
+        // whole operand expression together (`" a + whi"`). The cursor is really
+        // completing only the bare trailing identifier, so when the innermost open
+        // mode is arith, re-take `word`/`word_start` as the maximal trailing
+        // `[A-Za-z_][A-Za-z0-9_]*` run of the source ending at the cursor.
+        if matches!(
+            self.modes
+                .iter()
+                .rev()
+                .find(|m| !matches!(m, Mode::Command)),
+            Some(Mode::Arith { .. })
+        ) {
+            let bytes = self.cursor.s.as_bytes();
+            let mut start = end.min(bytes.len());
+            while start > 0 && {
+                let b = bytes[start - 1];
+                b == b'_' || b.is_ascii_alphanumeric()
+            } {
+                start -= 1;
+            }
+            // An identifier cannot start with a digit — drop any leading digits so
+            // `word` is a valid name prefix (`12ab` → `ab`, all-digits → empty).
+            while start < end && bytes[start].is_ascii_digit() {
+                start += 1;
+            }
+            word = self.cursor.s[start..end].to_string();
+            word_start = start;
+        }
+        RecoveryCapture {
+            modes: self.modes.clone(),
+            word,
+            word_start,
+            last_is_dollar_name,
+            cmd_word: self.recovery_cmd_word,
+        }
+    }
+
     /// v264: record the `${`'s `$` byte offset in the current ParamExpansion frame,
     /// computed from the live cursor (which sits just past `${`, 2 ASCII bytes, once
     /// the ENCLOSING scanner has consumed the opener — in production the head
@@ -1601,6 +1814,8 @@ impl<'a> Lexer<'a> {
             assign_val_tilde_ok: self.assign_val_tilde_ok,
             pending_lvalue_subscript: self.pending_lvalue_subscript,
             heredoc_gen: self.heredoc_gen,
+            recovery_frames: self.recovery_frames.clone(),
+            recovery_cmd_word: self.recovery_cmd_word,
         }
     }
 
@@ -1634,6 +1849,17 @@ impl<'a> Lexer<'a> {
         self.cmd_at_word_start = m.cmd_at_word_start;
         self.assign_val_tilde_ok = m.assign_val_tilde_ok;
         self.pending_lvalue_subscript = m.pending_lvalue_subscript;
+        // Transient recovery bookkeeping — a rewind (only ever taken mid-input,
+        // before genuine EOF) invalidates any pending EOF-closer state and any
+        // cursor-context snapshot; the post-rewind re-lex re-captures at EOF, so
+        // the LAST (settled) state wins.
+        self.recover_last_depth = None;
+        self.recovery_capture = None;
+        // Restore (not clear) the frame vec + cmd-word flag: a speculative parse
+        // that pushed a frame or flipped the flag inside the marked span must not
+        // leave it stale after the rewind.
+        self.recovery_frames = m.recovery_frames.clone();
+        self.recovery_cmd_word = m.recovery_cmd_word;
         debug_assert_eq!(
             self.heredoc_gen, m.heredoc_gen,
             "mark/rewind must not span heredoc-body emission (v250)"
@@ -1686,7 +1912,67 @@ impl<'a> Lexer<'a> {
     /// Scan one step under the current mode. v241 T2 implements `ParamExpansion`;
     /// v241 T3 implements the four operand modes; remaining Phase C modes are
     /// forward declarations (never pushed in production).
+    /// The atom a given open `Mode` emits on a REAL close — the synthetic closer
+    /// `scan_step` injects for that frame under `opts.recover_at_eof`. Each maps to
+    /// the exact `TokenKind` the parser consumes to pop the frame (grep each mode's
+    /// real-close site). `Command` is the floor (never closed → `None`). Any mode
+    /// without a recovery closer returns `None` (treated as plain EOF).
+    fn recover_close_atom(mode: Mode) -> Option<TokenKind> {
+        match mode {
+            // `$( … )` / `<( … )` / `( … )` bodies are Command-mode tokens; the
+            // parser closes them on `Op(RParen)` (parse_command_sub / subshell).
+            Mode::CommandSub { .. } => Some(TokenKind::Op(Operator::RParen)),
+            Mode::BacktickRaw => Some(TokenKind::EndBacktick),
+            // `${ … }` and its operand sub-modes all close on `}` → ParamClose,
+            // except a subscript operand `${x[ … ]}` which closes on `]`.
+            Mode::ParamExpansion { .. }
+            | Mode::ParamWordOperand { .. }
+            | Mode::ParamSubstPatternOperand { .. }
+            | Mode::ParamSubstringOffsetOperand { .. } => Some(TokenKind::ParamClose),
+            Mode::ParamSubscriptOperand { .. } => Some(TokenKind::RBracket),
+            Mode::Arith { .. } => Some(TokenKind::ArithClose),
+            Mode::DoubleQuote { .. } => Some(TokenKind::EndDquote),
+            Mode::ArrayLiteral { .. } => Some(TokenKind::ArrayClose),
+            Mode::Regex { .. } => Some(TokenKind::RegexEnd),
+            Mode::Extglob { .. } => Some(TokenKind::ExtglobEnd),
+            Mode::Command => None,
+        }
+    }
+
     fn scan_step(&mut self) -> Result<Step, LexError> {
+        // Recovery (`opts.recover_at_eof`): at genuine end-of-input with an open
+        // lexer frame, synthesize that frame's real close atom so the parser sees
+        // a well-formed stream instead of erroring on the unterminated tail. One
+        // closer per `scan_step`, innermost-out; the parser consumes each and pops
+        // its frame, so `modes.len()` strictly decreases. `recover_last_depth`
+        // blocks a duplicate closer for the same still-unpopped frame when
+        // `fill_to` scans ahead (`peek2`) before the parser consumes the first.
+        if self.opts.recover_at_eof && self.cursor.peek().is_none() {
+            // Cursor context (Task 4): the FIRST time real EOF is reached, snapshot
+            // the mode stack + last word BEFORE the parser consumes any synthetic
+            // closer and pops its frame. Fires for depth == 1 too (a top-level
+            // `echo whi` has no open frame but still a well-defined cursor word).
+            if self.recovery_capture.is_none() {
+                self.recovery_capture = Some(self.build_recovery_capture());
+            }
+            let depth = self.modes.len();
+            if depth > 1 {
+                if self.recover_last_depth == Some(depth) {
+                    return Ok(Step::Eof);
+                }
+                if let Some(kind) = Self::recover_close_atom(self.current_mode()) {
+                    let off = self.cursor.offset();
+                    let l = self.cursor.line();
+                    let c = self.cursor.column();
+                    self.history.push(Token::new(kind, Span::new(off, l, c)));
+                    self.recover_last_depth = Some(depth);
+                    return Ok(Step::Produced);
+                }
+                // No known closer for this mode — behave as plain EOF rather than
+                // running the mode scanner (which would error).
+                return Ok(Step::Eof);
+            }
+        }
         match self.current_mode() {
             Mode::Command => self.scan_step_command_atoms(),
             Mode::ParamExpansion { .. } => self.scan_step_param_head(),
