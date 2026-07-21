@@ -37,6 +37,9 @@ pub struct CompletionSpec {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompOptions {
     pub default: bool,
+    /// `-o nospace`: suppress the trailing space bash/huck normally append
+    /// after a unique, word-final, non-directory completion. Load-bearing
+    /// for both the tab-dispatch path (`completion.rs`) and `compopt`.
     pub nospace: bool,
     pub filenames: bool,
     pub bashdefault: bool,
