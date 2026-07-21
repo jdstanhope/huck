@@ -1197,6 +1197,14 @@ pub(crate) struct RecoveryCapture {
     /// The rightmost real word atom was a `$name` (`DollarName`) → the cursor
     /// sits in a variable name.
     pub(crate) last_is_dollar_name: bool,
+    /// The ENTIRE trailing word run is a single unquoted, bare `$` (a
+    /// `DollarLit { quoted: false }` with nothing before it in the run) — an
+    /// incomplete variable expansion with no name typed yet, e.g. `echo $`.
+    /// Degenerate sibling of `last_is_dollar_name` / `${` (empty-name
+    /// `ParamExpansion`): the cursor completes variable names from an empty
+    /// prefix. `a$` (a `$` glued onto a preceding word atom) does NOT set
+    /// this — only a lone `$` at a word start. #248.
+    pub(crate) trailing_lone_dollar: bool,
     /// The parser's command-vs-argument flag for the word being assembled at
     /// EOF (`true` == command position). Set via `set_recovery_cmd_word`.
     pub(crate) cmd_word: bool,
@@ -1636,12 +1644,21 @@ impl<'a> Lexer<'a> {
         // Collect the trailing contiguous word-content atoms (reverse order).
         let mut pieces: Vec<(usize, String)> = Vec::new();
         let mut last_is_dollar_name = false;
+        // Set when the RIGHTMOST atom scanned is an unquoted lone `$`
+        // (`DollarLit { quoted: false }`); only honored below once we know it's
+        // also the ONLY piece in the run (`a$` must not qualify — see field doc).
+        let mut rightmost_is_unquoted_dollar_lit = false;
         for tok in self.history.iter().rev() {
             let piece = match &tok.kind {
                 TokenKind::Lit { text, .. } | TokenKind::QuoteRun { text, .. } => {
                     Some((text.clone(), false))
                 }
-                TokenKind::DollarLit { .. } => Some(("$".to_string(), false)),
+                TokenKind::DollarLit { quoted } => {
+                    if pieces.is_empty() {
+                        rightmost_is_unquoted_dollar_lit = !quoted;
+                    }
+                    Some(("$".to_string(), false))
+                }
                 TokenKind::ParamName(s) | TokenKind::ParamNameDecoded(s) => {
                     Some((s.clone(), false))
                 }
@@ -1670,7 +1687,15 @@ impl<'a> Lexer<'a> {
                 None => break,
             }
         }
-        let (mut word, mut word_start) = if pieces.is_empty() {
+        // A lone `$` at a word start (nothing before it in the trailing run) is
+        // the entire captured word — the degenerate empty-name `$name`, parallel
+        // to `${`'s empty-name capture. Anchor `word_start` past the sigil (like
+        // `$HO`/`${HO`) with an empty `word`, rather than reporting the literal
+        // `"$"` text as an `Argument` word.
+        let trailing_lone_dollar = rightmost_is_unquoted_dollar_lit && pieces.len() == 1;
+        let (mut word, mut word_start) = if trailing_lone_dollar {
+            (String::new(), end)
+        } else if pieces.is_empty() {
             (String::new(), end)
         } else {
             let start = pieces.last().expect("non-empty").0;
@@ -1711,6 +1736,7 @@ impl<'a> Lexer<'a> {
             word,
             word_start,
             last_is_dollar_name,
+            trailing_lone_dollar,
             cmd_word: self.recovery_cmd_word,
             redirect_target: self.recovery_redirect_target,
         }

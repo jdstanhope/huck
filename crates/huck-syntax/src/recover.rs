@@ -87,12 +87,14 @@ fn mode_to_frame(mode: &Mode) -> Option<Frame> {
 }
 
 /// Compute the `WordPosition` of the cursor word from the captured lexer state.
-/// Priority: a `${…}`/`$((…))` name context and a `$name` word both mean
-/// `VariableName`; an array literal RHS (`x=(…`) is `AssignRhs`; otherwise the
-/// parser's command-vs-argument flag decides.
+/// Priority: a `${…}`/`$((…))` name context, a `$name` word, and a lone
+/// trailing `$` (no name typed yet, e.g. `echo $`) all mean `VariableName`; an
+/// array literal RHS (`x=(…`) is `AssignRhs`; otherwise the parser's
+/// command-vs-argument flag decides.
 fn position_from(
     modes: &[Mode],
     last_is_dollar_name: bool,
+    trailing_lone_dollar: bool,
     cmd_word: bool,
     redirect_target: bool,
 ) -> WordPosition {
@@ -114,8 +116,10 @@ fn position_from(
         // needs re-lexing the raw body and is left to iteration 2 (cf. ba38434).
         Some(Mode::BacktickRaw) => WordPosition::Command,
         _ => {
-            if last_is_dollar_name {
-                // A bare `$name` at the cursor (e.g. `echo $whi`).
+            if last_is_dollar_name || trailing_lone_dollar {
+                // A bare `$name` at the cursor (e.g. `echo $whi`), or a lone
+                // trailing `$` with no name yet (`echo $`) — the degenerate
+                // empty-name case, parallel to `${`.
                 WordPosition::VariableName
             } else if cmd_word {
                 WordPosition::Command
@@ -207,6 +211,7 @@ pub fn parse_recover(src: &str) -> RecoveredParse {
                 position: position_from(
                     &cap.modes,
                     cap.last_is_dollar_name,
+                    cap.trailing_lone_dollar,
                     cap.cmd_word,
                     cap.redirect_target,
                 ),
@@ -546,6 +551,31 @@ mod tests {
         assert_eq!(
             parse_recover("if for x in").cursor.enclosing.last(),
             Some(&Frame::ForList)
+        );
+    }
+
+    #[test]
+    fn cursor_lone_dollar_is_variable_position() {
+        // `echo $` — a bare `$` at a word start begins a variable expansion; the
+        // cursor completes variable names (empty prefix), like `${`. #248.
+        for src in ["echo $", "$", "cat foo > $"] {
+            let c = parse_recover(src).cursor;
+            assert_eq!(c.position, WordPosition::VariableName, "{src:?}");
+            assert_eq!(c.word, "", "{src:?}");
+            assert_eq!(c.word_start, src.len(), "word_start past the `$`: {src:?}");
+        }
+        // Regression guards: these must NOT change.
+        assert_eq!(
+            parse_recover("echo a$").cursor.position,
+            WordPosition::Argument
+        );
+        assert_eq!(
+            parse_recover("echo $H").cursor.position,
+            WordPosition::VariableName
+        );
+        assert_eq!(
+            parse_recover("echo ${").cursor.position,
+            WordPosition::VariableName
         );
     }
 
