@@ -427,6 +427,31 @@ mod tests {
     }
 
     #[test]
+    fn cursor_for_list_frame_survives_inside_lexer_mode() {
+        // for/select word-list inside a `$(` must not drop the ForList frame.
+        assert_eq!(
+            parse_recover("echo $(for x in y").cursor.enclosing.last(),
+            Some(&Frame::ForList)
+        );
+        assert_eq!(
+            parse_recover("echo $(select y in z")
+                .cursor
+                .enclosing
+                .last(),
+            Some(&Frame::ForList)
+        );
+        // Regression guard: the already-working cases stay correct.
+        assert_eq!(
+            parse_recover("echo $(for x").cursor.enclosing.last(),
+            Some(&Frame::ForList)
+        );
+        assert_eq!(
+            parse_recover("if for x in").cursor.enclosing.last(),
+            Some(&Frame::ForList)
+        );
+    }
+
+    #[test]
     fn types_are_non_exhaustive_and_public() {
         // Compile-time surface check.
         let _f: Frame = Frame::CommandSub;

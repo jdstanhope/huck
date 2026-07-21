@@ -4660,7 +4660,14 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
                 || matches!(
                     iter.peek_kind()?,
                     None | Some(TokenKind::Newline) | Some(TokenKind::Op(Operator::Semi))
-                );
+                )
+                // Recovery (Task 4): a for/select word-list truncated inside an
+                // enclosing lexer mode (`echo $(for x in y`) reaches EOF with the
+                // next token being the synthetic recovery-close (an `Op` stamped
+                // at the EOF offset). Treat it as end-of-list so control falls
+                // through to the `ForList` push guard instead of erroring on the
+                // `Op(_)` arm below. Gated on `recover_at_eof` → strict path dead.
+                || (iter.recover_at_eof() && iter.peek_is_recovery_close()?);
             if stop {
                 break;
             }
@@ -4735,7 +4742,14 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
                 || matches!(
                     iter.peek_kind()?,
                     None | Some(TokenKind::Newline) | Some(TokenKind::Op(Operator::Semi))
-                );
+                )
+                // Recovery (Task 4): a for/select word-list truncated inside an
+                // enclosing lexer mode (`echo $(for x in y`) reaches EOF with the
+                // next token being the synthetic recovery-close (an `Op` stamped
+                // at the EOF offset). Treat it as end-of-list so control falls
+                // through to the `ForList` push guard instead of erroring on the
+                // `Op(_)` arm below. Gated on `recover_at_eof` → strict path dead.
+                || (iter.recover_at_eof() && iter.peek_is_recovery_close()?);
             if stop {
                 break;
             }
@@ -4757,6 +4771,14 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
         None
     };
 
+    // Recovery (Task 4): `select x [in …]` truncated before `do` — mirror the
+    // `parse_for` push guard (~4690) so the `ForList` frame is recorded even when
+    // the select is nested inside a truncated lexer-mode (`echo $(select y in z`).
+    // `peek_is_recovery_close` (not bare `is_none`) so the synthetic closer past
+    // the enclosing `$(` still records the frame.
+    if iter.recover_at_eof() && iter.peek_is_recovery_close()? {
+        iter.push_recovery_frame(crate::recover::Frame::ForList);
+    }
     let body = parse_do_body_done(iter)?;
     maybe_wrap_redirects(
         Command::Select(Box::new(SelectClause { var, words, body })),
