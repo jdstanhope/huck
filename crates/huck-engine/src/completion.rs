@@ -243,6 +243,22 @@ const COMPLETION_KEYWORDS: &[&str] = &[
     "done", "in", "function", "time", "coproc",
 ];
 
+/// Appends bash's post-completion trailing space to the `replacement` of
+/// every non-directory candidate; directories keep their `/` and get no
+/// space. `display` is never touched. This is the tab-dispatch decoration
+/// for the BUILT-IN completion kinds (command/variable/plain-file), whose
+/// `CandidateKind` reliably distinguishes directories. The space surfaces
+/// only on a unique match — rustyline inserts the full `replacement` for a
+/// single candidate and only the common prefix (space excluded) otherwise.
+fn append_trailing_space_non_dir(mut cands: Vec<Candidate>) -> Vec<Candidate> {
+    for c in &mut cands {
+        if c.kind != CandidateKind::Directory {
+            c.replacement.push(' ');
+        }
+    }
+    cands
+}
+
 /// Completes a command name: builtins, keywords, user-defined functions and
 /// aliases (`function_names`/`alias_names`), plus executables found in the
 /// `:`-separated `path` — the full bash command-position candidate set.
@@ -443,7 +459,10 @@ pub mod dispatch {
         // Path 1: variable context — always wins, no spec lookup.
         if let CompletionContext::Variable { prefix } = &context {
             let var_names: Vec<String> = shell.completion_var_names();
-            return (start, complete_variable(prefix, &var_names));
+            return (
+                start,
+                append_trailing_space_non_dir(complete_variable(prefix, &var_names)),
+            );
         }
 
         // Path 2: command position.
@@ -459,7 +478,10 @@ pub mod dispatch {
             let path = shell.get("PATH").unwrap_or("").to_string();
             let funcs: Vec<String> = shell.functions.keys().cloned().collect();
             let aliases: Vec<String> = shell.aliases.keys().cloned().collect();
-            return (start, complete_command(prefix, &path, &funcs, &aliases));
+            return (
+                start,
+                append_trailing_space_non_dir(complete_command(prefix, &path, &funcs, &aliases)),
+            );
         }
 
         // Path 3: file/argument position.
@@ -489,7 +511,10 @@ pub mod dispatch {
                 // No spec at all -> existing default file completion
                 // (basenames, anchored after the last '/').
                 let home = shell.get("HOME").unwrap_or("").to_string();
-                (start, complete_file(dir, prefix, &home))
+                (
+                    start,
+                    append_trailing_space_non_dir(complete_file(dir, prefix, &home)),
+                )
             }
         }
     }
@@ -1485,7 +1510,7 @@ mod tests {
         let (start, cands) = dispatch::resolve("echo $MY_V", 10, &mut s);
         assert_eq!(start, 6);
         let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
-        assert!(names.contains(&"MY_VAR"), "{names:?}");
+        assert!(names.contains(&"MY_VAR "), "{names:?}");
         assert!(
             !names.contains(&"should_not_appear"),
             "spec fired on var: {names:?}"
@@ -1497,7 +1522,7 @@ mod tests {
         let mut shell = Shell::new();
         let (_, cands) = dispatch::resolve("ec", 2, &mut shell);
         let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
-        assert!(names.contains(&"echo"), "{names:?}");
+        assert!(names.contains(&"echo "), "{names:?}");
     }
 
     #[test]
@@ -1573,7 +1598,7 @@ mod tests {
         let (_, cands) = dispatch::resolve("myuniquea", 9, &mut shell);
         let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
         assert!(
-            names.contains(&"myuniquealias"),
+            names.contains(&"myuniquealias "),
             "alias not completed: {names:?}"
         );
     }
@@ -1602,7 +1627,7 @@ mod tests {
         let pos = line.len();
         let (_, cands) = dispatch::resolve(&line, pos, &mut shell);
         let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
-        assert!(names.contains(&"targetfile"), "{names:?}");
+        assert!(names.contains(&"targetfile "), "{names:?}");
     }
 
     #[test]
@@ -1774,5 +1799,59 @@ mod tests {
             fn_cands.iter().any(|c| c.contains("FUNCNAME")),
             "FUNCNAME should complete, got {fn_cands:?}"
         );
+    }
+
+    #[test]
+    fn dispatch_command_appends_trailing_space() {
+        let mut sh = Shell::new();
+        // `ech` uniquely prefixes the `echo` builtin among commands here.
+        let (_start, cands) = dispatch::resolve("ech", 3, &mut sh);
+        let echo = cands
+            .iter()
+            .find(|c| c.display == "echo")
+            .expect("echo candidate present");
+        assert_eq!(
+            echo.replacement, "echo ",
+            "command replacement gets a trailing space"
+        );
+        assert_eq!(echo.display, "echo", "display stays clean (no space)");
+    }
+
+    #[test]
+    fn dispatch_variable_appends_trailing_space() {
+        let mut sh = Shell::new();
+        sh.set("MYUNIQUEVAR", "x".to_string());
+        let (_start, cands) = dispatch::resolve("echo $MYUNIQ", 11, &mut sh);
+        let v = cands
+            .iter()
+            .find(|c| c.display == "MYUNIQUEVAR")
+            .expect("variable candidate present");
+        assert_eq!(v.replacement, "MYUNIQUEVAR ");
+        assert_eq!(v.display, "MYUNIQUEVAR");
+    }
+
+    #[test]
+    fn dispatch_plain_file_space_but_dir_slash() {
+        // No completion spec registered -> the None (plain-file) branch.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("solofile.txt"), b"x").unwrap();
+        std::fs::create_dir(dir.path().join("solodir")).unwrap();
+        let mut sh = Shell::new();
+        let _guard = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let (_s1, file_cands) = dispatch::resolve("cat solof", 9, &mut sh);
+        let (_s2, dir_cands) = dispatch::resolve("cat solod", 9, &mut sh);
+        std::env::set_current_dir(prev).unwrap();
+
+        let f = file_cands
+            .iter()
+            .find(|c| c.display == "solofile.txt")
+            .unwrap();
+        assert_eq!(f.replacement, "solofile.txt ", "regular file gets a space");
+        let d = dir_cands.iter().find(|c| c.display == "solodir/").unwrap();
+        assert_eq!(d.replacement, "solodir/", "directory keeps `/`, no space");
     }
 }
