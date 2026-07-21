@@ -60,9 +60,18 @@ pub struct RecoveredParse {
 
 /// Parse `src` (a line truncated at the cursor) with EOF-recovery.
 pub fn parse_recover(src: &str) -> RecoveredParse {
-    // Task 1 skeleton: strict parse, best-effort cursor. Tasks 2-4 activate
-    // recovery of incomplete input.
-    let tree = crate::parser::parse(src).ok().flatten();
+    // Drive a recovery lexer (`recover_at_eof`): at genuine EOF with open lexer
+    // modes it emits each frame's synthetic close atom (innermost-out), so the
+    // parser recovers the nesting constructs instead of erroring on the
+    // unterminated tail. The strict `parse()` path is unaffected (the option
+    // defaults `false`). Cursor context is still the Task-1 best-effort stub;
+    // Tasks 3-4 populate it.
+    let opts = crate::lexer::LexerOptions {
+        recover_at_eof: true,
+        ..Default::default()
+    };
+    let mut lx = crate::lexer::Lexer::new(src, &Default::default(), opts);
+    let tree = crate::parser::parse_sequence(&mut lx).ok().flatten();
     RecoveredParse {
         tree,
         cursor: CursorContext {
@@ -91,6 +100,43 @@ mod tests {
         assert_eq!(r.cursor.position, WordPosition::Command);
         assert_eq!(r.cursor.word, "");
         assert_eq!(r.cursor.word_start, 0);
+    }
+
+    #[test]
+    fn recover_unterminated_cmdsub_yields_tree() {
+        // `echo $(whi` — recovery closes the `$(` so the whole thing parses.
+        let r = parse_recover("echo $(whi");
+        assert!(r.tree.is_some(), "unterminated $( should recover to a tree");
+    }
+
+    #[test]
+    fn recover_cmdsub_in_double_quotes_yields_tree() {
+        let r = parse_recover("echo \"$(whi");
+        assert!(r.tree.is_some(), "quoted unterminated $( should recover");
+    }
+
+    #[test]
+    fn recover_unterminated_param_expansion_yields_tree() {
+        let r = parse_recover("echo ${whi");
+        assert!(r.tree.is_some());
+    }
+
+    #[test]
+    fn recover_unterminated_arith_yields_tree() {
+        let r = parse_recover("echo $(( x + ");
+        assert!(r.tree.is_some());
+    }
+
+    #[test]
+    fn recover_unterminated_backtick_yields_tree() {
+        let r = parse_recover("echo `whi");
+        assert!(r.tree.is_some());
+    }
+
+    #[test]
+    fn recover_unterminated_double_quote_yields_tree() {
+        let r = parse_recover("echo \"hello");
+        assert!(r.tree.is_some());
     }
 
     #[test]

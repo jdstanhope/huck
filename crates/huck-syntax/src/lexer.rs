@@ -972,6 +972,13 @@ pub struct LexerOptions {
     /// mark/rewound (see the `Mark` doc-comment), and the flag is immutable for a
     /// lexer's lifetime.
     pub eof_closes_heredoc: bool,
+    /// Recovery mode for completion/tooling: at genuine end-of-input with open
+    /// lexer modes (`$(`, `${`, `$((`, `"`, `'`, backtick, `<(`/`>(`, `NAME=(`),
+    /// emit the synthetic CLOSING atom for each open frame (innermost-out)
+    /// before yielding `None`, so a caller (`parse_recover`) sees a well-formed
+    /// token stream. DEFAULT `false`: strict parsing (execution) is unaffected.
+    /// Like `eof_closes_heredoc`, immutable for a lexer's lifetime.
+    pub recover_at_eof: bool,
 }
 
 /// Core tokenizer body. `brace_expand` controls whether unquoted braces are
@@ -1286,6 +1293,14 @@ pub struct Lexer<'a> {
     /// not mark/rewind. See `atoms_heredoc_marks_dont_span_bodies` for a case
     /// that drives that rewind while a heredoc body is actively emitting.
     heredoc_gen: u64,
+    /// Recovery bookkeeping (only meaningful under `opts.recover_at_eof`): the
+    /// `modes.len()` at which the most recent synthetic EOF closer was emitted.
+    /// Guards against emitting a SECOND closer for the same still-unpopped frame
+    /// when `fill_to` scans past it for lookahead (`peek2`) before the parser has
+    /// consumed the first — depth strictly decreases as the parser pops each
+    /// frame, so equality means "already closed this frame; nothing more". Reset
+    /// on `rewind`. Transient (not captured in `Mark`, like `stall_steps`).
+    recover_last_depth: Option<usize>,
 }
 
 impl<'a> Lexer<'a> {
@@ -1321,6 +1336,7 @@ impl<'a> Lexer<'a> {
             stall_steps: 0,
             heredoc_gen: 0,
             backtick_raw_started: false,
+            recover_last_depth: None,
         }
     }
 
@@ -1634,6 +1650,9 @@ impl<'a> Lexer<'a> {
         self.cmd_at_word_start = m.cmd_at_word_start;
         self.assign_val_tilde_ok = m.assign_val_tilde_ok;
         self.pending_lvalue_subscript = m.pending_lvalue_subscript;
+        // Transient recovery bookkeeping — a rewind (only ever taken mid-input,
+        // before genuine EOF) invalidates any pending EOF-closer state.
+        self.recover_last_depth = None;
         debug_assert_eq!(
             self.heredoc_gen, m.heredoc_gen,
             "mark/rewind must not span heredoc-body emission (v250)"
@@ -1686,7 +1705,60 @@ impl<'a> Lexer<'a> {
     /// Scan one step under the current mode. v241 T2 implements `ParamExpansion`;
     /// v241 T3 implements the four operand modes; remaining Phase C modes are
     /// forward declarations (never pushed in production).
+    /// The atom a given open `Mode` emits on a REAL close — the synthetic closer
+    /// `scan_step` injects for that frame under `opts.recover_at_eof`. Each maps to
+    /// the exact `TokenKind` the parser consumes to pop the frame (grep each mode's
+    /// real-close site). `Command` is the floor (never closed → `None`). Any mode
+    /// without a recovery closer returns `None` (treated as plain EOF).
+    fn recover_close_atom(mode: Mode) -> Option<TokenKind> {
+        match mode {
+            // `$( … )` / `<( … )` / `( … )` bodies are Command-mode tokens; the
+            // parser closes them on `Op(RParen)` (parse_command_sub / subshell).
+            Mode::CommandSub { .. } => Some(TokenKind::Op(Operator::RParen)),
+            Mode::BacktickRaw => Some(TokenKind::EndBacktick),
+            // `${ … }` and its operand sub-modes all close on `}` → ParamClose,
+            // except a subscript operand `${x[ … ]}` which closes on `]`.
+            Mode::ParamExpansion { .. }
+            | Mode::ParamWordOperand { .. }
+            | Mode::ParamSubstPatternOperand { .. }
+            | Mode::ParamSubstringOffsetOperand { .. } => Some(TokenKind::ParamClose),
+            Mode::ParamSubscriptOperand { .. } => Some(TokenKind::RBracket),
+            Mode::Arith { .. } => Some(TokenKind::ArithClose),
+            Mode::DoubleQuote { .. } => Some(TokenKind::EndDquote),
+            Mode::ArrayLiteral { .. } => Some(TokenKind::ArrayClose),
+            Mode::Regex { .. } => Some(TokenKind::RegexEnd),
+            Mode::Extglob { .. } => Some(TokenKind::ExtglobEnd),
+            Mode::Command => None,
+        }
+    }
+
     fn scan_step(&mut self) -> Result<Step, LexError> {
+        // Recovery (`opts.recover_at_eof`): at genuine end-of-input with an open
+        // lexer frame, synthesize that frame's real close atom so the parser sees
+        // a well-formed stream instead of erroring on the unterminated tail. One
+        // closer per `scan_step`, innermost-out; the parser consumes each and pops
+        // its frame, so `modes.len()` strictly decreases. `recover_last_depth`
+        // blocks a duplicate closer for the same still-unpopped frame when
+        // `fill_to` scans ahead (`peek2`) before the parser consumes the first.
+        if self.opts.recover_at_eof && self.cursor.peek().is_none() {
+            let depth = self.modes.len();
+            if depth > 1 {
+                if self.recover_last_depth == Some(depth) {
+                    return Ok(Step::Eof);
+                }
+                if let Some(kind) = Self::recover_close_atom(self.current_mode()) {
+                    let off = self.cursor.offset();
+                    let l = self.cursor.line();
+                    let c = self.cursor.column();
+                    self.history.push(Token::new(kind, Span::new(off, l, c)));
+                    self.recover_last_depth = Some(depth);
+                    return Ok(Step::Produced);
+                }
+                // No known closer for this mode — behave as plain EOF rather than
+                // running the mode scanner (which would error).
+                return Ok(Step::Eof);
+            }
+        }
         match self.current_mode() {
             Mode::Command => self.scan_step_command_atoms(),
             Mode::ParamExpansion { .. } => self.scan_step_param_head(),
