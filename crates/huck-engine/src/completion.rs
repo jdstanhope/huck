@@ -32,155 +32,6 @@ pub struct Candidate {
     pub kind: CandidateKind,
 }
 
-/// What the cursor is positioned to complete.
-#[derive(Debug, PartialEq, Eq)]
-pub enum CompletionContext {
-    Command { prefix: String },
-    Variable { prefix: String },
-    File { dir: String, prefix: String },
-}
-
-/// Classifies the completion context at byte offset `pos` in `line`.
-/// Returns the basename replacement offset and the context.
-pub fn analyze(line: &str, pos: usize) -> (usize, CompletionContext) {
-    let (_, start, ctx) = analyze_full(line, pos);
-    (start, ctx)
-}
-
-/// Like `analyze`, but also returns the start of the WHOLE word
-/// (`word_start`) — the anchor the programmable-completion path uses to
-/// replace the entire `cur` word with full-path candidates.
-pub(crate) fn analyze_full(line: &str, pos: usize) -> (usize, usize, CompletionContext) {
-    let head = &line[..pos];
-
-    let mut word_start = 0usize;
-    let mut current_has_content = false;
-    let mut is_command_pos = true;
-    let mut in_single = false;
-    let mut in_double = false;
-
-    let indexed: Vec<(usize, char)> = head.char_indices().collect();
-    let mut i = 0;
-    while i < indexed.len() {
-        let (off, c) = indexed[i];
-
-        if !in_single && c == '\\' {
-            current_has_content = true;
-            i += 2;
-            continue;
-        }
-        if in_single {
-            current_has_content = true;
-            if c == '\'' {
-                in_single = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_double {
-            current_has_content = true;
-            if c == '"' {
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            '\'' => {
-                in_single = true;
-                current_has_content = true;
-                i += 1;
-            }
-            '"' => {
-                in_double = true;
-                current_has_content = true;
-                i += 1;
-            }
-            ' ' | '\t' => {
-                if current_has_content {
-                    let word = &head[word_start..off];
-                    // Assignment prefix and compound-command keywords both keep
-                    // the next word in command position; everything else moves
-                    // into argument position.
-                    is_command_pos = is_assignment(word) || is_compound_keyword(word);
-                }
-                current_has_content = false;
-                word_start = off + c.len_utf8();
-                i += 1;
-            }
-            ';' | '|' | '&' => {
-                current_has_content = false;
-                is_command_pos = true;
-                word_start = off + c.len_utf8();
-                i += 1;
-            }
-            '<' | '>' => {
-                current_has_content = false;
-                // A redirect operator does not introduce a command; what follows
-                // is a file argument. Leave is_command_pos unchanged.
-                word_start = off + c.len_utf8();
-                i += 1;
-            }
-            _ => {
-                current_has_content = true;
-                i += 1;
-            }
-        }
-    }
-
-    let word = &head[word_start..];
-
-    if let Some(dollar) = last_unescaped_dollar(word) {
-        let after = &word[dollar + 1..];
-        let (brace, name) = match after.strip_prefix('{') {
-            Some(rest) => (true, rest),
-            None => (false, after),
-        };
-        if name
-            .chars()
-            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        {
-            let name_off = dollar + 1 + if brace { 1 } else { 0 };
-            return (
-                word_start,
-                word_start + name_off,
-                CompletionContext::Variable {
-                    prefix: name.to_string(),
-                },
-            );
-        }
-    }
-
-    if let Some(slash) = word.rfind('/') {
-        let dir = unescape(&word[..=slash]);
-        let prefix = unescape(&word[slash + 1..]);
-        return (
-            word_start,
-            word_start + slash + 1,
-            CompletionContext::File { dir, prefix },
-        );
-    }
-
-    if !is_command_pos {
-        return (
-            word_start,
-            word_start,
-            CompletionContext::File {
-                dir: String::new(),
-                prefix: unescape(word),
-            },
-        );
-    }
-
-    (
-        word_start,
-        word_start,
-        CompletionContext::Command {
-            prefix: unescape(word),
-        },
-    )
-}
-
 /// True if `word` looks like a `NAME=value` assignment prefix.
 fn is_assignment(word: &str) -> bool {
     let Some(eq) = word.find('=') else {
@@ -194,50 +45,6 @@ fn is_assignment(word: &str) -> bool {
             .map(|c| c == '_' || c.is_ascii_alphabetic())
             .unwrap_or(false)
         && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
-}
-
-/// True if `word` is a compound-command keyword after which the next word
-/// is in command position (i.e., the start of a new simple command).
-fn is_compound_keyword(word: &str) -> bool {
-    matches!(
-        word,
-        "then" | "do" | "else" | "elif" | "fi" | "done" | "esac" | "{" | "}"
-    )
-}
-
-/// Byte offset of the last `$` in `word` that is not backslash-escaped.
-fn last_unescaped_dollar(word: &str) -> Option<usize> {
-    let mut result = None;
-    let mut escaped = false;
-    for (i, c) in word.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if c == '\\' {
-            escaped = true;
-        } else if c == '$' {
-            result = Some(i);
-        }
-    }
-    result
-}
-
-/// Resolves backslash escapes: `\x` -> `x`.
-fn unescape(s: &str) -> String {
-    let mut out = String::new();
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some(next) => out.push(next),
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// Shell keywords completed at command position (bash completes these too).
@@ -453,12 +260,9 @@ fn split_word_anchor(word: &str, word_start: usize) -> (String, String, usize) {
     }
 }
 
-/// Map the parser-derived cursor context to a completion source. Replaces the
-/// hand-rolled `analyze_full` context determination. Returns the replacement
-/// anchor and the trailing-space-decorated candidates.
-///
-/// Not yet wired into `dispatch::resolve` — task 3 of #248 does the switch.
-#[allow(dead_code)]
+/// Map the parser-derived cursor context (`parse_recover`) to a completion
+/// source. Returns the replacement anchor and the trailing-space-decorated
+/// candidates. This is the sole context-determination path for tab completion.
 fn cursor_to_completion(
     cursor: &CursorContext,
     line: &str,
@@ -466,23 +270,44 @@ fn cursor_to_completion(
     shell: &mut Shell,
 ) -> (usize, Vec<Candidate>) {
     let has_slash = cursor.word.contains('/');
-    // Variable — inner ${…}/$((…))/$name context always won in the capture.
+    // Variable — inner ${…}/$((…))/$name context always won in the capture. The
+    // name ends at the cursor, but `word_start` points at the `$` for a bare
+    // `$name` (parse_recover reports the DollarName token's offset). Anchor at the
+    // name's start so the completion replaces `name`, keeping the `$`.
     if cursor.position == WordPosition::VariableName {
         let names: Vec<String> = shell.completion_var_names();
+        let anchor = pos.saturating_sub(cursor.word.len());
         return (
-            cursor.word_start,
+            anchor,
             append_trailing_space_non_dir(complete_variable(&cursor.word, &names)),
         );
     }
-    // Command with no `/` — command completion.
-    if cursor.position == WordPosition::Command && !has_slash {
+    // Command-vs-argument for an EMPTY cursor word: parse_recover's `cmd_word`
+    // flag lags at a whitespace-terminated boundary (`ls ` reports Command, but
+    // the cursor is at the first ARGUMENT; `echo hi; ` reports Argument, but the
+    // cursor is at a new COMMAND). For an empty word derive the position from the
+    // current simple command's leading word: a keyword (or none — right after a
+    // separator) means the next word is a command, otherwise it is an argument.
+    let is_command_pos = if cursor.word.is_empty()
+        && matches!(
+            cursor.position,
+            WordPosition::Command | WordPosition::Argument
+        ) {
+        match dispatch::extract_command_name(&line[..pos]) {
+            None => true,
+            Some(cmd) => COMPLETION_KEYWORDS.contains(&cmd.as_str()),
+        }
+    } else {
+        cursor.position == WordPosition::Command && !has_slash
+    };
+    if is_command_pos {
         // Preserve the existing `-E` empty-command-line spec fallback.
         if cursor.word.is_empty()
             && line[..pos].trim().is_empty()
             && let Some(spec) = shell.completion_specs.empty_spec.clone()
         {
             return (
-                cursor.word_start,
+                pos,
                 dispatch::run_spec_with_empty_fallback(&spec, line, pos, "", shell),
             );
         }
@@ -495,10 +320,14 @@ fn cursor_to_completion(
         );
     }
     // Argument — file completion + programmable-spec lookup (matches the old
-    // File-context spec path). Command-with-`/`, RedirectTarget, and AssignRhs
-    // all resolve to file completion below; only Argument consults a spec.
+    // File-context spec path). A registered spec is consulted for a true
+    // `Argument` position AND for an empty word reclassified to argument above
+    // (`ls <TAB>`); Command-with-`/`, RedirectTarget, and AssignRhs resolve to
+    // plain file completion only.
     let (dir, prefix, anchor) = split_word_anchor(&cursor.word, cursor.word_start);
-    if cursor.position == WordPosition::Argument {
+    let consult_spec = cursor.position == WordPosition::Argument
+        || (cursor.word.is_empty() && cursor.position == WordPosition::Command);
+    if consult_spec {
         let cmd_name = dispatch::extract_command_name(&line[..pos]).unwrap_or_default();
         let spec_opt = shell
             .completion_specs
@@ -540,69 +369,8 @@ pub mod dispatch {
         // run_spec_with_empty_fallback. Belt-and-suspenders alongside
         // builtin_compgen's own save/restore.
         shell.current_completion_spec = None;
-        let (word_start, start, context) = analyze_full(line, pos);
-
-        // Path 1: variable context — always wins, no spec lookup.
-        if let CompletionContext::Variable { prefix } = &context {
-            let var_names: Vec<String> = shell.completion_var_names();
-            return (
-                start,
-                append_trailing_space_non_dir(complete_variable(prefix, &var_names)),
-            );
-        }
-
-        // Path 2: command position.
-        if let CompletionContext::Command { prefix } = &context {
-            // -E: empty command line + an -E spec.
-            if prefix.is_empty()
-                && line[..pos].trim().is_empty()
-                && let Some(spec) = shell.completion_specs.empty_spec.clone()
-            {
-                let cands = run_spec_with_empty_fallback(&spec, line, pos, "", shell);
-                return (start, cands);
-            }
-            let path = shell.get("PATH").unwrap_or("").to_string();
-            let funcs: Vec<String> = shell.functions.keys().cloned().collect();
-            let aliases: Vec<String> = shell.aliases.keys().cloned().collect();
-            return (
-                start,
-                append_trailing_space_non_dir(complete_command(prefix, &path, &funcs, &aliases)),
-            );
-        }
-
-        // Path 3: file/argument position.
-        let CompletionContext::File { dir, prefix } = &context else {
-            // analyze() returns one of three; unreachable.
-            return (start, Vec::new());
-        };
-
-        let cmd_name = extract_command_name(&line[..pos]).unwrap_or_default();
-
-        let spec_opt: Option<CompletionSpec> = shell
-            .completion_specs
-            .by_command
-            .get(&cmd_name)
-            .cloned()
-            .or_else(|| shell.completion_specs.default_spec.clone());
-
-        match spec_opt {
-            Some(spec) => {
-                let cands = run_spec_with_empty_fallback(&spec, line, pos, &cmd_name, shell);
-                // Programmable completion replaces the WHOLE cur word with
-                // full-path candidates (bash's model) -> anchor at word_start,
-                // not the basename offset. Fixes `cd projects/projects`.
-                (word_start, cands)
-            }
-            None => {
-                // No spec at all -> existing default file completion
-                // (basenames, anchored after the last '/').
-                let home = shell.get("HOME").unwrap_or("").to_string();
-                (
-                    start,
-                    append_trailing_space_non_dir(complete_file(dir, prefix, &home)),
-                )
-            }
-        }
+        let cursor = huck_syntax::parse_recover(&line[..pos]).cursor;
+        cursor_to_completion(&cursor, line, pos, shell)
     }
 
     /// Runs `run_spec` on the spec, applies `-o filenames` rendering
@@ -760,26 +528,29 @@ pub mod dispatch {
     }
 
     fn bashdefault_strings(line: &str, pos: usize, shell: &Shell) -> Vec<String> {
-        let (_, ctx) = analyze(line, pos);
-        match ctx {
-            CompletionContext::Variable { prefix } => {
-                let names: Vec<String> = shell.completion_var_names();
-                complete_variable(&prefix, &names)
+        let cursor = huck_syntax::parse_recover(&line[..pos]).cursor;
+        use huck_syntax::WordPosition;
+        match cursor.position {
+            WordPosition::VariableName => {
+                let names = shell.completion_var_names();
+                complete_variable(&cursor.word, &names)
                     .into_iter()
                     .map(|c| c.replacement)
                     .collect()
             }
-            CompletionContext::Command { prefix } => {
+            WordPosition::Command if !cursor.word.contains('/') => {
                 let path = shell.get("PATH").unwrap_or("").to_string();
                 let funcs: Vec<String> = shell.functions.keys().cloned().collect();
                 let aliases: Vec<String> = shell.aliases.keys().cloned().collect();
-                complete_command(&prefix, &path, &funcs, &aliases)
+                complete_command(&cursor.word, &path, &funcs, &aliases)
                     .into_iter()
                     .map(|c| c.replacement)
                     .collect()
             }
-            CompletionContext::File { dir, prefix } => {
+            _ => {
+                // Argument / RedirectTarget / AssignRhs / Command-with-`/` → files.
                 let home = shell.get("HOME").unwrap_or("").to_string();
+                let (dir, prefix, _anchor) = split_word_anchor(&cursor.word, cursor.word_start);
                 complete_file(&dir, &prefix, &home)
                     .into_iter()
                     .map(|c| format!("{dir}{}", c.replacement))
@@ -933,275 +704,6 @@ mod tests {
     use crate::shell_state::Shell;
     use crate::test_support::CWD_LOCK;
     use std::rc::Rc;
-
-    #[test]
-    fn analyze_empty_line_is_command() {
-        let (start, ctx) = analyze("", 0);
-        assert_eq!(start, 0);
-        assert_eq!(
-            ctx,
-            CompletionContext::Command {
-                prefix: String::new()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_first_word_is_command() {
-        let (start, ctx) = analyze("ec", 2);
-        assert_eq!(start, 0);
-        assert_eq!(
-            ctx,
-            CompletionContext::Command {
-                prefix: "ec".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_after_command_is_file() {
-        let (start, ctx) = analyze("echo fo", 7);
-        assert_eq!(start, 5);
-        assert_eq!(
-            ctx,
-            CompletionContext::File {
-                dir: String::new(),
-                prefix: "fo".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_after_semicolon_is_command() {
-        let (start, ctx) = analyze("echo hi; ec", 11);
-        assert_eq!(start, 9);
-        assert_eq!(
-            ctx,
-            CompletionContext::Command {
-                prefix: "ec".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_after_pipe_is_command() {
-        let (_, ctx) = analyze("ls | gr", 7);
-        assert_eq!(
-            ctx,
-            CompletionContext::Command {
-                prefix: "gr".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_after_assignment_word_is_command() {
-        let (start, ctx) = analyze("FOO=bar ec", 10);
-        assert_eq!(start, 8);
-        assert_eq!(
-            ctx,
-            CompletionContext::Command {
-                prefix: "ec".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_after_then_keyword_is_command() {
-        let (start, ctx) = analyze("if true; then ec", 16);
-        assert_eq!(start, 14);
-        assert_eq!(
-            ctx,
-            CompletionContext::Command {
-                prefix: "ec".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_after_do_keyword_is_command() {
-        let (_, ctx) = analyze("for x in 1; do ec", 17);
-        assert_eq!(
-            ctx,
-            CompletionContext::Command {
-                prefix: "ec".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_after_else_keyword_is_command() {
-        let (_, ctx) = analyze("if x; then y; else ec", 21);
-        assert_eq!(
-            ctx,
-            CompletionContext::Command {
-                prefix: "ec".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_after_elif_keyword_is_command() {
-        let (_, ctx) = analyze("if x; then y; elif ec", 21);
-        assert_eq!(
-            ctx,
-            CompletionContext::Command {
-                prefix: "ec".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_after_open_brace_keyword_is_command() {
-        let (_, ctx) = analyze("{ ec", 4);
-        assert_eq!(
-            ctx,
-            CompletionContext::Command {
-                prefix: "ec".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_after_fi_keyword_is_command() {
-        // After `fi`, a separator is conventionally required, but treating the
-        // next word as a command position is the more useful completion default
-        // — it lets the user tab-complete `if x; then y; fi <TAB>` to a command.
-        let (_, ctx) = analyze("if x; then y; fi ec", 19);
-        assert_eq!(
-            ctx,
-            CompletionContext::Command {
-                prefix: "ec".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_variable_dollar() {
-        let (start, ctx) = analyze("echo $HO", 8);
-        assert_eq!(start, 6);
-        assert_eq!(
-            ctx,
-            CompletionContext::Variable {
-                prefix: "HO".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_variable_braced() {
-        let (start, ctx) = analyze("echo ${HO", 9);
-        assert_eq!(start, 7);
-        assert_eq!(
-            ctx,
-            CompletionContext::Variable {
-                prefix: "HO".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_variable_mid_word() {
-        let (start, ctx) = analyze("echo foo$BA", 11);
-        assert_eq!(start, 9);
-        assert_eq!(
-            ctx,
-            CompletionContext::Variable {
-                prefix: "BA".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_variable_empty_prefix() {
-        let (start, ctx) = analyze("echo $", 6);
-        assert_eq!(start, 6);
-        assert_eq!(
-            ctx,
-            CompletionContext::Variable {
-                prefix: String::new()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_path_splits_at_slash() {
-        let (start, ctx) = analyze("cat src/le", 10);
-        assert_eq!(start, 8);
-        assert_eq!(
-            ctx,
-            CompletionContext::File {
-                dir: "src/".to_string(),
-                prefix: "le".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_command_with_slash_is_file() {
-        let (start, ctx) = analyze("./scr", 5);
-        assert_eq!(start, 2);
-        assert_eq!(
-            ctx,
-            CompletionContext::File {
-                dir: "./".to_string(),
-                prefix: "scr".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_escaped_space_stays_in_word() {
-        let (start, ctx) = analyze("cat my\\ fi", 10);
-        assert_eq!(start, 4);
-        assert_eq!(
-            ctx,
-            CompletionContext::File {
-                dir: String::new(),
-                prefix: "my fi".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_ignores_text_after_cursor() {
-        let (_, ctx) = analyze("echo fo bar", 7);
-        assert_eq!(
-            ctx,
-            CompletionContext::File {
-                dir: String::new(),
-                prefix: "fo".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_escaped_dollar_is_not_variable() {
-        let (_, ctx) = analyze("echo \\$HOM", 10);
-        assert!(matches!(ctx, CompletionContext::File { .. }));
-    }
-
-    #[test]
-    fn analyze_full_reports_word_start_for_slash_word() {
-        // `cd projects/sub`: whole word starts at 3; basename anchor after the slash.
-        let (word_start, start, ctx) = analyze_full("cd projects/sub", 15);
-        assert_eq!(word_start, 3);
-        assert_eq!(start, 12); // just past "projects/"
-        assert_eq!(
-            ctx,
-            CompletionContext::File {
-                dir: "projects/".to_string(),
-                prefix: "sub".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn analyze_full_word_start_equals_start_without_slash() {
-        let (word_start, start, _) = analyze_full("cd pr", 5);
-        assert_eq!(word_start, 3);
-        assert_eq!(start, 3);
-    }
 
     #[test]
     fn spec_completion_anchors_at_word_start() {
@@ -1683,20 +1185,6 @@ mod tests {
     }
 
     #[test]
-    fn analyze_redirect_target_is_file_not_command() {
-        // `echo > lo` — the word after `>` is a redirect target (a file),
-        // not a command.
-        let (_, ctx) = analyze("echo > lo", 9);
-        assert_eq!(
-            ctx,
-            CompletionContext::File {
-                dir: String::new(),
-                prefix: "lo".to_string()
-            }
-        );
-    }
-
-    #[test]
     fn dispatch_variable_context_bypasses_spec() {
         use std::cell::RefCell;
         let shell = Rc::new(RefCell::new(Shell::new()));
@@ -2059,6 +1547,44 @@ mod tests {
         assert_eq!(f.replacement, "solofile.txt ", "regular file gets a space");
         let d = dir_cands.iter().find(|c| c.display == "solodir/").unwrap();
         assert_eq!(d.replacement, "solodir/", "directory keeps `/`, no space");
+    }
+
+    #[test]
+    fn dispatch_fixes_the_four_divergences() {
+        let mut sh = Shell::new();
+        sh.set("HOMESENTINEL", "x".to_string());
+        // if COND → command position.
+        let (_s, c) = dispatch::resolve("if whi", 6, &mut sh);
+        assert!(c.iter().any(|x| x.display == "while"), "if whi → commands");
+        // command sub inside double quotes → command position.
+        let (_s, c) = dispatch::resolve("echo \"$(whi", 10, &mut sh);
+        assert!(
+            c.iter().any(|x| x.display == "while"),
+            "quoted $( → commands"
+        );
+        // arithmetic → variable position.
+        let (_s, c) = dispatch::resolve("echo $(( HOMESENT", 17, &mut sh);
+        assert!(
+            c.iter().any(|x| x.display == "HOMESENTINEL"),
+            "arith → variables"
+        );
+    }
+
+    #[test]
+    fn dispatch_does_not_regress_redirect_or_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("uniqf.txt"), b"x").unwrap();
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let mut sh = Shell::new();
+        for (line, pos) in [("echo > uniqf", 12), ("cat ./uniqf", 11), ("cat uniqf", 9)] {
+            let (_s, c) = dispatch::resolve(line, pos, &mut sh);
+            assert!(c.iter().any(|x| x.display.starts_with("uniqf")), "{line:?}");
+        }
+        std::env::set_current_dir(prev).unwrap();
     }
 
     fn map(line: &str) -> Vec<Candidate> {
