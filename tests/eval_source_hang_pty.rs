@@ -12,7 +12,9 @@ use expectrl::session::OsSession;
 
 #[test]
 fn interactive_eval_capture_does_not_hang() {
-    let cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    // Hermetic: never source the developer's ~/.huckrc (#239).
+    cmd.arg("--norc");
     let mut session = match OsSession::spawn(cmd) {
         Ok(s) => s,
         Err(e) => {
@@ -43,7 +45,9 @@ fn interactive_eval_capture_does_not_hang() {
 
 #[test]
 fn interactive_eval_pipe_capture_does_not_hang() {
-    let cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    // Hermetic: never source the developer's ~/.huckrc (#239).
+    cmd.arg("--norc");
     let mut session = match OsSession::spawn(cmd) {
         Ok(s) => s,
         Err(e) => {

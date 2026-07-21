@@ -31,6 +31,10 @@ const CTRL_D: &str = "\x04";
 /// Returns `None` (after logging) if PTY allocation fails.
 fn try_spawn(cwd: &Path, env: &[(&str, &str)]) -> Option<OsSession> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    // Hermetic: never source the developer's ~/.huckrc (#239). `--norc` takes
+    // precedence over --rcfile/$HUCK_RC, so a future rc-file test must spawn
+    // huck directly rather than through this helper.
+    cmd.arg("--norc");
     cmd.current_dir(cwd);
     for (k, v) in env {
         cmd.env(k, v);

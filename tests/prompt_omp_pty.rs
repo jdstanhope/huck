@@ -69,7 +69,9 @@ fn oh_my_posh_prompt_renders_not_literal() {
     let init_path = init_file.path().to_string_lossy().into_owned();
 
     // 3. Spawn interactive huck in a PTY. Skip if no PTY.
-    let cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    // Hermetic: never source the developer's ~/.huckrc (#239).
+    cmd.arg("--norc");
     let mut session = match OsSession::spawn(cmd) {
         Ok(s) => s,
         Err(e) => {

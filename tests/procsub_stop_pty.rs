@@ -32,7 +32,9 @@ use expectrl::Expect;
 use expectrl::session::OsSession;
 
 fn spawn() -> Option<OsSession> {
-    let cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    // Hermetic: never source the developer's ~/.huckrc (#239).
+    cmd.arg("--norc");
     match OsSession::spawn(cmd) {
         Ok(mut s) => {
             s.set_expect_timeout(Some(Duration::from_secs(8)));
