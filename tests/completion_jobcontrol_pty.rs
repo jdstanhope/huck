@@ -29,7 +29,9 @@ fn external_pipeline_completer_does_not_hang() {
         return;
     }
 
-    let cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    // Hermetic: never source the developer's ~/.huckrc (#239).
+    cmd.arg("--norc");
     let mut session = match OsSession::spawn(cmd) {
         Ok(s) => s,
         Err(e) => {

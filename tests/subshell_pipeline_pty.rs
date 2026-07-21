@@ -37,7 +37,9 @@ impl PtyRun {
 /// missing marker rather than blocking the suite. The session is dropped at the
 /// end, closing the master fd and killing any wedged child.
 fn run_in_pty(steps: &[(&str, &str)], timeout: Duration) -> PtyRun {
-    let cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    // Hermetic: never source the developer's ~/.huckrc (#239).
+    cmd.arg("--norc");
     let mut session = match OsSession::spawn(cmd) {
         Ok(s) => s,
         Err(e) => {

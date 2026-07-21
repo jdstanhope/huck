@@ -9,7 +9,10 @@ use std::process::Command;
 use std::time::Duration;
 
 fn run_in_pty(cmd: &str) -> Option<String> {
-    let mut session = match OsSession::spawn(Command::new(env!("CARGO_BIN_EXE_huck"))) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_huck"));
+    // Hermetic: never source the developer's ~/.huckrc (#239).
+    child.arg("--norc");
+    let mut session = match OsSession::spawn(child) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("subshell_job_notice_pty: skipping — no PTY: {e}");

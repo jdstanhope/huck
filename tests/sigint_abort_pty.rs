@@ -33,7 +33,9 @@ use expectrl::session::OsSession;
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn ctrl_c_aborts_foreground_external_and_shell_survives() {
-    let cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    // Hermetic: never source the developer's ~/.huckrc (#239).
+    cmd.arg("--norc");
     let mut session = match OsSession::spawn(cmd) {
         Ok(s) => s,
         Err(e) => {
@@ -70,7 +72,9 @@ fn ctrl_c_aborts_foreground_external_and_shell_survives() {
 
 #[test]
 fn ctrl_c_aborts_shell_function_loop_and_shell_survives() {
-    let cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
+    // Hermetic: never source the developer's ~/.huckrc (#239).
+    cmd.arg("--norc");
     let mut session = match OsSession::spawn(cmd) {
         Ok(s) => s,
         Err(e) => {
