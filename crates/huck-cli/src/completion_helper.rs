@@ -78,8 +78,10 @@ mod tests {
             rustyline::completion::Completer::complete(&helper, "echo $MY_V", 10, &ctx).unwrap();
         assert_eq!(start, 6);
         let replacements: Vec<&str> = pairs.iter().map(|p| p.replacement.as_str()).collect();
+        // The replacement carries bash's post-completion trailing space (#42);
+        // the point of this test is that the live var is visible to the helper.
         assert!(
-            pairs.iter().any(|p| p.replacement == "MY_VAR"),
+            pairs.iter().any(|p| p.replacement == "MY_VAR "),
             "live var not visible to helper: {replacements:?}"
         );
     }
