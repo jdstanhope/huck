@@ -2771,6 +2771,17 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
             if matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
                 iter.next_kind()?;
             }
+            // Recovery cursor context (iteration 2): the word assembled here is a
+            // bare redirect operand. A redirect target is never command-position,
+            // so clear the command-word flag (an operator-glued redirect like
+            // `echo >whi` leaves it `true` from the preceding command word); the
+            // `RedirectTarget` position then replaces the `Argument` fallback. If
+            // the cursor (EOF) falls inside an inner expansion (`> $HOM`, `> $(whi`)
+            // that inner-mode position wins instead. Reset once the redirect is
+            // built so a following argument word is not misread. No-op off the
+            // recovery path.
+            iter.set_recovery_cmd_word(false);
+            iter.set_recovery_redirect_target(true);
             let target = match iter.peek_kind()? {
                 Some(TokenKind::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
                 Some(TokenKind::Newline) => {
@@ -2805,6 +2816,7 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
                 },
                 Some(_) => parse_word_command(iter, false)?,
             };
+            iter.set_recovery_redirect_target(false);
             Ok(crate::command::build_redirections(op, target, fd_prefix))
         }
         _ => {

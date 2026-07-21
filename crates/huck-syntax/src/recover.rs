@@ -30,18 +30,15 @@ pub enum Frame {
 }
 
 /// What the word at the cursor is.
-///
-/// Iteration-1 limitation: `RedirectTarget` is defined but NEVER produced yet —
-/// a redirect target (`echo > whi`) currently reports `Command`. The Task-4 brief
-/// scoped positions to Command/Argument/VariableName/AssignRhs; distinguishing a
-/// redirect target is deferred to iteration 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WordPosition {
     Command,
     Argument,
     VariableName,
-    /// NOT yet produced — see the enum note. Reserved for iteration 2.
+    /// A bare redirect operand (`cat foo > whi`) — the LOWEST-priority position,
+    /// reported in place of `Argument` (iteration 2). An inner expansion mode at
+    /// the cursor (`> $HOM`, `> ${HOM`, `> $(whi`, `> $(( HO`) wins instead.
     RedirectTarget,
     AssignRhs,
     Unknown,
@@ -93,7 +90,12 @@ fn mode_to_frame(mode: &Mode) -> Option<Frame> {
 /// Priority: a `${…}`/`$((…))` name context and a `$name` word both mean
 /// `VariableName`; an array literal RHS (`x=(…`) is `AssignRhs`; otherwise the
 /// parser's command-vs-argument flag decides.
-fn position_from(modes: &[Mode], last_is_dollar_name: bool, cmd_word: bool) -> WordPosition {
+fn position_from(
+    modes: &[Mode],
+    last_is_dollar_name: bool,
+    cmd_word: bool,
+    redirect_target: bool,
+) -> WordPosition {
     // The innermost non-`Command` mode drives the mode-based positions.
     let innermost = modes.iter().rev().find(|m| !matches!(m, Mode::Command));
     match innermost {
@@ -117,6 +119,11 @@ fn position_from(modes: &[Mode], last_is_dollar_name: bool, cmd_word: bool) -> W
                 WordPosition::VariableName
             } else if cmd_word {
                 WordPosition::Command
+            } else if redirect_target {
+                // A bare redirect operand with no inner expansion mode
+                // (`cat foo > whi`). LOWEST priority — in place of `Argument`,
+                // per bash 5.2.21. An inner `$name`/`${`/`$(`/`$((` above wins.
+                WordPosition::RedirectTarget
             } else {
                 WordPosition::Argument
             }
@@ -197,7 +204,12 @@ pub fn parse_recover(src: &str) -> RecoveredParse {
             let enclosing = merge_enclosing(&cap.modes, lx.recovery_frames());
             CursorContext {
                 enclosing,
-                position: position_from(&cap.modes, cap.last_is_dollar_name, cap.cmd_word),
+                position: position_from(
+                    &cap.modes,
+                    cap.last_is_dollar_name,
+                    cap.cmd_word,
+                    cap.redirect_target,
+                ),
                 word: cap.word.clone(),
                 word_start: cap.word_start,
             }
@@ -364,6 +376,44 @@ mod tests {
         assert_eq!(ctx("echo ${whi").position, WordPosition::VariableName);
         assert_eq!(ctx("echo $whi").position, WordPosition::VariableName);
         assert_eq!(ctx("echo $(( whi").position, WordPosition::VariableName);
+    }
+
+    #[test]
+    fn cursor_bare_redirect_target_is_redirect_target() {
+        for src in [
+            "cat foo > whi",
+            "echo >whi",
+            "cat < whi",
+            "echo 2> whi",
+            "echo >> whi",
+        ] {
+            assert_eq!(
+                parse_recover(src).cursor.position,
+                WordPosition::RedirectTarget,
+                "{src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_redirect_target_with_inner_expansion_keeps_inner_position() {
+        // The inner expansion wins — a redirect target is a WORD.
+        assert_eq!(
+            parse_recover("cat foo > $HOM").cursor.position,
+            WordPosition::VariableName
+        );
+        assert_eq!(
+            parse_recover("cat foo > ${HOM").cursor.position,
+            WordPosition::VariableName
+        );
+        assert_eq!(
+            parse_recover("cat foo > $(whi").cursor.position,
+            WordPosition::Command
+        );
+        assert_eq!(
+            parse_recover("cat foo > $(( HO").cursor.position,
+            WordPosition::VariableName
+        );
     }
 
     #[test]

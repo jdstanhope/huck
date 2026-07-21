@@ -1175,6 +1175,7 @@ pub(crate) struct Mark {
     /// rewind precedes genuine EOF, so any pending EOF snapshot is invalid.)
     recovery_frames: Vec<(usize, crate::recover::Frame)>,
     recovery_cmd_word: bool,
+    recovery_redirect_target: bool,
 }
 
 /// Snapshot of lexer state at the FIRST real EOF reached under
@@ -1199,6 +1200,11 @@ pub(crate) struct RecoveryCapture {
     /// The parser's command-vs-argument flag for the word being assembled at
     /// EOF (`true` == command position). Set via `set_recovery_cmd_word`.
     pub(crate) cmd_word: bool,
+    /// The parser is assembling a bare redirect operand (`> whi`) at EOF. Set
+    /// via `set_recovery_redirect_target`. Drives the LOWEST-priority
+    /// `RedirectTarget` position — in place of `Argument` — when no inner
+    /// expansion mode and no `$name`/command word takes precedence.
+    pub(crate) redirect_target: bool,
 }
 
 /// v250: lexer-internal state while emitting a heredoc body as atoms (atom path).
@@ -1354,6 +1360,12 @@ pub struct Lexer<'a> {
     /// Defaults `true` (a bare/empty line is command position). Only read when a
     /// recovery capture is taken.
     recovery_cmd_word: bool,
+    /// Recovery: the parser sets this to `true` while assembling a bare redirect
+    /// operand (`parse_one_redirect`'s target word) and back to `false` once the
+    /// redirect is built, so the EOF capture records whether the cursor word is a
+    /// redirect target. Defaults `false`. Only read when a recovery capture is
+    /// taken.
+    recovery_redirect_target: bool,
     /// Recovery: compound-command frames the parser pushes when a Task-3
     /// synthesis fires at EOF (`IfCondition`/`WhileCondition`/`ForList`/
     /// `CaseSubject`/`BraceGroup`) — these are NOT lexer modes. Each is recorded
@@ -1400,6 +1412,7 @@ impl<'a> Lexer<'a> {
             recover_last_depth: None,
             recovery_capture: None,
             recovery_cmd_word: true,
+            recovery_redirect_target: false,
             recovery_frames: Vec::new(),
         }
     }
@@ -1565,6 +1578,15 @@ impl<'a> Lexer<'a> {
         self.recovery_cmd_word = is_cmd;
     }
 
+    /// Recovery (iteration 2): the parser declares whether the word it is about
+    /// to assemble is a bare redirect operand (`true`, `parse_one_redirect`'s
+    /// target) — reset to `false` once the redirect is built. The EOF capture
+    /// records the last value set. No-op off the recovery path (read only when a
+    /// recovery capture is taken).
+    pub(crate) fn set_recovery_redirect_target(&mut self, is_target: bool) {
+        self.recovery_redirect_target = is_target;
+    }
+
     /// Recovery (Task 4): the parser pushes a compound-command frame when a
     /// Task-3 synthesis fires at EOF (these are not lexer modes). The frame is
     /// tagged with the live mode-stack depth — the depth at which the compound is
@@ -1682,6 +1704,7 @@ impl<'a> Lexer<'a> {
             word_start,
             last_is_dollar_name,
             cmd_word: self.recovery_cmd_word,
+            redirect_target: self.recovery_redirect_target,
         }
     }
 
@@ -1816,6 +1839,7 @@ impl<'a> Lexer<'a> {
             heredoc_gen: self.heredoc_gen,
             recovery_frames: self.recovery_frames.clone(),
             recovery_cmd_word: self.recovery_cmd_word,
+            recovery_redirect_target: self.recovery_redirect_target,
         }
     }
 
@@ -1860,6 +1884,7 @@ impl<'a> Lexer<'a> {
         // leave it stale after the rewind.
         self.recovery_frames = m.recovery_frames.clone();
         self.recovery_cmd_word = m.recovery_cmd_word;
+        self.recovery_redirect_target = m.recovery_redirect_target;
         debug_assert_eq!(
             self.heredoc_gen, m.heredoc_gen,
             "mark/rewind must not span heredoc-body emission (v250)"
