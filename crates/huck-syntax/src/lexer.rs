@@ -1170,6 +1170,30 @@ pub(crate) struct Mark {
     heredoc_gen: u64,
 }
 
+/// Snapshot of lexer state at the FIRST real EOF reached under
+/// `opts.recover_at_eof`, taken in `scan_step` BEFORE the parser consumes any
+/// synthetic closer and pops its frame. `parse_recover` reads it after the
+/// parse to assemble `CursorContext` — even when the tree recovers to `None`.
+/// Reset on `rewind` so the last pre-EOF state (after any speculative rewind)
+/// wins. Never populated on the strict path (`recover_at_eof == false`).
+#[derive(Debug, Clone)]
+pub(crate) struct RecoveryCapture {
+    /// The open mode stack at EOF, innermost LAST (`Command` floor included).
+    pub(crate) modes: Vec<Mode>,
+    /// Text of the trailing real word-atom run at EOF (empty at a fresh
+    /// boundary — i.e. the last real atom was a separator/opener).
+    pub(crate) word: String,
+    /// Byte offset the trailing word run started at (`src.len()` at a fresh
+    /// boundary).
+    pub(crate) word_start: usize,
+    /// The rightmost real word atom was a `$name` (`DollarName`) → the cursor
+    /// sits in a variable name.
+    pub(crate) last_is_dollar_name: bool,
+    /// The parser's command-vs-argument flag for the word being assembled at
+    /// EOF (`true` == command position). Set via `set_recovery_cmd_word`.
+    pub(crate) cmd_word: bool,
+}
+
 /// v250: lexer-internal state while emitting a heredoc body as atoms (atom path).
 /// `began` tracks whether `HeredocBodyBegin` was already emitted for the FRONT
 /// entry of `atom_pending_heredocs`. Self-started at the newline; cleared when
@@ -1312,6 +1336,22 @@ pub struct Lexer<'a> {
     /// frame, so equality means "already closed this frame; nothing more". Reset
     /// on `rewind`. Transient (not captured in `Mark`, like `stall_steps`).
     recover_last_depth: Option<usize>,
+    /// Recovery (only meaningful under `opts.recover_at_eof`): state captured at
+    /// the first real EOF, read by `parse_recover`. See `RecoveryCapture`. Reset
+    /// on `rewind`. Inert on the strict path (the capture site is guarded by
+    /// `opts.recover_at_eof`, so this stays `None`).
+    recovery_capture: Option<RecoveryCapture>,
+    /// Recovery: the parser sets this to `true` before assembling a command-word
+    /// (`consume_command_word`) and `false` before an argument/list word, so the
+    /// EOF capture records whether the cursor word is command- or arg-position.
+    /// Defaults `true` (a bare/empty line is command position). Only read when a
+    /// recovery capture is taken.
+    recovery_cmd_word: bool,
+    /// Recovery: compound-command frames the parser pushes when a Task-3
+    /// synthesis fires at EOF (`IfCondition`/`WhileCondition`/`ForList`/
+    /// `CaseSubject`/`BraceGroup`) — these are NOT lexer modes. `parse_recover`
+    /// appends them after the mode-derived frames.
+    recovery_frames: Vec<crate::recover::Frame>,
 }
 
 impl<'a> Lexer<'a> {
@@ -1348,6 +1388,9 @@ impl<'a> Lexer<'a> {
             heredoc_gen: 0,
             backtick_raw_started: false,
             recover_last_depth: None,
+            recovery_capture: None,
+            recovery_cmd_word: true,
+            recovery_frames: Vec::new(),
         }
     }
 
@@ -1503,6 +1546,82 @@ impl<'a> Lexer<'a> {
     /// compound-command bodies at genuine end-of-input instead of erroring).
     pub(crate) fn recover_at_eof(&self) -> bool {
         self.opts.recover_at_eof
+    }
+
+    /// Recovery (Task 4): the parser declares whether the word it is about to
+    /// assemble is command-position (`true`, `consume_command_word`) or an
+    /// argument/list word (`false`). The EOF capture records the last value set.
+    pub(crate) fn set_recovery_cmd_word(&mut self, is_cmd: bool) {
+        self.recovery_cmd_word = is_cmd;
+    }
+
+    /// Recovery (Task 4): the parser pushes a compound-command frame when a
+    /// Task-3 synthesis fires at EOF (these are not lexer modes).
+    pub(crate) fn push_recovery_frame(&mut self, frame: crate::recover::Frame) {
+        self.recovery_frames.push(frame);
+    }
+
+    /// Recovery (Task 4): the compound frames the parser recorded, in push order.
+    pub(crate) fn recovery_frames(&self) -> &[crate::recover::Frame] {
+        &self.recovery_frames
+    }
+
+    /// Recovery (Task 4): the cursor-context snapshot captured at the first real
+    /// EOF (before frames were popped), or `None` if EOF was never reached under
+    /// recovery. Read by `parse_recover`.
+    pub(crate) fn recovery_capture(&self) -> Option<&RecoveryCapture> {
+        self.recovery_capture.as_ref()
+    }
+
+    /// Build the cursor-context snapshot from live lexer state. Walks the token
+    /// history backward over the trailing run of real word-content atoms to find
+    /// the cursor word + its start offset (empty / `src.len()` at a fresh
+    /// boundary). Called once, at the first real EOF, before any frame is popped.
+    fn build_recovery_capture(&self) -> RecoveryCapture {
+        let end = self.cursor.offset();
+        // Collect the trailing contiguous word-content atoms (reverse order).
+        let mut pieces: Vec<(usize, String)> = Vec::new();
+        let mut last_is_dollar_name = false;
+        for tok in self.history.iter().rev() {
+            let piece = match &tok.kind {
+                TokenKind::Lit { text, .. } | TokenKind::QuoteRun { text, .. } => {
+                    Some((text.clone(), false))
+                }
+                TokenKind::DollarLit { .. } => Some(("$".to_string(), false)),
+                TokenKind::ParamName(s) | TokenKind::ParamNameDecoded(s) => {
+                    Some((s.clone(), false))
+                }
+                TokenKind::BacktickRawText(s) => Some((s.clone(), false)),
+                TokenKind::DollarName { name, .. } => Some((name.clone(), true)),
+                // Any non-word atom (separator/opener/closer/structural) ends the
+                // trailing word run.
+                _ => None,
+            };
+            match piece {
+                Some((text, is_dollar)) => {
+                    if pieces.is_empty() {
+                        // First atom seen scanning backward == the rightmost atom.
+                        last_is_dollar_name = is_dollar;
+                    }
+                    pieces.push((tok.span.offset, text));
+                }
+                None => break,
+            }
+        }
+        let (word, word_start) = if pieces.is_empty() {
+            (String::new(), end)
+        } else {
+            let start = pieces.last().expect("non-empty").0;
+            let text: String = pieces.iter().rev().map(|(_, t)| t.as_str()).collect();
+            (text, start)
+        };
+        RecoveryCapture {
+            modes: self.modes.clone(),
+            word,
+            word_start,
+            last_is_dollar_name,
+            cmd_word: self.recovery_cmd_word,
+        }
     }
 
     /// v264: record the `${`'s `$` byte offset in the current ParamExpansion frame,
@@ -1668,8 +1787,11 @@ impl<'a> Lexer<'a> {
         self.assign_val_tilde_ok = m.assign_val_tilde_ok;
         self.pending_lvalue_subscript = m.pending_lvalue_subscript;
         // Transient recovery bookkeeping — a rewind (only ever taken mid-input,
-        // before genuine EOF) invalidates any pending EOF-closer state.
+        // before genuine EOF) invalidates any pending EOF-closer state and any
+        // cursor-context snapshot; the post-rewind re-lex re-captures at EOF, so
+        // the LAST (settled) state wins.
         self.recover_last_depth = None;
+        self.recovery_capture = None;
         debug_assert_eq!(
             self.heredoc_gen, m.heredoc_gen,
             "mark/rewind must not span heredoc-body emission (v250)"
@@ -1758,6 +1880,13 @@ impl<'a> Lexer<'a> {
         // blocks a duplicate closer for the same still-unpopped frame when
         // `fill_to` scans ahead (`peek2`) before the parser consumes the first.
         if self.opts.recover_at_eof && self.cursor.peek().is_none() {
+            // Cursor context (Task 4): the FIRST time real EOF is reached, snapshot
+            // the mode stack + last word BEFORE the parser consumes any synthetic
+            // closer and pops its frame. Fires for depth == 1 too (a top-level
+            // `echo whi` has no open frame but still a well-defined cursor word).
+            if self.recovery_capture.is_none() {
+                self.recovery_capture = Some(self.build_recovery_capture());
+            }
             let depth = self.modes.len();
             if depth > 1 {
                 if self.recover_last_depth == Some(depth) {

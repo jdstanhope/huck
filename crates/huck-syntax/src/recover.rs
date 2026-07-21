@@ -7,6 +7,7 @@
 //! `parse()` path is unaffected.
 
 use crate::command::Sequence;
+use crate::lexer::Mode;
 
 /// An enclosing construct at the cursor. Innermost is LAST in
 /// `CursorContext::enclosing`.
@@ -58,29 +59,102 @@ pub struct RecoveredParse {
     pub cursor: CursorContext,
 }
 
+/// Map a lexer `Mode` to the enclosing `Frame` it represents at the cursor, or
+/// `None` for modes with no cursor-context meaning (the `Command` floor, and the
+/// internal `Regex`/`Extglob` scanners). The `${…}` operand sub-modes all fold
+/// back to `ParamExpansion` — from the cursor's view they are all "inside `${`".
+fn mode_to_frame(mode: &Mode) -> Option<Frame> {
+    match mode {
+        // `$( … )` / `<( … )` / `>( … )` bodies (the parser also opens this mode
+        // for a bare `( … )` process-sub body); from the cursor's view all are a
+        // command substitution / paren-command.
+        Mode::CommandSub { .. } => Some(Frame::CommandSub),
+        Mode::BacktickRaw => Some(Frame::Backtick),
+        Mode::ParamExpansion { .. }
+        | Mode::ParamWordOperand { .. }
+        | Mode::ParamSubstPatternOperand { .. }
+        | Mode::ParamSubstringOffsetOperand { .. }
+        | Mode::ParamSubscriptOperand { .. } => Some(Frame::ParamExpansion),
+        Mode::Arith { .. } => Some(Frame::Arith),
+        Mode::DoubleQuote { .. } => Some(Frame::DoubleQuote),
+        Mode::ArrayLiteral { .. } => Some(Frame::ArrayLiteral),
+        // Not cursor-context frames.
+        Mode::Command | Mode::Regex { .. } | Mode::Extglob { .. } => None,
+    }
+}
+
+/// Compute the `WordPosition` of the cursor word from the captured lexer state.
+/// Priority: a `${…}`/`$((…))` name context and a `$name` word both mean
+/// `VariableName`; an array literal RHS (`x=(…`) is `AssignRhs`; otherwise the
+/// parser's command-vs-argument flag decides.
+fn position_from(modes: &[Mode], last_is_dollar_name: bool, cmd_word: bool) -> WordPosition {
+    // The innermost non-`Command` mode drives the mode-based positions.
+    let innermost = modes.iter().rev().find(|m| !matches!(m, Mode::Command));
+    match innermost {
+        // Inside `${` (scanning the name) or `$((`/`$[` (an arith operand) — the
+        // cursor sits in a variable name.
+        Some(Mode::ParamExpansion { .. }) | Some(Mode::Arith { .. }) => WordPosition::VariableName,
+        // `x=(whi` — an array literal element, an assignment RHS (NOT a command).
+        Some(Mode::ArrayLiteral { .. }) => WordPosition::AssignRhs,
+        // A backtick body is raw-captured by the outer lexer (a separate nested
+        // lexer re-parses it), so the outer `cmd_word` flag reflects the ENCLOSING
+        // word, not the backtick's content. The cursor sits at the start of the
+        // backtick's command — command position (cf. commit ba38434).
+        Some(Mode::BacktickRaw) => WordPosition::Command,
+        _ => {
+            if last_is_dollar_name {
+                // A bare `$name` at the cursor (e.g. `echo $whi`).
+                WordPosition::VariableName
+            } else if cmd_word {
+                WordPosition::Command
+            } else {
+                WordPosition::Argument
+            }
+        }
+    }
+}
+
 /// Parse `src` (a line truncated at the cursor) with EOF-recovery.
 pub fn parse_recover(src: &str) -> RecoveredParse {
     // Drive a recovery lexer (`recover_at_eof`): at genuine EOF with open lexer
     // modes it emits each frame's synthetic close atom (innermost-out), so the
     // parser recovers the nesting constructs instead of erroring on the
     // unterminated tail. The strict `parse()` path is unaffected (the option
-    // defaults `false`). Cursor context is still the Task-1 best-effort stub;
-    // Tasks 3-4 populate it.
+    // defaults `false`).
     let opts = crate::lexer::LexerOptions {
         recover_at_eof: true,
         ..Default::default()
     };
     let mut lx = crate::lexer::Lexer::new(src, &Default::default(), opts);
     let tree = crate::parser::parse_sequence(&mut lx).ok().flatten();
-    RecoveredParse {
-        tree,
-        cursor: CursorContext {
+
+    // Assemble the cursor context from state captured at the synthesis boundary
+    // (real EOF) — NOT by walking `tree`, which may be `None` even though the
+    // cursor context is well-defined (e.g. `case $x in a`). The lexer snapshot is
+    // taken before frames are popped; the parser's compound frames are appended
+    // after the mode-derived ones.
+    let cursor = match lx.recovery_capture() {
+        Some(cap) => {
+            let mut enclosing: Vec<Frame> = cap.modes.iter().filter_map(mode_to_frame).collect();
+            enclosing.extend(lx.recovery_frames().iter().cloned());
+            CursorContext {
+                enclosing,
+                position: position_from(&cap.modes, cap.last_is_dollar_name, cap.cmd_word),
+                word: cap.word.clone(),
+                word_start: cap.word_start,
+            }
+        }
+        // EOF was never reached under recovery (defensive — the parser peeks at
+        // EOF on essentially every input). Fall back to a fresh command boundary.
+        None => CursorContext {
             enclosing: Vec::new(),
             position: WordPosition::Command,
             word: String::new(),
             word_start: src.len(),
         },
-    }
+    };
+
+    RecoveredParse { tree, cursor }
 }
 
 #[cfg(test)]
@@ -199,6 +273,63 @@ mod tests {
     fn recover_subshell_yields_tree() {
         let r = parse_recover("( whi");
         assert!(r.tree.is_some());
+    }
+
+    fn ctx(src: &str) -> CursorContext {
+        parse_recover(src).cursor
+    }
+
+    #[test]
+    fn cursor_command_position_cases() {
+        for src in [
+            "whi",
+            "if whi",
+            "while whi",
+            "echo $(whi",
+            "echo `whi",
+            "(whi",
+            "echo <(whi",
+        ] {
+            assert_eq!(ctx(src).position, WordPosition::Command, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn cursor_argument_position_cases() {
+        for src in ["echo whi", "for x in whi", "ls -l whi"] {
+            assert_eq!(ctx(src).position, WordPosition::Argument, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn cursor_variable_position_cases() {
+        assert_eq!(ctx("echo ${whi").position, WordPosition::VariableName);
+        assert_eq!(ctx("echo $whi").position, WordPosition::VariableName);
+        assert_eq!(ctx("echo $(( whi").position, WordPosition::VariableName);
+    }
+
+    #[test]
+    fn cursor_word_and_start() {
+        let c = ctx("echo $(whi");
+        assert_eq!(c.word, "whi");
+        assert_eq!(c.word_start, 7, "anchor right after `$(`");
+    }
+
+    #[test]
+    fn cursor_enclosing_frames() {
+        assert_eq!(
+            ctx("echo \"$(whi").enclosing.last(),
+            Some(&Frame::CommandSub)
+        );
+        assert_eq!(ctx("echo $(( whi").enclosing.last(), Some(&Frame::Arith));
+        assert!(ctx("echo whi").enclosing.is_empty());
+    }
+
+    #[test]
+    fn cursor_array_literal_not_command() {
+        // `x=(whi` is an array literal, not a subshell command.
+        assert_ne!(ctx("x=(whi").position, WordPosition::Command);
+        assert_eq!(ctx("x=$(whi").position, WordPosition::Command);
     }
 
     #[test]

@@ -2665,6 +2665,10 @@ fn peek_leading_keyword(iter: &mut Lexer) -> Result<Option<Keyword>, ParseError>
 /// whole (non-atom path).  Callers that expect a keyword here must have already
 /// verified it via `peek_leading_keyword` (which also skips leading blanks).
 fn consume_command_word(iter: &mut Lexer) -> Result<Word, ParseError> {
+    // Recovery cursor context (Task 4): a word assembled here is command-position
+    // (the leading command word, an `if`/`while` condition command, a for/case
+    // subject, or a keyword). No-op off the recovery path.
+    iter.set_recovery_cmd_word(true);
     if matches!(iter.peek_kind()?, Some(TokenKind::Word(_))) {
         match iter.next_kind()? {
             Some(TokenKind::Word(w)) => Ok(w),
@@ -3024,6 +3028,8 @@ fn parse_simple_with_leading_word(
         ) {
             // v264 flip-fix (Finding 1): argument command words brace-expand
             // (1→N Words), matching the oracle's lex-time `emit_word_with_braces`.
+            // Recovery cursor context (Task 4): this is an argument-position word.
+            iter.set_recovery_cmd_word(false);
             let w = parse_word_command(iter, false)?;
             push_command_word_brace_expanded(&mut all_words, w, iter)?;
             continue;
@@ -4304,7 +4310,10 @@ fn parse_brace_group(iter: &mut Lexer) -> Result<Command, ParseError> {
     expect_keyword(iter, Keyword::LBrace, ParseError::UnterminatedBrace)?;
     let body = parse_compound_section(iter, &[Keyword::RBrace], ParseError::UnterminatedBrace)?;
     // Under recovery, a missing `}` at EOF closes the group with what was parsed.
-    expect_or_recover(iter, Keyword::RBrace, ParseError::UnterminatedBrace)?;
+    if !expect_or_recover(iter, Keyword::RBrace, ParseError::UnterminatedBrace)? {
+        // Recovery (Task 4): `{ …` truncated before `}` — cursor is in the group.
+        iter.push_recovery_frame(crate::recover::Frame::BraceGroup);
+    }
     maybe_wrap_redirects(Command::BraceGroup(Box::new(body)), iter)
 }
 
@@ -4327,6 +4336,9 @@ fn parse_if(iter: &mut Lexer) -> Result<Command, ParseError> {
             ParseError::UnterminatedIf,
         )?
     } else {
+        // Recovery (Task 4): `if COND` truncated with no `then` — the cursor sits
+        // in the if-condition.
+        iter.push_recovery_frame(crate::recover::Frame::IfCondition);
         synthetic_colon_sequence()
     };
 
@@ -4640,7 +4652,9 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
                 }
                 // v264 flip-fix (Finding 1): for-loop in-list words brace-expand
                 // (oracle: `emit_word_with_braces` is called for for/select lists).
+                // Recovery cursor context (Task 4): a for-list word is argument-position.
                 _ => {
+                    iter.set_recovery_cmd_word(false);
                     let w = parse_word_command(iter, false)?;
                     push_command_word_brace_expanded(&mut words, w, iter)?;
                 }
@@ -4651,6 +4665,11 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
         false
     };
 
+    // Recovery (Task 4): `for x [in …]` truncated before `do` — the cursor sits
+    // in the loop's word list (or right after the variable).
+    if iter.recover_at_eof() && iter.peek_kind()?.is_none() {
+        iter.push_recovery_frame(crate::recover::Frame::ForList);
+    }
     let body = parse_do_body_done(iter)?;
     maybe_wrap_redirects(
         Command::For(Box::new(ForClause {
@@ -4705,7 +4724,9 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
                     return Err(ParseError::Unexpected(iter.unexpected_here(None)?));
                 }
                 // v264 flip-fix (Finding 1): select in-list words brace-expand too.
+                // Recovery cursor context (Task 4): a select-list word is argument-position.
                 _ => {
+                    iter.set_recovery_cmd_word(false);
                     let w = parse_word_command(iter, false)?;
                     push_command_word_brace_expanded(&mut list, w, iter)?;
                 }
@@ -4743,7 +4764,13 @@ fn parse_case(iter: &mut Lexer) -> Result<Command, ParseError> {
     let mut items: Vec<CaseItem> = Vec::new();
     // Under recovery, a missing `in` at EOF (`case whi`) closes the `case` with
     // no clauses; otherwise parse the clause list and `esac` as usual.
-    if expect_or_recover(iter, Keyword::In, ParseError::UnterminatedCase)? {
+    let saw_in = expect_or_recover(iter, Keyword::In, ParseError::UnterminatedCase)?;
+    if !saw_in {
+        // Recovery (Task 4): `case SUBJ` truncated before `in` — cursor is in the
+        // case subject.
+        iter.push_recovery_frame(crate::recover::Frame::CaseSubject);
+    }
+    if saw_in {
         skip_newlines(iter)?;
         loop {
             skip_newlines(iter)?;
@@ -4864,6 +4891,9 @@ fn parse_while(iter: &mut Lexer) -> Result<Command, ParseError> {
         expect_or_recover(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
         b
     } else {
+        // Recovery (Task 4): `while COND` truncated with no `do` — cursor is in
+        // the loop condition.
+        iter.push_recovery_frame(crate::recover::Frame::WhileCondition);
         synthetic_colon_sequence()
     };
     maybe_wrap_redirects(
