@@ -1499,6 +1499,12 @@ impl<'a> Lexer<'a> {
         self.opts
     }
 
+    /// Whether EOF-recovery is enabled (the parser synthesizes minimal
+    /// compound-command bodies at genuine end-of-input instead of erroring).
+    pub(crate) fn recover_at_eof(&self) -> bool {
+        self.opts.recover_at_eof
+    }
+
     /// v264: record the `${`'s `$` byte offset in the current ParamExpansion frame,
     /// computed from the live cursor (which sits just past `${`, 2 ASCII bytes, once
     /// the ENCLOSING scanner has consumed the opener — in production the head

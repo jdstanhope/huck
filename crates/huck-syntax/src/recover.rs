@@ -163,6 +163,45 @@ mod tests {
     }
 
     #[test]
+    fn recover_if_without_then_yields_tree() {
+        let r = parse_recover("if whi");
+        assert!(
+            r.tree.is_some(),
+            "`if COND` should recover (synthesize then/fi)"
+        );
+    }
+
+    #[test]
+    fn recover_while_without_do_yields_tree() {
+        let r = parse_recover("while whi");
+        assert!(r.tree.is_some());
+    }
+
+    #[test]
+    fn recover_for_in_without_do_yields_tree() {
+        let r = parse_recover("for x in whi");
+        assert!(r.tree.is_some());
+    }
+
+    #[test]
+    fn recover_case_without_esac_yields_tree() {
+        let r = parse_recover("case whi");
+        assert!(r.tree.is_some());
+    }
+
+    #[test]
+    fn recover_brace_group_yields_tree() {
+        let r = parse_recover("{ whi");
+        assert!(r.tree.is_some());
+    }
+
+    #[test]
+    fn recover_subshell_yields_tree() {
+        let r = parse_recover("( whi");
+        assert!(r.tree.is_some());
+    }
+
+    #[test]
     fn types_are_non_exhaustive_and_public() {
         // Compile-time surface check.
         let _f: Frame = Frame::CommandSub;
