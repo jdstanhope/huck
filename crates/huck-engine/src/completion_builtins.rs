@@ -825,6 +825,19 @@ mod tests {
     }
 
     #[test]
+    fn compgen_output_has_no_trailing_space() {
+        // The tab-dispatch trailing space (Tasks 1-2, #42) must NOT reach
+        // compgen (bash's compgen lists matches without a trailing space).
+        let mut sh = Shell::new();
+        let (out, code) = run_compgen(&["-W", "foobar", "foo"], &mut sh);
+        assert_eq!(code, 0);
+        assert_eq!(
+            out, "foobar\n",
+            "compgen output must not carry the tab-completion trailing space"
+        );
+    }
+
+    #[test]
     fn compgen_no_match_returns_1() {
         let mut sh = Shell::new();
         let (out, code) = run_compgen(&["-W", "a b c", "z"], &mut sh);
