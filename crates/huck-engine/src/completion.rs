@@ -55,6 +55,10 @@ pub(crate) fn analyze_full(line: &str, pos: usize) -> (usize, usize, CompletionC
     let mut is_command_pos = true;
     let mut in_single = false;
     let mut in_double = false;
+    let mut in_backtick = false;
+    // The command-position state to restore when a backtick command
+    // substitution closes (backticks use the same char to open and close).
+    let mut saved_cmd_pos = true;
 
     let indexed: Vec<(usize, char)> = head.char_indices().collect();
     let mut i = 0;
@@ -108,6 +112,45 @@ pub(crate) fn analyze_full(line: &str, pos: usize) -> (usize, usize, CompletionC
             ';' | '|' | '&' => {
                 current_has_content = false;
                 is_command_pos = true;
+                word_start = off + c.len_utf8();
+                i += 1;
+            }
+            '(' => {
+                // Command-substitution / subshell / process-substitution
+                // opener: the word after `(` is a fresh command, so bash
+                // command-completes there. Covers `$(`, `(`, `<(`, `>(`, and
+                // `$((` (each `(` resets). `${` is `{`, not `(`, so parameter
+                // expansion is untouched. A matching `)` needs no handling —
+                // the space after it resets `is_command_pos` via the word
+                // check on the ` `/`\t` arm.
+                //
+                // EXCEPTION: `NAME=(` is an array literal, not a subshell, so
+                // bash does NOT command-complete inside it — guard on the
+                // preceding char being `=`. `NAME=$(…` (comsub in an
+                // assignment RHS) has `$` before `(`, so it still resets.
+                let array_literal = off > 0 && head.as_bytes()[off - 1] == b'=';
+                if !array_literal {
+                    current_has_content = false;
+                    is_command_pos = true;
+                    word_start = off + c.len_utf8();
+                } else {
+                    current_has_content = true;
+                }
+                i += 1;
+            }
+            '`' => {
+                // Backtick command substitution toggles: the content inside is
+                // a fresh command; on close, restore the outer position so a
+                // following word (e.g. `echo `ls` foo`) stays an argument.
+                if in_backtick {
+                    in_backtick = false;
+                    is_command_pos = saved_cmd_pos;
+                } else {
+                    in_backtick = true;
+                    saved_cmd_pos = is_command_pos;
+                    is_command_pos = true;
+                }
+                current_has_content = false;
                 word_start = off + c.len_utf8();
                 i += 1;
             }
@@ -898,6 +941,131 @@ mod tests {
             ctx,
             CompletionContext::Command {
                 prefix: "gr".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn analyze_inside_dollar_paren_is_command() {
+        // `echo $(whi` — the cursor is in command position inside a `$(...)`
+        // command substitution (bash completes commands there). #244.
+        let (start, ctx) = analyze("echo $(whi", 10);
+        assert_eq!(start, 7, "anchor is right after `$(`");
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "whi".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn analyze_inside_backtick_is_command() {
+        let (start, ctx) = analyze("echo `whi", 9);
+        assert_eq!(start, 6, "anchor is right after the backtick");
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "whi".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn analyze_inside_subshell_is_command() {
+        let (_, ctx) = analyze("(whi", 4);
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "whi".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn analyze_inside_procsub_is_command() {
+        let (_, ctx) = analyze("echo <(whi", 10);
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "whi".to_string()
+            }
+        );
+        let (_, ctx2) = analyze("cat >(whi", 9);
+        assert_eq!(
+            ctx2,
+            CompletionContext::Command {
+                prefix: "whi".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn analyze_after_closed_cmdsub_is_argument() {
+        // A CLOSED `$(...)` followed by a space returns to argument position:
+        // `whi` is an argument to `echo`, not a command.
+        let (_, ctx) = analyze("echo $(ls) whi", 14);
+        assert_eq!(
+            ctx,
+            CompletionContext::File {
+                dir: String::new(),
+                prefix: "whi".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn analyze_after_closed_backtick_is_argument() {
+        // A CLOSED backtick pair leaves the following word an argument, not a
+        // command — the backtick toggle must restore the outer position.
+        let (_, ctx) = analyze("echo `ls` whi", 13);
+        assert_eq!(
+            ctx,
+            CompletionContext::File {
+                dir: String::new(),
+                prefix: "whi".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn analyze_array_literal_is_not_command() {
+        // `x=(whi` is an array literal, not a subshell — bash does NOT
+        // command-complete there (`(` after `=`). It stays the assignment
+        // word, which command-completion finds no match for.
+        let (_, ctx) = analyze("x=(whi", 6);
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "x=(whi".to_string()
+            },
+            "array literal must not become inner command position"
+        );
+    }
+
+    #[test]
+    fn analyze_comsub_in_assignment_rhs_is_command() {
+        // `x=$(whi` — command substitution in an assignment RHS DOES command-
+        // complete (`$` before `(`, not `=`).
+        let (start, ctx) = analyze("x=$(whi", 7);
+        assert_eq!(start, 4, "anchor right after `$(`");
+        assert_eq!(
+            ctx,
+            CompletionContext::Command {
+                prefix: "whi".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn analyze_dollar_brace_stays_variable() {
+        // `${whi` is parameter expansion, NOT a command opener — must stay
+        // variable completion (the `(` handling must not touch `{`).
+        let (_, ctx) = analyze("echo ${whi", 10);
+        assert_eq!(
+            ctx,
+            CompletionContext::Variable {
+                prefix: "whi".to_string()
             }
         );
     }
