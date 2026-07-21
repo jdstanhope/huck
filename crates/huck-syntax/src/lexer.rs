@@ -1168,6 +1168,13 @@ pub(crate) struct Mark {
     /// v250 T6: see `Lexer::heredoc_gen`. Captured so `rewind` can assert the
     /// mark did not span an atom-path heredoc-state change.
     heredoc_gen: u64,
+    /// Recovery bookkeeping (dead unless `opts.recover_at_eof`). Captured/restored
+    /// so a speculative parse that pushes a compound frame or flips the
+    /// command-vs-argument flag and then rewinds does not leak that state past the
+    /// checkpoint. (`recovery_capture` is instead reset to `None` in `rewind` — a
+    /// rewind precedes genuine EOF, so any pending EOF snapshot is invalid.)
+    recovery_frames: Vec<(usize, crate::recover::Frame)>,
+    recovery_cmd_word: bool,
 }
 
 /// Snapshot of lexer state at the FIRST real EOF reached under
@@ -1349,9 +1356,12 @@ pub struct Lexer<'a> {
     recovery_cmd_word: bool,
     /// Recovery: compound-command frames the parser pushes when a Task-3
     /// synthesis fires at EOF (`IfCondition`/`WhileCondition`/`ForList`/
-    /// `CaseSubject`/`BraceGroup`) — these are NOT lexer modes. `parse_recover`
-    /// appends them after the mode-derived frames.
-    recovery_frames: Vec<crate::recover::Frame>,
+    /// `CaseSubject`/`BraceGroup`) — these are NOT lexer modes. Each is recorded
+    /// with the mode-stack depth (`self.modes.len()`) live at push time, which is
+    /// the depth at which the compound is nested; `parse_recover` merges these
+    /// into the mode-derived frames by that depth so `enclosing` reflects true
+    /// nesting order (innermost LAST) across BOTH sources.
+    recovery_frames: Vec<(usize, crate::recover::Frame)>,
 }
 
 impl<'a> Lexer<'a> {
@@ -1556,14 +1566,36 @@ impl<'a> Lexer<'a> {
     }
 
     /// Recovery (Task 4): the parser pushes a compound-command frame when a
-    /// Task-3 synthesis fires at EOF (these are not lexer modes).
+    /// Task-3 synthesis fires at EOF (these are not lexer modes). The frame is
+    /// tagged with the live mode-stack depth — the depth at which the compound is
+    /// nested — so `parse_recover` can interleave it with the mode-derived frames
+    /// in true nesting order rather than blindly appending.
     pub(crate) fn push_recovery_frame(&mut self, frame: crate::recover::Frame) {
-        self.recovery_frames.push(frame);
+        self.recovery_frames.push((self.modes.len(), frame));
     }
 
-    /// Recovery (Task 4): the compound frames the parser recorded, in push order.
-    pub(crate) fn recovery_frames(&self) -> &[crate::recover::Frame] {
+    /// Recovery (Task 4): the compound frames the parser recorded, each paired
+    /// with the mode-stack depth live at push time, in push order.
+    pub(crate) fn recovery_frames(&self) -> &[(usize, crate::recover::Frame)] {
         &self.recovery_frames
+    }
+
+    /// Recovery (Task 4): true when the next token to be produced is a synthetic
+    /// EOF-recovery closer (or there is no next token at all). Real tokens always
+    /// begin strictly before end-of-input; the synthetic closers `scan_step`
+    /// emits are stamped at the EOF offset (`>= self.s.len()`). `expect_or_recover`
+    /// uses this so a compound whose delimiter would sit past a truncated inner
+    /// lexer-mode (`echo $(if whi`) still recovers — and records its frame —
+    /// instead of erroring on the synthetic closer. Always `false` off the
+    /// recovery path.
+    pub(crate) fn peek_is_recovery_close(&mut self) -> Result<bool, LexError> {
+        if !self.opts.recover_at_eof {
+            return Ok(false);
+        }
+        match self.peek_span()? {
+            None => Ok(true),
+            Some(s) => Ok(s.offset >= self.cursor.s.len()),
+        }
     }
 
     /// Recovery (Task 4): the cursor-context snapshot captured at the first real
@@ -1608,13 +1640,42 @@ impl<'a> Lexer<'a> {
                 None => break,
             }
         }
-        let (word, word_start) = if pieces.is_empty() {
+        let (mut word, mut word_start) = if pieces.is_empty() {
             (String::new(), end)
         } else {
             let start = pieces.last().expect("non-empty").0;
             let text: String = pieces.iter().rev().map(|(_, t)| t.as_str()).collect();
             (text, start)
         };
+        // Arith operands (`$(( … ))` / `$[ … ]` / `(( … ))`) emit operators and
+        // spaces as Lit-family atoms, so the trailing word-run above glues the
+        // whole operand expression together (`" a + whi"`). The cursor is really
+        // completing only the bare trailing identifier, so when the innermost open
+        // mode is arith, re-take `word`/`word_start` as the maximal trailing
+        // `[A-Za-z_][A-Za-z0-9_]*` run of the source ending at the cursor.
+        if matches!(
+            self.modes
+                .iter()
+                .rev()
+                .find(|m| !matches!(m, Mode::Command)),
+            Some(Mode::Arith { .. })
+        ) {
+            let bytes = self.cursor.s.as_bytes();
+            let mut start = end.min(bytes.len());
+            while start > 0 && {
+                let b = bytes[start - 1];
+                b == b'_' || b.is_ascii_alphanumeric()
+            } {
+                start -= 1;
+            }
+            // An identifier cannot start with a digit — drop any leading digits so
+            // `word` is a valid name prefix (`12ab` → `ab`, all-digits → empty).
+            while start < end && bytes[start].is_ascii_digit() {
+                start += 1;
+            }
+            word = self.cursor.s[start..end].to_string();
+            word_start = start;
+        }
         RecoveryCapture {
             modes: self.modes.clone(),
             word,
@@ -1753,6 +1814,8 @@ impl<'a> Lexer<'a> {
             assign_val_tilde_ok: self.assign_val_tilde_ok,
             pending_lvalue_subscript: self.pending_lvalue_subscript,
             heredoc_gen: self.heredoc_gen,
+            recovery_frames: self.recovery_frames.clone(),
+            recovery_cmd_word: self.recovery_cmd_word,
         }
     }
 
@@ -1792,6 +1855,11 @@ impl<'a> Lexer<'a> {
         // the LAST (settled) state wins.
         self.recover_last_depth = None;
         self.recovery_capture = None;
+        // Restore (not clear) the frame vec + cmd-word flag: a speculative parse
+        // that pushed a frame or flipped the flag inside the marked span must not
+        // leave it stale after the rewind.
+        self.recovery_frames = m.recovery_frames.clone();
+        self.recovery_cmd_word = m.recovery_cmd_word;
         debug_assert_eq!(
             self.heredoc_gen, m.heredoc_gen,
             "mark/rewind must not span heredoc-body emission (v250)"

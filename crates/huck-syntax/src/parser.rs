@@ -4225,6 +4225,19 @@ pub(crate) fn parse_compound_section(
                 Err(unterminated)
             }
         }
+        // Recovery: the section body ran into a synthetic EOF-recovery closer.
+        // This happens when the truncation sits inside an enclosing lexer-mode:
+        // in `echo $(if whi` the inner `if` condition meets the `$(`'s synthetic
+        // `)` (an `Unexpected` error), never a bare EOF. Best-effort a `:` body so
+        // the enclosing compound still recovers and records its frame. Guarded by
+        // `recover_at_eof`, so the strict path is byte-for-byte unaffected.
+        Err(e) => {
+            if iter.recover_at_eof() && iter.peek_is_recovery_close()? {
+                Ok(synthetic_colon_sequence())
+            } else {
+                Err(e)
+            }
+        }
         other => other,
     }
 }
@@ -4267,7 +4280,12 @@ fn expect_or_recover(
     if peek_leading_keyword(iter)? == Some(expected) {
         consume_command_word(iter)?;
         Ok(true)
-    } else if iter.recover_at_eof() && iter.peek_kind()?.is_none() {
+    } else if iter.recover_at_eof() && iter.peek_is_recovery_close()? {
+        // Recover not only at bare EOF but also when the delimiter would sit past
+        // a truncated inner lexer-mode: `echo $(if whi` reaches EOF inside the
+        // `$(`, so the next token is the synthetic `)` closer, not `None`. Keying
+        // off "the next token is a synthetic EOF closer" lets the inner compound
+        // still recover (and record its frame) instead of erroring.
         Ok(false)
     } else {
         Err(on_missing)
@@ -4666,8 +4684,10 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
     };
 
     // Recovery (Task 4): `for x [in …]` truncated before `do` — the cursor sits
-    // in the loop's word list (or right after the variable).
-    if iter.recover_at_eof() && iter.peek_kind()?.is_none() {
+    // in the loop's word list (or right after the variable). `peek_is_recovery_close`
+    // (not bare `is_none`) so a `for` truncated inside an enclosing lexer-mode
+    // (`echo $(for x in y`) still records its frame past the synthetic closer.
+    if iter.recover_at_eof() && iter.peek_is_recovery_close()? {
         iter.push_recovery_frame(crate::recover::Frame::ForList);
     }
     let body = parse_do_body_done(iter)?;

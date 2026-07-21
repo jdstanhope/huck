@@ -30,12 +30,18 @@ pub enum Frame {
 }
 
 /// What the word at the cursor is.
+///
+/// Iteration-1 limitation: `RedirectTarget` is defined but NEVER produced yet —
+/// a redirect target (`echo > whi`) currently reports `Command`. The Task-4 brief
+/// scoped positions to Command/Argument/VariableName/AssignRhs; distinguishing a
+/// redirect target is deferred to iteration 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WordPosition {
     Command,
     Argument,
     VariableName,
+    /// NOT yet produced — see the enum note. Reserved for iteration 2.
     RedirectTarget,
     AssignRhs,
     Unknown,
@@ -96,10 +102,14 @@ fn position_from(modes: &[Mode], last_is_dollar_name: bool, cmd_word: bool) -> W
         Some(Mode::ParamExpansion { .. }) | Some(Mode::Arith { .. }) => WordPosition::VariableName,
         // `x=(whi` — an array literal element, an assignment RHS (NOT a command).
         Some(Mode::ArrayLiteral { .. }) => WordPosition::AssignRhs,
-        // A backtick body is raw-captured by the outer lexer (a separate nested
-        // lexer re-parses it), so the outer `cmd_word` flag reflects the ENCLOSING
-        // word, not the backtick's content. The cursor sits at the start of the
-        // backtick's command — command position (cf. commit ba38434).
+        // A backtick body is raw-captured by the outer lexer as a single opaque
+        // `BacktickRawText` run (a separate nested lexer re-parses it only later),
+        // so the outer `cmd_word` flag reflects the ENCLOSING word, not the
+        // backtick's content. Iteration-1 limitation: because the body is one raw
+        // atom, `word` captures the WHOLE backtick body verbatim and the position
+        // is coarsely `Command` even when the cursor is really inside a variable
+        // reference or an argument within the backticks; distinguishing those
+        // needs re-lexing the raw body and is left to iteration 2 (cf. ba38434).
         Some(Mode::BacktickRaw) => WordPosition::Command,
         _ => {
             if last_is_dollar_name {
@@ -112,6 +122,55 @@ fn position_from(modes: &[Mode], last_is_dollar_name: bool, cmd_word: bool) -> W
             }
         }
     }
+}
+
+/// Merge the two frame sources into one `enclosing` list ordered innermost-LAST.
+///
+/// `modes` is the lexer mode stack at EOF (outermost first, `Command` floor at
+/// index 0). `compounds` are the parser's compound frames, each tagged with the
+/// mode-stack depth (`self.modes.len()`) live when it was pushed — i.e. the depth
+/// at which the compound is nested. A compound tagged `e` encloses every lexer
+/// mode at stack index `>= e` and is enclosed by those at index `< e`, so it
+/// belongs in the output just before the first mode frame at index `>= e`. This
+/// single depth key interleaves the two sources correctly in all four nesting
+/// combinations (mode-in-compound `if echo $(whi` → `[IfCondition, CommandSub]`,
+/// compound-in-mode `echo $(if whi` → `[CommandSub, IfCondition]`, and the
+/// mode-in-mode / compound-in-compound cases). Among compounds sharing a depth
+/// (nested compounds with no intervening lexer mode, e.g. `if while whi`), the
+/// later-pushed one is the OUTER one (frames are pushed inner-first as the parser
+/// unwinds), so equal depths are ordered by descending push index.
+fn merge_enclosing(modes: &[Mode], compounds: &[(usize, Frame)]) -> Vec<Frame> {
+    // (depth, push_index, frame), sorted by depth asc then push index desc.
+    let mut comps: Vec<(usize, usize, Frame)> = compounds
+        .iter()
+        .enumerate()
+        .map(|(idx, (depth, frame))| (*depth, idx, frame.clone()))
+        .collect();
+    comps.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+
+    let mut out = Vec::new();
+    let mut ci = 0;
+    // Walk the mode stack (skip the `Command` floor at index 0). Before emitting
+    // the frame for mode index `i`, flush every compound whose depth `<= i` (its
+    // nesting point is at or above this mode).
+    for (i, mode) in modes.iter().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        while ci < comps.len() && comps[ci].0 <= i {
+            out.push(comps[ci].2.clone());
+            ci += 1;
+        }
+        if let Some(frame) = mode_to_frame(mode) {
+            out.push(frame);
+        }
+    }
+    // Any compound nested deeper than the deepest mode frame trails at the end.
+    while ci < comps.len() {
+        out.push(comps[ci].2.clone());
+        ci += 1;
+    }
+    out
 }
 
 /// Parse `src` (a line truncated at the cursor) with EOF-recovery.
@@ -131,12 +190,11 @@ pub fn parse_recover(src: &str) -> RecoveredParse {
     // Assemble the cursor context from state captured at the synthesis boundary
     // (real EOF) — NOT by walking `tree`, which may be `None` even though the
     // cursor context is well-defined (e.g. `case $x in a`). The lexer snapshot is
-    // taken before frames are popped; the parser's compound frames are appended
-    // after the mode-derived ones.
+    // taken before frames are popped; the parser's compound frames are merged into
+    // the mode-derived ones by nesting depth (see `merge_enclosing`).
     let cursor = match lx.recovery_capture() {
         Some(cap) => {
-            let mut enclosing: Vec<Frame> = cap.modes.iter().filter_map(mode_to_frame).collect();
-            enclosing.extend(lx.recovery_frames().iter().cloned());
+            let enclosing = merge_enclosing(&cap.modes, lx.recovery_frames());
             CursorContext {
                 enclosing,
                 position: position_from(&cap.modes, cap.last_is_dollar_name, cap.cmd_word),
@@ -323,6 +381,42 @@ mod tests {
         );
         assert_eq!(ctx("echo $(( whi").enclosing.last(), Some(&Frame::Arith));
         assert!(ctx("echo whi").enclosing.is_empty());
+    }
+
+    #[test]
+    fn cursor_enclosing_nesting_order_is_innermost_last() {
+        // lexer-mode nested in a compound: innermost is the `$(`.
+        assert_eq!(
+            parse_recover("if echo $(whi").cursor.enclosing.last(),
+            Some(&Frame::CommandSub)
+        );
+        // compound nested in a lexer-mode: innermost is the if-condition.
+        assert_eq!(
+            parse_recover("echo $(if whi").cursor.enclosing.last(),
+            Some(&Frame::IfCondition)
+        );
+    }
+
+    #[test]
+    fn cursor_enclosing_full_nesting_order() {
+        // Both frames present, outer-first: `if echo $(whi`.
+        assert_eq!(
+            parse_recover("if echo $(whi").cursor.enclosing,
+            vec![Frame::IfCondition, Frame::CommandSub]
+        );
+        // Reversed nesting: `echo $(if whi`.
+        assert_eq!(
+            parse_recover("echo $(if whi").cursor.enclosing,
+            vec![Frame::CommandSub, Frame::IfCondition]
+        );
+    }
+
+    #[test]
+    fn cursor_arith_word_is_bare_identifier() {
+        let c = parse_recover("echo $(( a + whi").cursor;
+        assert_eq!(c.position, WordPosition::VariableName);
+        assert_eq!(c.word, "whi");
+        assert_eq!(c.word_start, 13);
     }
 
     #[test]
