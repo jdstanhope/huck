@@ -457,4 +457,105 @@ mod tests {
         let _f: Frame = Frame::CommandSub;
         let _p: WordPosition = WordPosition::Argument;
     }
+
+    #[test]
+    fn recovered_tree_is_walkable() {
+        use crate::command::{Command, SimpleCommand};
+        use crate::lexer::WordPart;
+
+        // `echo $(whi` — recovery closes the `$(`, so the tree should be the
+        // simple command `echo` with one argument: a command substitution
+        // whose (recovered) inner body is the simple command `whi`.
+        let r = parse_recover("echo $(whi");
+        let seq = r.tree.expect("tree");
+
+        // The top-level command is a one-stage `Pipeline` wrapping the simple
+        // `echo` command (the parser's normal shape for a bare simple command).
+        let Command::Pipeline(outer_pipeline) = &seq.first else {
+            panic!("expected a top-level pipeline, got {:?}", seq.first);
+        };
+        assert_eq!(outer_pipeline.commands.len(), 1, "single-stage pipeline");
+        let Command::Simple(SimpleCommand::Exec(outer)) = &outer_pipeline.commands[0] else {
+            panic!(
+                "expected a simple exec command, got {:?}",
+                outer_pipeline.commands[0]
+            );
+        };
+        assert_eq!(
+            outer.program_static_text().as_deref(),
+            Some("echo"),
+            "outer program is `echo`"
+        );
+        assert_eq!(
+            outer.args.len(),
+            1,
+            "one argument: the command substitution"
+        );
+
+        let arg_parts = &outer.args[0].0;
+        assert_eq!(
+            arg_parts.len(),
+            1,
+            "the argument is exactly one command-substitution word part"
+        );
+        let WordPart::CommandSub {
+            sequence: inner, ..
+        } = &arg_parts[0]
+        else {
+            panic!("expected a CommandSub word part, got {:?}", arg_parts[0]);
+        };
+
+        let Command::Pipeline(inner_pipeline) = &inner.first else {
+            panic!(
+                "expected the command-sub body's top command to be a pipeline, got {:?}",
+                inner.first
+            );
+        };
+        assert_eq!(
+            inner_pipeline.commands.len(),
+            1,
+            "single-stage inner pipeline"
+        );
+        let Command::Simple(SimpleCommand::Exec(inner_cmd)) = &inner_pipeline.commands[0] else {
+            panic!(
+                "expected the command-sub body to be a simple exec command, got {:?}",
+                inner_pipeline.commands[0]
+            );
+        };
+        assert_eq!(
+            inner_cmd.program_static_text().as_deref(),
+            Some("whi"),
+            "inner command-sub body is the command `whi`"
+        );
+    }
+
+    #[test]
+    fn recover_never_panics_on_any_truncation() {
+        // A spread of inputs exercising every construct; truncate each at every
+        // byte offset (including inside multi-byte-free ASCII here) and assert
+        // parse_recover returns without panicking.
+        let corpus = [
+            "echo hi",
+            "echo $(whi)",
+            "echo \"$(ls) $x\"",
+            "if a; then b; fi",
+            "for x in a b; do echo $x; done",
+            "case $x in a) b;; esac",
+            "a=(1 2 3)",
+            "echo ${x:-def}",
+            "echo $(( 1 + 2 ))",
+            "f() { echo `date`; }",
+            "while read l; do :; done < f",
+            "{ a; b; }",
+        ];
+        for s in corpus {
+            for i in 0..=s.len() {
+                if !s.is_char_boundary(i) {
+                    continue;
+                }
+                // Must not panic. Result content is not asserted here.
+                let _ = parse_recover(&s[..i]);
+            }
+        }
+    }
 }
