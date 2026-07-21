@@ -61,6 +61,7 @@ pub mod errors;
 pub mod generate;
 pub mod lexer;
 pub mod parser;
+pub mod recover;
 pub mod spell;
 pub mod util;
 
@@ -87,4 +88,5 @@ pub use lexer::{
     WordPart,
 };
 pub use parser::{parse, parse_sequence};
+pub use recover::{CursorContext, Frame, RecoveredParse, WordPosition, parse_recover};
 pub use util::escape_double_quote_value;
