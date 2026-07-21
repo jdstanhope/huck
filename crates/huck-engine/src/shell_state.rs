@@ -691,9 +691,22 @@ pub struct Shell {
     /// sites, popped after `waitpid` success. The timeout timer thread iterates
     /// this list to send SIGTERM when the deadline fires.
     pub live_external_children: Arc<Mutex<Vec<libc::pid_t>>>,
-    /// True while the current `ExecBuilder::run`/`capture` call is running
-    /// under `.restricted()`. Snapshot-and-restored by the builder.
-    pub restricted: bool,
+    /// Which operations this shell may perform. Snapshot-and-restored by
+    /// `ExecBuilder`; inherited by functions, subshells, and command
+    /// substitutions because `Shell` carries it by value.
+    pub policy: crate::policy::Policy,
+    /// PROVENANCE ONLY — how the shell became restricted, never WHETHER it is.
+    /// `policy` is the sole authority on what is allowed; this flag records
+    /// only that restriction was requested at INVOCATION time (`-r`, argv[0]
+    /// `rbash`, or `ExecBuilder::restricted()`), as opposed to at runtime via
+    /// `set -r`. Do not read it to decide whether an operation is permitted.
+    ///
+    /// It exists because bash 5.2.21 distinguishes the two: `shopt
+    /// restricted_shell` reports `on` for a startup entry and `off` after
+    /// `set -r` — while that `set -r` shell still refuses `cd` and still
+    /// rejects `set +r`. So `off` does NOT mean unrestricted, and the two
+    /// questions genuinely need two fields.
+    pub restricted_at_startup: bool,
     pub shell_pgid: i32,
     /// Command history. `Rc` so cloning the Shell (per command substitution) is
     /// O(1); the rare mutation (append/load/clear) uses `Rc::make_mut` (COW).
@@ -1071,7 +1084,8 @@ impl Shell {
             sigint_flag: Arc::new(AtomicBool::new(false)),
             timeout_flag: Arc::new(AtomicBool::new(false)),
             live_external_children: Arc::new(Mutex::new(Vec::new())),
-            restricted: false,
+            policy: crate::policy::Policy::Unrestricted,
+            restricted_at_startup: false,
             shell_pgid: unsafe { libc::getpgrp() },
             history: Rc::new(crate::history::History::new()),
             shell_pid,
@@ -1415,19 +1429,14 @@ impl Shell {
     /// overwritten — the rest of the map is preserved (bash's `a=v` rule).
     /// User-facing assignments must use `assign()` / `try_set` instead.
     ///
-    /// In restricted mode, assignment to SHELL/PATH/ENV/BASH_ENV is refused
-    /// with a diagnostic emitted via `sh_error!` (the thread-local sink); if
-    /// no executor sink is installed (e.g. direct unit tests), the diagnostic
-    /// falls through to `io::stderr()`.
+    /// This leaf setter does NOT consult the restriction policy or the
+    /// readonly bit — it is the internal store. Restricted mode is enforced
+    /// by marking SHELL/PATH/HISTFILE/ENV/BASH_ENV readonly
+    /// (`apply_restricted_readonly`), which the user-facing `assign()` path
+    /// checks.
     pub fn set(&mut self, name: &str, value: String) {
         if is_write_protected_var(name) {
             return; // bash silently discards writes to FUNCNAME
-        }
-        if self.restricted
-            && let Err(msg) = crate::restricted::check_special_assign(name)
-        {
-            crate::sh_error!(self, None, "{msg}");
-            return;
         }
         self.store_scalar(name, value);
     }
@@ -2137,17 +2146,6 @@ impl Shell {
             return Ok(()); // bash silently discards writes to FUNCNAME
         }
 
-        // Restricted-mode gate: refuse assignment to SHELL/PATH/ENV/BASH_ENV.
-        // Mirrors the gate in `Shell::set`, but covers the user-facing path
-        // (script `PATH=...` or `declare PATH=...`) which routes through here
-        // rather than the leaf `set`.
-        if self.restricted
-            && let Err(msg) = crate::restricted::check_special_assign(&name)
-        {
-            crate::sh_error!(self, None, "{msg}");
-            return Err(AssignErr::Readonly);
-        }
-
         // The single readonly check, before any store (no partial array
         // writes); the storage primitives do not re-check.
         if self.is_readonly(&name) {
@@ -2344,11 +2342,40 @@ impl Shell {
         }
     }
 
-    /// Marks `name` readonly. If `name` is unset, creates it with an
-    /// empty value (matching bash's behavior for `readonly NAME`
-    /// against an unset name).
+    /// Marks `name` readonly. If `name` is unset, creates it with an empty
+    /// value.
+    ///
+    /// This DIVERGES from bash for an unset name: bash records the attribute
+    /// without creating a value, so `readonly Q` leaves `[ -v Q ]` false while
+    /// `declare -p Q` prints `declare -r Q`. huck has no attribute-without-
+    /// value state, so `Q` becomes set-to-empty. Pre-existing; verified against
+    /// bash 5.2.21 in v319. (An earlier version of this comment claimed the
+    /// empty-value creation MATCHED bash — it does not.)
     pub fn mark_readonly(&mut self, name: &str) {
         self.mutate_or_create(name, |v| v.readonly = true);
+    }
+
+    /// Mark the variables bash makes readonly under restriction. Called once
+    /// when a restricted policy engages, NOT per write — every write path then
+    /// reports through ordinary readonly machinery with its own wording.
+    pub fn apply_restricted_readonly(&mut self) {
+        for name in crate::policy::RESTRICTED_READONLY_VARS {
+            self.mark_readonly(name);
+        }
+    }
+
+    /// Engage bash's restricted shell as a STARTUP entry (`-r` or invocation
+    /// as `rbash`): policy, provenance, and the readonly marks in one step.
+    /// `restricted_at_startup` is what makes `shopt restricted_shell` report
+    /// `on`, which a later `set -r` deliberately does not do.
+    ///
+    /// WHEN to call this is bash's rule, not ours: "these restrictions are
+    /// enforced after any startup files are read". See the single ordering
+    /// comment in `huck-cli`'s `repl::run`.
+    pub fn engage_startup_restriction(&mut self) {
+        self.policy = crate::policy::Policy::Rbash;
+        self.restricted_at_startup = true;
+        self.apply_restricted_readonly();
     }
 
     /// True if `name` is set and marked integer (v65). Unset names are

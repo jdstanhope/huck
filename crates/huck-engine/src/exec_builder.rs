@@ -177,13 +177,42 @@ impl<'a> ExecBuilder<'a> {
         self
     }
 
-    /// Enable restricted mode for this call only (bash `rbash` subset:
-    /// refuses `cd`, `exec`, command-names containing `/`, `source` of paths
-    /// containing `/`, write-redirects to absolute or `..` paths, assignment
-    /// to `SHELL`/`PATH`/`ENV`/`BASH_ENV`, and `set +r`). Refused operations
-    /// emit `huck: restricted: <op>` via the active stderr sink and return
-    /// exit 1; the script keeps running unless `set -e` propagates the
-    /// failure.
+    /// Enable restricted mode for this call by selecting `Policy::Sandbox`
+    /// (`policy.rs`) — huck's embedding policy, distinct from bash's `rbash`
+    /// (`Policy::Rbash`, reachable via `-r` / `set -r` / `argv[0] == "rbash"`).
+    /// `Sandbox` denies `cd`, `exec`, command names containing `/`, `source`
+    /// of paths containing `/`, and `set +r`, same as `Rbash`. It differs from
+    /// `Rbash` in exactly one place: a file-target write-redirect is denied
+    /// only when the target **escapes the working directory** (an absolute
+    /// path, or one with a `..` component) — a relative write like `> out.txt`
+    /// stays permitted, so a hosted script can still do local work, while
+    /// `Rbash` denies every file-target redirect regardless of path shape.
+    /// Refused operations emit a diagnostic via the active stderr sink and
+    /// return a non-zero exit; the script keeps running unless `set -e`
+    /// propagates the failure. See
+    /// `docs/superpowers/specs/2026-07-20-restricted-policy-design.md` for the
+    /// full design and the bash-vs-huck rationale.
+    ///
+    /// # The protected variables are marked readonly, and that OUTLIVES the call
+    ///
+    /// Entering a restricted policy marks `SHELL`, `PATH`, `HISTFILE`, `ENV`
+    /// and `BASH_ENV` readonly, so every write path (plain assignment,
+    /// `export`, `read`, `declare`, `unset`, `+=`) reports through ordinary
+    /// readonly machinery as `<name>: readonly variable` rather than a
+    /// restriction-specific message.
+    ///
+    /// Those readonly marks are **deliberately not undone** when the call
+    /// ends — matching bash, where restricted mode is one-way and cannot be
+    /// unset from within the shell. A later, *unrestricted* call on the same
+    /// `Engine` therefore still sees them:
+    ///
+    /// ```text
+    /// e.prepare("echo hi").restricted().capture();   // marks PATH readonly
+    /// e.prepare("PATH=/usr/bin").capture();          // PATH: readonly variable
+    /// ```
+    ///
+    /// If an embedder needs an unrestricted shell afterwards, construct a
+    /// fresh `Engine` rather than reusing this one.
     pub fn restricted(mut self) -> Self {
         self.restricted = true;
         self
@@ -466,7 +495,21 @@ fn run_cwd_inner(
     })
 }
 
-/// Snapshot+set `Shell.restricted`, run the inner script, restore on exit (RAII).
+/// Snapshot+set `Shell.policy`, run the inner script, restore on exit (RAII).
+///
+/// Restriction is ONE-WAY, and the restore honors that in two ways:
+///
+/// * It does NOT unmark the variables `apply_restricted_readonly` made
+///   readonly: a shell that has once been restricted never regains
+///   writability of SHELL/PATH/HISTFILE/ENV/BASH_ENV. bash behaves the same
+///   way (its `set -r` marks are permanent for the shell's life).
+/// * It puts the previous policy back only when the policy is still the one
+///   this guard installed. If the INNER script raised it — `set -r` — that
+///   elevation survives the guard, exactly as the readonly marks do.
+///   Reverting it would leave a half-restricted shell (`cd` permitted again
+///   while PATH stays readonly) that bash never produces.
+///
+/// This is intentional, not a leak.
 fn run_restricted_then_inner(
     cell: &Rc<RefCell<Shell>>,
     restricted: bool,
@@ -474,20 +517,42 @@ fn run_restricted_then_inner(
     out: &mut StdoutSink,
     err: &mut StderrSink,
 ) -> i32 {
-    let prev_restricted = cell.borrow().restricted;
-    cell.borrow_mut().restricted = restricted || prev_restricted;
+    let prev_policy = cell.borrow().policy;
+    let prev_startup = cell.borrow().restricted_at_startup;
+    if restricted {
+        let mut sh = cell.borrow_mut();
+        sh.policy = crate::policy::Policy::Sandbox;
+        // An invocation-time choice by the embedder, analogous to `-r` rather
+        // than to `set -r` — so `shopt restricted_shell` reports `on`.
+        sh.restricted_at_startup = true;
+        sh.apply_restricted_readonly();
+    }
+    // The policy in effect once the prologue is done. If the inner script has
+    // moved away from it by the time we unwind, it raised the policy itself
+    // (`set -r`) and that elevation must survive — see the fn doc.
+    let installed_policy = cell.borrow().policy;
     struct R<'c> {
         cell: &'c Rc<RefCell<Shell>>,
-        prev: bool,
+        installed: crate::policy::Policy,
+        prev: crate::policy::Policy,
+        prev_startup: bool,
     }
     impl Drop for R<'_> {
         fn drop(&mut self) {
-            self.cell.borrow_mut().restricted = self.prev;
+            // Policy + provenance only — see the fn doc on why the readonly
+            // marks stay, and why an inner-script elevation is left alone.
+            let mut sh = self.cell.borrow_mut();
+            if sh.policy == self.installed {
+                sh.policy = self.prev;
+                sh.restricted_at_startup = self.prev_startup;
+            }
         }
     }
     let _r = R {
         cell,
-        prev: prev_restricted,
+        installed: installed_policy,
+        prev: prev_policy,
+        prev_startup,
     };
 
     let label = cell.borrow().shell_argv0.clone();

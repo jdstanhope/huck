@@ -47,12 +47,17 @@ check_script 'script-continues' 'readonly r=1' 'r=2' 'echo L2' 'echo L3'
 
 # --- Control: a normal successful assignment must not be affected.
 check 'good-assign'       'x=1; echo $x done'
-# NOTE: three adjacent readonly cases are DELIBERATELY not tested here — they are
+# --- Readonly-diagnostic wording on the non-assignment write paths. These match
+# bash as of v319 (#204 fixed there, as a side effect of routing restricted-mode
+# variable protection through the ordinary readonly machinery).
+check 'unset-readonly'    'readonly r=1; unset r; echo done'
+check 'declare-readonly'  'readonly r=1; declare r=2; echo done'
+# NOTE: two adjacent readonly cases are DELIBERATELY not tested here — they are
 # PRE-EXISTING divergences in OTHER code paths (not run_assignment_list / #31),
 # each filed separately: inline-prefix `r=2 cmd` skips the command bash runs
-# (#203); `unset` of a readonly omits bash's "cannot unset:" wording (#204); a
-# for-loop var readonly bind double-prints the diagnostic (#205). Adding them as
-# huck-vs-bash controls would red this harness for reasons unrelated to #31.
+# (#203); a for-loop var readonly bind double-prints the diagnostic (#205).
+# Adding them as huck-vs-bash controls would red this harness for reasons
+# unrelated to #31.
 
 if [ $FAIL -ne 0 ]; then echo "readonly_assign_discard_diff_check FAILED" >&2; exit 1; fi
 echo "readonly_assign_discard_diff_check OK"

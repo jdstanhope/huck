@@ -195,7 +195,7 @@ pub fn run_builtin(
         "shopt" => builtin_shopt(args, out, err, shell),
         "shift" => builtin_shift(args, err, shell),
         "getopts" => builtin_getopts(args, err, shell),
-        "." | "source" => builtin_source(args, err, shell),
+        "." | "source" => builtin_source(name, args, err, shell),
         "eval" => builtin_eval(args, shell),
         "let" => builtin_let(args, err, shell),
         "help" => builtin_help(args, out, err, shell),
@@ -465,9 +465,7 @@ fn builtin_cd_as(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    if crate::restricted::is_restricted(shell)
-        && let Err(msg) = crate::restricted::check_cd()
-    {
+    if let Err(msg) = shell.policy.check(crate::policy::Op::Cd) {
         crate::sh_error_to!(shell, err, None, "{msg}");
         return ExecOutcome::Continue(1);
     }
@@ -872,7 +870,12 @@ fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
                 continue;
             }
             if shell.is_readonly(arg) {
-                crate::sh_error_to!(shell, err, None, "unset: {arg}: readonly variable");
+                crate::sh_error_to!(
+                    shell,
+                    err,
+                    None,
+                    "unset: {arg}: cannot unset: readonly variable"
+                );
                 any_error = true;
                 continue;
             }
@@ -955,7 +958,7 @@ fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
                 shell,
                 err,
                 None,
-                "unset: {effective_arg}: readonly variable"
+                "unset: {effective_arg}: cannot unset: readonly variable"
             );
             any_error = true;
             continue;
@@ -1430,7 +1433,10 @@ fn builtin_export_decl(
                         continue;
                     }
                     if shell.is_readonly(name) {
-                        crate::sh_error_to!(shell, err, None, "export: {name}: readonly variable");
+                        // bash 5.2.21 emits NO `export:` prefix here:
+                        //   $ bash -c 'readonly FOO=1; export FOO=2'
+                        //   bash: line 1: FOO: readonly variable
+                        crate::sh_error_to!(shell, err, None, "{name}: readonly variable");
                         any_error = true;
                         continue;
                     }
@@ -1477,7 +1483,10 @@ fn builtin_export_decl(
                 }
                 let name = a.target.name().to_string();
                 if shell.is_readonly(&name) {
-                    crate::sh_error_to!(shell, err, None, "export: {name}: readonly variable");
+                    // bash 5.2.21 emits NO `export:` prefix here:
+                    //   $ bash -c 'readonly FOO=1; export FOO=2'
+                    //   bash: line 1: FOO: readonly variable
+                    crate::sh_error_to!(shell, err, None, "{name}: readonly variable");
                     any_error = true;
                     continue;
                 }
@@ -2286,6 +2295,56 @@ fn builtin_declare_decl(
                     exit = 1;
                     continue;
                 }
+            } else if let Some(cur) = shell.get(name) {
+                // Value-less `declare -n NAME`: bash validates the variable's
+                // EXISTING value as the reference target, and this check fires
+                // BEFORE the readonly check (verified on bash 5.2.21:
+                // `readonly PATH; declare -n PATH` reports the invalid-name
+                // error). An unset NAME is accepted and simply gains the `-n`
+                // attribute.
+                //
+                // DIVERGENCE, unset + readonly: bash reports `readonly
+                // variable` there, huck reports the invalid-name error with an
+                // empty value. Not reachable as an escape (rc 1, nothing is
+                // applied) — it falls out of huck having no attribute-without-
+                // value state, so `readonly FOO` on an unset FOO creates FOO
+                // as set-to-empty and `shell.get` returns Some(""). See #225.
+                let cur = cur.to_string();
+                let valid = is_valid_name(&cur)
+                    || matches!(parse_subscripted_arg(&cur), Ok(Some((b, _))) if is_valid_name(b));
+                if !valid {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "declare: `{cur}': invalid variable name for name reference"
+                    );
+                    exit = 1;
+                    continue;
+                }
+            }
+            // A nameref BIND writes through the `Shell::set` leaf, which does
+            // not itself enforce readonly — so the readonly gate must live
+            // here. Without it `declare -n PATH=EVIL; EVIL=...` would let the
+            // nameref deref hand out arbitrary control of a readonly variable
+            // (a sandbox escape under a restricted policy, which marks PATH et
+            // al readonly). bash 5.2.21 refuses the bind and applies NOTHING —
+            // not even the `-n` attribute:
+            //   $ bash -c 'readonly FOO=1; declare -n FOO=BAR; declare -p FOO'
+            //   bash: declare: FOO: readonly variable
+            //   declare -r FOO="1"
+            // The value-LESS form (`declare -n FOO`) is refused too: bash
+            // treats FOO's existing value as the target name, so applying `-n`
+            // to a readonly FOO would make `FOO=x` write through to whatever
+            // that value names — the readonly gate bypassed entirely, because
+            // `resolve_assign_target` checks readonly on the RESOLVED name.
+            //   $ bash -c 'readonly RO=safe; declare -nx RO; declare -p RO'
+            //   bash: declare: RO: readonly variable
+            //   declare -r RO="safe"      # neither -n nor -x applied
+            if shell.is_readonly(name) {
+                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
+                exit = 1;
+                continue;
             }
             shell.set_nameref(name, true);
             // BIND: store the target name as the RAW value (not through
@@ -2326,16 +2385,10 @@ fn builtin_declare_decl(
                 }
                 continue;
             }
-            // -r combined with =VALUE: must not clobber an existing
-            // readonly. Other =VALUE assignments rely on
-            // apply_one_assignment's internal readonly check.
-            if want_readonly && shell.is_readonly(name) {
-                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
-                exit = 1;
-                continue;
-            }
+            // `=VALUE` must not clobber an existing readonly, with or without
+            // a co-requested `-r`.
             if shell.is_readonly(name) {
-                crate::sh_error_to!(shell, err, None, "{name}: readonly variable");
+                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
                 exit = 1;
                 continue;
             }
@@ -3349,8 +3402,10 @@ fn builtin_read(
 
     let mut exit = base_exit;
     for (name, value) in assignments {
+        // `try_set` has already printed bash's `<name>: readonly variable`
+        // (as the `-a` path above notes for `replace_indexed`); read adds no
+        // second, `read:`-prefixed line — bash prints exactly one.
         if shell.try_set(&name, value).is_err() {
-            crate::sh_error_to!(shell, err, None, "read: {name}: readonly variable");
             exit = 1;
         }
     }
@@ -6318,19 +6373,19 @@ fn builtin_set(
     builtin_set_inner(args, out, err, shell)
 }
 
+/// bash's `set` usage line, verbatim from 5.2.21. Currently reached only by
+/// the `+r` refusal; huck's unknown-flag path still says "not yet supported"
+/// instead of bash's `invalid option` + usage, so when that is aligned it
+/// should print this same constant.
+const SET_USAGE: &str =
+    "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]";
+
 fn builtin_set_inner(
     args: &[String],
     out: &mut dyn Write,
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    if crate::restricted::is_restricted(shell)
-        && args.iter().any(|a| a == "+r")
-        && let Err(msg) = crate::restricted::check_set_plus_r()
-    {
-        crate::sh_error_to!(shell, err, None, "{msg}");
-        return ExecOutcome::Continue(1);
-    }
     if args.is_empty() {
         let mut names: Vec<String> = shell.var_names().map(|s| s.to_string()).collect();
         names.sort();
@@ -6413,6 +6468,14 @@ fn builtin_set_inner(
                     b'P' => shell.shell_options.physical = true,
                     b'T' => shell.shell_options.functrace = true,
                     b'p' => shell.shell_options.privileged = true,
+                    // `set -r` restricts a RUNNING shell. Not a startup entry,
+                    // so `restricted_at_startup` deliberately stays false —
+                    // bash reports `shopt restricted_shell` as `off` here even
+                    // though the shell is now fully restricted.
+                    b'r' => {
+                        shell.policy = crate::policy::Policy::Rbash;
+                        shell.apply_restricted_readonly();
+                    }
                     b'o' => {
                         i += 1;
                         if i >= args.len() {
@@ -6470,6 +6533,18 @@ fn builtin_set_inner(
                     b'P' => shell.shell_options.physical = false,
                     b'T' => shell.shell_options.functrace = false,
                     b'p' => shell.shell_options.privileged = false,
+                    // Restriction is one-way. bash does not emit a
+                    // restriction-specific refusal here: it routes `+r` through
+                    // the ordinary invalid-option path (usage line, rc 1 —
+                    // note NOT the rc 2 an unknown flag like `+Z` gets).
+                    // Unrestricted, `set +r` is simply accepted at rc 0.
+                    b'r' => {
+                        if shell.policy.is_restricted() {
+                            crate::sh_error_to!(shell, err, None, "set: +r: invalid option");
+                            e!(err, "{}", SET_USAGE);
+                            return ExecOutcome::Continue(1);
+                        }
+                    }
                     b'o' => {
                         i += 1;
                         if i >= args.len() {
@@ -6522,6 +6597,21 @@ fn builtin_set_inner(
 /// Formats one option line in bash's `%-15s\t%s` shopt/`set -o` format.
 fn fmt_opt_line(name: &str, on: bool) -> String {
     format!("{:<15}\t{}", name, if on { "on" } else { "off" })
+}
+
+/// The one shopt name that is not a stored bit — bash computes it, and it is
+/// READ-ONLY: `shopt -s`/`-u` on it are silent no-ops in both directions, so
+/// it can neither enter nor escape restriction.
+const RESTRICTED_SHELL_OPT: &str = "restricted_shell";
+
+/// Read a shopt bit. `restricted_shell` reports the shell's startup PROVENANCE
+/// (see `Shell::restricted_at_startup`), not its current policy: bash says
+/// `off` after `set -r` even though that shell is restricted.
+fn shopt_get(shell: &Shell, name: &str) -> Option<bool> {
+    if name == RESTRICTED_SHELL_OPT {
+        return Some(shell.restricted_at_startup);
+    }
+    shell.shopt_options.get(name)
 }
 
 /// `shopt` builtin. Operates on the `shopt` option namespace, or — with
@@ -6583,7 +6673,7 @@ fn builtin_shopt(
             return ExecOutcome::Continue(0);
         }
         for opt in SHOPT_TABLE {
-            let on = shell.shopt_options.get(opt.name).unwrap_or(false);
+            let on = shopt_get(shell, opt.name).unwrap_or(false);
             if set_f && !on {
                 continue;
             }
@@ -6602,6 +6692,11 @@ fn builtin_shopt(
     if set_f || unset_f {
         let mut rc = 0;
         for name in names {
+            if name == RESTRICTED_SHELL_OPT {
+                // Silent no-op, rc 0 — `-u` must not lift the restriction and
+                // `-s` must not impose one. Verified against bash 5.2.21.
+                continue;
+            }
             if !shell.shopt_options.set(name, set_f) {
                 crate::sh_error_to!(shell, err, None, "shopt: {name}: invalid shell option name");
                 rc = 1;
@@ -6613,7 +6708,7 @@ fn builtin_shopt(
     // query mode
     let mut all_set = true;
     for name in names {
-        match shell.shopt_options.get(name) {
+        match shopt_get(shell, name) {
             Some(on) => {
                 if !on {
                     all_set = false;
@@ -7360,13 +7455,15 @@ fn builtin_help(
 
 pub(crate) fn source_in_sink(
     args: &[String],
+    invoked: &str,
     shell: &mut Shell,
     sink: &mut crate::executor::StdoutSink,
     err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
-    if crate::restricted::is_restricted(shell)
-        && let Some(path) = args.first()
-        && let Err(msg) = crate::restricted::check_source_path(path)
+    if let Some(path) = args.first()
+        && let Err(msg) = shell
+            .policy
+            .check(crate::policy::Op::SourcePath { invoked, path })
     {
         let mut err = crate::executor::err_writer(err_sink, sink);
         crate::sh_error_to!(shell, &mut *err, None, "{msg}");
@@ -7475,11 +7572,16 @@ pub(crate) fn source_in_sink(
     result
 }
 
-fn builtin_source(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_source(
+    invoked: &str,
+    args: &[String],
+    err: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
     let _ = err; // err writer not used: source_in_sink materializes from sinks
     let mut sink = crate::executor::StdoutSink::Terminal;
     let mut err_sink = crate::executor::StderrSink::Terminal;
-    source_in_sink(args, shell, &mut sink, &mut err_sink)
+    source_in_sink(args, invoked, shell, &mut sink, &mut err_sink)
 }
 
 fn resolve_source_path(

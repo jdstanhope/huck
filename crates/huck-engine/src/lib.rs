@@ -37,12 +37,12 @@ pub(crate) mod job_spec;
 pub mod jobs;
 pub(crate) mod line_buf;
 pub(crate) mod param_expansion;
+pub mod policy;
 pub(crate) mod procsub;
 #[doc(hidden)]
 pub mod prompt;
 #[doc(hidden)]
 pub mod readline_bind;
-pub(crate) mod restricted;
 #[doc(hidden)]
 pub mod shell;
 #[doc(hidden)]

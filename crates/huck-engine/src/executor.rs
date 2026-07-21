@@ -39,29 +39,32 @@ pub enum StderrSink<'a> {
 /// per call site — stderr is best-effort and small, so the heap hit is fine.
 /// Each call-site brace-scopes the writer to release the `err_sink` / `sink`
 /// borrows before subsequent code runs (`{ let mut err = err_writer(...); e!(...) }`).
-/// Restricted-mode gate for a write-style redirect target path. Returns
-/// `Err(())` after emitting the diagnostic when the shell is in restricted
-/// mode, the `mode` is write-style (Truncate/Append/Clobber/ReadWrite), and
-/// the path is absolute or contains a `..` component. Input-only modes
-/// (`ReadOnly`) are NEVER refused.
+/// Refuse a file-target output redirect under a restricted policy. Input-only
+/// (`ReadOnly`) is never refused, and fd-duplication never reaches here — both
+/// match bash, where `<`, `>&2`, and `2>&1` stay permitted under `-r`.
+///
+/// `subject` is the word to NAME in the diagnostic; it differs from `path` for
+/// a `{var}`-fd redirect, where bash names the variable (`{v}> f` reports `v`,
+/// not `f`). The policy decision itself always looks at `path`.
 #[inline]
 fn check_restricted_redirect(
     mode: &FileMode,
     path: &str,
+    subject: &str,
     shell: &Shell,
     sink: &mut StdoutSink<'_>,
     err_sink: &mut StderrSink<'_>,
 ) -> Result<(), ()> {
-    if !crate::restricted::is_restricted(shell) {
-        return Ok(());
-    }
     if !matches!(
         mode,
         FileMode::Truncate | FileMode::Append | FileMode::Clobber | FileMode::ReadWrite
     ) {
         return Ok(());
     }
-    if let Err(msg) = crate::restricted::check_redirect_path(path) {
+    if let Err(msg) = shell
+        .policy
+        .check(crate::policy::Op::RedirectFile { path, subject })
+    {
         let mut err = err_writer(err_sink, sink);
         crate::sh_error_to!(shell, &mut *err, None, "{msg}");
         return Err(());
@@ -4616,13 +4619,61 @@ fn run_exec_single_inner(
     // after xtrace, but before the dispatch machinery. Its inline assignments
     // persist (special builtin), so no restore on return.
     if resolved.program == "exec" {
-        if crate::restricted::is_restricted(shell)
-            && let Err(msg) = crate::restricted::check_exec()
-        {
-            {
-                let mut err = err_writer(err_sink, sink);
-                crate::sh_error_to!(shell, &mut *err, None, "{msg}");
+        // bash refuses `exec` only when it has a COMMAND WORD to replace the
+        // shell with. Redirect-only / bare / options-only `exec` (`exec 3<f`,
+        // `exec 2>&1`, `exec -c`) is PERMITTED — its redirections are then
+        // subject to the ordinary Op::RedirectFile check applied by
+        // `run_exec_builtin`, which is why `exec 3> f` reports the redirect
+        // diagnostic, not `exec: restricted`.
+        // A bad option falls through so run_exec_builtin reports the usage
+        // error, as bash does.
+        let has_command_word = parse_exec_flags(&resolved.args)
+            .map(|f| resolved.args.len() > f.operand_start)
+            .unwrap_or(false);
+        // bash evaluates the redirections BEFORE refusing the exec, so a
+        // restricted `exec 2>/dev/null true` reports the REDIRECT diagnostic
+        // (`/dev/null: restricted: cannot redirect output`), not `exec:
+        // restricted`. Pre-scan the redirects in order and let the first
+        // refusal speak. Only reachable when the exec is doomed anyway
+        // (`Op::Exec` is refused by every restricted policy), so the targets
+        // expanded here are never expanded a second time.
+        let mut refused_redirect = false;
+        if has_command_word && shell.policy.is_restricted() {
+            for redir in &cmd.redirects {
+                let RedirOp::File { mode, target: word } = &redir.op else {
+                    continue;
+                };
+                let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
+                    Ok(p) => p,
+                    Err(()) => {
+                        refused_redirect = true;
+                        break;
+                    }
+                };
+                let subject = match &redir.fd {
+                    RedirFd::Var(name) => name.as_str(),
+                    _ => path.as_str(),
+                };
+                if check_restricted_redirect(mode, &path, subject, shell, sink, err_sink).is_err() {
+                    refused_redirect = true;
+                    break;
+                }
             }
+        }
+        // Refused, with the diagnostic already on stderr in every case: the
+        // scan above emits its own, so only the `exec: restricted` verdict is
+        // left to report here.
+        let refused = refused_redirect
+            || (has_command_word
+                && match shell.policy.check(crate::policy::Op::Exec) {
+                    Ok(()) => false,
+                    Err(msg) => {
+                        let mut err = err_writer(err_sink, sink);
+                        crate::sh_error_to!(shell, &mut *err, None, "{msg}");
+                        true
+                    }
+                });
+        if refused {
             // exec's variable assignments persist (special builtin), but the
             // #28 child-env scalar overlay must NOT — pop it so a later command
             // doesn't inherit this inline scalar. (inline_scopes isn't pushed on
@@ -4658,8 +4709,9 @@ fn run_exec_single_inner(
         .inline_scopes
         .push(snap.vars.iter().map(|(n, _)| n.clone()).collect());
 
-    if crate::restricted::is_restricted(shell)
-        && let Err(msg) = crate::restricted::check_command_name(&resolved.program)
+    if let Err(msg) = shell
+        .policy
+        .check(crate::policy::Op::CommandName(&resolved.program))
     {
         {
             let mut err = err_writer(err_sink, sink);
@@ -4720,6 +4772,7 @@ fn run_exec_single_inner(
         }
     } else if resolved.program == "source" || resolved.program == "." {
         let args = resolved.args;
+        let invoked = resolved.program.clone();
         if has_any_redirect(cmd) {
             with_redirect_scope(
                 &cmd.redirects,
@@ -4727,11 +4780,11 @@ fn run_exec_single_inner(
                 sink,
                 err_sink,
                 move |shell, inner_sink, inner_err_sink| {
-                    builtins::source_in_sink(&args, shell, inner_sink, inner_err_sink)
+                    builtins::source_in_sink(&args, &invoked, shell, inner_sink, inner_err_sink)
                 },
             )
         } else {
-            builtins::source_in_sink(&args, shell, sink, err_sink)
+            builtins::source_in_sink(&args, &invoked, shell, sink, err_sink)
         }
     } else if builtins::builtin_active(&resolved.program, shell) {
         // v156 task 7: ALL redirects flow through one ordered RedirectScope (via
@@ -5234,7 +5287,9 @@ fn lower_one_redirect(
                     Ok(p) => p,
                     Err(()) => return Err(1),
                 };
-                if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
+                // `{name}> f`: bash names the VARIABLE in the restricted
+                // diagnostic, not the resolved file.
+                if check_restricted_redirect(mode, &path, name, shell, sink, err_sink).is_err() {
                     return Err(1);
                 }
                 // RawLow: the {var}-fd relocation happens once below via dup_to_high_fd.
@@ -5410,7 +5465,7 @@ fn lower_one_redirect(
                 Ok(p) => p,
                 Err(()) => return Err(1),
             };
-            if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
+            if check_restricted_redirect(mode, &path, &path, shell, sink, err_sink).is_err() {
                 return Err(1);
             }
             let owned = match open_redirect_file(

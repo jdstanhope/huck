@@ -643,6 +643,164 @@ mod tests {
     // ============== RESTRICTED ==============
 
     #[test]
+    fn set_dash_r_enters_restricted_mode() {
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        let out = e.prepare("set -r; cd /tmp").capture();
+        assert!(
+            out.stderr.contains("cd: restricted"),
+            "stderr: {:?}",
+            out.stderr
+        );
+    }
+
+    /// `set -r` in one `prepare()` call must survive into the NEXT one on the
+    /// same Engine. The `restricted()` RAII guard restores the policy it
+    /// installed; it must not revert an elevation the inner script made itself,
+    /// or the shell lands in a half-restricted state (`cd` allowed again while
+    /// PATH stays readonly) that bash never produces.
+    #[test]
+    fn inner_set_dash_r_survives_the_exec_guard() {
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        let out = e.prepare("set -r").capture();
+        assert_eq!(out.exit_code, 0, "stderr: {:?}", out.stderr);
+
+        // The policy half: `cd` is still refused on a later, plain call.
+        let out = e.prepare("cd /tmp").capture();
+        assert!(
+            out.stderr.contains("cd: restricted"),
+            "policy reverted: {:?}",
+            out.stderr
+        );
+
+        // The readonly half, in the same shell — read the value BACK rather
+        // than grepping stdout: a refused assignment aborts the rest of the
+        // script, so a trailing `echo` would never run and any "does not
+        // contain" assertion would pass vacuously.
+        let before = e.var("PATH");
+        let out = e.prepare("PATH=/hijacked").capture();
+        assert!(
+            out.stderr.contains("PATH: readonly variable"),
+            "PATH writable again: {:?}",
+            out.stderr
+        );
+        assert_eq!(e.var("PATH"), before, "PATH was actually overwritten");
+    }
+
+    #[test]
+    fn set_plus_r_is_an_invalid_option_while_restricted() {
+        // bash makes +r an INVALID OPTION under restriction (usage + rc 1),
+        // rather than emitting a restriction-specific refusal.
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        let out = e.prepare("set -r; set +r; cd /tmp").capture();
+        assert!(
+            out.stderr.contains("set: +r: invalid option"),
+            "stderr: {:?}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains(
+                "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]"
+            ),
+            "usage line missing: {:?}",
+            out.stderr
+        );
+        // ...and the restriction is still in force afterwards.
+        assert!(
+            out.stderr.contains("cd: restricted"),
+            "restriction leaked off: {:?}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn set_plus_r_succeeds_in_a_normal_shell() {
+        // Verified against bash 5.2.21: rc 0, no diagnostic.
+        let mut e = Engine::new();
+        let out = e.prepare("set +r; echo ok").capture();
+        assert_eq!(out.stdout, "ok\n", "stderr: {:?}", out.stderr);
+        assert!(out.stderr.is_empty(), "stderr: {:?}", out.stderr);
+    }
+
+    /// `shopt restricted_shell` records HOW the shell was entered — startup vs
+    /// runtime — NOT whether it is currently restricted. Verified against bash
+    /// 5.2.21: `bash -r` and `rbash` report `on`, but a shell that ran `set -r`
+    /// reports `off` while still refusing `cd`. The `off` case below is the
+    /// whole point: `off` does not mean unrestricted.
+    #[test]
+    fn shopt_restricted_shell_is_a_readonly_indicator() {
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        // A startup entry (the embedding API, analogous to -r) reports on...
+        let out = e.prepare("shopt restricted_shell").restricted().capture();
+        assert!(out.stdout.contains("on"), "stdout: {:?}", out.stdout);
+        // ...an unrestricted shell reports off...
+        let out = e.prepare("shopt restricted_shell").capture();
+        assert!(out.stdout.contains("off"), "stdout: {:?}", out.stdout);
+        // ...and `set -r` ALSO reports off, while being genuinely restricted.
+        let out = e
+            .prepare("set -r; shopt restricted_shell; cd /tmp")
+            .capture();
+        assert!(
+            out.stdout.contains("off"),
+            "set -r must report off: {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.contains("cd: restricted"),
+            "off must NOT mean unrestricted: {:?}",
+            out.stderr
+        );
+        // ...and -s is a silent no-op that does NOT enter restricted mode.
+        // A FRESH Engine: the `set -r` above restricted `e` permanently (one-way,
+        // as in bash), so reusing it here would prove nothing about `shopt -s`.
+        let mut e = Engine::new();
+        let out = e
+            .prepare("shopt -s restricted_shell; echo rc=$?; cd /tmp && echo escaped")
+            .capture();
+        assert!(out.stdout.contains("rc=0"), "stdout: {:?}", out.stdout);
+        assert!(
+            out.stdout.contains("escaped"),
+            "shopt -s must not restrict: {:?}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn shopt_minus_u_restricted_shell_cannot_escape() {
+        // bash: silent no-op, rc 0, option stays on, restriction still enforced.
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        let out = e
+            .prepare("shopt -u restricted_shell; echo rc=$?; shopt restricted_shell; cd /tmp")
+            .restricted()
+            .capture();
+        assert!(out.stdout.contains("rc=0"), "stdout: {:?}", out.stdout);
+        assert!(
+            out.stdout.contains("on"),
+            "-u must not clear the indicator: {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.contains("cd: restricted"),
+            "escaped via shopt -u: {:?}",
+            out.stderr
+        );
+    }
+
+    #[test]
     fn restricted_off_by_default() {
         let _g = crate::test_support::CWD_LOCK
             .lock()
@@ -668,7 +826,7 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare("cd /tmp; echo \"$PWD\"").restricted().capture();
         assert!(
-            out.stderr.contains("restricted: cd"),
+            out.stderr.contains("cd: restricted"),
             "stderr={:?}",
             out.stderr
         );
@@ -681,7 +839,7 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare("exec /bin/true").restricted().capture();
         assert!(
-            out.stderr.contains("restricted: exec"),
+            out.stderr.contains("exec: restricted"),
             "stderr={:?}",
             out.stderr
         );
@@ -692,7 +850,8 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare("/bin/echo hi").restricted().capture();
         assert!(
-            out.stderr.contains("restricted:"),
+            out.stderr
+                .contains("/bin/echo: restricted: cannot specify `/' in command names"),
             "stderr={:?}",
             out.stderr
         );
@@ -711,7 +870,7 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare(". /etc/profile").restricted().capture();
         assert!(
-            out.stderr.contains("restricted: source"),
+            out.stderr.contains(".: /etc/profile: restricted"),
             "stderr={:?}",
             out.stderr
         );
@@ -725,7 +884,8 @@ mod tests {
             .restricted()
             .capture();
         assert!(
-            out.stderr.contains("restricted:"),
+            out.stderr
+                .contains("/tmp/v206-restricted-test: restricted: cannot redirect output"),
             "stderr={:?}",
             out.stderr
         );
@@ -743,7 +903,8 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare("echo hi > ../escape").restricted().capture();
         assert!(
-            out.stderr.contains("restricted:"),
+            out.stderr
+                .contains("../escape: restricted: cannot redirect output"),
             "stderr={:?}",
             out.stderr
         );
@@ -754,7 +915,7 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare("PATH=/tmp; echo done").restricted().capture();
         assert!(
-            out.stderr.contains("restricted: PATH"),
+            out.stderr.contains("PATH: readonly variable"),
             "stderr={:?}",
             out.stderr
         );
@@ -768,8 +929,193 @@ mod tests {
             .restricted()
             .capture();
         assert!(
-            out.stderr.contains("restricted: SHELL"),
+            out.stderr.contains("SHELL: readonly variable"),
             "stderr={:?}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn restricted_marks_all_five_vars_readonly() {
+        let mut e = Engine::new();
+        // Every write path must report through readonly machinery, not a
+        // restriction-specific message. HISTFILE is included (bash does).
+        for name in ["SHELL", "PATH", "HISTFILE", "ENV", "BASH_ENV"] {
+            let out = e
+                .prepare(&format!("{name}=/tmp; echo done"))
+                .restricted()
+                .capture();
+            assert!(
+                out.stderr.contains(&format!("{name}: readonly variable")),
+                "{name}: expected readonly diagnostic, got {:?}",
+                out.stderr
+            );
+        }
+    }
+
+    #[test]
+    fn restricted_covers_non_assignment_write_paths() {
+        let mut e = Engine::new();
+        // These four paths escape the old check_special_assign sites entirely.
+        //
+        // NOTE on assertion strength: these are SUBSTRING checks, so what each
+        // case pins differs. The two whose expected string carries a builtin
+        // prefix (`declare:`, `unset:`) pin the exact WORDING. The two whose
+        // expected string is the bare `PATH: readonly variable` pin only that
+        // the write was REFUSED — a prefixed message such as
+        // `export: PATH: readonly variable` would also contain that substring.
+        // Exact-wording coverage for those two lives in the bash-diff harness.
+        let cases = [
+            ("export PATH=/tmp", "PATH: readonly variable"),
+            ("PATH+=/tmp", "PATH: readonly variable"),
+            ("declare PATH=/tmp", "declare: PATH: readonly variable"),
+            ("unset PATH", "unset: PATH: cannot unset: readonly variable"),
+        ];
+        for (src, want) in cases {
+            let out = e.prepare(src).restricted().capture();
+            assert!(
+                out.stderr.contains(want),
+                "{src}: expected {want:?}, got {:?}",
+                out.stderr
+            );
+        }
+    }
+
+    #[test]
+    fn declare_nameref_bind_refused_on_readonly_var() {
+        // A nameref bind writes through the `Shell::set` leaf, which does not
+        // enforce readonly. Unguarded, `declare -n PATH=EVIL` gives arbitrary
+        // control of PATH inside a restricted shell (command hijacking), so
+        // BOTH assertions matter: that it is refused AND that nothing landed.
+        let mut e = Engine::new();
+        let out = e
+            .prepare("declare -n PATH=EVIL; EVIL=/attacker; echo \"PATH=$PATH\"")
+            .restricted()
+            .capture();
+        assert!(
+            out.stderr.contains("declare: PATH: readonly variable"),
+            "stderr={:?}",
+            out.stderr
+        );
+        assert!(
+            !out.stdout.contains("PATH=/attacker"),
+            "nameref bind LANDED despite the refusal: stdout={:?}",
+            out.stdout
+        );
+
+        // Same guard, plain readonly (no restricted policy) — the check is on
+        // `is_readonly`, not on the policy, so it covers both for free.
+        let mut e = Engine::new();
+        let out = e
+            .prepare("readonly FOO=1; declare -n FOO=BAR; BAR=hijacked; echo \"FOO=$FOO\"")
+            .capture();
+        assert!(
+            out.stderr.contains("declare: FOO: readonly variable"),
+            "stderr={:?}",
+            out.stderr
+        );
+        assert!(
+            out.stdout.contains("FOO=1"),
+            "readonly value was clobbered: stdout={:?}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn declare_nameref_valueless_refused_on_readonly_var() {
+        // The VALUE-LESS form `declare -n NAME` is the same escape as the
+        // valued bind: bash treats NAME's existing value as the target name,
+        // so once `-n` is on, `NAME=x` resolves through the nameref and the
+        // readonly gate (which checks the RESOLVED name) never fires.
+        // Every case asserts BOTH the diagnostic AND that no write landed —
+        // a stderr-only assertion is exactly how the first round of this bug
+        // survived review.
+        let mut e = Engine::new();
+        let out = e
+            .prepare("declare -n PATH; PATH=/attacker/bin")
+            .restricted()
+            .capture();
+        // PATH's value is a real path, so bash's invalid-name check fires
+        // first (verified on bash 5.2.21); either refusal is a refusal, but
+        // the write must not land.
+        assert!(
+            out.stderr
+                .contains("invalid variable name for name reference")
+                || out.stderr.contains("declare: PATH: readonly variable"),
+            "value-less `declare -n PATH` was not refused: stderr={:?}",
+            out.stderr
+        );
+        // Read back through the Engine, not a trailing `echo` — the refused
+        // assignment is fatal to the rest of the non-interactive script, so a
+        // later in-script command would never run and a stdout assertion
+        // would pass vacuously.
+        assert_ne!(
+            e.var("PATH").as_deref(),
+            Some("/attacker/bin"),
+            "value-less nameref bind LANDED: PATH was hijacked"
+        );
+
+        // Plain readonly, no restricted policy, with a value that IS a valid
+        // identifier — here the readonly check is the ONLY thing standing
+        // between the attacker and the write.
+        let mut e = Engine::new();
+        let out = e
+            .prepare("readonly RO=safe; declare -n RO; RO=/attacker")
+            .capture();
+        assert!(
+            out.stderr.contains("declare: RO: readonly variable"),
+            "stderr={:?}",
+            out.stderr
+        );
+        // Read the value back through the Engine rather than a trailing
+        // `echo`: the refused `RO=/attacker` assignment is itself a readonly
+        // error, which is fatal to the rest of the non-interactive script, so
+        // no in-script command after it would run to observe the value.
+        assert_eq!(
+            e.var("RO").as_deref(),
+            Some("safe"),
+            "readonly value was clobbered through the nameref"
+        );
+    }
+
+    #[test]
+    fn declare_nameref_valueless_invalid_name_message() {
+        // bash validates the EXISTING value as a reference target, and this
+        // check fires regardless of readonly:
+        //   $ bash -c 'X=/some/path; declare -n X'
+        //   bash: declare: `/some/path': invalid variable name for name reference
+        let mut e = Engine::new();
+        let out = e.prepare("X=/some/path; declare -n X").capture();
+        assert!(
+            out.stderr
+                .contains("declare: `/some/path': invalid variable name for name reference"),
+            "stderr={:?}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn declare_nameref_valueless_on_unset_name_succeeds() {
+        // Do NOT over-refuse: bash applies `-n` to an unset name at rc 0.
+        //   $ bash -c 'declare -n NEWV; declare -p NEWV'  =>  declare -n NEWV
+        let mut e = Engine::new();
+        let out = e.prepare("declare -n NEWV; echo \"rc=$?\"").capture();
+        assert!(
+            out.stderr.is_empty(),
+            "unexpected diagnostic: stderr={:?}",
+            out.stderr
+        );
+        assert!(out.stdout.contains("rc=0"), "stdout={:?}", out.stdout);
+
+        // And the attribute really is applied — the nameref still works.
+        let mut e = Engine::new();
+        let out = e
+            .prepare("declare -n REF; REF=tgt; REF=hello; echo \"tgt=$tgt\"")
+            .capture();
+        assert!(
+            out.stdout.contains("tgt=hello"),
+            "nameref attribute was not applied: stdout={:?} stderr={:?}",
+            out.stdout,
             out.stderr
         );
     }
@@ -781,15 +1127,18 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
         let out = e.prepare("set +r; cd /tmp").restricted().capture();
+        // The Sandbox policy refuses `+r` by the same mechanism as Rbash:
+        // bash's ordinary invalid-option path, not a restriction-specific
+        // message. (Task 2's stopgap wording, "restricted: cannot turn off
+        // restricted mode", was never bash's — see task 5.)
         assert!(
-            out.stderr.contains("restricted: cannot turn off")
-                || out.stderr.contains("restricted:"),
+            out.stderr.contains("set: +r: invalid option"),
             "stderr={:?}",
             out.stderr
         );
         // cd should STILL be refused after the refused `set +r`.
         assert!(
-            out.stderr.contains("restricted: cd"),
+            out.stderr.contains("cd: restricted"),
             "stderr={:?}",
             out.stderr
         );
@@ -803,7 +1152,7 @@ mod tests {
         let mut e = Engine::new();
         let out = e.prepare("f() { cd /tmp; }; f").restricted().capture();
         assert!(
-            out.stderr.contains("restricted: cd"),
+            out.stderr.contains("cd: restricted"),
             "stderr={:?}",
             out.stderr
         );
@@ -819,6 +1168,30 @@ mod tests {
         // Next call, no restricted: cd works.
         let out = e.prepare("cd /; pwd").capture();
         assert_eq!(out.stdout, "/\n", "stderr={:?}", out.stderr);
+    }
+
+    #[test]
+    fn sandbox_permits_relative_redirect() {
+        // Sandbox blocks ESCAPE, not local work — this is the one place it
+        // deliberately diverges from bash's rbash, which refuses every file
+        // target. See docs/superpowers/specs/2026-07-20-restricted-policy-design.md.
+        //
+        // `.cwd()` sets the PROCESS-global cwd, so this takes CWD_LOCK like
+        // every other cwd test here — this box's single core serializes tests
+        // and would hide the race that CI's 4 cores surface.
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("huck-v319-sandbox-rel");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut e = Engine::new();
+        let out = e
+            .prepare("echo hi > local_log; cat local_log")
+            .cwd(&dir)
+            .restricted()
+            .capture();
+        assert_eq!(out.stdout, "hi\n", "stderr: {:?}", out.stderr);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ============== TIMEOUT ==============
@@ -927,7 +1300,7 @@ mod tests {
             .restricted()
             .capture();
         assert!(
-            out.stderr.contains("restricted: cd"),
+            out.stderr.contains("cd: restricted"),
             "stderr={:?}",
             out.stderr
         );
@@ -1143,7 +1516,7 @@ mod tests {
             .restricted()
             .on_stderr_line(|line| err_lines.push(line.to_string()))
             .capture();
-        assert!(err_lines.iter().any(|l| l.contains("restricted: cd")));
+        assert!(err_lines.iter().any(|l| l.contains("cd: restricted")));
     }
 
     #[test]

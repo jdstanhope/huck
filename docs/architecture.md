@@ -46,10 +46,7 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   >=3-relocated, CLOEXEC pipe — + dup2(r, 0) save/restore guard). Sandbox knobs
   (v206) layer on top: `.cwd(path)` chdirs for the call
   (RAII via `cwd_scope.rs`, snapshotting OS cwd + shell `PWD`/`OLDPWD`);
-  `.restricted()` enables a bash `rbash`-subset policy (refuses
-  `cd`/`exec`/slash-bearing command names/slash-bearing `source` paths/
-  absolute-or-`..`-redirect targets/assignment to SHELL/PATH/ENV/BASH_ENV/
-  `set +r`) via `restricted.rs`; `.timeout(dur)` spawns a timer thread
+  `.restricted()` selects `Policy::Sandbox` (v319; see below); `.timeout(dur)` spawns a timer thread
   (`timeout.rs`) that, on deadline, sets `Shell.timeout_flag` (polled by
   `executor::check_interrupt`) and SIGTERMs every pid in
   `Shell.live_external_children`, with the call returning exit 124.
@@ -76,6 +73,30 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   `complete -F func` callbacks may mutate shell state. The CLI's `HuckHelper`
   rustyline adapter drops `kind` (rustyline has no kind concept) — REPL
   behavior unchanged.
+  Restricted-mode (v319) is a **policy abstraction**, `crates/huck-engine/src/policy.rs`:
+  `Shell.policy: Policy` is `Unrestricted` (default) / `Rbash` / `Sandbox`, and
+  every enforcement site is one line, `shell.policy.check(op)?`, where `op` is
+  a variant of the `Op` enum (`Cd`, `Exec`, `CommandName`, `SourcePath`,
+  `RedirectFile`). `Policy::Unrestricted` returns `Ok(())` from the first match
+  arm, so the permitted path costs one branch. `Rbash` mirrors bash's `rbash`
+  exactly (verified against 5.2.21); `Sandbox` is huck's embedding policy
+  (`ExecBuilder::restricted()`) and differs in exactly one place — it denies a
+  file-target redirect only when the target escapes the working directory
+  (absolute path or a `..` component), so a sandboxed script can still write
+  its own relative files, where `Rbash` denies every file-target redirect.
+  Variable restriction is **not** a per-site check: entering a restricted
+  policy marks `SHELL`/`PATH`/`HISTFILE`/`ENV`/`BASH_ENV` readonly via
+  `Shell::mark_readonly`, so every write path (plain assignment, `+=`,
+  `export`, `read`, `declare`, `unset`) reports through ordinary readonly
+  machinery with that path's own wording — the old `restricted.rs` covered
+  only plain assignment. Entry points: `argv[0] == "rbash"`, `-r` at
+  invocation, and `set -r` at runtime; `set +r` is refused via `set`'s
+  existing invalid-option path while restricted (one-way, matching bash) but
+  succeeds at rc 0 in a normal shell. `shopt restricted_shell` reports
+  **provenance** (was restriction entered at startup — `-r`/`rbash`/
+  `ExecBuilder::restricted()` — vs. via a later `set -r`), tracked separately
+  as `Shell.restricted_at_startup`, not current policy state. `restricted.rs`
+  is deleted. See `docs/superpowers/specs/2026-07-20-restricted-policy-design.md`.
 - **`huck-cli`** (`crates/huck-cli/`) — the interactive **REPL** (`run` + the
   rustyline `Editor` loop) and the line-editor *adapters*: the `HuckHelper`
   completer (`Candidate`→`rustyline::Pair`) and the readline apply
@@ -413,6 +434,7 @@ remove it.
 | New control-flow construct | `lexer.rs`: emit any new keyword/atom the construct needs. `parser.rs`: parse it (delimiter-matching/recursion) and build the AST node (defined in `command.rs`). `executor.rs`: add a `run_*` walker for the new `Command` variant. |
 | New `set -o` option | `shell_state.rs::ShellOptions`: add the bool field. `builtins.rs::builtin_set`: add to the OptionInfo registry and the get/set/print helpers. Wire into the executor at the relevant action site. |
 | New trap signal / pseudo-signal | `traps.rs`: add to the signal name table. `executor.rs`: add a `fire_*_trap` call at the appropriate spot. |
+| New restricted-mode check | `policy.rs`: add an `Op` variant, then add its arm to `Policy::check` for both `Rbash` and `Sandbox` (the compiler forces both — that's the point of the enum). Call `shell.policy.check(op)?` at the enforcement site and emit the returned message via `sh_error!`/`sh_error_to!`. If it's a *variable* restriction rather than an operation, don't add an `Op` — extend `RESTRICTED_READONLY_VARS` instead so it rides the existing readonly machinery. |
 | Array follow-on (e.g. `read -a`) | `builtins.rs`: extend the existing builtin with the flag. Use `Shell::set_indexed_element` / `Shell::extend_indexed` / etc. (or the associative siblings). The expansion side is already wired. |
 | Emit an error message | Use the `sh_error!` family (`error_emit.rs`), never a literal `"huck: "` (the invariant test rejects it). If a redirect-aware `out`/`err` writer is in scope (builtins, executor) use `sh_error_to!(shell, writer, cmd, "…")`; otherwise `sh_error!(shell, cmd, "…")`. Syntax errors → `emit_syntax_error`; pre-shell CLI → `emit_cli_error`. See the "Error emission" note in Cross-cutting conventions above. |
 | A builtin's write to `out` fails | **Do NOT emit a diagnostic** — return early (stop writing) and let the `run_builtin_with_redirects` epilogue report it. Builtin stdout bound for a real fd goes through `fd_writer.rs`'s unbuffered `FdWriter`, which records the first errno; the epilogue is the SINGLE place a write error is worded (`<name>: write error: <strerror>` + rc 1, matching bash). Emitting at the write site double-reports — `cd` and `export -f` both did (v308, #190). Discarding the `Result` (`let _ = writeln!(out, …)`, what most sites do) is fine and still reports correctly. This is also why builtin output must never go through `io::stdout()`: it swallows EBADF, and its `LineWriter` retains failed bytes that then leak to the restored fd 1 (#186, #191). |
