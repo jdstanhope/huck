@@ -554,10 +554,20 @@ pub mod dispatch {
                     let is_dir = std::fs::metadata(expand_tilde_prefix(&name, &home))
                         .map(|m| m.is_dir())
                         .unwrap_or(false);
+                    // Display is readline's `printable_part`: for filename
+                    // completions the Tab-Tab list shows only the text after
+                    // the last `/` (the basename), never the directory prefix
+                    // that is already on the line. The `replacement` below keeps
+                    // the full path — only the shown label is stripped.
+                    let base = name
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&name);
                     let display = if is_dir {
-                        format!("{name}/")
+                        format!("{base}/")
                     } else {
-                        name.clone()
+                        base.to_string()
                     };
                     // Preserve a leading `~/` UNescaped (tilde-expansion intent);
                     // escaping it would yield `cd \~/projects` (a literal `~` dir).
@@ -1200,6 +1210,66 @@ mod tests {
         assert!(
             reps.contains(&"~/projects/"),
             "tilde dir should get trailing slash: {reps:?}"
+        );
+    }
+
+    #[test]
+    fn spec_filenames_display_is_basename_not_full_path() {
+        // A `-o filenames` completion (bash-completion's default `complete -D`)
+        // returns FULL-path candidates and replaces the whole word — but bash's
+        // readline displays only the text after the last `/` (printable_part),
+        // so the Tab-Tab list shows `huck-cli/`, not `crates/huck-cli/`. The
+        // replacement stays the full path; only `display` is the basename.
+        let root = tempfile::tempdir().unwrap();
+        for d in ["huck-cli", "huck-engine", "huck-syntax"] {
+            std::fs::create_dir_all(root.path().join("crates").join(d)).unwrap();
+        }
+        let mut sh = Shell::new();
+        // COMPREPLY holds full paths, exactly as `_filedir` produces them.
+        let _ = crate::shell::process_line(
+            "_t() { COMPREPLY=('crates/huck-cli' 'crates/huck-engine' 'crates/huck-syntax'); }",
+            &mut sh,
+            false,
+        );
+        std::rc::Rc::make_mut(&mut sh.completion_specs)
+            .by_command
+            .insert(
+                "ls".to_string(),
+                crate::completion_spec::CompletionSpec {
+                    function: Some("_t".to_string()),
+                    options: crate::completion_spec::CompOptions {
+                        filenames: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        // Run from a cwd where the candidate paths resolve (is_dir → trailing /).
+        let _guard = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(root.path()).unwrap();
+        let (_start, cands) = dispatch::resolve("ls crates/huck-", 15, &mut sh);
+        std::env::set_current_dir(prev).unwrap();
+
+        let displays: Vec<&str> = cands.iter().map(|c| c.display.as_str()).collect();
+        let reps: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        // Display: basename with a trailing slash (directories), NO dir prefix.
+        assert!(
+            displays.contains(&"huck-cli/"),
+            "display should be the basename `huck-cli/`, got: {displays:?}"
+        );
+        assert!(
+            !displays
+                .iter()
+                .any(|d| d.contains('/') && d.contains("crates")),
+            "display must not carry the `crates/` prefix: {displays:?}"
+        );
+        // Replacement: still the full path (the whole word is replaced).
+        assert!(
+            reps.contains(&"crates/huck-cli/"),
+            "replacement should keep the full path: {reps:?}"
         );
     }
 
