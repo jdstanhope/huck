@@ -2,6 +2,9 @@
 
 use std::collections::BTreeSet;
 
+use crate::shell_state::Shell;
+use huck_syntax::{CursorContext, WordPosition};
+
 /// What kind of completion a `Candidate` represents. Useful for embedders
 /// rendering icons or sorting by kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -437,6 +440,89 @@ fn is_executable_file(entry: &std::fs::DirEntry) -> bool {
     }
 }
 
+/// Split a completion word on its last `/` into (dir, basename); the anchor is
+/// `word_start + byte offset past the last '/'` (or `word_start` if none).
+fn split_word_anchor(word: &str, word_start: usize) -> (String, String, usize) {
+    match word.rfind('/') {
+        Some(i) => (
+            word[..=i].to_string(),
+            word[i + 1..].to_string(),
+            word_start + i + 1,
+        ),
+        None => (String::new(), word.to_string(), word_start),
+    }
+}
+
+/// Map the parser-derived cursor context to a completion source. Replaces the
+/// hand-rolled `analyze_full` context determination. Returns the replacement
+/// anchor and the trailing-space-decorated candidates.
+///
+/// Not yet wired into `dispatch::resolve` — task 3 of #248 does the switch.
+#[allow(dead_code)]
+fn cursor_to_completion(
+    cursor: &CursorContext,
+    line: &str,
+    pos: usize,
+    shell: &mut Shell,
+) -> (usize, Vec<Candidate>) {
+    let has_slash = cursor.word.contains('/');
+    // Variable — inner ${…}/$((…))/$name context always won in the capture.
+    if cursor.position == WordPosition::VariableName {
+        let names: Vec<String> = shell.completion_var_names();
+        return (
+            cursor.word_start,
+            append_trailing_space_non_dir(complete_variable(&cursor.word, &names)),
+        );
+    }
+    // Command with no `/` — command completion.
+    if cursor.position == WordPosition::Command && !has_slash {
+        // Preserve the existing `-E` empty-command-line spec fallback.
+        if cursor.word.is_empty()
+            && line[..pos].trim().is_empty()
+            && let Some(spec) = shell.completion_specs.empty_spec.clone()
+        {
+            return (
+                cursor.word_start,
+                dispatch::run_spec_with_empty_fallback(&spec, line, pos, "", shell),
+            );
+        }
+        let path = shell.get("PATH").unwrap_or("").to_string();
+        let funcs: Vec<String> = shell.functions.keys().cloned().collect();
+        let aliases: Vec<String> = shell.aliases.keys().cloned().collect();
+        return (
+            cursor.word_start,
+            append_trailing_space_non_dir(complete_command(&cursor.word, &path, &funcs, &aliases)),
+        );
+    }
+    // Argument — file completion + programmable-spec lookup (matches the old
+    // File-context spec path). Command-with-`/`, RedirectTarget, and AssignRhs
+    // all resolve to file completion below; only Argument consults a spec.
+    let (dir, prefix, anchor) = split_word_anchor(&cursor.word, cursor.word_start);
+    if cursor.position == WordPosition::Argument {
+        let cmd_name = dispatch::extract_command_name(&line[..pos]).unwrap_or_default();
+        let spec_opt = shell
+            .completion_specs
+            .by_command
+            .get(&cmd_name)
+            .cloned()
+            .or_else(|| shell.completion_specs.default_spec.clone());
+        if let Some(spec) = spec_opt {
+            // Programmable completion replaces the WHOLE word (bash's model).
+            return (
+                cursor.word_start,
+                dispatch::run_spec_with_empty_fallback(&spec, line, pos, &cmd_name, shell),
+            );
+        }
+    }
+    // Plain file completion (Argument-no-spec, Command-with-`/`, RedirectTarget,
+    // AssignRhs). Anchored after the last `/`; dirs get `/`, files get a space.
+    let home = shell.get("HOME").unwrap_or("").to_string();
+    (
+        anchor,
+        append_trailing_space_non_dir(complete_file(&dir, &prefix, &home)),
+    )
+}
+
 pub mod dispatch {
     //! Tab-time dispatch ladder. Decides which completion source
     //! handles the cursor position: variable, command-pos commands,
@@ -521,7 +607,10 @@ pub mod dispatch {
 
     /// Runs `run_spec` on the spec, applies `-o filenames` rendering
     /// and the empty-fallback (`-o default` / `-o bashdefault`).
-    fn run_spec_with_empty_fallback(
+    ///
+    /// `pub(super)`: also called by the top-level `cursor_to_completion`
+    /// mapper (task 2 of #248), which lives outside this module.
+    pub(super) fn run_spec_with_empty_fallback(
         spec: &CompletionSpec,
         line: &str,
         pos: usize,
@@ -702,7 +791,10 @@ pub mod dispatch {
     /// Extracts the command word (word 0) of the simple command that
     /// the cursor is in. Returns None if the cursor is before any
     /// command word (e.g., empty line). Skips assignment prefixes.
-    fn extract_command_name(head: &str) -> Option<String> {
+    ///
+    /// `pub(super)`: also called by the top-level `cursor_to_completion`
+    /// mapper (task 2 of #248), which lives outside this module.
+    pub(super) fn extract_command_name(head: &str) -> Option<String> {
         // Walk forward through `head` tracking quoting; the most recent
         // separator (`;`, `|`, `&`, `\n`, `(`, `{`) bumps `start` past it.
         let mut start = 0usize;
@@ -1967,5 +2059,78 @@ mod tests {
         assert_eq!(f.replacement, "solofile.txt ", "regular file gets a space");
         let d = dir_cands.iter().find(|c| c.display == "solodir/").unwrap();
         assert_eq!(d.replacement, "solodir/", "directory keeps `/`, no space");
+    }
+
+    fn map(line: &str) -> Vec<Candidate> {
+        let mut sh = Shell::new();
+        let cur = huck_syntax::parse_recover(line).cursor;
+        cursor_to_completion(&cur, line, line.len(), &mut sh).1
+    }
+
+    #[test]
+    fn mapper_command_position_yields_commands() {
+        // `if whi` / bare word / inside $( → command candidates.
+        for line in ["if whi", "whi", "echo $(whi", "echo \"$(whi"] {
+            let c = map(line);
+            assert!(
+                c.iter().any(|x| x.display == "while"),
+                "{line:?}: {:?}",
+                c.iter().map(|x| &x.display).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn mapper_variable_position_yields_variables() {
+        let mut sh = Shell::new();
+        sh.set("MYUNIQUEVAR", "x".to_string());
+        for line in ["echo $MYUNIQ", "echo ${MYUNIQ", "echo $(( MYUNIQ"] {
+            let cur = huck_syntax::parse_recover(line).cursor;
+            let c = cursor_to_completion(&cur, line, line.len(), &mut sh).1;
+            assert!(c.iter().any(|x| x.display == "MYUNIQUEVAR"), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn mapper_argument_and_redirect_and_path_yield_files() {
+        // Run in a scratch dir so file completion has known entries.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("uniqfile.txt"), b"x").unwrap();
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let mut sh = Shell::new();
+        for line in ["cat uniqf", "for x in uniqf", "echo > uniqf", "cat ./uniqf"] {
+            let cur = huck_syntax::parse_recover(line).cursor;
+            let c = cursor_to_completion(&cur, line, line.len(), &mut sh).1;
+            assert!(
+                c.iter().any(|x| x.display.starts_with("uniqfile")),
+                "{line:?}: {:?}",
+                c.iter().map(|x| &x.display).collect::<Vec<_>>()
+            );
+        }
+        std::env::set_current_dir(prev).unwrap();
+    }
+
+    #[test]
+    fn mapper_dir_prefix_split_anchors_after_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("leaf.txt"), b"x").unwrap();
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let mut sh = Shell::new();
+        let line = "cat sub/le";
+        let cur = huck_syntax::parse_recover(line).cursor;
+        let (anchor, cands) = cursor_to_completion(&cur, line, line.len(), &mut sh);
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(anchor, 8, "anchor is right after `sub/`");
+        // display is the basename (leaf.txt), replacement carries the full path.
+        assert!(cands.iter().any(|c| c.display == "leaf.txt"));
     }
 }
