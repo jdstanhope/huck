@@ -214,10 +214,15 @@ pub fn run_spec(spec: &CompletionSpec, ctx: &CompletionCtx, shell: &mut Shell) -
     }
 
     // -X pattern filter. `pat` removes matches; `!pat` keeps only matches.
+    // A leading `!` is the negation prefix ONLY when it does not begin an
+    // extglob `!(…)` — otherwise `-X '!(*.rs)'` (as `_filedir_xspec` builds)
+    // would be mangled into `(*.rs)` with inverted sense. `!(` is the sole
+    // extglob operator that starts with `!`, so this check is exact.
     if let Some(filter) = &spec.filter {
-        let (pattern, invert) = match filter.strip_prefix('!') {
-            Some(rest) => (rest, true),
-            None => (filter.as_str(), false),
+        let (pattern, invert) = if filter.starts_with('!') && !filter.starts_with("!(") {
+            (&filter[1..], true)
+        } else {
+            (filter.as_str(), false)
         };
         out.retain(|s| {
             let matches = glob_match(pattern, s);
@@ -397,10 +402,12 @@ fn filename_matches_prefix(path: &str, prefix: &str) -> bool {
 }
 
 fn glob_match(pattern: &str, candidate: &str) -> bool {
-    // The glob crate lacks POSIX [:name:] classes; route class-bearing
-    // patterns through the own-matcher (case-sensitive, matching the
-    // default glob::Pattern::matches below).
-    if crate::glob_match::has_posix_class(pattern) {
+    // The glob crate handles neither POSIX [:name:] classes nor extended
+    // globs (`@(…)`, `!(…)`, `?(…)`, `*(…)`, `+(…)`); route both through the
+    // own-matcher (case-sensitive, matching the default glob::Pattern::matches
+    // below). Without this, a `-X` extension filter such as
+    // `_filedir_xspec`'s `!(*.@(so|…))` silently matches nothing.
+    if crate::glob_match::has_posix_class(pattern) || crate::glob_match::has_extglob(pattern) {
         return crate::glob_match::extglob_match(pattern, candidate, false);
     }
     let pattern = crate::glob_match::translate_bracket_negation(pattern);
@@ -807,6 +814,52 @@ mod tests {
         let mut sh = Shell::new();
         let got = run_spec(&spec, &ctx(""), &mut sh);
         assert_eq!(got, vec!["alpha", "apple"]);
+    }
+
+    #[test]
+    fn filter_extglob_at_removes_matches() {
+        // `@(...)` is an extended glob: `-X '@(*.rs)'` removes the .rs files,
+        // like bash. Regression for `_filedir_xspec` (vim etc.) losing all
+        // plain files because the -X matcher ignored extglob.
+        let spec = CompletionSpec {
+            wordlist: Some("a.rs b.rs c.txt d".to_string()),
+            filter: Some("@(*.rs)".to_string()),
+            ..Default::default()
+        };
+        let mut sh = Shell::new();
+        let got = run_spec(&spec, &ctx(""), &mut sh);
+        assert_eq!(got, vec!["c.txt", "d"]);
+    }
+
+    #[test]
+    fn filter_extglob_bang_paren_is_not_negation() {
+        // A leading `!(` is the extglob "not" operator, NOT the -X negation
+        // prefix. `-X '!(*.rs)'` removes files that are NOT *.rs, keeping the
+        // .rs files — bash's behavior. Stripping the `!` as negation would
+        // invert this and keep the wrong set.
+        let spec = CompletionSpec {
+            wordlist: Some("a.rs b.rs c.txt d".to_string()),
+            filter: Some("!(*.rs)".to_string()),
+            ..Default::default()
+        };
+        let mut sh = Shell::new();
+        let got = run_spec(&spec, &ctx(""), &mut sh);
+        assert_eq!(got, vec!["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn filter_bang_extglob_negates_extglob() {
+        // A leading `!` followed by a non-`(` char IS the -X negation prefix,
+        // and the remainder can itself be an extglob. `-X '!@(*.rs)'` keeps
+        // only files matching `@(*.rs)` — the .rs files.
+        let spec = CompletionSpec {
+            wordlist: Some("a.rs b.rs c.txt d".to_string()),
+            filter: Some("!@(*.rs)".to_string()),
+            ..Default::default()
+        };
+        let mut sh = Shell::new();
+        let got = run_spec(&spec, &ctx(""), &mut sh);
+        assert_eq!(got, vec!["a.rs", "b.rs"]);
     }
 
     #[test]
