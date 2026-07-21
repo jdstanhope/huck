@@ -231,12 +231,23 @@ impl<'a> CharCursor<'a> {
 
     /// Verbatim source `&s[start..=end]`. `end` is the byte offset of the last
     /// char to include (the `}` of a `${…}`). Mirrors `slice_from`'s guard.
+    ///
+    /// Under `recover_at_eof` an unterminated `${…}` gets a *synthetic* closing
+    /// atom whose span sits at EOF (`end == self.s.len()`), so the inclusive
+    /// `..=end` would index one past the end. When `end` is at or beyond EOF we
+    /// slice exclusive-to-end (`&self.s[start..]`) instead. A real `}` always
+    /// sits strictly before EOF (`end < self.s.len()`), so the strict path is
+    /// byte-for-byte unaffected.
     pub fn slice_inclusive(&self, start: usize, end: usize) -> &str {
         debug_assert!(
             self.injected.is_empty(),
             "slice_inclusive must not straddle an injected alias body"
         );
-        &self.s[start..=end]
+        if end >= self.s.len() {
+            &self.s[start..]
+        } else {
+            &self.s[start..=end]
+        }
     }
 
     /// Reposition the cursor to a byte offset with explicit line/column, clearing

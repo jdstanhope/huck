@@ -140,6 +140,29 @@ mod tests {
     }
 
     #[test]
+    fn recover_never_panics_on_truncated_param_expansion() {
+        // Half-typed ${…} with an invalid/absent separator must recover, not crash.
+        // Regression: the bad-substitution reconstruction slices `${…}` inclusive to
+        // the close atom's offset; under recover_at_eof the synthetic closer sits at
+        // EOF, so an inclusive `..=len` panicked out of bounds.
+        for s in [
+            "echo ${baz ",
+            "echo ${x@",
+            "echo ${x@Z",
+            "echo ${V!",
+            "echo ${-3",
+            "echo ${x;",
+            "echo ${x =",
+            "echo ${",
+            "echo ${x",
+        ] {
+            let _ = parse_recover(s); // must return without panicking
+        }
+        // And the reconstruction actually recovers a tree rather than bailing.
+        assert!(parse_recover("echo ${baz ").tree.is_some());
+    }
+
+    #[test]
     fn types_are_non_exhaustive_and_public() {
         // Compile-time surface check.
         let _f: Frame = Frame::CommandSub;
