@@ -270,36 +270,20 @@ fn cursor_to_completion(
     shell: &mut Shell,
 ) -> (usize, Vec<Candidate>) {
     let has_slash = cursor.word.contains('/');
-    // Variable — inner ${…}/$((…))/$name context always won in the capture. The
-    // name ends at the cursor, but `word_start` points at the `$` for a bare
-    // `$name` (parse_recover reports the DollarName token's offset). Anchor at the
-    // name's start so the completion replaces `name`, keeping the `$`.
+    // Variable — inner ${…}/$((…))/$name context always won in the capture.
+    // `word_start` anchors at the name's first char (past the `$`/`${`/arith
+    // sigil), so the completion replaces `name` and keeps the sigil.
     if cursor.position == WordPosition::VariableName {
         let names: Vec<String> = shell.completion_var_names();
-        let anchor = pos.saturating_sub(cursor.word.len());
         return (
-            anchor,
+            cursor.word_start,
             append_trailing_space_non_dir(complete_variable(&cursor.word, &names)),
         );
     }
-    // Command-vs-argument for an EMPTY cursor word: parse_recover's `cmd_word`
-    // flag lags at a whitespace-terminated boundary (`ls ` reports Command, but
-    // the cursor is at the first ARGUMENT; `echo hi; ` reports Argument, but the
-    // cursor is at a new COMMAND). For an empty word derive the position from the
-    // current simple command's leading word: a keyword (or none — right after a
-    // separator) means the next word is a command, otherwise it is an argument.
-    let is_command_pos = if cursor.word.is_empty()
-        && matches!(
-            cursor.position,
-            WordPosition::Command | WordPosition::Argument
-        ) {
-        match dispatch::extract_command_name(&line[..pos]) {
-            None => true,
-            Some(cmd) => COMPLETION_KEYWORDS.contains(&cmd.as_str()),
-        }
-    } else {
-        cursor.position == WordPosition::Command && !has_slash
-    };
+    // Command-vs-argument comes straight from the parser: `parse_recover` reports
+    // the EXPECTED next slot even at an empty whitespace boundary (`ls ` → Argument,
+    // `echo hi; ` → Command), so the mapper trusts `cursor.position` directly.
+    let is_command_pos = cursor.position == WordPosition::Command && !has_slash;
     if is_command_pos {
         // Preserve the existing `-E` empty-command-line spec fallback.
         if cursor.word.is_empty()
@@ -320,13 +304,12 @@ fn cursor_to_completion(
         );
     }
     // Argument — file completion + programmable-spec lookup (matches the old
-    // File-context spec path). A registered spec is consulted for a true
-    // `Argument` position AND for an empty word reclassified to argument above
-    // (`ls <TAB>`); Command-with-`/`, RedirectTarget, and AssignRhs resolve to
-    // plain file completion only.
+    // File-context spec path). A registered spec is consulted for an `Argument`
+    // position (including the empty trailing word `ls <TAB>`, which the parser now
+    // reports as Argument directly); Command-with-`/`, RedirectTarget, and
+    // AssignRhs resolve to plain file completion only.
     let (dir, prefix, anchor) = split_word_anchor(&cursor.word, cursor.word_start);
-    let consult_spec = cursor.position == WordPosition::Argument
-        || (cursor.word.is_empty() && cursor.position == WordPosition::Command);
+    let consult_spec = cursor.position == WordPosition::Argument;
     if consult_spec {
         let cmd_name = dispatch::extract_command_name(&line[..pos]).unwrap_or_default();
         let spec_opt = shell
@@ -1567,6 +1550,45 @@ mod tests {
         assert!(
             c.iter().any(|x| x.display == "HOMESENTINEL"),
             "arith → variables"
+        );
+    }
+
+    #[test]
+    fn dispatch_empty_word_after_command_yields_files_not_commands() {
+        // Gap A: `ls <SP>` (empty trailing word after a command word) is the first
+        // ARGUMENT — file completion, NOT the command list. (The old lagged
+        // `cmd_word` flag reported Command here and listed every executable.)
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("uniqarg.txt"), b"x").unwrap();
+        let _g = crate::test_support::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let mut sh = Shell::new();
+        let (_s, c) = dispatch::resolve("ls ", 3, &mut sh);
+        std::env::set_current_dir(prev).unwrap();
+        assert!(
+            c.iter().any(|x| x.display.starts_with("uniqarg")),
+            "`ls <SP>` → files: {:?}",
+            c.iter().map(|x| &x.display).collect::<Vec<_>>()
+        );
+        assert!(
+            !c.iter().any(|x| x.display == "while"),
+            "`ls <SP>` must NOT list commands"
+        );
+    }
+
+    #[test]
+    fn dispatch_empty_word_after_separator_yields_commands() {
+        // Gap A: `echo hi; <SP>` starts a NEW command — command completion, not the
+        // previous command's argument/file position.
+        let mut sh = Shell::new();
+        let (_s, c) = dispatch::resolve("echo hi; ", 9, &mut sh);
+        assert!(
+            c.iter().any(|x| x.display == "while"),
+            "`echo hi; <SP>` → commands: {:?}",
+            c.iter().map(|x| &x.display).collect::<Vec<_>>()
         );
     }
 

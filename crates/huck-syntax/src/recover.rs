@@ -417,6 +417,54 @@ mod tests {
     }
 
     #[test]
+    fn cursor_empty_trailing_word_reports_expected_next_slot() {
+        // Gap A (iteration 2): at a whitespace boundary with an EMPTY cursor word,
+        // the position reflects the grammar slot the NEXT word would occupy, not
+        // the last consumed word's slot.
+        // After a command word → the next word is an argument.
+        for src in ["echo ", "ls ", "echo hi ", "for x in "] {
+            let c = ctx(src);
+            assert_eq!(c.position, WordPosition::Argument, "{src:?}");
+            assert_eq!(c.word, "", "{src:?} empty word");
+        }
+        // After a command separator → a new command begins.
+        for src in ["echo hi; ", "echo hi |", "echo hi | ", "echo hi && "] {
+            let c = ctx(src);
+            assert_eq!(c.position, WordPosition::Command, "{src:?}");
+            assert_eq!(c.word, "", "{src:?} empty word");
+        }
+        // Already-correct empty-boundary slots stay put.
+        assert_eq!(ctx("if ").position, WordPosition::Command);
+        assert_eq!(ctx("cat foo > ").position, WordPosition::RedirectTarget);
+    }
+
+    #[test]
+    fn cursor_nonempty_word_slot_unchanged_by_gap_a() {
+        // The non-empty cases must NOT regress.
+        assert_eq!(ctx("whi").position, WordPosition::Command);
+        assert_eq!(ctx("if whi").position, WordPosition::Command);
+        assert_eq!(ctx("echo $(whi").position, WordPosition::Command);
+        assert_eq!(ctx("echo whi").position, WordPosition::Argument);
+        assert_eq!(ctx("for x in whi").position, WordPosition::Argument);
+    }
+
+    #[test]
+    fn cursor_variable_word_start_skips_sigil() {
+        // Gap B (iteration 2): `word_start` anchors at the first NAME char, past the
+        // `$` / `${` / arith-operand sigil — consistent with `word` (which excludes
+        // the sigil).
+        let c = ctx("echo $HO");
+        assert_eq!(c.word, "HO");
+        assert_eq!(c.word_start, 6, "past `$`");
+        let c = ctx("echo ${HO");
+        assert_eq!(c.word, "HO");
+        assert_eq!(c.word_start, 7, "past the braced sigil");
+        let c = ctx("echo $(( HO");
+        assert_eq!(c.word, "HO");
+        assert_eq!(c.word_start, 9, "at the `HO` operand");
+    }
+
+    #[test]
     fn cursor_word_and_start() {
         let c = ctx("echo $(whi");
         assert_eq!(c.word, "whi");

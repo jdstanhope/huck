@@ -1657,7 +1657,15 @@ impl<'a> Lexer<'a> {
                         // First atom seen scanning backward == the rightmost atom.
                         last_is_dollar_name = is_dollar;
                     }
-                    pieces.push((tok.span.offset, text));
+                    // Gap B (iteration 2): a `$name` (`DollarName`) atom's span
+                    // starts at the `$` sigil, but the `text` we push is the bare
+                    // NAME (`$` excluded). The contract is `word_start` = the byte
+                    // offset where `word` begins, so skip the 1-byte `$` sigil for
+                    // a `DollarName` so a bare `$HO` anchors at the `H`, not the `$`
+                    // (`${…}`/arith operands already anchor at the name). No effect
+                    // when the atom is not the leftmost of the trailing run.
+                    let off = tok.span.offset + if is_dollar { 1 } else { 0 };
+                    pieces.push((off, text));
                 }
                 None => break,
             }
