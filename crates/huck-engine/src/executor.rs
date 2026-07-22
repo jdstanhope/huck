@@ -1826,6 +1826,7 @@ fn run_for_inner(
             };
             xtrace_compound(shell, &body);
         }
+        let _ = crate::traps::fire_debug_trap(shell);
         if let Some(o) = check_interrupt(shell) {
             return o;
         }
@@ -2018,6 +2019,10 @@ fn run_arith_for_inner(
             ),
         );
     }
+    // bash fires DEBUG before the init section unconditionally — an empty
+    // `for ((;;))` init still fires (verified vs bash 5.2.21). Decision
+    // ignored (#262).
+    let _ = crate::traps::fire_debug_trap(shell);
     if let Some(init) = &clause.init
         && let Err(e) = crate::expand::eval_arith_word(init, shell)
     {
@@ -2041,6 +2046,8 @@ fn run_arith_for_inner(
                 &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(c)),
             );
         }
+        // bash fires DEBUG before each cond evaluation, empty cond included.
+        let _ = crate::traps::fire_debug_trap(shell);
         // 2. Eval cond. Empty cond = always true (matches bash).
         let cond_value = match &clause.cond {
             None => 1,
@@ -2094,6 +2101,8 @@ fn run_arith_for_inner(
                 ),
             );
         }
+        // bash fires DEBUG before each step evaluation, empty step included.
+        let _ = crate::traps::fire_debug_trap(shell);
         if let Some(step) = &clause.step
             && let Err(e) = crate::expand::eval_arith_word(step, shell)
         {
@@ -2190,6 +2199,13 @@ fn run_select_inner(
     let mut show_menu = true;
 
     loop {
+        // v324 (#257): DEBUG fires once per select header (menu display +
+        // prompt), before each body iteration — matches bash's
+        // execute_select_command, which re-runs the DEBUG trap at the top of
+        // each iteration but NOT on an empty-REPLY re-prompt (that's an inner
+        // retry of the same iteration).
+        let _ = crate::traps::fire_debug_trap(shell);
+
         // 3a. PS3 (default "#? ").
         let ps3 = shell.lookup_var("PS3").unwrap_or_else(|| "#? ".to_string());
 
@@ -2348,6 +2364,7 @@ fn run_case_inner(
             crate::expand::reconstruct_word_source(&clause.subject)
         ),
     );
+    let _ = crate::traps::fire_debug_trap(shell);
     let mut last = ExecOutcome::Continue(0);
     let mut i = 0;
     let mut fall_through = false;
@@ -6416,6 +6433,12 @@ fn spawn_pipeline(
     for (i, stage_cmd) in commands.iter().enumerate() {
         let is_last = i == n - 1;
 
+        // v324 (#257): bash fires DEBUG in the PARENT before forking each
+        // pipeline stage, in stage order — its action's output must reach the
+        // terminal, not the pipe, so this must run here (before any fork
+        // below), not inside the forked child. Decision ignored (#262).
+        let _ = crate::traps::fire_debug_trap(shell);
+
         // ---- Assign-only stages: no-op, just pass stdin through as empty ----
         if let Command::Simple(SimpleCommand::Assign(items, aline)) = stage_cmd {
             // In a pipeline, assignment-only stages are a no-op: they don't
@@ -8212,7 +8235,32 @@ pub fn fork_and_run_in_subshell(
         // POSIX: subshells reset traps to default. Clear all huck
         // trap state so the parent's EXIT trap and real-signal traps
         // don't inherit into the child.
+        // v324 (#257): under `set -T` (functrace), bash inherits DEBUG and
+        // RETURN traps into a `( )` SUBSHELL (everything else still resets), so
+        // the subshell's interior commands still fire DEBUG. Restrict this to a
+        // real `Command::Subshell` fork — a PIPELINE STAGE also forks through
+        // this helper, but bash already fired DEBUG for the stage parent-side
+        // (spawn_pipeline), so preserving the trap here too would double-fire.
+        // Signature of `clear_for_subshell` stays unchanged.
+        let preserve_functrace =
+            shell.shell_options.functrace && matches!(cmd, Command::Subshell { .. });
+        let saved_debug = if preserve_functrace {
+            shell.traps.get(&crate::traps::TrapSignal::Debug).cloned()
+        } else {
+            None
+        };
+        let saved_return = if preserve_functrace {
+            shell.traps.get(&crate::traps::TrapSignal::Return).cloned()
+        } else {
+            None
+        };
         crate::traps::clear_for_subshell(shell);
+        if let Some(a) = saved_debug {
+            shell.traps.insert(crate::traps::TrapSignal::Debug, a);
+        }
+        if let Some(a) = saved_return {
+            shell.traps.insert(crate::traps::TrapSignal::Return, a);
+        }
         // Mark this process as a forked subshell so its inner pipelines skip
         // interactive job-control process-grouping (deadlocks on a tty — M-104).
         shell.in_subshell = true;
