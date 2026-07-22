@@ -1826,6 +1826,7 @@ fn run_for_inner(
             };
             xtrace_compound(shell, &body);
         }
+        let _ = crate::traps::fire_debug_trap(shell);
         if let Some(o) = check_interrupt(shell) {
             return o;
         }
@@ -2017,6 +2018,7 @@ fn run_arith_for_inner(
                 crate::expand::reconstruct_word_source_inner(init)
             ),
         );
+        let _ = crate::traps::fire_debug_trap(shell);
     }
     if let Some(init) = &clause.init
         && let Err(e) = crate::expand::eval_arith_word(init, shell)
@@ -2040,6 +2042,7 @@ fn run_arith_for_inner(
                 shell,
                 &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(c)),
             );
+            let _ = crate::traps::fire_debug_trap(shell);
         }
         // 2. Eval cond. Empty cond = always true (matches bash).
         let cond_value = match &clause.cond {
@@ -2093,6 +2096,7 @@ fn run_arith_for_inner(
                     crate::expand::reconstruct_word_source_inner(step)
                 ),
             );
+            let _ = crate::traps::fire_debug_trap(shell);
         }
         if let Some(step) = &clause.step
             && let Err(e) = crate::expand::eval_arith_word(step, shell)
@@ -2190,6 +2194,13 @@ fn run_select_inner(
     let mut show_menu = true;
 
     loop {
+        // v324 (#257): DEBUG fires once per select header (menu display +
+        // prompt), before each body iteration — matches bash's
+        // execute_select_command, which re-runs the DEBUG trap at the top of
+        // each iteration but NOT on an empty-REPLY re-prompt (that's an inner
+        // retry of the same iteration).
+        let _ = crate::traps::fire_debug_trap(shell);
+
         // 3a. PS3 (default "#? ").
         let ps3 = shell.lookup_var("PS3").unwrap_or_else(|| "#? ".to_string());
 
@@ -2348,6 +2359,7 @@ fn run_case_inner(
             crate::expand::reconstruct_word_source(&clause.subject)
         ),
     );
+    let _ = crate::traps::fire_debug_trap(shell);
     let mut last = ExecOutcome::Continue(0);
     let mut i = 0;
     let mut fall_through = false;
