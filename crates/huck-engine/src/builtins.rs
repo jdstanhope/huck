@@ -7645,7 +7645,13 @@ pub(crate) fn run_sourced_contents_in_sinks(
     // `process_line_in_sinks` call, independent of what this wrapper cleared.
     let saved_eval_frame = shell.eval_frame;
     shell.eval_frame = None;
+    // v325 (#266): a sourced file has its OWN line numbering; the piped-stdin
+    // cumulative base (`stdin_line_base`) must not bleed into it via
+    // `line_base()`'s stdin fallback (same reset discipline as `eval_frame`).
+    let saved_stdin_base = shell.stdin_line_base;
+    shell.stdin_line_base = 0;
     let result = run_sourced_contents_in_sinks_inner(contents, _path, shell, sink, err_sink);
+    shell.stdin_line_base = saved_stdin_base;
     shell.eval_frame = saved_eval_frame;
     result
 }

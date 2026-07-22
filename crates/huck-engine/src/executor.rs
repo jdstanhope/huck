@@ -4007,6 +4007,10 @@ pub(crate) fn call_function(
     // reframe (e.g. a DEBUG trap firing `func $LINENO`) doesn't shift the
     // function's own $LINENO; restore it below.
     let saved_eval_frame = shell.eval_frame.take();
+    // v325 (#266): likewise clear the piped-stdin cumulative base for the body
+    // so `line_base()`'s stdin fallback doesn't add the caller's stream
+    // position to the function's own (definition-relative) line numbering.
+    let saved_stdin_base = std::mem::take(&mut shell.stdin_line_base);
     shell.positional_args = args;
     let frame = crate::shell_state::Frame {
         funcname: name.to_string(),
@@ -4053,6 +4057,7 @@ pub(crate) fn call_function(
     shell.getopts_sp = saved_getopts_sp;
     shell.getopts_optind_cache = saved_getopts_optind_cache;
     shell.eval_frame = saved_eval_frame;
+    shell.stdin_line_base = saved_stdin_base;
     match result {
         ExecOutcome::FunctionReturn(n) => ExecOutcome::Continue(n),
         other => other,

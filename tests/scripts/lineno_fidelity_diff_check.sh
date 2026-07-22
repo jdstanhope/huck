@@ -20,8 +20,13 @@ HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
 PASS=0; FAIL=0
 
 LF_TMPDIR=$(mktemp -d)
-cleanup_lf_tmpdir() { rm -rf "$LF_TMPDIR"; }
+cleanup_lf_tmpdir() { rm -rf "$LF_TMPDIR" /tmp/v325_srcd.sh; }
 trap cleanup_lf_tmpdir EXIT
+
+# A sourced file at a fixed path (referenced by the "source keeps own lineno"
+# case below): its OWN $LINENO must stay 1,2 regardless of the outer script's
+# piped-stdin cumulative line position.
+printf 'echo S$LINENO\necho S$LINENO\n' > /tmp/v325_srcd.sh
 
 check_file() {
     local label="$1" frag="$2" f b h
@@ -93,6 +98,20 @@ check_file "case header lineno" 'trap '\''echo L$LINENO'\'' DEBUG
 case a in
 a) echo m;;
 esac'
+
+# v325 review fixes (#266): nested line-contexts must NOT inherit the piped-stdin
+# cumulative base. A sourced file uses its own line numbering; a function body
+# uses its definition-relative numbering.
+# /tmp/v325_srcd.sh is two `echo S$LINENO` lines (created before running this harness).
+check_stdin "source keeps own lineno" 'echo $LINENO
+. /tmp/v325_srcd.sh
+echo $LINENO'
+check_stdin "function body lineno" 'f() {
+echo $LINENO
+}
+echo $LINENO
+f
+echo $LINENO'
 
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
