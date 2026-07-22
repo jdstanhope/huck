@@ -135,13 +135,32 @@ pub fn fire_debug_trap(shell: &mut Shell) -> DebugDecision {
     if shell.current_lineno != 0 {
         shell.eval_frame = Some(shell.current_lineno);
     }
+    // Save $? across the trap firing: like bash's other traps, the DEBUG
+    // action's own commands run in their own status context, but the
+    // pending command (or, on Proceed, the command right after) must still
+    // see the ORIGINAL $? — not whatever the trap action itself last set.
+    // `debug_decision` reads the action's own status (captured below, before
+    // the restore) purely to decide Proceed/Skip/Return; that decision does
+    // not leak into the surface $?.
+    let saved_status = shell.last_status();
     let prev_firing = shell.firing_trap.replace(TrapSignal::Debug);
     let _ = crate::shell::process_line(&action, shell, false);
     shell.firing_trap = prev_firing;
     shell.eval_frame = prev_frame;
 
-    let in_subroutine = !shell.call_stack.is_empty() || shell.source_depth > 0;
-    debug_decision(shell.extdebug(), shell.last_status(), in_subroutine)
+    // "In a subroutine" for the return-2 simulation means a context where
+    // `return` is legal — a function or a sourced script — NOT the main script
+    // (whose base "main" frame is always present). Same predicate the `return`
+    // builtin uses to reject a top-level `return`.
+    let in_subroutine = shell.call_stack.iter().any(|f| {
+        matches!(
+            f.kind,
+            crate::shell_state::FrameKind::Function | crate::shell_state::FrameKind::Source
+        )
+    });
+    let decision = debug_decision(shell.extdebug(), shell.last_status(), in_subroutine);
+    shell.set_last_status(saved_status);
+    decision
 }
 
 /// Fires the RETURN pseudo-signal trap. Repeatable; recursion-guarded.
