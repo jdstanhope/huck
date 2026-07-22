@@ -154,6 +154,25 @@ use std::path::PathBuf;
 /// `home`). `prefix` is the filename fragment. Directory results get a
 /// trailing `/`; `replacement` is metacharacter-escaped.
 pub fn complete_file(dir: &str, prefix: &str, home: &str) -> Vec<Candidate> {
+    complete_file_filtered(dir, prefix, home, false)
+}
+
+/// File completion for a command word that is a PATH (`./x`, `bin/x`,
+/// `/usr/bin/l`). bash restricts command-position path completion to
+/// **executables + directories** (non-executable regular files are excluded),
+/// unlike an argument path which offers every file. #250.
+pub fn complete_command_path(dir: &str, prefix: &str, home: &str) -> Vec<Candidate> {
+    complete_file_filtered(dir, prefix, home, true)
+}
+
+/// Shared file-completion scan. When `executables_only` is true, a non-directory
+/// entry is kept only if it has an executable bit (command-position paths).
+fn complete_file_filtered(
+    dir: &str,
+    prefix: &str,
+    home: &str,
+    executables_only: bool,
+) -> Vec<Candidate> {
     let Some(scan_dir) = resolve_dir(dir, home) else {
         return Vec::new();
     };
@@ -178,6 +197,10 @@ pub fn complete_file(dir: &str, prefix: &str, home: &str) -> Vec<Candidate> {
         let is_dir = std::fs::metadata(entry.path())
             .map(|m| m.is_dir())
             .unwrap_or(false);
+        // Command-position paths keep only executables and directories.
+        if executables_only && !is_dir && !is_executable_file(&entry) {
+            continue;
+        }
         let mut display = name.to_string();
         let mut replacement = escape_filename(name);
         let kind = if is_dir {
@@ -326,13 +349,17 @@ fn cursor_to_completion(
             );
         }
     }
-    // Plain file completion (Argument-no-spec, Command-with-`/`, RedirectTarget,
-    // AssignRhs). Anchored after the last `/`; dirs get `/`, files get a space.
+    // File completion. A Command-position path (`./x`, `bin/x`) reached here
+    // because it has a `/`; bash restricts it to executables + directories
+    // (#250). Argument-no-spec, RedirectTarget, and AssignRhs offer every file.
+    // Anchored after the last `/`; dirs get `/`, files get a space.
     let home = shell.get("HOME").unwrap_or("").to_string();
-    (
-        anchor,
-        append_trailing_space_non_dir(complete_file(&dir, &prefix, &home)),
-    )
+    let cands = if cursor.position == WordPosition::Command {
+        complete_command_path(&dir, &prefix, &home)
+    } else {
+        complete_file(&dir, &prefix, &home)
+    };
+    (anchor, append_trailing_space_non_dir(cands))
 }
 
 pub mod dispatch {
@@ -1028,6 +1055,39 @@ mod tests {
         assert!(
             !names.contains(&"huckcmd_subdir"),
             "subdir should not match"
+        );
+    }
+
+    #[test]
+    fn complete_command_path_keeps_executables_and_dirs_only() {
+        // A command word that is a PATH (`./x`, `bin/x`) completes to
+        // executables + directories only — bash excludes non-executable files
+        // in command position, unlike an argument path. #250.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("pfx_exe");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = dir.path().join("pfx_plain.txt");
+        std::fs::write(&plain, b"data").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::create_dir(dir.path().join("pfx_dir")).unwrap();
+
+        let scan = format!("{}/", dir.path().to_str().unwrap());
+        let cands = complete_command_path(&scan, "pfx_", "");
+        let disp: Vec<&str> = cands.iter().map(|c| c.display.as_str()).collect();
+        assert!(disp.contains(&"pfx_exe"), "executable kept: {disp:?}");
+        assert!(disp.contains(&"pfx_dir/"), "directory kept: {disp:?}");
+        assert!(
+            !disp.iter().any(|d| d.starts_with("pfx_plain")),
+            "non-executable file excluded in command position: {disp:?}"
+        );
+        // The unfiltered file completer still offers the plain file (argument path).
+        let allf = complete_file(&scan, "pfx_", "");
+        assert!(
+            allf.iter().any(|c| c.display.starts_with("pfx_plain")),
+            "argument-path file completion still offers the plain file: {:?}",
+            allf.iter().map(|c| &c.display).collect::<Vec<_>>()
         );
     }
 
