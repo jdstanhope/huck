@@ -106,7 +106,23 @@ pub enum DebugDecision {
    - `status == 2 && in_subroutine(shell)` → `ReturnFromSub(2)`.
    - otherwise (extdebug + non-zero) → `SkipCommand`.
 
-where `in_subroutine(shell) = !shell.call_stack.is_empty() || shell.source_depth > 0`.
+where `in_subroutine(shell)` is true iff a `return` would be legal here.
+
+> **CORRECTION (during implementation).** The definition above —
+> `!call_stack.is_empty() || source_depth > 0` — is WRONG: the main script
+> always carries a base `"main"` frame, so `!call_stack.is_empty()` is always
+> true, which made an extdebug status-2 at the top level of a *script file*
+> wrongly simulate a return and abort the whole script (bash skips one command
+> there — a script run as an argument is not a returnable subroutine). It also
+> only surfaced in script-file mode, so the `-c` bash-diff harness missed it;
+> running the real `dbg-support2` category caught it. The correct predicate is
+> the same one the `return` builtin uses to reject a top-level `return`:
+> `call_stack.iter().any(|f| matches!(f.kind, FrameKind::Function | FrameKind::Source))`.
+> Separately, the `$LINENO` reframe leaked into a function the action calls
+> (its own `$LINENO` shifted by the eval-frame base); the fix was to
+> save/clear/restore `eval_frame` across a function body in `call_function`
+> (a general correctness improvement — a function's `$LINENO` is its own
+> absolute-source line, independent of any caller eval/DEBUG reframe).
 
 `RETURN`/`ERR`/real-signal traps keep the existing `fire_pseudo_trap` path
 (status-agnostic); only DEBUG needs the decision. `fire_debug_trap`'s two
