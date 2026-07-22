@@ -8857,101 +8857,75 @@ mod tests {
     }
 
     // ── v321 (#253): enclosing_dquote gates the nested-`"…"` backslash arm ────
+    //
+    // These are LEXER-ONLY tests: they drive `Mode::ParamWordOperand` directly
+    // via `operand_atoms` (as the `operand_*` tests above do) and assert on the
+    // emitted `Lit` atoms. The `enclosing_dquote` flag — which the parser sets
+    // from the outer-quote context when it pushes the operand mode — is set
+    // here explicitly, so these tests never reach into the parser (the parser
+    // drives the lexer, not the reverse). The end-to-end behavior with the
+    // parser deciding `enclosing_dquote` is covered by
+    // `tests/scripts/rhs_exp_nested_quote_diff_check.sh`.
 
-    /// Parse `src` as a full command (via `parser::parse_sequence`, the
-    /// production front-end discipline — see `pull_surfaces_lex_error_as_err`
-    /// above) and return the bare command-word `Word` (`ExecCommand::program`).
-    /// The test sources are themselves the sole command word, e.g.
-    /// `"${v:+a="\p"}"`.
-    fn parse_word(src: &str) -> Word {
-        let empty = std::collections::HashMap::new();
-        let mut lx = Lexer::new(src, &empty, LexerOptions::default());
-        let seq = crate::parser::parse_sequence(&mut lx)
-            .expect("parse error")
-            .expect("empty sequence");
-        // A bare command word parses as a one-stage Pipeline wrapping the Exec.
-        let cmd = match seq.first {
-            crate::command::Command::Pipeline(p) if p.commands.len() == 1 => {
-                p.commands.into_iter().next().unwrap()
-            }
-            other => other,
-        };
-        match cmd {
-            crate::command::Command::Simple(crate::command::SimpleCommand::Exec(exec)) => {
-                exec.program
-            }
-            other => panic!("expected a bare Exec command word, got {other:?}"),
-        }
-    }
-
-    /// Recursively concatenate every `Literal` part's text, descending into
-    /// `Quoted` runs and into the operand `Word` of the value-family
-    /// `ParamModifier`s (`-`/`:-`, `=`/`:=`, `?`/`:?`, `+`/`:+`) so a nested
-    /// `"…"` span's literals show up in source order alongside the rest.
-    fn collect_literals(parts: &[WordPart], out: &mut String) {
-        for p in parts {
-            match p {
-                WordPart::Literal { text, .. } => out.push_str(text),
-                WordPart::Quoted { parts, .. } => collect_literals(parts, out),
-                WordPart::ParamExpansion { modifier, .. } => match modifier {
-                    ParamModifier::UseDefault { word, .. }
-                    | ParamModifier::AssignDefault { word, .. }
-                    | ParamModifier::ErrorIfUnset { word, .. }
-                    | ParamModifier::UseAlternate { word, .. } => {
-                        collect_literals(&word.0, out);
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-        }
-    }
-
-    fn literal_texts(word: &Word) -> String {
-        let mut out = String::new();
-        collect_literals(&word.0, &mut out);
-        out
+    /// Concatenate the text of every `Lit` atom in an operand atom stream.
+    fn operand_lit_text(atoms: &[TokenKind]) -> String {
+        atoms
+            .iter()
+            .filter_map(|t| match t {
+                TokenKind::Lit { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
     fn param_value_nested_dquote_backslash_strips_when_enclosing_dquoted() {
-        // Outer `${…}` is itself double-quoted: the nested `"\p"` span's
-        // backslash before a non-special char is DROPPED (`\p` → `p`),
-        // matching bash 5.2.21.
-        let word = parse_word(r#""${v:+a="\p"}""#);
-        let text = literal_texts(&word);
-        assert!(
-            text.contains("a=p"),
-            "backslash should be stripped: {text:?}"
+        // `enclosing_dquote: true` models `"…${v:+a="\p"}…"`: inside the nested
+        // `"…"` span a backslash before a non-special char is DROPPED (`\p`→`p`),
+        // matching bash 5.2.21. Operand body is the text after `:+`.
+        let atoms = operand_atoms(
+            r#"a="\p"}"#,
+            Mode::ParamWordOperand {
+                in_dquote: false,
+                enclosing_dquote: true,
+            },
         );
-        assert!(
-            !text.contains("a=\\p"),
-            "backslash should NOT survive: {text:?}"
-        );
+        assert_eq!(operand_lit_text(&atoms), "a=p", "{atoms:?}");
     }
 
     #[test]
     fn param_value_nested_dquote_backslash_kept_when_enclosing_unquoted() {
-        // Outer `${…}` is UNQUOTED: standard double-quote rules apply inside
-        // the nested `"…"` span, so the backslash before a non-special char
-        // is KEPT (`\p` → `\p`).
-        let word = parse_word(r#"${v:+a="\p"}"#);
-        let text = literal_texts(&word);
-        assert!(text.contains("a=\\p"), "backslash should be kept: {text:?}");
+        // `enclosing_dquote: false` models an UNQUOTED outer `${v:+a="\p"}`:
+        // standard double-quote rules keep the backslash (`\p`→`\p`).
+        let atoms = operand_atoms(
+            r#"a="\p"}"#,
+            Mode::ParamWordOperand {
+                in_dquote: false,
+                enclosing_dquote: false,
+            },
+        );
+        assert_eq!(operand_lit_text(&atoms), r"a=\p", "{atoms:?}");
     }
 
     #[test]
     fn param_value_nested_dquote_special_backslash_unchanged() {
-        // `\$` in the nested span is dropped under BOTH quoted and unquoted
-        // enclosing context — this guards the untouched SPECIAL arm
-        // (`$`/backtick/`"`/`\`), which already drops the backslash either way.
-        let quoted = literal_texts(&parse_word(r#""${v:+x="\$"}""#));
-        assert!(quoted.contains("x=$"), "{quoted:?}");
-        assert!(!quoted.contains("x=\\$"), "{quoted:?}");
-
-        let unquoted = literal_texts(&parse_word(r#"${v:+x="\$"}"#));
-        assert!(unquoted.contains("x=$"), "{unquoted:?}");
-        assert!(!unquoted.contains("x=\\$"), "{unquoted:?}");
+        // `\$` in the nested span → `$` under BOTH enclosing contexts — guards
+        // the untouched SPECIAL arm (`$`/`` ` ``/`"`/`\`), which drops the
+        // backslash regardless of `enclosing_dquote`.
+        for enclosing_dquote in [true, false] {
+            let atoms = operand_atoms(
+                r#"x="\$"}"#,
+                Mode::ParamWordOperand {
+                    in_dquote: false,
+                    enclosing_dquote,
+                },
+            );
+            assert_eq!(
+                operand_lit_text(&atoms),
+                "x=$",
+                "enclosing_dquote={enclosing_dquote}: {atoms:?}"
+            );
+        }
     }
 }
 
