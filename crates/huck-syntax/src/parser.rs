@@ -1582,9 +1582,16 @@ fn zero_lines_in_command(cmd: &mut Command) {
             zero_lines_in_sequence(&mut clause.condition);
             zero_lines_in_sequence(&mut clause.body);
         }
-        Command::For(clause) => zero_lines_in_sequence(&mut clause.body),
-        Command::Select(clause) => zero_lines_in_sequence(&mut clause.body),
+        Command::For(clause) => {
+            clause.line = 0;
+            zero_lines_in_sequence(&mut clause.body);
+        }
+        Command::Select(clause) => {
+            clause.line = 0;
+            zero_lines_in_sequence(&mut clause.body);
+        }
         Command::Case(clause) => {
+            clause.line = 0;
             for item in &mut clause.items {
                 if let Some(b) = &mut item.body {
                     zero_lines_in_sequence(b);
@@ -1594,7 +1601,10 @@ fn zero_lines_in_command(cmd: &mut Command) {
         Command::FunctionDef { body, .. } => zero_lines_in_command(body),
         Command::DoubleBracket { .. } => {} // no line field in TestExpr
         Command::Arith(_) => {}
-        Command::ArithFor(clause) => zero_lines_in_sequence(&mut clause.body),
+        Command::ArithFor(clause) => {
+            clause.line = 0;
+            zero_lines_in_sequence(&mut clause.body);
+        }
         Command::Redirected { inner, .. } => zero_lines_in_command(inner),
         Command::Coproc { body, .. } => zero_lines_in_command(body),
     }
@@ -4603,6 +4613,7 @@ fn parse_arith_for_body(iter: &mut Lexer) -> Result<Vec<Word>, ParseError> {
 /// `Mode::Arith` unterminated-arith lex error (EOF before `))`) ⇒ `UnterminatedLoop`,
 /// matching the oracle's `for ((` fallback.
 fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
+    let line = iter.current_line()?;
     iter.next_kind()?; // first `(`
     iter.next_kind()?; // second `(`
     iter.push_mode(Mode::Arith {
@@ -4636,6 +4647,7 @@ fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
             cond,
             step,
             body,
+            line,
         })),
         iter,
     )
@@ -4645,6 +4657,7 @@ fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
 /// `parse_for_command`/`parse_for_after_keyword` (~1487/1537) in `command.rs`.
 /// C-style `for ((...))` (ArithFor) is parsed via `parse_arith_for_clause`.
 fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
+    let line = iter.current_line()?;
     expect_keyword(iter, Keyword::For, ParseError::UnterminatedLoop)?;
 
     // Skip inter-token blanks + newlines so `for ((...))` / `for\n((...))` are
@@ -4742,6 +4755,7 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
             words,
             has_in,
             body,
+            line,
         })),
         iter,
     )
@@ -4752,6 +4766,7 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
 /// `words: Option<Vec<Word>>` to distinguish the no-`in` form (`None`) from an
 /// explicit `in` clause (`Some`, possibly empty).
 fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
+    let line = iter.current_line()?;
     expect_keyword(iter, Keyword::Select, ParseError::UnterminatedLoop)?;
 
     // Read the loop variable name (assembled from atoms).
@@ -4822,7 +4837,12 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
     }
     let body = parse_do_body_done(iter)?;
     maybe_wrap_redirects(
-        Command::Select(Box::new(SelectClause { var, words, body })),
+        Command::Select(Box::new(SelectClause {
+            var,
+            words,
+            body,
+            line,
+        })),
         iter,
     )
 }
@@ -4830,6 +4850,7 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
 /// Parses `case WORD in [clause]... esac`.  Mirrors `parse_case` (~1673) in
 /// `command.rs`.  Returns `Command::Case(Box::new(CaseClause{subject, items}))`.
 fn parse_case(iter: &mut Lexer) -> Result<Command, ParseError> {
+    let line = iter.current_line()?;
     expect_keyword(iter, Keyword::Case, ParseError::UnterminatedCase)?;
     skip_newlines(iter)?;
 
@@ -4871,7 +4892,14 @@ fn parse_case(iter: &mut Lexer) -> Result<Command, ParseError> {
         }
         expect_or_recover(iter, Keyword::Esac, ParseError::UnterminatedCase)?;
     }
-    maybe_wrap_redirects(Command::Case(Box::new(CaseClause { subject, items })), iter)
+    maybe_wrap_redirects(
+        Command::Case(Box::new(CaseClause {
+            subject,
+            items,
+            line,
+        })),
+        iter,
+    )
 }
 
 /// Parses one `[(] pattern [| pattern]... ) [body] [terminator]` clause.

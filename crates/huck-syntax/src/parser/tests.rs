@@ -4296,3 +4296,61 @@ fn cmdword_unclosed_bracket_eq_leaks_no_stale_flag() {
         assert_eq!(got_args, args, "{src:?}: args mismatch");
     }
 }
+
+// ── v325 T3 (#261): compound clauses carry a source line ────────────────
+
+/// A parsed top-level `for`/`select`/`case`/arith-for clause carries the
+/// keyword's 1-based source line (used to stamp `$LINENO` before each
+/// compound-header DEBUG-trap fire); `zero_lines_in_command` (run on a
+/// `$(...)` command-substitution body, matching the production oracle's
+/// span-zeroing) resets it back to 0.
+#[test]
+fn compound_clause_line_captured_and_zeroed_in_comsub() {
+    let for_src = "x=1\nfor i in 1 2\ndo\n:\ndone";
+    let seq = parse(for_src).expect("parse").expect("non-empty");
+    let Command::For(clause) = &seq.rest[0].1 else {
+        panic!("expected Command::For, got {:?}", seq.rest[0].1);
+    };
+    assert_eq!(clause.line, 2, "for header line");
+
+    let case_src = "x=1\ncase a in\na) : ;;\nesac";
+    let seq = parse(case_src).expect("parse").expect("non-empty");
+    let Command::Case(clause) = &seq.rest[0].1 else {
+        panic!("expected Command::Case, got {:?}", seq.rest[0].1);
+    };
+    assert_eq!(clause.line, 2, "case header line");
+
+    let select_src = "x=1\nselect i in a b\ndo\n:\ndone";
+    let seq = parse(select_src).expect("parse").expect("non-empty");
+    let Command::Select(clause) = &seq.rest[0].1 else {
+        panic!("expected Command::Select, got {:?}", seq.rest[0].1);
+    };
+    assert_eq!(clause.line, 2, "select header line");
+
+    let arith_for_src = "x=1\nfor ((i=0;i<2;i++))\ndo\n:\ndone";
+    let seq = parse(arith_for_src).expect("parse").expect("non-empty");
+    let Command::ArithFor(clause) = &seq.rest[0].1 else {
+        panic!("expected Command::ArithFor, got {:?}", seq.rest[0].1);
+    };
+    assert_eq!(clause.line, 2, "arith-for header line");
+
+    // Zeroed on the `$(...)` line-stripping path (mirrors ExecCommand.line).
+    let comsub_src = "echo $(for i in 1 2\ndo\n:\ndone)";
+    let seq = parse(comsub_src).expect("parse").expect("non-empty");
+    let Command::Pipeline(p) = &seq.first else {
+        panic!("expected Pipeline, got {:?}", seq.first);
+    };
+    let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else {
+        panic!("expected Exec, got {:?}", p.commands[0]);
+    };
+    let word = &e.args[0];
+    let found = word.0.iter().find_map(|part| match part {
+        WordPart::CommandSub { sequence, .. } => Some(sequence),
+        _ => None,
+    });
+    let body = found.expect("comsub body");
+    let Command::For(clause) = &body.first else {
+        panic!("expected Command::For inside comsub, got {:?}", body.first);
+    };
+    assert_eq!(clause.line, 0, "for header line zeroed inside $(...)");
+}

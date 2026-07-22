@@ -1826,6 +1826,9 @@ fn run_for_inner(
             };
             xtrace_compound(shell, &body);
         }
+        if clause.line != 0 {
+            shell.current_lineno = shell.line_base() + clause.line;
+        }
         let _ = crate::traps::fire_debug_trap(shell);
         if let Some(o) = check_interrupt(shell) {
             return o;
@@ -2022,6 +2025,9 @@ fn run_arith_for_inner(
     // bash fires DEBUG before the init section unconditionally — an empty
     // `for ((;;))` init still fires (verified vs bash 5.2.21). Decision
     // ignored (#262).
+    if clause.line != 0 {
+        shell.current_lineno = shell.line_base() + clause.line;
+    }
     let _ = crate::traps::fire_debug_trap(shell);
     if let Some(init) = &clause.init
         && let Err(e) = crate::expand::eval_arith_word(init, shell)
@@ -2047,6 +2053,9 @@ fn run_arith_for_inner(
             );
         }
         // bash fires DEBUG before each cond evaluation, empty cond included.
+        if clause.line != 0 {
+            shell.current_lineno = shell.line_base() + clause.line;
+        }
         let _ = crate::traps::fire_debug_trap(shell);
         // 2. Eval cond. Empty cond = always true (matches bash).
         let cond_value = match &clause.cond {
@@ -2102,6 +2111,9 @@ fn run_arith_for_inner(
             );
         }
         // bash fires DEBUG before each step evaluation, empty step included.
+        if clause.line != 0 {
+            shell.current_lineno = shell.line_base() + clause.line;
+        }
         let _ = crate::traps::fire_debug_trap(shell);
         if let Some(step) = &clause.step
             && let Err(e) = crate::expand::eval_arith_word(step, shell)
@@ -2204,6 +2216,9 @@ fn run_select_inner(
         // execute_select_command, which re-runs the DEBUG trap at the top of
         // each iteration but NOT on an empty-REPLY re-prompt (that's an inner
         // retry of the same iteration).
+        if clause.line != 0 {
+            shell.current_lineno = shell.line_base() + clause.line;
+        }
         let _ = crate::traps::fire_debug_trap(shell);
 
         // 3a. PS3 (default "#? ").
@@ -2364,6 +2379,9 @@ fn run_case_inner(
             crate::expand::reconstruct_word_source(&clause.subject)
         ),
     );
+    if clause.line != 0 {
+        shell.current_lineno = shell.line_base() + clause.line;
+    }
     let _ = crate::traps::fire_debug_trap(shell);
     let mut last = ExecOutcome::Continue(0);
     let mut i = 0;

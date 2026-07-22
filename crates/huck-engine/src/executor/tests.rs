@@ -548,6 +548,7 @@ fn for_iterates_each_value_in_order() {
         words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
         has_in: true,
         body: echo_var_seq("x"),
+        line: 0,
     };
     let mut shell = Shell::new();
     let (out, status) = execute_capturing(&for_seq(clause), &mut shell);
@@ -562,6 +563,7 @@ fn for_empty_list_runs_body_zero_times() {
         words: vec![],
         has_in: true,
         body: echo_seq("hi"),
+        line: 0,
     };
     let mut shell = Shell::new();
     let (out, status) = execute_capturing(&for_seq(clause), &mut shell);
@@ -587,6 +589,7 @@ fn for_without_in_iterates_positionals() {
         words: vec![],
         has_in: false,
         body: echo_var_seq("x"),
+        line: 0,
     };
     let mut shell = Shell::new();
     shell.positional_args = vec!["a".to_string(), "b".to_string(), "c".to_string()];
@@ -602,6 +605,7 @@ fn for_variable_holds_last_value_after_loop() {
         words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
         has_in: true,
         body: echo_var_seq("x"),
+        line: 0,
     };
     let mut shell = Shell::new();
     execute_capturing(&for_seq(clause), &mut shell);
@@ -615,6 +619,7 @@ fn for_break_stops_iteration() {
         words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
         has_in: true,
         body: break_seq(),
+        line: 0,
     };
     let mut shell = Shell::new();
     let (_out, status) = execute_capturing(&for_seq(clause), &mut shell);
@@ -649,6 +654,7 @@ fn for_continue_advances_through_all_values() {
         words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
         has_in: true,
         body,
+        line: 0,
     };
     let mut shell = Shell::new();
     let (out, status) = execute_capturing(&for_seq(clause), &mut shell);
@@ -754,6 +760,7 @@ fn case_runs_first_matching_clause() {
             item(&["foo"], Some(echo_seq("matched"))),
             item(&["bar"], Some(echo_seq("other"))),
         ],
+        line: 0,
     };
     let mut shell = Shell::new();
     let (out, status) = execute_capturing(&case_seq(clause), &mut shell);
@@ -766,6 +773,7 @@ fn case_glob_pattern_matches() {
     let clause = CaseClause {
         subject: lit_word("report.txt"),
         items: vec![item(&["*.txt"], Some(echo_seq("text")))],
+        line: 0,
     };
     let mut shell = Shell::new();
     let (out, _) = execute_capturing(&case_seq(clause), &mut shell);
@@ -777,6 +785,7 @@ fn case_alternation_matches_any() {
     let clause = CaseClause {
         subject: lit_word("b"),
         items: vec![item(&["a", "b", "c"], Some(echo_seq("hit")))],
+        line: 0,
     };
     let mut shell = Shell::new();
     let (out, _) = execute_capturing(&case_seq(clause), &mut shell);
@@ -788,6 +797,7 @@ fn case_no_match_is_status_zero_no_output() {
     let clause = CaseClause {
         subject: lit_word("x"),
         items: vec![item(&["y"], Some(echo_seq("nope")))],
+        line: 0,
     };
     let mut shell = Shell::new();
     let (out, status) = execute_capturing(&case_seq(clause), &mut shell);
@@ -800,6 +810,7 @@ fn case_empty_body_is_status_zero() {
     let clause = CaseClause {
         subject: lit_word("x"),
         items: vec![item(&["x"], None)],
+        line: 0,
     };
     let mut shell = Shell::new();
     let (out, status) = execute_capturing(&case_seq(clause), &mut shell);
@@ -820,6 +831,7 @@ fn case_fall_through_runs_next_body() {
             },
             item(&["*"], Some(echo_seq("two"))),
         ],
+        line: 0,
     };
     let mut shell = Shell::new();
     let (out, _) = execute_capturing(&case_seq(clause), &mut shell);
@@ -839,6 +851,7 @@ fn case_continue_match_keeps_testing() {
             },
             item(&["a"], Some(echo_seq("two"))),
         ],
+        line: 0,
     };
     let mut shell = Shell::new();
     let (out, _) = execute_capturing(&case_seq(clause), &mut shell);
@@ -895,6 +908,7 @@ fn case_quoted_metacharacter_matches_literally() {
             body: Some(echo_seq("hit")),
             terminator: CaseTerminator::Break,
         }],
+        line: 0,
     };
     let mut shell = Shell::new();
     let (out_star, _) = execute_capturing(&case_seq(make("*")), &mut shell);

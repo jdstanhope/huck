@@ -83,5 +83,16 @@ eval '\''echo $LINENO
 echo $LINENO
 echo $LINENO'\'''
 
+# --- Task 3: compound-header DEBUG-trap $LINENO (#261) ---
+check_file "for header lineno" 'trap '\''echo L$LINENO'\'' DEBUG
+for x in 1 2
+do
+echo hi
+done'
+check_file "case header lineno" 'trap '\''echo L$LINENO'\'' DEBUG
+case a in
+a) echo m;;
+esac'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
