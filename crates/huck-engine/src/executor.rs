@@ -6428,6 +6428,12 @@ fn spawn_pipeline(
     for (i, stage_cmd) in commands.iter().enumerate() {
         let is_last = i == n - 1;
 
+        // v324 (#257): bash fires DEBUG in the PARENT before forking each
+        // pipeline stage, in stage order — its action's output must reach the
+        // terminal, not the pipe, so this must run here (before any fork
+        // below), not inside the forked child. Decision ignored (#262).
+        let _ = crate::traps::fire_debug_trap(shell);
+
         // ---- Assign-only stages: no-op, just pass stdin through as empty ----
         if let Command::Simple(SimpleCommand::Assign(items, aline)) = stage_cmd {
             // In a pipeline, assignment-only stages are a no-op: they don't
@@ -8224,7 +8230,28 @@ pub fn fork_and_run_in_subshell(
         // POSIX: subshells reset traps to default. Clear all huck
         // trap state so the parent's EXIT trap and real-signal traps
         // don't inherit into the child.
+        // v324 (#257): under `set -T` (functrace), bash inherits DEBUG and
+        // RETURN traps into subshells (everything else still resets). Save
+        // those two actions across the clear and restore them so the
+        // subshell's interior commands still fire DEBUG. Signature of
+        // `clear_for_subshell` stays unchanged.
+        let saved_debug = if shell.shell_options.functrace {
+            shell.traps.get(&crate::traps::TrapSignal::Debug).cloned()
+        } else {
+            None
+        };
+        let saved_return = if shell.shell_options.functrace {
+            shell.traps.get(&crate::traps::TrapSignal::Return).cloned()
+        } else {
+            None
+        };
         crate::traps::clear_for_subshell(shell);
+        if let Some(a) = saved_debug {
+            shell.traps.insert(crate::traps::TrapSignal::Debug, a);
+        }
+        if let Some(a) = saved_return {
+            shell.traps.insert(crate::traps::TrapSignal::Return, a);
+        }
         // Mark this process as a forked subshell so its inner pipelines skip
         // interactive job-control process-grouping (deadlocks on a tty — M-104).
         shell.in_subshell = true;
