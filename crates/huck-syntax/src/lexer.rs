@@ -1697,6 +1697,20 @@ impl<'a> Lexer<'a> {
             (String::new(), end)
         } else if pieces.is_empty() {
             (String::new(), end)
+        } else if last_is_dollar_name {
+            // #248 whole-branch review: the rightmost atom is a bare `$name`. Its
+            // completion is only that NAME — the preceding contiguous word segment
+            // (`foo` in `foo$HO`, `a:` in `a:$HO`, `--opt=` in `--opt=$HO`) must
+            // NOT be glued into `word`, or `complete_variable` searches for a
+            // name that includes the segment and finds nothing (and the anchor
+            // clobbers the segment). The `${…}`/arith operand paths isolate the
+            // name via their inner lexer mode; the bare `$name` path has none, so
+            // re-slice to just the `DollarName` (`pieces[0]`, the rightmost atom).
+            // Its offset already skips the `$` sigil (see the +1 above), so this
+            // anchors at the first name char, exactly like the single-segment
+            // `$HO` case.
+            let (off, ref text) = pieces[0];
+            (text.clone(), off)
         } else {
             let start = pieces.last().expect("non-empty").0;
             let text: String = pieces.iter().rev().map(|(_, t)| t.as_str()).collect();

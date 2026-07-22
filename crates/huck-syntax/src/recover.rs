@@ -580,6 +580,30 @@ mod tests {
     }
 
     #[test]
+    fn cursor_dollar_name_glued_after_segment_isolates_the_name() {
+        // A `$name` glued after a preceding word segment completes the NAME only,
+        // anchored at the name (not clobbering the segment). #248 whole-branch
+        // review. `word_start` is the first name char (past the `$` sigil), so it
+        // matches the single-segment `$name` anchor rather than the `$`.
+        for (src, word, start) in [
+            ("echo foo$MYVAR", "MYVAR", 9usize),
+            ("echo a:$MYVAR", "MYVAR", 8),
+            ("echo --opt=$MYVAR", "MYVAR", 12),
+            ("echo ${HOME}$MYVAR", "MYVAR", 13),
+        ] {
+            let c = parse_recover(src).cursor;
+            assert_eq!(c.position, WordPosition::VariableName, "{src:?}");
+            assert_eq!(c.word, word, "{src:?}");
+            assert_eq!(c.word_start, start, "{src:?}");
+        }
+        // Regression guards — single-segment / lone-$ unchanged.
+        let c = parse_recover("echo $MYVAR").cursor;
+        assert_eq!((c.word.as_str(), c.word_start), ("MYVAR", 6));
+        let c = parse_recover("echo $").cursor;
+        assert_eq!((c.word.as_str(), c.word_start), ("", 6));
+    }
+
+    #[test]
     fn types_are_non_exhaustive_and_public() {
         // Compile-time surface check.
         let _f: Frame = Frame::CommandSub;
