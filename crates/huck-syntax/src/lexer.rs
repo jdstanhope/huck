@@ -2718,8 +2718,19 @@ impl<'a> Lexer<'a> {
                             ));
                         }
                         _ => {
-                            let mut s = String::from("\\");
-                            if let Some(ch) = self.cursor.next() {
+                            // v321 (#253): when the enclosing `${…}` is itself double-quoted,
+                            // bash does a second de-quoting pass over a nested `"…"` span in a
+                            // value-family word — a backslash before a NON-special char is
+                            // DROPPED (`\p` → `p`). Outside that context, standard double-quote
+                            // rules keep the backslash (`\p` → `\p`). The special arm above
+                            // (`$` `` ` `` `"` `\`) already drops the backslash under both rules,
+                            // so only this arm is context-dependent.
+                            let next = self.cursor.next();
+                            let mut s = String::new();
+                            if !enclosing_dquote {
+                                s.push('\\');
+                            }
+                            if let Some(ch) = next {
                                 s.push(ch);
                             }
                             self.history.push(Token::new(
@@ -3095,8 +3106,19 @@ impl<'a> Lexer<'a> {
                                     ));
                                 }
                                 _ => {
-                                    let mut s = String::from("\\");
-                                    if let Some(ch) = self.cursor.next() {
+                                    // v321 (#253): same gate as the continuing-span
+                                    // arm below — this is the FIRST char of the nested
+                                    // `"…"` span (forward-progress inlining), so it
+                                    // needs the identical enclosing_dquote treatment or
+                                    // a short nested span like `"\p"` (closing `"`
+                                    // immediately after) never reaches the
+                                    // continuing-span branch at all.
+                                    let next = self.cursor.next();
+                                    let mut s = String::new();
+                                    if !enclosing_dquote {
+                                        s.push('\\');
+                                    }
+                                    if let Some(ch) = next {
                                         s.push(ch);
                                     }
                                     self.history.push(Token::new(
@@ -8832,6 +8854,78 @@ mod tests {
                 quoted: true
             }
         );
+    }
+
+    // ── v321 (#253): enclosing_dquote gates the nested-`"…"` backslash arm ────
+    //
+    // These are LEXER-ONLY tests: they drive `Mode::ParamWordOperand` directly
+    // via `operand_atoms` (as the `operand_*` tests above do) and assert on the
+    // emitted `Lit` atoms. The `enclosing_dquote` flag — which the parser sets
+    // from the outer-quote context when it pushes the operand mode — is set
+    // here explicitly, so these tests never reach into the parser (the parser
+    // drives the lexer, not the reverse). The end-to-end behavior with the
+    // parser deciding `enclosing_dquote` is covered by
+    // `tests/scripts/rhs_exp_nested_quote_diff_check.sh`.
+
+    /// Concatenate the text of every `Lit` atom in an operand atom stream.
+    fn operand_lit_text(atoms: &[TokenKind]) -> String {
+        atoms
+            .iter()
+            .filter_map(|t| match t {
+                TokenKind::Lit { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn param_value_nested_dquote_backslash_strips_when_enclosing_dquoted() {
+        // `enclosing_dquote: true` models `"…${v:+a="\p"}…"`: inside the nested
+        // `"…"` span a backslash before a non-special char is DROPPED (`\p`→`p`),
+        // matching bash 5.2.21. Operand body is the text after `:+`.
+        let atoms = operand_atoms(
+            r#"a="\p"}"#,
+            Mode::ParamWordOperand {
+                in_dquote: false,
+                enclosing_dquote: true,
+            },
+        );
+        assert_eq!(operand_lit_text(&atoms), "a=p", "{atoms:?}");
+    }
+
+    #[test]
+    fn param_value_nested_dquote_backslash_kept_when_enclosing_unquoted() {
+        // `enclosing_dquote: false` models an UNQUOTED outer `${v:+a="\p"}`:
+        // standard double-quote rules keep the backslash (`\p`→`\p`).
+        let atoms = operand_atoms(
+            r#"a="\p"}"#,
+            Mode::ParamWordOperand {
+                in_dquote: false,
+                enclosing_dquote: false,
+            },
+        );
+        assert_eq!(operand_lit_text(&atoms), r"a=\p", "{atoms:?}");
+    }
+
+    #[test]
+    fn param_value_nested_dquote_special_backslash_unchanged() {
+        // `\$` in the nested span → `$` under BOTH enclosing contexts — guards
+        // the untouched SPECIAL arm (`$`/`` ` ``/`"`/`\`), which drops the
+        // backslash regardless of `enclosing_dquote`.
+        for enclosing_dquote in [true, false] {
+            let atoms = operand_atoms(
+                r#"x="\$"}"#,
+                Mode::ParamWordOperand {
+                    in_dquote: false,
+                    enclosing_dquote,
+                },
+            );
+            assert_eq!(
+                operand_lit_text(&atoms),
+                "x=$",
+                "enclosing_dquote={enclosing_dquote}: {atoms:?}"
+            );
+        }
     }
 }
 
