@@ -1227,6 +1227,11 @@ impl Shell {
         self.shopt_options.get("extglob").unwrap_or(false)
     }
 
+    /// True when `shopt -s extdebug` is in effect.
+    pub fn extdebug(&self) -> bool {
+        self.shopt_options.get("extdebug").unwrap_or(false)
+    }
+
     /// Line offset added to an eval string's local (1-based) line numbers so
     /// they reflect the outer line where `eval` sits. 0 outside eval. v315 (#209).
     pub fn line_base(&self) -> u32 {
