@@ -2718,8 +2718,19 @@ impl<'a> Lexer<'a> {
                             ));
                         }
                         _ => {
-                            let mut s = String::from("\\");
-                            if let Some(ch) = self.cursor.next() {
+                            // v321 (#253): when the enclosing `${…}` is itself double-quoted,
+                            // bash does a second de-quoting pass over a nested `"…"` span in a
+                            // value-family word — a backslash before a NON-special char is
+                            // DROPPED (`\p` → `p`). Outside that context, standard double-quote
+                            // rules keep the backslash (`\p` → `\p`). The special arm above
+                            // (`$` `` ` `` `"` `\`) already drops the backslash under both rules,
+                            // so only this arm is context-dependent.
+                            let next = self.cursor.next();
+                            let mut s = String::new();
+                            if !enclosing_dquote {
+                                s.push('\\');
+                            }
+                            if let Some(ch) = next {
                                 s.push(ch);
                             }
                             self.history.push(Token::new(
@@ -3095,8 +3106,19 @@ impl<'a> Lexer<'a> {
                                     ));
                                 }
                                 _ => {
-                                    let mut s = String::from("\\");
-                                    if let Some(ch) = self.cursor.next() {
+                                    // v321 (#253): same gate as the continuing-span
+                                    // arm below — this is the FIRST char of the nested
+                                    // `"…"` span (forward-progress inlining), so it
+                                    // needs the identical enclosing_dquote treatment or
+                                    // a short nested span like `"\p"` (closing `"`
+                                    // immediately after) never reaches the
+                                    // continuing-span branch at all.
+                                    let next = self.cursor.next();
+                                    let mut s = String::new();
+                                    if !enclosing_dquote {
+                                        s.push('\\');
+                                    }
+                                    if let Some(ch) = next {
                                         s.push(ch);
                                     }
                                     self.history.push(Token::new(
@@ -8832,6 +8854,104 @@ mod tests {
                 quoted: true
             }
         );
+    }
+
+    // ── v321 (#253): enclosing_dquote gates the nested-`"…"` backslash arm ────
+
+    /// Parse `src` as a full command (via `parser::parse_sequence`, the
+    /// production front-end discipline — see `pull_surfaces_lex_error_as_err`
+    /// above) and return the bare command-word `Word` (`ExecCommand::program`).
+    /// The test sources are themselves the sole command word, e.g.
+    /// `"${v:+a="\p"}"`.
+    fn parse_word(src: &str) -> Word {
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new(src, &empty, LexerOptions::default());
+        let seq = crate::parser::parse_sequence(&mut lx)
+            .expect("parse error")
+            .expect("empty sequence");
+        // A bare command word parses as a one-stage Pipeline wrapping the Exec.
+        let cmd = match seq.first {
+            crate::command::Command::Pipeline(p) if p.commands.len() == 1 => {
+                p.commands.into_iter().next().unwrap()
+            }
+            other => other,
+        };
+        match cmd {
+            crate::command::Command::Simple(crate::command::SimpleCommand::Exec(exec)) => {
+                exec.program
+            }
+            other => panic!("expected a bare Exec command word, got {other:?}"),
+        }
+    }
+
+    /// Recursively concatenate every `Literal` part's text, descending into
+    /// `Quoted` runs and into the operand `Word` of the value-family
+    /// `ParamModifier`s (`-`/`:-`, `=`/`:=`, `?`/`:?`, `+`/`:+`) so a nested
+    /// `"…"` span's literals show up in source order alongside the rest.
+    fn collect_literals(parts: &[WordPart], out: &mut String) {
+        for p in parts {
+            match p {
+                WordPart::Literal { text, .. } => out.push_str(text),
+                WordPart::Quoted { parts, .. } => collect_literals(parts, out),
+                WordPart::ParamExpansion { modifier, .. } => match modifier {
+                    ParamModifier::UseDefault { word, .. }
+                    | ParamModifier::AssignDefault { word, .. }
+                    | ParamModifier::ErrorIfUnset { word, .. }
+                    | ParamModifier::UseAlternate { word, .. } => {
+                        collect_literals(&word.0, out);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    fn literal_texts(word: &Word) -> String {
+        let mut out = String::new();
+        collect_literals(&word.0, &mut out);
+        out
+    }
+
+    #[test]
+    fn param_value_nested_dquote_backslash_strips_when_enclosing_dquoted() {
+        // Outer `${…}` is itself double-quoted: the nested `"\p"` span's
+        // backslash before a non-special char is DROPPED (`\p` → `p`),
+        // matching bash 5.2.21.
+        let word = parse_word(r#""${v:+a="\p"}""#);
+        let text = literal_texts(&word);
+        assert!(
+            text.contains("a=p"),
+            "backslash should be stripped: {text:?}"
+        );
+        assert!(
+            !text.contains("a=\\p"),
+            "backslash should NOT survive: {text:?}"
+        );
+    }
+
+    #[test]
+    fn param_value_nested_dquote_backslash_kept_when_enclosing_unquoted() {
+        // Outer `${…}` is UNQUOTED: standard double-quote rules apply inside
+        // the nested `"…"` span, so the backslash before a non-special char
+        // is KEPT (`\p` → `\p`).
+        let word = parse_word(r#"${v:+a="\p"}"#);
+        let text = literal_texts(&word);
+        assert!(text.contains("a=\\p"), "backslash should be kept: {text:?}");
+    }
+
+    #[test]
+    fn param_value_nested_dquote_special_backslash_unchanged() {
+        // `\$` in the nested span is dropped under BOTH quoted and unquoted
+        // enclosing context — this guards the untouched SPECIAL arm
+        // (`$`/backtick/`"`/`\`), which already drops the backslash either way.
+        let quoted = literal_texts(&parse_word(r#""${v:+x="\$"}""#));
+        assert!(quoted.contains("x=$"), "{quoted:?}");
+        assert!(!quoted.contains("x=\\$"), "{quoted:?}");
+
+        let unquoted = literal_texts(&parse_word(r#"${v:+x="\$"}"#));
+        assert!(unquoted.contains("x=$"), "{unquoted:?}");
+        assert!(!unquoted.contains("x=\\$"), "{unquoted:?}");
     }
 }
 
