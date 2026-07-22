@@ -84,7 +84,7 @@ pub fn fire_exit_trap(shell: &mut Shell) {
 
 /// Fires the ERR pseudo-signal trap. Repeatable: the trap entry is
 /// NOT removed after firing (unlike EXIT). Respects the recursion
-/// guard via `Shell::firing_trap`.
+/// guard via `Shell::firing_traps`.
 pub fn fire_err_trap(shell: &mut Shell) {
     fire_pseudo_trap(shell, TrapSignal::Err);
 }
@@ -119,7 +119,7 @@ pub(crate) fn debug_decision(extdebug: bool, status: i32, in_subroutine: bool) -
 /// action runs, `$LINENO` is reframed so its top-level line equals the pending
 /// command's line (`current_lineno`, stamped by the caller just before).
 pub fn fire_debug_trap(shell: &mut Shell) -> DebugDecision {
-    if shell.firing_trap == Some(TrapSignal::Debug) {
+    if shell.firing_traps.contains(&TrapSignal::Debug) {
         return DebugDecision::Proceed;
     }
     let action = match shell.traps.get(&TrapSignal::Debug) {
@@ -143,9 +143,9 @@ pub fn fire_debug_trap(shell: &mut Shell) -> DebugDecision {
     // the restore) purely to decide Proceed/Skip/Return; that decision does
     // not leak into the surface $?.
     let saved_status = shell.last_status();
-    let prev_firing = shell.firing_trap.replace(TrapSignal::Debug);
+    shell.firing_traps.push(TrapSignal::Debug);
     let _ = crate::shell::process_line(&action, shell, false);
-    shell.firing_trap = prev_firing;
+    shell.firing_traps.pop();
     shell.eval_frame = prev_frame;
 
     // "In a subroutine" for the return-2 simulation means a context where
@@ -169,21 +169,23 @@ pub fn fire_return_trap(shell: &mut Shell) {
 }
 
 /// Shared body for the three repeating pseudo-signal traps. Returns
-/// immediately if `shell.firing_trap == Some(sig)` (recursion guard).
-/// Looks up the action via `traps.get` (NOT remove), executes via
-/// `process_line`. Save-and-restore of `firing_trap` allows different
-/// pseudo-signals to nest (e.g. a DEBUG action that triggers ERR).
+/// immediately if `sig` is already on `shell.firing_traps` (recursion
+/// guard — a trap never re-enters itself, even through an intervening
+/// different pseudo-signal). Looks up the action via `traps.get` (NOT
+/// remove), executes via `process_line`. Push/pop of `firing_traps`
+/// allows different pseudo-signals to nest (e.g. a DEBUG action that
+/// triggers ERR still fires ERR).
 fn fire_pseudo_trap(shell: &mut Shell, sig: TrapSignal) {
-    if shell.firing_trap == Some(sig) {
+    if shell.firing_traps.contains(&sig) {
         return;
     }
     let action = match shell.traps.get(&sig) {
         Some(Some(text)) => text.clone(),
         _ => return,
     };
-    let prev = shell.firing_trap.replace(sig);
+    shell.firing_traps.push(sig);
     let _ = crate::shell::process_line(&action, shell, false);
-    shell.firing_trap = prev;
+    shell.firing_traps.pop();
 }
 
 /// Resets all trap state in a freshly-forked subshell child. POSIX:
@@ -197,7 +199,7 @@ pub fn clear_for_subshell(shell: &mut Shell) {
     }
     shell.traps.clear();
     shell.trap_pending = Arc::new(AtomicU32::new(0));
-    shell.firing_trap = None;
+    shell.firing_traps.clear();
     shell.err_suppressed_depth = 0;
 }
 
@@ -842,19 +844,19 @@ mod tests {
     #[test]
     fn fire_err_trap_recursion_guard_suppresses_reentry() {
         let mut shell = Shell::new();
-        shell.firing_trap = Some(TrapSignal::Err);
+        shell.firing_traps = vec![TrapSignal::Err];
         shell
             .traps
             .insert(TrapSignal::Err, Some("FOO=should_not_run".to_string()));
         fire_err_trap(&mut shell);
-        // Action should NOT have run because firing_trap was already set.
+        // Action should NOT have run because firing_traps already contains Err.
         assert_eq!(shell.get("FOO"), None);
     }
 
     #[test]
     fn fire_debug_trap_recursion_guard_suppresses_reentry() {
         let mut shell = Shell::new();
-        shell.firing_trap = Some(TrapSignal::Debug);
+        shell.firing_traps = vec![TrapSignal::Debug];
         shell
             .traps
             .insert(TrapSignal::Debug, Some("FOO=should_not_run".to_string()));
@@ -865,7 +867,7 @@ mod tests {
     #[test]
     fn fire_return_trap_recursion_guard_suppresses_reentry() {
         let mut shell = Shell::new();
-        shell.firing_trap = Some(TrapSignal::Return);
+        shell.firing_traps = vec![TrapSignal::Return];
         shell
             .traps
             .insert(TrapSignal::Return, Some("FOO=should_not_run".to_string()));
@@ -875,26 +877,50 @@ mod tests {
 
     #[test]
     fn fire_err_trap_different_signal_in_flight_does_not_suppress() {
-        // firing_trap is Some(Debug), but we're firing Err — should fire.
+        // firing_traps contains Debug, but we're firing Err — should fire.
         let mut shell = Shell::new();
-        shell.firing_trap = Some(TrapSignal::Debug);
+        shell.firing_traps = vec![TrapSignal::Debug];
         shell
             .traps
             .insert(TrapSignal::Err, Some("FOO=err_ran".to_string()));
         fire_err_trap(&mut shell);
         assert_eq!(shell.get("FOO"), Some("err_ran"));
-        // firing_trap restored to its previous value (Debug) after the
+        // firing_traps restored to its previous value (just Debug) after the
         // ERR action finished.
-        assert_eq!(shell.firing_trap, Some(TrapSignal::Debug));
+        assert_eq!(shell.firing_traps, vec![TrapSignal::Debug]);
     }
 
     #[test]
     fn clear_for_subshell_resets_firing_trap_and_err_depth() {
         let mut shell = Shell::new();
-        shell.firing_trap = Some(TrapSignal::Err);
+        shell.firing_traps = vec![TrapSignal::Err];
         shell.err_suppressed_depth = 5;
         clear_for_subshell(&mut shell);
-        assert_eq!(shell.firing_trap, None);
+        assert!(shell.firing_traps.is_empty());
         assert_eq!(shell.err_suppressed_depth, 0);
+    }
+
+    #[test]
+    fn cross_signal_trap_does_not_reenter_itself() {
+        // Debug is already on the active stack (e.g. an ERR action is running
+        // inside a DEBUG action). Firing Debug again must be suppressed, even
+        // though the top of the stack is Err — the old single-slot guard missed
+        // this and recursed to a stack overflow (#256).
+        let mut shell = Shell::new();
+        shell.firing_traps = vec![TrapSignal::Debug, TrapSignal::Err];
+        shell
+            .traps
+            .insert(TrapSignal::Debug, Some("FOO=should_not_run".to_string()));
+        assert_eq!(fire_debug_trap(&mut shell), DebugDecision::Proceed);
+        assert_eq!(shell.get("FOO"), None);
+
+        // A DIFFERENT signal not on the stack still fires.
+        let mut shell2 = Shell::new();
+        shell2.firing_traps = vec![TrapSignal::Debug];
+        shell2
+            .traps
+            .insert(TrapSignal::Err, Some("BAR=err_ran".to_string()));
+        fire_err_trap(&mut shell2);
+        assert_eq!(shell2.get("BAR"), Some("err_ran"));
     }
 }
