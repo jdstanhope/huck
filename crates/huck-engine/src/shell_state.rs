@@ -817,12 +817,15 @@ pub struct Shell {
     /// installed trap handler. Used by `traps::reset` to unregister.
     pub trap_sigids: std::collections::HashMap<i32, signal_hook::SigId>,
 
-    /// Currently-firing pseudo-trap, if any. Set on entry to
-    /// fire_err/fire_debug/fire_return; cleared on exit. Used to
-    /// suppress re-firing of the SAME trap from within its own action.
-    /// Different signals do NOT cross-suppress (a DEBUG action that
-    /// triggers ERR still fires ERR).
-    pub firing_trap: Option<crate::traps::TrapSignal>,
+    /// Stack of currently-firing pseudo-traps. Pushed on entry to
+    /// fire_err/fire_debug/fire_return; popped on exit. A trap is
+    /// suppressed if it is ANYWHERE on this stack (not just at the top) —
+    /// this stops a trap from re-entering itself even when a DIFFERENT
+    /// pseudo-signal is nested in between (e.g. DEBUG -> ERR -> DEBUG).
+    /// Different signals do NOT cross-suppress each other (a DEBUG action
+    /// that triggers ERR still fires ERR, as long as ERR isn't already
+    /// on the stack).
+    pub firing_traps: Vec<crate::traps::TrapSignal>,
 
     /// Depth counter for ERR-suppression contexts (if/elif/while/until
     /// conditions). ERR trap only fires when this is 0.
@@ -1110,7 +1113,7 @@ impl Shell {
             traps: std::collections::HashMap::new(),
             trap_pending: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             trap_sigids: std::collections::HashMap::new(),
-            firing_trap: None,
+            firing_traps: Vec::new(),
             err_suppressed_depth: 0,
             source_depth: 0,
             local_scopes: Vec::new(),
