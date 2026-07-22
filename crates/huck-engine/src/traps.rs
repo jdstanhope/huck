@@ -89,9 +89,78 @@ pub fn fire_err_trap(shell: &mut Shell) {
     fire_pseudo_trap(shell, TrapSignal::Err);
 }
 
-/// Fires the DEBUG pseudo-signal trap. Repeatable; recursion-guarded.
-pub fn fire_debug_trap(shell: &mut Shell) {
-    fire_pseudo_trap(shell, TrapSignal::Debug);
+/// What a command-dispatch site must do after the DEBUG trap action ran.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DebugDecision {
+    /// Run the pending command normally.
+    Proceed,
+    /// extdebug + non-zero DEBUG status: skip the pending command.
+    SkipCommand,
+    /// extdebug + status 2 in a subroutine: simulate `return n`.
+    ReturnFromSub(i32),
+}
+
+/// Pure mapping from (extdebug, DEBUG action exit status, in-a-subroutine) to
+/// the post-DEBUG action. Kept pure for exhaustive unit testing; the effects
+/// (skipping/returning) live at the executor dispatch sites.
+pub(crate) fn debug_decision(extdebug: bool, status: i32, in_subroutine: bool) -> DebugDecision {
+    if !extdebug || status == 0 {
+        return DebugDecision::Proceed;
+    }
+    if status == 2 && in_subroutine {
+        return DebugDecision::ReturnFromSub(2);
+    }
+    DebugDecision::SkipCommand
+}
+
+/// Fires the DEBUG pseudo-signal trap before a command runs. Returns the
+/// action the dispatch site must take (Proceed / SkipCommand / ReturnFromSub).
+/// Recursion-guarded (the action's own commands don't re-fire). While the
+/// action runs, `$LINENO` is reframed so its top-level line equals the pending
+/// command's line (`current_lineno`, stamped by the caller just before).
+pub fn fire_debug_trap(shell: &mut Shell) -> DebugDecision {
+    if shell.firing_trap == Some(TrapSignal::Debug) {
+        return DebugDecision::Proceed;
+    }
+    let action = match shell.traps.get(&TrapSignal::Debug) {
+        Some(Some(text)) => text.clone(),
+        _ => return DebugDecision::Proceed,
+    };
+    // Reframe $LINENO: with line_base() = eval_frame.saturating_sub(1) and each
+    // command stamping current_lineno = line_base() + cmd.line, setting
+    // eval_frame = Some(current_lineno) makes the action's line-1 command
+    // resolve back to current_lineno. Restore afterward. (Skip for the
+    // synthesized line-0 case, where there is no meaningful pending line.)
+    let prev_frame = shell.eval_frame;
+    if shell.current_lineno != 0 {
+        shell.eval_frame = Some(shell.current_lineno);
+    }
+    // Save $? across the trap firing: like bash's other traps, the DEBUG
+    // action's own commands run in their own status context, but the
+    // pending command (or, on Proceed, the command right after) must still
+    // see the ORIGINAL $? — not whatever the trap action itself last set.
+    // `debug_decision` reads the action's own status (captured below, before
+    // the restore) purely to decide Proceed/Skip/Return; that decision does
+    // not leak into the surface $?.
+    let saved_status = shell.last_status();
+    let prev_firing = shell.firing_trap.replace(TrapSignal::Debug);
+    let _ = crate::shell::process_line(&action, shell, false);
+    shell.firing_trap = prev_firing;
+    shell.eval_frame = prev_frame;
+
+    // "In a subroutine" for the return-2 simulation means a context where
+    // `return` is legal — a function or a sourced script — NOT the main script
+    // (whose base "main" frame is always present). Same predicate the `return`
+    // builtin uses to reject a top-level `return`.
+    let in_subroutine = shell.call_stack.iter().any(|f| {
+        matches!(
+            f.kind,
+            crate::shell_state::FrameKind::Function | crate::shell_state::FrameKind::Source
+        )
+    });
+    let decision = debug_decision(shell.extdebug(), shell.last_status(), in_subroutine);
+    shell.set_last_status(saved_status);
+    decision
 }
 
 /// Fires the RETURN pseudo-signal trap. Repeatable; recursion-guarded.
@@ -712,9 +781,51 @@ mod tests {
         shell
             .traps
             .insert(TrapSignal::Debug, Some("FOO=dbg_ran".to_string()));
-        fire_debug_trap(&mut shell);
+        assert_eq!(fire_debug_trap(&mut shell), DebugDecision::Proceed);
         assert_eq!(shell.get("FOO"), Some("dbg_ran"));
         assert!(shell.traps.contains_key(&TrapSignal::Debug));
+    }
+
+    #[test]
+    fn debug_decision_matrix() {
+        use DebugDecision::*;
+        // extdebug off: never skips, whatever the status.
+        assert_eq!(debug_decision(false, 0, false), Proceed);
+        assert_eq!(debug_decision(false, 1, false), Proceed);
+        assert_eq!(debug_decision(false, 2, true), Proceed);
+        // extdebug on, status 0: proceed.
+        assert_eq!(debug_decision(true, 0, false), Proceed);
+        // extdebug on, non-zero non-2: skip one command (top level or in sub).
+        assert_eq!(debug_decision(true, 1, false), SkipCommand);
+        assert_eq!(debug_decision(true, 3, true), SkipCommand);
+        // extdebug on, status 2, NOT in a subroutine: skip (can't return).
+        assert_eq!(debug_decision(true, 2, false), SkipCommand);
+        // extdebug on, status 2, IN a subroutine: simulate return 2.
+        assert_eq!(debug_decision(true, 2, true), ReturnFromSub(2));
+    }
+
+    #[test]
+    fn fire_debug_trap_reframes_lineno_to_pending_command_line() {
+        let mut shell = Shell::new();
+        shell.current_lineno = 5;
+        shell
+            .traps
+            .insert(TrapSignal::Debug, Some("probe=$LINENO".to_string()));
+        let d = fire_debug_trap(&mut shell);
+        assert_eq!(d, DebugDecision::Proceed); // no extdebug, action exits 0
+        // The action's top-level $LINENO reflected the pending command's line (5),
+        // not 1 (which is what a fresh process_line would otherwise stamp).
+        assert_eq!(shell.get("probe"), Some("5"));
+    }
+
+    #[test]
+    fn fire_debug_trap_skips_when_extdebug_and_action_nonzero() {
+        let mut shell = Shell::new();
+        shell.shopt_options.set("extdebug", true);
+        shell
+            .traps
+            .insert(TrapSignal::Debug, Some("false".to_string())); // exits 1
+        assert_eq!(fire_debug_trap(&mut shell), DebugDecision::SkipCommand);
     }
 
     #[test]
@@ -747,7 +858,7 @@ mod tests {
         shell
             .traps
             .insert(TrapSignal::Debug, Some("FOO=should_not_run".to_string()));
-        fire_debug_trap(&mut shell);
+        assert_eq!(fire_debug_trap(&mut shell), DebugDecision::Proceed);
         assert_eq!(shell.get("FOO"), None);
     }
 

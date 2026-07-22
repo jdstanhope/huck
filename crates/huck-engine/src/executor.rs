@@ -3880,10 +3880,18 @@ fn run_single(
             // group/function/subshell/`$()` — never across a later command —
             // so a plain per-command drain is the bash-matching lifetime; no
             // extension needed.
-            let procsub_base = shell.procsub_pending.len();
-            let st = run_assignment_list(items, shell, sink, err_sink);
-            drain_procsubs(shell, procsub_base);
-            ExecOutcome::Continue(st)
+            match crate::traps::fire_debug_trap(shell) {
+                crate::traps::DebugDecision::Proceed => {
+                    let procsub_base = shell.procsub_pending.len();
+                    let st = run_assignment_list(items, shell, sink, err_sink);
+                    drain_procsubs(shell, procsub_base);
+                    ExecOutcome::Continue(st)
+                }
+                crate::traps::DebugDecision::SkipCommand => {
+                    ExecOutcome::Continue(shell.last_status())
+                }
+                crate::traps::DebugDecision::ReturnFromSub(n) => ExecOutcome::FunctionReturn(n),
+            }
         }
     };
     // $PIPESTATUS reflects this leaf command's exit status. break/continue
@@ -3958,6 +3966,12 @@ pub(crate) fn call_function(
     // below so the caller resumes its own scan, matching bash. (M-106)
     let saved_getopts_sp = std::mem::replace(&mut shell.getopts_sp, 0);
     let saved_getopts_optind_cache = std::mem::replace(&mut shell.getopts_optind_cache, 0);
+    // A function body has its own $LINENO context (absolute source lines of the
+    // function definition), independent of any eval/DEBUG-trap line reframe
+    // active in the caller. Clear the eval frame for the body so a caller's
+    // reframe (e.g. a DEBUG trap firing `func $LINENO`) doesn't shift the
+    // function's own $LINENO; restore it below.
+    let saved_eval_frame = shell.eval_frame.take();
     shell.positional_args = args;
     let frame = crate::shell_state::Frame {
         funcname: name.to_string(),
@@ -4003,6 +4017,7 @@ pub(crate) fn call_function(
     shell.loop_depth = saved_loop_depth;
     shell.getopts_sp = saved_getopts_sp;
     shell.getopts_optind_cache = saved_getopts_optind_cache;
+    shell.eval_frame = saved_eval_frame;
     match result {
         ExecOutcome::FunctionReturn(n) => ExecOutcome::Continue(n),
         other => other,
@@ -4254,7 +4269,15 @@ fn run_exec_single_inner(
     // runs. The two recursive pre-resolve paths (command/builtin re-dispatch)
     // return before any expansion, so the drain is a no-op on those paths.
     let procsub_base = shell.procsub_pending.len();
-    crate::traps::fire_debug_trap(shell);
+    match crate::traps::fire_debug_trap(shell) {
+        crate::traps::DebugDecision::Proceed => {}
+        crate::traps::DebugDecision::SkipCommand => {
+            return ExecOutcome::Continue(shell.last_status());
+        }
+        crate::traps::DebugDecision::ReturnFromSub(n) => {
+            return ExecOutcome::FunctionReturn(n);
+        }
+    }
 
     // Pre-resolve interception: `command [-p|--]… <decl-command> …` where the
     // inner program is a declaration builtin (`declare`/`export`/…). Detected

@@ -2,6 +2,14 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v322 (#255, 2026-07-22 UTC):** `dbg-support2` flipped to PASS (0-diff)
+— the DEBUG trap now fires before bare assignments, the action's `$LINENO` equals
+the pending command's line (without leaking into a function the action calls), and
+under `shopt -s extdebug` a non-zero DEBUG-action status skips the pending command
+(status 2 inside a function/sourced script simulates `return 2`)
+(`tests/scripts/debug_trap_extdebug_diff_check.sh`, 10/10). Summary PASS 18→19,
+FAIL 64→63. Only `dbg-support2` changed.
+
 **Updated by v321 (#253, 2026-07-22 UTC):** `rhs-exp` flipped to PASS (0-diff) —
 inside a nested `"…"` span of a value-family parameter-expansion word, huck now
 drops a backslash before a non-special char when the enclosing `${…}` is
@@ -20,7 +28,7 @@ The v313/v314 full/targeted-sweep narrative below is left as the
 historical record of those sweeps and is otherwise unchanged by v315
 (confirmed via the harness-level `syntax_error_diag_diff_check.sh` and
 the full `run_diff_checks.sh` sweep — no other category's output moved).
-Sweep date: 2026-07-19 UTC (v313 full re-sweep — verifies the v299–v313 arc: the job-control batch (v299–v306), the heredoc-in-process / builtin write-error work (v307–v308), the huck-engine fork-guard (v309), in-process group stderr under `2>&1` in `$()` (v310), and the three error-fatality-funnel fixes — negated-pipeline errexit (v311/#1), arithmetic-expansion discard (v312/#3), readonly-assignment discard (v313/#31)). **NO change and NO regression: PASS holds at 15/82, TIMEOUT 0, ERROR 0 — the same 15 categories pass, none regressed, no new hangs.** Why no category flipped despite real fixes: each failing category is gated by SEVERAL independent divergences, and the arc fixed narrow ones that shrink diffs below the flip threshold. Case in point — v313 resolved L-43 (readonly-assignment abort), the note previously cited as `case`'s SOLE blocker, but the current `case` diff exposes two more live divergences (see its row), so it stays FAIL. **The 67 FAIL notes below have drifted since v268/v298 — treat them as approximate; the count is the authoritative signal.** Near-miss ranking (smallest current diffs, closest to PASS): `posix2` (5 lines — error-diagnostic format on `case esac in esac)`, [#209](https://github.com/jdstanhope/huck/issues/209)), `procsub` (9), `dbg-support2`/`nquote` (12). Prior sweep provenance: 2026-07-15 UTC (v298 re-sweep, PASS 10→15: +getopts, input-test, iquote, nquote1, tilde; TIMEOUT 4→2 then 2→0 via v299 harness correction); 2026-07-07 UTC (v268 full re-sweep); 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers; v219 cprint+herestr flip; v220 herestr; v225 func).
+Sweep date: 2026-07-19 UTC (v313 full re-sweep — verifies the v299–v313 arc: the job-control batch (v299–v306), the heredoc-in-process / builtin write-error work (v307–v308), the huck-engine fork-guard (v309), in-process group stderr under `2>&1` in `$()` (v310), and the three error-fatality-funnel fixes — negated-pipeline errexit (v311/#1), arithmetic-expansion discard (v312/#3), readonly-assignment discard (v313/#31)). **NO change and NO regression: PASS holds at 15/82, TIMEOUT 0, ERROR 0 — the same 15 categories pass, none regressed, no new hangs.** Why no category flipped despite real fixes: each failing category is gated by SEVERAL independent divergences, and the arc fixed narrow ones that shrink diffs below the flip threshold. Case in point — v313 resolved L-43 (readonly-assignment abort), the note previously cited as `case`'s SOLE blocker, but the current `case` diff exposes two more live divergences (see its row), so it stays FAIL. **The 67 FAIL notes below have drifted since v268/v298 — treat them as approximate; the count is the authoritative signal.** Near-miss ranking (smallest current diffs, closest to PASS): `posix2` (5 lines — error-diagnostic format on `case esac in esac)`, [#209](https://github.com/jdstanhope/huck/issues/209)), `procsub` (9), `nquote` (12). Prior sweep provenance: 2026-07-15 UTC (v298 re-sweep, PASS 10→15: +getopts, input-test, iquote, nquote1, tilde; TIMEOUT 4→2 then 2→0 via v299 harness correction); 2026-07-07 UTC (v268 full re-sweep); 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers; v219 cprint+herestr flip; v220 herestr; v225 func).
 
 **v314 targeted re-sweep** (2026-07-19 UTC, syntax-error 3-shape alignment
 #211 — top-level `ParseError`/`LexError` diagnostics now render as one of
@@ -108,8 +116,8 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 ## Summary
 
 - Categories run: 82
-- PASS: 18
-- FAIL: 64
+- PASS: 19
+- FAIL: 63
 - TIMEOUT: 0
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
@@ -147,7 +155,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | coproc | FAIL | Coproc pipe file-descriptor numbers diverge — huck allocates low-numbered fds while bash allocates high-numbered fds. Also `<&N-` / `>&N-` dup-and-close fd redirect operator not supported (same root cause as the redir TIMEOUT). M-126 and a new dup-close gap. |
 | cprint | PASS | v218 resolved the `declare -f` trailing-space format; v219's `WordPart::Quoted` quote-provenance fix (L-57) resolves the remaining reconstruction divergences — `echo`-argument quoting and adjacent-double-quoted-substring reconstruction now match bash byte-for-byte. 0-diff PASS (verified via the runner 2026-06-25). |
 | dbg-support | FAIL | `set -o functrace` (DEBUG/RETURN/ERR trap inheritance through function calls) not yet supported. Entire debug-trap test suite fails from the first rejected option. |
-| dbg-support2 | FAIL | `LINENO` inside functions reports the logical-command start line (often line 1) rather than the actual in-function source line. New bug: LINENO tracking accuracy inside function bodies. |
+| dbg-support2 | PASS | v322 (#255): DEBUG trap fires before bare assignments; the action's `$LINENO` tracks the pending command's line without leaking into a function the action calls; extdebug non-zero DEBUG-action status skips the pending command (status 2 in a function/sourced script simulates `return 2`). 0-diff PASS. |
 | dirstack | FAIL | `pushd -m` / `popd -m` / `dirs -m` argument is treated as an invalid option rather than a numeric argument (huck and bash differ on which flags these commands accept). Error-message prefix and format differences throughout. |
 | dollars | FAIL | No longer TIMEOUTs (the v220-recorded hang — a blocking read/process-wait around `${!*}`/`${!@}` indirect expansion — is resolved): the category now runs to completion with output divergences across the `$@`/`$*`/`${!*}` dollar-special tests (error-message wording and expansion-count differences). |
 | dynvar | FAIL | `BASH_ARGV0` is not updated to reflect the running script's `$0` — tests that check `BASH_ARGV0` report a mismatch. `EPOCHREALTIME` not implemented (L-41 computed-dynamics gap). |
