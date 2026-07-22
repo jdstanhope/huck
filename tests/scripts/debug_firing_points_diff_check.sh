@@ -30,6 +30,14 @@ check "if unchanged"          'trap "echo D" DEBUG; if true; then echo y; fi'
 check "group unchanged"       'trap "echo D" DEBUG; { echo a; echo b; }'
 check "single command"        'trap "echo D" DEBUG; echo solo'
 check "nested pipeline+for"   'trap "echo D" DEBUG; for x in 1 2; do echo $x | cat; done'
+# set -T + pipeline: DEBUG fires once per stage PARENT-side; a forked in-process
+# stage must NOT re-fire in the child (regression guard for the functrace/pipeline
+# double-fire fixed in review).
+check "functrace pipeline"    'set -T; trap "echo D" DEBUG; echo a | cat'
+check "functrace pipe 3stage" 'set -T; trap "echo D" DEBUG; echo a | cat | cat'
+# empty arith-for sections still fire DEBUG (bash fires for absent init/cond/step).
+check "arith-for empty all"   'trap "echo D" DEBUG; for ((;;)); do echo x; break; done'
+check "arith-for empty init"  'trap "echo D" DEBUG; i=0; for ((;i<2;)); do echo $i; i=$((i+1)); done'
 
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

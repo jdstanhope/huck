@@ -2018,8 +2018,11 @@ fn run_arith_for_inner(
                 crate::expand::reconstruct_word_source_inner(init)
             ),
         );
-        let _ = crate::traps::fire_debug_trap(shell);
     }
+    // bash fires DEBUG before the init section unconditionally — an empty
+    // `for ((;;))` init still fires (verified vs bash 5.2.21). Decision
+    // ignored (#262).
+    let _ = crate::traps::fire_debug_trap(shell);
     if let Some(init) = &clause.init
         && let Err(e) = crate::expand::eval_arith_word(init, shell)
     {
@@ -2042,8 +2045,9 @@ fn run_arith_for_inner(
                 shell,
                 &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(c)),
             );
-            let _ = crate::traps::fire_debug_trap(shell);
         }
+        // bash fires DEBUG before each cond evaluation, empty cond included.
+        let _ = crate::traps::fire_debug_trap(shell);
         // 2. Eval cond. Empty cond = always true (matches bash).
         let cond_value = match &clause.cond {
             None => 1,
@@ -2096,8 +2100,9 @@ fn run_arith_for_inner(
                     crate::expand::reconstruct_word_source_inner(step)
                 ),
             );
-            let _ = crate::traps::fire_debug_trap(shell);
         }
+        // bash fires DEBUG before each step evaluation, empty step included.
+        let _ = crate::traps::fire_debug_trap(shell);
         if let Some(step) = &clause.step
             && let Err(e) = crate::expand::eval_arith_word(step, shell)
         {
@@ -8231,16 +8236,20 @@ pub fn fork_and_run_in_subshell(
         // trap state so the parent's EXIT trap and real-signal traps
         // don't inherit into the child.
         // v324 (#257): under `set -T` (functrace), bash inherits DEBUG and
-        // RETURN traps into subshells (everything else still resets). Save
-        // those two actions across the clear and restore them so the
-        // subshell's interior commands still fire DEBUG. Signature of
-        // `clear_for_subshell` stays unchanged.
-        let saved_debug = if shell.shell_options.functrace {
+        // RETURN traps into a `( )` SUBSHELL (everything else still resets), so
+        // the subshell's interior commands still fire DEBUG. Restrict this to a
+        // real `Command::Subshell` fork — a PIPELINE STAGE also forks through
+        // this helper, but bash already fired DEBUG for the stage parent-side
+        // (spawn_pipeline), so preserving the trap here too would double-fire.
+        // Signature of `clear_for_subshell` stays unchanged.
+        let preserve_functrace =
+            shell.shell_options.functrace && matches!(cmd, Command::Subshell { .. });
+        let saved_debug = if preserve_functrace {
             shell.traps.get(&crate::traps::TrapSignal::Debug).cloned()
         } else {
             None
         };
-        let saved_return = if shell.shell_options.functrace {
+        let saved_return = if preserve_functrace {
             shell.traps.get(&crate::traps::TrapSignal::Return).cloned()
         } else {
             None
