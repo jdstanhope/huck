@@ -9,13 +9,11 @@
 #                                     `bash --norc < file` vs `"$HUCK_BIN" < file`
 #                                     (piped STDIN).
 #
-# Task 1 (this task) covers eval's multi-line-body $LINENO offset via
-# check_file only. Task 2 (per-line stdin $LINENO) adds check_stdin variants
-# of these same eval cases plus its own cases -- until Task 2 lands, the
-# stdin form of a multi-line eval can still differ from bash for reasons
-# unrelated to the eval offset fixed here (piped-stdin $LINENO tracking is a
-# separate bug), so those variants are deliberately deferred rather than
-# included in a red state.
+# Task 1 covered eval's multi-line-body $LINENO offset via check_file only.
+# Task 2 (#266) fixed piped-stdin's cumulative $LINENO tracking (the
+# non-interactive stdin REPL loop re-stamped $LINENO from line 1 on every
+# logical command) and added check_stdin variants of the same eval cases plus
+# its own cases below.
 set -u
 HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
 [[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
@@ -60,6 +58,27 @@ check_file "eval@3 2-line" ':
 eval '\''echo $LINENO
 echo $LINENO'\'''
 check_file "eval@2 3-line" ':
+eval '\''echo $LINENO
+echo $LINENO
+echo $LINENO'\'''
+
+# --- Task 2: cumulative $LINENO for a piped-stdin script (#266) ---
+check_stdin "stdin 3-line"     'echo $LINENO
+echo $LINENO
+echo $LINENO'
+check_stdin "stdin for body"   'for x in 1
+do
+echo $LINENO
+done'
+
+# Task 1's eval cases, now also exercised via stdin (deferred until Task 2
+# landed cumulative stdin line tracking -- see header comment).
+check_stdin "eval@1 1-line" 'eval '\''echo $LINENO'\'''
+check_stdin "eval@3 2-line" ':
+:
+eval '\''echo $LINENO
+echo $LINENO'\'''
+check_stdin "eval@2 3-line" ':
 eval '\''echo $LINENO
 echo $LINENO
 echo $LINENO'\'''

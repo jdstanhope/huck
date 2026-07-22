@@ -885,6 +885,16 @@ pub struct Shell {
     /// v315 (#209).
     pub eval_frame: Option<u32>,
 
+    /// Cumulative physical-line count of a piped-stdin (non-interactive, non-`-c`)
+    /// script consumed by prior logical commands. `line_base()` falls back to this
+    /// when `eval_frame` is None, so a stdin script's `$LINENO` runs cumulatively
+    /// like a file/`-c` script instead of resetting to 1 per logical command. Kept
+    /// SEPARATE from `eval_frame` (rather than reusing it) so it does not also
+    /// drive the `eval:` syntax-error marker, which must stay true only inside a
+    /// real `eval`. Maintained by the non-interactive stdin REPL loop; 0 elsewhere
+    /// (file/`-c`/interactive). v325 (#266).
+    pub stdin_line_base: u32,
+
     /// LCG state for `$RANDOM`. Uses interior mutability so `lookup_var`
     /// (&self) can advance the state on each read. Seeded at startup from
     /// PID + nanoseconds; reseedable via `RANDOM=n`.
@@ -1125,6 +1135,7 @@ impl Shell {
             procsub_pending: Vec::new(),
             current_lineno: 0,
             eval_frame: None,
+            stdin_line_base: 0,
             random_state: std::cell::Cell::new({
                 let pid = shell_pid as u64;
                 let nanos = std::time::SystemTime::now()
@@ -1235,10 +1246,14 @@ impl Shell {
         self.shopt_options.get("extdebug").unwrap_or(false)
     }
 
-    /// Line offset added to an eval string's local (1-based) line numbers so
-    /// they reflect the outer line where `eval` sits. 0 outside eval. v315 (#209).
+    /// Line offset added to a command's local (1-based) line number so it
+    /// reflects the outer/absolute line. `eval_frame`, when set, wins (the
+    /// eval's own offset); otherwise falls back to `stdin_line_base` (the
+    /// piped-stdin REPL's cumulative counter, 0 everywhere else). v315 (#209),
+    /// v325 (#266).
     pub fn line_base(&self) -> u32 {
-        self.eval_frame.map_or(0, |n| n.saturating_sub(1))
+        self.eval_frame
+            .map_or(self.stdin_line_base, |n| n.saturating_sub(1))
     }
 
     /// Bash-compatible error prologue — the complete matrix of
