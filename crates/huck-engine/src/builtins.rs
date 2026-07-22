@@ -6838,7 +6838,8 @@ pub(crate) fn eval_in_sink(
     // PS4 depth-repeat: eval's body traces one level deeper (bash). The
     // `+ eval '…'` line was already emitted at the outer depth before dispatch.
     let saved_frame = shell.eval_frame;
-    shell.eval_frame = Some(shell.current_lineno.max(1));
+    let body_newlines = joined.bytes().filter(|&b| b == b'\n').count() as u32;
+    shell.eval_frame = Some(shell.current_lineno.max(1) + body_newlines);
     let saved = shell.xtrace_depth;
     shell.xtrace_depth += 1;
     let r = crate::shell::process_line_in_sinks(&joined, shell, true, sink, err_sink);
