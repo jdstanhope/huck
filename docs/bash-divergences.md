@@ -225,3 +225,14 @@ huck enforces `FUNCNEST` exactly like bash, but additionally clamps the effectiv
 - **Workaround**: none needed; completed jobs are still pruned (no leak) and `wait $pid` still resolves a completed job's exit status (huck retains terminal statuses in a bounded ring). The only difference is the one-time `[1]+ Done` echo in script/stdin mode.
 
 ---
+
+### completion offers commands/variables after `if` / inside quoted `$(` / in arithmetic, where bash offers nothing
+
+[Issue #249 · by-design](https://github.com/jdstanhope/huck/issues/249)
+
+- **huck**: completion context is derived structurally from the parser (`parse_recover`'s `CursorContext`, #248), so it completes in three contexts where bash's interactive completer (a shallow textual heuristic, not the grammar) completes nothing: `if whi<TAB>` (and after `while`/`until`/`then`/`do`) → **commands**; `echo "$(whi<TAB>` (command substitution inside double quotes) → **commands**; `echo $(( HO<TAB>` (arithmetic) → **variable names**.
+- **bash**: completes nothing in all three. Its *unquoted* `echo $(whi` DOES complete commands (huck matches that); the *quoted* form does not. `(` is a readline word-break char, so bash never forms a completable variable token inside `$(( … ))`, and its completer does not treat the word after a reserved word as command position.
+- **Why intentional**: strictly more helpful than bash and a natural consequence of parser-driven context — the parser knows `if whi` is command position, that `$(` inside `"…"` opens a command, and that `HO` in `$(( … ))` is a variable reference. zsh and fish also complete after `if`. Narrowing huck to bash's non-completion would mean discarding correct, useful completions to replicate a bash limitation. The genuine "bash completes, huck didn't" cases (unquoted `echo $(whi`, `for x in whi`) DO now match bash.
+- **Workaround**: none needed — huck offers useful completions where bash offers none.
+
+---
