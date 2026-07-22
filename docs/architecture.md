@@ -73,6 +73,20 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   `complete -F func` callbacks may mutate shell state. The CLI's `HuckHelper`
   rustyline adapter drops `kind` (rustyline has no kind concept) — REPL
   behavior unchanged.
+  Completion context (#248) is derived from `huck_syntax::parse_recover`'s
+  `CursorContext` (see `recover.rs` below) rather than a hand-rolled character
+  scanner: `dispatch::resolve` calls `parse_recover(&line[..pos])` and maps the
+  returned `CursorContext { enclosing, position, word, word_start }` to a
+  completion source via `cursor_to_completion` (`completion.rs`). Because the
+  context now comes from the real (error-recovering) parser instead of a
+  scanner re-deriving structure by hand, completion is correct inside nested
+  constructs by construction. This fixed the genuine bash-parity gaps where the
+  old scanner produced nothing (`for x in <word>` list position, and the
+  command-substitution / redirect-target / path cases). It also makes huck
+  complete *more* than bash in three contexts where bash's textual completer
+  gives up — after `if`/`while`/`then`/`do`, inside a double-quoted `$(…)`, and
+  in arithmetic `$(( … ))` — a kept-by-design improvement (see
+  `docs/bash-divergences.md`, [#249](https://github.com/jdstanhope/huck/issues/249)).
   Restricted-mode (v319) is a **policy abstraction**, `crates/huck-engine/src/policy.rs`:
   `Shell.policy: Policy` is `Unrestricted` (default) / `Rbash` / `Sandbox`, and
   every enforcement site is one line, `shell.policy.check(op)?`, where `op` is

@@ -2771,6 +2771,17 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
             if matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
                 iter.next_kind()?;
             }
+            // Recovery cursor context (iteration 2): the word assembled here is a
+            // bare redirect operand. A redirect target is never command-position,
+            // so clear the command-word flag (an operator-glued redirect like
+            // `echo >whi` leaves it `true` from the preceding command word); the
+            // `RedirectTarget` position then replaces the `Argument` fallback. If
+            // the cursor (EOF) falls inside an inner expansion (`> $HOM`, `> $(whi`)
+            // that inner-mode position wins instead. Reset once the redirect is
+            // built so a following argument word is not misread. No-op off the
+            // recovery path.
+            iter.set_recovery_cmd_word(false);
+            iter.set_recovery_redirect_target(true);
             let target = match iter.peek_kind()? {
                 Some(TokenKind::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
                 Some(TokenKind::Newline) => {
@@ -2805,6 +2816,7 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
                 },
                 Some(_) => parse_word_command(iter, false)?,
             };
+            iter.set_recovery_redirect_target(false);
             Ok(crate::command::build_redirections(op, target, fd_prefix))
         }
         _ => {
@@ -3330,6 +3342,15 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     ) {
         let line = iter.current_line()?;
         let name_word = consume_command_word(iter)?;
+        // Recovery cursor context (Gap A, iteration 2): the command word is now
+        // fully consumed — the parser next expects an ARGUMENT. `consume_command_word`
+        // left the flag `true` (command position); flip it so an EMPTY trailing
+        // word at the whitespace boundary (`echo `, `ls `) reports `Argument`, not
+        // `Command`. When the cursor is still ON the command word (`whi`, `echo $(whi`)
+        // the EOF capture was already taken INSIDE `consume_command_word`'s
+        // terminating peek with the flag `true`, so this is moot there. No-op off
+        // the recovery path.
+        iter.set_recovery_cmd_word(false);
         while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
             iter.next_kind()?;
         }
@@ -3633,6 +3654,10 @@ fn finish_pipeline(
     };
     let mut stages = vec![first_stage];
     iter.next_kind()?; // consume `|`
+    // Recovery cursor context (Gap A, iteration 2): a `|` starts a new pipeline
+    // stage — a command word is expected next, so an empty trailing word (`echo hi | `)
+    // reports `Command`, not the previous stage's argument position. No-op off recovery.
+    iter.set_recovery_cmd_word(true);
     skip_newlines(iter)?;
 
     loop {
@@ -3647,6 +3672,8 @@ fn finish_pipeline(
         }
         if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Pipe))) {
             iter.next_kind()?; // consume `|`
+            // Recovery (Gap A): next pipeline stage expects a command word.
+            iter.set_recovery_cmd_word(true);
             skip_newlines(iter)?;
         } else {
             break;
@@ -3737,6 +3764,12 @@ fn parse_and_or_opts(
 
         // Consume the connector token.
         let token = iter.next_kind()?.unwrap();
+        // Recovery cursor context (Gap A, iteration 2): a connector (`;`, newline,
+        // `&`, `&&`, `||`) starts a NEW command — the parser next expects a command
+        // word. Reset the flag (the preceding command's last argument left it
+        // `false`) so an EMPTY trailing word right after the separator (`echo hi; `,
+        // `echo hi && `) reports `Command`, not `Argument`. No-op off recovery.
+        iter.set_recovery_cmd_word(true);
         match token {
             // ── `&` — background / Amp separator ────────────────────────────
             TokenKind::Op(Operator::Background) => {
@@ -4651,6 +4684,11 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
     let mut words: Vec<Word> = Vec::new();
     let has_in = if peek_leading_keyword(iter)? == Some(Keyword::In) {
         consume_command_word(iter)?; // consume `in`
+        // Recovery (Gap A, iteration 2): after `in`, the parser expects word-LIST
+        // words (argument position), not a command. `consume_command_word` left the
+        // flag `true`; flip it so an empty trailing word (`for x in `) reports
+        // `Argument`. No-op off recovery.
+        iter.set_recovery_cmd_word(false);
         loop {
             while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
                 iter.next_kind()?;
@@ -4732,6 +4770,9 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
     // Optional `in` plus the word list.
     let words: Option<Vec<Word>> = if peek_leading_keyword(iter)? == Some(Keyword::In) {
         consume_command_word(iter)?; // consume `in`
+        // Recovery (Gap A, iteration 2): after `in`, select expects word-LIST words
+        // (argument position). Flip the flag so `select x in ` reports `Argument`.
+        iter.set_recovery_cmd_word(false);
         let mut list: Vec<Word> = Vec::new();
         loop {
             while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {

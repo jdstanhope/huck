@@ -30,18 +30,15 @@ pub enum Frame {
 }
 
 /// What the word at the cursor is.
-///
-/// Iteration-1 limitation: `RedirectTarget` is defined but NEVER produced yet —
-/// a redirect target (`echo > whi`) currently reports `Command`. The Task-4 brief
-/// scoped positions to Command/Argument/VariableName/AssignRhs; distinguishing a
-/// redirect target is deferred to iteration 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WordPosition {
     Command,
     Argument,
     VariableName,
-    /// NOT yet produced — see the enum note. Reserved for iteration 2.
+    /// A bare redirect operand (`cat foo > whi`) — the LOWEST-priority position,
+    /// reported in place of `Argument` (iteration 2). An inner expansion mode at
+    /// the cursor (`> $HOM`, `> ${HOM`, `> $(whi`, `> $(( HO`) wins instead.
     RedirectTarget,
     AssignRhs,
     Unknown,
@@ -90,10 +87,17 @@ fn mode_to_frame(mode: &Mode) -> Option<Frame> {
 }
 
 /// Compute the `WordPosition` of the cursor word from the captured lexer state.
-/// Priority: a `${…}`/`$((…))` name context and a `$name` word both mean
-/// `VariableName`; an array literal RHS (`x=(…`) is `AssignRhs`; otherwise the
-/// parser's command-vs-argument flag decides.
-fn position_from(modes: &[Mode], last_is_dollar_name: bool, cmd_word: bool) -> WordPosition {
+/// Priority: a `${…}`/`$((…))` name context, a `$name` word, and a lone
+/// trailing `$` (no name typed yet, e.g. `echo $`) all mean `VariableName`; an
+/// array literal RHS (`x=(…`) is `AssignRhs`; otherwise the parser's
+/// command-vs-argument flag decides.
+fn position_from(
+    modes: &[Mode],
+    last_is_dollar_name: bool,
+    trailing_lone_dollar: bool,
+    cmd_word: bool,
+    redirect_target: bool,
+) -> WordPosition {
     // The innermost non-`Command` mode drives the mode-based positions.
     let innermost = modes.iter().rev().find(|m| !matches!(m, Mode::Command));
     match innermost {
@@ -112,11 +116,18 @@ fn position_from(modes: &[Mode], last_is_dollar_name: bool, cmd_word: bool) -> W
         // needs re-lexing the raw body and is left to iteration 2 (cf. ba38434).
         Some(Mode::BacktickRaw) => WordPosition::Command,
         _ => {
-            if last_is_dollar_name {
-                // A bare `$name` at the cursor (e.g. `echo $whi`).
+            if last_is_dollar_name || trailing_lone_dollar {
+                // A bare `$name` at the cursor (e.g. `echo $whi`), or a lone
+                // trailing `$` with no name yet (`echo $`) — the degenerate
+                // empty-name case, parallel to `${`.
                 WordPosition::VariableName
             } else if cmd_word {
                 WordPosition::Command
+            } else if redirect_target {
+                // A bare redirect operand with no inner expansion mode
+                // (`cat foo > whi`). LOWEST priority — in place of `Argument`,
+                // per bash 5.2.21. An inner `$name`/`${`/`$(`/`$((` above wins.
+                WordPosition::RedirectTarget
             } else {
                 WordPosition::Argument
             }
@@ -197,7 +208,13 @@ pub fn parse_recover(src: &str) -> RecoveredParse {
             let enclosing = merge_enclosing(&cap.modes, lx.recovery_frames());
             CursorContext {
                 enclosing,
-                position: position_from(&cap.modes, cap.last_is_dollar_name, cap.cmd_word),
+                position: position_from(
+                    &cap.modes,
+                    cap.last_is_dollar_name,
+                    cap.trailing_lone_dollar,
+                    cap.cmd_word,
+                    cap.redirect_target,
+                ),
                 word: cap.word.clone(),
                 word_start: cap.word_start,
             }
@@ -367,6 +384,92 @@ mod tests {
     }
 
     #[test]
+    fn cursor_bare_redirect_target_is_redirect_target() {
+        for src in [
+            "cat foo > whi",
+            "echo >whi",
+            "cat < whi",
+            "echo 2> whi",
+            "echo >> whi",
+        ] {
+            assert_eq!(
+                parse_recover(src).cursor.position,
+                WordPosition::RedirectTarget,
+                "{src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_redirect_target_with_inner_expansion_keeps_inner_position() {
+        // The inner expansion wins — a redirect target is a WORD.
+        assert_eq!(
+            parse_recover("cat foo > $HOM").cursor.position,
+            WordPosition::VariableName
+        );
+        assert_eq!(
+            parse_recover("cat foo > ${HOM").cursor.position,
+            WordPosition::VariableName
+        );
+        assert_eq!(
+            parse_recover("cat foo > $(whi").cursor.position,
+            WordPosition::Command
+        );
+        assert_eq!(
+            parse_recover("cat foo > $(( HO").cursor.position,
+            WordPosition::VariableName
+        );
+    }
+
+    #[test]
+    fn cursor_empty_trailing_word_reports_expected_next_slot() {
+        // Gap A (iteration 2): at a whitespace boundary with an EMPTY cursor word,
+        // the position reflects the grammar slot the NEXT word would occupy, not
+        // the last consumed word's slot.
+        // After a command word → the next word is an argument.
+        for src in ["echo ", "ls ", "echo hi ", "for x in "] {
+            let c = ctx(src);
+            assert_eq!(c.position, WordPosition::Argument, "{src:?}");
+            assert_eq!(c.word, "", "{src:?} empty word");
+        }
+        // After a command separator → a new command begins.
+        for src in ["echo hi; ", "echo hi |", "echo hi | ", "echo hi && "] {
+            let c = ctx(src);
+            assert_eq!(c.position, WordPosition::Command, "{src:?}");
+            assert_eq!(c.word, "", "{src:?} empty word");
+        }
+        // Already-correct empty-boundary slots stay put.
+        assert_eq!(ctx("if ").position, WordPosition::Command);
+        assert_eq!(ctx("cat foo > ").position, WordPosition::RedirectTarget);
+    }
+
+    #[test]
+    fn cursor_nonempty_word_slot_unchanged_by_gap_a() {
+        // The non-empty cases must NOT regress.
+        assert_eq!(ctx("whi").position, WordPosition::Command);
+        assert_eq!(ctx("if whi").position, WordPosition::Command);
+        assert_eq!(ctx("echo $(whi").position, WordPosition::Command);
+        assert_eq!(ctx("echo whi").position, WordPosition::Argument);
+        assert_eq!(ctx("for x in whi").position, WordPosition::Argument);
+    }
+
+    #[test]
+    fn cursor_variable_word_start_skips_sigil() {
+        // Gap B (iteration 2): `word_start` anchors at the first NAME char, past the
+        // `$` / `${` / arith-operand sigil — consistent with `word` (which excludes
+        // the sigil).
+        let c = ctx("echo $HO");
+        assert_eq!(c.word, "HO");
+        assert_eq!(c.word_start, 6, "past `$`");
+        let c = ctx("echo ${HO");
+        assert_eq!(c.word, "HO");
+        assert_eq!(c.word_start, 7, "past the braced sigil");
+        let c = ctx("echo $(( HO");
+        assert_eq!(c.word, "HO");
+        assert_eq!(c.word_start, 9, "at the `HO` operand");
+    }
+
+    #[test]
     fn cursor_word_and_start() {
         let c = ctx("echo $(whi");
         assert_eq!(c.word, "whi");
@@ -449,6 +552,55 @@ mod tests {
             parse_recover("if for x in").cursor.enclosing.last(),
             Some(&Frame::ForList)
         );
+    }
+
+    #[test]
+    fn cursor_lone_dollar_is_variable_position() {
+        // `echo $` — a bare `$` at a word start begins a variable expansion; the
+        // cursor completes variable names (empty prefix), like `${`. #248.
+        for src in ["echo $", "$", "cat foo > $"] {
+            let c = parse_recover(src).cursor;
+            assert_eq!(c.position, WordPosition::VariableName, "{src:?}");
+            assert_eq!(c.word, "", "{src:?}");
+            assert_eq!(c.word_start, src.len(), "word_start past the `$`: {src:?}");
+        }
+        // Regression guards: these must NOT change.
+        assert_eq!(
+            parse_recover("echo a$").cursor.position,
+            WordPosition::Argument
+        );
+        assert_eq!(
+            parse_recover("echo $H").cursor.position,
+            WordPosition::VariableName
+        );
+        assert_eq!(
+            parse_recover("echo ${").cursor.position,
+            WordPosition::VariableName
+        );
+    }
+
+    #[test]
+    fn cursor_dollar_name_glued_after_segment_isolates_the_name() {
+        // A `$name` glued after a preceding word segment completes the NAME only,
+        // anchored at the name (not clobbering the segment). #248 whole-branch
+        // review. `word_start` is the first name char (past the `$` sigil), so it
+        // matches the single-segment `$name` anchor rather than the `$`.
+        for (src, word, start) in [
+            ("echo foo$MYVAR", "MYVAR", 9usize),
+            ("echo a:$MYVAR", "MYVAR", 8),
+            ("echo --opt=$MYVAR", "MYVAR", 12),
+            ("echo ${HOME}$MYVAR", "MYVAR", 13),
+        ] {
+            let c = parse_recover(src).cursor;
+            assert_eq!(c.position, WordPosition::VariableName, "{src:?}");
+            assert_eq!(c.word, word, "{src:?}");
+            assert_eq!(c.word_start, start, "{src:?}");
+        }
+        // Regression guards — single-segment / lone-$ unchanged.
+        let c = parse_recover("echo $MYVAR").cursor;
+        assert_eq!((c.word.as_str(), c.word_start), ("MYVAR", 6));
+        let c = parse_recover("echo $").cursor;
+        assert_eq!((c.word.as_str(), c.word_start), ("", 6));
     }
 
     #[test]

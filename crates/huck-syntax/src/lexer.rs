@@ -1175,6 +1175,7 @@ pub(crate) struct Mark {
     /// rewind precedes genuine EOF, so any pending EOF snapshot is invalid.)
     recovery_frames: Vec<(usize, crate::recover::Frame)>,
     recovery_cmd_word: bool,
+    recovery_redirect_target: bool,
 }
 
 /// Snapshot of lexer state at the FIRST real EOF reached under
@@ -1196,9 +1197,22 @@ pub(crate) struct RecoveryCapture {
     /// The rightmost real word atom was a `$name` (`DollarName`) → the cursor
     /// sits in a variable name.
     pub(crate) last_is_dollar_name: bool,
+    /// The ENTIRE trailing word run is a single unquoted, bare `$` (a
+    /// `DollarLit { quoted: false }` with nothing before it in the run) — an
+    /// incomplete variable expansion with no name typed yet, e.g. `echo $`.
+    /// Degenerate sibling of `last_is_dollar_name` / `${` (empty-name
+    /// `ParamExpansion`): the cursor completes variable names from an empty
+    /// prefix. `a$` (a `$` glued onto a preceding word atom) does NOT set
+    /// this — only a lone `$` at a word start. #248.
+    pub(crate) trailing_lone_dollar: bool,
     /// The parser's command-vs-argument flag for the word being assembled at
     /// EOF (`true` == command position). Set via `set_recovery_cmd_word`.
     pub(crate) cmd_word: bool,
+    /// The parser is assembling a bare redirect operand (`> whi`) at EOF. Set
+    /// via `set_recovery_redirect_target`. Drives the LOWEST-priority
+    /// `RedirectTarget` position — in place of `Argument` — when no inner
+    /// expansion mode and no `$name`/command word takes precedence.
+    pub(crate) redirect_target: bool,
 }
 
 /// v250: lexer-internal state while emitting a heredoc body as atoms (atom path).
@@ -1354,6 +1368,12 @@ pub struct Lexer<'a> {
     /// Defaults `true` (a bare/empty line is command position). Only read when a
     /// recovery capture is taken.
     recovery_cmd_word: bool,
+    /// Recovery: the parser sets this to `true` while assembling a bare redirect
+    /// operand (`parse_one_redirect`'s target word) and back to `false` once the
+    /// redirect is built, so the EOF capture records whether the cursor word is a
+    /// redirect target. Defaults `false`. Only read when a recovery capture is
+    /// taken.
+    recovery_redirect_target: bool,
     /// Recovery: compound-command frames the parser pushes when a Task-3
     /// synthesis fires at EOF (`IfCondition`/`WhileCondition`/`ForList`/
     /// `CaseSubject`/`BraceGroup`) — these are NOT lexer modes. Each is recorded
@@ -1400,6 +1420,7 @@ impl<'a> Lexer<'a> {
             recover_last_depth: None,
             recovery_capture: None,
             recovery_cmd_word: true,
+            recovery_redirect_target: false,
             recovery_frames: Vec::new(),
         }
     }
@@ -1565,6 +1586,15 @@ impl<'a> Lexer<'a> {
         self.recovery_cmd_word = is_cmd;
     }
 
+    /// Recovery (iteration 2): the parser declares whether the word it is about
+    /// to assemble is a bare redirect operand (`true`, `parse_one_redirect`'s
+    /// target) — reset to `false` once the redirect is built. The EOF capture
+    /// records the last value set. No-op off the recovery path (read only when a
+    /// recovery capture is taken).
+    pub(crate) fn set_recovery_redirect_target(&mut self, is_target: bool) {
+        self.recovery_redirect_target = is_target;
+    }
+
     /// Recovery (Task 4): the parser pushes a compound-command frame when a
     /// Task-3 synthesis fires at EOF (these are not lexer modes). The frame is
     /// tagged with the live mode-stack depth — the depth at which the compound is
@@ -1614,12 +1644,21 @@ impl<'a> Lexer<'a> {
         // Collect the trailing contiguous word-content atoms (reverse order).
         let mut pieces: Vec<(usize, String)> = Vec::new();
         let mut last_is_dollar_name = false;
+        // Set when the RIGHTMOST atom scanned is an unquoted lone `$`
+        // (`DollarLit { quoted: false }`); only honored below once we know it's
+        // also the ONLY piece in the run (`a$` must not qualify — see field doc).
+        let mut rightmost_is_unquoted_dollar_lit = false;
         for tok in self.history.iter().rev() {
             let piece = match &tok.kind {
                 TokenKind::Lit { text, .. } | TokenKind::QuoteRun { text, .. } => {
                     Some((text.clone(), false))
                 }
-                TokenKind::DollarLit { .. } => Some(("$".to_string(), false)),
+                TokenKind::DollarLit { quoted } => {
+                    if pieces.is_empty() {
+                        rightmost_is_unquoted_dollar_lit = !quoted;
+                    }
+                    Some(("$".to_string(), false))
+                }
                 TokenKind::ParamName(s) | TokenKind::ParamNameDecoded(s) => {
                     Some((s.clone(), false))
                 }
@@ -1635,13 +1674,43 @@ impl<'a> Lexer<'a> {
                         // First atom seen scanning backward == the rightmost atom.
                         last_is_dollar_name = is_dollar;
                     }
-                    pieces.push((tok.span.offset, text));
+                    // Gap B (iteration 2): a `$name` (`DollarName`) atom's span
+                    // starts at the `$` sigil, but the `text` we push is the bare
+                    // NAME (`$` excluded). The contract is `word_start` = the byte
+                    // offset where `word` begins, so skip the 1-byte `$` sigil for
+                    // a `DollarName` so a bare `$HO` anchors at the `H`, not the `$`
+                    // (`${…}`/arith operands already anchor at the name). No effect
+                    // when the atom is not the leftmost of the trailing run.
+                    let off = tok.span.offset + if is_dollar { 1 } else { 0 };
+                    pieces.push((off, text));
                 }
                 None => break,
             }
         }
-        let (mut word, mut word_start) = if pieces.is_empty() {
+        // A lone `$` at a word start (nothing before it in the trailing run) is
+        // the entire captured word — the degenerate empty-name `$name`, parallel
+        // to `${`'s empty-name capture. Anchor `word_start` past the sigil (like
+        // `$HO`/`${HO`) with an empty `word`, rather than reporting the literal
+        // `"$"` text as an `Argument` word.
+        let trailing_lone_dollar = rightmost_is_unquoted_dollar_lit && pieces.len() == 1;
+        let (mut word, mut word_start) = if trailing_lone_dollar {
             (String::new(), end)
+        } else if pieces.is_empty() {
+            (String::new(), end)
+        } else if last_is_dollar_name {
+            // #248 whole-branch review: the rightmost atom is a bare `$name`. Its
+            // completion is only that NAME — the preceding contiguous word segment
+            // (`foo` in `foo$HO`, `a:` in `a:$HO`, `--opt=` in `--opt=$HO`) must
+            // NOT be glued into `word`, or `complete_variable` searches for a
+            // name that includes the segment and finds nothing (and the anchor
+            // clobbers the segment). The `${…}`/arith operand paths isolate the
+            // name via their inner lexer mode; the bare `$name` path has none, so
+            // re-slice to just the `DollarName` (`pieces[0]`, the rightmost atom).
+            // Its offset already skips the `$` sigil (see the +1 above), so this
+            // anchors at the first name char, exactly like the single-segment
+            // `$HO` case.
+            let (off, ref text) = pieces[0];
+            (text.clone(), off)
         } else {
             let start = pieces.last().expect("non-empty").0;
             let text: String = pieces.iter().rev().map(|(_, t)| t.as_str()).collect();
@@ -1681,7 +1750,9 @@ impl<'a> Lexer<'a> {
             word,
             word_start,
             last_is_dollar_name,
+            trailing_lone_dollar,
             cmd_word: self.recovery_cmd_word,
+            redirect_target: self.recovery_redirect_target,
         }
     }
 
@@ -1816,6 +1887,7 @@ impl<'a> Lexer<'a> {
             heredoc_gen: self.heredoc_gen,
             recovery_frames: self.recovery_frames.clone(),
             recovery_cmd_word: self.recovery_cmd_word,
+            recovery_redirect_target: self.recovery_redirect_target,
         }
     }
 
@@ -1860,6 +1932,7 @@ impl<'a> Lexer<'a> {
         // leave it stale after the rewind.
         self.recovery_frames = m.recovery_frames.clone();
         self.recovery_cmd_word = m.recovery_cmd_word;
+        self.recovery_redirect_target = m.recovery_redirect_target;
         debug_assert_eq!(
             self.heredoc_gen, m.heredoc_gen,
             "mark/rewind must not span heredoc-body emission (v250)"
