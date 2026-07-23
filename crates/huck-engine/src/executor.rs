@@ -2254,7 +2254,9 @@ fn run_select_inner(
         }
         match crate::traps::fire_debug_trap(shell) {
             crate::traps::DebugDecision::Proceed => {}
-            crate::traps::DebugDecision::SkipCommand => break,
+            // A DEBUG-skipped `select` returns 0 (bash: `return
+            // (EXECUTION_SUCCESS)`), not the loop's EOF-default status 1.
+            crate::traps::DebugDecision::SkipCommand => return ExecOutcome::Continue(0),
             crate::traps::DebugDecision::ReturnFromSub(n) => {
                 return ExecOutcome::FunctionReturn(n);
             }
@@ -2423,9 +2425,9 @@ fn run_case_inner(
     }
     match crate::traps::fire_debug_trap(shell) {
         crate::traps::DebugDecision::Proceed => {}
-        crate::traps::DebugDecision::SkipCommand => {
-            return ExecOutcome::Continue(shell.last_status());
-        }
+        // A DEBUG-skipped `case` returns 0 (bash: `return (EXECUTION_SUCCESS)`),
+        // not the prior command's status.
+        crate::traps::DebugDecision::SkipCommand => return ExecOutcome::Continue(0),
         crate::traps::DebugDecision::ReturnFromSub(n) => return ExecOutcome::FunctionReturn(n),
     }
     let mut last = ExecOutcome::Continue(0);

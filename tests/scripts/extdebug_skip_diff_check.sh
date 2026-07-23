@@ -82,5 +82,10 @@ check "ReturnFromSub (return 2 in fn)" \
 check "no-extdebug: non-zero status does not skip" \
   'n=0; tr(){ n=$((n+1)); [[ $n == 1 ]] && return 1; return 0; }; trap tr DEBUG; for x in 1 2; do echo b$x; done; echo after'
 
+# v326 review: the skipped construct's OWN $? (a non-zero prior status must not
+# leak; bash returns 0 for a DEBUG-skipped case/select).
+check "case skip \$?"   'shopt -s extdebug; n=0; tr(){ n=$((n+1)); [[ $n == 2 ]] && return 1; return 0; }; trap tr DEBUG; false; case a in a) echo m;; esac; echo "R=$?"'
+check "select skip \$?" 'shopt -s extdebug; n=0; tr(){ n=$((n+1)); [[ $n == 1 ]] && return 1; return 0; }; trap tr DEBUG; false; select x in a; do echo $x; break; done <<< 1; echo "R=$?"'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
