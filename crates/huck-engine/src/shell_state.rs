@@ -749,6 +749,13 @@ pub struct Shell {
     /// function is defined. Used to fill `Frame.source` and ultimately
     /// `BASH_SOURCE`.
     pub function_source: std::collections::HashMap<String, String>,
+    /// Map of function-name → ABSOLUTE definition line (the `f() {`/
+    /// `function f {` line, offset by `line_base()` at define-time). 0 means
+    /// unknown/synthesized (parallels `FunctionDef.line`'s 0 convention).
+    /// v329 (#274): lets `call_function` stamp `$LINENO` to this line before
+    /// firing the DEBUG trap on function ENTRY, matching bash's
+    /// function-tracing entry fire.
+    pub function_def_line: std::collections::HashMap<String, u32>,
     /// `Some(status)` after a fatal parameter-expansion error fires
     /// inside an `expand_*` call. The executor peeks this to bail the
     /// current simple command; the REPL loop drains it via
@@ -1008,7 +1015,7 @@ fn parse_imported_function(name: &str, value: &str) -> Option<Box<crate::command
         return None;
     }
     match seq.first {
-        crate::command::Command::FunctionDef { name: n, body } if n == name => Some(body),
+        crate::command::Command::FunctionDef { name: n, body, .. } if n == name => Some(body),
         _ => None,
     }
 }
@@ -1110,6 +1117,7 @@ impl Shell {
             inline_scopes: Vec::new(),
             inline_scalar_export: Vec::new(),
             function_source: std::collections::HashMap::new(),
+            function_def_line: std::collections::HashMap::new(),
             pending_fatal_status: None,
             pending_discard: false,
             builtin_usage_error: None,
@@ -1156,7 +1164,10 @@ impl Shell {
         // (single matching FunctionDef, never executed) — Shellshock-safe.
         for (fname, value) in bash_funcs {
             if let Some(body) = parse_imported_function(&fname, &value) {
-                shell.define_function(fname.clone(), body);
+                // No meaningful absolute source line for an env-imported
+                // function (its BASH_FUNC_<name>%% text isn't part of this
+                // script) — 0 (unknown), matching the zero-lines convention.
+                shell.define_function(fname.clone(), body, 0);
                 shell.mark_function_exported(&fname);
             }
         }
@@ -2782,13 +2793,24 @@ impl Shell {
     /// Defines (or replaces) a shell function. Copy-on-write: if the function
     /// table is shared (e.g. with a command-substitution clone), this copies it
     /// first so the mutation does not leak across the isolation boundary.
-    pub(crate) fn define_function(&mut self, name: String, body: Box<crate::command::Command>) {
+    pub(crate) fn define_function(
+        &mut self,
+        name: String,
+        body: Box<crate::command::Command>,
+        line: u32,
+    ) {
         let def_src = self
             .call_stack
             .last()
             .map(|f| f.source.clone())
             .unwrap_or_else(|| "environment".to_string());
         self.function_source.insert(name.clone(), def_src);
+        let abs_line = if line == 0 {
+            0
+        } else {
+            self.line_base() + line
+        };
+        self.function_def_line.insert(name.clone(), abs_line);
         Rc::make_mut(&mut self.functions).insert(name, body);
     }
 
@@ -2836,6 +2858,7 @@ impl Shell {
     pub(crate) fn remove_function(&mut self, name: &str) -> bool {
         self.exported_functions.remove(name);
         self.function_source.remove(name);
+        self.function_def_line.remove(name);
         Rc::make_mut(&mut self.functions).remove(name).is_some()
     }
 

@@ -190,7 +190,7 @@ fn import_accepts_simple_and_rejects_invalid_name() {
 #[test]
 fn exported_function_env_pairs() {
     let mut sh = Shell::new();
-    sh.define_function("ef".to_string(), test_fn_body());
+    sh.define_function("ef".to_string(), test_fn_body(), 0);
     sh.mark_function_exported("ef");
     let env = sh.exported_function_env();
     let (_, v) = env
@@ -204,7 +204,7 @@ fn exported_function_env_pairs() {
 #[test]
 fn mark_and_query_exported_function() {
     let mut sh = Shell::new();
-    sh.define_function("f".to_string(), test_fn_body());
+    sh.define_function("f".to_string(), test_fn_body(), 0);
     assert!(!sh.is_function_exported("f"));
     sh.mark_function_exported("f");
     assert!(sh.is_function_exported("f"));
@@ -214,7 +214,7 @@ fn mark_and_query_exported_function() {
 #[test]
 fn remove_function_unexports() {
     let mut sh = Shell::new();
-    sh.define_function("f".to_string(), test_fn_body());
+    sh.define_function("f".to_string(), test_fn_body(), 0);
     sh.mark_function_exported("f");
     assert!(sh.remove_function("f"));
     assert!(!sh.is_function_exported("f"), "unset -f must un-export");
@@ -325,13 +325,13 @@ fn shell_clone_shares_functions_and_cow_isolates_defines() {
     let body = Box::new(crate::command::Command::Simple(
         crate::command::SimpleCommand::Assign(vec![], 0),
     ));
-    a.define_function("f".to_string(), body.clone());
+    a.define_function("f".to_string(), body.clone(), 0);
     assert_eq!(Rc::strong_count(&a.functions), 1);
     let b = a.clone();
     // After clone both shells share the same Rc — O(1) clone, NOT a deep copy.
     assert_eq!(Rc::strong_count(&a.functions), 2);
     // COW: defining a new function in `a` must NOT affect `b`.
-    a.define_function("g".to_string(), body);
+    a.define_function("g".to_string(), body, 0);
     assert!(a.functions.contains_key("g"));
     assert!(!b.functions.contains_key("g")); // isolation preserved
     // After make_mut the two Rcs are now independent.

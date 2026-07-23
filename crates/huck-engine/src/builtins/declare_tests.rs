@@ -101,8 +101,8 @@ fn declare_f_lists_functions() {
     let body = Box::new(crate::command::Command::Simple(
         crate::command::SimpleCommand::Assign(vec![], 0),
     ));
-    shell.define_function("fn1".to_string(), body.clone());
-    shell.define_function("fn2".to_string(), body);
+    shell.define_function("fn1".to_string(), body.clone(), 0);
+    shell.define_function("fn2".to_string(), body, 0);
     let (oc, out) = run(&["-f"], &mut shell);
     assert!(matches!(oc, ExecOutcome::Continue(0)));
     // v146: `-f` prints the normalized function body via `generate`, so
@@ -132,7 +132,7 @@ fn declare_f_named_function_found() {
     let body = Box::new(crate::command::Command::Simple(
         crate::command::SimpleCommand::Assign(vec![], 0),
     ));
-    shell.define_function("fn1".to_string(), body);
+    shell.define_function("fn1".to_string(), body, 0);
     let (oc, out) = run(&["-F", "fn1"], &mut shell);
     assert!(matches!(oc, ExecOutcome::Continue(0)));
     // bash `declare -F NAME` (explicit name) → bare name (not "declare -f NAME").
@@ -148,10 +148,10 @@ fn define_fn(shell: &mut Shell, src: &str) {
     ))
     .unwrap()
     .unwrap();
-    let crate::command::Command::FunctionDef { name, body } = seq.first else {
+    let crate::command::Command::FunctionDef { name, body, .. } = seq.first else {
         panic!("expected function def")
     };
-    shell.define_function(name, body);
+    shell.define_function(name, body, 0);
 }
 
 #[test]

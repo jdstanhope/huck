@@ -884,6 +884,7 @@ fn function_def_registers_and_returns_zero() {
         first: Command::FunctionDef {
             name: "f".to_string(),
             body: Box::new(Command::BraceGroup(Box::new(body))),
+            line: 0,
         },
         rest: vec![],
         background: false,

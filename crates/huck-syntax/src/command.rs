@@ -622,6 +622,14 @@ pub enum Command {
     FunctionDef {
         name: String,
         body: Box<Command>,
+        /// The `f() {`/`function f {` definition line (1-based, LOCAL to the
+        /// parse — same convention as other `line: u32` fields, absolutized
+        /// via `Shell::line_base()` by the engine). 0 when synthesized/unknown
+        /// (mirrors `zero_lines_in_command`'s convention for other commands).
+        /// v329 (#274): lets the engine fire the DEBUG trap on function ENTRY
+        /// with `$LINENO` = this line, matching bash's function-tracing entry
+        /// fire.
+        line: u32,
     },
     /// NEW (v30): `[[ … ]]` extended test.
     /// `inline_assignments` holds any `NAME=value` prefixes (e.g. `FOO=hi [[ … ]]`).

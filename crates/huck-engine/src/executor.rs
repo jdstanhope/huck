@@ -953,7 +953,7 @@ fn run_command(
                 ExecOutcome::Continue(code)
             }
         }
-        Command::FunctionDef { name, body } => {
+        Command::FunctionDef { name, body, line } => {
             // POSIX: a function may not be named after a special builtin; a
             // non-interactive posix shell errors and exits (default mode allows it).
             if shell.shell_options.posix && builtins::is_special_builtin(name) {
@@ -964,7 +964,7 @@ fn run_command(
                 shell.posix_fatal(2);
                 return ExecOutcome::Continue(2);
             }
-            shell.define_function(name.clone(), body.clone());
+            shell.define_function(name.clone(), body.clone(), *line);
             ExecOutcome::Continue(0)
         }
         Command::DoubleBracket {
@@ -4073,6 +4073,22 @@ pub(crate) fn call_function(
     // Keep the dynamic FUNCNAME array in lockstep with the call stack (v151).
     shell.sync_call_arrays();
     shell.local_scopes.push(std::collections::HashMap::new());
+
+    // v329 (#274): fire the DEBUG trap ONCE on function ENTRY (after the
+    // call-site fire, before the first body command), with $LINENO stamped to
+    // the function's DEFINITION line — matching bash's function-tracing
+    // entry fire. Fired AFTER the frame push (above) so the action sees the
+    // right FUNCNAME and `fire_debug_trap`'s functrace gate sees the
+    // just-pushed Function frame. The entry fire's DebugDecision
+    // (extdebug SkipCommand/ReturnFromSub) is deferred — see #277 — so this
+    // fires the action only (Proceed semantics); `fire_debug_trap` itself is
+    // a no-op when DEBUG isn't inherited here (no functrace/extdebug).
+    if let Some(&def_line) = shell.function_def_line.get(name)
+        && def_line != 0
+    {
+        shell.current_lineno = def_line;
+    }
+    let _ = crate::traps::fire_debug_trap(shell);
 
     let result = run_command(&body, shell, sink, err_sink);
 

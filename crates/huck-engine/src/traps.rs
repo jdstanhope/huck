@@ -161,9 +161,14 @@ pub fn fire_debug_trap(shell: &mut Shell) -> DebugDecision {
     // the restore) purely to decide Proceed/Skip/Return; that decision does
     // not leak into the surface $?.
     let saved_status = shell.last_status();
+    // #274-adjacent: the DEBUG action's own commands (incl. function calls)
+    // must not leak their line number into the surrounding code's $LINENO —
+    // bash restores LINENO across the trap action. Save/restore current_lineno.
+    let saved_lineno = shell.current_lineno;
     shell.firing_traps.push(TrapSignal::Debug);
     let _ = crate::shell::process_line(&action, shell, false);
     shell.firing_traps.pop();
+    shell.current_lineno = saved_lineno;
     shell.eval_frame = prev_frame;
 
     // Reuse `in_subroutine` computed above (for the firing gate) — the

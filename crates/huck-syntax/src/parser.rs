@@ -1598,7 +1598,10 @@ fn zero_lines_in_command(cmd: &mut Command) {
                 }
             }
         }
-        Command::FunctionDef { body, .. } => zero_lines_in_command(body),
+        Command::FunctionDef { body, line, .. } => {
+            *line = 0;
+            zero_lines_in_command(body);
+        }
         Command::DoubleBracket { .. } => {} // no line field in TestExpr
         Command::Arith(_) => {}
         Command::ArithFor(clause) => {
@@ -3410,7 +3413,7 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
         if !oracle_accepts_as_name
             && matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen)))
         {
-            return parse_function_def(name_word, iter);
+            return parse_function_def(name_word, line, iter);
         }
         return parse_simple_with_leading_word(iter, line, Some(name_word));
     }
@@ -5175,7 +5178,7 @@ fn parse_subshell_sequence(iter: &mut Lexer) -> Result<Sequence, ParseError> {
 /// atom-path `parse_command`, and validate its shape. A body that is itself a
 /// still-deferred construct makes `parse_command` return `UnsupportedCommand`,
 /// which propagates — the funcdef defers cleanly (pinned case).
-fn finish_function_body(name: String, iter: &mut Lexer) -> Result<Command, ParseError> {
+fn finish_function_body(name: String, line: u32, iter: &mut Lexer) -> Result<Command, ParseError> {
     skip_newlines(iter)?;
     if iter.peek_kind()?.is_none() {
         return Err(ParseError::UnterminatedFunction);
@@ -5187,6 +5190,7 @@ fn finish_function_body(name: String, iter: &mut Lexer) -> Result<Command, Parse
     Ok(Command::FunctionDef {
         name,
         body: Box::new(body),
+        line,
     })
 }
 
@@ -5195,6 +5199,9 @@ fn finish_function_body(name: String, iter: &mut Lexer) -> Result<Command, Parse
 /// `function` via `peek_leading_keyword`. Skips the atom-stream `Blank`s the
 /// Word-lexer never emitted.
 fn parse_function_keyword_def(iter: &mut Lexer) -> Result<Command, ParseError> {
+    // v329 (#274): the `function` keyword's own line is the definition line
+    // bash reports on the DEBUG-trap function-entry fire.
+    let line = iter.current_line()?;
     consume_command_word(iter)?; // consume the `function` keyword word
     while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
         iter.next_kind()?;
@@ -5217,13 +5224,15 @@ fn parse_function_keyword_def(iter: &mut Lexer) -> Result<Command, ParseError> {
             _ => return Err(ParseError::FunctionBody),
         }
     }
-    finish_function_body(name, iter)
+    finish_function_body(name, line, iter)
 }
 
 /// `name() compound` (mirrors `command.rs`'s `parse_function_def`). The caller
 /// consumed the name (`name_word`) and confirmed the next non-`Blank` token is
-/// `Op(LParen)`. Skips atom-stream `Blank`s inside `( )`.
-fn parse_function_def(name_word: Word, iter: &mut Lexer) -> Result<Command, ParseError> {
+/// `Op(LParen)`. Skips atom-stream `Blank`s inside `( )`. `line` is the
+/// command-start line the caller already captured (before consuming the name
+/// word) — v329 (#274)'s definition line for the DEBUG-trap entry fire.
+fn parse_function_def(name_word: Word, line: u32, iter: &mut Lexer) -> Result<Command, ParseError> {
     let name =
         crate::command::valid_function_name_text(&name_word).ok_or(ParseError::FunctionName)?;
     iter.next_kind()?; // `(`
@@ -5234,7 +5243,7 @@ fn parse_function_def(name_word: Word, iter: &mut Lexer) -> Result<Command, Pars
         Some(TokenKind::Op(Operator::RParen)) => {}
         _ => return Err(ParseError::FunctionBody),
     }
-    finish_function_body(name, iter)
+    finish_function_body(name, line, iter)
 }
 
 /// Skips inter-atom whitespace inside `[[ … ]]`: BOTH `Blank` (atom-stream
