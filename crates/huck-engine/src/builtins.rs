@@ -6838,7 +6838,8 @@ pub(crate) fn eval_in_sink(
     // PS4 depth-repeat: eval's body traces one level deeper (bash). The
     // `+ eval '…'` line was already emitted at the outer depth before dispatch.
     let saved_frame = shell.eval_frame;
-    shell.eval_frame = Some(shell.current_lineno.max(1));
+    let body_newlines = joined.bytes().filter(|&b| b == b'\n').count() as u32;
+    shell.eval_frame = Some(shell.current_lineno.max(1) + body_newlines);
     let saved = shell.xtrace_depth;
     shell.xtrace_depth += 1;
     let r = crate::shell::process_line_in_sinks(&joined, shell, true, sink, err_sink);
@@ -7644,7 +7645,13 @@ pub(crate) fn run_sourced_contents_in_sinks(
     // `process_line_in_sinks` call, independent of what this wrapper cleared.
     let saved_eval_frame = shell.eval_frame;
     shell.eval_frame = None;
+    // v325 (#266): a sourced file has its OWN line numbering; the piped-stdin
+    // cumulative base (`stdin_line_base`) must not bleed into it via
+    // `line_base()`'s stdin fallback (same reset discipline as `eval_frame`).
+    let saved_stdin_base = shell.stdin_line_base;
+    shell.stdin_line_base = 0;
     let result = run_sourced_contents_in_sinks_inner(contents, _path, shell, sink, err_sink);
+    shell.stdin_line_base = saved_stdin_base;
     shell.eval_frame = saved_eval_frame;
     result
 }

@@ -678,6 +678,10 @@ pub struct ForClause {
     pub has_in: bool,
     /// The do…done body.
     pub body: Sequence,
+    /// Source line of the `for` keyword (v325 #261), for stamping
+    /// `$LINENO` before each per-iteration DEBUG-trap header fire. 0 when
+    /// stripped by `zero_lines_in_command` (e.g. inside `$(...)`).
+    pub line: u32,
 }
 
 /// NEW (v81): a `select NAME [in WORDS]; do BODY; done` clause.
@@ -689,6 +693,10 @@ pub struct SelectClause {
     /// Some(words) => explicit `in WORDS` (Some(vec![]) = empty `in`).
     pub words: Option<Vec<Word>>,
     pub body: Sequence,
+    /// Source line of the `select` keyword (v325 #261), for stamping
+    /// `$LINENO` before each per-iteration DEBUG-trap header fire. 0 when
+    /// stripped by `zero_lines_in_command`.
+    pub line: u32,
 }
 
 /// NEW (v78): a C-style `for ((init; cond; step)) do BODY done` clause.
@@ -699,6 +707,10 @@ pub struct ArithForClause {
     pub cond: Option<crate::lexer::Word>,
     pub step: Option<crate::lexer::Word>,
     pub body: Sequence,
+    /// Source line of the `for` keyword (v325 #261), for stamping
+    /// `$LINENO` before each init/cond/step DEBUG-trap header fire. 0 when
+    /// stripped by `zero_lines_in_command`.
+    pub line: u32,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -707,6 +719,10 @@ pub struct CaseClause {
     pub subject: Word,
     /// The clauses, in source order. May be empty.
     pub items: Vec<CaseItem>,
+    /// Source line of the `case` keyword (v325 #261), for stamping
+    /// `$LINENO` before the entry DEBUG-trap header fire. 0 when stripped
+    /// by `zero_lines_in_command`.
+    pub line: u32,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]

@@ -490,11 +490,11 @@ pub fn process_line_in_sinks(
         Err(e) => {
             // No AST-carried position for an immediate (non-EOF) parse error on
             // a single logical command: derive the line from the live lexer's
-            // cursor, counting newlines within THIS command's own text. Matches
-            // bash for the common (first/only command) case; a longer piped-
-            // stdin session with cumulative line tracking is a separate gap
-            // (bash counts lines across the whole non-interactive input, which
-            // huck's per-command REPL loop does not track today).
+            // cursor, counting newlines within THIS command's own text, plus
+            // `shell.line_base()` — which folds in the piped-stdin REPL's
+            // cumulative `stdin_line_base` (v325 #266) so a syntax error later
+            // in a non-interactive stdin session still reports bash's absolute
+            // line number, not just this command's own local count.
             let off = lx.cursor_pos().min(line.len());
             let ln = shell.line_base()
                 + 1

@@ -29,8 +29,17 @@ const DEFAULT_PS2: &str = "> ";
 /// The outcome of reading one logical (possibly multi-line) command.
 enum ReadResult {
     /// A finished command: `buffer` is fed to the executor, `history`
-    /// is its single-line form for the history list.
-    Ready { buffer: String, history: String },
+    /// is its single-line form for the history list. `lines` is the number of
+    /// PHYSICAL input lines this logical command consumed (one per successful
+    /// `readline`/raw-stdin read in `read_logical_command`'s loop, regardless
+    /// of how they joined into `buffer` — a backslash continuation joins with
+    /// no `\n`, so counting `buffer`'s embedded newlines would undercount).
+    /// Used to advance the non-interactive stdin cumulative `$LINENO` base.
+    Ready {
+        buffer: String,
+        history: String,
+        lines: u32,
+    },
     /// Ctrl-C — any partial command is discarded; the REPL loops.
     Interrupted,
     /// Ctrl-D at an empty first-line prompt — exit the shell cleanly.
@@ -221,6 +230,15 @@ pub fn run(args: &[String], version: &str) -> i32 {
         Rc::make_mut(&mut shell.history).set_max(cap);
     }
 
+    // Cumulative physical-line counter for a non-interactive (piped-stdin)
+    // session: bash's $LINENO runs cumulatively across the WHOLE input, but
+    // this REPL loop calls `process_line` once per logical command, each of
+    // which stamps `current_lineno` from its own line-1-based `cmd.line`.
+    // Before each `process_line`, publish the lines already consumed via
+    // `shell.stdin_line_base` (read by `line_base()`); after, advance it by
+    // the physical lines this command's buffer consumed. Interactive mode
+    // never touches this field (line_base() then stays 0, unchanged).
+    let mut lines_before: u32 = 0;
     loop {
         apply_readline_settings(&mut editor, &shell_cell);
         {
@@ -235,7 +253,11 @@ pub fn run(args: &[String], version: &str) -> i32 {
             }
         }
         match read_logical_command(&mut editor, &shell_cell) {
-            ReadResult::Ready { buffer, history } => {
+            ReadResult::Ready {
+                buffer,
+                history,
+                lines,
+            } => {
                 {
                     let mut shell = shell_cell.borrow_mut();
                     if !history.trim().is_empty() {
@@ -256,7 +278,22 @@ pub fn run(args: &[String], version: &str) -> i32 {
                 };
                 let outcome = {
                     let mut shell = shell_cell.borrow_mut();
-                    process_line(&buffer, &mut shell, do_alias)
+                    // Non-interactive (piped-stdin) cumulative $LINENO base: see
+                    // `stdin_line_base`. `lines` is the exact count of physical
+                    // input lines `read_logical_command` consumed for this
+                    // logical command (see its doc comment) — advance the
+                    // running total by that after the command runs. Gated on
+                    // `!is_interactive` so an interactive session never touches
+                    // this field (line_base() then stays 0, unchanged).
+                    if !shell.is_interactive {
+                        shell.stdin_line_base = lines_before;
+                    }
+                    let outcome = process_line(&buffer, &mut shell, do_alias);
+                    if !shell.is_interactive {
+                        lines_before += lines;
+                        shell.stdin_line_base = lines_before;
+                    }
+                    outcome
                 };
                 match outcome {
                     ExecOutcome::Exit(code) => {
@@ -456,6 +493,12 @@ fn read_logical_command(
     // The reason the buffer-so-far is incomplete, and the line that
     // caused it — together they pick the joiner for the next line.
     let mut pending: Option<(huck_engine::continuation::ContinuationReason, String)> = None;
+    // Count of physical lines read so far for this logical command — one per
+    // successful read below, independent of how the lines joined into
+    // `buffer`/`history` (a backslash continuation joins with no `\n` but is
+    // still a real physical line). Used by the caller to advance the
+    // non-interactive cumulative `$LINENO` base.
+    let mut phys_lines: u32 = 0;
 
     // Non-tty stdin (a piped or redirected script): read the script byte-at-a-time
     // from fd 0 rather than through rustyline, so a child process / `read` builtin
@@ -498,6 +541,7 @@ fn read_logical_command(
         };
         match read {
             Ok(raw) => {
+                phys_lines += 1;
                 // History expansion runs per physical line, as before.
                 let line = {
                     let mut shell = cell.borrow_mut();
@@ -541,7 +585,11 @@ fn read_logical_command(
 
                 match classify(&buffer, cell.borrow().extglob()) {
                     Completeness::Complete | Completeness::Error => {
-                        return ReadResult::Ready { buffer, history };
+                        return ReadResult::Ready {
+                            buffer,
+                            history,
+                            lines: phys_lines,
+                        };
                     }
                     Completeness::Incomplete(reason) => {
                         if reason == huck_engine::continuation::ContinuationReason::Backslash {
@@ -568,7 +616,11 @@ fn read_logical_command(
                     // (`eof_closes_heredoc`), so hand the buffer off as Ready.
                     // Other incompleteness (unclosed quote/`$(`/compound) still
                     // reports "unexpected end of input" via EofMidCommand.
-                    ReadResult::Ready { buffer, history }
+                    ReadResult::Ready {
+                        buffer,
+                        history,
+                        lines: phys_lines,
+                    }
                 } else {
                     ReadResult::EofMidCommand(buffer)
                 };
