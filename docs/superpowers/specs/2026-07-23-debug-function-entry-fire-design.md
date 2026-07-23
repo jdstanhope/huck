@@ -24,6 +24,23 @@ The entry fire is a distinct fire even for a one-liner (`f() { echo a; }` on
 line 3 → bash `D=<call> D=3 D=3`, two fires on line 3). It applies to both the
 `f() {…}` and `function f {…}` forms, under `-T` or `extdebug`.
 
+## ADDENDUM (during implementation): bundled `$LINENO`-leak fix (#279)
+
+Measuring the entry fire alone against the real `dbg-support` category showed
+NO shrinkage (635 → 635) — the same isolated-vs-category gap v327 hit. Root
+cause: a SEPARATE, pre-existing bug — the DEBUG trap action's own commands
+(the test's action is `print_debug_trap $LINENO`, a function call) stamp
+`current_lineno` and huck never restores it, so the surrounding function body's
+`$LINENO` leaks the action's line (`L 2` instead of `L 4`/`5`). bash restores
+`$LINENO` across the trap action (as it does `$?`). Fixed in the SAME iteration
+by saving/restoring `current_lineno` around the action in `fire_debug_trap`
+(v322 already saves `$?`/`eval_frame`). Together the entry fire + leak fix
+shrink `dbg-support` **635 → 509** (the `LINENO` class 54 → 0; the `$LINENO`
+values now match bash). The residual is dominated by the missing `caller`
+builtin (the remaining "debug lineno" diff lines are `caller: command not
+found` interleaving, not `$LINENO`). Filed #279 for the leak; entry-fire
+extdebug skip/return deferred to #278.
+
 ## Design
 
 The entry fire needs the function's definition line, which huck does not store.
