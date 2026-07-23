@@ -181,7 +181,7 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
             s.push_str(&format!("[[ {} ]]", testexpr_to_source(expr)));
             s
         }
-        Command::FunctionDef { name, body } => render_function_def(name, body, indent, true),
+        Command::FunctionDef { name, body, .. } => render_function_def(name, body, indent, true),
         Command::Coproc { name, body } => {
             let body_src = command_to_source(body, indent);
             if name == "COPROC" {
@@ -1291,7 +1291,7 @@ mod tests {
     fn arith_command_renders_unquoted() {
         use crate::command;
         let seq = live_parse("f(){ (( i < 3 )); }");
-        let command::Command::FunctionDef { name, body } = seq.first else {
+        let command::Command::FunctionDef { name, body, .. } = seq.first else {
             panic!()
         };
         let s = function_to_source(&name, &body);
@@ -1303,7 +1303,7 @@ mod tests {
     fn arith_expansion_renders_unquoted() {
         use crate::command;
         let seq = live_parse("f(){ i=$(( i + 1 )); }");
-        let command::Command::FunctionDef { name, body } = seq.first else {
+        let command::Command::FunctionDef { name, body, .. } = seq.first else {
             panic!()
         };
         let s = function_to_source(&name, &body);
@@ -1315,7 +1315,7 @@ mod tests {
     fn arith_with_var_renders_unquoted() {
         use crate::command;
         let seq = live_parse("f(){ (( x + $y )); }");
-        let command::Command::FunctionDef { name, body } = seq.first else {
+        let command::Command::FunctionDef { name, body, .. } = seq.first else {
             panic!()
         };
         let s = function_to_source(&name, &body);
@@ -1326,7 +1326,7 @@ mod tests {
     fn declf(src: &str) -> String {
         use crate::command;
         let seq = live_parse(src);
-        let command::Command::FunctionDef { name, body } = seq.first else {
+        let command::Command::FunctionDef { name, body, .. } = seq.first else {
             panic!("expected a function def")
         };
         function_to_source(&name, &body)
@@ -1611,7 +1611,7 @@ mod tests {
         use crate::command;
         let src = format!("f(){{ echo {body_word_src}; }}");
         let seq = live_parse(&src);
-        let command::Command::FunctionDef { name, body } = seq.first else {
+        let command::Command::FunctionDef { name, body, .. } = seq.first else {
             panic!()
         };
         function_to_source(&name, &body)

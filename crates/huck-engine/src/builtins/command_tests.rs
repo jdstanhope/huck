@@ -105,7 +105,7 @@ fn command_dash_v_function() {
     let body = Box::new(crate::command::Command::Simple(
         crate::command::SimpleCommand::Assign(vec![], 0),
     ));
-    shell.define_function("myfn".to_string(), body);
+    shell.define_function("myfn".to_string(), body, 0);
     let mut buf: Vec<u8> = Vec::new();
     let args = vec!["-v".to_string(), "myfn".to_string()];
     let outcome = run_builtin(

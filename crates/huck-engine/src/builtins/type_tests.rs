@@ -34,10 +34,10 @@ fn type_default_function() {
     ))
     .unwrap()
     .unwrap();
-    let crate::command::Command::FunctionDef { name, body } = seq.first else {
+    let crate::command::Command::FunctionDef { name, body, .. } = seq.first else {
         panic!("expected function def")
     };
-    shell.define_function(name, body);
+    shell.define_function(name, body, 0);
     let (oc, out) = run(&["myfn"], &mut shell);
     assert!(matches!(oc, ExecOutcome::Continue(0)));
     assert_eq!(out, "myfn is a function\nmyfn () \n{ \n    :\n}\n");
@@ -53,10 +53,10 @@ fn type_prints_function_body() {
     ))
     .unwrap()
     .unwrap();
-    let crate::command::Command::FunctionDef { name, body } = seq.first else {
+    let crate::command::Command::FunctionDef { name, body, .. } = seq.first else {
         panic!("expected function def")
     };
-    shell.define_function(name, body);
+    shell.define_function(name, body, 0);
     let (oc, out) = run(&["tf"], &mut shell);
     assert!(matches!(oc, ExecOutcome::Continue(0)));
     assert_eq!(out, "tf is a function\ntf () \n{ \n    echo a\n}\n");
@@ -101,7 +101,7 @@ fn type_t_function() {
     let body = Box::new(crate::command::Command::Simple(
         crate::command::SimpleCommand::Assign(vec![], 0),
     ));
-    shell.define_function("myfn".to_string(), body);
+    shell.define_function("myfn".to_string(), body, 0);
     let (oc, out) = run(&["-t", "myfn"], &mut shell);
     assert!(matches!(oc, ExecOutcome::Continue(0)));
     assert_eq!(out.trim_end(), "function");
@@ -147,7 +147,7 @@ fn type_f_skips_function() {
     let body = Box::new(crate::command::Command::Simple(
         crate::command::SimpleCommand::Assign(vec![], 0),
     ));
-    shell.define_function("myfn".to_string(), body);
+    shell.define_function("myfn".to_string(), body, 0);
     // Without -f: would find the function.
     let (oc, _) = run(&["-f", "myfn"], &mut shell);
     // With -f: function ignored, no other match → not found.
