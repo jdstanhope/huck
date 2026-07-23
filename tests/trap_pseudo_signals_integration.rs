@@ -36,7 +36,10 @@ fn debug_fires_before_simple_command() {
 
 #[test]
 fn debug_fires_inside_function_body() {
-    let (out, _err, _) = run("trap 'echo DBG' DEBUG\nf() { true; }\nf\nexit\n");
+    // v327: DEBUG is inherited into a function body only under functrace
+    // (`set -T`); without it, this test's own `f` call would be the ONLY
+    // top-level DEBUG source and the assertion would pass vacuously.
+    let (out, _err, _) = run("trap 'echo DBG' DEBUG\nset -T\nf() { true; }\nf\nexit\n");
     // At least one DBG fires for the `true` inside f.
     let count = out.lines().filter(|l| **l == *"DBG").count();
     assert!(count >= 1, "expected ≥1 DBG, got {count}; stdout: {out}");
@@ -127,7 +130,8 @@ fn err_fires_on_and_chain_rhs_failure() {
 
 #[test]
 fn return_fires_after_function_return() {
-    let (out, _err, _) = run("trap 'echo RET' RETURN\nf() { :; }\nf\nexit\n");
+    // v327: RETURN is inherited into a function only under functrace (`set -T`).
+    let (out, _err, _) = run("trap 'echo RET' RETURN\nset -T\nf() { :; }\nf\nexit\n");
     let count = out.lines().filter(|l| **l == *"RET").count();
     assert_eq!(
         count, 1,
@@ -138,8 +142,9 @@ fn return_fires_after_function_return() {
 #[test]
 fn return_action_sees_function_status() {
     // The action runs with $? set to the function's return status.
+    // v327: RETURN is inherited into a function only under functrace (`set -T`).
     let (out, _err, _) =
-        run("trap 'echo got=$?' RETURN\nf() { return 7; }\nf\necho done=$?\nexit\n");
+        run("trap 'echo got=$?' RETURN\nset -T\nf() { return 7; }\nf\necho done=$?\nexit\n");
     assert!(out.lines().any(|l| l == "got=7"), "stdout: {out}");
     assert!(out.lines().any(|l| l == "done=7"), "stdout: {out}");
 }
