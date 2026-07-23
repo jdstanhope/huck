@@ -29,6 +29,29 @@ set -T; f    # bash: D D g D … D f …   (fires inside; both match under -T)
 trap 'echo D' DEBUG; source ./x   # bash: no DEBUG inside x; huck: fires inside x
 ```
 
+## CORRECTION (during implementation)
+
+Two premises in this spec were wrong and were corrected by the implementer,
+verified against bash 5.2.21:
+
+1. **The gate condition is `functrace || extdebug`, not `functrace` alone.**
+   `shopt -s extdebug` couples to bash's `function_trace_mode` (the same flag
+   `set -T` sets — see bash `shopt_set_debug_mode()`), so extdebug ALONE also
+   inherits DEBUG/RETURN into a function/sourced script. The gate is
+   `if in_subroutine && !(shell.shell_options.functrace || shell.extdebug()) { return/skip }`.
+   The `functrace`-only gate would have suppressed firing under extdebug (which
+   bash fires) and broken the v326 `ReturnFromSub` case.
+
+2. **This does NOT shrink the `dbg-support` diff (it stays ~1171).** The
+   prototype's "1171 → 592" used the WRONG functrace-only gate. `dbg-support`
+   sets `shopt -s extdebug`, so under the correct gate the traps fire inside
+   functions regardless of functrace — the gate only suppresses when NEITHER
+   extdebug nor functrace is set. So v327 fixes a REAL divergence (over-firing
+   with neither set) but is orthogonal to the `dbg-support` category. The
+   category's actual drivers are #273 (traps fire inside a trap action, ~430
+   lines), #274 (DEBUG on function entry), the `caller` builtin, and
+   `$LINENO`-in-trap fidelity — the sub-arc's remaining iterations.
+
 ## Design
 
 Gate the two pseudo-trap fires on functrace + whether we are inside a
