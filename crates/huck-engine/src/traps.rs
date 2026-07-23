@@ -188,6 +188,13 @@ pub fn fire_return_trap(shell: &mut Shell) {
     if !(shell.shell_options.functrace || shell.extdebug()) {
         return;
     }
+    // #273: RETURN does not fire for a function/source that returns while the
+    // DEBUG trap action is executing (bash suppresses the RETURN trap for the
+    // duration of the DEBUG trap). ERR does NOT suppress RETURN; the same-signal
+    // (RETURN-during-RETURN) case is already covered by fire_pseudo_trap's guard.
+    if shell.firing_traps.contains(&TrapSignal::Debug) {
+        return;
+    }
     fire_pseudo_trap(shell, TrapSignal::Return);
 }
 
