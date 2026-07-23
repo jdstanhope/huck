@@ -95,6 +95,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "ulimit",
     "times",
     "enable",
+    "caller",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -251,6 +252,7 @@ pub fn run_builtin(
         "ulimit" => builtin_ulimit(args, out, err, shell),
         "times" => builtin_times(args, out, err, shell),
         "enable" => builtin_enable(args, out, err, shell),
+        "caller" => builtin_caller(args, out, err, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -9815,6 +9817,51 @@ fn builtin_enable(
         }
     }
     ExecOutcome::Continue(status)
+}
+
+/// `caller [expr]` — report the LINE, [FUNCNAME,] and FILE of a call-stack
+/// frame, reading the same `shell.call_stack` that already backs
+/// `FUNCNAME`/`BASH_LINENO`/`BASH_SOURCE`. No arg reports the immediate
+/// caller (rc 1, no output, if there isn't one); `expr` walks `expr` frames
+/// further up (rc 1 out of range). Extra args are ignored.
+fn builtin_caller(
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    let n = shell.call_stack.len();
+    match args.first() {
+        None => {
+            if n >= 2 {
+                let line = shell.call_stack[n - 1].call_line;
+                let file = shell.call_stack[n - 2].source.clone();
+                let _ = writeln!(out, "{line} {file}");
+                ExecOutcome::Continue(0)
+            } else {
+                ExecOutcome::Continue(1)
+            }
+        }
+        Some(a) => {
+            let k: usize = match a.parse::<u64>() {
+                Ok(v) => v as usize,
+                Err(_) => {
+                    crate::sh_error_to!(shell, err, Some("caller"), "{a}: invalid number");
+                    e!(err, "caller: usage: caller [expr]");
+                    return ExecOutcome::Continue(2);
+                }
+            };
+            if n >= k + 2 {
+                let line = shell.call_stack[n - 1 - k].call_line;
+                let func = shell.call_stack[n - 2 - k].funcname.clone();
+                let file = shell.call_stack[n - 2 - k].source.clone();
+                let _ = writeln!(out, "{line} {func} {file}");
+                ExecOutcome::Continue(0)
+            } else {
+                ExecOutcome::Continue(1)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
