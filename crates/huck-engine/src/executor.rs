@@ -1829,7 +1829,18 @@ fn run_for_inner(
         if clause.line != 0 {
             shell.current_lineno = shell.line_base() + clause.line;
         }
-        let _ = crate::traps::fire_debug_trap(shell);
+        match crate::traps::fire_debug_trap(shell) {
+            crate::traps::DebugDecision::Proceed => {}
+            // bash's execute_cmd.c does a C `continue` here (inside `for
+            // (retval = ...; list; list = list->next)`), not a break: only
+            // this iteration's assignment+body are skipped, and the loop
+            // proceeds to the next value (verified against bash 5.2.21
+            // source + empirically — see extdebug_skip_diff_check.sh).
+            crate::traps::DebugDecision::SkipCommand => continue,
+            crate::traps::DebugDecision::ReturnFromSub(n) => {
+                return ExecOutcome::FunctionReturn(n);
+            }
+        }
         if let Some(o) = check_interrupt(shell) {
             return o;
         }
@@ -2028,8 +2039,16 @@ fn run_arith_for_inner(
     if clause.line != 0 {
         shell.current_lineno = shell.line_base() + clause.line;
     }
-    let _ = crate::traps::fire_debug_trap(shell);
-    if let Some(init) = &clause.init
+    let mut run_init = true;
+    match crate::traps::fire_debug_trap(shell) {
+        crate::traps::DebugDecision::Proceed => {}
+        crate::traps::DebugDecision::SkipCommand => run_init = false,
+        crate::traps::DebugDecision::ReturnFromSub(n) => {
+            return ExecOutcome::FunctionReturn(n);
+        }
+    }
+    if run_init
+        && let Some(init) = &clause.init
         && let Err(e) = crate::expand::eval_arith_word(init, shell)
     {
         {
@@ -2056,7 +2075,13 @@ fn run_arith_for_inner(
         if clause.line != 0 {
             shell.current_lineno = shell.line_base() + clause.line;
         }
-        let _ = crate::traps::fire_debug_trap(shell);
+        match crate::traps::fire_debug_trap(shell) {
+            crate::traps::DebugDecision::Proceed => {}
+            crate::traps::DebugDecision::SkipCommand => break,
+            crate::traps::DebugDecision::ReturnFromSub(n) => {
+                return ExecOutcome::FunctionReturn(n);
+            }
+        }
         // 2. Eval cond. Empty cond = always true (matches bash).
         let cond_value = match &clause.cond {
             None => 1,
@@ -2114,8 +2139,16 @@ fn run_arith_for_inner(
         if clause.line != 0 {
             shell.current_lineno = shell.line_base() + clause.line;
         }
-        let _ = crate::traps::fire_debug_trap(shell);
-        if let Some(step) = &clause.step
+        let mut run_step = true;
+        match crate::traps::fire_debug_trap(shell) {
+            crate::traps::DebugDecision::Proceed => {}
+            crate::traps::DebugDecision::SkipCommand => run_step = false,
+            crate::traps::DebugDecision::ReturnFromSub(n) => {
+                return ExecOutcome::FunctionReturn(n);
+            }
+        }
+        if run_step
+            && let Some(step) = &clause.step
             && let Err(e) = crate::expand::eval_arith_word(step, shell)
         {
             {
@@ -2219,7 +2252,13 @@ fn run_select_inner(
         if clause.line != 0 {
             shell.current_lineno = shell.line_base() + clause.line;
         }
-        let _ = crate::traps::fire_debug_trap(shell);
+        match crate::traps::fire_debug_trap(shell) {
+            crate::traps::DebugDecision::Proceed => {}
+            crate::traps::DebugDecision::SkipCommand => break,
+            crate::traps::DebugDecision::ReturnFromSub(n) => {
+                return ExecOutcome::FunctionReturn(n);
+            }
+        }
 
         // 3a. PS3 (default "#? ").
         let ps3 = shell.lookup_var("PS3").unwrap_or_else(|| "#? ".to_string());
@@ -2382,7 +2421,13 @@ fn run_case_inner(
     if clause.line != 0 {
         shell.current_lineno = shell.line_base() + clause.line;
     }
-    let _ = crate::traps::fire_debug_trap(shell);
+    match crate::traps::fire_debug_trap(shell) {
+        crate::traps::DebugDecision::Proceed => {}
+        crate::traps::DebugDecision::SkipCommand => {
+            return ExecOutcome::Continue(shell.last_status());
+        }
+        crate::traps::DebugDecision::ReturnFromSub(n) => return ExecOutcome::FunctionReturn(n),
+    }
     let mut last = ExecOutcome::Continue(0);
     let mut i = 0;
     let mut fall_through = false;
