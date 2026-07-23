@@ -66,6 +66,7 @@ check "for-paren newline"   $'for()\ntrue'
 # parsing, so it is regression-tested by huck-syntax's `recover.rs` unit
 # tests (e.g. `parse_recover("if whi")`), not by this bash-diff harness.
 check "if-then EOF fallback (unaffected)" 'if true; then echo hi'
+check "for bad-name lineno" 'for 1x in a; do :; done'   # `line 1:` prefix, rc 1
 
 if [ $FAIL -ne 0 ]; then echo "parser_syntax_errors_diff_check FAILED" >&2; exit 1; fi
 echo "parser_syntax_errors_diff_check OK"
