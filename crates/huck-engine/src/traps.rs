@@ -122,6 +122,24 @@ pub fn fire_debug_trap(shell: &mut Shell) -> DebugDecision {
     if shell.firing_traps.contains(&TrapSignal::Debug) {
         return DebugDecision::Proceed;
     }
+    // "In a subroutine" means a context where `return` is legal — a function
+    // or a sourced script — NOT the main script (whose base "main" frame is
+    // always present). Same predicate the `return` builtin uses to reject a
+    // top-level `return`.
+    let in_subroutine = shell.call_stack.iter().any(|f| {
+        matches!(
+            f.kind,
+            crate::shell_state::FrameKind::Function | crate::shell_state::FrameKind::Source
+        )
+    });
+    // functrace (`set -T` / `shopt -s extdebug`): DEBUG is inherited into a
+    // function or sourced script only under functrace; at the top level it
+    // always fires. bash's shopt_set_debug_mode() couples `extdebug` to the
+    // same function_trace_mode flag `-T` sets, so extdebug alone also
+    // inherits the trap (verified against real bash 5.2.21). (bash)
+    if in_subroutine && !(shell.shell_options.functrace || shell.extdebug()) {
+        return DebugDecision::Proceed;
+    }
     let action = match shell.traps.get(&TrapSignal::Debug) {
         Some(Some(text)) => text.clone(),
         _ => return DebugDecision::Proceed,
@@ -148,16 +166,10 @@ pub fn fire_debug_trap(shell: &mut Shell) -> DebugDecision {
     shell.firing_traps.pop();
     shell.eval_frame = prev_frame;
 
-    // "In a subroutine" for the return-2 simulation means a context where
-    // `return` is legal — a function or a sourced script — NOT the main script
-    // (whose base "main" frame is always present). Same predicate the `return`
-    // builtin uses to reject a top-level `return`.
-    let in_subroutine = shell.call_stack.iter().any(|f| {
-        matches!(
-            f.kind,
-            crate::shell_state::FrameKind::Function | crate::shell_state::FrameKind::Source
-        )
-    });
+    // Reuse `in_subroutine` computed above (for the firing gate) — the
+    // return-2-simulation predicate is the same "function or sourced script"
+    // check, and `shell.call_stack` is unchanged across the trap action (any
+    // function calls made by the action push and pop symmetrically).
     let decision = debug_decision(shell.extdebug(), shell.last_status(), in_subroutine);
     shell.set_last_status(saved_status);
     decision
@@ -165,6 +177,17 @@ pub fn fire_debug_trap(shell: &mut Shell) -> DebugDecision {
 
 /// Fires the RETURN pseudo-signal trap. Repeatable; recursion-guarded.
 pub fn fire_return_trap(shell: &mut Shell) {
+    // RETURN is inherited into a function/sourced script only under
+    // functrace (`set -T` / `shopt -s extdebug`, which bash couples to the
+    // same function_trace_mode flag — verified against real bash 5.2.21);
+    // without it the trap does not fire on return. The sole call site
+    // (`call_function`) is a function return, so this blanket gate is
+    // correct there; huck does not yet fire RETURN on sourced-script
+    // completion at all (a separate, pre-existing gap outside this task).
+    // (bash)
+    if !(shell.shell_options.functrace || shell.extdebug()) {
+        return;
+    }
     fire_pseudo_trap(shell, TrapSignal::Return);
 }
 
@@ -833,6 +856,9 @@ mod tests {
     #[test]
     fn fire_return_trap_runs_action_without_remove() {
         let mut shell = Shell::new();
+        // v327: RETURN now requires functrace to fire at all (this test's
+        // intent is the action-runs/not-removed behavior, not the gate).
+        shell.shell_options.functrace = true;
         shell
             .traps
             .insert(TrapSignal::Return, Some("FOO=ret_ran".to_string()));
@@ -867,6 +893,9 @@ mod tests {
     #[test]
     fn fire_return_trap_recursion_guard_suppresses_reentry() {
         let mut shell = Shell::new();
+        // v327: functrace must be on to reach the recursion guard at all
+        // (this test's intent), since RETURN now also gates on functrace.
+        shell.shell_options.functrace = true;
         shell.firing_traps = vec![TrapSignal::Return];
         shell
             .traps
