@@ -128,22 +128,34 @@ if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
 ### 4. `run_sourced_contents_in_sinks_inner` (`crates/huck-engine/src/builtins.rs`)
 
 In the regular parse-error arm (after the lex-error `if is_lex { … }` early
-restart, before the skip-to-newline recovery), abort the parse-context when
-non-interactive:
+restart, replacing the skip-to-newline recovery), abort the parse-context
+unconditionally:
 
 ```rust
-if !shell.is_interactive {
-    return ExecOutcome::Continue(2);
-}
+return ExecOutcome::Continue(2);
 ```
 
-Because each `-c` string / script / `source` runs its own
-`run_sourced_contents_in_sinks` invocation, the early return aborts **this**
-context while a parent driver loop (for a sourced file) continues — reproducing
-bash's source-aborts-remainder / parent-continues behavior with no extra
-machinery. Interactive `source`/`.`/rc keep the skip-and-continue recovery (the
-same `!is_interactive` gate the existing fatal-expansion drain uses a few lines
-above). `Continue(2)` maps to exit status 2 at `run_program_in_sinks`.
+This driver runs only `-c` strings, script files, and `source`/`.`/rc files —
+bash aborts a syntax error in **every** one of them (and a sourced file's
+remainder) regardless of interactivity (verified: `bash -i` aborts a sourced
+file's remainder just as `bash -c` does). The interactive REPL and `eval` use
+`process_line` / `process_line_in_sinks`, **not** this driver, so line-at-a-time
+interactive recovery is unaffected. Because each `-c` string / script /
+`source` runs its own `run_sourced_contents_in_sinks` invocation, the early
+return aborts **this** context while a parent driver loop (for a sourced file)
+continues — reproducing bash's source-aborts-remainder / parent-continues
+(`source bad; echo x` runs `echo x`, rc 0) with no extra machinery. `Continue(2)`
+maps to exit status 2 at `run_program_in_sinks`.
+
+> **Refinement (from the final whole-branch review).** The original prototype
+> gated this on `!shell.is_interactive` (and its comment claimed interactive
+> `source`/rc keep recovery as bash-correct). That was wrong: bash aborts an
+> interactive sourced file's remainder too, and this driver's only interactive
+> caller is `source`/rc, so the gate was a wrong proxy. The unconditional form
+> is both simpler and strictly more bash-faithful. **Not covered here** (a
+> separate driver — the REPL `process_line` per-line loop in `repl.rs`):
+> non-interactive **piped stdin** still recovers where bash aborts; filed as
+> #284.
 
 ## Testing
 

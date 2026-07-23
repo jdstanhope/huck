@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# v331 (#27): parser near-token error shapes match bash exactly for a handful
-# of concrete-wrong-token cases (`for(`, a keyword-position wrong token) that
-# huck previously mis-shaped as unexpected-EOF/invalid-name errors. Modeled
-# on syntax_error_diag_diff_check.sh. Later v331 tasks extend this file with
-# more `check`/`check_file` cases (for-loop line-prefix fix + driver-loop
-# abort) as part of the parser bash-suite category flip.
+# v331 (#27/#283): parser near-token error shapes match bash exactly for a
+# handful of concrete-wrong-token cases (`for(`, a keyword-position wrong
+# token) that huck previously mis-shaped as unexpected-EOF/invalid-name
+# errors, plus the driver-loop fix so a non-interactive syntax error aborts
+# the whole parse-context (rc 2) instead of skipping the bad line and
+# resuming — matching bash. Modeled on syntax_error_diag_diff_check.sh. Part
+# of the parser bash-suite category flip.
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 HUCK_BIN=${HUCK_BIN:-target/debug/huck}
@@ -48,8 +49,9 @@ check_file() {
 
 check "case wrong-token"    'case x in in do do) :; esac'
 check "for single-paren"    'for()'
-# EXIT mismatch expected until a later task's driver-loop abort fix lands
-# (huck currently resumes and runs `true`; bash aborts at the syntax error).
+# This task's driver-loop abort fix flips this case from EXIT mismatch to
+# PASS: huck previously resumed and ran `true`; now it aborts at the syntax
+# error like bash.
 check "for-paren newline"   $'for()\ntrue'
 # Guard: a missing keyword at genuine EOF (no concrete wrong token) must still
 # fall through to the pre-existing "unexpected end of file" error, not the new
@@ -67,6 +69,28 @@ check "for-paren newline"   $'for()\ntrue'
 # tests (e.g. `parse_recover("if whi")`), not by this bash-diff harness.
 check "if-then EOF fallback (unaffected)" 'if true; then echo hi'
 check "for bad-name lineno" 'for 1x in a; do :; done'   # `line 1:` prefix, rc 1
+
+# Driver-loop abort: a non-interactive syntax error aborts the whole
+# parse-context (rc 2) instead of skipping the bad line and resuming.
+check "abort multiline -c" $'echo a\nfor()\necho b'   # a; error; rc 2; NO b
+
+TMPFILE=$(mktemp)
+printf 'echo a\nfor()\necho b\n' > "$TMPFILE"
+check_file "abort script-file" "$TMPFILE"             # a; error; rc 2; NO b
+rm -f "$TMPFILE"
+
+# A sourced file's remainder aborts, but the parent driver loop continues.
+SUBFILE=$(mktemp)
+printf 'echo in-src\nfor()\necho after-err\n' > "$SUBFILE"
+check "source parent-continues" \
+  "$(printf 'echo before; source %s; echo parent-after' "$SUBFILE")"
+rm -f "$SUBFILE"
+
+# Regression guards: a valid multi-line fragment still runs to completion,
+# and a same-line syntax error still aborts (this already matched bash
+# before this task's fix, since there is no later command to skip to).
+check "valid multi still runs" $'echo x\necho y'      # x; y; rc 0
+check "same-line still aborts" 'echo a; for(); echo b'
 
 if [ $FAIL -ne 0 ]; then echo "parser_syntax_errors_diff_check FAILED" >&2; exit 1; fi
 echo "parser_syntax_errors_diff_check OK"

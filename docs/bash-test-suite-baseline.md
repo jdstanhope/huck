@@ -2,6 +2,8 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v331 (#27/#283, 2026-07-23 UTC):** `parser` flipped to PASS
+(0-diff). Summary PASS 19→20, FAIL 63→62.
 **Updated by v322 (#255, 2026-07-22 UTC):** `dbg-support2` flipped to PASS (0-diff)
 — the DEBUG trap now fires before bare assignments, the action's `$LINENO` equals
 the pending command's line (without leaking into a function the action calls), and
