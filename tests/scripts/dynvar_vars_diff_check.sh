@@ -21,5 +21,10 @@ check "argv0 in fn"      'setarg0(){ BASH_ARGV0="$1"; }; setarg0 arg0; echo "$0"
 check "epochrealtime fmt" '[[ $EPOCHREALTIME =~ ^[0-9]+\.[0-9]{6}$ ]] && echo shape-ok'
 check "epochrealtime pos" '(( ${EPOCHREALTIME%.*} > 0 )) && echo pos-ok'
 
+check "bashcmd simple"   'echo $BASH_COMMAND'                          # echo $BASH_COMMAND
+check "bashcmd in fn"    'f(){ echo $BASH_COMMAND; }; f'               # echo $BASH_COMMAND
+check "bashcmd after asn" 'x=1; echo $BASH_COMMAND'                    # echo $BASH_COMMAND
+check "bashcmd in debug"  'set -T; trap "echo D:\$BASH_COMMAND" DEBUG; :; true'  # match bash
+
 if [ $FAIL -ne 0 ]; then echo "dynvar_vars_diff_check FAILED" >&2; exit 1; fi
 echo "dynvar_vars_diff_check OK"

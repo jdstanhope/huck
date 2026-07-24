@@ -886,6 +886,11 @@ pub struct Shell {
     /// `ExecCommand.line`. Zero means "unknown / not yet set".
     pub current_lineno: u32,
 
+    /// `$BASH_COMMAND`: the source text of the simple command currently being
+    /// executed (or about to be, when a DEBUG trap reads it). Stamped by the
+    /// executor before each command runs.
+    pub current_command: String,
+
     /// Set to Some(outer_line) while executing an `eval` string: the line where
     /// the `eval` command was invoked. Drives the `eval:` syntax-error marker
     /// and the line base for inner error lines and `$LINENO`. None at top level.
@@ -1046,6 +1051,7 @@ pub const DYNAMIC_SPECIAL_VARS: &[&str] = &[
     "EPOCHSECONDS",
     "EPOCHREALTIME",
     "BASH_ARGV0",
+    "BASH_COMMAND",
     "BASHPID",
     "LINENO",
     "BASH_SOURCE",
@@ -1144,6 +1150,7 @@ impl Shell {
             current_completion_spec: None,
             procsub_pending: Vec::new(),
             current_lineno: 0,
+            current_command: String::new(),
             eval_frame: None,
             stdin_line_base: 0,
             random_state: std::cell::Cell::new({
@@ -1366,6 +1373,7 @@ impl Shell {
                 );
             }
             "BASH_ARGV0" => return Some(self.shell_argv0.clone()),
+            "BASH_COMMAND" => return Some(self.current_command.clone()),
             "BASHPID" => return Some((unsafe { libc::getpid() }).to_string()),
             _ => {}
         }
