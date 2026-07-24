@@ -94,5 +94,26 @@ checkf "assign inner-eq then colon" 'HOME=/h; foo=x=~:~; echo "$foo"'      # x=~
 # once `h=HOME=~` keeps the literal tilde, the eval chain matches bash).
 checkf "eval tail cascade" $'HOME=/h\nh=HOME=~\nset -o posix\neval echo $h\nset +o posix\neval echo $h'  # HOME=~ \n HOME=/h
 
+# ---- Root B (#294): word-start tilde in an UNQUOTED value operand expands;
+# quoted operands stay literal; a tilde after `:` in the operand is literal.
+checkf "op use-default unq"     'HOME=/h; unset t; echo ${t:-~}'          # /h
+checkf "op use-default noco"    'HOME=/h; unset t; echo ${t-~}'           # /h
+checkf "op assign-default unq"  'HOME=/h; unset t; echo ${t:=~}; echo "$t"'  # /h \n /h
+checkf "op use-alt unq"         'HOME=/h; t=x; echo ${t:+~}'              # /h
+checkf "op default quoted lit"  'HOME=/h; unset t; echo "${t:-~}"'        # ~
+checkf "op default inq lit"     'HOME=/h; unset t; echo "${t:-"~"}"'      # ~
+checkf "op default midcolon"    'HOME=/h; unset t; echo ${t:=~/a:~/b}; echo "$t"'  # /h/a:~/b (x2)
+checkf "op default not-start"   'HOME=/h; t=x; echo ${t:-$t~}'            # x~  (tilde not word-start)
+# NOTE: pattern-family operands (`${t#~}`, `${t%~}`, `${t/~/x}`, `${t^~}`, ...)
+# are a DIFFERENT, verified-separate divergence: real bash 5.2.21 also
+# word-start tilde-expands the PATTERN operand of `#`/`%`/`/`/`^`/`,` (confirmed
+# empirically: `t=/h; echo ${t#~}` -> "" in bash, since `~` in the pattern
+# expands to $HOME=/h and matches the whole prefix). That is NOT what Root B
+# fixes (Root B's word-start signal is keyed on the value ParamOpKind history
+# token -- UseDefault/AssignDefault/ErrorIfUnset/UseAlternate -- which never
+# appears preceding a pattern operand), and it is not covered by the real
+# tilde2.tests fixture. Left out of this harness; tracked as a follow-up
+# divergence, not attempted here.
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

@@ -182,6 +182,13 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                     parts: vec![WordPart::Literal { text, quoted: true }],
                 });
             }
+            // Root B (#294): a word-start `~` in an unquoted value operand
+            // (`${x:-~}`/`${x:=~}`/…) — `scan_step_param_operand` emits this
+            // only for that case (gated: unquoted, value-family, word-start);
+            // mirrors `parse_word_command`'s identical arm for command words.
+            TokenKind::Tilde { spec, assign_ctx } => {
+                parts.push(WordPart::Tilde { spec, assign_ctx });
+            }
             _ => {
                 // Unexpected atom in operand context.
                 return Err(ParseError::UnsupportedExpansion);

@@ -3330,6 +3330,53 @@ impl<'a> Lexer<'a> {
                     return Ok(Step::Produced);
                 }
 
+                // Root B (#294): a WORD-START `~` in an UNQUOTED VALUE operand is a tilde-prefix
+                // (`${x:-~}` → HOME). Gates: unquoted (`!in_dquote && !enclosing_dquote`); value
+                // operand (`!is_pattern` — patterns `#`/`%`/`/` are not tilde-expanded); word
+                // start — detected by a BACKWARD read of the last emitted token being the value
+                // `ParamOp` (no operand atom emitted yet). bash expands only the leading tilde,
+                // not one after `:`, so this fires solely at operand start.
+                Some('~')
+                    if !in_dquote
+                        && !enclosing_dquote
+                        && !is_pattern
+                        && matches!(
+                            self.history.last().map(|t| &t.kind),
+                            Some(TokenKind::ParamOp(
+                                ParamOpKind::UseDefault(_)
+                                    | ParamOpKind::AssignDefault(_)
+                                    | ParamOpKind::ErrorIfUnset(_)
+                                    | ParamOpKind::UseAlternate(_)
+                            )),
+                        ) =>
+                {
+                    self.cursor.next(); // consume `~`
+                    // `end` (`}`/`]`) closes the operand word, so it must ALSO
+                    // terminate a tilde-prefix here (bare `${x:-~}` -> Home, not
+                    // swallowed as a non-terminator and rejected): `is_tilde_terminator`
+                    // has no notion of the enclosing `${…}`, so pass `end` as an
+                    // extra terminator (confirmed against real bash: `~`, `~+`,
+                    // `~-`, `~user` immediately before the closing brace all
+                    // tilde-expand there, same as at true word/command end).
+                    match try_parse_tilde(&mut self.cursor, false, Some(end)) {
+                        Some(spec) => self.history.push(Token::new(
+                            TokenKind::Tilde {
+                                spec,
+                                assign_ctx: false,
+                            },
+                            Span::new(off, l, c),
+                        )),
+                        None => self.history.push(Token::new(
+                            TokenKind::Lit {
+                                text: "~".into(),
+                                quoted: false,
+                            },
+                            Span::new(off, l, c),
+                        )),
+                    }
+                    return Ok(Step::Produced);
+                }
+
                 // Unquoted literal run: accumulate until the next special char or terminator.
                 //
                 // v264: when `enclosing_dquote`, dquote rules apply INSIDE this run
@@ -5181,7 +5228,7 @@ impl<'a> Lexer<'a> {
             Some('~') if at_word_start || (self.in_assignment_value && tilde_ok) => {
                 self.cmd_at_word_start = false;
                 self.cursor.next(); // consume `~`
-                match try_parse_tilde(&mut self.cursor, self.in_assignment_value) {
+                match try_parse_tilde(&mut self.cursor, self.in_assignment_value, None) {
                     Some(spec) => {
                         // The `~` arm fires for `at_word_start` OR the
                         // assignment-value branch; `!at_word_start` here means it
@@ -7233,8 +7280,14 @@ fn is_name_cont(c: char) -> bool {
 /// `)` terminates a tilde-prefix via `is_tilde_terminator` (it closes an
 /// array-literal element `a=(a=~)`, a `case` pattern, a subshell, and a
 /// `$(…)`/backtick body — a value-final `~` before it must still be a tilde).
-fn try_parse_tilde(chars: &mut CharCursor<'_>, in_assignment_value: bool) -> Option<TildeSpec> {
-    let term = |c: char| is_tilde_terminator(c) || (in_assignment_value && c == ':');
+fn try_parse_tilde(
+    chars: &mut CharCursor<'_>,
+    in_assignment_value: bool,
+    extra_term: Option<char>,
+) -> Option<TildeSpec> {
+    let term = |c: char| {
+        is_tilde_terminator(c) || (in_assignment_value && c == ':') || extra_term == Some(c)
+    };
     match chars.peek().copied() {
         // Bare ~ at end of word.
         None => Some(TildeSpec::Home),
@@ -8352,6 +8405,37 @@ mod tests {
             c[0],
             TokenKind::BeginBacktick,
             "backtick must emit BeginBacktick signal"
+        );
+    }
+
+    #[test]
+    fn operand_word_start_tilde_unquoted_value() {
+        // `${x:-~}` value operand, unquoted: a word-start `~` is a Tilde token.
+        //
+        // The word-start signal (#294 Root B) is a BACKWARD read of
+        // `history.last()` being the value ParamOp (UseDefault/AssignDefault/
+        // ErrorIfUnset/UseAlternate), with no operand atom emitted yet.
+        // `operand_atoms` seeds the operand mode directly with no preceding
+        // ParamOp in history, which would make this test vacuous (the arm
+        // would never fire). Drive the lexer manually instead, pushing a real
+        // `ParamOp(UseDefault)` token into history first so the test exercises
+        // the actual signal the lexer checks, not just the mode.
+        let mut lx = Lexer::new_scanner("~}", LexerOptions::default(), true);
+        lx.push_mode(Mode::ParamWordOperand {
+            in_dquote: false,
+            enclosing_dquote: false,
+            is_pattern: false,
+        });
+        lx.history
+            .push(Token::from(TokenKind::ParamOp(ParamOpKind::UseDefault(
+                true,
+            ))));
+        lx.pos = lx.history.len(); // mark the seeded token as already consumed
+        let t = lx.next_token().unwrap().unwrap();
+        assert!(
+            matches!(t.kind, TokenKind::Tilde { .. }),
+            "word-start ~ in an unquoted value operand must be a Tilde token, got {:?}",
+            t.kind
         );
     }
 
