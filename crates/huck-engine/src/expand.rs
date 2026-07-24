@@ -375,9 +375,16 @@ fn expand_assoc_param(
         // ${m[@]} / ${m[*]} — pure expansion, no scalar modifier.
         (PM::None, SK::All) => ExpansionResult::WordList(values),
         (PM::None, SK::Star) => {
-            let ifs = shell.ifs();
-            let sep = ifs_join_sep(&ifs);
-            ExpansionResult::Value(values.join(&sep))
+            if quoted {
+                // Quoted `"${m[*]}"` — single word, joined with IFS[0].
+                let ifs = shell.ifs();
+                let sep = ifs_join_sep(&ifs);
+                ExpansionResult::Value(values.join(&sep))
+            } else {
+                // Unquoted `${m[*]}` behaves like `${m[@]}`: separate words (a joined
+                // Value would collapse them under an empty IFS).
+                ExpansionResult::WordList(values)
+            }
         }
         // ${m[k]} — string-key lookup (no arith on `k`).
         (PM::None, SK::Index(w)) => {
@@ -835,14 +842,17 @@ fn expand_array_param(
         // ${a[@]} / ${a[*]} — pure expansion, no scalar modifier.
         (PM::None, SK::All) => ExpansionResult::WordList(collect_values(shell)),
         (PM::None, SK::Star) => {
-            // Quoted `${a[*]}` joins with first IFS char; unquoted is
-            // also joined-then-split (we hand back Value and let the
-            // consumer's split path do the rest, so emitting a single
-            // joined string here matches both quoted and unquoted
-            // semantics modulo the consumer's split step).
-            let ifs = shell.ifs();
-            let sep = ifs_join_sep(&ifs);
-            ExpansionResult::Value(collect_values(shell).join(&sep))
+            if quoted {
+                // Quoted `"${a[*]}"` is a single word: elements joined with the first IFS char.
+                let ifs = shell.ifs();
+                let sep = ifs_join_sep(&ifs);
+                ExpansionResult::Value(collect_values(shell).join(&sep))
+            } else {
+                // Unquoted `${a[*]}` behaves like unquoted `${a[@]}`: each element is a
+                // separate word (field boundary), IFS-split within. A joined Value would
+                // collapse the elements when IFS is empty.
+                ExpansionResult::WordList(collect_values(shell))
+            }
         }
         // ${a[i]} — read a specific element.
         (PM::None, SK::Index(w)) => {
@@ -1292,12 +1302,32 @@ fn expand_part(
                             }
                         }
                     } else {
-                        // Unquoted: join with first IFS char then
-                        // let word-splitting do the rest.
                         let ifs = shell.ifs();
-                        let sep = ifs_join_sep(&ifs);
-                        let joined = words.join(&sep);
-                        emit_split_fields(&joined, &ifs, current, result, has_emitted);
+                        if ifs.is_empty() {
+                            // Empty IFS: no field-splitting, but each array element still stays a
+                            // SEPARATE word (bash keeps `IFS=''; A=(bob 'x y' joe); set ${A[@]}` as
+                            // 3 fields, not 1 — joining with the empty IFS[0] would collapse them).
+                            // An empty element yields no word (unquoted null removal), matching
+                            // bash's `IFS=''; A=(a '' b)` → 2 fields. Element boundaries are field
+                            // boundaries; surrounding text attaches to the first/last non-empty
+                            // element.
+                            let mut emitted_any = false;
+                            for w in words.iter().filter(|w| !w.is_empty()) {
+                                if emitted_any {
+                                    result.push(std::mem::take(current));
+                                }
+                                current.push_str(w, false);
+                                *has_emitted = true;
+                                emitted_any = true;
+                            }
+                        } else {
+                            // Non-empty IFS: join with IFS[0] then field-split. Whitespace IFS
+                            // collapses the resulting empty fields and non-whitespace IFS preserves
+                            // them — exactly bash's element-boundary behavior in these cases.
+                            let sep = ifs_join_sep(&ifs);
+                            let joined = words.join(&sep);
+                            emit_split_fields(&joined, &ifs, current, result, has_emitted);
+                        }
                     }
                 }
                 crate::param_expansion::ExpansionResult::Fields(fields) => {

@@ -2,6 +2,8 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v334 (#291, 2026-07-24 UTC):** `array2` flipped to PASS (0-diff).
+Summary PASS 22→23, FAIL 60→59.
 **Updated by v333 (#289, 2026-07-24 UTC):** `nquote` flipped to PASS (0-diff).
 Summary PASS 21→22, FAIL 61→60.
 **Updated by v332 (#286, 2026-07-24 UTC):** `dynvar` flipped to PASS (0-diff).
