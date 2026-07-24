@@ -1044,6 +1044,8 @@ pub const DYNAMIC_SPECIAL_VARS: &[&str] = &[
     "RANDOM",
     "SECONDS",
     "EPOCHSECONDS",
+    "EPOCHREALTIME",
+    "BASH_ARGV0",
     "BASHPID",
     "LINENO",
     "BASH_SOURCE",
@@ -1355,6 +1357,15 @@ impl Shell {
                         .to_string(),
                 );
             }
+            "EPOCHREALTIME" => {
+                return Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| format!("{}.{:06}", d.as_secs(), d.subsec_micros()))
+                        .unwrap_or_else(|_| "0.000000".to_string()),
+                );
+            }
+            "BASH_ARGV0" => return Some(self.shell_argv0.clone()),
             "BASHPID" => return Some((unsafe { libc::getpid() }).to_string()),
             _ => {}
         }
@@ -1450,6 +1461,12 @@ impl Shell {
                         .checked_sub(std::time::Duration::from_secs(n))
                         .unwrap_or_else(std::time::Instant::now);
                 }
+                true
+            }
+            // Assigning BASH_ARGV0 sets $0 (shell_argv0); it is computed in
+            // lookup_var, never stored as an ordinary var.
+            "BASH_ARGV0" => {
+                self.shell_argv0 = value.to_string();
                 true
             }
             _ => false,
