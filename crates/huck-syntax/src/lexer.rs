@@ -1089,6 +1089,14 @@ pub(crate) enum Mode {
     ParamWordOperand {
         in_dquote: bool,
         enclosing_dquote: bool,
+        // Set by the PARSER (it knows whether this operand is a value word,
+        // e.g. `${x-word}`/`${x=word}`/`${x?word}`/`${x+word}`, or a pattern,
+        // e.g. `${x%pat}`/`${x#pat}`/`${x/pat/rep}`/case `${x^pat}`). The
+        // lexer only READS it (like `in_dquote`/`enclosing_dquote`) — no
+        // forward scan/lookahead is added to tell the two apart. bash keeps
+        // `$'…'` ANSI-C quoting LITERAL in a heredoc value word but still
+        // expands it in a pattern operand. See v333 #289.
+        is_pattern: bool,
     },
     ParamSubstPatternOperand {
         in_dquote: bool,
@@ -2052,19 +2060,20 @@ impl<'a> Lexer<'a> {
             Mode::ParamWordOperand {
                 in_dquote,
                 enclosing_dquote,
-            } => self.scan_step_param_operand(None, '}', in_dquote, enclosing_dquote),
+                is_pattern,
+            } => self.scan_step_param_operand(None, '}', in_dquote, enclosing_dquote, is_pattern),
             Mode::ParamSubstPatternOperand {
                 in_dquote,
                 enclosing_dquote,
-            } => self.scan_step_param_operand(Some('/'), '}', in_dquote, enclosing_dquote),
+            } => self.scan_step_param_operand(Some('/'), '}', in_dquote, enclosing_dquote, true),
             Mode::ParamSubstringOffsetOperand {
                 in_dquote,
                 enclosing_dquote,
-            } => self.scan_step_param_operand(Some(':'), '}', in_dquote, enclosing_dquote),
+            } => self.scan_step_param_operand(Some(':'), '}', in_dquote, enclosing_dquote, true),
             Mode::ParamSubscriptOperand {
                 in_dquote,
                 enclosing_dquote,
-            } => self.scan_step_param_operand(None, ']', in_dquote, enclosing_dquote),
+            } => self.scan_step_param_operand(None, ']', in_dquote, enclosing_dquote, true),
             Mode::CommandSub { body_started } => self.scan_step_command_sub(body_started),
             Mode::BacktickRaw => self.scan_step_backtick_raw(),
             Mode::Arith {
@@ -2685,6 +2694,7 @@ impl<'a> Lexer<'a> {
         end: char,
         in_dquote: bool,
         enclosing_dquote: bool,
+        is_pattern: bool,
     ) -> Result<Step, LexError> {
         let off = self.cursor.offset();
         let l = self.cursor.line();
@@ -2928,7 +2938,7 @@ impl<'a> Lexer<'a> {
                         // a `QuoteRun{AnsiC}` (parse_word wraps it in Quoted{AnsiC}).
                         // Mirrors the command scanner's `$'…'` arm (lexer.rs ~3792)
                         // and the oracle's `scan_dollar_expansion` `Some('\'')` arm.
-                        Some('\'') => {
+                        Some('\'') if !(self.emitting_heredoc.is_some() && !is_pattern) => {
                             self.cursor.next(); // `$`
                             self.cursor.next(); // `'`
                             let text = scan_ansi_c_quoted(&mut self.cursor)?;
@@ -6966,6 +6976,16 @@ fn decode_ansi_c_escape(chars: &mut CharCursor<'_>, out: &mut String) -> Result<
             }
             Some('?') => out.push('\x7F'),
             Some('@') => out.push('\0'),
+            Some('\\') => {
+                // `\c\` is Ctrl-\ (0x1C). The escaped-backslash form `\c\\`
+                // consumes the SECOND backslash as part of the control target;
+                // `\c\X` for any other X yields Ctrl-\ and leaves X. Matches
+                // bash: `\c\\` -> 1c, `\c\a` -> 1c 61, `\c\\\c]` -> 1c 1d.
+                if chars.peek() == Some(&'\\') {
+                    chars.next();
+                }
+                out.push('\x1C');
+            }
             Some(c) => {
                 let v = (c.to_ascii_uppercase() as u32) & 0x1F;
                 push_codepoint(out, v);
@@ -8195,7 +8215,8 @@ mod tests {
                 "foo}",
                 Mode::ParamWordOperand {
                     in_dquote: false,
-                    enclosing_dquote: false
+                    enclosing_dquote: false,
+                    is_pattern: false
                 }
             ),
             vec![
@@ -8216,7 +8237,8 @@ mod tests {
                 "$a}",
                 Mode::ParamWordOperand {
                     in_dquote: false,
-                    enclosing_dquote: false
+                    enclosing_dquote: false,
+                    is_pattern: false
                 }
             ),
             vec![
@@ -8234,6 +8256,7 @@ mod tests {
             Mode::ParamWordOperand {
                 in_dquote: false,
                 enclosing_dquote: false,
+                is_pattern: false,
             },
         );
         assert_eq!(nested[0], TokenKind::ParamOpen { quoted: false });
@@ -8289,6 +8312,7 @@ mod tests {
             Mode::ParamWordOperand {
                 in_dquote: false,
                 enclosing_dquote: false,
+                is_pattern: false,
             },
         );
         assert_eq!(
@@ -8303,6 +8327,7 @@ mod tests {
             Mode::ParamWordOperand {
                 in_dquote: false,
                 enclosing_dquote: false,
+                is_pattern: false,
             },
         );
         assert_eq!(
@@ -8317,6 +8342,7 @@ mod tests {
             Mode::ParamWordOperand {
                 in_dquote: false,
                 enclosing_dquote: false,
+                is_pattern: false,
             },
         );
         assert_eq!(
@@ -8334,6 +8360,7 @@ mod tests {
             Mode::ParamWordOperand {
                 in_dquote: false,
                 enclosing_dquote: false,
+                is_pattern: false,
             },
         );
         assert_eq!(a[0], TokenKind::ArithOpen, "$(( must emit ArithOpen signal");
@@ -8353,6 +8380,7 @@ mod tests {
             lx.push_mode(Mode::ParamWordOperand {
                 in_dquote: false,
                 enclosing_dquote: false,
+                is_pattern: false,
             });
             while let Some(t) = lx.next_token().unwrap() {
                 if matches!(
@@ -8802,6 +8830,7 @@ mod tests {
             Mode::ParamWordOperand {
                 in_dquote: false,
                 enclosing_dquote: false,
+                is_pattern: false,
             },
         );
         assert_eq!(
@@ -8825,6 +8854,7 @@ mod tests {
         lx.push_mode(Mode::ParamWordOperand {
             in_dquote: false,
             enclosing_dquote: false,
+            is_pattern: false,
         });
         assert_eq!(
             lx.next_token().unwrap().unwrap().kind,
@@ -8846,6 +8876,7 @@ mod tests {
         lx.push_mode(Mode::ParamWordOperand {
             in_dquote: false,
             enclosing_dquote: false,
+            is_pattern: false,
         });
         assert_eq!(
             lx.next_token().unwrap().unwrap().kind,
@@ -8888,6 +8919,7 @@ mod tests {
             Mode::ParamWordOperand {
                 in_dquote: false,
                 enclosing_dquote: true,
+                is_pattern: false,
             },
         );
         assert_eq!(operand_lit_text(&atoms), "a=p", "{atoms:?}");
@@ -8902,6 +8934,7 @@ mod tests {
             Mode::ParamWordOperand {
                 in_dquote: false,
                 enclosing_dquote: false,
+                is_pattern: false,
             },
         );
         assert_eq!(operand_lit_text(&atoms), r"a=\p", "{atoms:?}");
@@ -8918,6 +8951,7 @@ mod tests {
                 Mode::ParamWordOperand {
                     in_dquote: false,
                     enclosing_dquote,
+                    is_pattern: false,
                 },
             );
             assert_eq!(

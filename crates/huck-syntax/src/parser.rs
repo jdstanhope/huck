@@ -1066,7 +1066,8 @@ pub(crate) fn parse_param_expansion(
             let _ = word_in_mode!(
                 Mode::ParamWordOperand {
                     in_dquote: false,
-                    enclosing_dquote: quoted
+                    enclosing_dquote: quoted,
+                    is_pattern: true
                 },
                 quoted
             );
@@ -1227,7 +1228,8 @@ pub(crate) fn parse_param_expansion(
             let _ = word_in_mode!(
                 Mode::ParamWordOperand {
                     in_dquote: false,
-                    enclosing_dquote: quoted
+                    enclosing_dquote: quoted,
+                    is_pattern: true
                 },
                 quoted
             );
@@ -1268,7 +1270,8 @@ pub(crate) fn parse_param_expansion(
                     let word = word_in_mode!(
                         Mode::ParamWordOperand {
                             in_dquote: false,
-                            enclosing_dquote: quoted
+                            enclosing_dquote: quoted,
+                            is_pattern: false
                         },
                         quoted
                     );
@@ -1285,7 +1288,8 @@ pub(crate) fn parse_param_expansion(
                     let word = word_in_mode!(
                         Mode::ParamWordOperand {
                             in_dquote: false,
-                            enclosing_dquote: quoted
+                            enclosing_dquote: quoted,
+                            is_pattern: false
                         },
                         quoted
                     );
@@ -1303,7 +1307,8 @@ pub(crate) fn parse_param_expansion(
                     let word = word_in_mode!(
                         Mode::ParamWordOperand {
                             in_dquote: false,
-                            enclosing_dquote: false
+                            enclosing_dquote: false,
+                            is_pattern: false
                         },
                         false
                     );
@@ -1320,7 +1325,8 @@ pub(crate) fn parse_param_expansion(
                     let word = word_in_mode!(
                         Mode::ParamWordOperand {
                             in_dquote: false,
-                            enclosing_dquote: quoted
+                            enclosing_dquote: quoted,
+                            is_pattern: false
                         },
                         quoted
                     );
@@ -1340,7 +1346,8 @@ pub(crate) fn parse_param_expansion(
                     let pattern = word_in_mode!(
                         Mode::ParamWordOperand {
                             in_dquote: false,
-                            enclosing_dquote: false
+                            enclosing_dquote: false,
+                            is_pattern: true
                         },
                         false
                     );
@@ -1357,7 +1364,8 @@ pub(crate) fn parse_param_expansion(
                     let pattern = word_in_mode!(
                         Mode::ParamWordOperand {
                             in_dquote: false,
-                            enclosing_dquote: false
+                            enclosing_dquote: false,
+                            is_pattern: true
                         },
                         false
                     );
@@ -1406,7 +1414,8 @@ pub(crate) fn parse_param_expansion(
                         word_in_mode!(
                             Mode::ParamWordOperand {
                                 in_dquote: false,
-                                enclosing_dquote: false
+                                enclosing_dquote: false,
+                                is_pattern: true
                             },
                             false
                         )
@@ -1435,7 +1444,8 @@ pub(crate) fn parse_param_expansion(
                     let word = word_in_mode!(
                         Mode::ParamWordOperand {
                             in_dquote: false,
-                            enclosing_dquote: false
+                            enclosing_dquote: false,
+                            is_pattern: true
                         },
                         false
                     );
@@ -1496,7 +1506,8 @@ pub(crate) fn parse_param_expansion(
                         Some(word_in_mode!(
                             Mode::ParamWordOperand {
                                 in_dquote: false,
-                                enclosing_dquote: false
+                                enclosing_dquote: false,
+                                is_pattern: true
                             },
                             false
                         ))

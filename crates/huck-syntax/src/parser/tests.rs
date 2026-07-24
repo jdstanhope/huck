@@ -65,6 +65,7 @@ fn scaffolding_types_exist() {
     let _ = Mode::ParamWordOperand {
         in_dquote: false,
         enclosing_dquote: false,
+        is_pattern: false,
     };
     let _ = ParseError::UnsupportedExpansion;
 }
