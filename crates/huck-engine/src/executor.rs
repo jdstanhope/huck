@@ -3947,6 +3947,20 @@ fn run_single(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
+    // $BASH_COMMAND: the source text of the command about to run — stamped
+    // before the DEBUG trap fires (bash sets it at the same point, so a DEBUG
+    // action reading $BASH_COMMAND sees the command that triggered it). While
+    // ANY pseudo-trap action (DEBUG/ERR/RETURN) is itself executing, its own
+    // commands must NOT re-stamp this — bash holds $BASH_COMMAND fixed at the
+    // triggering command for the whole trap action (verified against real
+    // bash: `trap 'echo $BASH_COMMAND' ERR/RETURN/DEBUG` reads the command
+    // that fired the trap, not the action's own text, even across an
+    // intervening `true`/function call). `firing_traps` is non-empty exactly
+    // while such an action runs. (EXIT and real-signal traps don't push
+    // `firing_traps`, so their freeze is a separate follow-up.)
+    if shell.firing_traps.is_empty() {
+        shell.current_command = render_job_simple(cmd);
+    }
     let outcome = match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink, err_sink),
         SimpleCommand::Assign(items, line) => {
