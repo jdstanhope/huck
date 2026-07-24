@@ -5262,7 +5262,10 @@ impl<'a> Lexer<'a> {
                     }
                     text.push(ch);
                     self.cursor.next();
-                    boundary = self.in_assignment_value && matches!(ch, '=' | ':');
+                    // bash tilde-expands the prefix after the ASSIGNING `=` (word start, seeded by
+                    // begin_assignment_value) and after each unquoted `:`, but NOT after a second,
+                    // embedded `=` (`h=HOME=~` → literal). Only `:` re-enables eligibility. (#294)
+                    boundary = self.in_assignment_value && ch == ':';
                 }
                 // v247 T5 fd-prefix: a WHOLE-word pure digit-run or `{ident}` (this
                 // run began at word start) glued directly to a redirect operator

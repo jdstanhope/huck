@@ -82,5 +82,17 @@ checkf "word-start ~ POSIX" 'HOME=/h; set -o posix; echo ~/x ~'
 # ~root cases all match bash — only the "named tilde then ':' terminator in a
 # command word" form diverges. Excluded to keep the harness all-green.
 
+# ---- Root A (#294): tilde after an EMBEDDED `=` in an assignment value is
+# literal (only the assigning `=` word-start and unquoted `:` are tilde-prefixes).
+checkf "assign inner-eq literal"   'HOME=/h; h=HOME=~; echo "$h"'          # HOME=~
+checkf "assign path inner-eq"      'HOME=/h; X=/b:/u; A=PATH=~/bin:$X; echo "$A"'  # PATH=~/bin:/b:/u
+checkf "export inner-eq literal"   'HOME=/h; export h=HOME=~; echo "$h"'   # HOME=~
+checkf "assign after-colon expands" 'HOME=/h; foo=a:~; echo "$foo"'       # a:/h  (regression guard)
+checkf "assign both tildes ~:~"    'HOME=/h; foo=~:~; echo "$foo"'         # /h:/h (regression guard)
+checkf "assign inner-eq then colon" 'HOME=/h; foo=x=~:~; echo "$foo"'      # x=~:/h
+# The posix / non-posix eval tail from tilde2.tests (guards the Root A cascade:
+# once `h=HOME=~` keeps the literal tilde, the eval chain matches bash).
+checkf "eval tail cascade" $'HOME=/h\nh=HOME=~\nset -o posix\neval echo $h\nset +o posix\neval echo $h'  # HOME=~ \n HOME=/h
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
