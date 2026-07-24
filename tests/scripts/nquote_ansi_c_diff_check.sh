@@ -22,5 +22,22 @@ check "cc bs then a"  "printf '%s' \$'\\c\\a' | od -An -tx1"                    
 check "cc bs then c]" "printf '%s' \$'\\c\\\\\\c]' | od -An -tx1"                      # 1c 1d
 check "cc full run"   "printf '%s' \$'\\c[\\c\\\\\\c]\\c^\\c_\\c?' | od -An -tx1"      # 1b 1c 1d 1e 1f 7f
 
+# Root B — heredoc value-word `$'...'` stays LITERAL; pattern operand still
+# EXPANDS it; dquote/unquoted (outside a heredoc) keep expanding both.
+check "hd default lit" 'unset none; cat <<EOF
+[${none-X$'"'"'\t'"'"'Y}]
+EOF'
+check "hd assign default" 'unset none; cat <<EOF
+[${none=X$'"'"'\t'"'"'Y}]
+EOF'
+check "hd use alternate" 'set2=1; cat <<EOF
+[${set2+X$'"'"'\t'"'"'Y}]
+EOF'
+check "hd suffix exp" 'V=X$'"'"'\t'"'"'; cat <<EOF
+[${V%$'"'"'\t'"'"'}]
+EOF'
+check "dq value exp" 'unset none; printf "[%s]" "${none-X$'"'"'\t'"'"'Y}"'
+check "unquoted value exp" 'unset none; printf "%s" ${none-X$'"'"'\t'"'"'Y}'
+
 if [ $FAIL -ne 0 ]; then echo "nquote_ansi_c_diff_check FAILED" >&2; exit 1; fi
 echo "nquote_ansi_c_diff_check OK"
