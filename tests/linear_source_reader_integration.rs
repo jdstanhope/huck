@@ -106,10 +106,17 @@ fn set_u_unbound_aborts_script() {
 }
 
 #[test]
-fn syntax_error_reports_line_and_continues() {
-    let (out, err, _c) = run("echo a\n)\necho b\n");
-    assert!(out.contains('a') && out.contains('b'));
+fn syntax_error_reports_line_and_aborts() {
+    // A regular syntax error in a non-interactive script aborts the whole
+    // parse-context (like `set -e`/`exit`/`set -u` above): commands before the
+    // error ran, commands after it do NOT, exit status 2 — matching bash
+    // (`bash script` with `echo a; ); echo b` prints only `a`, rc 2). huck
+    // previously skipped the offending line and resumed (running `b`); v331
+    // (#283) fixed that.
+    let (out, err, c) = run("echo a\n)\necho b\n");
+    assert_eq!(out, "a\n", "stdout was: {out:?}");
     assert!(err.contains("line 2"), "stderr was: {err}");
+    assert_eq!(c, 2);
 }
 
 #[test]

@@ -4326,6 +4326,11 @@ fn expect_or_recover(
     if peek_leading_keyword(iter)? == Some(expected) {
         consume_command_word(iter)?;
         Ok(true)
+    } else if iter.peek_kind()?.is_some() && !iter.peek_is_recovery_close()? {
+        // A concrete wrong token where `expected` keyword was required — bash
+        // reports it as a near-token error (`unexpected token \`X'`), not the
+        // unterminated/EOF shape.
+        Err(ParseError::Unexpected(iter.unexpected_here(None)?))
     } else if iter.recover_at_eof() && iter.peek_is_recovery_close()? {
         // Recover not only at bare EOF but also when the delimiter would sit past
         // a truncated inner lexer-mode: `echo $(if whi` reaches EOF inside the
@@ -4681,6 +4686,12 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
         && matches!(iter.peek2_kind()?, Some(TokenKind::Op(Operator::LParen)))
     {
         return parse_arith_for_clause(iter);
+    }
+
+    // A single `(` after `for` (not `((`) is a syntax error at the `(` —
+    // bash: `syntax error near unexpected token \`('`.
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
+        return Err(ParseError::Unexpected(iter.unexpected_here(None)?));
     }
 
     // Read the loop variable name (assembled from atoms).

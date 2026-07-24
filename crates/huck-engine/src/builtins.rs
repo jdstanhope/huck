@@ -7908,21 +7908,21 @@ fn run_sourced_contents_in_sinks_inner(
                         prev_end = start;
                         continue 'outer;
                     }
-                    // Regular parse error: skip tokens to the next newline and
-                    // continue within the same lexer (no restart needed).
-                    loop {
-                        match iter.next_kind().ok().flatten() {
-                            Some(crate::lexer::TokenKind::Newline) | None => break,
-                            Some(_) => {}
-                        }
-                    }
-                    prev_end = start
-                        + iter
-                            .peek_span()
-                            .ok()
-                            .flatten()
-                            .map(|sp| sp.offset)
-                            .unwrap_or(sentinel);
+                    // bash aborts the whole parse-context on a regular syntax
+                    // error — it does NOT skip the offending line and resume.
+                    // This driver runs only `-c` strings, script files, and
+                    // `source`/`.`/rc files; bash aborts every one of them (and a
+                    // sourced file's remainder) on a syntax error regardless of
+                    // interactivity. Returning here aborts THIS invocation while a
+                    // parent driver loop (for a `source`d file) still continues —
+                    // reproducing bash's `source bad; echo x` runs `echo x`
+                    // (rc 0) with no extra machinery, since each `source` runs its
+                    // OWN `run_sourced_contents_in_sinks`. The interactive REPL and
+                    // `eval` use `process_line`/`process_line_in_sinks`, not this
+                    // driver, so this never affects line-at-a-time recovery there.
+                    // (Piped-stdin abort is a separate driver — the REPL
+                    // per-line `process_line` loop — tracked in #284.)
+                    return ExecOutcome::Continue(2);
                 }
             }
             // Break only on true EOF (Ok(None)). An Err result means the

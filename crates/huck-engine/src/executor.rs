@@ -1781,6 +1781,11 @@ fn run_for_inner(
     // body not run, the surrounding list continues). Reserved words like `if`
     // are valid identifiers and fall through to run normally.
     if !crate::builtins::is_valid_name(&clause.var) {
+        // Stamp the for-header line so the runtime error carries bash's
+        // `line N:` prefix (compound commands don't stamp current_lineno).
+        if clause.line != 0 {
+            shell.current_lineno = shell.line_base() + clause.line;
+        }
         {
             let mut err = err_writer(err_sink, sink);
             crate::sh_error_to!(
