@@ -6966,6 +6966,16 @@ fn decode_ansi_c_escape(chars: &mut CharCursor<'_>, out: &mut String) -> Result<
             }
             Some('?') => out.push('\x7F'),
             Some('@') => out.push('\0'),
+            Some('\\') => {
+                // `\c\` is Ctrl-\ (0x1C). The escaped-backslash form `\c\\`
+                // consumes the SECOND backslash as part of the control target;
+                // `\c\X` for any other X yields Ctrl-\ and leaves X. Matches
+                // bash: `\c\\` -> 1c, `\c\a` -> 1c 61, `\c\\\c]` -> 1c 1d.
+                if chars.peek() == Some(&'\\') {
+                    chars.next();
+                }
+                out.push('\x1C');
+            }
             Some(c) => {
                 let v = (c.to_ascii_uppercase() as u32) & 0x1F;
                 push_codepoint(out, v);
