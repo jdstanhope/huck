@@ -2,6 +2,13 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v335 (#294, 2026-07-24 UTC):** `tilde2` flipped to PASS (0-diff) —
+two lexer-side tilde-recognition roots: `~` after an embedded `=` in an
+assignment value is literal (Root A), and a word-start `~` in an unquoted
+`${x:-word}`/`${x:=word}` value operand expands (Root B). Summary PASS 23→24,
+FAIL 59→58. Only `tilde2` flipped; `more-exp` (111→109) and `minimal` (1270→1268)
+shrank (no regression). Follow-ups: #295 (recognition→expander refactor), #296
+(pattern-operand tilde `${x#~}`).
 **Updated by v334 (#291, 2026-07-24 UTC):** `array2` flipped to PASS (0-diff).
 Summary PASS 22→23, FAIL 60→59.
 **Updated by v333 (#289, 2026-07-24 UTC):** `nquote` flipped to PASS (0-diff).
@@ -220,7 +227,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | strip | PASS | |
 | test | FAIL | `test <` and `test >` lexicographic string-comparison operators not supported — huck rejects them with "unexpected argument". Also `/dev/tty` inaccessible in the test runner environment (test infrastructure). |
 | tilde | PASS | v298 re-sweep: 0-diff PASS (the v268 `set -o posix` preamble rejection + colon-delimited-assignment tilde divergence are resolved). |
-| tilde2 | FAIL | Tilde expansion timing diverges from bash in two directions: huck expands `~` in assignment-RHS contexts where bash stores the literal `~` (so `declare -p` shows the expanded path while bash shows `~`), and in one test huck fails to expand `~` where bash does produce the expanded path. The `set: posix: not yet supported` issue is no longer the primary cause. |
+| tilde2 | PASS | v335 (#294): 0-diff PASS. Two lexer-side tilde-recognition roots fixed — Root A: `~` after an embedded `=` in an assignment value is literal (`h=HOME=~`), eligibility re-enables on `:` only; Root B: a word-start `~` in an unquoted `${x:-word}`/`${x:=word}` value operand expands. The posix-`eval` tail was downstream of Root A. Pattern-operand tilde (`${x#~}`) stays literal — separate divergence #296. |
 | trap | FAIL | `trap -p` display format divergence — huck prints bare signal names (`HUP`, `INT`, etc.) while bash prints them with the `SIG` prefix (`SIGHUP`, `SIGINT`, etc.). Subshell EXIT trap not firing when expected. Signal-number display differences in job-notification lines. Multiple trap formatting gaps. |
 | type | FAIL | Error-message prefix format difference (L-class), `set: posix: not yet supported`, and `declare -f` output format issues cascade into function-display comparisons. |
 | varenv | FAIL | `set -k` (keyword mode: treating `key=val` tokens anywhere on a command line as variable assignments) is not supported, causing wrong argument counts in the first several tests. Multiple other `set` options (`ignoreeof`, `monitor`, `-a`, `-m`) are not supported, cascading through later tests. Additional divergences: a `declare` call with an inline array-value token is rejected; function-local variable scoping differs from bash in one case; `SHELLOPTS` content differs; and error-message prefix format differs for some `declare` errors. |
