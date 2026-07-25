@@ -9,7 +9,11 @@ fn run_script_file(script: &str, suffix: &str) -> (String, String, i32) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("huck-v215-arith-{stamp}-{suffix}.sh"));
+    // pid too: `suffix` keeps callers within this process distinct, but without
+    // pid a stale file from a concurrent run (or another UID on a shared /tmp)
+    // makes the write below panic for a reason unrelated to the test (#297).
+    let pid = std::process::id();
+    let path = std::env::temp_dir().join(format!("huck-v215-arith-{pid}-{stamp}-{suffix}.sh"));
     std::fs::write(&path, script).expect("write");
     let out = Command::new(env!("CARGO_BIN_EXE_huck"))
         .arg(&path)

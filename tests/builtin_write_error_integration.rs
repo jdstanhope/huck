@@ -3,11 +3,35 @@
 //! output reaches NOTHING — least of all the fd 1 that the redirect scope
 //! restores afterwards.
 //!
-//! `exec 3</etc/hostname` gives a genuinely read-only fd (the kernel returns
-//! EBADF for a write); `/dev/full` gives ENOSPC. Externals are already correct,
-//! so these all exercise the in-process builtin path.
+//! `exec 3</dev/null` gives a genuinely read-only fd (the kernel returns EBADF
+//! for a write to any fd not open for writing); `/dev/full` gives ENOSPC.
+//! Externals are already correct, so these all exercise the in-process builtin
+//! path.
 
 use std::process::Command;
+
+/// A read-only fd 3: writes to it fail EBADF. `/dev/null` because POSIX makes
+/// `write(2)` fail EBADF for ANY fd not open for writing, so the file behind it
+/// is irrelevant and this is the one path every unix has. (Was `/etc/hostname`,
+/// which macOS does not ship — #297.)
+const RO_FD3: &str = "exec 3</dev/null; ";
+
+/// A redirect whose every write fails, as `(prelude, redirect, strerror)`.
+///
+/// Linux gets `/dev/full`: ENOSPC through a genuine *file-target* redirect,
+/// which is the exact shape #191 leaked through, so that coverage stays put.
+/// No other unix ships an ENOSPC-on-demand device (#297), so elsewhere the sink
+/// is the read-only fd reached via `>&3`. Both drive the same builtin
+/// write-error path — only the errno and the redirect syntax differ.
+#[cfg(target_os = "linux")]
+fn failing_sink() -> (&'static str, &'static str, &'static str) {
+    ("", "> /dev/full", "write error: No space left on device")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn failing_sink() -> (&'static str, &'static str, &'static str) {
+    (RO_FD3, ">&3", "write error: Bad file descriptor")
+}
 
 fn huck() -> &'static str {
     env!("CARGO_BIN_EXE_huck")
@@ -29,7 +53,7 @@ fn run(script: &str) -> (String, String, i32) {
 
 #[test]
 fn echo_to_read_only_fd_reports_and_fails() {
-    let (out, err, rc) = run("exec 3</etc/hostname; echo x >&3");
+    let (out, err, rc) = run(&format!("{RO_FD3}echo x >&3"));
     assert!(
         err.contains("echo: write error: Bad file descriptor"),
         "stderr was: {err:?}"
@@ -40,7 +64,7 @@ fn echo_to_read_only_fd_reports_and_fails() {
 
 #[test]
 fn printf_to_read_only_fd_reports_and_fails() {
-    let (_, err, rc) = run("exec 3</etc/hostname; printf x >&3");
+    let (_, err, rc) = run(&format!("{RO_FD3}printf x >&3"));
     assert!(
         err.contains("printf: write error: Bad file descriptor"),
         "stderr was: {err:?}"
@@ -52,7 +76,7 @@ fn printf_to_read_only_fd_reports_and_fails() {
 /// only works if the WRITER records the error rather than the builtin checking.
 #[test]
 fn declare_to_read_only_fd_reports_and_fails() {
-    let (_, err, rc) = run("exec 3</etc/hostname; x=1; declare -p x >&3");
+    let (_, err, rc) = run(&format!("{RO_FD3}x=1; declare -p x >&3"));
     assert!(
         err.contains("declare: write error: Bad file descriptor"),
         "stderr was: {err:?}"
@@ -64,12 +88,9 @@ fn declare_to_read_only_fd_reports_and_fails() {
 /// before this change.
 #[test]
 fn failed_output_never_leaks_to_the_restored_fd1() {
-    for script in [
-        "echo x > /dev/full",
-        "echo -n x > /dev/full",
-        "printf 'x' > /dev/full",
-        "x=1; declare -p x > /dev/full",
-    ] {
+    let (pre, redir, _) = failing_sink();
+    for body in ["echo x", "echo -n x", "printf 'x'", "x=1; declare -p x"] {
+        let script = &format!("{pre}{body} {redir}");
         let (out, _, rc) = run(script);
         assert_eq!(out, "", "payload leaked to the real stdout for: {script}");
         assert_eq!(rc, 1, "exit status for: {script}");
@@ -80,15 +101,12 @@ fn failed_output_never_leaks_to_the_restored_fd1() {
 /// the newline chose the reporter, and the two disagreed.
 #[test]
 fn wording_is_identical_with_and_without_a_trailing_newline() {
-    for script in [
-        "printf 'x\\n' > /dev/full",
-        "printf 'x' > /dev/full",
-        "echo x > /dev/full",
-        "echo -n x > /dev/full",
-    ] {
+    let (pre, redir, strerror) = failing_sink();
+    for body in ["printf 'x\\n'", "printf 'x'", "echo x", "echo -n x"] {
+        let script = &format!("{pre}{body} {redir}");
         let (_, err, rc) = run(script);
         assert!(
-            err.contains("write error: No space left on device"),
+            err.contains(strerror),
             "wrong wording for {script:?}: {err:?}"
         );
         assert!(
@@ -102,14 +120,15 @@ fn wording_is_identical_with_and_without_a_trailing_newline() {
 /// bash is SILENT when no bytes are written, even to a broken fd.
 #[test]
 fn zero_byte_output_is_silent_and_succeeds() {
-    for script in [
-        "exec 3</etc/hostname; echo -n '' >&3",
-        "exec 3</etc/hostname; printf '' >&3",
-        "exec 3</etc/hostname; : >&3",
-        "exec 3</etc/hostname; true >&3",
-        "exec 3</etc/hostname; jobs >&3",
-        "exec 3</etc/hostname; cd /tmp >&3",
+    for body in [
+        "echo -n '' >&3",
+        "printf '' >&3",
+        ": >&3",
+        "true >&3",
+        "jobs >&3",
+        "cd /tmp >&3",
     ] {
+        let script = &format!("{RO_FD3}{body}");
         let (_, err, rc) = run(script);
         assert!(!err.contains("write error"), "must be silent: {script}");
         assert_eq!(rc, 0, "exit status for: {script}");

@@ -75,19 +75,46 @@ mod tests {
     use std::io::Write;
 
     /// Open a read-only fd (writes to it fail with EBADF).
+    ///
+    /// `/dev/null` rather than a real file: POSIX makes `write(2)` fail EBADF
+    /// for ANY fd not open for writing, so the underlying file is irrelevant —
+    /// and `/dev/null` is the one path guaranteed to exist on every unix.
+    /// (This used to be `/etc/hostname`, which macOS does not have — #297.)
     fn ro_fd() -> RawFd {
-        let p = c"/etc/hostname";
+        let p = c"/dev/null";
         let fd = unsafe { libc::open(p.as_ptr(), libc::O_RDONLY) };
-        assert!(fd >= 0, "open /etc/hostname failed");
+        assert!(fd >= 0, "open /dev/null O_RDONLY failed");
         fd
     }
 
-    /// Open /dev/full (writes to it fail with ENOSPC).
+    /// Open /dev/full (writes to it fail with ENOSPC). Linux-only — no other
+    /// unix ships a device that reports ENOSPC on demand (#297).
+    #[cfg(target_os = "linux")]
     fn full_fd() -> RawFd {
         let p = c"/dev/full";
         let fd = unsafe { libc::open(p.as_ptr(), libc::O_WRONLY) };
         assert!(fd >= 0, "open /dev/full failed");
         fd
+    }
+
+    /// The write end of a pipe whose read end is already closed: writes to it
+    /// fail EPIPE. The portable stand-in for `/dev/full` as a "the errno is
+    /// surfaced verbatim, and it isn't EBADF" fixture.
+    ///
+    /// Rust's runtime sets SIGPIPE to SIG_IGN for the test process, so the
+    /// failing write returns rather than killing the harness; this asserts that
+    /// rather than assuming it, so a runtime change fails loudly instead of
+    /// silently aborting the suite.
+    fn broken_pipe_fd() -> RawFd {
+        assert_eq!(
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) },
+            libc::SIG_IGN,
+            "test harness must have SIGPIPE ignored for an EPIPE write to return"
+        );
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe { libc::close(fds[0]) };
+        fds[1]
     }
 
     #[test]
@@ -112,12 +139,28 @@ mod tests {
         assert_eq!(e.raw_os_error(), Some(libc::EBADF));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn write_to_dev_full_surfaces_enospc() {
         let fd = full_fd();
         let mut w = FdWriter::new(fd);
         let e = w.write_all(b"x").expect_err("write to /dev/full must fail");
         assert_eq!(e.raw_os_error(), Some(libc::ENOSPC));
+        unsafe { libc::close(fd) };
+    }
+
+    /// The portable half of the above: a non-EBADF errno must reach the caller
+    /// unchanged. On Linux this runs ALONGSIDE the /dev/full ENOSPC check; on
+    /// platforms with no ENOSPC-on-demand device it is the only cover for
+    /// "the writer does not collapse every failure into EBADF".
+    #[test]
+    fn write_to_broken_pipe_surfaces_epipe() {
+        let fd = broken_pipe_fd();
+        let mut w = FdWriter::new(fd);
+        let e = w
+            .write_all(b"x")
+            .expect_err("write to a broken pipe must fail");
+        assert_eq!(e.raw_os_error(), Some(libc::EPIPE));
         unsafe { libc::close(fd) };
     }
 
