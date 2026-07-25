@@ -208,6 +208,145 @@ pub fn has_posix_class(pattern: &str) -> bool {
     false
 }
 
+/// POSIX.2 table 2.8 collating-symbol names → their C-locale character.
+/// Authored from the POSIX standard (NOT copied from bash's GPL collsyms.h).
+/// Upper/lower letters are intentionally omitted — single-char passthrough in
+/// `collsym` covers them; digits are listed by name here.
+static POSIX_COLLSYMS: &[(&str, char)] = &[
+    ("NUL", '\0'),
+    ("SOH", '\u{01}'),
+    ("STX", '\u{02}'),
+    ("ETX", '\u{03}'),
+    ("EOT", '\u{04}'),
+    ("ENQ", '\u{05}'),
+    ("ACK", '\u{06}'),
+    ("alert", '\u{07}'),
+    ("BS", '\u{08}'),
+    ("backspace", '\u{08}'),
+    ("HT", '\t'),
+    ("tab", '\t'),
+    ("LF", '\n'),
+    ("newline", '\n'),
+    ("VT", '\u{0b}'),
+    ("vertical-tab", '\u{0b}'),
+    ("FF", '\u{0c}'),
+    ("form-feed", '\u{0c}'),
+    ("CR", '\r'),
+    ("carriage-return", '\r'),
+    ("SO", '\u{0e}'),
+    ("SI", '\u{0f}'),
+    ("DLE", '\u{10}'),
+    ("DC1", '\u{11}'),
+    ("DC2", '\u{12}'),
+    ("DC3", '\u{13}'),
+    ("DC4", '\u{14}'),
+    ("NAK", '\u{15}'),
+    ("SYN", '\u{16}'),
+    ("ETB", '\u{17}'),
+    ("CAN", '\u{18}'),
+    ("EM", '\u{19}'),
+    ("SUB", '\u{1a}'),
+    ("ESC", '\u{1b}'),
+    ("IS4", '\u{1c}'),
+    ("FS", '\u{1c}'),
+    ("IS3", '\u{1d}'),
+    ("GS", '\u{1d}'),
+    ("IS2", '\u{1e}'),
+    ("RS", '\u{1e}'),
+    ("IS1", '\u{1f}'),
+    ("US", '\u{1f}'),
+    ("space", ' '),
+    ("exclamation-mark", '!'),
+    ("quotation-mark", '"'),
+    ("number-sign", '#'),
+    ("dollar-sign", '$'),
+    ("percent-sign", '%'),
+    ("ampersand", '&'),
+    ("apostrophe", '\''),
+    ("left-parenthesis", '('),
+    ("right-parenthesis", ')'),
+    ("asterisk", '*'),
+    ("plus-sign", '+'),
+    ("comma", ','),
+    ("hyphen", '-'),
+    ("hyphen-minus", '-'),
+    ("minus", '-'),
+    ("dash", '-'),
+    ("period", '.'),
+    ("full-stop", '.'),
+    ("slash", '/'),
+    ("solidus", '/'),
+    ("zero", '0'),
+    ("one", '1'),
+    ("two", '2'),
+    ("three", '3'),
+    ("four", '4'),
+    ("five", '5'),
+    ("six", '6'),
+    ("seven", '7'),
+    ("eight", '8'),
+    ("nine", '9'),
+    ("colon", ':'),
+    ("semicolon", ';'),
+    ("less-than-sign", '<'),
+    ("equals-sign", '='),
+    ("greater-than-sign", '>'),
+    ("question-mark", '?'),
+    ("commercial-at", '@'),
+    ("left-square-bracket", '['),
+    ("backslash", '\\'),
+    ("reverse-solidus", '\\'),
+    ("right-square-bracket", ']'),
+    ("circumflex", '^'),
+    ("circumflex-accent", '^'),
+    ("underscore", '_'),
+    ("grave-accent", '`'),
+    ("left-brace", '{'),
+    ("left-curly-bracket", '{'),
+    ("vertical-line", '|'),
+    ("right-brace", '}'),
+    ("right-curly-bracket", '}'),
+    ("tilde", '~'),
+    ("DEL", '\u{7f}'),
+];
+
+/// Resolve a POSIX.2 collating-symbol name: table lookup, else a single
+/// character is a collating element for itself, else invalid (`None`).
+fn collsym(name: &str) -> Option<char> {
+    if let Some(&(_, c)) = POSIX_COLLSYMS.iter().find(|&&(n, _)| n == name) {
+        return Some(c);
+    }
+    let mut it = name.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    }
+}
+
+/// True if `pattern` contains a collating symbol `[.` … `.]` (unescaped `[`).
+/// Mirrors `has_posix_class`.
+pub fn has_collating_symbol(pattern: &str) -> bool {
+    let b: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if b[i] == '[' && i + 1 < b.len() && b[i + 1] == '.' {
+            let mut j = i + 2;
+            while j + 1 < b.len() {
+                if b[j] == '.' && b[j + 1] == ']' {
+                    return true;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Matches `text` against extglob `pattern` (the WHOLE text must match).
 pub fn extglob_match(pattern: &str, text: &str, case_insensitive: bool) -> bool {
     let chars: Vec<char> = pattern.chars().collect();
@@ -778,7 +917,7 @@ mod bracket_negation_tests {
 
 #[cfg(test)]
 mod posix_class_tests {
-    use super::{extglob_match, has_posix_class};
+    use super::{collsym, extglob_match, has_collating_symbol, has_posix_class};
 
     fn m(p: &str, t: &str) -> bool {
         extglob_match(p, t, false)
@@ -834,5 +973,27 @@ mod posix_class_tests {
         assert!(!has_posix_class("[a-z]"));
         assert!(!has_posix_class("plain*"));
         assert!(!has_posix_class("\\[[:x")); // escaped, no close
+    }
+    #[test]
+    fn collsym_named_and_single_and_invalid() {
+        assert_eq!(collsym("hyphen"), Some('-'));
+        assert_eq!(collsym("space"), Some(' '));
+        assert_eq!(collsym("grave-accent"), Some('`'));
+        assert_eq!(collsym("newline"), Some('\n'));
+        assert_eq!(collsym("period"), Some('.'));
+        assert_eq!(collsym("a"), Some('a')); // single-char passthrough (letters omitted from table)
+        assert_eq!(collsym("-"), Some('-')); // single-char passthrough
+        assert_eq!(collsym("Z"), Some('Z'));
+        assert_eq!(collsym("zz"), None); // multi-char non-name → invalid
+        assert_eq!(collsym("yyz"), None);
+    }
+    #[test]
+    fn has_collating_symbol_detects() {
+        assert!(has_collating_symbol("[[.a.]]"));
+        assert!(has_collating_symbol("x[[.hyphen.]-9]y"));
+        assert!(!has_collating_symbol("[[:alpha:]]")); // that's a class, not a collating symbol
+        assert!(!has_collating_symbol("[abc]"));
+        assert!(!has_collating_symbol("plain"));
+        assert!(!has_collating_symbol("\\[.a.]")); // escaped `[` — not a bracket
     }
 }
