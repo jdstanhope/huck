@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# A minimal stand-in for GNU coreutils `timeout(1)`, for platforms that do not
+# ship it (a stock macOS; coreutils installs it as `gtimeout`). See #297.
+#
+# `run_diff_checks.sh` prepends this directory to PATH only when no real
+# `timeout` is on PATH, so on Linux — and on a mac with coreutils — the genuine
+# tool is used and this file is never reached.
+#
+# Supports exactly the form the diff harnesses use:
+#     timeout <seconds> <command> [args...]
+# No option flags (-k/-s/--foreground); the harnesses use none. Passing one is
+# an error here rather than being silently swallowed.
+#
+# Exits 124 when the deadline fires, matching GNU timeout so the harnesses'
+# rc comparisons stay meaningful.
+set -u
+
+if command -v gtimeout >/dev/null 2>&1; then
+  exec gtimeout "$@"
+fi
+
+case "${1:-}" in
+  -*) echo "timeout(shim): option '$1' is not supported (#297)" >&2; exit 125 ;;
+esac
+if [[ $# -lt 2 ]]; then
+  echo "timeout(shim): usage: timeout <seconds> <command> [args...]" >&2
+  exit 125
+fi
+
+duration=$1
+shift
+
+"$@" &
+cmd_pid=$!
+
+# Watchdog: SIGTERM the command if it outlives the deadline. Its own output is
+# silenced so a kill never adds bytes to a harness's captured stream.
+( sleep "$duration" 2>/dev/null; kill -TERM "$cmd_pid" 2>/dev/null ) &
+watch_pid=$!
+
+wait "$cmd_pid" 2>/dev/null
+rc=$?
+
+kill -TERM "$watch_pid" 2>/dev/null
+wait "$watch_pid" 2>/dev/null
+
+# 128+SIGTERM. Ambiguous in principle — a command that terminates itself with
+# SIGTERM reports the same — but for a watchdog over these harnesses a 143 is a
+# timeout, and reporting GNU's 124 is what the callers compare against.
+if [[ $rc -eq 143 ]]; then
+  rc=124
+fi
+exit "$rc"

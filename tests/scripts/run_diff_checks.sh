@@ -22,22 +22,19 @@ cd "$(dirname "$0")/../.." || exit 1   # repo root
 for b in target/debug/huck target/release/huck; do
   [[ -x "$b" ]] || { echo "missing binary: $b — build it first" >&2; exit 1; }
 done
-# Per-harness watchdog. `timeout` is GNU coreutils: present on Linux, absent on
-# a stock macOS (where coreutils installs it as `gtimeout`). Prefer whichever
-# exists; if neither does, run the harness bare rather than failing every single
-# one with "timeout: command not found" (#297). A hung harness then hangs the
-# sweep instead of being killed at 120s — acceptable on a dev box, and CI is
-# Linux, where the watchdog is always present.
-if command -v timeout >/dev/null 2>&1; then
-  watchdog=(timeout 120)
-elif command -v gtimeout >/dev/null 2>&1; then
-  watchdog=(gtimeout 120)
-else
-  # `env` as a transparent pass-through, not an empty array: under `set -u` an
-  # empty "${arr[@]}" is an unbound-variable error on older bash.
-  watchdog=(env)
-  echo "note: no timeout(1)/gtimeout(1) — running harnesses without a watchdog" >&2
+# `timeout` is GNU coreutils: present on Linux, absent on a stock macOS (where
+# coreutils installs it as `gtimeout`). It is needed both as the per-harness
+# watchdog below AND by 22 harnesses that call it themselves — without it those
+# fail with "timeout: command not found" instead of testing anything (#297).
+# Prepend the shim directory only when no real `timeout` is on PATH, so Linux —
+# and a mac with coreutils — keeps using the genuine tool. The shim itself
+# delegates to `gtimeout` when that exists.
+if ! command -v timeout >/dev/null 2>&1; then
+  PATH="$(cd "$(dirname "$0")/bin" && pwd):$PATH"
+  export PATH
+  echo "note: no timeout(1) on PATH — using the tests/scripts/bin/timeout shim" >&2
 fi
+watchdog=(timeout 120)
 pass=0; fail=0; failed=()
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
