@@ -2341,10 +2341,12 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts, shell: &Shell
             continue;
         }
         let pattern = build_glob_pattern(&field);
-        // Route POSIX-class patterns through the own-matcher too (the glob
-        // crate lacks [:name:]); unconditional on the extglob shopt.
+        // Route POSIX-class and collating-symbol patterns through the
+        // own-matcher too (the glob crate lacks [:name:]/[.name.]);
+        // unconditional on the extglob shopt.
         let is_extglob = (opts.extglob && crate::glob_match::has_extglob(&pattern))
-            || crate::glob_match::has_posix_class(&pattern);
+            || crate::glob_match::has_posix_class(&pattern)
+            || crate::glob_match::has_collating_symbol(&pattern);
 
         // No globbing needed: not a wildcard field AND not an extglob field.
         if !has_unquoted_metachar(&field) && !is_extglob {
