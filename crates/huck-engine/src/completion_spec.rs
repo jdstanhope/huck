@@ -1040,7 +1040,7 @@ mod tests {
 
     #[test]
     fn action_file_handles_dir_prefix() {
-        let _g = CWD_LOCK.lock().unwrap();
+        let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let subdir = dir.path().join("subdir");
         std::fs::create_dir(&subdir).unwrap();

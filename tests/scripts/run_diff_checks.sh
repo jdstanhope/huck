@@ -22,6 +22,19 @@ cd "$(dirname "$0")/../.." || exit 1   # repo root
 for b in target/debug/huck target/release/huck; do
   [[ -x "$b" ]] || { echo "missing binary: $b — build it first" >&2; exit 1; }
 done
+# `timeout` is GNU coreutils: present on Linux, absent on a stock macOS (where
+# coreutils installs it as `gtimeout`). It is needed both as the per-harness
+# watchdog below AND by 22 harnesses that call it themselves — without it those
+# fail with "timeout: command not found" instead of testing anything (#297).
+# Prepend the shim directory only when no real `timeout` is on PATH, so Linux —
+# and a mac with coreutils — keeps using the genuine tool. The shim itself
+# delegates to `gtimeout` when that exists.
+if ! command -v timeout >/dev/null 2>&1; then
+  PATH="$(cd "$(dirname "$0")/bin" && pwd):$PATH"
+  export PATH
+  echo "note: no timeout(1) on PATH — using the tests/scripts/bin/timeout shim" >&2
+fi
+watchdog=(timeout 120)
 pass=0; fail=0; failed=()
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
@@ -30,7 +43,7 @@ for h in tests/scripts/*_diff_check.sh; do
   case "$name" in
     run_diff_checks.sh|bash_test_suite_runner_diff_check.sh) continue ;;
   esac
-  if timeout 120 bash "$h" >"$log" 2>&1; then
+  if "${watchdog[@]}" bash "$h" >"$log" 2>&1; then
     pass=$((pass+1)); echo "PASS $name"
   else
     fail=$((fail+1)); failed+=("$name"); echo "FAIL $name"

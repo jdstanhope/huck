@@ -722,7 +722,7 @@ fn glob_expand_quoted_metachar_treated_as_literal() {
 fn glob_expand_question_mark_metachar_detected() {
     // CWD is process-global; run inside an empty temp dir under the lock
     // so concurrent tests can't contaminate the glob result.
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let saved = std::env::current_dir().unwrap();
     std::env::set_current_dir(tmp.path()).unwrap();
@@ -758,7 +758,7 @@ fn touch(dir: &std::path::Path, name: &str) {
 
 #[test]
 fn glob_star_matches_files_in_cwd() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     touch(tmp.path(), "a.txt");
     touch(tmp.path(), "b.txt");
@@ -776,7 +776,7 @@ fn glob_star_matches_files_in_cwd() {
 
 #[test]
 fn glob_star_excludes_dotfiles_by_default() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     touch(tmp.path(), "visible");
     touch(tmp.path(), ".hidden");
@@ -793,7 +793,7 @@ fn glob_star_excludes_dotfiles_by_default() {
 
 #[test]
 fn glob_dot_star_matches_dotfiles_but_excludes_dot_and_dotdot() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     touch(tmp.path(), ".hidden");
     let saved = std::env::current_dir().unwrap();
@@ -812,7 +812,7 @@ fn glob_dot_star_matches_dotfiles_but_excludes_dot_and_dotdot() {
 
 #[test]
 fn glob_bracket_dot_class_matches_dotfile() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     touch(tmp.path(), ".hidden");
     let saved = std::env::current_dir().unwrap();
@@ -829,7 +829,7 @@ fn glob_bracket_dot_class_matches_dotfile() {
 
 #[test]
 fn glob_bracket_class_matches_listed_chars() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     touch(tmp.path(), "a.txt");
     touch(tmp.path(), "b.txt");
@@ -848,7 +848,7 @@ fn glob_bracket_class_matches_listed_chars() {
 
 #[test]
 fn glob_no_match_returns_literal_pattern() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let saved = std::env::current_dir().unwrap();
     std::env::set_current_dir(tmp.path()).unwrap();
@@ -865,7 +865,7 @@ fn glob_no_match_returns_literal_pattern() {
 
 #[test]
 fn glob_partial_quoting_keeps_literal_prefix() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     touch(tmp.path(), "fooA");
     touch(tmp.path(), "fooB");
@@ -885,7 +885,7 @@ fn glob_partial_quoting_keeps_literal_prefix() {
 
 #[test]
 fn glob_negation_bracket_excludes_listed() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     touch(tmp.path(), "a.txt");
     touch(tmp.path(), "b.txt");
@@ -904,7 +904,7 @@ fn glob_negation_bracket_excludes_listed() {
 
 #[test]
 fn glob_unterminated_bracket_falls_back_to_literal() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let saved = std::env::current_dir().unwrap();
     std::env::set_current_dir(tmp.path()).unwrap();
@@ -1150,7 +1150,7 @@ fn expand_pattern_last_status_snapshots_before_command_sub() {
 
 #[test]
 fn glob_star_does_not_cross_path_separator() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join("sub")).unwrap();
     touch(&tmp.path().join("sub"), "deep.txt");

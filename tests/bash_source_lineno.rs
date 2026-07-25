@@ -8,16 +8,31 @@ fn huck(s: &str) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
+/// A tag unique across BOTH processes and threads: pid for the former, a
+/// process-wide counter for the latter.
+///
+/// The counter is not decoration. These helpers used pid + `SystemTime` nanos
+/// alone, which is only unique if the clock ticks between two calls. On Linux
+/// it does; macOS reports `SystemTime` at microsecond granularity, so two test
+/// threads entering within the same microsecond built the SAME paths and
+/// clobbered each other's scripts — a real race that merely never lost on
+/// Linux (#297). An atomic counter cannot collide within the process at all.
+fn unique_tag() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}_{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Run huck with a two-file setup: a lib file and a main file that sources it.
 /// `main_body` contains `%LIB%` which is replaced with the absolute path to the lib file.
 fn huck_two_file(main_body: &str, lib_body: &str) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let pid = std::process::id();
-    let lib = std::env::temp_dir().join(format!("huck_v153_lib_{pid}_{nanos}.sh"));
-    let mainf = std::env::temp_dir().join(format!("huck_v153_main_{pid}_{nanos}.sh"));
+    let tag = unique_tag();
+    let lib = std::env::temp_dir().join(format!("huck_v153_lib_{tag}.sh"));
+    let mainf = std::env::temp_dir().join(format!("huck_v153_main_{tag}.sh"));
     std::fs::write(&lib, lib_body).unwrap();
     let body = main_body.replace("%LIB%", lib.to_str().unwrap());
     std::fs::write(&mainf, &body).unwrap();
@@ -31,14 +46,7 @@ fn huck_two_file(main_body: &str, lib_body: &str) -> String {
 }
 
 fn huck_file(body: &str) -> String {
-    let f = std::env::temp_dir().join(format!(
-        "huck_v153_{}_{}.sh",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let f = std::env::temp_dir().join(format!("huck_v153_{}.sh", unique_tag()));
     std::fs::write(&f, body).unwrap();
     let o = Command::new(env!("CARGO_BIN_EXE_huck"))
         .arg(&f)

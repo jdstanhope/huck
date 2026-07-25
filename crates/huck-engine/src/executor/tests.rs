@@ -452,7 +452,7 @@ fn brace_group_assignments_affect_current_shell() {
 
 #[test]
 fn redirect_target_does_not_glob() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Create a temp dir with a real file matching the literal pattern name.
     let tmp = tempfile::tempdir().unwrap();
     // The file is named literally "starfile" — `*` should not glob to it.
@@ -1238,7 +1238,7 @@ fn export_prefix_persists_in_default_mode() {
 #[test]
 #[cfg(unix)]
 fn for_brace_body_iterates_with_break_continue() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let run = |src: &str| -> String {
         let mut buf: Vec<u8> = Vec::new();
         let mut shell = Shell::new();
@@ -1281,7 +1281,7 @@ fn for_brace_body_iterates_with_break_continue() {
 #[test]
 #[cfg(unix)]
 fn external_process_stderr_is_captured() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut buf_out: Vec<u8> = Vec::new();
     let mut buf_err: Vec<u8> = Vec::new();
     let mut shell = Shell::new();
@@ -1310,7 +1310,7 @@ fn external_process_stderr_is_captured() {
 #[test]
 #[cfg(unix)]
 fn external_process_merged_stderr_interleaves_via_kernel() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut buf: Vec<u8> = Vec::new();
     let mut shell = Shell::new();
     {
@@ -1336,7 +1336,7 @@ fn external_process_merged_stderr_interleaves_via_kernel() {
 #[test]
 #[cfg(unix)]
 fn pipeline_stage_stderr_is_captured() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut buf_out: Vec<u8> = Vec::new();
     let mut buf_err: Vec<u8> = Vec::new();
     let mut shell = Shell::new();

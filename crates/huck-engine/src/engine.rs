@@ -326,29 +326,11 @@ mod tests {
         assert_eq!(out.stdout, "10\n");
     }
 
-    #[test]
-    fn heredoc_in_comsub_eof_adjacency_expands() {
-        // Heredoc STARTED inside a command substitution whose close delimiter is
-        // adjacent to the heredoc close-delimiter text. bash prefix-matches the
-        // heredoc delimiter, so the body terminates and the `$()`/`` ` `` closes.
-        // `$()`/`` `…` `` strip the trailing newline, so the body `hi\n` → `hi`.
-        let mut e = Engine::new();
-        // comsub-eof0: `EOF )` (delimiter, space, `)`).
-        assert_eq!(
-            e.capture("foo=$(cat <<EOF\nhi\nEOF )\necho $foo").stdout,
-            "hi\n"
-        );
-        // comsub-eof1: heredoc inside a BACKTICK (the former panic case).
-        assert_eq!(
-            e.capture("foo=`cat <<EOF\nhi\nEOF`\necho $foo").stdout,
-            "hi\n"
-        );
-        // comsub-eof4: `EOF)` (no space before the `)`).
-        assert_eq!(
-            e.capture("e=$(cat <<EOF\ncontents\nEOF)\necho $e").stdout,
-            "contents\n"
-        );
-    }
+    // NOTE: `heredoc_in_comsub_eof_adjacency_expands` moved to
+    // `tests/streaming_fd_serial.rs` — the comsub capture swaps a
+    // process-global fd around an external `cat`, so a concurrently-finishing
+    // sibling test's libtest output could truncate the captured body to empty
+    // under the parallel harness (reproducible on macOS). See #297 and #90.
 
     #[test]
     fn heredoc_delim_line_continuation_in_comsub() {
@@ -541,54 +523,16 @@ mod tests {
     // file and read it back, which races libtest's own output under the parallel
     // harness (reproducible on macOS). See that file and #90.
 
-    #[test]
-    fn capture_bare_dup_to_one_routes_to_stdout_sink() {
-        // The fixup must not regress Task 7's bare-builtin in-memory routing.
-        //
-        // route_out_to_err: a builtin's `>&2` under stderr capture lands in
-        // the separate stderr buffer (not the embedder's terminal).
-        let mut e = Engine::new();
-        let out = e.prepare("echo out; echo err >&2").capture();
-        assert_eq!(out.stdout, "out\n");
-        assert_eq!(out.stderr, "err\n");
+    // NOTE: `capture_bare_dup_to_one_routes_to_stdout_sink` moved to
+    // `tests/streaming_fd_serial.rs` — its `>&2` / `2>&1` bare-builtin routing
+    // depends on the real fd 1 being intact, so a concurrently-forking sibling
+    // that inherits a temporarily-installed pipe (dup2 clears O_CLOEXEC, see
+    // the tee note below) made it read back
+    // "…: line 1: 1: Bad file descriptor" instead of "out". See #297 and #90.
 
-        // route_err_to_out: a builtin's `2>&1` under stdout capture folds
-        // stderr writes into the stdout buffer. Use a builtin whose primary
-        // output goes to stderr — `declare -p UNSET_NAME` writes the "not
-        // found" diagnostic to fd 2.
-        let mut e = Engine::new();
-        let out = e.prepare("declare -p NOPE_NOT_DEFINED 2>&1").capture();
-        assert_eq!(out.stderr, "");
-        assert!(
-            out.stdout.contains("NOPE_NOT_DEFINED"),
-            "got stdout=[{:?}]",
-            out.stdout
-        );
-    }
-
-    #[test]
-    fn cmdsub_bare_builtin_2to1_capture_is_nonempty() {
-        // v269 T3b regression: a builtin error emitted under `$(... 2>&1)`
-        // must reach the CALLER's writer (the executor's in-memory
-        // route_err_to_out swap for the bare-builtin redirect), not the
-        // thread-local sink — sh_error_to!, not sh_error!. Verified bug
-        // (pre-fix): `x=$(cd /nonexistent 2>&1); echo "$x"` printed an empty
-        // string instead of capturing `cd`'s diagnostic.
-        let mut e = Engine::new();
-        let out = e
-            .prepare(r#"x=$(cd /nonexistent_xyz_engine_test 2>&1); echo "$x""#)
-            .capture();
-        assert_eq!(out.stderr, "");
-        assert!(
-            !out.stdout.trim().is_empty(),
-            "expected the cd error to be captured, got empty stdout"
-        );
-        assert!(
-            out.stdout.contains("No such file or directory"),
-            "expected the captured cd diagnostic body, got stdout=[{:?}]",
-            out.stdout
-        );
-    }
+    // NOTE: `cmdsub_bare_builtin_2to1_capture_is_nonempty` moved to
+    // `tests/streaming_fd_serial.rs` — same process-global fd swap under
+    // `$(... 2>&1)`, same parallel-harness race. See #297 and #90.
 
     // ============== CWD ==============
 
@@ -1170,29 +1114,12 @@ mod tests {
         assert_eq!(out.stdout, "/\n", "stderr={:?}", out.stderr);
     }
 
-    #[test]
-    fn sandbox_permits_relative_redirect() {
-        // Sandbox blocks ESCAPE, not local work — this is the one place it
-        // deliberately diverges from bash's rbash, which refuses every file
-        // target. See docs/superpowers/specs/2026-07-20-restricted-policy-design.md.
-        //
-        // `.cwd()` sets the PROCESS-global cwd, so this takes CWD_LOCK like
-        // every other cwd test here — this box's single core serializes tests
-        // and would hide the race that CI's 4 cores surface.
-        let _g = crate::test_support::CWD_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join("huck-v319-sandbox-rel");
-        let _ = std::fs::create_dir_all(&dir);
-        let mut e = Engine::new();
-        let out = e
-            .prepare("echo hi > local_log; cat local_log")
-            .cwd(&dir)
-            .restricted()
-            .capture();
-        assert_eq!(out.stdout, "hi\n", "stderr: {:?}", out.stderr);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // NOTE: `sandbox_permits_relative_redirect` moved to
+    // `tests/streaming_fd_serial.rs` — CWD_LOCK serialized the cwd swap but NOT
+    // libtest itself, and the capture's fd-1 swap let a sibling's
+    // `test … ok` progress line land inside the captured bytes (observed:
+    // stdout == "hi\ntest engine::tests::set_arg0_visible_as_dollar_zero ...
+    // ok\n"). No in-process lock can fix that. See #297 and #90.
 
     // ============== TIMEOUT ==============
 
@@ -1403,23 +1330,10 @@ mod tests {
     // run_subprocess (single external command), the Subshell arm
     // (`( … )`), and multi-stage pipelines.
 
-    #[test]
-    fn on_stdout_line_external_real_time() {
-        use std::time::{Duration, Instant};
-        let mut timestamps: Vec<Instant> = Vec::new();
-        let mut e = Engine::new();
-        let _ = e
-            .prepare("/bin/sh -c 'echo first; sleep 0.1; echo second'")
-            .on_stdout_line(|_line| timestamps.push(Instant::now()))
-            .capture();
-        assert_eq!(timestamps.len(), 2);
-        let gap = timestamps[1].duration_since(timestamps[0]);
-        assert!(
-            gap >= Duration::from_millis(50),
-            "expected ~100ms gap, got {gap:?}"
-        );
-        assert!(gap <= Duration::from_secs(2), "gap too large: {gap:?}");
-    }
+    // NOTE: `on_stdout_line_external_real_time` moved to
+    // `tests/streaming_fd_serial.rs` — it swaps a process-global fd AND asserts
+    // on wall-clock gaps, so the parallel harness could drop a callback line
+    // (the observed failure) or inflate the gap under load. See #297 and #90.
 
     #[test]
     fn on_stdout_line_external_fires_during_wait() {
@@ -1519,20 +1433,10 @@ mod tests {
         assert!(err_lines.iter().any(|l| l.contains("cd: restricted")));
     }
 
-    #[test]
-    fn on_stdout_line_with_timeout_fires_during_run() {
-        use std::time::Duration;
-        let mut lines: Vec<String> = Vec::new();
-        let mut e = Engine::new();
-        let code = e
-            .prepare("/bin/sh -c 'echo before; sleep 5'")
-            .timeout(Duration::from_millis(200))
-            .on_stdout_line(|line| lines.push(line.to_string()))
-            .capture()
-            .exit_code;
-        assert_eq!(code, 124);
-        assert_eq!(lines, vec!["before"]);
-    }
+    // NOTE: `on_stdout_line_with_timeout_fires_during_run` moved to
+    // `tests/streaming_fd_serial.rs` — a 200ms deadline over an external child
+    // plus a callback fd swap. Under a loaded parallel harness it returned 1
+    // instead of 124. See #297 and #90.
 
     #[test]
     fn all_knobs_compose() {

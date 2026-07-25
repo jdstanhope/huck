@@ -866,10 +866,26 @@ mod tests {
         );
     }
 
-    // A raw waitpid status for which WIFCONTINUED is true. On Linux/glibc
-    // WIFCONTINUED(status) is `status == 0xffff` (the __W_CONTINUED sentinel).
+    // A raw waitpid status for which WIFCONTINUED is true. The encoding is
+    // libc-specific (#297):
+    //   - Linux/glibc: the __W_CONTINUED sentinel, `status == 0xffff`.
+    //   - BSD/macOS:   `_WSTATUS(x) == _WSTOPPED && WSTOPSIG(x) == SIGCONT`,
+    //     i.e. the stopped encoding carrying SIGCONT. (0xffff decodes there as
+    //     WIFSTOPPED with stop signal 255, which is why the glibc sentinel
+    //     landed these jobs in Stopped(255) instead of Running.)
+    // `reap` itself uses libc::WIFCONTINUED, so only this fixture is
+    // platform-sensitive; the assert keeps it honest on a new target rather
+    // than letting a wrong constant quietly retarget the test.
     fn fake_continued_raw() -> libc::c_int {
-        0xffff
+        #[cfg(target_os = "linux")]
+        let raw: libc::c_int = 0xffff;
+        #[cfg(not(target_os = "linux"))]
+        let raw: libc::c_int = (libc::SIGCONT << 8) | 0x7f;
+        assert!(
+            libc::WIFCONTINUED(raw),
+            "fixture {raw:#x} is not WIFCONTINUED on this platform"
+        );
+        raw
     }
 
     #[test]

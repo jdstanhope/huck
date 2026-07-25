@@ -1296,7 +1296,7 @@ mod tests {
         // Simulates git's `COMP_WORDBREAKS="$COMP_WORDBREAKS:"`: with the
         // whitespace-inclusive default, appending ':' must keep `cd ~/`
         // tokenizing on the space (cur word "~/"), so the spec still completes.
-        let _g = CWD_LOCK.lock().unwrap();
+        let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut shell = Shell::new();
         shell.export_set(
             "HOME",
@@ -1369,7 +1369,7 @@ mod tests {
 
     #[test]
     fn dispatch_o_default_falls_back_on_empty() {
-        let _g = CWD_LOCK.lock().unwrap();
+        let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("alphafile"), b"").unwrap();
         let prior_cwd = std::env::current_dir().unwrap();
@@ -1433,7 +1433,7 @@ mod tests {
 
     #[test]
     fn dispatch_resolve_starts_with_clean_current_spec() {
-        let _g = CWD_LOCK.lock().unwrap();
+        let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Simulate a leaked spec from a prior compgen -F (without going
         // through the actual compgen path). Without the defensive clear
         // at the top of dispatch::resolve, the .take() inside

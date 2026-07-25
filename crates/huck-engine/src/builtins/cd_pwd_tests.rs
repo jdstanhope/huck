@@ -10,7 +10,7 @@ use crate::test_support::CWD_LOCK;
 /// assertions portable.
 #[test]
 fn cd_sets_pwd_to_target_directory() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut shell = Shell::new();
     let mut out: Vec<u8> = Vec::new();
     let prev = std::env::current_dir().unwrap();
@@ -32,7 +32,7 @@ fn cd_sets_pwd_to_target_directory() {
 
 #[test]
 fn cd_sets_oldpwd_to_previous_pwd() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut shell = Shell::new();
     shell.export_set("PWD", "/var".to_string());
     let mut out: Vec<u8> = Vec::new();
@@ -51,7 +51,7 @@ fn cd_sets_oldpwd_to_previous_pwd() {
 
 #[test]
 fn cd_with_pwd_initially_unset_does_not_set_oldpwd() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut shell = Shell::new();
     shell.unset("PWD");
     shell.unset("OLDPWD");
@@ -73,7 +73,7 @@ fn cd_with_pwd_initially_unset_does_not_set_oldpwd() {
 
 #[test]
 fn cd_dash_uses_oldpwd_as_target() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut shell = Shell::new();
     shell.export_set("OLDPWD", "/tmp".to_string());
     shell.export_set("PWD", "/var".to_string());
@@ -95,7 +95,7 @@ fn cd_dash_uses_oldpwd_as_target() {
 
 #[test]
 fn cd_dash_prints_new_pwd_on_stdout() {
-    let _g = CWD_LOCK.lock().unwrap();
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut shell = Shell::new();
     shell.export_set("OLDPWD", "/tmp".to_string());
     shell.export_set("PWD", "/var".to_string());
