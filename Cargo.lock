@@ -173,6 +173,7 @@ dependencies = [
  "expectrl",
  "huck-cli",
  "libc",
+ "ptyprocess",
  "tempfile",
 ]
 
