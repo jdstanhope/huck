@@ -524,6 +524,9 @@ fn parse_class(chars: &[char], pos: &mut usize) -> Item {
         // collating symbol (via the same `collsym` lookup), but it is NOT a
         // range endpoint (unlike a collating symbol) — bash leaks the `-`/
         // next-atom as literals after it, matching `[:class:]`.
+        // NOTE: a negated bracket ending in an equivalence class matches
+        // nothing in bash 5.2 (a bash quirk); huck negates normally — kept
+        // by design (docs/bash-divergences.md).
         #[allow(clippy::collapsible_if)] // keep the explicit fall-through comment.
         if chars[k] == '[' && k + 1 < chars.len() && chars[k + 1] == '=' {
             if let Some(close) = (k + 2..chars.len().saturating_sub(1))
@@ -1171,9 +1174,19 @@ mod posix_class_tests {
         // composes with adjacent POSIX classes (posixpat.tests ok 1)
         assert!(m("[[:alpha:]][[=b=]][[:ascii:]]", "abc"));
         assert!(!m("[[:alpha:]][[=b=]][[:ascii:]]", "azc"));
-        // negation composes
-        assert!(m("[![=b=]]", "c"));
+        // Negation composes. DELIBERATE DIVERGENCE (kept by design, see
+        // docs/bash-divergences.md): bash 5.2 has a quirk where a NEGATED
+        // bracket whose LAST atom is an equivalence class matches NOTHING
+        // (`[![=b=]]` → no match for any char); huck negates normally
+        // (matches any char but `b`).
+        assert!(m("[![=b=]]", "c")); // huck negates normally; bash matches nothing here
         assert!(!m("[![=b=]]", "b"));
+        // When the equivalence class is NOT the last atom, bash negates
+        // normally and huck agrees (byte-identical) — the quirk is specific
+        // to the trailing `=]]`.
+        assert!(m("[![=b=]x]", "c")); // not b, not x
+        assert!(!m("[![=b=]x]", "b"));
+        assert!(!m("[![=b=]x]", "x"));
         // not a range endpoint: `-` and the next atom leak as literals,
         // mirroring `[:class:]` (NotEligible), unlike `[.sym.]`.
         assert!(m("[[=a=]-z]", "-"));
