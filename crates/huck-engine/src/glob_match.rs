@@ -441,6 +441,40 @@ fn parse_class(chars: &[char], pos: &mut usize) -> Item {
         set.push(ClassAtom::Ch(']'));
         i += 1;
     }
+    // Parse one bracket atom at `k`: a `[:class:]`, a `[.sym.]`, or a plain
+    // char. Returns (standalone atom, range-endpoint char if any, index past
+    // the atom). Assumes chars[k] != ']' (the caller handles the closing
+    // bracket).
+    fn parse_atom(chars: &[char], k: usize) -> (ClassAtom, Option<char>, usize) {
+        // [:name:] POSIX class — not a range endpoint.
+        if chars[k] == '[' && k + 1 < chars.len() && chars[k + 1] == ':' {
+            if let Some(close) = (k + 2..chars.len().saturating_sub(1))
+                .find(|&j| chars[j] == ':' && chars[j + 1] == ']')
+            {
+                let name: String = chars[k + 2..close].iter().collect();
+                let atom = match posix_class_from_name(&name) {
+                    Some(pc) => ClassAtom::Posix(pc),
+                    None => ClassAtom::Never,
+                };
+                return (atom, None, close + 2);
+            }
+        }
+        // [.name.] collating symbol — a valid one is a range endpoint.
+        if chars[k] == '[' && k + 1 < chars.len() && chars[k + 1] == '.' {
+            if let Some(close) = (k + 2..chars.len().saturating_sub(1))
+                .find(|&j| chars[j] == '.' && chars[j + 1] == ']')
+            {
+                let name: String = chars[k + 2..close].iter().collect();
+                return match collsym(&name) {
+                    Some(c) => (ClassAtom::Ch(c), Some(c), close + 2),
+                    None => (ClassAtom::Never, None, close + 2),
+                };
+            }
+        }
+        // Plain char.
+        (ClassAtom::Ch(chars[k]), Some(chars[k]), k + 1)
+    }
+
     let mut closed = false;
     while i < chars.len() {
         if chars[i] == ']' {
@@ -448,29 +482,23 @@ fn parse_class(chars: &[char], pos: &mut usize) -> Item {
             i += 1;
             break;
         }
-        // POSIX class `[:name:]` (the inner `[:` of `[[:name:]]`).
-        #[allow(clippy::collapsible_if)] // keep the explicit fall-through comment.
-        if chars[i] == '[' && i + 1 < chars.len() && chars[i + 1] == ':' {
-            if let Some(close) = (i + 2..chars.len().saturating_sub(1))
-                .find(|&k| chars[k] == ':' && chars[k + 1] == ']')
-            {
-                let name: String = chars[i + 2..close].iter().collect();
-                set.push(match posix_class_from_name(&name) {
-                    Some(pc) => ClassAtom::Posix(pc),
-                    None => ClassAtom::Never,
-                });
-                i = close + 2; // skip past ":]"
-                continue;
+        let (atom, lo_ep, after) = parse_atom(chars, i);
+        // Range: <atom> '-' <atom>, where the '-' is not the trailing set char.
+        if lo_ep.is_some()
+            && after < chars.len()
+            && chars[after] == '-'
+            && after + 1 < chars.len()
+            && chars[after + 1] != ']'
+        {
+            let (_batom, hi_ep, after2) = parse_atom(chars, after + 1);
+            match (lo_ep, hi_ep) {
+                (Some(lo), Some(hi)) => set.push(ClassAtom::Range(lo, hi)),
+                _ => set.push(ClassAtom::Never), // invalid collating endpoint
             }
-            // not a valid `[:...:]` — fall through to literal handling.
-        }
-        // Range: x-y (where y is not the closing ']').
-        if i + 2 < chars.len() && chars[i + 1] == '-' && chars[i + 2] != ']' {
-            set.push(ClassAtom::Range(chars[i], chars[i + 2]));
-            i += 3;
+            i = after2;
         } else {
-            set.push(ClassAtom::Ch(chars[i]));
-            i += 1;
+            set.push(atom);
+            i = after;
         }
     }
     if !closed {
@@ -995,5 +1023,35 @@ mod posix_class_tests {
         assert!(!has_collating_symbol("[abc]"));
         assert!(!has_collating_symbol("plain"));
         assert!(!has_collating_symbol("\\[.a.]")); // escaped `[` — not a bracket
+    }
+    #[test]
+    fn collating_symbol_matching() {
+        // single-char and named collating elements
+        assert!(m("[[.a.]]", "a"));
+        assert!(!m("[[.a.]]", "b"));
+        assert!(m("[[.hyphen.]]", "-"));
+        assert!(m("[[.space.]]", " "));
+        assert!(!m("[[.grave-accent.]]", " ")); // ` != space  → posixpat ok 6
+        // collating symbols as range endpoints
+        assert!(m("[[.a.]-[.z.]]", "p")); // ok 3
+        assert!(m("[[.hyphen.]-9]", "-")); // ok 2
+        assert!(m("[[.-.]-9]", "4")); // ok 7
+        assert!(!m("[[.a.]-[.Z.]]", "p")); // reversed range → no match → ok 11
+        // invalid collating symbols (multi-char non-names)
+        assert!(!m("[[.yyz.]-[.z.]]", "c")); // invalid range start → ok 8
+        assert!(m("[[.yyz.][.a.]-z]", "c")); // invalid atom + valid range → ok 9
+        assert!(m("[[.a.]-[.zz.]p]", "p")); // invalid range end, literal p → ok 12
+        assert!(m("[[.aa.]-[.z.]p]", "p")); // invalid range start, literal p → ok 13
+        // negation composes
+        assert!(!m("[![.a.]]", "a"));
+        assert!(m("[![.a.]]", "b"));
+        // mixed with a POSIX class
+        assert!(m("[[:digit:][.hyphen.]]", "-"));
+        assert!(m("[[:digit:][.hyphen.]]", "5"));
+        // no regression on plain ranges / literals
+        assert!(m("[a-z]", "m"));
+        assert!(!m("[a-z]", "M"));
+        assert!(m("[a-]", "-")); // trailing '-' is literal
+        assert!(m("[]a]", "]")); // ']' first is literal
     }
 }
