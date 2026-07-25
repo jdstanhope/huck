@@ -441,12 +441,25 @@ fn parse_class(chars: &[char], pos: &mut usize) -> Item {
         set.push(ClassAtom::Ch(']'));
         i += 1;
     }
+    // Whether an atom is SHAPE-eligible to sit on one side of a `-` range,
+    // as distinct from whether it resolved to a valid char. A `[:class:]` is
+    // structurally never a range endpoint (bash leaks the `-`/next-atom as
+    // literals after it). A plain char or a `[.sym.]` collating token IS
+    // shape-eligible even when the symbol name is invalid — bash then
+    // consumes the whole `atom '-' atom` span as a single failed (no-match)
+    // range rather than leaking the `-`/second atom as literals.
+    enum RangeEp {
+        NotEligible,
+        Eligible(Option<char>),
+    }
+
     // Parse one bracket atom at `k`: a `[:class:]`, a `[.sym.]`, or a plain
-    // char. Returns (standalone atom, range-endpoint char if any, index past
-    // the atom). Assumes chars[k] != ']' (the caller handles the closing
-    // bracket).
-    fn parse_atom(chars: &[char], k: usize) -> (ClassAtom, Option<char>, usize) {
+    // char. Returns (standalone atom, range-endpoint eligibility/value, index
+    // past the atom). Assumes chars[k] != ']' (the caller handles the
+    // closing bracket).
+    fn parse_atom(chars: &[char], k: usize) -> (ClassAtom, RangeEp, usize) {
         // [:name:] POSIX class — not a range endpoint.
+        #[allow(clippy::collapsible_if)] // keep the explicit fall-through comment.
         if chars[k] == '[' && k + 1 < chars.len() && chars[k + 1] == ':' {
             if let Some(close) = (k + 2..chars.len().saturating_sub(1))
                 .find(|&j| chars[j] == ':' && chars[j + 1] == ']')
@@ -456,23 +469,31 @@ fn parse_class(chars: &[char], pos: &mut usize) -> Item {
                     Some(pc) => ClassAtom::Posix(pc),
                     None => ClassAtom::Never,
                 };
-                return (atom, None, close + 2);
+                return (atom, RangeEp::NotEligible, close + 2);
             }
         }
-        // [.name.] collating symbol — a valid one is a range endpoint.
+        // [.name.] collating symbol — always range-eligible; an invalid name
+        // yields Eligible(None) so a range attempt still consumes the span.
+        #[allow(clippy::collapsible_if)] // keep the explicit fall-through comment.
         if chars[k] == '[' && k + 1 < chars.len() && chars[k + 1] == '.' {
             if let Some(close) = (k + 2..chars.len().saturating_sub(1))
                 .find(|&j| chars[j] == '.' && chars[j + 1] == ']')
             {
                 let name: String = chars[k + 2..close].iter().collect();
-                return match collsym(&name) {
-                    Some(c) => (ClassAtom::Ch(c), Some(c), close + 2),
-                    None => (ClassAtom::Never, None, close + 2),
+                let val = collsym(&name);
+                let atom = match val {
+                    Some(c) => ClassAtom::Ch(c),
+                    None => ClassAtom::Never,
                 };
+                return (atom, RangeEp::Eligible(val), close + 2);
             }
         }
         // Plain char.
-        (ClassAtom::Ch(chars[k]), Some(chars[k]), k + 1)
+        (
+            ClassAtom::Ch(chars[k]),
+            RangeEp::Eligible(Some(chars[k])),
+            k + 1,
+        )
     }
 
     let mut closed = false;
@@ -483,20 +504,30 @@ fn parse_class(chars: &[char], pos: &mut usize) -> Item {
             break;
         }
         let (atom, lo_ep, after) = parse_atom(chars, i);
-        // Range: <atom> '-' <atom>, where the '-' is not the trailing set char.
-        if lo_ep.is_some()
+        // Range: <atom> '-' <atom>, where the '-' is not the trailing set
+        // char, gated on SHAPE-eligibility of the first atom (not on its
+        // value being resolved — an invalid collating endpoint still forms
+        // (and fails) a range instead of leaking as literals).
+        let mut consumed_as_range = false;
+        if let RangeEp::Eligible(lo_val) = lo_ep
             && after < chars.len()
             && chars[after] == '-'
             && after + 1 < chars.len()
             && chars[after + 1] != ']'
         {
             let (_batom, hi_ep, after2) = parse_atom(chars, after + 1);
-            match (lo_ep, hi_ep) {
+            let hi_val = match hi_ep {
+                RangeEp::Eligible(v) => v,
+                RangeEp::NotEligible => None,
+            };
+            match (lo_val, hi_val) {
                 (Some(lo), Some(hi)) => set.push(ClassAtom::Range(lo, hi)),
-                _ => set.push(ClassAtom::Never), // invalid collating endpoint
+                _ => set.push(ClassAtom::Never), // invalid collating endpoint(s)
             }
             i = after2;
-        } else {
+            consumed_as_range = true;
+        }
+        if !consumed_as_range {
             set.push(atom);
             i = after;
         }
@@ -1042,6 +1073,13 @@ mod posix_class_tests {
         assert!(m("[[.yyz.][.a.]-z]", "c")); // invalid atom + valid range → ok 9
         assert!(m("[[.a.]-[.zz.]p]", "p")); // invalid range end, literal p → ok 12
         assert!(m("[[.aa.]-[.z.]p]", "p")); // invalid range start, literal p → ok 13
+        // invalid collating range endpoint consumes the WHOLE `atom-atom`
+        // span as a single failed range (bash 5.2.21, LC_ALL=C confirmed) —
+        // it must NOT leak the '-' or the second atom as separate literals.
+        assert!(!m("[[.aa.]-[.z.]p]", "z"));
+        assert!(!m("[[.aa.]-[.z.]p]", "-"));
+        assert!(!m("[[.yyz.]-[.z.]]", "z"));
+        assert!(!m("[[.yyz.]-[.z.]]", "-"));
         // negation composes
         assert!(!m("[![.a.]]", "a"));
         assert!(m("[![.a.]]", "b"));
