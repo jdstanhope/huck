@@ -111,6 +111,11 @@ enum PosixClass {
     Graph,
     Print,
     Xdigit,
+    // `ascii` is a glibc `wctype`/fnmatch extension beyond the 12 POSIX.2
+    // classes (v119's original scope) — bash's own posixpat.tests exercises
+    // it (`[[:alpha:]][[=b=]][[:ascii:]]`), so it needs to resolve too or
+    // that line never flips even with equivalence classes wired up.
+    Ascii,
 }
 
 fn posix_class_from_name(name: &str) -> Option<PosixClass> {
@@ -128,6 +133,7 @@ fn posix_class_from_name(name: &str) -> Option<PosixClass> {
         "space" => Space,
         "blank" => Blank,
         "print" => Print,
+        "ascii" => Ascii,
         _ => return None,
     })
 }
@@ -161,6 +167,7 @@ fn posix_matches(pc: PosixClass, c: char, ci: bool) -> bool {
         Space => matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}'),
         Blank => matches!(c, ' ' | '\t'),
         Print => c.is_ascii_graphic() || c == ' ',
+        Ascii => c.is_ascii(),
     }
 }
 
@@ -347,6 +354,30 @@ pub fn has_collating_symbol(pattern: &str) -> bool {
     false
 }
 
+/// True if `pattern` contains an equivalence class `[=` … `=]` (unescaped
+/// `[`). Mirrors `has_collating_symbol`.
+pub fn has_equivalence_class(pattern: &str) -> bool {
+    let b: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if b[i] == '[' && i + 1 < b.len() && b[i + 1] == '=' {
+            let mut j = i + 2;
+            while j + 1 < b.len() {
+                if b[j] == '=' && b[j + 1] == ']' {
+                    return true;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Matches `text` against extglob `pattern` (the WHOLE text must match).
 pub fn extglob_match(pattern: &str, text: &str, case_insensitive: bool) -> bool {
     let chars: Vec<char> = pattern.chars().collect();
@@ -486,6 +517,24 @@ fn parse_class(chars: &[char], pos: &mut usize) -> Item {
                     None => ClassAtom::Never,
                 };
                 return (atom, RangeEp::Eligible(val), close + 2);
+            }
+        }
+        // [=name=] equivalence class — in the C/POSIX locale each char is its
+        // own class, so this resolves to the SAME char as a `[.name.]`
+        // collating symbol (via the same `collsym` lookup), but it is NOT a
+        // range endpoint (unlike a collating symbol) — bash leaks the `-`/
+        // next-atom as literals after it, matching `[:class:]`.
+        #[allow(clippy::collapsible_if)] // keep the explicit fall-through comment.
+        if chars[k] == '[' && k + 1 < chars.len() && chars[k + 1] == '=' {
+            if let Some(close) = (k + 2..chars.len().saturating_sub(1))
+                .find(|&j| chars[j] == '=' && chars[j + 1] == ']')
+            {
+                let name: String = chars[k + 2..close].iter().collect();
+                let atom = match collsym(&name) {
+                    Some(c) => ClassAtom::Ch(c),
+                    None => ClassAtom::Never,
+                };
+                return (atom, RangeEp::NotEligible, close + 2);
             }
         }
         // Plain char.
@@ -976,7 +1025,9 @@ mod bracket_negation_tests {
 
 #[cfg(test)]
 mod posix_class_tests {
-    use super::{collsym, extglob_match, has_collating_symbol, has_posix_class};
+    use super::{
+        collsym, extglob_match, has_collating_symbol, has_equivalence_class, has_posix_class,
+    };
 
     fn m(p: &str, t: &str) -> bool {
         extglob_match(p, t, false)
@@ -1017,6 +1068,16 @@ mod posix_class_tests {
     fn unknown_class_matches_nothing() {
         assert!(!m("[[:bogus:]]", "x"));
         assert!(!m("[[:bogus:]]", ":"));
+    }
+    #[test]
+    fn ascii_class_glibc_extension() {
+        // `ascii` is a glibc fnmatch extension beyond POSIX's 12 classes;
+        // bash's own posixpat.tests exercises it alongside equivalence
+        // classes (`[[:alpha:]][[=b=]][[:ascii:]]`).
+        assert!(m("[[:ascii:]]", "A"));
+        assert!(m("[[:ascii:]]", "\u{7f}")); // DEL — still ASCII (0-127)
+        assert!(!m("[[:ascii:]]", "\u{80}")); // first non-ASCII byte value
+        assert!(!m("[[:ascii:]]", "é"));
     }
     #[test]
     fn single_bracket_colon_is_literal_set() {
@@ -1091,5 +1152,34 @@ mod posix_class_tests {
         assert!(!m("[a-z]", "M"));
         assert!(m("[a-]", "-")); // trailing '-' is literal
         assert!(m("[]a]", "]")); // ']' first is literal
+    }
+    #[test]
+    fn has_equivalence_class_detects() {
+        assert!(has_equivalence_class("[[=b=]]"));
+        assert!(has_equivalence_class("x[[=b=]]y"));
+        assert!(!has_equivalence_class("[[.b.]]")); // that's a collating symbol, not an equiv class
+        assert!(!has_equivalence_class("[[:alpha:]]")); // that's a class, not an equiv class
+        assert!(!has_equivalence_class("[abc]"));
+        assert!(!has_equivalence_class("plain"));
+        assert!(!has_equivalence_class("\\[=b=]")); // escaped `[` — not a bracket
+    }
+    #[test]
+    fn equivalence_class_matching() {
+        // C locale: [[=x=]] matches ONLY x (each char is its own class).
+        assert!(m("[[=b=]]", "b"));
+        assert!(!m("[[=b=]]", "c"));
+        // composes with adjacent POSIX classes (posixpat.tests ok 1)
+        assert!(m("[[:alpha:]][[=b=]][[:ascii:]]", "abc"));
+        assert!(!m("[[:alpha:]][[=b=]][[:ascii:]]", "azc"));
+        // negation composes
+        assert!(m("[![=b=]]", "c"));
+        assert!(!m("[![=b=]]", "b"));
+        // not a range endpoint: `-` and the next atom leak as literals,
+        // mirroring `[:class:]` (NotEligible), unlike `[.sym.]`.
+        assert!(m("[[=a=]-z]", "-"));
+        assert!(m("[[=a=]-z]", "z"));
+        assert!(!m("[[=a=]-z]", "m"));
+        // invalid multi-char non-name → no match
+        assert!(!m("[[=zz=]]", "z"));
     }
 }

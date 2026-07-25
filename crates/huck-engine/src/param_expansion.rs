@@ -489,6 +489,7 @@ fn pe_pattern_matches(pattern: &str, text: &str, extglob: bool, case_sensitive: 
     if (extglob && crate::glob_match::has_extglob(pattern))
         || crate::glob_match::has_posix_class(pattern)
         || crate::glob_match::has_collating_symbol(pattern)
+        || crate::glob_match::has_equivalence_class(pattern)
     {
         crate::glob_match::extglob_match(pattern, text, !case_sensitive)
     } else {

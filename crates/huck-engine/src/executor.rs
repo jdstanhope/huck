@@ -2365,6 +2365,7 @@ fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool 
         let hit = if (extglob && crate::glob_match::has_extglob(&pattern))
             || crate::glob_match::has_posix_class(&pattern)
             || crate::glob_match::has_collating_symbol(&pattern)
+            || crate::glob_match::has_equivalence_class(&pattern)
         {
             crate::glob_match::extglob_match(&pattern, subject, nocase)
         } else {
@@ -2857,6 +2858,7 @@ fn eval_binary(
             let matched = if crate::glob_match::has_extglob(&pattern_str)
                 || crate::glob_match::has_posix_class(&pattern_str)
                 || crate::glob_match::has_collating_symbol(&pattern_str)
+                || crate::glob_match::has_equivalence_class(&pattern_str)
             {
                 crate::glob_match::extglob_match(&pattern_str, lhs, nocase)
             } else {

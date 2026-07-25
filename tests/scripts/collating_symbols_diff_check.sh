@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Byte-identical bash<->huck harness for v337: POSIX.2 collating symbols
-# (`[.name.]`/`[.c.]`) inside bracket expressions, in `case`, `[[ == ]]`, and
-# `${x#…}` pattern contexts, plus collating-symbol range endpoints.
+# (`[.name.]`/`[.c.]`) and equivalence classes (`[=name=]`/`[=c=]`) inside
+# bracket expressions, in `case`, `[[ == ]]`, and `${x#…}` pattern contexts,
+# plus collating-symbol range endpoints.
 set -u
 HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
 [[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
@@ -36,6 +37,10 @@ checkf "mixed with class"     'case 5 in [[:digit:][.hyphen.]]) echo m;; *) echo
 # param-expansion + [[ ]] contexts
 checkf "param-exp prefix"     'x=abc; echo "${x#[[.a.]]}"'
 checkf "dbracket hyphen"      '[[ - == [[.hyphen.]] ]] && echo yes || echo no'
+# equivalence classes
+checkf "case equiv b"         'case b in [[=b=]]) echo m;; *) echo no;; esac'
+checkf "equiv mixed classes"  'case abc in [[:alpha:]][[=b=]][[:ascii:]]) echo ok1;; *) echo no;; esac'
+checkf "dbracket equiv"       '[[ b == [[=b=]] ]] && echo yes || echo no'
 
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
