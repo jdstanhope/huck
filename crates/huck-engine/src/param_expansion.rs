@@ -488,6 +488,8 @@ pub(crate) fn expand_word_to_string(word: &Word, shell: &mut Shell) -> String {
 fn pe_pattern_matches(pattern: &str, text: &str, extglob: bool, case_sensitive: bool) -> bool {
     if (extglob && crate::glob_match::has_extglob(pattern))
         || crate::glob_match::has_posix_class(pattern)
+        || crate::glob_match::has_collating_symbol(pattern)
+        || crate::glob_match::has_equivalence_class(pattern)
     {
         crate::glob_match::extglob_match(pattern, text, !case_sensitive)
     } else {

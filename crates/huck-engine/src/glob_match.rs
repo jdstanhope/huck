@@ -111,6 +111,11 @@ enum PosixClass {
     Graph,
     Print,
     Xdigit,
+    // `ascii` is a glibc `wctype`/fnmatch extension beyond the 12 POSIX.2
+    // classes (v119's original scope) — bash's own posixpat.tests exercises
+    // it (`[[:alpha:]][[=b=]][[:ascii:]]`), so it needs to resolve too or
+    // that line never flips even with equivalence classes wired up.
+    Ascii,
 }
 
 fn posix_class_from_name(name: &str) -> Option<PosixClass> {
@@ -128,6 +133,7 @@ fn posix_class_from_name(name: &str) -> Option<PosixClass> {
         "space" => Space,
         "blank" => Blank,
         "print" => Print,
+        "ascii" => Ascii,
         _ => return None,
     })
 }
@@ -161,6 +167,7 @@ fn posix_matches(pc: PosixClass, c: char, ci: bool) -> bool {
         Space => matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}'),
         Blank => matches!(c, ' ' | '\t'),
         Print => c.is_ascii_graphic() || c == ' ',
+        Ascii => c.is_ascii(),
     }
 }
 
@@ -198,6 +205,169 @@ pub fn has_posix_class(pattern: &str) -> bool {
             let mut j = i + 2;
             while j + 1 < b.len() {
                 if b[j] == ':' && b[j + 1] == ']' {
+                    return true;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// POSIX.2 table 2.8 collating-symbol names → their C-locale character.
+/// Authored from the POSIX standard (NOT copied from bash's GPL collsyms.h).
+/// Upper/lower letters are intentionally omitted — single-char passthrough in
+/// `collsym` covers them; digits are listed by name here.
+static POSIX_COLLSYMS: &[(&str, char)] = &[
+    ("NUL", '\0'),
+    ("SOH", '\u{01}'),
+    ("STX", '\u{02}'),
+    ("ETX", '\u{03}'),
+    ("EOT", '\u{04}'),
+    ("ENQ", '\u{05}'),
+    ("ACK", '\u{06}'),
+    ("alert", '\u{07}'),
+    ("BS", '\u{08}'),
+    ("backspace", '\u{08}'),
+    ("HT", '\t'),
+    ("tab", '\t'),
+    ("LF", '\n'),
+    ("newline", '\n'),
+    ("VT", '\u{0b}'),
+    ("vertical-tab", '\u{0b}'),
+    ("FF", '\u{0c}'),
+    ("form-feed", '\u{0c}'),
+    ("CR", '\r'),
+    ("carriage-return", '\r'),
+    ("SO", '\u{0e}'),
+    ("SI", '\u{0f}'),
+    ("DLE", '\u{10}'),
+    ("DC1", '\u{11}'),
+    ("DC2", '\u{12}'),
+    ("DC3", '\u{13}'),
+    ("DC4", '\u{14}'),
+    ("NAK", '\u{15}'),
+    ("SYN", '\u{16}'),
+    ("ETB", '\u{17}'),
+    ("CAN", '\u{18}'),
+    ("EM", '\u{19}'),
+    ("SUB", '\u{1a}'),
+    ("ESC", '\u{1b}'),
+    ("IS4", '\u{1c}'),
+    ("FS", '\u{1c}'),
+    ("IS3", '\u{1d}'),
+    ("GS", '\u{1d}'),
+    ("IS2", '\u{1e}'),
+    ("RS", '\u{1e}'),
+    ("IS1", '\u{1f}'),
+    ("US", '\u{1f}'),
+    ("space", ' '),
+    ("exclamation-mark", '!'),
+    ("quotation-mark", '"'),
+    ("number-sign", '#'),
+    ("dollar-sign", '$'),
+    ("percent-sign", '%'),
+    ("ampersand", '&'),
+    ("apostrophe", '\''),
+    ("left-parenthesis", '('),
+    ("right-parenthesis", ')'),
+    ("asterisk", '*'),
+    ("plus-sign", '+'),
+    ("comma", ','),
+    ("hyphen", '-'),
+    ("hyphen-minus", '-'),
+    ("minus", '-'),
+    ("dash", '-'),
+    ("period", '.'),
+    ("full-stop", '.'),
+    ("slash", '/'),
+    ("solidus", '/'),
+    ("zero", '0'),
+    ("one", '1'),
+    ("two", '2'),
+    ("three", '3'),
+    ("four", '4'),
+    ("five", '5'),
+    ("six", '6'),
+    ("seven", '7'),
+    ("eight", '8'),
+    ("nine", '9'),
+    ("colon", ':'),
+    ("semicolon", ';'),
+    ("less-than-sign", '<'),
+    ("equals-sign", '='),
+    ("greater-than-sign", '>'),
+    ("question-mark", '?'),
+    ("commercial-at", '@'),
+    ("left-square-bracket", '['),
+    ("backslash", '\\'),
+    ("reverse-solidus", '\\'),
+    ("right-square-bracket", ']'),
+    ("circumflex", '^'),
+    ("circumflex-accent", '^'),
+    ("underscore", '_'),
+    ("grave-accent", '`'),
+    ("left-brace", '{'),
+    ("left-curly-bracket", '{'),
+    ("vertical-line", '|'),
+    ("right-brace", '}'),
+    ("right-curly-bracket", '}'),
+    ("tilde", '~'),
+    ("DEL", '\u{7f}'),
+];
+
+/// Resolve a POSIX.2 collating-symbol name: table lookup, else a single
+/// character is a collating element for itself, else invalid (`None`).
+fn collsym(name: &str) -> Option<char> {
+    if let Some(&(_, c)) = POSIX_COLLSYMS.iter().find(|&&(n, _)| n == name) {
+        return Some(c);
+    }
+    let mut it = name.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    }
+}
+
+/// True if `pattern` contains a collating symbol `[.` … `.]` (unescaped `[`).
+/// Mirrors `has_posix_class`.
+pub fn has_collating_symbol(pattern: &str) -> bool {
+    let b: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if b[i] == '[' && i + 1 < b.len() && b[i + 1] == '.' {
+            let mut j = i + 2;
+            while j + 1 < b.len() {
+                if b[j] == '.' && b[j + 1] == ']' {
+                    return true;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True if `pattern` contains an equivalence class `[=` … `=]` (unescaped
+/// `[`). Mirrors `has_collating_symbol`.
+pub fn has_equivalence_class(pattern: &str) -> bool {
+    let b: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if b[i] == '[' && i + 1 < b.len() && b[i + 1] == '=' {
+            let mut j = i + 2;
+            while j + 1 < b.len() {
+                if b[j] == '=' && b[j + 1] == ']' {
                     return true;
                 }
                 j += 1;
@@ -302,6 +472,82 @@ fn parse_class(chars: &[char], pos: &mut usize) -> Item {
         set.push(ClassAtom::Ch(']'));
         i += 1;
     }
+    // Whether an atom is SHAPE-eligible to sit on one side of a `-` range,
+    // as distinct from whether it resolved to a valid char. A `[:class:]` is
+    // structurally never a range endpoint (bash leaks the `-`/next-atom as
+    // literals after it). A plain char or a `[.sym.]` collating token IS
+    // shape-eligible even when the symbol name is invalid — bash then
+    // consumes the whole `atom '-' atom` span as a single failed (no-match)
+    // range rather than leaking the `-`/second atom as literals.
+    enum RangeEp {
+        NotEligible,
+        Eligible(Option<char>),
+    }
+
+    // Parse one bracket atom at `k`: a `[:class:]`, a `[.sym.]`, or a plain
+    // char. Returns (standalone atom, range-endpoint eligibility/value, index
+    // past the atom). Assumes chars[k] != ']' (the caller handles the
+    // closing bracket).
+    fn parse_atom(chars: &[char], k: usize) -> (ClassAtom, RangeEp, usize) {
+        // [:name:] POSIX class — not a range endpoint.
+        #[allow(clippy::collapsible_if)] // keep the explicit fall-through comment.
+        if chars[k] == '[' && k + 1 < chars.len() && chars[k + 1] == ':' {
+            if let Some(close) = (k + 2..chars.len().saturating_sub(1))
+                .find(|&j| chars[j] == ':' && chars[j + 1] == ']')
+            {
+                let name: String = chars[k + 2..close].iter().collect();
+                let atom = match posix_class_from_name(&name) {
+                    Some(pc) => ClassAtom::Posix(pc),
+                    None => ClassAtom::Never,
+                };
+                return (atom, RangeEp::NotEligible, close + 2);
+            }
+        }
+        // [.name.] collating symbol — always range-eligible; an invalid name
+        // yields Eligible(None) so a range attempt still consumes the span.
+        #[allow(clippy::collapsible_if)] // keep the explicit fall-through comment.
+        if chars[k] == '[' && k + 1 < chars.len() && chars[k + 1] == '.' {
+            if let Some(close) = (k + 2..chars.len().saturating_sub(1))
+                .find(|&j| chars[j] == '.' && chars[j + 1] == ']')
+            {
+                let name: String = chars[k + 2..close].iter().collect();
+                let val = collsym(&name);
+                let atom = match val {
+                    Some(c) => ClassAtom::Ch(c),
+                    None => ClassAtom::Never,
+                };
+                return (atom, RangeEp::Eligible(val), close + 2);
+            }
+        }
+        // [=name=] equivalence class — in the C/POSIX locale each char is its
+        // own class, so this resolves to the SAME char as a `[.name.]`
+        // collating symbol (via the same `collsym` lookup), but it is NOT a
+        // range endpoint (unlike a collating symbol) — bash leaks the `-`/
+        // next-atom as literals after it, matching `[:class:]`.
+        // NOTE: a negated bracket ending in an equivalence class matches
+        // nothing in bash 5.2 (a bash quirk); huck negates normally — kept
+        // by design (docs/bash-divergences.md).
+        #[allow(clippy::collapsible_if)] // keep the explicit fall-through comment.
+        if chars[k] == '[' && k + 1 < chars.len() && chars[k + 1] == '=' {
+            if let Some(close) = (k + 2..chars.len().saturating_sub(1))
+                .find(|&j| chars[j] == '=' && chars[j + 1] == ']')
+            {
+                let name: String = chars[k + 2..close].iter().collect();
+                let atom = match collsym(&name) {
+                    Some(c) => ClassAtom::Ch(c),
+                    None => ClassAtom::Never,
+                };
+                return (atom, RangeEp::NotEligible, close + 2);
+            }
+        }
+        // Plain char.
+        (
+            ClassAtom::Ch(chars[k]),
+            RangeEp::Eligible(Some(chars[k])),
+            k + 1,
+        )
+    }
+
     let mut closed = false;
     while i < chars.len() {
         if chars[i] == ']' {
@@ -309,29 +555,33 @@ fn parse_class(chars: &[char], pos: &mut usize) -> Item {
             i += 1;
             break;
         }
-        // POSIX class `[:name:]` (the inner `[:` of `[[:name:]]`).
-        #[allow(clippy::collapsible_if)] // keep the explicit fall-through comment.
-        if chars[i] == '[' && i + 1 < chars.len() && chars[i + 1] == ':' {
-            if let Some(close) = (i + 2..chars.len().saturating_sub(1))
-                .find(|&k| chars[k] == ':' && chars[k + 1] == ']')
-            {
-                let name: String = chars[i + 2..close].iter().collect();
-                set.push(match posix_class_from_name(&name) {
-                    Some(pc) => ClassAtom::Posix(pc),
-                    None => ClassAtom::Never,
-                });
-                i = close + 2; // skip past ":]"
-                continue;
+        let (atom, lo_ep, after) = parse_atom(chars, i);
+        // Range: <atom> '-' <atom>, where the '-' is not the trailing set
+        // char, gated on SHAPE-eligibility of the first atom (not on its
+        // value being resolved — an invalid collating endpoint still forms
+        // (and fails) a range instead of leaking as literals).
+        let mut consumed_as_range = false;
+        if let RangeEp::Eligible(lo_val) = lo_ep
+            && after < chars.len()
+            && chars[after] == '-'
+            && after + 1 < chars.len()
+            && chars[after + 1] != ']'
+        {
+            let (_batom, hi_ep, after2) = parse_atom(chars, after + 1);
+            let hi_val = match hi_ep {
+                RangeEp::Eligible(v) => v,
+                RangeEp::NotEligible => None,
+            };
+            match (lo_val, hi_val) {
+                (Some(lo), Some(hi)) => set.push(ClassAtom::Range(lo, hi)),
+                _ => set.push(ClassAtom::Never), // invalid collating endpoint(s)
             }
-            // not a valid `[:...:]` — fall through to literal handling.
+            i = after2;
+            consumed_as_range = true;
         }
-        // Range: x-y (where y is not the closing ']').
-        if i + 2 < chars.len() && chars[i + 1] == '-' && chars[i + 2] != ']' {
-            set.push(ClassAtom::Range(chars[i], chars[i + 2]));
-            i += 3;
-        } else {
-            set.push(ClassAtom::Ch(chars[i]));
-            i += 1;
+        if !consumed_as_range {
+            set.push(atom);
+            i = after;
         }
     }
     if !closed {
@@ -778,7 +1028,9 @@ mod bracket_negation_tests {
 
 #[cfg(test)]
 mod posix_class_tests {
-    use super::{extglob_match, has_posix_class};
+    use super::{
+        collsym, extglob_match, has_collating_symbol, has_equivalence_class, has_posix_class,
+    };
 
     fn m(p: &str, t: &str) -> bool {
         extglob_match(p, t, false)
@@ -821,6 +1073,16 @@ mod posix_class_tests {
         assert!(!m("[[:bogus:]]", ":"));
     }
     #[test]
+    fn ascii_class_glibc_extension() {
+        // `ascii` is a glibc fnmatch extension beyond POSIX's 12 classes;
+        // bash's own posixpat.tests exercises it alongside equivalence
+        // classes (`[[:alpha:]][[=b=]][[:ascii:]]`).
+        assert!(m("[[:ascii:]]", "A"));
+        assert!(m("[[:ascii:]]", "\u{7f}")); // DEL — still ASCII (0-127)
+        assert!(!m("[[:ascii:]]", "\u{80}")); // first non-ASCII byte value
+        assert!(!m("[[:ascii:]]", "é"));
+    }
+    #[test]
     fn single_bracket_colon_is_literal_set() {
         // `[:y:]` (single bracket) is a literal set {':','y'}, NOT a class.
         assert!(m("[:y:]", ":") && m("[:y:]", "y") && !m("[:y:]", "z"));
@@ -834,5 +1096,103 @@ mod posix_class_tests {
         assert!(!has_posix_class("[a-z]"));
         assert!(!has_posix_class("plain*"));
         assert!(!has_posix_class("\\[[:x")); // escaped, no close
+    }
+    #[test]
+    fn collsym_named_and_single_and_invalid() {
+        assert_eq!(collsym("hyphen"), Some('-'));
+        assert_eq!(collsym("space"), Some(' '));
+        assert_eq!(collsym("grave-accent"), Some('`'));
+        assert_eq!(collsym("newline"), Some('\n'));
+        assert_eq!(collsym("period"), Some('.'));
+        assert_eq!(collsym("a"), Some('a')); // single-char passthrough (letters omitted from table)
+        assert_eq!(collsym("-"), Some('-')); // single-char passthrough
+        assert_eq!(collsym("Z"), Some('Z'));
+        assert_eq!(collsym("zz"), None); // multi-char non-name → invalid
+        assert_eq!(collsym("yyz"), None);
+    }
+    #[test]
+    fn has_collating_symbol_detects() {
+        assert!(has_collating_symbol("[[.a.]]"));
+        assert!(has_collating_symbol("x[[.hyphen.]-9]y"));
+        assert!(!has_collating_symbol("[[:alpha:]]")); // that's a class, not a collating symbol
+        assert!(!has_collating_symbol("[abc]"));
+        assert!(!has_collating_symbol("plain"));
+        assert!(!has_collating_symbol("\\[.a.]")); // escaped `[` — not a bracket
+    }
+    #[test]
+    fn collating_symbol_matching() {
+        // single-char and named collating elements
+        assert!(m("[[.a.]]", "a"));
+        assert!(!m("[[.a.]]", "b"));
+        assert!(m("[[.hyphen.]]", "-"));
+        assert!(m("[[.space.]]", " "));
+        assert!(!m("[[.grave-accent.]]", " ")); // ` != space  → posixpat ok 6
+        // collating symbols as range endpoints
+        assert!(m("[[.a.]-[.z.]]", "p")); // ok 3
+        assert!(m("[[.hyphen.]-9]", "-")); // ok 2
+        assert!(m("[[.-.]-9]", "4")); // ok 7
+        assert!(!m("[[.a.]-[.Z.]]", "p")); // reversed range → no match → ok 11
+        // invalid collating symbols (multi-char non-names)
+        assert!(!m("[[.yyz.]-[.z.]]", "c")); // invalid range start → ok 8
+        assert!(m("[[.yyz.][.a.]-z]", "c")); // invalid atom + valid range → ok 9
+        assert!(m("[[.a.]-[.zz.]p]", "p")); // invalid range end, literal p → ok 12
+        assert!(m("[[.aa.]-[.z.]p]", "p")); // invalid range start, literal p → ok 13
+        // invalid collating range endpoint consumes the WHOLE `atom-atom`
+        // span as a single failed range (bash 5.2.21, LC_ALL=C confirmed) —
+        // it must NOT leak the '-' or the second atom as separate literals.
+        assert!(!m("[[.aa.]-[.z.]p]", "z"));
+        assert!(!m("[[.aa.]-[.z.]p]", "-"));
+        assert!(!m("[[.yyz.]-[.z.]]", "z"));
+        assert!(!m("[[.yyz.]-[.z.]]", "-"));
+        // negation composes
+        assert!(!m("[![.a.]]", "a"));
+        assert!(m("[![.a.]]", "b"));
+        // mixed with a POSIX class
+        assert!(m("[[:digit:][.hyphen.]]", "-"));
+        assert!(m("[[:digit:][.hyphen.]]", "5"));
+        // no regression on plain ranges / literals
+        assert!(m("[a-z]", "m"));
+        assert!(!m("[a-z]", "M"));
+        assert!(m("[a-]", "-")); // trailing '-' is literal
+        assert!(m("[]a]", "]")); // ']' first is literal
+    }
+    #[test]
+    fn has_equivalence_class_detects() {
+        assert!(has_equivalence_class("[[=b=]]"));
+        assert!(has_equivalence_class("x[[=b=]]y"));
+        assert!(!has_equivalence_class("[[.b.]]")); // that's a collating symbol, not an equiv class
+        assert!(!has_equivalence_class("[[:alpha:]]")); // that's a class, not an equiv class
+        assert!(!has_equivalence_class("[abc]"));
+        assert!(!has_equivalence_class("plain"));
+        assert!(!has_equivalence_class("\\[=b=]")); // escaped `[` — not a bracket
+    }
+    #[test]
+    fn equivalence_class_matching() {
+        // C locale: [[=x=]] matches ONLY x (each char is its own class).
+        assert!(m("[[=b=]]", "b"));
+        assert!(!m("[[=b=]]", "c"));
+        // composes with adjacent POSIX classes (posixpat.tests ok 1)
+        assert!(m("[[:alpha:]][[=b=]][[:ascii:]]", "abc"));
+        assert!(!m("[[:alpha:]][[=b=]][[:ascii:]]", "azc"));
+        // Negation composes. DELIBERATE DIVERGENCE (kept by design, see
+        // docs/bash-divergences.md): bash 5.2 has a quirk where a NEGATED
+        // bracket whose LAST atom is an equivalence class matches NOTHING
+        // (`[![=b=]]` → no match for any char); huck negates normally
+        // (matches any char but `b`).
+        assert!(m("[![=b=]]", "c")); // huck negates normally; bash matches nothing here
+        assert!(!m("[![=b=]]", "b"));
+        // When the equivalence class is NOT the last atom, bash negates
+        // normally and huck agrees (byte-identical) — the quirk is specific
+        // to the trailing `=]]`.
+        assert!(m("[![=b=]x]", "c")); // not b, not x
+        assert!(!m("[![=b=]x]", "b"));
+        assert!(!m("[![=b=]x]", "x"));
+        // not a range endpoint: `-` and the next atom leak as literals,
+        // mirroring `[:class:]` (NotEligible), unlike `[.sym.]`.
+        assert!(m("[[=a=]-z]", "-"));
+        assert!(m("[[=a=]-z]", "z"));
+        assert!(!m("[[=a=]-z]", "m"));
+        // invalid multi-char non-name → no match
+        assert!(!m("[[=zz=]]", "z"));
     }
 }

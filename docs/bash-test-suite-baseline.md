@@ -2,6 +2,14 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v337 (#302, 2026-07-25 UTC):** `posixpat` flipped to PASS (0-diff) —
+implemented POSIX.2 collating symbols `[[.name.]]` and equivalence classes
+`[[=x=]]` in the bracket matcher (`glob_match.rs`: name→char table + `collsym`,
+`parse_class` atom-based ranges, `has_collating_symbol`/`has_equivalence_class`
+routing at 4 sites) plus the `[[:ascii:]]` class. Summary PASS 24→25, FAIL 58→57.
+Only `posixpat` flipped; `glob-test` (212→190) and `minimal` (1268→1247) shrank
+(no regression). Follow-up: completion-filter routing site (`completion_spec.rs`)
+still unwired for collating/equivalence patterns.
 **Updated by v335 (#294, 2026-07-24 UTC):** `tilde2` flipped to PASS (0-diff) —
 two lexer-side tilde-recognition roots: `~` after an embedded `=` in an
 assignment value is literal (Root A), and a word-start `~` in an unquoted
@@ -211,7 +219,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | posix2 | PASS | v315 (#209): the `eval:` marker + eval line base resolved the diagnostic-prefix diff v314 (#211) had narrowed this to — huck now prints `eval: line 199:` with the correct outer line number, matching bash exactly. 0-diff PASS. |
 | posixexp | FAIL | Multiple real divergences: quoting-aware pattern removal (`${var//pattern}`) strips more content than bash; an unterminated `${...}` form that bash accepts causes a syntax error in huck; `$*` with a non-whitespace IFS joins with a space instead of the IFS character (producing `1 2` where bash produces `12`); IFS-splitting at word boundaries diverges (huck splits where bash keeps tokens joined); and the test-case label printed for IFS diagnostic output shows `(null)` in huck versus the actual IFS value in bash for some edge cases. |
 | posixexp2 | FAIL | `set: posix: not yet supported` misconfigures the test environment; also an unterminated `${...}` handling difference when posix mode is presumed active. |
-| posixpat | FAIL | POSIX bracket-expression edge cases — specifically certain character-range and negated-bracket patterns where huck and bash produce different match results. New bug in the POSIX-ERE-adjacent glob matching path. |
+| posixpat | PASS | v337 (#302): 0-diff PASS. Implemented POSIX.2 collating symbols `[[.name.]]` (POSIX.2 name→char table + `collsym`, `parse_class` atom-based ranges) and equivalence classes `[[=x=]]` (C-locale = match the char), wired to `extglob_match` via `has_collating_symbol`/`has_equivalence_class` at 4 match sites, plus the `[[:ascii:]]` glibc class. The char-class half already passed pre-v337. |
 | posixpipe | FAIL | `time` builtin output format differs (huck emits the system `time(1)` format while bash uses its own built-in format with `real`/`user`/`sys` labels). Also lastpipe behavior divergence. |
 | precedence | PASS | |
 | printf | FAIL | Usage-message prefix format (`huck: printf: usage:` vs bare `printf: usage:`). Also some format-specifier differences (string width and `%b` handling). |

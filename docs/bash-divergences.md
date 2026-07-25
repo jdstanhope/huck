@@ -1,6 +1,6 @@
 # huck vs bash 5.x — Intentional Divergences
 
-**Last updated:** 2026-07-16.
+**Last updated:** 2026-07-25.
 
 This document lists ONLY the divergences from bash 5.x that huck keeps **on
 purpose** — deliberate design choices we do not intend to "fix." Each one is
@@ -234,5 +234,16 @@ huck enforces `FUNCNEST` exactly like bash, but additionally clamps the effectiv
 - **bash**: completes nothing in all three. Its *unquoted* `echo $(whi` DOES complete commands (huck matches that); the *quoted* form does not. `(` is a readline word-break char, so bash never forms a completable variable token inside `$(( … ))`, and its completer does not treat the word after a reserved word as command position.
 - **Why intentional**: strictly more helpful than bash and a natural consequence of parser-driven context — the parser knows `if whi` is command position, that `$(` inside `"…"` opens a command, and that `HO` in `$(( … ))` is a variable reference. zsh and fish also complete after `if`. Narrowing huck to bash's non-completion would mean discarding correct, useful completions to replicate a bash limitation. The genuine "bash completes, huck didn't" cases (unquoted `echo $(whi`, `for x in whi`) DO now match bash.
 - **Workaround**: none needed — huck offers useful completions where bash offers none.
+
+---
+
+### a negated bracket ending in an equivalence class `[![=x=]]` matches normally (bash matches nothing)
+
+[Issue #304 · by-design](https://github.com/jdstanhope/huck/issues/304)
+
+- **huck**: a negated bracket whose final atom is a POSIX.2 equivalence class negates normally — `[![=b=]]` matches any char except `b` (and `[!x[=b=]]`, `[![=b=][=c=]]` likewise).
+- **bash**: matches **nothing** when the last atom before the closing `]` of a *negated* bracket is an equivalence class `[=…=]` (a bash 5.2 parsing quirk). The bug is narrow: with the equivalence class NOT last (`[![=b=]x]`), or ending in a collating symbol (`[![.b.]]`) or POSIX class (`[![:digit:]]`), bash negates normally and huck agrees byte-identically; non-negated `[[=b=]]` also agrees.
+- **Why intentional**: huck implements the correct POSIX interpretation; bash's behavior here is a parsing bug (a `=]` immediately followed by the bracket close in a negated set). The construct appears in no bash test-suite category (`posixpat` is 0-diff PASS without it), so replicating the bug would add special-case logic solely to reproduce incorrect matching. Introduced by v337 (#302); pre-v337 huck agreed with bash only accidentally (the pattern was unrouted and fell to the `glob` crate).
+- **Workaround**: none needed — huck's negation is correct.
 
 ---
