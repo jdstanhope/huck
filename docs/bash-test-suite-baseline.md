@@ -2,6 +2,13 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v338 (#306, 2026-07-26 UTC):** `lastpipe` flipped to PASS (0-diff) —
+implemented `shopt lastpipe`: when set with job control off and a Terminal sink,
+the last pipeline stage runs in the current shell (a `PipelineStage::InProcess`
+variant; run before reaping the forked stages to avoid deadlock; PIPESTATUS +
+control-flow outcomes integrated), so its assignments persist. Summary PASS 25→26,
+FAIL 57→56. Only `lastpipe` flipped; no regressions. Follow-ups: #307
+(capture-context `$()` lastpipe), #308 (last-stage-own-redirect-failure PIPESTATUS).
 **Updated by v337 (#302, 2026-07-25 UTC):** `posixpat` flipped to PASS (0-diff) —
 implemented POSIX.2 collating symbols `[[.name.]]` and equivalence classes
 `[[=x=]]` in the bracket matcher (`glob_match.rs`: name→char table + `collsym`,
@@ -203,7 +210,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | invert | PASS | |
 | iquote | PASS | v298 re-sweep: 0-diff PASS (the v268 `$'...'` control-char/high-byte escape-expansion divergence is resolved). |
 | jobs | FAIL | v299: NOT a hang. `jobs.tests` is inherently long — its real foreground `sleep`/`wait` budget runs **~62s in bash 5.2.21 itself** vs ~43s in huck (huck is *faster*). It only showed TIMEOUT because the harness default cap was 30s; it is now in `LONG_CATEGORIES` (180s cap) and reports its true status. Now FAILs on job-control output divergences (non-interactive job-control message formats, `%job` notation, `disown`/`bg`/`fg` error wording) — needs triage. |
-| lastpipe | FAIL | `shopt -s lastpipe` not implemented — with lastpipe enabled bash runs the final pipeline stage in the current shell so its assignments are visible after the pipe. Huck always forks all pipeline stages; variables set in the last stage are not visible. New missing feature. |
+| lastpipe | PASS | v338 (#306): 0-diff PASS. `shopt lastpipe` implemented — with lastpipe set, job control off, and a Terminal sink, the last pipeline stage runs in the current shell (`PipelineStage::InProcess`, run before the forked-stage reap to avoid pipe deadlock); its assignments persist, `$?`/`PIPESTATUS`/pipefail include it, and control-flow (`exit`/`return`) propagates. Capture-context (`$()`) lastpipe deferred (#307). |
 | mapfile | FAIL | L-34 (`mapfile -C` callback and `mapfile -u` fd-argument flags not implemented). Documented deferred gap from v140. |
 | minimal | FAIL | v299: NOT a hang. `minimal` is a meta-runner (~25 sub-runners); its time is dominated by `read.tests`' deliberate `read -t` timeout tests (~17s in **both** huck and bash — `read -t` sleeps for its timeout by design, it does NOT block indefinitely), plus func (~5s) and dynvar (~2s), all within ~0.1s of bash. It only showed TIMEOUT because the ~25s+ inherent runtime exceeded the harness's 30s default cap; it is now in `LONG_CATEGORIES` (180s cap). Now FAILs on the aggregate output divergences of its sub-runners — needs triage. |
 | more-exp | FAIL | Several remaining divergences: `${a[@]}` in contexts where IFS-splitting interacts with leading-space preservation produces fewer fields than bash; tilde in certain variable assignment contexts is not expanded when it should be (or expands to an unrelated value); a backslash at the end of a word in `"$@"` contexts splits incorrectly; an unterminated command substitution causes an abort where bash would produce output; and word-splitting with embedded bracket characters diverges. |
