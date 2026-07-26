@@ -3087,9 +3087,12 @@ fn run_background_sequence(
     // stays in the shell's group). Best-effort: a stage that already exec'd or
     // exited yields EACCES/ESRCH, which is fine — its group was set at spawn.
     if sp.pgid_target != NO_PGROUP {
-        for &PipelineStage::Forked(pid) in &sp.stages {
+        for stage in &sp.stages {
+            let PipelineStage::Forked(pid) = stage else {
+                continue;
+            };
             unsafe {
-                libc::setpgid(pid, sp.pgid_target);
+                libc::setpgid(*pid, sp.pgid_target);
             }
         }
     }
@@ -3109,7 +3112,10 @@ fn run_background_sequence(
     let pids: Vec<i32> = sp
         .stages
         .iter()
-        .map(|PipelineStage::Forked(p)| *p)
+        .filter_map(|s| match s {
+            PipelineStage::Forked(p) => Some(*p),
+            PipelineStage::InProcess { .. } => None,
+        })
         .collect();
     let last_pid = *pids.last().unwrap();
     shell.last_bg_pid = Some(last_pid);
@@ -3144,7 +3150,13 @@ fn bail_teardown_pipeline(
 ) -> ExecOutcome {
     drain_procsubs(shell, procsub_base);
     if mode == SpawnMode::Background {
-        let pids: Vec<i32> = stages.iter().map(|PipelineStage::Forked(p)| *p).collect();
+        let pids: Vec<i32> = stages
+            .iter()
+            .filter_map(|s| match s {
+                PipelineStage::Forked(p) => Some(*p),
+                PipelineStage::InProcess { .. } => None,
+            })
+            .collect();
         cleanup_partial_pipeline_raw(first_pid, &pids);
     }
     for fd in parent_held.drain(..) {
@@ -6215,6 +6227,7 @@ fn run_subprocess(
 /// Per-stage outcome after spawning: a forked child pid to be waited for.
 enum PipelineStage {
     Forked(i32),
+    InProcess { stdin_fd: RawFd }, // lastpipe: last stage runs in the parent (not waited)
 }
 
 /// Which caller a pipeline is being spawned for. Foreground (`run_multi_stage`)
@@ -7363,9 +7376,15 @@ fn run_multi_stage(
         Err(outcome) => return outcome,
     };
     // Reconstruct the per-stage pid list (same order as `stages`) for the wait
-    // and the live-children clear. Every stage is Forked, so this mirrors the
-    // pids published per-stage inside spawn_pipeline.
-    let stage_pids: Vec<i32> = stages.iter().map(|PipelineStage::Forked(p)| *p).collect();
+    // and the live-children clear. Only Forked stages have pids; an InProcess
+    // stage (lastpipe) runs in the parent and is never waited/registered here.
+    let stage_pids: Vec<i32> = stages
+        .iter()
+        .filter_map(|s| match s {
+            PipelineStage::Forked(p) => Some(*p),
+            PipelineStage::InProcess { .. } => None,
+        })
+        .collect();
     // Re-acquire the live-children registry handle to clear this pipeline's pids
     // after the wait (they were published per-stage inside spawn_pipeline).
     let live_pids_arc = shell.live_external_children.clone();
@@ -7429,6 +7448,7 @@ fn run_multi_stage(
         sink,
         err_sink,
         interactive,
+        None,
     );
 
     // Clear this pipeline's stage pids from the live-children registry in one
@@ -7500,14 +7520,17 @@ fn wait_pipeline_raw(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
     interactive: bool,
+    inprocess_status: Option<i32>,
 ) -> PipelineWaitResult {
-    // All stages are Forked; initialize status slots to None.
+    // Status slots to fill: Forked stages via waitpid below; an InProcess slot
+    // (lastpipe) is filled directly from `inprocess_status` instead.
     let mut stage_status: Vec<Option<i32>> = stages.iter().map(|_| None).collect();
 
     let pid_per_stage: Vec<Option<i32>> = stages
         .iter()
         .map(|s| match s {
             PipelineStage::Forked(pid) => Some(*pid),
+            PipelineStage::InProcess { .. } => None,
         })
         .collect();
 
@@ -7582,7 +7605,13 @@ fn wait_pipeline_raw(
     } else {
         // Non-interactive: wait on each pid in order.
         for (stage, slot) in stages.iter().zip(stage_status.iter_mut()) {
-            let PipelineStage::Forked(pid) = stage;
+            let pid = match stage {
+                PipelineStage::Forked(p) => p,
+                PipelineStage::InProcess { .. } => {
+                    *slot = inprocess_status;
+                    continue;
+                }
+            };
             let mut raw: libc::c_int = 0;
             loop {
                 let r = unsafe { libc::waitpid(*pid, &mut raw, 0) };
