@@ -3087,9 +3087,12 @@ fn run_background_sequence(
     // stays in the shell's group). Best-effort: a stage that already exec'd or
     // exited yields EACCES/ESRCH, which is fine — its group was set at spawn.
     if sp.pgid_target != NO_PGROUP {
-        for &PipelineStage::Forked(pid) in &sp.stages {
+        for stage in &sp.stages {
+            let PipelineStage::Forked(pid) = stage else {
+                continue;
+            };
             unsafe {
-                libc::setpgid(pid, sp.pgid_target);
+                libc::setpgid(*pid, sp.pgid_target);
             }
         }
     }
@@ -3109,7 +3112,10 @@ fn run_background_sequence(
     let pids: Vec<i32> = sp
         .stages
         .iter()
-        .map(|PipelineStage::Forked(p)| *p)
+        .filter_map(|s| match s {
+            PipelineStage::Forked(p) => Some(*p),
+            PipelineStage::InProcess { .. } => None,
+        })
         .collect();
     let last_pid = *pids.last().unwrap();
     shell.last_bg_pid = Some(last_pid);
@@ -3144,7 +3150,13 @@ fn bail_teardown_pipeline(
 ) -> ExecOutcome {
     drain_procsubs(shell, procsub_base);
     if mode == SpawnMode::Background {
-        let pids: Vec<i32> = stages.iter().map(|PipelineStage::Forked(p)| *p).collect();
+        let pids: Vec<i32> = stages
+            .iter()
+            .filter_map(|s| match s {
+                PipelineStage::Forked(p) => Some(*p),
+                PipelineStage::InProcess { .. } => None,
+            })
+            .collect();
         cleanup_partial_pipeline_raw(first_pid, &pids);
     }
     for fd in parent_held.drain(..) {
@@ -6212,9 +6224,15 @@ fn run_subprocess(
 
 // ----- multi-stage pipeline -------------------------------------------------
 
-/// Per-stage outcome after spawning: a forked child pid to be waited for.
+/// Per-stage outcome after spawning: either a forked child pid to be waited
+/// for (`Forked`), or — under `shopt lastpipe` — the last stage running
+/// in-process in the current shell, recorded by its resolved stdin fd rather
+/// than a pid (`InProcess`; not forked, not waited on by `wait_pipeline_raw`,
+/// run directly by `run_multi_stage` before the wait).
+#[derive(Clone, Copy)]
 enum PipelineStage {
     Forked(i32),
+    InProcess { stdin_fd: RawFd }, // lastpipe: last stage runs in the parent (not waited)
 }
 
 /// Which caller a pipeline is being spawned for. Foreground (`run_multi_stage`)
@@ -6465,8 +6483,26 @@ fn spawn_pipeline(
     };
     let n = commands.len();
 
+    // lastpipe (#306): under this gate the LAST stage does not fork — its
+    // resolved stdin fd is recorded as `PipelineStage::InProcess` and run by
+    // `run_multi_stage` directly in the current shell (before the wait), so
+    // its assignments/exit status/control flow apply to the shell itself and
+    // it is recorded in $PIPESTATUS. Gated to Foreground + job control OFF +
+    // Terminal sink: a background pipeline, a job-controlled foreground
+    // pipeline (subshell would still be needed for the process group), and a
+    // `$()`/capture context (bash itself runs those in a subshell, so a
+    // "last stage in the CURRENT shell" would still not be the outer shell)
+    // are all out of scope here.
+    let lastpipe = mode == SpawnMode::Foreground
+        && shell.shopt_options.get("lastpipe").unwrap_or(false)
+        && !job_control
+        && matches!(sink, StdoutSink::Terminal);
+
     // Fd for the capture-sink case: last stage's stdout is piped back to parent.
     let mut capture_read_fd: Option<RawFd> = None;
+    // lastpipe: the in-process last stage's resolved stdin fd, preserved
+    // through the parent bulk-close below (mirrors capture_read_fd).
+    let mut inprocess_stdin_fd: Option<RawFd> = None;
 
     // Pid tracking.
     let mut first_pid: Option<i32> = None;
@@ -6549,7 +6585,15 @@ fn spawn_pipeline(
         let _ = crate::traps::fire_debug_trap(shell);
 
         // ---- Assign-only stages: no-op, just pass stdin through as empty ----
-        if let Command::Simple(SimpleCommand::Assign(items, aline)) = stage_cmd {
+        // Skipped under `is_last && lastpipe`: falling through lets the
+        // generic stdin-building code below (the `else` "compound command"
+        // branch, since `SimpleCommand::Assign` isn't `Exec`) resolve this
+        // stage's stdin fd and hand it to the lastpipe short-circuit, so
+        // `run_multi_stage` runs the assignment in-process (persists to the
+        // shell) instead of forking it away as inert.
+        if let Command::Simple(SimpleCommand::Assign(items, aline)) = stage_cmd
+            && !(is_last && lastpipe)
+        {
             // In a pipeline, assignment-only stages are a no-op: they don't
             // produce output and are run as InProcess. But since assignments
             // in a subshell don't affect the parent, they're truly inert.
@@ -6971,6 +7015,39 @@ fn spawn_pipeline(
             }
         };
 
+        // ---- lastpipe: last stage runs in-process, no fork ------------------
+        // `stdin` above is this stage's fully resolved stdin (the previous
+        // stage's pipe read end, or an explicit `<`/heredoc/herestring
+        // override). Under the gate we don't build stdout/stderr or spawn at
+        // all — `run_multi_stage` runs `commands.last()` directly via
+        // `run_command` (BEFORE waiting on the forked upstream stages, else
+        // they'd deadlock writing into a full pipe with no reader), so it
+        // needs the raw fd, not a spawned child. `redirect_failed` (set above
+        // only for THIS stage's own stdin resolution) still falls back to the
+        // existing forked exit-1-dummy path below, matching every other stage.
+        if is_last && lastpipe && !redirect_failed {
+            // Take the fd out of `stdin` WITHOUT closing it (`into_raw` never
+            // runs `ChildFd`'s Drop). A multi-stage pipeline's last stage
+            // always resolves to an OWNED stdin here: `is_last` implies `i >=
+            // 1` (n >= 2 — `spawn_pipeline` is only called for multi-stage
+            // pipelines), so `prev_pipe_read` is always `Some` by this point
+            // unless overridden by an explicit `<`/heredoc/herestring, all of
+            // which also produce an owned fd.
+            let stdin_fd = stdin
+                .into_raw()
+                .expect("multi-stage pipeline's last stage always has an owned stdin fd");
+            // Preserve it through the parent bulk-close below (mirrors
+            // capture_read_fd/capture_err_read_fd) — belt-and-suspenders: the
+            // fd was already removed from `parent_held` when it was resolved
+            // into `stdin` above, so it wouldn't be touched by that loop
+            // regardless, but this keeps the invariant explicit.
+            inprocess_stdin_fd = Some(stdin_fd);
+            stages.push(PipelineStage::InProcess { stdin_fd });
+            // No pid: don't touch live_pids_arc / first_pid for this stage.
+            restore_inline_assignments(snap, shell);
+            continue;
+        }
+
         // #144: InProcess stages get a NEUTRAL stdout/stderr base
         // (pipe/capture/inherit); the forked child re-applies the stage's own
         // `>file` / `2>file` / `2>&n` redirects in source order via run_command,
@@ -7317,14 +7394,24 @@ fn spawn_pipeline(
     // bulk-close. The capture_err_pipe_write_fd IS closed here (intentional —
     // every stage has its own dup, so closing the parent's copy is what makes
     // the read-end see EOF after the last stage exits).
+    // Also preserve `inprocess_stdin_fd` (lastpipe's in-process last-stage
+    // stdin) — `run_multi_stage` still needs it after this bulk-close, before
+    // it's dup2'd onto fd 0 via `RedirectScope::redirect` and closed there.
     for fd in parent_held.iter().copied() {
-        if Some(fd) != capture_read_fd && Some(fd) != capture_err_read_fd {
+        if Some(fd) != capture_read_fd
+            && Some(fd) != capture_err_read_fd
+            && Some(fd) != inprocess_stdin_fd
+        {
             unsafe {
                 libc::close(fd);
             }
         }
     }
-    parent_held.retain(|&fd| Some(fd) == capture_read_fd || Some(fd) == capture_err_read_fd);
+    parent_held.retain(|&fd| {
+        Some(fd) == capture_read_fd
+            || Some(fd) == capture_err_read_fd
+            || Some(fd) == inprocess_stdin_fd
+    });
 
     let pgid_target = if group {
         first_pid.unwrap_or(0)
@@ -7363,12 +7450,55 @@ fn run_multi_stage(
         Err(outcome) => return outcome,
     };
     // Reconstruct the per-stage pid list (same order as `stages`) for the wait
-    // and the live-children clear. Every stage is Forked, so this mirrors the
-    // pids published per-stage inside spawn_pipeline.
-    let stage_pids: Vec<i32> = stages.iter().map(|PipelineStage::Forked(p)| *p).collect();
+    // and the live-children clear. Only Forked stages have pids; an InProcess
+    // stage (lastpipe) runs in the parent and is never waited/registered here.
+    let stage_pids: Vec<i32> = stages
+        .iter()
+        .filter_map(|s| match s {
+            PipelineStage::Forked(p) => Some(*p),
+            PipelineStage::InProcess { .. } => None,
+        })
+        .collect();
     // Re-acquire the live-children registry handle to clear this pipeline's pids
     // after the wait (they were published per-stage inside spawn_pipeline).
     let live_pids_arc = shell.live_external_children.clone();
+
+    // ---- lastpipe: run the in-process last stage BEFORE the wait ------------
+    // Must run BEFORE `wait_pipeline_raw`: the forked upstream stages write
+    // into pipes this in-process stage is the sole reader of, so running it
+    // after the wait would deadlock (upstream blocks writing into a full pipe
+    // with no reader). Under the gate that produces an InProcess stage
+    // (`spawn_pipeline`'s `lastpipe`), `capture_read_fd`/`capture_err_read_fd`
+    // are always None and `interactive` is always false (Terminal sink, job
+    // control off), so this doesn't disturb the capture-drain loop or the
+    // terminal-handoff/stopped handling below.
+    let inproc: Option<ExecOutcome> =
+        if let Some(PipelineStage::InProcess { stdin_fd }) = stages.last().copied() {
+            let mut scope = RedirectScope::new();
+            // Dup the resolved stdin fd onto fd 0 for the stage's duration.
+            // Handles an already-closed fd 0 (`exec 0<&-`): `dup(0)` fails
+            // EBADF, `RedirectScope` records the saved slot as -1, and Drop
+            // closes fd 0 back to unopened afterward — see `redirect`'s doc.
+            if scope
+                .redirect(shell, stdin_fd, libc::STDIN_FILENO, sink, err_sink)
+                .is_ok()
+            {
+                let outcome = run_command(&commands[commands.len() - 1], shell, sink, err_sink);
+                drop(scope); // restores (or re-closes) fd 0
+                unsafe {
+                    libc::close(stdin_fd);
+                }
+                Some(outcome)
+            } else {
+                unsafe {
+                    libc::close(stdin_fd);
+                }
+                Some(ExecOutcome::Continue(1))
+            }
+        } else {
+            None
+        };
+    let inproc_status = inproc.as_ref().map(outcome_status);
 
     // Drain stdout AND stderr capture pipes via a single poll loop on the
     // embedder's thread. Real-time streaming callbacks fire as bytes
@@ -7429,6 +7559,7 @@ fn run_multi_stage(
         sink,
         err_sink,
         interactive,
+        inproc_status,
     );
 
     // Clear this pipeline's stage pids from the live-children registry in one
@@ -7470,12 +7601,42 @@ fn run_multi_stage(
         }
         PipelineWaitResult::Stopped(sig) => 128 + sig,
     };
+
+    // lastpipe: propagate the in-process last stage's control flow. $PIPESTATUS
+    // is already set above (from `set_pipestatus`) regardless of which branch
+    // this takes. A plain `Continue` falls through to the normal `status`
+    // return below; anything else (`Exit`/`FunctionReturn`/`LoopBreak`/
+    // `LoopContinue`/`Interrupted`) must propagate as-is — e.g. `exit 14` as
+    // the last stage exits the shell, `return 42` from a function last stage
+    // returns from the function.
+    if let Some(o) = inproc
+        && !matches!(o, ExecOutcome::Continue(_))
+    {
+        drain_procsubs(shell, procsub_base);
+        return o;
+    }
+
     // Drain any process substitutions realized during stage word expansion.
     // We drain here (after wait_pipeline_raw), not per-stage, because the
     // parent_fd must stay open until all stages that reference /dev/fd/N have
     // run.
     drain_procsubs(shell, procsub_base);
     ExecOutcome::Continue(status)
+}
+
+/// Maps an `ExecOutcome` to its plain exit-status integer, dropping
+/// control-flow metadata — used to fill `PIPESTATUS`'s InProcess slot for the
+/// lastpipe last stage. `run_multi_stage` separately propagates the full
+/// `ExecOutcome` (not just this status) when it's not a plain `Continue`.
+fn outcome_status(outcome: &ExecOutcome) -> i32 {
+    match outcome {
+        ExecOutcome::Continue(s)
+        | ExecOutcome::Exit(s)
+        | ExecOutcome::FunctionReturn(s)
+        | ExecOutcome::LoopBreak(_, s) => *s,
+        ExecOutcome::LoopContinue(_) => 0,
+        ExecOutcome::Interrupted(_) => 130,
+    }
 }
 
 enum PipelineWaitResult {
@@ -7500,14 +7661,17 @@ fn wait_pipeline_raw(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
     interactive: bool,
+    inprocess_status: Option<i32>,
 ) -> PipelineWaitResult {
-    // All stages are Forked; initialize status slots to None.
+    // Status slots to fill: Forked stages via waitpid below; an InProcess slot
+    // (lastpipe) is filled directly from `inprocess_status` instead.
     let mut stage_status: Vec<Option<i32>> = stages.iter().map(|_| None).collect();
 
     let pid_per_stage: Vec<Option<i32>> = stages
         .iter()
         .map(|s| match s {
             PipelineStage::Forked(pid) => Some(*pid),
+            PipelineStage::InProcess { .. } => None,
         })
         .collect();
 
@@ -7582,7 +7746,13 @@ fn wait_pipeline_raw(
     } else {
         // Non-interactive: wait on each pid in order.
         for (stage, slot) in stages.iter().zip(stage_status.iter_mut()) {
-            let PipelineStage::Forked(pid) = stage;
+            let pid = match stage {
+                PipelineStage::Forked(p) => p,
+                PipelineStage::InProcess { .. } => {
+                    *slot = inprocess_status;
+                    continue;
+                }
+            };
             let mut raw: libc::c_int = 0;
             loop {
                 let r = unsafe { libc::waitpid(*pid, &mut raw, 0) };
