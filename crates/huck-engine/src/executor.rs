@@ -4374,7 +4374,7 @@ fn run_assignment_list(
             let op = if a.append { "+=" } else { "=" };
             // Bare-scalar apply recorded the assigned RHS; array/assoc/indexed
             // targets don't — fall back to the full value for those (their
-            // literal-source trace is a separate deferred divergence, #310).
+            // literal-source trace is a separate deferred divergence, #311).
             // `match` (not `unwrap_or_else`) so the mut borrow from `take_…`
             // fully ends before the `lookup_var` shared borrow.
             let val = match shell.take_xtrace_assign_rhs() {
@@ -8154,7 +8154,9 @@ pub(crate) fn apply_one_assignment(
             let s = expand_assignment(&a.value, shell);
             // Record the RHS this statement assigns so the `set -x` trace in
             // run_assignment_list can show `name+=rhs` / `name=rhs` (v339 #310).
-            shell.set_xtrace_assign_rhs(Some(s.clone()));
+            if shell.shell_options.xtrace {
+                shell.set_xtrace_assign_rhs(Some(s.clone()));
+            }
             if a.append {
                 // a+=v: on a scalar, concatenate; on an array, append to element 0
                 // (bash: `a=(x y); a+=z; echo "${a[0]}"` → "xz").
