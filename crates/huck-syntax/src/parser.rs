@@ -4528,31 +4528,22 @@ fn parse_do_body_done(iter: &mut Lexer) -> Result<Sequence, ParseError> {
     Ok(body)
 }
 
-/// Trim a for-header section `Word` to match the oracle's `s.trim()` + empty-⇒-`None`.
-/// Trims leading whitespace from the first `Literal` part and trailing whitespace from
-/// the last `Literal` part (dropping parts that become empty). No parts ⇒ `None`.
+/// Trim a for-header section `Word`'s leading whitespace only (bash's `s.trim()` is NOT
+/// mirrored on the trailing side — see v339 #310 below). Trims leading whitespace from the
+/// first `Literal` part, dropping it if it becomes empty. No parts ⇒ `None`.
 fn trim_section(word: &Word) -> Option<Word> {
     let mut parts: Vec<WordPart> = word.0.clone();
-    // Trim the leading Literal.
+    // Trim the leading Literal only. bash preserves each `for (( … ))` header
+    // section's TRAILING whitespace verbatim (v339 #310) — it flows through
+    // reconstruct_word_source_inner into both the xtrace and `declare -f`
+    // output, matching bash `(( i++  ))` / `for ((…; i++ ))`. Arith evaluation
+    // ignores trailing whitespace, so this is trace/reconstruction-only.
     if let Some(WordPart::Literal { text, quoted }) = parts.first().cloned() {
         let trimmed = text.trim_start().to_string();
         if trimmed.is_empty() {
             parts.remove(0);
         } else {
             parts[0] = WordPart::Literal {
-                text: trimmed,
-                quoted,
-            };
-        }
-    }
-    // Trim the trailing Literal.
-    if let Some(WordPart::Literal { text, quoted }) = parts.last().cloned() {
-        let trimmed = text.trim_end().to_string();
-        let last = parts.len() - 1;
-        if trimmed.is_empty() {
-            parts.pop();
-        } else {
-            parts[last] = WordPart::Literal {
                 text: trimmed,
                 quoted,
             };
