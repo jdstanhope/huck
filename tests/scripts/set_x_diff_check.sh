@@ -24,5 +24,12 @@ check "set -o xtrace"  'set -o xtrace; echo hi'
 check "trace true"     'set -x; true; set +x; echo done'
 check "trace two args" 'set -x; echo one two'
 
+# v339 (#310) Root 1: arith-for section trace preserves trailing whitespace.
+check "arith-for trailing sp"  'set -x; for ((i=0; i<=2; i++ )); do :; done'
+check "arith-for no sp"        'set -x; for ((i=0;i<=2;i++)); do :; done'
+check "arith-for all spaced"   'set -x; for ((i=0 ; i<=2 ; i++ )); do :; done'
+# declare -f reconstruction shares the same section-trim path.
+check "declare -f arith-for"   'f() { for ((i=0; i<=2; i++ )); do :; done; }; declare -f f'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

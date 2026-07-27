@@ -1212,6 +1212,22 @@ mod tests {
         assert_rt("for ((i=0; i<3; i++)); do echo $i; done");
     }
     #[test]
+    fn rt_arith_for_trailing_space() {
+        // v339 (#310): a header section with trailing whitespace before `))`
+        // (`i++ ))`) must round-trip WITH the space — bash preserves trailing
+        // section whitespace (trims leading only). `assert_rt` alone can't
+        // catch a trim-at-parse-time bug (dropping the space is idempotent
+        // across re-parse/re-generate), so also assert the reconstructed
+        // header text itself retains the trailing space before `))`.
+        let src = "for ((i=0; i<3; i++ )); do echo $i; done";
+        assert_rt(src);
+        let (s1, _s2) = rt(src);
+        assert!(
+            s1.contains("i++ ))"),
+            "trailing whitespace in arith-for section dropped: {s1:?}"
+        );
+    }
+    #[test]
     fn rt_select() {
         assert_rt("select x in a b; do echo $x; done");
     }
