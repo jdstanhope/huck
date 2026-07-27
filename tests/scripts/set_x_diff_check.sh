@@ -31,5 +31,8 @@ check "arith-for all spaced"   'set -x; for ((i=0 ; i<=2 ; i++ )); do :; done'
 # declare -f reconstruction shares the same section-trim path.
 check "declare -f arith-for"   'f() { for ((i=0; i<=2; i++ )); do :; done; }; declare -f f'
 
+# v339 (#310) Root 3: BASH_XTRACEFD redirects xtrace to an fd; unset reverts.
+check "BASH_XTRACEFD" 'tf=$(mktemp); exec 4>"$tf"; BASH_XTRACEFD=4; set -x; echo a; echo b; unset BASH_XTRACEFD; echo c; set +x; echo ---; cat "$tf"; rm -f "$tf"'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
