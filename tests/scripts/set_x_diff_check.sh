@@ -24,5 +24,21 @@ check "set -o xtrace"  'set -o xtrace; echo hi'
 check "trace true"     'set -x; true; set +x; echo done'
 check "trace two args" 'set -x; echo one two'
 
+# v339 (#310) Root 1: arith-for section trace preserves trailing whitespace.
+check "arith-for trailing sp"  'set -x; for ((i=0; i<=2; i++ )); do :; done'
+check "arith-for no sp"        'set -x; for ((i=0;i<=2;i++)); do :; done'
+check "arith-for all spaced"   'set -x; for ((i=0 ; i<=2 ; i++ )); do :; done'
+# declare -f reconstruction shares the same section-trim path.
+check "declare -f arith-for"   'f() { for ((i=0; i<=2; i++ )); do :; done; }; declare -f f'
+
+# v339 (#310) Root 3: BASH_XTRACEFD redirects xtrace to an fd; unset reverts.
+check "BASH_XTRACEFD" 'tf=$(mktemp); exec 4>"$tf"; BASH_XTRACEFD=4; set -x; echo a; echo b; unset BASH_XTRACEFD; echo c; set +x; echo ---; cat "$tf"; rm -f "$tf"'
+
+# v339 (#310) Root 2: standalone assignment trace shows the operator (+=/=) and
+# the RHS this statement assigned, not the full post-append value.
+check "trace plain assign"     'set -x; x=hi'
+check "trace append assign"    'set -x; foo=one; foo+=two'
+check "trace append expand"    'y=world; set -x; foo=hello; foo+=" $y"'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

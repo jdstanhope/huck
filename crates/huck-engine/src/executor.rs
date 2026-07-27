@@ -2674,7 +2674,7 @@ fn eval_test_expr_traced(
     {
         let body = render_test_leaf(expr, shell);
         let p4 = ps4(shell);
-        xtrace_emit(&format!("{p4}[[ {body} ]]"));
+        xtrace_emit(xtrace_target_fd(shell), &format!("{p4}[[ {body} ]]"));
     }
     match expr {
         TestExpr::Unary { op, operand } => {
@@ -2737,7 +2737,7 @@ fn eval_test_expr_traced(
             {
                 let body = render_test_leaf(inner, shell);
                 let p4 = ps4(shell);
-                xtrace_emit(&format!("{p4}[[ ! {body} ]]"));
+                xtrace_emit(xtrace_target_fd(shell), &format!("{p4}[[ ! {body} ]]"));
                 return eval_test_expr_traced(inner, shell, true).map(|b| !b);
             }
             eval_test_expr_traced(inner, shell, suppress).map(|b| !b)
@@ -4206,13 +4206,31 @@ fn ps4(shell: &mut Shell) -> String {
     out
 }
 
-/// Emit one xtrace line (the trailing newline is added) to fd 2 in a SINGLE
-/// `write(2)`. Pipeline stages run in separate processes (a forked in-process
-/// stage and the parent tracing an external stage) and share fd 2; a multi-write
-/// `eprintln!` lets a sibling's bytes wedge between the prefix and the body
-/// (`+ + echo a` / `cat`). A single write of the whole line keeps each trace
-/// line intact (stages may still REORDER, which is best-effort per spec).
-fn xtrace_emit(line: &str) {
+/// Resolve the fd that `set -x` trace output goes to. bash's `BASH_XTRACEFD`,
+/// when its value parses to a valid non-negative integer, is the xtrace
+/// destination fd; unset / empty / non-numeric falls back to fd 2 (stderr).
+/// Resolved at emit time (v339 #310) — no separate assign-time capture — which
+/// naturally handles set→fd, `unset`→stderr, and invalid→stderr.
+fn xtrace_target_fd(shell: &Shell) -> i32 {
+    match shell.lookup_var("BASH_XTRACEFD") {
+        Some(v) => v
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .filter(|&n| n >= 0)
+            .unwrap_or(2),
+        None => 2,
+    }
+}
+
+/// Emit one xtrace line (the trailing newline is added) to `fd` (resolved via
+/// `xtrace_target_fd`, normally fd 2) in a SINGLE `write(2)`. Pipeline stages
+/// run in separate processes (a forked in-process stage and the parent tracing
+/// an external stage) and share fd 2; a multi-write `eprintln!` lets a
+/// sibling's bytes wedge between the prefix and the body (`+ + echo a` / `cat`).
+/// A single write of the whole line keeps each trace line intact (stages may
+/// still REORDER, which is best-effort per spec).
+fn xtrace_emit(fd: i32, line: &str) {
     let mut buf = String::with_capacity(line.len() + 1);
     buf.push_str(line);
     buf.push('\n');
@@ -4222,7 +4240,7 @@ fn xtrace_emit(line: &str) {
     // truncates one line. Single write keeps a line intact against concurrent
     // fd-2 writers (forked pipeline stages).
     unsafe {
-        let _ = libc::write(2, bytes.as_ptr() as *const libc::c_void, bytes.len());
+        let _ = libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
     }
 }
 
@@ -4241,7 +4259,7 @@ fn xtrace_command_line(prefix: &[String], program: &str, args: &[String]) -> Str
 fn xtrace_compound(shell: &mut Shell, body: &str) {
     if shell.shell_options.xtrace {
         let p4 = ps4(shell);
-        xtrace_emit(&format!("{p4}{body}"));
+        xtrace_emit(xtrace_target_fd(shell), &format!("{p4}{body}"));
     }
 }
 
@@ -4338,6 +4356,7 @@ fn run_assignment_list(
             st = 1;
             break;
         }
+        shell.set_xtrace_assign_rhs(None);
         if apply_one_assignment(a, shell, &mut *err_writer(err_sink, sink)).is_err() {
             if shell.shell_options.posix && !shell.is_interactive {
                 shell.posix_fatal(127); // EXITPROG (v226): POSIX non-interactive exits 127
@@ -4352,12 +4371,24 @@ fn run_assignment_list(
             shell.export(name);
         }
         if shell.shell_options.xtrace {
-            let val = shell.lookup_var(name).unwrap_or_default();
+            let op = if a.append { "+=" } else { "=" };
+            // Bare-scalar apply recorded the assigned RHS; array/assoc/indexed
+            // targets don't — fall back to the full value for those (their
+            // literal-source trace is a separate deferred divergence, #311).
+            // `match` (not `unwrap_or_else`) so the mut borrow from `take_…`
+            // fully ends before the `lookup_var` shared borrow.
+            let val = match shell.take_xtrace_assign_rhs() {
+                Some(rhs) => rhs,
+                None => shell.lookup_var(name).unwrap_or_default(),
+            };
             let p4 = ps4(shell);
-            xtrace_emit(&format!(
-                "{p4}{name}={}",
-                crate::param_expansion::xtrace_quote(&val)
-            ));
+            xtrace_emit(
+                xtrace_target_fd(shell),
+                &format!(
+                    "{p4}{name}{op}{}",
+                    crate::param_expansion::xtrace_quote(&val)
+                ),
+            );
         }
     }
     // bash: a bare assignment's status is the last command substitution in its
@@ -4711,10 +4742,10 @@ fn run_exec_single_inner(
         for a in &cmd.inline_assignments {
             let name = a.target.name();
             let val = shell.lookup_var(name).unwrap_or_default();
-            xtrace_emit(&format!(
-                "{p4}{name}={}",
-                crate::param_expansion::xtrace_quote(&val)
-            ));
+            xtrace_emit(
+                xtrace_target_fd(shell),
+                &format!("{p4}{name}={}", crate::param_expansion::xtrace_quote(&val)),
+            );
         }
         if !resolved.program.is_empty() {
             let body = if let Some(dargs) = &resolved.decl_args {
@@ -4756,7 +4787,7 @@ fn run_exec_single_inner(
             } else {
                 xtrace_command_line(&command_prefix, &resolved.program, &resolved.args)
             };
-            xtrace_emit(&format!("{p4}{body}"));
+            xtrace_emit(xtrace_target_fd(shell), &format!("{p4}{body}"));
         }
     }
 
@@ -8121,6 +8152,11 @@ pub(crate) fn apply_one_assignment(
         // Bare name + scalar RHS.
         (AssignTarget::Bare(name), None) => {
             let s = expand_assignment(&a.value, shell);
+            // Record the RHS this statement assigns so the `set -x` trace in
+            // run_assignment_list can show `name+=rhs` / `name=rhs` (v339 #310).
+            if shell.shell_options.xtrace {
+                shell.set_xtrace_assign_rhs(Some(s.clone()));
+            }
             if a.append {
                 // a+=v: on a scalar, concatenate; on an array, append to element 0
                 // (bash: `a=(x y); a+=z; echo "${a[0]}"` → "xz").
@@ -8868,10 +8904,13 @@ fn spawn_external_with_fds(
 
     if shell.shell_options.xtrace {
         let p4 = ps4(shell);
-        xtrace_emit(&format!(
-            "{p4}{}",
-            xtrace_command_line(&[], &resolved.program, &resolved.args)
-        ));
+        xtrace_emit(
+            xtrace_target_fd(shell),
+            &format!(
+                "{p4}{}",
+                xtrace_command_line(&[], &resolved.program, &resolved.args)
+            ),
+        );
     }
 
     // External pipeline stages replay their full ordered ChildRedirPlan; no slot

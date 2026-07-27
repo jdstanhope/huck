@@ -2,6 +2,22 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v339 (#310, 2026-07-27 UTC):** `set-x` flipped to PASS (0-diff) —
+fixed three `set -x` xtrace divergences: (1) each `for (( … ))` header section's
+TRAILING whitespace is now preserved (`trim_section` trims leading only), so the
+trace reads `(( i++  ))` and `declare -f` reconstructs `for ((…; i++ ))`, both
+matching bash; (2) `BASH_XTRACEFD` is honored (`xtrace_target_fd` resolves the
+target fd at emit time; trace goes to that fd, reverting to stderr on unset);
+(3) a standalone assignment now traces its real operator + the RHS this
+statement assigned (`foo+=two`, not `foo=onetwo`) — the scalar RHS is threaded
+out of `apply_one_assignment` via a transient `Shell` field mirroring
+`last_cmd_sub_status`. Summary PASS 26→27, FAIL 56→55. Only `set-x` flipped
+(verified against a main-baseline build: `set-x` FAIL→PASS, `parser` PASS→PASS —
+its FAIL row below was already stale); no regressions across the full runner.
+The `## Summary` count block below is refreshed to the authoritative full-runner
+numbers (it had been stale at 19/63 since an old sweep; per-category rows may
+still lag — the count is the authoritative signal). Array/associative
+assignment-trace (literal-source) remains a deferred divergence: #311.
 **Updated by v338 (#306, 2026-07-26 UTC):** `lastpipe` flipped to PASS (0-diff) —
 implemented `shopt lastpipe`: when set with job control off and a Terminal sink,
 the last pipeline stage runs in the current shell (a `PipelineStage::InProcess`
@@ -146,11 +162,20 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 ## Summary
 
 - Categories run: 82
-- PASS: 19
-- FAIL: 63
+- PASS: 27
+- FAIL: 55
 - TIMEOUT: 0
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
+
+(Counts refreshed by the v339 full-runner sweep, 2026-07-27 UTC — authoritative.
+The block had drifted to 19/63 from an old sweep while the top-of-file dated
+notes tracked the true progression. The 27 PASS categories are: array2, cprint,
+dbg-support2, dynvar, extglob2, extglob3, func, getopts, herestr, ifs,
+input-test, invert, iquote, lastpipe, nquote, nquote1, nquote5, parser, posix2,
+posixpat, precedence, procsub, rhs-exp, set-x, strip, tilde, tilde2. Some
+per-category FAIL rows below still lag reality — the count above is the
+authoritative signal.)
 
 **v299 harness correction:** the two categories previously recorded as TIMEOUT
 (`jobs`, `minimal`) were NOT hangs and NOT huck performance bugs — they are
@@ -237,7 +262,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | redir | FAIL | v298 re-sweep: no longer TIMEOUT (the v268 hang — `<&N-`/`>&N-` dup-and-close leaving fd state inconsistent so a later `read` blocked on the tty — is resolved; move-fd redirects now supported and the category runs to completion). Now FAILs with remaining output divergences; needs re-triage. |
 | rhs-exp | PASS | v321 (#253): inside a nested `"…"` span of a value-family parameter-expansion word (e.g. `${v:+a="\p"b}`), a backslash before a non-special char is now DROPPED when the enclosing `${…}` is double-quoted (`\p`→`p`), matching bash — the old divergence (huck retained `\'` where bash produced `'`) is resolved. 0-diff. |
 | set-e | FAIL | `set -e` interaction with `&&`/`||` compound lists, `!` negation, and `eval` diverges — some cases where bash would abort the script huck continues (or vice versa). New bug area in `set -e` compound-list abort semantics. |
-| set-x | FAIL | Minor xtrace format difference: `(( expr ))` trace emits no trailing space in huck but bash includes one. Pre-existing L-21 residual. |
+| set-x | PASS | v339 (#310): 0-diff PASS. Three `set -x` xtrace fixes — (1) `for (( … ))` header sections preserve trailing whitespace (`trim_section` leading-only trim → `(( i++  ))`, and `declare -f` reconstructs `for ((…; i++ ))`); (2) `BASH_XTRACEFD` honored (`xtrace_target_fd` resolves the target fd at emit time; reverts to stderr on unset); (3) standalone assignments trace their real operator + assigned RHS (`foo+=two`, not `foo=onetwo`) via a transient `Shell` field. Array/associative assignment-trace (literal source) deferred: #311. |
 | shopt | FAIL | Error-message prefix format difference. Many `set -o <option>: not yet supported` rejections (allexport, braceexpand, hashall, histexpand, keyword, monitor, notify, onecmd, privileged, history, ignoreeof, interactive-comments, posix, emacs, vi). Significant missing set-option surface. |
 | strip | PASS | |
 | test | FAIL | `test <` and `test >` lexicographic string-comparison operators not supported — huck rejects them with "unexpected argument". Also `/dev/tty` inaccessible in the test runner environment (test infrastructure). |
