@@ -34,5 +34,11 @@ check "declare -f arith-for"   'f() { for ((i=0; i<=2; i++ )); do :; done; }; de
 # v339 (#310) Root 3: BASH_XTRACEFD redirects xtrace to an fd; unset reverts.
 check "BASH_XTRACEFD" 'tf=$(mktemp); exec 4>"$tf"; BASH_XTRACEFD=4; set -x; echo a; echo b; unset BASH_XTRACEFD; echo c; set +x; echo ---; cat "$tf"; rm -f "$tf"'
 
+# v339 (#310) Root 2: standalone assignment trace shows the operator (+=/=) and
+# the RHS this statement assigned, not the full post-append value.
+check "trace plain assign"     'set -x; x=hi'
+check "trace append assign"    'set -x; foo=one; foo+=two'
+check "trace append expand"    'y=world; set -x; foo=hello; foo+=" $y"'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

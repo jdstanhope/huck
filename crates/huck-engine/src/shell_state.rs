@@ -652,6 +652,12 @@ pub struct Shell {
     /// assignment command (`VAR=$(cmd)`) bash's exit status. Set by
     /// `run_substitution`; read+reset by the `SimpleCommand::Assign` arm.
     last_cmd_sub_status: Option<i32>,
+    /// The scalar RHS value the most recent bare-scalar `apply_one_assignment`
+    /// assigned (the expansion of the RHS word). Set by that path, read+cleared
+    /// by `run_assignment_list`'s `set -x` trace so the trace shows the RHS this
+    /// statement assigned (bash `foo+=two`), not the full variable value.
+    /// v339 (#310); mirrors `last_cmd_sub_status`.
+    xtrace_assign_rhs: Option<String>,
     /// Current frame of positional parameters. Populated only by
     /// function calls (Task 5); empty at the top level.
     pub positional_args: Vec<String>,
@@ -1101,6 +1107,7 @@ impl Shell {
             vars,
             last_status: 0,
             last_cmd_sub_status: None,
+            xtrace_assign_rhs: None,
             positional_args: Vec::new(),
             getopts_sp: 0,
             getopts_optind_cache: 0,
@@ -3125,6 +3132,13 @@ impl Shell {
     }
     pub fn last_cmd_sub_status(&self) -> Option<i32> {
         self.last_cmd_sub_status
+    }
+
+    pub(crate) fn set_xtrace_assign_rhs(&mut self, v: Option<String>) {
+        self.xtrace_assign_rhs = v;
+    }
+    pub(crate) fn take_xtrace_assign_rhs(&mut self) -> Option<String> {
+        self.xtrace_assign_rhs.take()
     }
 
     /// Returns and clears the pending fatal-PE-error flag.

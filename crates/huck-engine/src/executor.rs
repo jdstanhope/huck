@@ -4356,6 +4356,7 @@ fn run_assignment_list(
             st = 1;
             break;
         }
+        shell.set_xtrace_assign_rhs(None);
         if apply_one_assignment(a, shell, &mut *err_writer(err_sink, sink)).is_err() {
             if shell.shell_options.posix && !shell.is_interactive {
                 shell.posix_fatal(127); // EXITPROG (v226): POSIX non-interactive exits 127
@@ -4370,11 +4371,23 @@ fn run_assignment_list(
             shell.export(name);
         }
         if shell.shell_options.xtrace {
-            let val = shell.lookup_var(name).unwrap_or_default();
+            let op = if a.append { "+=" } else { "=" };
+            // Bare-scalar apply recorded the assigned RHS; array/assoc/indexed
+            // targets don't — fall back to the full value for those (their
+            // literal-source trace is a separate deferred divergence, #310).
+            // `match` (not `unwrap_or_else`) so the mut borrow from `take_…`
+            // fully ends before the `lookup_var` shared borrow.
+            let val = match shell.take_xtrace_assign_rhs() {
+                Some(rhs) => rhs,
+                None => shell.lookup_var(name).unwrap_or_default(),
+            };
             let p4 = ps4(shell);
             xtrace_emit(
                 xtrace_target_fd(shell),
-                &format!("{p4}{name}={}", crate::param_expansion::xtrace_quote(&val)),
+                &format!(
+                    "{p4}{name}{op}{}",
+                    crate::param_expansion::xtrace_quote(&val)
+                ),
             );
         }
     }
@@ -8139,6 +8152,9 @@ pub(crate) fn apply_one_assignment(
         // Bare name + scalar RHS.
         (AssignTarget::Bare(name), None) => {
             let s = expand_assignment(&a.value, shell);
+            // Record the RHS this statement assigns so the `set -x` trace in
+            // run_assignment_list can show `name+=rhs` / `name=rhs` (v339 #310).
+            shell.set_xtrace_assign_rhs(Some(s.clone()));
             if a.append {
                 // a+=v: on a scalar, concatenate; on an array, append to element 0
                 // (bash: `a=(x y); a+=z; echo "${a[0]}"` → "xz").
