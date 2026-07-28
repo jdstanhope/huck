@@ -47,5 +47,11 @@ check "backslash range Za" 'echo {Z..a}'
 check "step i64::MIN int"  'echo {1..2..-9223372036854775808}'
 check "step i64::MIN char" 'echo {a..z..-9223372036854775808}'
 
+# v341 (#318) Root 3: nested non-comma brace — inner still expands.
+check "nested non-comma"   'echo a-{b{d,e}}-c'
+check "nested deeper"      'echo a-{b{c{d,e}}}-f'
+check "nested plain body"  'echo x-{foo}-y'
+check "brace spaces body"  'echo {a b}'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

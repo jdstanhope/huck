@@ -71,15 +71,22 @@ fn expand_into(input: &str, out: &mut Vec<String>) -> Result<(), BraceError> {
     let items = match parse_body(body) {
         Some(items) => items,
         None => {
-            // Body wasn't a valid brace expr; treat `{body}` as a
-            // literal and continue scanning after it.
-            let head = format!("{prefix}{{{body}}}");
-            let mut tail = Vec::new();
-            expand_into(suffix, &mut tail)?;
-            for t in tail {
-                out.push(format!("{head}{t}"));
-                if out.len() > MAX_ELEMENTS {
-                    return Err(BraceError::TooManyElements);
+            // Outer {body} is not a brace expr (no top-level comma/range) → the
+            // braces are LITERAL, but inner braces inside body still expand
+            // (bash: `a-{b{d,e}}-c` → `a-{bd}-c a-{be}-c`). Recurse into body and
+            // suffix and cross them, re-wrapping body in literal braces. Do NOT
+            // re-feed `{be}` through expand_into — the literal braces would be
+            // re-parsed as a top-level brace with no comma/range and recurse forever.
+            let mut body_exp = Vec::new();
+            expand_into(body, &mut body_exp)?;
+            let mut suffix_exp = Vec::new();
+            expand_into(suffix, &mut suffix_exp)?;
+            for be in &body_exp {
+                for se in &suffix_exp {
+                    out.push(format!("{prefix}{{{be}}}{se}"));
+                    if out.len() > MAX_ELEMENTS {
+                        return Err(BraceError::TooManyElements);
+                    }
                 }
             }
             return Ok(());
