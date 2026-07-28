@@ -349,6 +349,32 @@ fn scalar_apply_per_element(
     }
 }
 
+/// `${@<op>}` / `${*<op>}` with a per-element transform op: apply `op` to EACH
+/// positional parameter (like `${arr[@]<op>}`). Result-shape mirrors the array
+/// per-element arm verbatim (expand_array_param): quoted `@` → WordList
+/// (separate words); every other case → Value(IFS[0]-join) — quoted `*` → one
+/// field, unquoted `@`/`*` → caller IFS-splits. v340 (#314).
+fn expand_positional_transform(
+    name: &str,
+    modifier: &crate::lexer::ParamModifier,
+    quoted: bool,
+    shell: &mut crate::shell_state::Shell,
+) -> crate::param_expansion::ExpansionResult {
+    use crate::param_expansion::ExpansionResult;
+    // Clone the args so the per-element closure can borrow `shell` mutably.
+    let args = shell.positional_args.clone();
+    let transformed: Vec<String> = args
+        .iter()
+        .map(|a| scalar_apply_per_element(name, modifier, a, quoted, shell))
+        .collect();
+    if name == "@" && quoted {
+        ExpansionResult::WordList(transformed)
+    } else {
+        let sep = ifs_join_sep(&shell.ifs());
+        ExpansionResult::Value(transformed.join(&sep))
+    }
+}
+
 /// Dispatches `${m[...]}` forms when `m` is an associative array.
 /// String-key subscripts (no arith), insertion-order iteration for
 /// `@`/`*`, and string keys for `${!m[@]}`. Routed from
@@ -1264,6 +1290,8 @@ fn expand_part(
                 ("@" | "*", crate::lexer::ParamModifier::Substring { .. })
             ) {
                 expand_positional_substring(name, modifier, *quoted, shell)
+            } else if matches!(name.as_str(), "@" | "*") && is_per_element_modifier(modifier) {
+                expand_positional_transform(name, modifier, *quoted, shell)
             } else {
                 crate::param_expansion::expand_modifier_quoted(name, modifier, *quoted, shell)
             };
