@@ -6873,9 +6873,16 @@ pub(crate) fn brace_expand_parts(parts: Vec<WordPart>) -> Result<Vec<Vec<WordPar
 /// becomes `$varx $vary` — the brace suffix's leading name-continuation run
 /// merges into a BARE `$name`. huck reconstructs `[Var{var}, Literal{"x"}]`;
 /// this merges the leading `[A-Za-z0-9_]` run of an unquoted Literal into an
-/// immediately-preceding bare `WordPart::Var{quoted:false}`. Only bare `$name`
-/// (Var) merges — braced `${name}` is a ParamExpansion and is left alone
-/// (bash: `${var}{x,y}` → `bazx bazy`). v341 (#44).
+/// immediately-preceding bare `WordPart::Var{quoted:false, braced:false}`.
+/// `braced` distinguishes a real bare `$name` from a modifier-less `${name}`
+/// that the parser demoted to the same `Var` shape (for `declare -f`/`type`
+/// round-tripping) — only `braced == false` merges; a braced `${var}{x,y}`
+/// keeps `braced == true` and is left alone (bash: `${var}{x,y}` → `bazx
+/// bazy`). Also gated on the name starting with an identifier char (ASCII
+/// alpha or `_`): bash only greedily reads a `$name` for a real identifier,
+/// so a positional/special param (`$1`, `$$`, `$#`) must NOT absorb the
+/// brace suffix's leading run (`set -- foo; echo $1{a,b}` → `fooa foob`,
+/// not merged into a bogus `$1a`/`$1b`). v341 (#44).
 fn merge_brace_name_suffix(parts: &mut Vec<WordPart>) {
     let mut i = 0;
     while i + 1 < parts.len() {
@@ -6885,11 +6892,8 @@ fn merge_brace_name_suffix(parts: &mut Vec<WordPart>) {
         let merge: Option<(String, String)> = {
             let bare_var = matches!(
                 &parts[i],
-                WordPart::Var {
-                    quoted: false,
-                    braced: false,
-                    ..
-                }
+                WordPart::Var { name, quoted: false, braced: false, .. }
+                    if name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
             );
             match (bare_var, &parts[i + 1]) {
                 (
@@ -9168,6 +9172,74 @@ mod array_parse_tests {
         }];
         let out = brace_expand_parts(parts).unwrap();
         assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn brace_expand_parts_merges_bare_identifier_name() {
+        // v341 (#44): `$var{x,y}` -> `[Var{"varx"}]` / `[Var{"vary"}]` — bash
+        // brace-expands textually before parameter expansion, so the brace
+        // suffix's leading name-continuation run merges into a bare $name.
+        let parts = vec![
+            WordPart::Var {
+                name: "var".to_string(),
+                quoted: false,
+                braced: false,
+            },
+            WordPart::Literal {
+                text: "{x,y}".to_string(),
+                quoted: false,
+            },
+        ];
+        let out = brace_expand_parts(parts).unwrap();
+        assert_eq!(out.len(), 2);
+        for (product, suffix) in out.iter().zip(["varx", "vary"]) {
+            assert_eq!(
+                product,
+                &vec![WordPart::Var {
+                    name: suffix.to_string(),
+                    quoted: false,
+                    braced: false,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn brace_expand_parts_does_not_merge_positional_param() {
+        // v341 (#44, final review): a positional/special param (`$1`) is NOT
+        // an identifier — bash's greedy $name read never absorbs a following
+        // brace suffix for it, unlike a real bare $name. `$1{a,b}` must stay
+        // `[Var{"1"}, Literal{"a"}]` / `[Var{"1"}, Literal{"b"}]`, NOT merge
+        // into a bogus `Var{"1a"}`/`Var{"1b"}`.
+        let parts = vec![
+            WordPart::Var {
+                name: "1".to_string(),
+                quoted: false,
+                braced: false,
+            },
+            WordPart::Literal {
+                text: "{a,b}".to_string(),
+                quoted: false,
+            },
+        ];
+        let out = brace_expand_parts(parts).unwrap();
+        assert_eq!(out.len(), 2);
+        for (product, suffix) in out.iter().zip(["a", "b"]) {
+            assert_eq!(
+                product,
+                &vec![
+                    WordPart::Var {
+                        name: "1".to_string(),
+                        quoted: false,
+                        braced: false,
+                    },
+                    WordPart::Literal {
+                        text: suffix.to_string(),
+                        quoted: false,
+                    },
+                ]
+            );
+        }
     }
 
     // --- process substitution lexer tests ---

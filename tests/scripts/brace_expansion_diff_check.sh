@@ -60,6 +60,12 @@ check "braced no merge"    'var=baz; varx=vx; vary=vy; echo ${var}{x,y}'
 check "quoted braced"      'var=baz; varx=vx; vary=vy; echo "${var}"{x,y}'
 check "merge non-namechar" 'var=baz; echo $var{-,+}'
 check "merge digits"       'v1=one; v2=two; var=baz; echo $var{1,2}'
+# v341 (#44, final review) Root 1 fix-round-2: positional/special params are
+# NOT identifiers — bash's greedy $name read never absorbs the brace suffix
+# for $1/$$/$#, unlike a real bare $name.
+check "no merge positional 1" 'set -- foo; echo $1{a,b}'
+check "no merge positional 2" 'set -- a b c d e f g h i j k; echo $1{0,1}'
+check "identifier merge"      'foo=baz; fooa=vx; foob=vy; echo $foo{a,b}'
 
 # v341 (#318) Root 5: unmatched outer `{` is literal but a LATER balanced
 # brace still expands.
