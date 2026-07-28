@@ -60,7 +60,22 @@ fn expand_into(input: &str, out: &mut Vec<String>) -> Result<(), BraceError> {
     let rbrace = match find_matching_rbrace(input, lbrace) {
         Some(i) => i,
         None => {
-            out.push(input.to_string());
+            // The `{` at lbrace has no matching `}` — it is literal. bash still
+            // expands a LATER balanced brace (`a-{bdef-{g,i}-c` → `a-{bdef-g-c
+            // a-{bdef-i-c`; `{a{b,c}` → `{ab {ac`). Emit through-and-including this
+            // `{` as literal and re-scan the remainder (which is strictly shorter,
+            // so no infinite recursion).
+            let split = lbrace + '{'.len_utf8();
+            let head = &input[..split];
+            let rest = &input[split..];
+            let mut tail = Vec::new();
+            expand_into(rest, &mut tail)?;
+            for t in tail {
+                out.push(format!("{head}{t}"));
+                if out.len() > MAX_ELEMENTS {
+                    return Err(BraceError::TooManyElements);
+                }
+            }
             return Ok(());
         }
     };
@@ -453,6 +468,18 @@ mod tests {
     #[test]
     fn invalid_brace_is_literal() {
         assert_eq!(expand("{a").unwrap(), vec!["{a"]);
+    }
+
+    #[test]
+    fn unmatched_brace_still_expands_a_later_balanced_one() {
+        // bash treats an unmatched `{` as literal but still expands a LATER
+        // balanced brace elsewhere in the string (#318).
+        assert_eq!(
+            expand("a-{bdef-{g,i}-c").unwrap(),
+            vec!["a-{bdef-g-c", "a-{bdef-i-c"]
+        );
+        assert_eq!(expand("{a{b,c}").unwrap(), vec!["{ab", "{ac"]);
+        assert_eq!(expand("{{a,b}").unwrap(), vec!["{a", "{b"]);
     }
 
     #[test]

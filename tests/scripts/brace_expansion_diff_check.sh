@@ -61,5 +61,12 @@ check "quoted braced"      'var=baz; varx=vx; vary=vy; echo "${var}"{x,y}'
 check "merge non-namechar" 'var=baz; echo $var{-,+}'
 check "merge digits"       'v1=one; v2=two; var=baz; echo $var{1,2}'
 
+# v341 (#318) Root 5: unmatched outer `{` is literal but a LATER balanced
+# brace still expands.
+check "unmatched then balanced" 'echo a-{bdef-{g,i}-c'
+check "unmatched wraps balanced" 'echo {a{b,c}'
+check "double unmatched"   'echo {{a,b}'
+check "unmatched no inner"  'echo x{y,z'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
