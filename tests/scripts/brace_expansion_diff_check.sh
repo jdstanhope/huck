@@ -42,6 +42,10 @@ check "pos step desc"      'echo {10..1..2}'
 # v341 (#318) Root 2: backslash char range → empty element.
 check "backslash range Aa" 'echo {A..a}'
 check "backslash range Za" 'echo {Z..a}'
+# v341 (#318) fix-round-1: i64::MIN step must not panic (checked_abs guard);
+# bash also leaves this literal (step magnitude has no i64 representation).
+check "step i64::MIN int"  'echo {1..2..-9223372036854775808}'
+check "step i64::MIN char" 'echo {a..z..-9223372036854775808}'
 
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

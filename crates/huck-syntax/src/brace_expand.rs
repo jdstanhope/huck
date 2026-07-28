@@ -217,7 +217,15 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
                 Ok(n) => {
                     // bash ignores the step's SIGN — magnitude only, direction from the
                     // endpoints (`{10..1..-2}` == `{10..1..2}` → 10 8 6 4 2). (#318)
-                    let m = n.abs();
+                    // `checked_abs` guards `i64::MIN`, whose magnitude has no `i64`
+                    // representation (`i64::MIN.abs()` panics) — bash also leaves a
+                    // step that extreme un-expanded (verified against bash 5.2.21:
+                    // `{1..2..-9223372036854775808}` prints literally, rc 0), so
+                    // falling back to `None` (literal) matches.
+                    let m = match n.checked_abs() {
+                        Some(m) => m,
+                        None => return None,
+                    };
                     if r >= l { m } else { -m }
                 }
                 Err(_) => return None,
@@ -285,7 +293,15 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
                 Ok(n) => {
                     // bash ignores the step's SIGN — magnitude only, direction from the
                     // endpoints (`{10..1..-2}` == `{10..1..2}` → 10 8 6 4 2). (#318)
-                    let m = n.abs();
+                    // `checked_abs` guards `i64::MIN`, whose magnitude has no `i64`
+                    // representation (`i64::MIN.abs()` panics) — bash also leaves a
+                    // step that extreme un-expanded (verified against bash 5.2.21:
+                    // `{1..2..-9223372036854775808}` prints literally, rc 0), so
+                    // falling back to `None` (literal) matches.
+                    let m = match n.checked_abs() {
+                        Some(m) => m,
+                        None => return None,
+                    };
                     if r >= l { m } else { -m }
                 }
                 Err(_) => return None,
@@ -374,8 +390,39 @@ mod tests {
     }
 
     #[test]
+    fn integer_range_negative_step_sign_ignored() {
+        // bash ignores the step's sign — magnitude only, direction from the
+        // endpoints (#318): {10..1..-2} == {10..1..2}.
+        assert_eq!(
+            expand("{10..1..-2}").unwrap(),
+            vec!["10", "8", "6", "4", "2"]
+        );
+    }
+
+    #[test]
+    fn integer_range_step_i64_min_stays_literal() {
+        // (#318 fix-round-1) i64::MIN's magnitude has no i64 representation
+        // (`i64::MIN.abs()` panics); `checked_abs` must fall back to treating
+        // the whole `{...}` as literal, matching bash (verified against bash
+        // 5.2.21: this prints literally, rc 0 — no expansion, no error).
+        assert_eq!(
+            expand("{1..2..-9223372036854775808}").unwrap(),
+            vec!["{1..2..-9223372036854775808}"]
+        );
+    }
+
+    #[test]
     fn char_range_ascending() {
         assert_eq!(expand("{a..e}").unwrap(), vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn char_range_step_i64_min_stays_literal() {
+        // Char arm of the same (#318 fix-round-1) guard.
+        assert_eq!(
+            expand("{a..z..-9223372036854775808}").unwrap(),
+            vec!["{a..z..-9223372036854775808}"]
+        );
     }
 
     #[test]
