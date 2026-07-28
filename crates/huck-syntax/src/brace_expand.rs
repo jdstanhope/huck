@@ -7,8 +7,22 @@
 //! are preserved verbatim through expansion. The PUA chars are
 //! reserved by Unicode for internal application use and are not
 //! expected to appear in real shell input.
+//!
+//! A third PUA sentinel, [`EMPTY_QUOTED_SENTINEL`], marks a char-range
+//! element that bash's `\` (0x5C) range quirk (#318) produces as an EMPTY
+//! but QUOTE-PROTECTED field — distinct from an ordinary empty string
+//! (e.g. the middle item of `{a,,b}`), which is an unquoted empty word and
+//! vanishes like any other unquoted-empty expansion. `split_on_sentinels`
+//! (lexer.rs) turns this sentinel into a `WordPart::Literal { quoted: true,
+//! text: "" }` so the field survives; a bare `""` string from `parse_body`
+//! still produces zero `WordPart`s and disappears as before.
 
 const MAX_ELEMENTS: usize = 65_536;
+
+/// PUA sentinel (see module docs) standing in for an EMPTY but
+/// QUOTE-PROTECTED brace-expansion element — bash's `\` (0x5C) char-range
+/// quirk (#318). `split_on_sentinels` (lexer.rs) is the sole consumer.
+pub(crate) const EMPTY_QUOTED_SENTINEL: char = '\u{E002}';
 
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -200,14 +214,13 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
             }
             Some(s) => match s.parse::<i64>() {
                 Ok(0) => return None,
-                Ok(n) if n > 0 => {
-                    if r >= l {
-                        n
-                    } else {
-                        -n
-                    }
+                Ok(n) => {
+                    // bash ignores the step's SIGN — magnitude only, direction from the
+                    // endpoints (`{10..1..-2}` == `{10..1..2}` → 10 8 6 4 2). (#318)
+                    let m = n.abs();
+                    if r >= l { m } else { -m }
                 }
-                _ => return None,
+                Err(_) => return None,
             },
         };
         let pad_width = compute_pad_width(left, right);
@@ -269,21 +282,27 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
             }
             Some(s) => match s.parse::<i64>() {
                 Ok(0) => return None,
-                Ok(n) if n > 0 => {
-                    if r >= l {
-                        n
-                    } else {
-                        -n
-                    }
+                Ok(n) => {
+                    // bash ignores the step's SIGN — magnitude only, direction from the
+                    // endpoints (`{10..1..-2}` == `{10..1..2}` → 10 8 6 4 2). (#318)
+                    let m = n.abs();
+                    if r >= l { m } else { -m }
                 }
-                _ => return None,
+                Err(_) => return None,
             },
         };
         let mut out = Vec::new();
         let mut cur = l;
         loop {
             if let Some(c) = char::from_u32(cur as u32) {
-                out.push(c.to_string());
+                // bash emits an EMPTY (but quote-protected — see module docs)
+                // element for `\` (0x5C) in a char range (#318); every other
+                // char in the byte span is emitted literally.
+                if c == '\\' {
+                    out.push(EMPTY_QUOTED_SENTINEL.to_string());
+                } else {
+                    out.push(c.to_string());
+                }
             } else {
                 return None;
             }

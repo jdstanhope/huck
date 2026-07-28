@@ -6754,12 +6754,30 @@ fn build_concat_with_sentinels(parts: &[WordPart]) -> (String, Vec<WordPart>) {
 /// Walks an expanded brace-expansion string and reconstructs a
 /// `Vec<WordPart>`. Literal runs (no sentinels) become Literals
 /// with `quoted: false`. Each sentinel block `\u{E000}<idx>\u{E001}`
-/// is replaced by `placeholders[idx].clone()`.
+/// is replaced by `placeholders[idx].clone()`. A lone
+/// `brace_expand::EMPTY_QUOTED_SENTINEL` becomes a `WordPart::Literal {
+/// text: "", quoted: true }` — bash's `\` (0x5C) char-range quirk (#318):
+/// an EMPTY but quote-protected field that survives unquoted-empty-word
+/// removal, unlike a bare empty string (e.g. the middle item of `{a,,b}`),
+/// which produces no `WordPart` at all and vanishes.
 fn split_on_sentinels(s: &str, placeholders: &[WordPart]) -> Vec<WordPart> {
     let mut out: Vec<WordPart> = Vec::new();
     let mut buf = String::new();
     let mut chars = CharCursor::new(s);
     while let Some(c) = chars.next() {
+        if c == crate::brace_expand::EMPTY_QUOTED_SENTINEL {
+            if !buf.is_empty() {
+                out.push(WordPart::Literal {
+                    text: std::mem::take(&mut buf),
+                    quoted: false,
+                });
+            }
+            out.push(WordPart::Literal {
+                text: String::new(),
+                quoted: true,
+            });
+            continue;
+        }
         if c == '\u{E000}' {
             if !buf.is_empty() {
                 out.push(WordPart::Literal {

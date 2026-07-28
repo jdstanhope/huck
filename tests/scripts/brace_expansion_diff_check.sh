@@ -33,5 +33,15 @@ check "bslash literal"  'echo \{a,b\}'
 # sentinel: brace precedes var expansion, so a var VALUE with braces is inert
 check "value not reexpanded" 'x='"'"'{a,b}'"'"'; echo $x'
 
+# v341 (#318) Root 4: negative step (sign ignored; direction from endpoints).
+check "neg step int desc"  'echo {10..1..-2}'
+check "neg step int asc"   'echo {-1..-10..-2}'
+check "neg step big"       'echo {100..0..-5}'
+check "neg step char"      'echo {z..a..-2}'
+check "pos step desc"      'echo {10..1..2}'
+# v341 (#318) Root 2: backslash char range → empty element.
+check "backslash range Aa" 'echo {A..a}'
+check "backslash range Za" 'echo {Z..a}'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
