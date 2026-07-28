@@ -29,5 +29,17 @@ check "escape nl"    'v='"'"'a\nb'"'"'; echo "${v@E}"'
 check "escape unknown" 'v='"'"'a\qb'"'"'; echo "${v@E}"'
 # @P prompt expansion (only \n — \u/\h/\w/\$ vary by user/host/cwd/uid)
 check "prompt nl"    'v='"'"'x\ny'"'"'; echo "${v@P}"'
+# v340 (#314): positional ${@<op>}/${*<op>} per-element transforms.
+check "at unq subst"   'set aXa bXb cXc; for w in ${@/X/-};   do printf "<%s>" "$w"; done; echo'
+check "at q   subst"   'set aXa bXb cXc; for w in "${@/X/-}"; do printf "<%s>" "$w"; done; echo'
+check "star unq subst" 'set aXa bXb cXc; for w in ${*/X/-};   do printf "<%s>" "$w"; done; echo'
+check "star q   subst" 'set aXa bXb cXc; for w in "${*/X/-}"; do printf "<%s>" "$w"; done; echo'
+check "at q   rmpre"   'set aXa bXb cXc; for w in "${@#?}";   do printf "<%s>" "$w"; done; echo'
+check "at q   rmsuf"   'set aXa bXb cXc; for w in "${@%?}";   do printf "<%s>" "$w"; done; echo'
+check "at q   case"    'set foo bar baz; for w in "${@^^}";   do printf "<%s>" "$w"; done; echo'
+check "at q   quoteQ"  'set "a b" c;     for w in "${@@Q}";   do printf "<%s>" "$w"; done; echo'
+check "at q   ctrlA"   'e=$'"'"'uv\001\001wx'"'"'; set "$e" "$e"; for w in "${@/$'"'"'\001'"'"'/A}"; do printf "<%s>" "$w"; done; echo'
+check "at empty args"  'set --; for w in "${@/X/-}"; do printf "<%s>" "$w"; done; echo DONE'
+check "star q custom-IFS" 'IFS=-; set aXa bXb cXc; printf "<%s>" "${*/X/_}"; echo'
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

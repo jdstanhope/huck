@@ -2,6 +2,25 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v340 (#314, 2026-07-28 UTC):** `nquote2` + `nquote3` BOTH flipped to
+PASS (0-diff) — a double flip. Single shared root: positional `${@<op>}` /
+`${*<op>}` per-element transforms (pattern removal `#`/`##`/`%`/`%%`,
+substitution `/`/`//`, case, `@Q`) applied the operator to only the FIRST
+positional parameter, and the quoted `"${@<op>}"` form joined all params into
+one word — while the array form `${arr[@]<op>}` already worked. Fixed by routing
+`$@`/`$*`+per-element-transform through the array's per-element path
+(`expand_positional_transform` in `expand.rs`: map `scalar_apply_per_element`
+over `positional_args`, returning `WordList` for quoted `@` and `Value(IFS-join)`
+otherwise — mirroring `expand_array_param`). The Ctrl-A (`$'\001'`) bytes in the
+tests were incidental data, not the cause (reproduces on plain `set aXa bXb cXc;
+"${@/X/-}"`). Summary PASS 27→29, FAIL 55→53. Only these two flipped; no
+regressions (`dollars` diff even shrank 251→246 from the same fix). The
+`arith-for` category was investigated first this iteration and abandoned — its
+residual is a non-behavioral `$0` program-name artifact in `-c` error output
+(`huck:` vs `bash:`), not fixable by huck code (see the shelved
+`2026-07-28-arith-for-category-design.md` spec / #64 / #313). Follow-ups: #315
+(same bug in the assignment-RHS/no-split dispatch), #26 (the `${@:-word}`
+default-op half of L-88, still deferred).
 **Updated by v339 (#310, 2026-07-27 UTC):** `set-x` flipped to PASS (0-diff) —
 fixed three `set -x` xtrace divergences: (1) each `for (( … ))` header section's
 TRAILING whitespace is now preserved (`trim_section` trims leading only), so the
@@ -162,20 +181,18 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 ## Summary
 
 - Categories run: 82
-- PASS: 27
-- FAIL: 55
+- PASS: 29
+- FAIL: 53
 - TIMEOUT: 0
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
 
-(Counts refreshed by the v339 full-runner sweep, 2026-07-27 UTC — authoritative.
-The block had drifted to 19/63 from an old sweep while the top-of-file dated
-notes tracked the true progression. The 27 PASS categories are: array2, cprint,
-dbg-support2, dynvar, extglob2, extglob3, func, getopts, herestr, ifs,
-input-test, invert, iquote, lastpipe, nquote, nquote1, nquote5, parser, posix2,
-posixpat, precedence, procsub, rhs-exp, set-x, strip, tilde, tilde2. Some
-per-category FAIL rows below still lag reality — the count above is the
-authoritative signal.)
+(Counts refreshed by the v340 full-runner sweep, 2026-07-28 UTC — authoritative.
+The 29 PASS categories are: array2, cprint, dbg-support2, dynvar, extglob2,
+extglob3, func, getopts, herestr, ifs, input-test, invert, iquote, lastpipe,
+nquote, nquote1, nquote2, nquote3, nquote5, parser, posix2, posixpat, precedence,
+procsub, rhs-exp, set-x, strip, tilde, tilde2. Some per-category FAIL rows below
+still lag reality — the count above is the authoritative signal.)
 
 **v299 harness correction:** the two categories previously recorded as TIMEOUT
 (`jobs`, `minimal`) were NOT hangs and NOT huck performance bugs — they are
@@ -243,8 +260,8 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | new-exp | FAIL | A parse or expansion error early in the test file (involving `}` as an unexpected token in an arith/expansion context) causes huck to abort the script, losing nearly all expected output. Error-message format also differs (huck says `unexpected character: '}'` while bash says `syntax error: operand expected (error token is "}")`). The `set: posix: not yet supported` issue is gone but the early-abort prevents the remainder from running. |
 | nquote | FAIL | Several divergences: `$'\t'` and similar `$'...'` escape sequences produce the literal escape notation rather than the actual character in some contexts; `set: history` and `set: -H` are not supported, causing format divergences; an unterminated `${...}` inside a multi-line quoted string errors in huck while bash produces output; byte-level differences in high-byte character sequences passed through quoting operations; and a helper glue-file source operation fails in huck. |
 | nquote1 | PASS | v298 re-sweep: 0-diff PASS (the v268 embedded-Ctrl-A word-count/empty-field divergence is resolved). |
-| nquote2 | FAIL | When `IFS` includes Ctrl-A (`^A`), joining and splitting strings that contain embedded Ctrl-A characters produces empty results in huck rather than the expected per-character word sequences. The `${a[*]}` and `${a[@]}` expansions with Ctrl-A IFS diverge significantly. |
-| nquote3 | FAIL | Same Ctrl-A IFS class as nquote2: substring extraction and quoting operations on strings with embedded Ctrl-A characters produce empty arguments in huck where bash produces the expected Ctrl-A-containing substrings. |
+| nquote2 | PASS | v340 (#314): 0-diff PASS. Root was positional `${@/pat/rep}`/`${@//pat/rep}` applying the substitution to only the first positional param (quoted form joined into one word); fixed by mapping the transform over each param via the array per-element path (`expand_positional_transform`). The Ctrl-A bytes were incidental test data, not the cause. |
+| nquote3 | PASS | v340 (#314): 0-diff PASS. Same root as nquote2 — positional `${@%pat}`/`${@#pat}`/`${@##pat}` pattern-removal transforms now apply per-param. Flipped by the same one-branch fix (double flip). |
 | nquote4 | FAIL | The braced hex-escape form `\x{NN}` inside `$'...'` strings is not implemented in huck: the sequence is passed through literally while bash expands it to the corresponding byte. Unbraced `\xNN` and other escape forms may have separate issues. |
 | nquote5 | PASS | |
 | parser | FAIL | v314 (#211) shrank the diff to 13 lines: the `for`/`case`-in-`for` syntax-error TEXT now matches bash's near-token/unexpected-EOF shapes byte-for-byte. Remaining: an unrelated `not a valid identifier` diagnostic wrongly carries a `line N:` prefix (not a top-level parse error, outside `render_syntax_diag`'s scope), plus a line-alignment artifact downstream of it. |
