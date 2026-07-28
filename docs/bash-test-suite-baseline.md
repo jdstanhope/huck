@@ -2,6 +2,24 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v341 (#44/#318, 2026-07-28 UTC):** `braces` flipped to PASS (0-diff)
+— four brace-expansion roots (all in `brace_expand.rs` + the lexer reconstruction):
+(1) negative step was rejected — bash ignores the step SIGN (magnitude only,
+direction from endpoints), so `{10..1..-2}` → `10 8 6 4 2`; (2) a nested outer
+brace with no top-level comma (`a-{b{d,e}}-c`) and an UNMATCHED outer brace
+(`a-{bdef-{g,i}-c`, `{a{b,c}`) left the inner balanced brace unexpanded — bash
+expands it (`expand_into` now recurses the body/remainder); (3) a char range
+emits an EMPTY element for `\` (0x5C), matching bash's `{A..a}` quirk (needed a
+sentinel so the empty survives as a field while `{a,,b}`'s empty still vanishes);
+(4) bare `$var{x,y}` merges the brace suffix's leading name-continuation run into
+the variable name (`$varx $vary` → `vx vy`), while braced `${var}{x,y}` does not
+— required a new `braced` flag on `WordPart::Var` because the parser demotes
+modifier-less `${var}` to a plain `Var`. Summary PASS 29→30, FAIL 53→52. Only
+`braces` flipped; no regressions (all big expansion categories byte-identical vs
+an origin/main baseline). Follow-ups: #44 stays open for the broader
+brace-before-param ordering; a pre-existing `declare -f`/`type` divergence
+(`$var` printed for a plain braced ref instead of `${var}`) was surfaced (the new
+`braced` flag could fix it later).
 **Updated by v340 (#314, 2026-07-28 UTC):** `nquote2` + `nquote3` BOTH flipped to
 PASS (0-diff) — a double flip. Single shared root: positional `${@<op>}` /
 `${*<op>}` per-element transforms (pattern removal `#`/`##`/`%`/`%%`,
@@ -181,18 +199,18 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 ## Summary
 
 - Categories run: 82
-- PASS: 29
-- FAIL: 53
+- PASS: 30
+- FAIL: 52
 - TIMEOUT: 0
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
 
-(Counts refreshed by the v340 full-runner sweep, 2026-07-28 UTC — authoritative.
-The 29 PASS categories are: array2, cprint, dbg-support2, dynvar, extglob2,
-extglob3, func, getopts, herestr, ifs, input-test, invert, iquote, lastpipe,
-nquote, nquote1, nquote2, nquote3, nquote5, parser, posix2, posixpat, precedence,
-procsub, rhs-exp, set-x, strip, tilde, tilde2. Some per-category FAIL rows below
-still lag reality — the count above is the authoritative signal.)
+(Counts refreshed by the v341 full-runner sweep, 2026-07-28 UTC — authoritative.
+The 30 PASS categories are: array2, braces, cprint, dbg-support2, dynvar,
+extglob2, extglob3, func, getopts, herestr, ifs, input-test, invert, iquote,
+lastpipe, nquote, nquote1, nquote2, nquote3, nquote5, parser, posix2, posixpat,
+precedence, procsub, rhs-exp, set-x, strip, tilde, tilde2. Some per-category FAIL
+rows below still lag reality — the count above is the authoritative signal.)
 
 **v299 harness correction:** the two categories previously recorded as TIMEOUT
 (`jobs`, `minimal`) were NOT hangs and NOT huck performance bugs — they are
@@ -215,7 +233,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | array2 | FAIL | With helpers provisioned, the real divergence is in how certain array subscript/expansion forms pass word counts to commands: huck collapses some `${a[@]}`-style expansions into fewer arguments than bash produces, treating them more like `${a[*]}` in specific subscript contexts. |
 | assoc | FAIL | `BASH_ALIASES` and `BASH_CMDS` built-in assoc arrays are not present in huck. Also L-46 (bare attribute-only `declare -A` prints an empty-string assignment in `declare -p`) and L-44 (assoc-array iteration order). |
 | attr | FAIL | `readonly -a` (array readonly flag) not recognized — huck rejects the `-a` option. Error-message prefix format differs throughout. New bug. |
-| braces | FAIL | L-38 (brace expansion ordering when a brace follows a parameter or appears in a scalar-assignment RHS). Also: the backslash character is absent from huck's character-range expansion output where bash includes it; nested brace literals like `{b{d,e}}` are expanded by huck but treated as literal by bash in certain contexts; and numeric sequences with a negative step (e.g., `{10..1..-2}`) are not expanded by huck but are by bash. |
+| braces | PASS | v341 (#44/#318): 0-diff PASS. Four roots fixed — negative step (sign ignored, `{10..1..-2}`→`10 8 6 4 2`); nested/unmatched outer brace still expands a balanced inner one (`a-{b{d,e}}-c`, `a-{bdef-{g,i}-c`); char range emits an empty element for `\`; and bare `$var{x,y}`→`$varx $vary` name-merge (new `braced` flag on `WordPart::Var`, since modifier-less `${var}` demotes to `Var`). #44 stays open for the broader brace-before-param ordering. |
 | builtins | FAIL | Multiple unimplemented `set -o` options (`posix`, `+p`) abort the test preamble. `ulimit` and `fc` are not found as commands. |
 | case | FAIL | L-43 (readonly-assignment abort) RESOLVED by v313 (#31) — a standalone readonly assignment now discards the current command, so the old cascade is gone. Two divergences remain (v313 re-sweep): (1) control-character case-PATTERN matching — patterns built from control bytes (soh/stx/del) match differently, yielding `ok1ok2ok3ok4ok5` where bash produces `fail1fail2fail3ok4fail5`; (2) arithmetic assignment to a readonly inside `(( ))` — `((xx++))` on a readonly emits one error + computes `1.1`, where bash emits a second `xx++: … (error token is "")` diagnostic and computes `1.0` (an arith-lvalue-on-readonly path, distinct from the run_assignment_list fix). |
 | casemod | FAIL | Case-modification operations on multi-word arrays produce output in a different word order than bash expects — likely L-44 (array/assoc iteration order) affecting the loop variable sequence. |
