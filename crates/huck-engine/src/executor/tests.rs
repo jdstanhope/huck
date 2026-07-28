@@ -510,6 +510,7 @@ fn echo_var_seq(var: &str) -> Sequence {
                 args: vec![Word(vec![WordPart::Var {
                     name: var.to_string(),
                     quoted: false,
+                    braced: false,
                 }])],
                 redirects: Vec::new(),
                 line: 0,
@@ -935,6 +936,7 @@ fn apply_inline_assignments_sets_and_exports_left_to_right() {
             Word(vec![WordPart::Var {
                 name: "A".to_string(),
                 quoted: false,
+                braced: false,
             }]),
         ),
     ];
@@ -1381,6 +1383,7 @@ fn dynamic_exec_cmd() -> Command {
         program: Word(vec![WordPart::Var {
             name: "cmd".to_string(),
             quoted: false,
+            braced: false,
         }]),
         args: vec![],
         redirects: Vec::new(),
@@ -1540,6 +1543,7 @@ fn program_static_text_returns_none_for_var_word() {
         program: Word(vec![WordPart::Var {
             name: "cmd".to_string(),
             quoted: false,
+            braced: false,
         }]),
         args: vec![],
         redirects: Vec::new(),

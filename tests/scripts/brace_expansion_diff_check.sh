@@ -23,9 +23,9 @@ check "trailing"        'echo a{1,2,3}z'
 check "nested"          'echo {a,{b,c}}'
 check "cross product"   'echo {a,b}{1,2}'
 # var-adjacent brace expansion
-# DIVERGENCE (reported): `x=p; echo $x{a,b}` — bash does brace expansion BEFORE
-# variable expansion, so $x{a,b} -> $xa $xb -> (unset) -> empty line. huck expands
-# the variable first, yielding `pa pb`. Excluded until the ordering is fixed.
+# v341 (#44) Root 1: bash brace-expands textually BEFORE variable expansion, so
+# `x=p; echo $x{a,b}` -> $xa $xb -> (both unset) -> empty line.
+check "var-adjacent unset"  'x=p; echo $x{a,b}'
 # quoting must NOT expand
 check "dquote literal"  'echo "{a,b}"'
 check "squote literal"  "echo '{a,b}'"
@@ -52,6 +52,14 @@ check "nested non-comma"   'echo a-{b{d,e}}-c'
 check "nested deeper"      'echo a-{b{c{d,e}}}-f'
 check "nested plain body"  'echo x-{foo}-y'
 check "brace spaces body"  'echo {a b}'
+
+# v341 (#44) Root 1: bare $var{x,y} merges the brace suffix into the name;
+# braced ${var} does NOT (structurally distinct: Var vs ParamExpansion).
+check "bare name merge"    'var=baz; varx=vx; vary=vy; echo $var{x,y}'
+check "braced no merge"    'var=baz; varx=vx; vary=vy; echo ${var}{x,y}'
+check "quoted braced"      'var=baz; varx=vx; vary=vy; echo "${var}"{x,y}'
+check "merge non-namechar" 'var=baz; echo $var{-,+}'
+check "merge digits"       'v1=one; v2=two; var=baz; echo $var{1,2}'
 
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

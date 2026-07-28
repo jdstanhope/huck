@@ -96,6 +96,7 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                     _ => WordPart::Var {
                         name: n,
                         quoted: eff,
+                        braced: false,
                     },
                 };
                 parts.push(part);
@@ -358,7 +359,7 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                         "@" => WordPart::AllArgs { quoted: eff, joined: false },
                         "*" => WordPart::AllArgs { quoted: eff, joined: true },
                         "?" => WordPart::LastStatus { quoted: eff },
-                        _   => WordPart::Var { name, quoted: eff },
+                        _   => WordPart::Var { name, quoted: eff, braced: false },
                     });
                 }
             }
@@ -645,7 +646,11 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
                             joined: true,
                         },
                         "?" => WordPart::LastStatus { quoted: q },
-                        _ => WordPart::Var { name, quoted: q },
+                        _ => WordPart::Var {
+                            name,
+                            quoted: q,
+                            braced: false,
+                        },
                     });
                 }
             }
@@ -780,7 +785,11 @@ fn parse_extglob_group(iter: &mut Lexer) -> Result<Vec<WordPart>, ParseError> {
                             joined: true,
                         },
                         "?" => WordPart::LastStatus { quoted: q },
-                        _ => WordPart::Var { name, quoted: q },
+                        _ => WordPart::Var {
+                            name,
+                            quoted: q,
+                            braced: false,
+                        },
                     });
                 }
             }
@@ -887,7 +896,11 @@ fn parse_dquote(iter: &mut Lexer, _outer_quoted: bool) -> Result<WordPart, Parse
                                 joined: true,
                             },
                             "?" => WordPart::LastStatus { quoted: true },
-                            _ => WordPart::Var { name, quoted: true },
+                            _ => WordPart::Var {
+                                name,
+                                quoted: true,
+                                braced: false,
+                            },
                         });
                     }
                 }
@@ -1212,8 +1225,16 @@ pub(crate) fn parse_param_expansion(
                     indirect: false,
                 }
             } else {
-                // `${name}` — plain variable reference.
-                WordPart::Var { name, quoted }
+                // `${name}` — plain variable reference. `braced: true` (v341,
+                // #44): this shape is a genuine `${…}` reference that was
+                // demoted from `ParamExpansion` for `declare -f` fidelity, so
+                // it must NOT absorb a following brace-suffix's name-run the
+                // way a bare `$name` does (`merge_brace_name_suffix`).
+                WordPart::Var {
+                    name,
+                    quoted,
+                    braced: true,
+                }
             }
         }
 
@@ -2178,7 +2199,11 @@ fn parse_arith_body(iter: &mut Lexer, _in_dquote: bool) -> Result<ArithBodyOutco
                             joined: true,
                         },
                         "?" => WordPart::LastStatus { quoted },
-                        _ => WordPart::Var { name, quoted },
+                        _ => WordPart::Var {
+                            name,
+                            quoted,
+                            braced: false,
+                        },
                     };
                     parts.push(part);
                 }
@@ -2496,7 +2521,11 @@ fn parse_heredoc_body_expanding(iter: &mut Lexer) -> Result<Word, ParseError> {
                             joined: true,
                         },
                         "?" => WordPart::LastStatus { quoted: true },
-                        _ => WordPart::Var { name, quoted: true },
+                        _ => WordPart::Var {
+                            name,
+                            quoted: true,
+                            braced: false,
+                        },
                     });
                 }
             }
@@ -4613,7 +4642,11 @@ fn parse_arith_for_body(iter: &mut Lexer) -> Result<Vec<Word>, ParseError> {
                             joined: true,
                         },
                         "?" => WordPart::LastStatus { quoted },
-                        _ => WordPart::Var { name, quoted },
+                        _ => WordPart::Var {
+                            name,
+                            quoted,
+                            braced: false,
+                        },
                     };
                     cur.push(part);
                 }

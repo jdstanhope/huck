@@ -586,6 +586,18 @@ pub enum WordPart {
     Var {
         name: String,
         quoted: bool,
+        /// True when this reference was written `${name}` (braced, no
+        /// modifier/subscript/indirect — the parser demotes that shape to a
+        /// plain `Var` for `declare -f` round-tripping fidelity, mirroring
+        /// bash's `print_cmd.c` normalisation). False for a bare `$name`.
+        /// Used ONLY by the brace-expansion name-suffix merge (v341, #44):
+        /// bash brace-expands `$var{x,y}` -> `$varx $vary` textually before
+        /// parameter expansion (the bare name run absorbs the brace's leading
+        /// name-continuation chars), but `${var}{x,y}` does NOT merge — the
+        /// `}` already closed the reference. Without this flag the two forms
+        /// are indistinguishable once modifier-less `${name}` collapses to
+        /// `Var` (see parser.rs's `${name}` plain-variable-reference arm).
+        braced: bool,
     },
     LastStatus {
         quoted: bool,
@@ -6849,8 +6861,74 @@ pub(crate) fn brace_expand_parts(parts: Vec<WordPart>) -> Result<Vec<Vec<WordPar
         crate::brace_expand::expand(&concat).map_err(|_| LexError::BraceExpansionLimit)?;
     Ok(expansions
         .into_iter()
-        .map(|s| split_on_sentinels(&s, &placeholders))
+        .map(|s| {
+            let mut v = split_on_sentinels(&s, &placeholders);
+            merge_brace_name_suffix(&mut v);
+            v
+        })
         .collect())
+}
+
+/// bash brace-expands textually before parameter expansion, so `$var{x,y}`
+/// becomes `$varx $vary` — the brace suffix's leading name-continuation run
+/// merges into a BARE `$name`. huck reconstructs `[Var{var}, Literal{"x"}]`;
+/// this merges the leading `[A-Za-z0-9_]` run of an unquoted Literal into an
+/// immediately-preceding bare `WordPart::Var{quoted:false}`. Only bare `$name`
+/// (Var) merges — braced `${name}` is a ParamExpansion and is left alone
+/// (bash: `${var}{x,y}` → `bazx bazy`). v341 (#44).
+fn merge_brace_name_suffix(parts: &mut Vec<WordPart>) {
+    let mut i = 0;
+    while i + 1 < parts.len() {
+        // Compute the merge (name-continuation run to move + the remaining
+        // literal) under a SCOPED immutable borrow, so it ends before the
+        // mutation below — avoids holding `&parts[i+1]` across `&mut parts[i]`.
+        let merge: Option<(String, String)> = {
+            let bare_var = matches!(
+                &parts[i],
+                WordPart::Var {
+                    quoted: false,
+                    braced: false,
+                    ..
+                }
+            );
+            match (bare_var, &parts[i + 1]) {
+                (
+                    true,
+                    WordPart::Literal {
+                        text,
+                        quoted: false,
+                    },
+                ) => {
+                    let run_len = text
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .unwrap_or(text.len());
+                    if run_len > 0 {
+                        Some((text[..run_len].to_string(), text[run_len..].to_string()))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+        match merge {
+            Some((run, rest)) => {
+                if let WordPart::Var { name, .. } = &mut parts[i] {
+                    name.push_str(&run);
+                }
+                if rest.is_empty() {
+                    parts.remove(i + 1);
+                } else {
+                    parts[i + 1] = WordPart::Literal {
+                        text: rest,
+                        quoted: false,
+                    };
+                }
+                // Do not advance i — a further literal may now be adjacent.
+            }
+            None => i += 1,
+        }
+    }
 }
 
 fn flush_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: bool) {

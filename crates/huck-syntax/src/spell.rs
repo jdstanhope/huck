@@ -149,6 +149,7 @@ mod tests {
             WordPart::Var {
                 name: "bar".to_string(),
                 quoted: false,
+                braced: false,
             },
         ]);
         assert_eq!(spell_token(&TokenKind::Word(w)), "word".to_string());
