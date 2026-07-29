@@ -53,7 +53,7 @@ fn format_declare_bare_line_scalar_and_array() {
 fn assoc_key_bareword_for_identifier() {
     use crate::shell_state::{VarValue, Variable};
     let var = Variable {
-        value: VarValue::Associative(vec![("foo".into(), "v".into())]),
+        value: VarValue::Associative(vec![("foo".into(), "v".into())].into_iter().collect()),
         exported: false,
         readonly: false,
         integer: false,
@@ -112,7 +112,7 @@ fn declare_p_indexed_control_uses_ansi_c() {
 fn declare_p_assoc_control_uses_ansi_c() {
     use crate::shell_state::{VarValue, Variable};
     let var = Variable {
-        value: VarValue::Associative(vec![("k".into(), "a\tb".into())]),
+        value: VarValue::Associative(vec![("k".into(), "a\tb".into())].into_iter().collect()),
         exported: false,
         readonly: false,
         integer: false,
@@ -126,7 +126,7 @@ fn declare_p_assoc_control_uses_ansi_c() {
 fn assoc_key_quoted_for_metachar() {
     use crate::shell_state::{VarValue, Variable};
     let var = Variable {
-        value: VarValue::Associative(vec![("a b".into(), "v".into())]),
+        value: VarValue::Associative(vec![("a b".into(), "v".into())].into_iter().collect()),
         exported: false,
         readonly: false,
         integer: false,

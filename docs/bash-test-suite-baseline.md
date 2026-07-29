@@ -2,6 +2,15 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v343 (#325, 2026-07-29 UTC):** NO category movement (PASS stays 31/51)
+— a behavior-preserving performance refactor: associative arrays are now backed by
+an order-preserving `AssocMap` (`HashMap<key,idx>` + insertion-ordered Vec; O(1)
+element get/set/insert, O(n) order-preserving `unset`) instead of a `Vec`, fixing
+the O(N²) assoc-insert cost (30k inserts: ~4.9s → ~0.3s). The v342 L-44 iteration
+order is unchanged — the view consumes `AssocMap::pairs()` (still insertion order),
+so all output is byte-identical (verified: every category's diff-line-count identical
+vs an origin/main baseline; full suite green). Bash-bucket-table-as-storage was
+rejected (couples huck's core store to bash internals); L-44 stays a decoupled view.
 **Updated by v342 (#32/#321, 2026-07-29 UTC):** `casemod` flipped to PASS (0-diff)
 — two roots: (1) **L-44** associative-array iteration order (#32) — bash iterates
 assoc arrays in hash-table order, not insertion order. Reverse-engineered and
