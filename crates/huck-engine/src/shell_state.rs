@@ -62,12 +62,14 @@ impl VarValue {
     }
 }
 
-/// The case-fold attribute set by `declare -l` / `declare -u`. Mutually
-/// exclusive by construction — a variable is Lower, Upper, or neither.
+/// The case-fold attribute set by `declare -l` / `declare -u` / `declare -c`.
+/// Mutually exclusive by construction — a variable is Lower, Upper,
+/// Capitalize, or neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseFold {
     Lower,
     Upper,
+    Capitalize,
 }
 
 #[derive(Debug, Clone)]
@@ -3427,6 +3429,19 @@ fn apply_case_fold(fold: Option<CaseFold>, value: String) -> String {
         None => value,
         Some(CaseFold::Lower) => value.to_lowercase(),
         Some(CaseFold::Upper) => value.to_uppercase(),
+        Some(CaseFold::Capitalize) => {
+            // bash `declare -c`: uppercase the first char AND lowercase the
+            // rest of the value on assignment — NOT the same transform as
+            // `${v@u}` (which leaves the untouched chars' case alone).
+            // Verified on bash 5.2.21: `declare -c x="foo BAR"` -> "Foo bar"
+            // and `declare -c x="BAZ qux"` -> "Baz qux" (the "BAR"/"BAZ"
+            // tails get lowercased, not left as-is).
+            let mut cs = value.chars();
+            match cs.next() {
+                Some(c0) => c0.to_uppercase().collect::<String>() + &cs.as_str().to_lowercase(),
+                None => value,
+            }
+        }
     }
 }
 

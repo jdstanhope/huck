@@ -57,5 +57,33 @@ check "assoc @A"           "$S; echo \"\${a[@]@A}\""
 check "assoc @K"           "$S; printf '%s\n' \"\${a[@]@K}\""
 check "assoc @k"           "$S; printf '<%s>' \"\${a[@]@k}\"; echo"
 
+
+# Task 4: `declare -c` (capitalize-first attribute, L-44's sibling casemod
+# blocker). bash uppercases the first char AND lowercases the rest of the
+# value on assignment -- NOT the same transform as `${v@u}` (which leaves
+# the untouched chars' case alone). Verified on bash 5.2.21.
+check "declare -c basic"     'declare -c x="hello world"; echo "$x"'
+check "declare -c mixed rest" 'declare -c x="foo BAR"; echo "$x"'
+check "declare -c reassign"  'declare -c x; x="foo BAR"; echo "$x"; x="BAZ qux"; echo "$x"'
+check "declare -c decl-p"    'declare -c x="hello"; declare -p x'
+check "declare -lc last-wins (both cancel)" 'declare -l -c x="HELLO"; echo "$x"; declare -p x'
+check "declare -uc both cancel"  'declare -u -c v="hello"; declare -p v'
+check "declare -u then -c (sequential, last wins)" 'declare -u v="hello"; declare -c v; declare -p v; echo "$v"'
+check "declare +c clears"   'declare -c v="hello"; declare +c v; v="second try"; echo "$v"; declare -p v'
+check "declare -c +c same-invocation cancel" 'declare -c +c v="hello"; declare -p v; echo "$v"'
+check "declare -c empty value" 'declare -c x=""; echo "$x"; declare -p x'
+check "local -c"            'f(){ local -c x="hello world"; echo "$x"; }; f'
+
+# casemod's actual remaining blocker after -c (found via re-measurement
+# against the real bash-test-suite `casemod` category, not part of the
+# original brief): `${v^pattern}`/`${v,pattern}` (all=false, singular form)
+# tested EVERY char for the first match, but bash only tests the STRING'S
+# FIRST char against pattern -- no forward scan. Fixed in
+# param_expansion.rs::case_modify. Verified on bash 5.2.21.
+check "casemod ^pattern no match at index 0 (no scan)" 'S=hello; echo "${S^[aeiou]}"'
+check "casemod ^pattern match at index 0"              'S=ello; echo "${S^[aeiou]}"'
+check "casemod ,pattern no match at index 0 (no scan)" 'S=HELLO; echo "${S,[AEIOU]}"'
+check "casemod @ positional ^pattern no scan"          'set -- hello ello; echo "${@^[aeiou]}"'
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

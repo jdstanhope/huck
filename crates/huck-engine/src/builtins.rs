@@ -1062,6 +1062,7 @@ pub(crate) fn format_declare_line(name: &str, var: &crate::shell_state::Variable
     match var.case_fold {
         Some(crate::shell_state::CaseFold::Lower) => attrs.push('l'),
         Some(crate::shell_state::CaseFold::Upper) => attrs.push('u'),
+        Some(crate::shell_state::CaseFold::Capitalize) => attrs.push('c'),
         None => {}
     }
     let flag_str = if attrs.is_empty() {
@@ -1529,6 +1530,7 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
     let mut want_readonly = false;
     let mut saw_minus_l = false;
     let mut saw_minus_u = false;
+    let mut saw_minus_c = false;
     let mut saw_minus_n = false;
     let mut idx = 0;
     // Parse leading flags from Plain args. Letters cluster (`-ri`, `-ir`)
@@ -1550,6 +1552,7 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
                 b'r' => want_readonly = true,
                 b'l' => saw_minus_l = true,
                 b'u' => saw_minus_u = true,
+                b'c' => saw_minus_c = true,
                 b'n' => saw_minus_n = true,
                 other => {
                     crate::sh_error_to!(
@@ -1570,16 +1573,22 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
         return ExecOutcome::Continue(1);
     }
 
-    // Net case-fold attribute from this command's flags.
+    // Net case-fold attribute from this command's flags. bash: any TWO (or
+    // three) of -l/-u/-c together in one invocation cancel to no attribute
+    // (verified on bash 5.2.21: `declare -u -c v=x` / `declare -l -c v=x` /
+    // `declare -u -l -c v=x` all yield `declare -- v="x"`, unfolded); exactly
+    // one wins.
     let minus_case_fold: Option<Option<crate::shell_state::CaseFold>> =
-        if saw_minus_l && saw_minus_u {
-            Some(None) // both cancel → clear
-        } else if saw_minus_l {
-            Some(Some(crate::shell_state::CaseFold::Lower))
-        } else if saw_minus_u {
-            Some(Some(crate::shell_state::CaseFold::Upper))
-        } else {
-            None // no minus case-fold flag this command
+        match [saw_minus_l, saw_minus_u, saw_minus_c]
+            .iter()
+            .filter(|b| **b)
+            .count()
+        {
+            0 => None, // no minus case-fold flag this command
+            1 if saw_minus_l => Some(Some(crate::shell_state::CaseFold::Lower)),
+            1 if saw_minus_u => Some(Some(crate::shell_state::CaseFold::Upper)),
+            1 => Some(Some(crate::shell_state::CaseFold::Capitalize)),
+            _ => Some(None), // 2 or 3 together cancel → clear
         };
     let mut exit: i32 = 0;
     for arg in &args[idx..] {
@@ -1960,8 +1969,10 @@ fn builtin_declare_decl(
     let mut global = false;
     let mut saw_minus_l = false;
     let mut saw_minus_u = false;
+    let mut saw_minus_c = false;
     let mut saw_plus_l = false;
     let mut saw_plus_u = false;
+    let mut saw_plus_c = false;
     let mut saw_minus_n = false;
     let mut saw_plus_n = false;
 
@@ -2026,6 +2037,8 @@ fn builtin_declare_decl(
                 b'l' if plus => saw_plus_l = true,
                 b'u' if minus => saw_minus_u = true,
                 b'u' if plus => saw_plus_u = true,
+                b'c' if minus => saw_minus_c = true,
+                b'c' if plus => saw_plus_c = true,
                 b'n' if minus => saw_minus_n = true,
                 b'n' if plus => saw_plus_n = true,
                 b'f' if minus => function_mode = true,
@@ -2052,16 +2065,22 @@ fn builtin_declare_decl(
     }
     let names = &args[idx..];
 
-    // Net case-fold attribute from this command's flags.
+    // Net case-fold attribute from this command's flags. bash: any TWO (or
+    // three) of -l/-u/-c together in one invocation cancel to no attribute
+    // (verified on bash 5.2.21: `declare -u -c v=x` / `declare -l -c v=x` /
+    // `declare -u -l -c v=x` all yield `declare -- v="x"`, unfolded); exactly
+    // one wins.
     let minus_case_fold: Option<Option<crate::shell_state::CaseFold>> =
-        if saw_minus_l && saw_minus_u {
-            Some(None) // both cancel → clear
-        } else if saw_minus_l {
-            Some(Some(crate::shell_state::CaseFold::Lower))
-        } else if saw_minus_u {
-            Some(Some(crate::shell_state::CaseFold::Upper))
-        } else {
-            None // no minus case-fold flag this command
+        match [saw_minus_l, saw_minus_u, saw_minus_c]
+            .iter()
+            .filter(|b| **b)
+            .count()
+        {
+            0 => None, // no minus case-fold flag this command
+            1 if saw_minus_l => Some(Some(crate::shell_state::CaseFold::Lower)),
+            1 if saw_minus_u => Some(Some(crate::shell_state::CaseFold::Upper)),
+            1 => Some(Some(crate::shell_state::CaseFold::Capitalize)),
+            _ => Some(None), // 2 or 3 together cancel → clear
         };
 
     // Reject the combinations we haven't implemented yet.
@@ -2267,6 +2286,10 @@ fn builtin_declare_decl(
             shell.set_case_fold(name, None);
         }
         if saw_plus_u && shell.case_fold_of(name) == Some(crate::shell_state::CaseFold::Upper) {
+            shell.set_case_fold(name, None);
+        }
+        if saw_plus_c && shell.case_fold_of(name) == Some(crate::shell_state::CaseFold::Capitalize)
+        {
             shell.set_case_fold(name, None);
         }
 
