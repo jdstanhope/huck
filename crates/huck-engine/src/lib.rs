@@ -10,6 +10,7 @@ pub use macros::bash_io_error;
 
 pub(crate) mod arith;
 pub(crate) mod array_transforms;
+pub(crate) mod assoc_map;
 pub(crate) mod assoc_order;
 #[doc(hidden)]
 pub mod builtins;

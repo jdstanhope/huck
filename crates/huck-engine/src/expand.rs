@@ -393,7 +393,10 @@ fn expand_assoc_param(
     // Snapshot the pairs once up-front so the rest of the function can
     // borrow `shell` mutably for sub-expansions (e.g., modifier word
     // evaluation, subscript-as-Word expansion).
-    let pairs: Vec<(String, String)> = shell.get_associative(name).cloned().unwrap_or_default();
+    let pairs: Vec<(String, String)> = shell
+        .get_associative(name)
+        .map(|m| m.pairs().to_vec())
+        .unwrap_or_default();
     // L-44 (#32): bash iterates assoc arrays in hash order, not insertion order.
     // Reorder the snapshot once; `values`/`keys`/transforms/slicing below all
     // derive from `pairs`, so this covers every ${m[@]}/${!m[@]}/${m[@]<op>} form.

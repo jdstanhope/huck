@@ -2,10 +2,14 @@ use super::*;
 
 #[test]
 fn scalar_view_returns_empty_for_associative() {
-    let v = VarValue::Associative(vec![
-        ("k1".to_string(), "v1".to_string()),
-        ("k2".to_string(), "v2".to_string()),
-    ]);
+    let v = VarValue::Associative(
+        vec![
+            ("k1".to_string(), "v1".to_string()),
+            ("k2".to_string(), "v2".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    );
     assert_eq!(v.scalar_view(), "");
 }
 
@@ -13,7 +17,7 @@ fn scalar_view_returns_empty_for_associative() {
 fn declare_associative_on_unset_creates_empty() {
     let mut shell = Shell::new();
     assert!(shell.declare_associative("m").is_ok());
-    assert_eq!(shell.get_associative("m").map(Vec::len), Some(0));
+    assert_eq!(shell.get_associative("m").map(|m| m.len()), Some(0));
 }
 
 #[test]
@@ -92,7 +96,7 @@ fn set_associative_element_preserves_insertion_order_on_update() {
     shell
         .set_associative_element("m", "a".into(), "999".into())
         .unwrap();
-    let pairs = shell.get_associative("m").unwrap();
+    let pairs = shell.get_associative("m").unwrap().pairs();
     assert_eq!(pairs[0], ("a".into(), "999".into()));
     assert_eq!(pairs[1], ("b".into(), "2".into()));
     assert_eq!(pairs[2], ("c".into(), "3".into()));
@@ -141,7 +145,7 @@ fn unset_associative_element_removes_one_key() {
         .set_associative_element("m", "c".into(), "3".into())
         .unwrap();
     shell.unset_associative_element("m", "b").unwrap();
-    let pairs = shell.get_associative("m").unwrap();
+    let pairs = shell.get_associative("m").unwrap().pairs();
     assert_eq!(pairs.len(), 2);
     assert_eq!(pairs[0].0, "a");
     assert_eq!(pairs[1].0, "c");
