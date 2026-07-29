@@ -376,10 +376,10 @@ fn expand_positional_transform(
 }
 
 /// Dispatches `${m[...]}` forms when `m` is an associative array.
-/// String-key subscripts (no arith), insertion-order iteration for
-/// `@`/`*`, and string keys for `${!m[@]}`. Routed from
-/// `expand_array_param` based on the variable's current `VarValue`
-/// variant.
+/// String-key subscripts (no arith), bash HASH-order iteration (#32,
+/// L-44; see `crate::assoc_order`) for `@`/`*`, and string keys for
+/// `${!m[@]}`. Routed from `expand_array_param` based on the variable's
+/// current `VarValue` variant.
 fn expand_assoc_param(
     name: &str,
     modifier: &crate::lexer::ParamModifier,
@@ -394,6 +394,10 @@ fn expand_assoc_param(
     // borrow `shell` mutably for sub-expansions (e.g., modifier word
     // evaluation, subscript-as-Word expansion).
     let pairs: Vec<(String, String)> = shell.get_associative(name).cloned().unwrap_or_default();
+    // L-44 (#32): bash iterates assoc arrays in hash order, not insertion order.
+    // Reorder the snapshot once; `values`/`keys`/transforms/slicing below all
+    // derive from `pairs`, so this covers every ${m[@]}/${!m[@]}/${m[@]<op>} form.
+    let pairs = crate::assoc_order::assoc_ordered_pairs(&pairs);
     let values: Vec<String> = pairs.iter().map(|(_, v)| v.clone()).collect();
     let keys: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
 
@@ -435,7 +439,7 @@ fn expand_assoc_param(
                 .unwrap_or_default();
             ExpansionResult::Value(val.chars().count().to_string())
         }
-        // ${!m[@]} / ${!m[*]} — list of string keys in insertion order.
+        // ${!m[@]} / ${!m[*]} — list of string keys in bash hash order.
         (PM::IndirectKeys, SK::All) => {
             if quoted {
                 ExpansionResult::WordList(keys)
@@ -454,7 +458,9 @@ fn expand_assoc_param(
         // supported in v72 (would require resolving the value as a
         // variable name). Produce empty for parity with the indexed path.
         (PM::IndirectKeys, SK::Index(_)) => ExpansionResult::Value(String::new()),
-        // ${m[@]:o:l} / ${m[*]:o:l} — slicing in insertion order.
+        // ${m[@]:o:l} / ${m[*]:o:l} — slicing over the bash-hash-ordered
+        // snapshot (offset/length semantics: see #322 for a known bash-only
+        // off-by-one on the offset base that huck does not yet replicate).
         (PM::Substring { offset, length }, SK::All)
         | (PM::Substring { offset, length }, SK::Star) => {
             let sliced = match slice_word_list(&values, offset, length.as_ref(), shell) {

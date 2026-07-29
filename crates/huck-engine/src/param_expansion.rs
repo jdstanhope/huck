@@ -668,13 +668,21 @@ fn substitute(
 
 /// Applies bash-style case modification to `value`. The `direction`
 /// (Upper/Lower) and `all` flag together determine whether every char
-/// or only the first matching char gets converted. `pattern` filters
-/// per-character — if `None`, every char matches; if `Some(p)`, only
-/// chars matching the glob `p` get converted. Glob compile errors
+/// or only the STRING'S FIRST char gets tested/converted. `pattern`
+/// filters per-character — if `None`, every char matches; if `Some(p)`,
+/// only chars matching the glob `p` get converted. Glob compile errors
 /// return `value` unchanged (silent fallthrough, matches v32's
 /// `substitute`). Unicode-aware via Rust's `char::to_uppercase` /
 /// `char::to_lowercase` iterators — handles multi-char expansions
 /// like `'ß'.to_uppercase()` → "SS".
+///
+/// `all=false` (the `^`/`,` forms, singular) does NOT scan forward for
+/// the first matching char — it tests ONLY `value`'s first character
+/// against `pattern` and, if that one doesn't match, returns `value`
+/// completely unchanged. Verified on bash 5.2.21: `S=hello; echo
+/// ${S^[aeiou]}` -> "hello" (unchanged — 'h' doesn't match, no scan to
+/// the 'e'), but `S=ello; echo ${S^[aeiou]}` -> "Ello" ('e' at index 0
+/// matches).
 fn case_modify(
     value: &str,
     direction: CaseDirection,
@@ -705,8 +713,8 @@ fn case_modify(
         }
     };
 
-    let mut out = String::with_capacity(value.len());
     if all {
+        let mut out = String::with_capacity(value.len());
         for c in value.chars() {
             if should_modify(c) {
                 out.push_str(&apply(c));
@@ -714,18 +722,13 @@ fn case_modify(
                 out.push(c);
             }
         }
+        out
     } else {
-        let mut done = false;
-        for c in value.chars() {
-            if !done && should_modify(c) {
-                out.push_str(&apply(c));
-                done = true;
-            } else {
-                out.push(c);
-            }
+        match value.chars().next() {
+            Some(c0) if should_modify(c0) => apply(c0) + &value[c0.len_utf8()..],
+            _ => value.to_string(),
         }
     }
-    out
 }
 
 /// Bash substring semantics for `${var:offset[:length]}`. Char-counting
@@ -1720,11 +1723,24 @@ mod tests {
     }
 
     #[test]
-    fn case_modify_upper_first_with_pattern_picks_first_match() {
-        // Only the first MATCHING char (the `e`) gets upper-cased.
+    fn case_modify_upper_first_with_pattern_tests_only_string_first_char() {
+        // bash `${S^pattern}` (all=false) does NOT scan forward for the
+        // first matching char — it tests ONLY the string's first char.
+        // "hello"'s first char 'h' doesn't match [aeiou], so the value is
+        // returned entirely unchanged (verified bash 5.2.21: no scan to the
+        // 'e'). Was previously (incorrectly) "hEllo" — see #321.
         assert_eq!(
             case_modify("hello", CaseDirection::Upper, false, Some("[aeiou]"), false),
-            "hEllo"
+            "hello"
+        );
+    }
+
+    #[test]
+    fn case_modify_upper_first_with_pattern_matches_at_index_zero() {
+        // "ello"'s first char 'e' DOES match [aeiou] -> converted.
+        assert_eq!(
+            case_modify("ello", CaseDirection::Upper, false, Some("[aeiou]"), false),
+            "Ello"
         );
     }
 
@@ -1753,7 +1769,8 @@ mod tests {
 
     #[test]
     fn case_modify_no_match_first_form_returns_unchanged() {
-        // No char in "hello" matches [xyz]; all=false → return unchanged.
+        // "hello"'s first char 'h' doesn't match [xyz]; all=false tests
+        // only that first char → return unchanged.
         assert_eq!(
             case_modify("hello", CaseDirection::Upper, false, Some("[xyz]"), false),
             "hello"
