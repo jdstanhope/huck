@@ -32,8 +32,11 @@ fn declare_and_read_roundtrip() {
     assert!(out.lines().any(|l| l == "bar"), "got: {out:?}");
 }
 
+// L-44 (#32): bash iterates assoc arrays in its own hash-table bucket
+// order, not insertion order. For keys a/b/c, real bash 5.2.21 enumerates
+// c, b, a — verified against the actual binary, not derived from huck.
 #[test]
-fn iteration_order_is_insertion_order() {
+fn iteration_order_is_bash_hash_order() {
     let (out, _, _) = run_capture(
         "declare -A m\nm[a]=1\nm[b]=2\nm[c]=3\nfor k in \"${!m[@]}\"; do echo $k; done\nexit\n",
     );
@@ -45,8 +48,8 @@ fn iteration_order_is_insertion_order() {
         .collect();
     assert_eq!(
         key_lines,
-        vec!["a", "b", "c"],
-        "expected insertion-order, got: {out:?}"
+        vec!["c", "b", "a"],
+        "expected bash hash order, got: {out:?}"
     );
 }
 
@@ -81,8 +84,12 @@ fn append_compound_merges_keys() {
     );
 }
 
+// L-44 (#32): bash re-derives hash order from whatever keys remain after
+// an unset, not the original insertion order minus the removed key. For
+// first/middle/last with "middle" unset, real bash 5.2.21 enumerates
+// last, first.
 #[test]
-fn unset_element_preserves_order_of_remaining() {
+fn unset_element_yields_bash_hash_order_of_remaining() {
     let (out, _, _) = run_capture(
         "declare -A m=([first]=1 [middle]=2 [last]=3)\nunset m[middle]\nfor k in \"${!m[@]}\"; do echo $k; done\nexit\n",
     );
@@ -92,7 +99,7 @@ fn unset_element_preserves_order_of_remaining() {
         .filter(|l| ["first", "middle", "last"].contains(l))
         .copied()
         .collect();
-    assert_eq!(key_lines, vec!["first", "last"], "got: {out:?}");
+    assert_eq!(key_lines, vec!["last", "first"], "got: {out:?}");
 }
 
 #[test]
