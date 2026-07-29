@@ -2,6 +2,21 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v342 (#32/#321, 2026-07-29 UTC):** `casemod` flipped to PASS (0-diff)
+— two roots: (1) **L-44** associative-array iteration order (#32) — bash iterates
+assoc arrays in hash-table order, not insertion order. Reverse-engineered and
+validated bash 5.2.21's exact order (FNV-1 hash, **1024** buckets, bucket-ascending
++ within-bucket newest-inserted-first; 400 randomized cross-checks, 0 mismatches),
+implemented as a pure iteration-order VIEW (`assoc_order.rs`) over huck's
+insertion-ordered `Vec<(String,String)>` storage, routed at every assoc
+enumeration site (`${m[@]}`/`${!m[@]}`/transforms/slice via the `expand_assoc_param`
+snapshot; `declare -p`/`@A`/`@K`/`@k` via `render_declare_value_part`). (2)
+**`declare -c`** (#321) capitalize-first attribute + a pre-existing `case_modify`
+fix (`${v^pat}`/`${v,pat}` tested only the first char, not a forward scan). Summary
+PASS 30→31, FAIL 52→51. Only `casemod` flipped; L-44 also shrank `assoc` (499→358)
+and `appendop` (21→19); NO regressions (all PASS categories held vs an origin/main
+baseline). Follow-ups: #322 (assoc `${a[@]:o:l}` slice offset), #323 (assoc-cluster
+residuals blocking `assoc`/`appendop`/`quotearray`).
 **Updated by v341 (#44/#318, 2026-07-28 UTC):** `braces` flipped to PASS (0-diff)
 — four brace-expansion roots (all in `brace_expand.rs` + the lexer reconstruction):
 (1) negative step was rejected — bash ignores the step SIGN (magnitude only,
@@ -199,14 +214,14 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 ## Summary
 
 - Categories run: 82
-- PASS: 30
-- FAIL: 52
+- PASS: 31
+- FAIL: 51
 - TIMEOUT: 0
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
 
-(Counts refreshed by the v341 full-runner sweep, 2026-07-28 UTC — authoritative.
-The 30 PASS categories are: array2, braces, cprint, dbg-support2, dynvar,
+(Counts refreshed by the v342 full-runner sweep, 2026-07-29 UTC — authoritative.
+The 31 PASS categories are: array2, braces, casemod, cprint, dbg-support2, dynvar,
 extglob2, extglob3, func, getopts, herestr, ifs, input-test, invert, iquote,
 lastpipe, nquote, nquote1, nquote2, nquote3, nquote5, parser, posix2, posixpat,
 precedence, procsub, rhs-exp, set-x, strip, tilde, tilde2. Some per-category FAIL
@@ -236,7 +251,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | braces | PASS | v341 (#44/#318): 0-diff PASS. Four roots fixed — negative step (sign ignored, `{10..1..-2}`→`10 8 6 4 2`); nested/unmatched outer brace still expands a balanced inner one (`a-{b{d,e}}-c`, `a-{bdef-{g,i}-c`); char range emits an empty element for `\`; and bare `$var{x,y}`→`$varx $vary` name-merge (new `braced` flag on `WordPart::Var`, since modifier-less `${var}` demotes to `Var`). #44 stays open for the broader brace-before-param ordering. |
 | builtins | FAIL | Multiple unimplemented `set -o` options (`posix`, `+p`) abort the test preamble. `ulimit` and `fc` are not found as commands. |
 | case | FAIL | L-43 (readonly-assignment abort) RESOLVED by v313 (#31) — a standalone readonly assignment now discards the current command, so the old cascade is gone. Two divergences remain (v313 re-sweep): (1) control-character case-PATTERN matching — patterns built from control bytes (soh/stx/del) match differently, yielding `ok1ok2ok3ok4ok5` where bash produces `fail1fail2fail3ok4fail5`; (2) arithmetic assignment to a readonly inside `(( ))` — `((xx++))` on a readonly emits one error + computes `1.1`, where bash emits a second `xx++: … (error token is "")` diagnostic and computes `1.0` (an arith-lvalue-on-readonly path, distinct from the run_assignment_list fix). |
-| casemod | FAIL | Case-modification operations on multi-word arrays produce output in a different word order than bash expects — likely L-44 (array/assoc iteration order) affecting the loop variable sequence. |
+| casemod | PASS | v342 (#32/#321): 0-diff PASS. Two roots — L-44 associative-array hash iteration order (now a bash-faithful view: FNV-1, 1024 buckets, bucket-asc + newest-first), and `declare -c` (capitalize-first attribute) + a pre-existing `case_modify` `${v^pat}` first-char-only fix. |
 | complete | FAIL | M-92 (`${!prefix@}` variable-name-listing expansion) not implemented — `complete.tests` uses this inside a `[[ ]]` expression, causing an unterminated-compound-test parse error that prevents the entire suite from running. |
 | comsub | FAIL | Error-message format divergence (huck uses its own name as prefix, not the script-file-and-line form). Unterminated heredoc inside a command substitution is treated as a hard error that aborts the substitution, losing many expected output lines. Huck also fails to parse several complex nested-comsub forms (command substitutions containing `esac` tokens, bare-word `case` clauses, and `nest`/`DO`/`DONE` patterns) that bash handles by treating `)` as the comsub terminator. |
 | comsub-eof | FAIL | Unterminated heredoc inside a command substitution is treated as a hard error in huck (aborts the substitution) while bash issues a warning and treats the EOF as the delimiter. New divergence in error-vs-warning handling. |
