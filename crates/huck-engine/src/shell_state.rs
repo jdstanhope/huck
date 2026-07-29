@@ -38,7 +38,7 @@ pub struct Frame {
 pub enum VarValue {
     Scalar(String),
     Indexed(BTreeMap<usize, String>),
-    Associative(Vec<(String, String)>),
+    Associative(crate::assoc_map::AssocMap),
 }
 
 impl VarValue {
@@ -53,11 +53,7 @@ impl VarValue {
         match self {
             VarValue::Scalar(s) => s.as_str(),
             VarValue::Indexed(m) => m.get(&0).map(String::as_str).unwrap_or(""),
-            VarValue::Associative(pairs) => pairs
-                .iter()
-                .find(|(k, _)| k == "0")
-                .map(|(_, v)| v.as_str())
-                .unwrap_or(""),
+            VarValue::Associative(map) => map.get("0").unwrap_or(""),
         }
     }
 }
@@ -2138,12 +2134,8 @@ impl Shell {
     ) -> Result<(), AssignErr> {
         match self.vars.get_mut(name) {
             Some(v) => match &mut v.value {
-                VarValue::Associative(pairs) => {
-                    if let Some(slot) = pairs.iter_mut().find(|(k, _)| k == &key) {
-                        slot.1 = value;
-                    } else {
-                        pairs.push((key, value));
-                    }
+                VarValue::Associative(map) => {
+                    map.insert(key, value);
                 }
                 _ => {
                     crate::sh_error!(
@@ -2180,7 +2172,7 @@ impl Shell {
         self.vars.insert(
             name.to_string(),
             Variable {
-                value: VarValue::Associative(pairs),
+                value: VarValue::Associative(pairs.into_iter().collect()),
                 exported,
                 readonly: false,
                 // Integer associative arrays (`declare -Ai`) coerce VALUES on
@@ -2989,7 +2981,7 @@ impl Shell {
     /// or `None` if the variable is unset, scalar, or indexed.
     /// Resolves through namerefs so that `local -n m=mymap; m[k]=v` dispatches
     /// correctly to the associative path.
-    pub fn get_associative(&self, name: &str) -> Option<&Vec<(String, String)>> {
+    pub fn get_associative(&self, name: &str) -> Option<&crate::assoc_map::AssocMap> {
         // Resolve through namerefs.
         let resolved = if self.is_nameref(name) {
             match self.resolve_nameref(name) {
@@ -3001,7 +2993,7 @@ impl Shell {
         };
         match self.vars.get(&resolved) {
             Some(v) => match &v.value {
-                VarValue::Associative(pairs) => Some(pairs),
+                VarValue::Associative(map) => Some(map),
                 _ => None,
             },
             None => None,
@@ -3012,7 +3004,7 @@ impl Shell {
     /// `None` if the variable is unset, not associative, or has no such key.
     pub fn lookup_associative_element(&self, name: &str, key: &str) -> Option<String> {
         self.get_associative(name)
-            .and_then(|pairs| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
+            .and_then(|m| m.get(key).map(str::to_string))
     }
 
     /// Sets `key` to `value` in the associative array `name`. Preserves
@@ -3068,9 +3060,9 @@ impl Shell {
             return Err(AssignErr::Readonly);
         }
         if let Some(v) = self.vars.get_mut(name)
-            && let VarValue::Associative(pairs) = &mut v.value
+            && let VarValue::Associative(map) = &mut v.value
         {
-            pairs.retain(|(k, _)| k != key);
+            map.remove(key);
         }
         Ok(())
     }
@@ -3105,7 +3097,7 @@ impl Shell {
                 self.vars.insert(
                     name.to_string(),
                     Variable {
-                        value: VarValue::Associative(Vec::new()),
+                        value: VarValue::Associative(crate::assoc_map::AssocMap::new()),
                         exported: false,
                         readonly: false,
                         integer: false,
