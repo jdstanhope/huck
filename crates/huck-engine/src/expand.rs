@@ -1120,7 +1120,9 @@ fn expand_part(
             current.push_str(&text, false);
             *has_emitted = true;
         }
-        WordPart::Var { name, quoted: true } => {
+        WordPart::Var {
+            name, quoted: true, ..
+        } => {
             match shell.lookup_var(name) {
                 Some(value) => current.push_str(&value, true),
                 None => {
@@ -1142,6 +1144,7 @@ fn expand_part(
         WordPart::Var {
             name,
             quoted: false,
+            ..
         } => {
             let value = match shell.lookup_var(name) {
                 Some(v) => v,

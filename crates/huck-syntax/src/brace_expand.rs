@@ -7,8 +7,22 @@
 //! are preserved verbatim through expansion. The PUA chars are
 //! reserved by Unicode for internal application use and are not
 //! expected to appear in real shell input.
+//!
+//! A third PUA sentinel, [`EMPTY_QUOTED_SENTINEL`], marks a char-range
+//! element that bash's `\` (0x5C) range quirk (#318) produces as an EMPTY
+//! but QUOTE-PROTECTED field — distinct from an ordinary empty string
+//! (e.g. the middle item of `{a,,b}`), which is an unquoted empty word and
+//! vanishes like any other unquoted-empty expansion. `split_on_sentinels`
+//! (lexer.rs) turns this sentinel into a `WordPart::Literal { quoted: true,
+//! text: "" }` so the field survives; a bare `""` string from `parse_body`
+//! still produces zero `WordPart`s and disappears as before.
 
 const MAX_ELEMENTS: usize = 65_536;
+
+/// PUA sentinel (see module docs) standing in for an EMPTY but
+/// QUOTE-PROTECTED brace-expansion element — bash's `\` (0x5C) char-range
+/// quirk (#318). `split_on_sentinels` (lexer.rs) is the sole consumer.
+pub(crate) const EMPTY_QUOTED_SENTINEL: char = '\u{E002}';
 
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -46,7 +60,22 @@ fn expand_into(input: &str, out: &mut Vec<String>) -> Result<(), BraceError> {
     let rbrace = match find_matching_rbrace(input, lbrace) {
         Some(i) => i,
         None => {
-            out.push(input.to_string());
+            // The `{` at lbrace has no matching `}` — it is literal. bash still
+            // expands a LATER balanced brace (`a-{bdef-{g,i}-c` → `a-{bdef-g-c
+            // a-{bdef-i-c`; `{a{b,c}` → `{ab {ac`). Emit through-and-including this
+            // `{` as literal and re-scan the remainder (which is strictly shorter,
+            // so no infinite recursion).
+            let split = lbrace + '{'.len_utf8();
+            let head = &input[..split];
+            let rest = &input[split..];
+            let mut tail = Vec::new();
+            expand_into(rest, &mut tail)?;
+            for t in tail {
+                out.push(format!("{head}{t}"));
+                if out.len() > MAX_ELEMENTS {
+                    return Err(BraceError::TooManyElements);
+                }
+            }
             return Ok(());
         }
     };
@@ -57,15 +86,22 @@ fn expand_into(input: &str, out: &mut Vec<String>) -> Result<(), BraceError> {
     let items = match parse_body(body) {
         Some(items) => items,
         None => {
-            // Body wasn't a valid brace expr; treat `{body}` as a
-            // literal and continue scanning after it.
-            let head = format!("{prefix}{{{body}}}");
-            let mut tail = Vec::new();
-            expand_into(suffix, &mut tail)?;
-            for t in tail {
-                out.push(format!("{head}{t}"));
-                if out.len() > MAX_ELEMENTS {
-                    return Err(BraceError::TooManyElements);
+            // Outer {body} is not a brace expr (no top-level comma/range) → the
+            // braces are LITERAL, but inner braces inside body still expand
+            // (bash: `a-{b{d,e}}-c` → `a-{bd}-c a-{be}-c`). Recurse into body and
+            // suffix and cross them, re-wrapping body in literal braces. Do NOT
+            // re-feed `{be}` through expand_into — the literal braces would be
+            // re-parsed as a top-level brace with no comma/range and recurse forever.
+            let mut body_exp = Vec::new();
+            expand_into(body, &mut body_exp)?;
+            let mut suffix_exp = Vec::new();
+            expand_into(suffix, &mut suffix_exp)?;
+            for be in &body_exp {
+                for se in &suffix_exp {
+                    out.push(format!("{prefix}{{{be}}}{se}"));
+                    if out.len() > MAX_ELEMENTS {
+                        return Err(BraceError::TooManyElements);
+                    }
                 }
             }
             return Ok(());
@@ -200,14 +236,21 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
             }
             Some(s) => match s.parse::<i64>() {
                 Ok(0) => return None,
-                Ok(n) if n > 0 => {
-                    if r >= l {
-                        n
-                    } else {
-                        -n
-                    }
+                Ok(n) => {
+                    // bash ignores the step's SIGN — magnitude only, direction from the
+                    // endpoints (`{10..1..-2}` == `{10..1..2}` → 10 8 6 4 2). (#318)
+                    // `checked_abs` guards `i64::MIN`, whose magnitude has no `i64`
+                    // representation (`i64::MIN.abs()` panics) — bash also leaves a
+                    // step that extreme un-expanded (verified against bash 5.2.21:
+                    // `{1..2..-9223372036854775808}` prints literally, rc 0), so
+                    // falling back to `None` (literal) matches.
+                    let m = match n.checked_abs() {
+                        Some(m) => m,
+                        None => return None,
+                    };
+                    if r >= l { m } else { -m }
                 }
-                _ => return None,
+                Err(_) => return None,
             },
         };
         let pad_width = compute_pad_width(left, right);
@@ -269,21 +312,35 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
             }
             Some(s) => match s.parse::<i64>() {
                 Ok(0) => return None,
-                Ok(n) if n > 0 => {
-                    if r >= l {
-                        n
-                    } else {
-                        -n
-                    }
+                Ok(n) => {
+                    // bash ignores the step's SIGN — magnitude only, direction from the
+                    // endpoints (`{10..1..-2}` == `{10..1..2}` → 10 8 6 4 2). (#318)
+                    // `checked_abs` guards `i64::MIN`, whose magnitude has no `i64`
+                    // representation (`i64::MIN.abs()` panics) — bash also leaves a
+                    // step that extreme un-expanded (verified against bash 5.2.21:
+                    // `{1..2..-9223372036854775808}` prints literally, rc 0), so
+                    // falling back to `None` (literal) matches.
+                    let m = match n.checked_abs() {
+                        Some(m) => m,
+                        None => return None,
+                    };
+                    if r >= l { m } else { -m }
                 }
-                _ => return None,
+                Err(_) => return None,
             },
         };
         let mut out = Vec::new();
         let mut cur = l;
         loop {
             if let Some(c) = char::from_u32(cur as u32) {
-                out.push(c.to_string());
+                // bash emits an EMPTY (but quote-protected — see module docs)
+                // element for `\` (0x5C) in a char range (#318); every other
+                // char in the byte span is emitted literally.
+                if c == '\\' {
+                    out.push(EMPTY_QUOTED_SENTINEL.to_string());
+                } else {
+                    out.push(c.to_string());
+                }
             } else {
                 return None;
             }
@@ -355,8 +412,39 @@ mod tests {
     }
 
     #[test]
+    fn integer_range_negative_step_sign_ignored() {
+        // bash ignores the step's sign — magnitude only, direction from the
+        // endpoints (#318): {10..1..-2} == {10..1..2}.
+        assert_eq!(
+            expand("{10..1..-2}").unwrap(),
+            vec!["10", "8", "6", "4", "2"]
+        );
+    }
+
+    #[test]
+    fn integer_range_step_i64_min_stays_literal() {
+        // (#318 fix-round-1) i64::MIN's magnitude has no i64 representation
+        // (`i64::MIN.abs()` panics); `checked_abs` must fall back to treating
+        // the whole `{...}` as literal, matching bash (verified against bash
+        // 5.2.21: this prints literally, rc 0 — no expansion, no error).
+        assert_eq!(
+            expand("{1..2..-9223372036854775808}").unwrap(),
+            vec!["{1..2..-9223372036854775808}"]
+        );
+    }
+
+    #[test]
     fn char_range_ascending() {
         assert_eq!(expand("{a..e}").unwrap(), vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn char_range_step_i64_min_stays_literal() {
+        // Char arm of the same (#318 fix-round-1) guard.
+        assert_eq!(
+            expand("{a..z..-9223372036854775808}").unwrap(),
+            vec!["{a..z..-9223372036854775808}"]
+        );
     }
 
     #[test]
@@ -380,6 +468,18 @@ mod tests {
     #[test]
     fn invalid_brace_is_literal() {
         assert_eq!(expand("{a").unwrap(), vec!["{a"]);
+    }
+
+    #[test]
+    fn unmatched_brace_still_expands_a_later_balanced_one() {
+        // bash treats an unmatched `{` as literal but still expands a LATER
+        // balanced brace elsewhere in the string (#318).
+        assert_eq!(
+            expand("a-{bdef-{g,i}-c").unwrap(),
+            vec!["a-{bdef-g-c", "a-{bdef-i-c"]
+        );
+        assert_eq!(expand("{a{b,c}").unwrap(), vec!["{ab", "{ac"]);
+        assert_eq!(expand("{{a,b}").unwrap(), vec!["{a", "{b"]);
     }
 
     #[test]

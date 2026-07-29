@@ -72,12 +72,14 @@ fn var_unq(name: &str) -> Word {
     Word(vec![WordPart::Var {
         name: name.to_string(),
         quoted: false,
+        braced: false,
     }])
 }
 fn var_q(name: &str) -> Word {
     Word(vec![WordPart::Var {
         name: name.to_string(),
         quoted: true,
+        braced: false,
     }])
 }
 
@@ -198,6 +200,7 @@ fn expand_unquoted_var_with_literal_prefix_merges_first_field() {
         WordPart::Var {
             name: "HUCK_T".to_string(),
             quoted: false,
+            braced: false,
         },
     ]);
     assert_eq!(
@@ -242,6 +245,7 @@ fn expand_unset_unquoted_returns_no_fields_for_redirect_check() {
             &Word(vec![WordPart::Var {
                 name: "DEFINITELY_NOT_SET_REDIR".to_string(),
                 quoted: false,
+                braced: false,
             }]),
             &mut shell
         )
@@ -259,6 +263,7 @@ fn expand_unquoted_var_with_two_fields_returns_two_for_redirect_check() {
             &Word(vec![WordPart::Var {
                 name: "HUCK_T_TWOFIELD".to_string(),
                 quoted: false,
+                braced: false,
             }]),
             &mut shell
         )
@@ -274,6 +279,7 @@ fn expand_assignment_preserves_interior_whitespace() {
     let word = Word(vec![WordPart::Var {
         name: "HUCK_T_PAD".to_string(),
         quoted: false,
+        braced: false,
     }]);
     assert_eq!(expand_assignment(&word, &mut shell), "a  b".to_string());
 }
@@ -290,6 +296,7 @@ fn expand_assignment_concatenates_parts() {
         WordPart::Var {
             name: "HUCK_T_X".to_string(),
             quoted: false,
+            braced: false,
         },
         WordPart::Literal {
             text: "-post".to_string(),
@@ -313,6 +320,7 @@ fn expand_assignment_unset_var_yields_empty_segment() {
         WordPart::Var {
             name: "DEFINITELY_NOT_SET_ASN".to_string(),
             quoted: false,
+            braced: false,
         },
         WordPart::Literal {
             text: "]".to_string(),
@@ -669,6 +677,7 @@ fn expand_quoted_var_marks_chars_quoted() {
     let word = Word(vec![WordPart::Var {
         name: "HUCK_Q".to_string(),
         quoted: true,
+        braced: false,
     }]);
     let fields = expand(&word, &mut shell);
     assert_eq!(fields.len(), 1);
@@ -682,6 +691,7 @@ fn expand_unquoted_var_marks_chars_unquoted() {
     let word = Word(vec![WordPart::Var {
         name: "HUCK_Q".to_string(),
         quoted: false,
+        braced: false,
     }]);
     let fields = expand(&word, &mut shell);
     assert_eq!(fields.len(), 1);
@@ -1176,6 +1186,7 @@ fn expand_dollar_digit_reads_positional() {
     let w = Word(vec![WordPart::Var {
         name: "1".to_string(),
         quoted: false,
+        braced: false,
     }]);
     let fields = expand(&w, &mut shell);
     assert_eq!(fields.len(), 1);
@@ -1188,6 +1199,7 @@ fn expand_dollar_digit_unset_is_empty() {
     let w = Word(vec![WordPart::Var {
         name: "1".to_string(),
         quoted: false,
+        braced: false,
     }]);
     let fields = expand(&w, &mut shell);
     // Unset positional → no field (consistent with unset var behaviour)
@@ -1201,6 +1213,7 @@ fn expand_dollar_hash_is_arg_count() {
     let w = Word(vec![WordPart::Var {
         name: "#".to_string(),
         quoted: false,
+        braced: false,
     }]);
     let fields = expand(&w, &mut shell);
     assert_eq!(fields.len(), 1);

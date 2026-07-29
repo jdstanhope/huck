@@ -586,6 +586,18 @@ pub enum WordPart {
     Var {
         name: String,
         quoted: bool,
+        /// True when this reference was written `${name}` (braced, no
+        /// modifier/subscript/indirect — the parser demotes that shape to a
+        /// plain `Var` for `declare -f` round-tripping fidelity, mirroring
+        /// bash's `print_cmd.c` normalisation). False for a bare `$name`.
+        /// Used ONLY by the brace-expansion name-suffix merge (v341, #44):
+        /// bash brace-expands `$var{x,y}` -> `$varx $vary` textually before
+        /// parameter expansion (the bare name run absorbs the brace's leading
+        /// name-continuation chars), but `${var}{x,y}` does NOT merge — the
+        /// `}` already closed the reference. Without this flag the two forms
+        /// are indistinguishable once modifier-less `${name}` collapses to
+        /// `Var` (see parser.rs's `${name}` plain-variable-reference arm).
+        braced: bool,
     },
     LastStatus {
         quoted: bool,
@@ -6754,12 +6766,30 @@ fn build_concat_with_sentinels(parts: &[WordPart]) -> (String, Vec<WordPart>) {
 /// Walks an expanded brace-expansion string and reconstructs a
 /// `Vec<WordPart>`. Literal runs (no sentinels) become Literals
 /// with `quoted: false`. Each sentinel block `\u{E000}<idx>\u{E001}`
-/// is replaced by `placeholders[idx].clone()`.
+/// is replaced by `placeholders[idx].clone()`. A lone
+/// `brace_expand::EMPTY_QUOTED_SENTINEL` becomes a `WordPart::Literal {
+/// text: "", quoted: true }` — bash's `\` (0x5C) char-range quirk (#318):
+/// an EMPTY but quote-protected field that survives unquoted-empty-word
+/// removal, unlike a bare empty string (e.g. the middle item of `{a,,b}`),
+/// which produces no `WordPart` at all and vanishes.
 fn split_on_sentinels(s: &str, placeholders: &[WordPart]) -> Vec<WordPart> {
     let mut out: Vec<WordPart> = Vec::new();
     let mut buf = String::new();
     let mut chars = CharCursor::new(s);
     while let Some(c) = chars.next() {
+        if c == crate::brace_expand::EMPTY_QUOTED_SENTINEL {
+            if !buf.is_empty() {
+                out.push(WordPart::Literal {
+                    text: std::mem::take(&mut buf),
+                    quoted: false,
+                });
+            }
+            out.push(WordPart::Literal {
+                text: String::new(),
+                quoted: true,
+            });
+            continue;
+        }
         if c == '\u{E000}' {
             if !buf.is_empty() {
                 out.push(WordPart::Literal {
@@ -6831,8 +6861,78 @@ pub(crate) fn brace_expand_parts(parts: Vec<WordPart>) -> Result<Vec<Vec<WordPar
         crate::brace_expand::expand(&concat).map_err(|_| LexError::BraceExpansionLimit)?;
     Ok(expansions
         .into_iter()
-        .map(|s| split_on_sentinels(&s, &placeholders))
+        .map(|s| {
+            let mut v = split_on_sentinels(&s, &placeholders);
+            merge_brace_name_suffix(&mut v);
+            v
+        })
         .collect())
+}
+
+/// bash brace-expands textually before parameter expansion, so `$var{x,y}`
+/// becomes `$varx $vary` — the brace suffix's leading name-continuation run
+/// merges into a BARE `$name`. huck reconstructs `[Var{var}, Literal{"x"}]`;
+/// this merges the leading `[A-Za-z0-9_]` run of an unquoted Literal into an
+/// immediately-preceding bare `WordPart::Var{quoted:false, braced:false}`.
+/// `braced` distinguishes a real bare `$name` from a modifier-less `${name}`
+/// that the parser demoted to the same `Var` shape (for `declare -f`/`type`
+/// round-tripping) — only `braced == false` merges; a braced `${var}{x,y}`
+/// keeps `braced == true` and is left alone (bash: `${var}{x,y}` → `bazx
+/// bazy`). Also gated on the name starting with an identifier char (ASCII
+/// alpha or `_`): bash only greedily reads a `$name` for a real identifier,
+/// so a positional/special param (`$1`, `$$`, `$#`) must NOT absorb the
+/// brace suffix's leading run (`set -- foo; echo $1{a,b}` → `fooa foob`,
+/// not merged into a bogus `$1a`/`$1b`). v341 (#44).
+fn merge_brace_name_suffix(parts: &mut Vec<WordPart>) {
+    let mut i = 0;
+    while i + 1 < parts.len() {
+        // Compute the merge (name-continuation run to move + the remaining
+        // literal) under a SCOPED immutable borrow, so it ends before the
+        // mutation below — avoids holding `&parts[i+1]` across `&mut parts[i]`.
+        let merge: Option<(String, String)> = {
+            let bare_var = matches!(
+                &parts[i],
+                WordPart::Var { name, quoted: false, braced: false, .. }
+                    if name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            );
+            match (bare_var, &parts[i + 1]) {
+                (
+                    true,
+                    WordPart::Literal {
+                        text,
+                        quoted: false,
+                    },
+                ) => {
+                    let run_len = text
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .unwrap_or(text.len());
+                    if run_len > 0 {
+                        Some((text[..run_len].to_string(), text[run_len..].to_string()))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+        match merge {
+            Some((run, rest)) => {
+                if let WordPart::Var { name, .. } = &mut parts[i] {
+                    name.push_str(&run);
+                }
+                if rest.is_empty() {
+                    parts.remove(i + 1);
+                } else {
+                    parts[i + 1] = WordPart::Literal {
+                        text: rest,
+                        quoted: false,
+                    };
+                }
+                // Do not advance i — a further literal may now be adjacent.
+            }
+            None => i += 1,
+        }
+    }
 }
 
 fn flush_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: bool) {
@@ -9072,6 +9172,74 @@ mod array_parse_tests {
         }];
         let out = brace_expand_parts(parts).unwrap();
         assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn brace_expand_parts_merges_bare_identifier_name() {
+        // v341 (#44): `$var{x,y}` -> `[Var{"varx"}]` / `[Var{"vary"}]` — bash
+        // brace-expands textually before parameter expansion, so the brace
+        // suffix's leading name-continuation run merges into a bare $name.
+        let parts = vec![
+            WordPart::Var {
+                name: "var".to_string(),
+                quoted: false,
+                braced: false,
+            },
+            WordPart::Literal {
+                text: "{x,y}".to_string(),
+                quoted: false,
+            },
+        ];
+        let out = brace_expand_parts(parts).unwrap();
+        assert_eq!(out.len(), 2);
+        for (product, suffix) in out.iter().zip(["varx", "vary"]) {
+            assert_eq!(
+                product,
+                &vec![WordPart::Var {
+                    name: suffix.to_string(),
+                    quoted: false,
+                    braced: false,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn brace_expand_parts_does_not_merge_positional_param() {
+        // v341 (#44, final review): a positional/special param (`$1`) is NOT
+        // an identifier — bash's greedy $name read never absorbs a following
+        // brace suffix for it, unlike a real bare $name. `$1{a,b}` must stay
+        // `[Var{"1"}, Literal{"a"}]` / `[Var{"1"}, Literal{"b"}]`, NOT merge
+        // into a bogus `Var{"1a"}`/`Var{"1b"}`.
+        let parts = vec![
+            WordPart::Var {
+                name: "1".to_string(),
+                quoted: false,
+                braced: false,
+            },
+            WordPart::Literal {
+                text: "{a,b}".to_string(),
+                quoted: false,
+            },
+        ];
+        let out = brace_expand_parts(parts).unwrap();
+        assert_eq!(out.len(), 2);
+        for (product, suffix) in out.iter().zip(["a", "b"]) {
+            assert_eq!(
+                product,
+                &vec![
+                    WordPart::Var {
+                        name: "1".to_string(),
+                        quoted: false,
+                        braced: false,
+                    },
+                    WordPart::Literal {
+                        text: suffix.to_string(),
+                        quoted: false,
+                    },
+                ]
+            );
+        }
     }
 
     // --- process substitution lexer tests ---
