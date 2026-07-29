@@ -2265,14 +2265,13 @@ impl Shell {
                     let existing = self.lookup_indexed_element(&n, idx).unwrap_or_default();
                     if self.is_integer(&n) {
                         // Integer array: `a[i]+=x` is arithmetic ADDITION (bash),
-                        // not concat-then-coerce (v344 #327). Base the sum on 0
-                        // when the element is absent so `(0)+(x)` parses.
-                        let base = if existing.is_empty() {
-                            "0".to_string()
-                        } else {
-                            existing
-                        };
-                        eval_integer_coerce(self, &format!("({base})+({v})"))
+                        // not concat-then-coerce (v344 #327). Default an EMPTY
+                        // operand (absent element, or `arr+=`/`arr+=""`) to 0 so
+                        // bash's `base + 0 == base` holds — empty parens `()`
+                        // would otherwise be an arith parse error → 0, losing base.
+                        let base = if existing.is_empty() { "0" } else { &existing };
+                        let rhs = if v.is_empty() { "0" } else { &v };
+                        eval_integer_coerce(self, &format!("({base})+({rhs})"))
                     } else {
                         existing + &v
                     }
@@ -2308,13 +2307,12 @@ impl Shell {
                         .unwrap_or_default();
                     if self.is_integer(&n) {
                         // Integer assoc array: `a[k]+=x` is arithmetic ADDITION
-                        // (bash), not concat-then-coerce (v344 #327).
-                        let base = if existing.is_empty() {
-                            "0".to_string()
-                        } else {
-                            existing
-                        };
-                        eval_integer_coerce(self, &format!("({base})+({v})"))
+                        // (bash), not concat-then-coerce (v344 #327). Empty operand
+                        // (absent key, or `f+=`/`f+=""`) defaults to 0 so
+                        // `base + 0 == base` — see the indexed arm for why.
+                        let base = if existing.is_empty() { "0" } else { &existing };
+                        let rhs = if v.is_empty() { "0" } else { &v };
+                        eval_integer_coerce(self, &format!("({base})+({rhs})"))
                     } else {
                         existing + &v
                     }

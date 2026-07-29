@@ -30,6 +30,12 @@ check "int indexed grows"        'declare -ai a=(10); a+=5; a[0]+=100; echo "${a
 check "int assoc a[k]+=n"        'declare -Ai m=([k]=10); m[k]+=5; echo "${m[k]}"'
 check "non-int indexed arr+=z"   'a=(x y); a+=z; echo "${a[0]}"'
 check "non-int indexed a[i]+=z"  'a=(x y); a[1]+=z; echo "${a[1]}"'
+# empty RHS on integer array += is base+0 (keeps base), not a reset to 0
+check "int indexed arr+= empty"  'declare -ai a=(10 20); a+=""; echo "${a[0]}"'
+check "int indexed a[i]+= empty" 'declare -ai a=(10 20); a[0]+=""; echo "${a[0]}"'
+check "int assoc a[k]+= empty"   'declare -Ai m=([k]=10); m[k]+=""; echo "${m[k]}"'
+check "int indexed += unset"     'declare -ai a=(10); u=; a+=$u; echo "${a[0]}"'
+check "int indexed += rhs expr"  'declare -ai a=(10); a+=2+3; echo "${a[0]}"'
 
 # --- Root C: runtime POSIXLY_CORRECT toggles posix mode ---
 check "runtime posixly persist"  'POSIXLY_CORRECT=1; x=2; x+=5 eval "echo hi"; echo "$x"'

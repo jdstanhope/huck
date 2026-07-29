@@ -697,6 +697,33 @@ fn integer_assoc_element_append_is_arithmetic() {
     );
 }
 
+// v344 (#327) Root B regression: an EMPTY RHS on an integer array element `+=`
+// is arithmetic `base + 0`, keeping the base — NOT a parse error that resets to
+// 0 (bash evaluates an empty arithmetic operand as 0). Guards `arr+=`/`arr+=""`
+// and `f[k]+=$unset`.
+#[test]
+fn integer_indexed_element_append_empty_rhs_keeps_base() {
+    let mut sh = Shell::new();
+    sh.set_indexed_element("a", 0, "10".to_string()).unwrap();
+    sh.mark_integer("a");
+    sh.append_indexed_element("a", 0, "").unwrap();
+    assert_eq!(sh.lookup_indexed_element("a", 0).as_deref(), Some("10"));
+}
+
+#[test]
+fn integer_assoc_element_append_empty_rhs_keeps_base() {
+    let mut sh = Shell::new();
+    sh.declare_associative("m").unwrap();
+    sh.mark_integer("m");
+    sh.set_associative_element("m", "k".to_string(), "10".to_string())
+        .unwrap();
+    sh.append_associative_element("m", "k", "").unwrap();
+    assert_eq!(
+        sh.lookup_associative_element("m", "k").as_deref(),
+        Some("10")
+    );
+}
+
 // v344 (#327) Root C: assigning POSIXLY_CORRECT at runtime enables posix mode,
 // while still storing the variable (unlike RANDOM/SECONDS).
 #[test]
