@@ -676,7 +676,10 @@ fn integer_assoc_first_append_bases_on_zero() {
     sh.declare_associative("f").unwrap();
     sh.mark_integer("f");
     sh.append_associative_element("f", "0", "1").unwrap();
-    assert_eq!(sh.lookup_associative_element("f", "0").as_deref(), Some("1"));
+    assert_eq!(
+        sh.lookup_associative_element("f", "0").as_deref(),
+        Some("1")
+    );
 }
 
 // Integer associative element append on an existing key adds arithmetically.
@@ -688,7 +691,10 @@ fn integer_assoc_element_append_is_arithmetic() {
     sh.set_associative_element("m", "k".to_string(), "10".to_string())
         .unwrap();
     sh.append_associative_element("m", "k", "5").unwrap();
-    assert_eq!(sh.lookup_associative_element("m", "k").as_deref(), Some("15"));
+    assert_eq!(
+        sh.lookup_associative_element("m", "k").as_deref(),
+        Some("15")
+    );
 }
 
 // v344 (#327) Root C: assigning POSIXLY_CORRECT at runtime enables posix mode,
