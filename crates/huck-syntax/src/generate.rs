@@ -690,7 +690,7 @@ fn part_to_source(part: &WordPart) -> String {
                 escape_bareword(text)
             }
         }
-        WordPart::Var { name, quoted } => quote_if(*quoted, format!("${name}")),
+        WordPart::Var { name, quoted, .. } => quote_if(*quoted, format!("${name}")),
         WordPart::LastStatus { quoted } => quote_if(*quoted, "$?".to_string()),
         WordPart::AllArgs { quoted, joined } => {
             quote_if(*quoted, (if *joined { "$*" } else { "$@" }).to_string())
@@ -1552,6 +1552,7 @@ mod tests {
                 WordPart::Var {
                     name: "a".into(),
                     quoted: true,
+                    braced: false,
                 },
                 WordPart::Literal {
                     text: " ".into(),
@@ -1560,6 +1561,7 @@ mod tests {
                 WordPart::Var {
                     name: "b".into(),
                     quoted: true,
+                    braced: false,
                 },
             ],
         }]);
