@@ -179,7 +179,10 @@ fn kv_string_whole(var: &Variable) -> String {
             parts.join(" ")
         }
         VarValue::Associative(pairs) => {
-            let parts: Vec<String> = pairs
+            // L-44 (#32): render in bash hash-table iteration order, not
+            // insertion order. Local view only — storage stays insertion-ordered.
+            let ordered = crate::assoc_order::assoc_ordered_pairs(pairs);
+            let parts: Vec<String> = ordered
                 .iter()
                 .map(|(k, v)| {
                     format!(
@@ -246,10 +249,13 @@ fn kv_words_whole(var: &Variable) -> Vec<String> {
             out
         }
         VarValue::Associative(pairs) => {
-            let mut out = Vec::with_capacity(pairs.len() * 2);
-            for (k, v) in pairs {
-                out.push(k.clone());
-                out.push(v.clone());
+            // L-44 (#32): render in bash hash-table iteration order, not
+            // insertion order. Local view only — storage stays insertion-ordered.
+            let ordered = crate::assoc_order::assoc_ordered_pairs(pairs);
+            let mut out = Vec::with_capacity(ordered.len() * 2);
+            for (k, v) in ordered {
+                out.push(k);
+                out.push(v);
             }
             out
         }

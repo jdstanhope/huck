@@ -1127,7 +1127,10 @@ fn render_declare_value_part(var: &crate::shell_state::Variable) -> String {
             format!("=({})", parts.join(" "))
         }
         VarValue::Associative(pairs) => {
-            let parts: Vec<String> = pairs
+            // L-44 (#32): render in bash hash-table iteration order, not
+            // insertion order. Local view only — storage stays insertion-ordered.
+            let ordered = crate::assoc_order::assoc_ordered_pairs(pairs);
+            let parts: Vec<String> = ordered
                 .iter()
                 .map(|(k, v)| format!("[{}]={}", quote_subscript_key(k), declare_p_value_quote(v)))
                 .collect();

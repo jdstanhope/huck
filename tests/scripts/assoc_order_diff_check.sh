@@ -44,5 +44,18 @@ check_known_divergence "assoc slice" "$S; printf '<%s>' \"\${a[@]:1:3}\"; echo"
 C='declare -A a; a[dup0]=1; a[dup1]=2; a[x]=3; a[dup0]=9; unset "a[x]"'
 check "assoc upd/unset !@" "$C; printf '<%s>' \"\${!a[@]}\"; echo"
 
+# Task 3: render/transform sites — declare -p / bare declare / @A / @K / @k.
+check "assoc declare -p"  "$S; declare -p a"
+check "assoc bare declare" "$S; declare -A | grep '^declare -A a='"
+# Note: @A whole-array uses `echo`, not `printf '%s\n'` — matches the
+# array_transforms_diff_check.sh precedent. bash's `[@]`+`@A` combo has an
+# orthogonal, pre-existing field-splitting quirk (the declare string is
+# split into words at top-level spaces even though quoted) that `printf`
+# would expose; `echo` re-joins with single spaces and hides it, isolating
+# this case to what this task targets: iteration order.
+check "assoc @A"           "$S; echo \"\${a[@]@A}\""
+check "assoc @K"           "$S; printf '%s\n' \"\${a[@]@K}\""
+check "assoc @k"           "$S; printf '<%s>' \"\${a[@]@k}\"; echo"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
