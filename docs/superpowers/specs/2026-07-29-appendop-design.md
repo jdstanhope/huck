@@ -31,14 +31,21 @@ associative-variant dispatch rejects it.
 not valid on associative array")` for `a.append` and `"scalar assignment not
 valid …"` otherwise.
 
-**Fix:** when `a.append`, expand the RHS (`expand_assignment(&a.value, shell)`,
-matching the non-assoc path) and `return
-shell.append_associative_element(name, "0", &s).map_err(|_| ())`. That
-primitive routes through `assign()` with `AssignKind::Append`, so the Root B
-integer fix below applies automatically to integer associative arrays. Leave
-the **non-append** case (`f=zero`, a whole-scalar assignment to an associative
-array) erroring exactly as today — that is a genuine bash type-mismatch and is
-out of scope.
+**Fix:** expand the RHS (`param_expansion::expand_word_to_string(&a.value,
+shell)`, matching the sibling associative element arm) and route to key `"0"`:
+`append_associative_element(name, "0", &s)` when `a.append`, else
+`set_associative_element(name, "0".to_string(), s)`. Both route through
+`assign()`, so the Root B integer fix below applies automatically to integer
+associative arrays.
+
+**Correction (found during implementation):** the original spec claimed the
+**non-append** case (`f=zero`) is a bash type-mismatch that should keep
+erroring. That was wrong — verified against bash 5.2.21: `declare -A
+f=([a]=1); f=zero` assigns `f[0]="zero"` and exits 0 (a bare scalar assignment
+to an array name targets element `[0]` for associative arrays too, exactly like
+indexed). So huck's pre-existing `scalar assignment not valid on associative
+array` error was itself a divergence; Root A now fixes **both** the set and the
+append forms.
 
 ## Root B — integer array element append honors `-i` (arithmetic add)
 
@@ -137,8 +144,8 @@ clear is included for correctness and is verified not to regress any category.
 
 ## Scope / non-goals
 
-- NOT changing non-append scalar assignment to an associative array
-  (`f=zero`) — that stays a bash type-mismatch error.
+- Root A covers both `f=zero` (set) and `f+=zero` (append) → key `"0"`, per the
+  correction above (bash accepts both).
 - NOT a broader posix-mode audit — Root C wires only the assign/unset toggle
   of the `posix` flag; the flag's existing single consumer
   (special-builtin prefix-assignment persistence) is unchanged.
@@ -147,8 +154,8 @@ clear is included for correctness and is verified not to regress any category.
 
 ## Summary of touched files
 
-- `crates/huck-engine/src/executor.rs` — Root A: assoc `+=scalar` append arm
-  expands the RHS and calls `append_associative_element(name, "0", &s)`.
+- `crates/huck-engine/src/executor.rs` — Root A: assoc bare-scalar arm routes
+  `f=v`/`f+=v` to key `"0"` (`set_`/`append_associative_element`).
 - `crates/huck-engine/src/shell_state.rs` — Root B: `assign()` Element+Append
   integer arms arithmetic-add. Root C: `reseed_special_on_assign`
   POSIXLY_CORRECT case (returns `false`); `unset`/`unset_var` guarded clear.
