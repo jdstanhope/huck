@@ -646,3 +646,107 @@ fn should_hangup_skips_marked_and_done_jobs() {
     let job = t.iter().find(|j| j.id == id).unwrap();
     assert!(super::should_hangup(job));
 }
+
+// v344 (#327) Root B: `arr[i]+=x` on an INTEGER array is arithmetic addition
+// (bash), not concat-then-coerce. `declare -ai a=(2); a[0]+=1` → "3", not "21".
+#[test]
+fn integer_indexed_element_append_is_arithmetic() {
+    let mut sh = Shell::new();
+    sh.set_indexed_element("a", 0, "2".to_string()).unwrap();
+    sh.mark_integer("a");
+    sh.append_indexed_element("a", 0, "1").unwrap();
+    assert_eq!(sh.lookup_indexed_element("a", 0).as_deref(), Some("3"));
+}
+
+// A NON-integer array keeps string concatenation for element append.
+#[test]
+fn noninteger_indexed_element_append_concats() {
+    let mut sh = Shell::new();
+    sh.set_indexed_element("a", 0, "2".to_string()).unwrap();
+    sh.append_indexed_element("a", 0, "1").unwrap();
+    assert_eq!(sh.lookup_indexed_element("a", 0).as_deref(), Some("21"));
+}
+
+// First append to an absent element of an integer associative array bases the
+// arithmetic on 0 (empty operand would otherwise be an arith syntax error → 0
+// via a different path; the empty-string guard makes `(0)+(1)` explicit).
+#[test]
+fn integer_assoc_first_append_bases_on_zero() {
+    let mut sh = Shell::new();
+    sh.declare_associative("f").unwrap();
+    sh.mark_integer("f");
+    sh.append_associative_element("f", "0", "1").unwrap();
+    assert_eq!(
+        sh.lookup_associative_element("f", "0").as_deref(),
+        Some("1")
+    );
+}
+
+// Integer associative element append on an existing key adds arithmetically.
+#[test]
+fn integer_assoc_element_append_is_arithmetic() {
+    let mut sh = Shell::new();
+    sh.declare_associative("m").unwrap();
+    sh.mark_integer("m");
+    sh.set_associative_element("m", "k".to_string(), "10".to_string())
+        .unwrap();
+    sh.append_associative_element("m", "k", "5").unwrap();
+    assert_eq!(
+        sh.lookup_associative_element("m", "k").as_deref(),
+        Some("15")
+    );
+}
+
+// v344 (#327) Root B regression: an EMPTY RHS on an integer array element `+=`
+// is arithmetic `base + 0`, keeping the base — NOT a parse error that resets to
+// 0 (bash evaluates an empty arithmetic operand as 0). Guards `arr+=`/`arr+=""`
+// and `f[k]+=$unset`.
+#[test]
+fn integer_indexed_element_append_empty_rhs_keeps_base() {
+    let mut sh = Shell::new();
+    sh.set_indexed_element("a", 0, "10".to_string()).unwrap();
+    sh.mark_integer("a");
+    sh.append_indexed_element("a", 0, "").unwrap();
+    assert_eq!(sh.lookup_indexed_element("a", 0).as_deref(), Some("10"));
+}
+
+#[test]
+fn integer_assoc_element_append_empty_rhs_keeps_base() {
+    let mut sh = Shell::new();
+    sh.declare_associative("m").unwrap();
+    sh.mark_integer("m");
+    sh.set_associative_element("m", "k".to_string(), "10".to_string())
+        .unwrap();
+    sh.append_associative_element("m", "k", "").unwrap();
+    assert_eq!(
+        sh.lookup_associative_element("m", "k").as_deref(),
+        Some("10")
+    );
+}
+
+// v344 (#327) Root C: assigning POSIXLY_CORRECT at runtime enables posix mode,
+// while still storing the variable (unlike RANDOM/SECONDS).
+#[test]
+fn runtime_posixly_correct_enables_posix() {
+    let mut sh = Shell::new();
+    assert!(!sh.shell_options.posix);
+    sh.export_set("POSIXLY_CORRECT", "1".to_string());
+    assert!(sh.shell_options.posix);
+    assert_eq!(sh.lookup_var("POSIXLY_CORRECT").as_deref(), Some("1"));
+}
+
+// Unsetting POSIXLY_CORRECT turns posix mode back off (both unset paths).
+#[test]
+fn unset_posixly_correct_disables_posix() {
+    let mut sh = Shell::new();
+    sh.export_set("POSIXLY_CORRECT", "1".to_string());
+    assert!(sh.shell_options.posix);
+    sh.unset_var("POSIXLY_CORRECT");
+    assert!(!sh.shell_options.posix);
+
+    // internal `unset` path clears it too
+    sh.export_set("POSIXLY_CORRECT", "yes".to_string());
+    assert!(sh.shell_options.posix);
+    sh.unset("POSIXLY_CORRECT");
+    assert!(!sh.shell_options.posix);
+}

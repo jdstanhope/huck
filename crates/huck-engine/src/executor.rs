@@ -8079,18 +8079,20 @@ pub(crate) fn apply_one_assignment(
                 }
             }
             (AssignTarget::Bare(name), None) => {
-                crate::sh_error_to!(
-                    shell,
-                    err,
-                    None,
-                    "{name}: {} not valid on associative array",
-                    if a.append {
-                        "scalar append"
-                    } else {
-                        "scalar assignment"
-                    }
-                );
-                return Err(());
+                // bash: a bare scalar assignment to an array name targets element
+                // [0] — `arr=v` == `arr[0]=v`, `arr+=v` == `arr[0]+=v` — for both
+                // indexed AND associative arrays (v344 #327). huck already did
+                // this for indexed arrays; mirror it here for associative (key
+                // "0"). The integer attribute is honored inside assign().
+                let val = crate::param_expansion::expand_word_to_string(&a.value, shell);
+                if a.append {
+                    return shell
+                        .append_associative_element(name, "0", &val)
+                        .map_err(|_| ());
+                }
+                return shell
+                    .set_associative_element(name, "0".to_string(), val)
+                    .map_err(|_| ());
             }
             (AssignTarget::Indexed { name, subscript }, None) => {
                 let key = crate::expand::eval_subscript_key(subscript, shell);

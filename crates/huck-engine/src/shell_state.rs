@@ -1482,6 +1482,14 @@ impl Shell {
                 self.shell_argv0 = value.to_string();
                 true
             }
+            // bash re-checks POSIXLY_CORRECT on every assignment: assigning it
+            // (any value) enables posix mode at runtime (v344 #327). Unlike the
+            // vars above, it is a real environment variable and MUST still be
+            // stored, so fall through by returning `false`.
+            "POSIXLY_CORRECT" => {
+                self.shell_options.posix = true;
+                false
+            }
             _ => false,
         }
     }
@@ -1826,6 +1834,11 @@ impl Shell {
     }
 
     pub fn unset(&mut self, name: &str) {
+        // bash: unsetting POSIXLY_CORRECT turns posix mode back off (v344 #327).
+        // The name guard makes this a no-op for every other variable.
+        if name == "POSIXLY_CORRECT" {
+            self.shell_options.posix = false;
+        }
         self.vars.remove(name);
     }
 
@@ -1860,6 +1873,10 @@ impl Shell {
     ///
     /// `Shell::unset` (plain `vars.remove`) is left for internal callers.
     pub fn unset_var(&mut self, name: &str) {
+        // bash: unsetting POSIXLY_CORRECT turns posix mode back off (v344 #327).
+        if name == "POSIXLY_CORRECT" {
+            self.shell_options.posix = false;
+        }
         // Nearest frame holding a snapshot for `name`, innermost-first
         // (the stack's top is the last element).
         let nearest = self
@@ -2245,13 +2262,27 @@ impl Shell {
                 let n = n.clone();
                 let idx = *idx;
                 let v = if op == AssignKind::Append {
-                    self.lookup_indexed_element(&n, idx).unwrap_or_default() + &v
+                    let existing = self.lookup_indexed_element(&n, idx).unwrap_or_default();
+                    if self.is_integer(&n) {
+                        // Integer array: `a[i]+=x` is arithmetic ADDITION (bash),
+                        // not concat-then-coerce (v344 #327). Default an EMPTY
+                        // operand (absent element, or `arr+=`/`arr+=""`) to 0 so
+                        // bash's `base + 0 == base` holds — empty parens `()`
+                        // would otherwise be an arith parse error → 0, losing base.
+                        let base = if existing.is_empty() { "0" } else { &existing };
+                        let rhs = if v.is_empty() { "0" } else { &v };
+                        eval_integer_coerce(self, &format!("({base})+({rhs})"))
+                    } else {
+                        existing + &v
+                    }
                 } else {
                     v
                 };
                 // Integer arrays (v-L49) coerce each element value via arith
                 // before case-fold, mirroring the scalar attribute order in
                 // `value_with_scalar_attrs`. Non-integer arrays are untouched.
+                // (For the integer-append branch above, `v` is already the
+                // numeric sum, so this re-coerce is a harmless no-op.)
                 let v = if self.is_integer(&n) {
                     eval_integer_coerce(self, &v)
                 } else {
@@ -2271,9 +2302,20 @@ impl Shell {
                 let n = n.clone();
                 let key = key.clone();
                 let v = if op == AssignKind::Append {
-                    self.lookup_associative_element(&n, &key)
-                        .unwrap_or_default()
-                        + &v
+                    let existing = self
+                        .lookup_associative_element(&n, &key)
+                        .unwrap_or_default();
+                    if self.is_integer(&n) {
+                        // Integer assoc array: `a[k]+=x` is arithmetic ADDITION
+                        // (bash), not concat-then-coerce (v344 #327). Empty operand
+                        // (absent key, or `f+=`/`f+=""`) defaults to 0 so
+                        // `base + 0 == base` — see the indexed arm for why.
+                        let base = if existing.is_empty() { "0" } else { &existing };
+                        let rhs = if v.is_empty() { "0" } else { &v };
+                        eval_integer_coerce(self, &format!("({base})+({rhs})"))
+                    } else {
+                        existing + &v
+                    }
                 } else {
                     v
                 };

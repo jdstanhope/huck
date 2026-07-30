@@ -2,6 +2,19 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v344 (#327, 2026-07-29 UTC):** `appendop` flipped to PASS (0-diff) —
+three `+=`-assignment roots: (A) a bare scalar assignment/append to an associative
+array name targets key `[0]` (`f=v`/`f+=v` == `f[0]=v`/`f[0]+=v`, matching bash for
+both indexed and associative; huck previously errored "scalar assignment not valid");
+(B) `arr[i]+=n` on an INTEGER array is arithmetic addition, not concat-then-coerce
+(`assign()` Element+Append arms now evaluate `(base)+(rhs)`; also fixes `arr+=n`);
+(C) runtime `POSIXLY_CORRECT=1` now toggles posix mode (`reseed_special_on_assign`
+sets `shell_options.posix` and returns false so the var is still stored; unset clears
+it), so posix-mode special-builtin prefix-assignment persistence works mid-script.
+Summary PASS 31→32, FAIL 51→50. Only `appendop` flipped — verified by diffing the
+full branch PASS-set against the v343 baseline (exactly the 31 + `appendop`; NO
+regressions, important since Root C touches a global mode flag). #323 stays open for
+the remaining assoc/`quotearray` cluster residuals.
 **Updated by v343 (#325, 2026-07-29 UTC):** NO category movement (PASS stays 31/51)
 — a behavior-preserving performance refactor: associative arrays are now backed by
 an order-preserving `AssocMap` (`HashMap<key,idx>` + insertion-ordered Vec; O(1)
@@ -223,15 +236,15 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 ## Summary
 
 - Categories run: 82
-- PASS: 31
-- FAIL: 51
+- PASS: 32
+- FAIL: 50
 - TIMEOUT: 0
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
 
-(Counts refreshed by the v342 full-runner sweep, 2026-07-29 UTC — authoritative.
-The 31 PASS categories are: array2, braces, casemod, cprint, dbg-support2, dynvar,
-extglob2, extglob3, func, getopts, herestr, ifs, input-test, invert, iquote,
+(Counts refreshed by the v344 full-runner sweep, 2026-07-29 UTC — authoritative.
+The 32 PASS categories are: appendop, array2, braces, casemod, cprint, dbg-support2,
+dynvar, extglob2, extglob3, func, getopts, herestr, ifs, input-test, invert, iquote,
 lastpipe, nquote, nquote1, nquote2, nquote3, nquote5, parser, posix2, posixpat,
 precedence, procsub, rhs-exp, set-x, strip, tilde, tilde2. Some per-category FAIL
 rows below still lag reality — the count above is the authoritative signal.)
@@ -250,7 +263,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | Category | Status | Note |
 |---|---|---|
 | alias | FAIL | Error-message format divergence — huck uses its own name as the command-not-found prefix rather than the running script's filename; also some alias-expansion differences in non-interactive script mode. |
-| appendop | FAIL | L-43 (readonly-assignment abort) RESOLVED by v313 (#31). Remaining: an array-element append subscript form that huck fails to parse; assoc-array iteration-order divergence (L-44). |
+| appendop | PASS | v344 (#327): 0-diff PASS. Three `+=` roots — (A) bare scalar assign/append to an associative array targets key `[0]` (matching bash for both indexed and associative; huck previously errored); (B) integer-array element `+=` is arithmetic addition, not concat-then-coerce (`assign()` Element+Append arms); (C) runtime `POSIXLY_CORRECT` toggles posix mode (`reseed_special_on_assign` + unset), enabling posix-mode prefix-assignment persistence mid-script. |
 | arith | FAIL | The `set -o posix` cascade was resolved in v215 (test now runs end-to-end). v216 aligns arith error-message format with bash: the source-file + line-number prologue, leading-trimmed expression echo, and `(error token is "...")` suffix now match byte-for-byte for the both-error cases verified by `arith_error_diff_check.sh` (10/10 PASS). Remaining failures are the behavioral divergences catalogued in L-56: signed-integer overflow wrapping (literals ≥ 2^63 wrap to min-int in bash; huck rejects as out-of-range); `++`/`--` applied to non-lvalue literals (bash treats as repeated unary `+`/`-` and yields the number; huck errors); lazy dead-branch evaluation in ternary expressions (dead branch must not be evaluated even if it contains an unset variable); array-element lvalue expressions inside arith (`a[n]=n++`); substring offset/length with arith ternary colons; standalone `(( ))` command line-number attribution (off vs bash because `Command::Arith` carries no source line); and minor error-kind wording for malformed base-N numbers. |
 | arith-for | FAIL | The `declare -f` trailing-space format divergence is resolved by v218. Remaining divergences: huck leaves empty `for ((` sections empty (`for ((; i<3; i++))`), whereas bash normalizes a missing section to `1` (`for ((1; i<3; i++))`) — an arith-for reconstruction-fidelity gap (L-59); and error-message wording for malformed `for ((` headers (wrong section count or a quoted string as a section value) still differs between huck and bash. |
 | array | FAIL | `set +a` (all-export off) not supported, misconfiguring the test environment. Also an array literal whose element contains a background `&` operator is parsed differently than bash expects. |
