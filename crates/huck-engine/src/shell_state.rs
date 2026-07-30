@@ -1002,14 +1002,21 @@ fn builtin_hostname() -> String {
 /// no background. NEVER executes the value. Returns `None` to skip (parse error,
 /// trailing tokens, non-function, name mismatch, invalid name) — Shellshock-safe.
 fn parse_imported_function(name: &str, value: &str) -> Option<Box<crate::command::Command>> {
-    // name must be a plain identifier (huck functions are POSIX identifiers).
+    // bash function names are NOT restricted to POSIX identifiers (`foo-a` is
+    // routine), so we don't require one here. Instead: (1) an explicit
+    // conservative denylist rejects shell-metacharacters that could turn the
+    // reconstructed "<name> <value>" source into something other than a lone
+    // function definition — whitespace/control chars (incl. newline) and
+    // `;`/`&`/`|`/`$`/`` ` ``/`(`/`=` are rejected outright; (2) the
+    // parse+name-match guard below is the REAL Shellshock defense (single
+    // `FunctionDef` named exactly `name`, nothing after `}`, no background) —
+    // this denylist is defense-in-depth on top of it, not a replacement.
     if name.is_empty()
-        || !name
-            .chars()
-            .next()
-            .map(|c| c == '_' || c.is_ascii_alphabetic())
-            .unwrap_or(false)
-        || !name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+        || name.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(c, ';' | '&' | '|' | '$' | '`' | '(' | '=')
+        })
     {
         return None;
     }

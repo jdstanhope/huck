@@ -1415,11 +1415,20 @@ fn builtin_export_decl(
                 // export -nf NAME: remove the export mark (lenient — no-op if not
                 // exported, matching bash's -n).
                 shell.unmark_function_exported(name);
-            } else if shell.functions.contains_key(name) {
-                shell.mark_function_exported(name);
-            } else {
+            } else if !shell.functions.contains_key(name) {
                 crate::sh_error_to!(shell, err, None, "export: {name}: not a function");
                 any_error = true;
+            } else if name.contains('=') || name.contains('/') {
+                // `=` can't be encoded into `BASH_FUNC_<name>%%` (the env-var
+                // key would split at the `=`); `/` is rejected too — matches
+                // bash 5.2.21 empirically (`function foo=bar`/`function
+                // /bin/echo` define fine but `export -f` on either name gives
+                // "cannot export", even though hyphens and most other
+                // punctuation in a name export just fine).
+                crate::sh_error_to!(shell, err, None, "export: {name}: cannot export");
+                any_error = true;
+            } else {
+                shell.mark_function_exported(name);
             }
             continue;
         }

@@ -49,6 +49,48 @@ fn huck_imports_bash_shaped_env() {
 }
 
 #[test]
+fn huck_imports_hyphenated_bash_shaped_env() {
+    // R1 (#339): bash routinely uses hyphens in function names (`foo-a`);
+    // huck's import must accept them too, matching bash.
+    let (out, _) = run(
+        huck(),
+        &["-c", "foo-a"],
+        &[("BASH_FUNC_foo-a%%", "() { echo exportfunc ok 2; }")],
+    );
+    assert_eq!(
+        out, "exportfunc ok 2\n",
+        "huck didn't import hyphenated BASH_FUNC env: {out:?}"
+    );
+}
+
+#[test]
+fn huck_hyphenated_function_round_trips_to_child_huck() {
+    // Full round-trip: define a hyphenated-name function, export -f it, and
+    // have a CHILD huck import + run it via the inherited BASH_FUNC_ env var.
+    let cmd = format!(
+        "foo-a(){{ echo exportfunc ok 2; }}; export -f foo-a; {} -c foo-a",
+        huck()
+    );
+    let (out, _) = run(huck(), &["-c", &cmd], &[]);
+    assert_eq!(
+        out, "exportfunc ok 2\n",
+        "hyphenated round-trip failed: {out:?}"
+    );
+}
+
+#[test]
+fn export_f_unencodable_name_cannot_export_rc1() {
+    // R4 (#339): a function name containing `=` can't be encoded as
+    // BASH_FUNC_<name>%%, so bash (and now huck) reject the export.
+    let (_o, rc) = run(
+        huck(),
+        &["-c", "function foo=bar { :; }; export -f foo=bar"],
+        &[],
+    );
+    assert_eq!(rc, 1);
+}
+
+#[test]
 fn export_f_not_a_function_rc1() {
     let (_o, rc) = run(huck(), &["-c", "export -f nope"], &[]);
     assert_eq!(rc, 1);
