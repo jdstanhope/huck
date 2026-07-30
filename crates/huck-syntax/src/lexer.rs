@@ -179,6 +179,17 @@ impl<'a> CharCursor<'a> {
         self.peeked.as_ref()
     }
 
+    /// v345 (#329, R4): true when an injection frame is on the stack but EVERY
+    /// frame is exhausted, so the next `peek()`/`next()` reads from the PARENT
+    /// source — i.e. a `peek()` here straddles the injected-alias-body → parent
+    /// boundary. Used to stop an alias body's trailing digit-run from gluing
+    /// onto a following PARENT redirect operator as an fd-prefix: bash keeps the
+    /// body's `0` as a plain word (`alias foo='echo 0'; foo>&2` runs `echo 0`
+    /// with the redirect applied to the command, not `echo 0>&2`).
+    pub(crate) fn peek_crosses_injection_boundary(&self) -> bool {
+        !self.injected.is_empty() && self.injected.iter().all(|f| f.exhausted())
+    }
+
     /// Byte offset of the next char to be produced (start of the next token
     /// when the cursor sits on a token boundary). Equals `s.len()` at EOF.
     /// v266: while an injected alias body is active AND still has content, this
@@ -5340,6 +5351,12 @@ impl<'a> Lexer<'a> {
                 if !in_array_value
                     && at_word_start
                     && matches!(self.cursor.peek(), Some('<') | Some('>'))
+                    // v345 (#329, R4): the `<`/`>` must be in the SAME source as
+                    // the digit run. When the run is the last content of an
+                    // injected alias body, `peek()` falls through to the parent —
+                    // that redirect belongs to the command, not this word, so the
+                    // digit run stays a plain Lit (`alias foo='echo 0'; foo>&2`).
+                    && !self.cursor.peek_crosses_injection_boundary()
                 {
                     // Oracle special-case: a bare `1` glued to `>` (`1>`, `1>>`,
                     // `1>&2`, `1>|`) is a plain STDOUT redirect with the DEFAULT
@@ -6669,6 +6686,15 @@ impl<'a> Lexer<'a> {
         // frame), so the anchor propagates outward-most automatically.
         self.cursor
             .push_injection(body.clone(), name.clone(), name_span);
+        // v345 (#329, R3): the body's first char is a fresh command-word start —
+        // `name`'s own Lit just cleared this flag when IT was scanned, but the
+        // injected body replaces that word entirely, so the flag must be set
+        // again here. Without this, a body beginning with `#` (e.g. `alias
+        // comment='#'`) would scan as a literal word (`#: command not found`)
+        // instead of hitting the comment gate (`Some('#') if
+        // self.cmd_at_word_start`) the way a literal leading `#` does — bash
+        // treats an alias expanding to a leading `#` as starting a comment.
+        self.cmd_at_word_start = true;
         // Re-drive: lex the body's first command word so a DIFFERENT leading alias
         // still expands. `name` is now on the stack, so it cannot re-expand itself.
         self.maybe_expand_command_alias()?;

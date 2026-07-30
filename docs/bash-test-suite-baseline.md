@@ -2,6 +2,28 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v345 (#329, 2026-07-30 UTC):** `alias` flipped to PASS (0-diff) —
+four alias-expansion roots: **R2** a command-word alias preceded by leading
+redirections is now expanded (`< /dev/null foo`), order-sensitive vs
+assignment prefixes (bash suppresses when a redirect follows an assignment
+word: `a=1 < /dev/null foo` does NOT expand); **R3** an alias whose expansion
+begins with `#` starts a comment — a lexer part (`cmd_at_word_start=true` after
+`push_injection`, so the injected `#` hits the word-start comment gate) plus a
+parser part (an alias-to-comment empties the command position, so
+`parse_sequence`/`parse_one_unit`'s first stage treats a genuinely-empty
+position as `Ok(None)` via an internal `EmptyCommandPosition` sentinel, while a
+mandatory command missing after a connector stays a hard error); **R1** a
+leading `name=(…)` array literal in an alias body now parses (fixed as a
+side-effect of R3's word-start flag — same root); **R4** an alias body ending
+in a numeric word glued to a following redirect (`alias foo='echo 0'; foo>&2`)
+no longer mis-glues the digit as the redirect's fd-prefix (a lexer fd-prefix
+probe that peeked across the injected-body→parent boundary). Summary PASS
+32→33, FAIL 50→49. Only `alias` flipped — full branch PASS-set diffed against
+the v344 baseline is exactly the 32 + `alias`, NO regressions (R2/R3/R4 touch
+broad front-end paths — verified explicitly). Follow-up: a pre-existing
+`$?`-reset-on-empty/comment/blank-line divergence (huck resets `$?` to 0; bash
+keeps it) surfaced during review — NOT caused by v345 (reproduces on a literal
+comment line); file separately.
 **Updated by v344 (#327, 2026-07-29 UTC):** `appendop` flipped to PASS (0-diff) —
 three `+=`-assignment roots: (A) a bare scalar assignment/append to an associative
 array name targets key `[0]` (`f=v`/`f+=v` == `f[0]=v`/`f[0]+=v`, matching bash for
@@ -236,14 +258,14 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 ## Summary
 
 - Categories run: 82
-- PASS: 32
-- FAIL: 50
+- PASS: 33
+- FAIL: 49
 - TIMEOUT: 0
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
 
-(Counts refreshed by the v344 full-runner sweep, 2026-07-29 UTC — authoritative.
-The 32 PASS categories are: appendop, array2, braces, casemod, cprint, dbg-support2,
+(Counts refreshed by the v345 full-runner sweep, 2026-07-30 UTC — authoritative.
+The 33 PASS categories are: alias, appendop, array2, braces, casemod, cprint, dbg-support2,
 dynvar, extglob2, extglob3, func, getopts, herestr, ifs, input-test, invert, iquote,
 lastpipe, nquote, nquote1, nquote2, nquote3, nquote5, parser, posix2, posixpat,
 precedence, procsub, rhs-exp, set-x, strip, tilde, tilde2. Some per-category FAIL
@@ -262,7 +284,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 
 | Category | Status | Note |
 |---|---|---|
-| alias | FAIL | Error-message format divergence — huck uses its own name as the command-not-found prefix rather than the running script's filename; also some alias-expansion differences in non-interactive script mode. |
+| alias | PASS | v345 (#329): 0-diff PASS. Four alias-expansion roots — R2 command-word alias after leading redirections (order-sensitive vs assignment prefixes); R3 alias expanding to a leading `#` starts a comment (lexer `cmd_at_word_start` after injection + parser empty-command-position handling); R1 leading `name=(…)` array literal in an alias body (side-effect of R3's word-start flag); R4 alias body trailing number not glued to a parent fd-redirect. |
 | appendop | PASS | v344 (#327): 0-diff PASS. Three `+=` roots — (A) bare scalar assign/append to an associative array targets key `[0]` (matching bash for both indexed and associative; huck previously errored); (B) integer-array element `+=` is arithmetic addition, not concat-then-coerce (`assign()` Element+Append arms); (C) runtime `POSIXLY_CORRECT` toggles posix mode (`reseed_special_on_assign` + unset), enabling posix-mode prefix-assignment persistence mid-script. |
 | arith | FAIL | The `set -o posix` cascade was resolved in v215 (test now runs end-to-end). v216 aligns arith error-message format with bash: the source-file + line-number prologue, leading-trimmed expression echo, and `(error token is "...")` suffix now match byte-for-byte for the both-error cases verified by `arith_error_diff_check.sh` (10/10 PASS). Remaining failures are the behavioral divergences catalogued in L-56: signed-integer overflow wrapping (literals ≥ 2^63 wrap to min-int in bash; huck rejects as out-of-range); `++`/`--` applied to non-lvalue literals (bash treats as repeated unary `+`/`-` and yields the number; huck errors); lazy dead-branch evaluation in ternary expressions (dead branch must not be evaluated even if it contains an unset variable); array-element lvalue expressions inside arith (`a[n]=n++`); substring offset/length with arith ternary colons; standalone `(( ))` command line-number attribution (off vs bash because `Command::Arith` carries no source line); and minor error-kind wording for malformed base-N numbers. |
 | arith-for | FAIL | The `declare -f` trailing-space format divergence is resolved by v218. Remaining divergences: huck leaves empty `for ((` sections empty (`for ((; i<3; i++))`), whereas bash normalizes a missing section to `1` (`for ((1; i<3; i++))`) — an arith-for reconstruction-fidelity gap (L-59); and error-message wording for malformed `for ((` headers (wrong section count or a quoted string as a section value) still differs between huck and bash. |

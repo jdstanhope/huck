@@ -801,6 +801,17 @@ pub struct ExpectFailure {
 #[non_exhaustive]
 pub enum ParseError {
     MissingCommand,
+    /// v345 (#329, R3): internal-use sentinel, produced ONLY by
+    /// `parser::parse_command_allow_empty` (the first-stage attempt in
+    /// `parse_sequence`/`parse_one_unit`) when the command position — after
+    /// resolving any leading alias, INCLUDING one whose body starts with `#`
+    /// and swallows the rest of the line as a comment — turns out to be
+    /// genuinely empty. That ONE call site always converts it to `Ok(None)`
+    /// (an empty sequence/unit, same as a blank or comment-only line) before
+    /// it can ever be rendered; every other `parse_command` call site keeps
+    /// producing plain `MissingCommand` (a real syntax error) instead, since
+    /// they call the ordinary `parser::parse_command`, never this variant.
+    EmptyCommandPosition,
     MissingRedirectTarget,
     RedirectTargetIsOperator,
     UnexpectedBackground,
