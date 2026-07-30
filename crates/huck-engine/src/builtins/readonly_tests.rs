@@ -330,3 +330,150 @@ fn export_set_preserves_readonly_flag_on_existing_var() {
     // Value updated, but readonly flag must stay set.
     assert!(shell.is_readonly("X"));
 }
+
+// ── v349 (#343) Task 2: Root D (quoted `name=val` is an assignment) ──────────
+// and Root B (`-a`/`-A` coerces a quoted `(...)` value to an array literal).
+
+/// Root D: a fully-quoted `'x=hi'` arg to `readonly` is an ASSIGNMENT (bash
+/// applies quote removal, then sees `x=hi`), not an invalid identifier.
+#[test]
+fn readonly_quoted_scalar_assignment_is_an_assignment() {
+    let mut s = Shell::new();
+    let outcome = run(&mut s, "readonly 'x=hi'");
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    assert_eq!(s.get("x").as_deref(), Some("hi"));
+    assert!(s.is_readonly("x"));
+}
+
+/// Root D KEEP: an invalid-identifier `'3x=1'` stays a Plain arg → the
+/// not-a-valid-identifier error, exit 1.
+#[test]
+fn readonly_quoted_invalid_ident_still_errors() {
+    let mut s = Shell::new();
+    let (outcome, errtext) = run_capture_err(&["3x=1"], &mut s);
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    assert!(
+        errtext.contains("`3x=1': not a valid identifier"),
+        "{errtext:?}"
+    );
+    assert!(!s.is_readonly("3x"));
+}
+
+/// Root D KEEP: a bare quoted name with no `=` marks the var readonly.
+#[test]
+fn readonly_quoted_bare_name_marks_readonly() {
+    let mut s = Shell::new();
+    let outcome = run(&mut s, "readonly 'foo'");
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    assert!(s.is_readonly("foo"));
+}
+
+/// Root D contrast: WITHOUT `-a`, a quoted `(...)` scalar assigned to an
+/// existing array lands as element 0 with the literal parens preserved.
+#[test]
+fn readonly_quoted_paren_scalar_without_dash_a_keeps_literal_parens() {
+    let mut s = Shell::new();
+    run(&mut s, "c=(outside)");
+    let outcome = run(&mut s, "readonly 'c=(3)'");
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    let (_, v) = s.iter_vars().find(|(n, _)| n.as_str() == "c").unwrap();
+    assert_eq!(format_declare_line("c", v), r#"declare -ar c=([0]="(3)")"#);
+}
+
+/// Root B: under `-a`, a quoted `(4)` scalar is coerced to an array literal
+/// (element 0 = "4"), replacing the existing array.
+#[test]
+fn readonly_dash_a_quoted_paren_coerces_to_array_literal() {
+    let mut s = Shell::new();
+    run(&mut s, "d=(outside)");
+    let outcome = run(&mut s, "readonly -a 'd=(4)'");
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    let (_, v) = s.iter_vars().find(|(n, _)| n.as_str() == "d").unwrap();
+    assert_eq!(format_declare_line("d", v), r#"declare -ar d=([0]="4")"#);
+    assert!(s.is_readonly("d"));
+}
+
+/// Root B: multi-element quoted array literal parses fully under `-a`.
+#[test]
+fn readonly_dash_a_quoted_multi_element_array_literal() {
+    let mut s = Shell::new();
+    let outcome = run(&mut s, "readonly -a 'd=(4 5)'");
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    let m = s.get_indexed("d").expect("d indexed");
+    assert_eq!(m.get(&0).map(String::as_str), Some("4"));
+    assert_eq!(m.get(&1).map(String::as_str), Some("5"));
+}
+
+/// Root B: `readonly -a r='(7)'` (quoted RHS via AssignPrefix) coerces too.
+#[test]
+fn readonly_dash_a_quoted_rhs_paren_coerces() {
+    let mut s = Shell::new();
+    let outcome = run(&mut s, "readonly -a r='(7)'");
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    let (_, v) = s.iter_vars().find(|(n, _)| n.as_str() == "r").unwrap();
+    assert_eq!(format_declare_line("r", v), r#"declare -ar r=([0]="7")"#);
+}
+
+/// Root B (export): `export -a r='(7)'` coerces the quoted `(...)` value.
+#[test]
+fn export_dash_a_quoted_paren_coerces_to_array() {
+    let mut s = Shell::new();
+    run(&mut s, "r=(1)");
+    let outcome = run(&mut s, "export -a r='(7)'");
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    let (_, v) = s.iter_vars().find(|(n, _)| n.as_str() == "r").unwrap();
+    assert_eq!(format_declare_line("r", v), r#"declare -ax r=([0]="7")"#);
+}
+
+/// Root B negative: `export r='(5)'` WITHOUT `-a` keeps the literal scalar.
+#[test]
+fn export_quoted_paren_without_dash_a_keeps_scalar() {
+    let mut s = Shell::new();
+    let outcome = run(&mut s, "export r='(5)'");
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    let (_, v) = s.iter_vars().find(|(n, _)| n.as_str() == "r").unwrap();
+    assert_eq!(format_declare_line("r", v), r#"declare -x r="(5)""#);
+}
+
+/// Root B (declare): `declare -a 'x=(1 2)'` coerces the quoted `(...)` value
+/// to an array literal and sets the array attribute.
+#[test]
+fn declare_dash_a_quoted_paren_coerces_to_array() {
+    let mut s = Shell::new();
+    let outcome = run(&mut s, "declare -a 'x=(1 2)'");
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    let (_, v) = s.iter_vars().find(|(n, _)| n.as_str() == "x").unwrap();
+    assert_eq!(
+        format_declare_line("x", v),
+        r#"declare -a x=([0]="1" [1]="2")"#
+    );
+}
+
+/// Root B (declare -A): quoted associative literal coerces under `-A`.
+#[test]
+fn declare_dash_aa_quoted_assoc_literal_coerces() {
+    let mut s = Shell::new();
+    let outcome = run(&mut s, "declare -A 'am=([k]=v)'");
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    let m = s.get_associative("am").expect("am associative");
+    assert_eq!(m.get("k"), Some("v"));
+}
+
+/// Root B negative (declare): WITHOUT `-a`, a quoted `(3)` stays a literal
+/// scalar.
+#[test]
+fn declare_quoted_paren_without_dash_a_keeps_scalar() {
+    let mut s = Shell::new();
+    let outcome = run(&mut s, "declare 'p=(3)'");
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    let (_, v) = s.iter_vars().find(|(n, _)| n.as_str() == "p").unwrap();
+    assert_eq!(format_declare_line("p", v), r#"declare -- p="(3)""#);
+}
+
+/// Root B (local): `local -a 'y=(3 4)'` coerces the quoted `(...)` value.
+#[test]
+fn local_dash_a_quoted_paren_coerces_to_array() {
+    let mut s = Shell::new();
+    let outcome = run(&mut s, "f(){ local -a 'y=(3 4)'; declare -p y; }; f");
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+}
