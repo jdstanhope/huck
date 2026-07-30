@@ -2292,6 +2292,18 @@ fn emit_split_fields(
         // non-whitespace IFS character, that delimiter does not produce
         // an empty field." (Bash: `IFS=:; v="a:"; echo $v` → `a`.)
         if i >= bytes.len() {
+            // The value ended WITH a consumed separator, so the field just
+            // read is complete and a field boundary follows it. Close it now
+            // (push it, INCLUDING a legitimately-emitted empty field such as
+            // the one before a trailing `:` in `IFS=:` value `":"`) so a
+            // following WordPart — e.g. the quoted-empty `"$y"` in operand
+            // `${x+ab "$y"}` — starts a NEW field rather than merging into
+            // this one. The trailing separator itself adds no further field.
+            // (R4, #334)
+            if !current.is_empty() || *has_emitted {
+                result.push(std::mem::take(current));
+                *has_emitted = false;
+            }
             break;
         }
     }
