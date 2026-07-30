@@ -2969,6 +2969,17 @@ fn parse_simple_with_leading_word(
 ) -> Result<Command, ParseError> {
     let mut all_words: Vec<Word> = Vec::new();
     let mut redirects: Vec<Redirection> = Vec::new();
+    // v345 (#329, R2) fix-loop round 1: bash suppresses command-word alias
+    // expansion iff a redirect is consumed AFTER at least one
+    // inline-assignment-prefix word has already been seen in this simple
+    // command's prefix run (empirically mapped against bash 5.2.21 via both
+    // `-c` and script-file checks) — e.g. `a=1 < /dev/null foo` does NOT
+    // expand `foo`, but `< /dev/null a=1 foo` DOES, and a pure redirect or
+    // pure assignment prefix (in either internal order/count) always does.
+    // Sticky for the rest of the command once set: a LATER redirect after
+    // the flag is already true can't un-suppress it (`< /dev/null a=1 <
+    // /dev/null foo` still suppresses).
+    let mut redir_after_assign = false;
     if let Some(w) = leading_word {
         // v264 flip-fix (Finding 1): the program word brace-expands too, matching
         // the oracle (which emits N Words at lex time BEFORE program/arg split).
@@ -3037,6 +3048,12 @@ fn parse_simple_with_leading_word(
         // list.  Mirrors the `next_is_redirect` + `parse_trailing_redirects`
         // delegation in `parse_simple_stage`.
         if crate::command::next_is_redirect(iter)? {
+            // v345 (#329, R2): a redirect consumed once an assignment-prefix
+            // word has already been collected suppresses the command-word
+            // alias re-drive below (see `redir_after_assign`'s declaration).
+            if all_words.iter().any(crate::command::is_assignment_word) {
+                redir_after_assign = true;
+            }
             redirects.extend(parse_one_redirect(iter)?);
             continue;
         }
@@ -3115,7 +3132,13 @@ fn parse_simple_with_leading_word(
             // name, so on every other iteration (another assignment-prefix word,
             // or after the true command word has already been consumed/expanded)
             // this is a harmless re-check, not a double expansion.
-            if all_words.iter().all(crate::command::is_assignment_word) {
+            //
+            // `!redir_after_assign`: bash additionally suppresses the whole
+            // command-word expansion once a redirect has appeared AFTER an
+            // assignment-prefix word in this command's prefix run (see the
+            // flag's declaration above for the empirically-mapped rule and
+            // examples).
+            if all_words.iter().all(crate::command::is_assignment_word) && !redir_after_assign {
                 iter.expand_command_alias()?;
             }
             // v264 flip-fix (Finding 1): argument command words brace-expand

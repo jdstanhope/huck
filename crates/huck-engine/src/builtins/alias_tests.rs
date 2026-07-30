@@ -238,6 +238,44 @@ fn command_word_alias_expands_after_assignment_prefix() {
     assert_eq!(out, "ok 4\n");
 }
 
+// v345 fix-loop round 1: bash's rule is order-sensitive, not just
+// word-shape-sensitive. A redirect consumed BEFORE any assignment-prefix
+// word still allows the command-word alias to expand; a redirect consumed
+// AFTER an assignment-prefix word suppresses it (empirically mapped against
+// bash 5.2.21). Both hand-checked byte-identical to bash for a wider matrix
+// (see task-1-report.md); these two lock the interleaved case the initial
+// (word-shape-only) guard got wrong.
+
+#[test]
+fn command_word_alias_expands_when_redirect_precedes_assignment_prefix() {
+    let mut shell = Shell::new();
+    shell.aliases.insert("foo".to_string(), "echo".to_string());
+    let (outcome, out, err) = run_line_with_aliases("< /dev/null a=1 foo bar", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} err={err:?}"
+    );
+    assert_eq!(out, "bar\n");
+}
+
+#[test]
+fn command_word_alias_suppressed_when_redirect_follows_assignment_prefix() {
+    let mut shell = Shell::new();
+    shell.aliases.insert("foo".to_string(), "echo".to_string());
+    let (outcome, out, err) = run_line_with_aliases("a=1 < /dev/null foo bar", &mut shell);
+    // bash does NOT expand `foo` here: `foo` runs as a literal external/PATH
+    // lookup and fails with 127 ("command not found"), matching real bash.
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(127)),
+        "outcome={outcome:?} out={out:?} err={err:?}"
+    );
+    assert!(out.is_empty(), "out={out:?}");
+    assert!(
+        err.contains("foo") && err.contains("not found"),
+        "err={err:?}"
+    );
+}
+
 #[test]
 fn redirect_target_word_is_not_alias_expanded() {
     let target = tempfile::NamedTempFile::new().expect("create temp redirect target");
