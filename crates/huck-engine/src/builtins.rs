@@ -7661,6 +7661,16 @@ fn resolve_source_path(
     usable(&cwd_candidate).then_some(cwd_candidate)
 }
 
+/// v348 (#339, R3): unlike the other `LexError` variants surfaced at this
+/// driver's skip-and-continue recovery points (which resume parsing at the
+/// NEXT physical line), exceeding bash's `HEREDOC_MAX` aborts the whole
+/// parse context — verified against real bash: a script whose 17th heredoc
+/// is followed by more commands prints exactly ONE error line and runs
+/// nothing else (`rc=2`), it does not skip ahead and keep executing.
+fn lex_error_is_fatal(le: &crate::lexer::LexError) -> bool {
+    matches!(le, crate::lexer::LexError::HeredocMaxExceeded)
+}
+
 pub(crate) fn run_sourced_contents_in_sinks(
     contents: &str,
     _path: &std::path::Path,
@@ -7771,11 +7781,15 @@ fn run_sourced_contents_in_sinks_inner(
                     Ok(_) => break,
                     Err(le) => {
                         let line = line_of(start + tok_off) as u32;
+                        let fatal = lex_error_is_fatal(&le);
                         let err = crate::command::ParseError::Lex(Box::new(le));
                         crate::err_thread_local::install_err_sinks(sink, err_sink, || {
                             crate::render_syntax_diag(shell, &err, contents, line);
                         });
                         last_status = 2;
+                        if fatal {
+                            return ExecOutcome::Continue(2);
+                        }
                         start = next_line_start(start + tok_off);
                         prev_end = start;
                         continue 'outer;
@@ -7912,11 +7926,15 @@ fn run_sourced_contents_in_sinks_inner(
                         // Report at the failing token's START line (not the cursor's
                         // post-scan EOF position), and restart just past that line.
                         let line = line_of(start + tok_off) as u32;
+                        let fatal = lex_error_is_fatal(&le);
                         let err = crate::command::ParseError::Lex(Box::new(le));
                         crate::err_thread_local::install_err_sinks(sink, err_sink, || {
                             crate::render_syntax_diag(shell, &err, contents, line);
                         });
                         last_status = 2;
+                        if fatal {
+                            return ExecOutcome::Continue(2);
+                        }
                         start = next_line_start(start + tok_off);
                         prev_end = start;
                         continue 'outer;
@@ -7938,7 +7956,16 @@ fn run_sourced_contents_in_sinks_inner(
                         crate::render_syntax_diag(shell, &e, contents, line);
                     });
                     last_status = 2;
-                    if is_lex {
+                    // v348 (#339, R3): a HEREDOC_MAX overflow is a lex error
+                    // but, unlike other recoverable lex errors here, is FATAL
+                    // (see `lex_error_is_fatal`) — falls through to the
+                    // abort-the-whole-parse-context `return` below.
+                    let recoverable = is_lex
+                        && match &e {
+                            crate::command::ParseError::Lex(le) => !lex_error_is_fatal(le),
+                            _ => false,
+                        };
+                    if recoverable {
                         start = next_line_start(start + foff);
                         prev_end = start;
                         continue 'outer;
