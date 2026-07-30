@@ -1819,15 +1819,20 @@ fn builtin_readonly_decl(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    // Parse leading flags (-p, -A). `--` terminates option processing.
+    // Parse leading flags (-p, -a, -A). `--` terminates option processing.
     let mut want_list = false;
     let mut want_associative = false;
+    let mut want_indexed = false;
     let mut idx = 0;
     while idx < args.len() {
         let DeclArg::Plain(s) = &args[idx] else { break };
         match s.as_str() {
             "-p" => {
                 want_list = true;
+                idx += 1;
+            }
+            "-a" => {
+                want_indexed = true;
                 idx += 1;
             }
             "-A" => {
@@ -1902,17 +1907,33 @@ fn builtin_readonly_decl(
                     exit = 1;
                     continue;
                 }
+                // `readonly -a NAME` (no value): ensure name is an indexed
+                // array before marking readonly (mirrors want_associative
+                // above; declare/local's -a bare-case pattern — promote an
+                // existing scalar to element 0, or create an empty array).
+                // Skip when NAME is already associative (e.g. `-aA` together,
+                // or a pre-existing `-A` array): `-A` wins, matching bash.
+                if want_indexed
+                    && shell.get_associative(name).is_none()
+                    && shell.get_indexed(name).is_none()
+                {
+                    let mut empty = std::collections::BTreeMap::new();
+                    if let Some(scalar) = shell.get(name) {
+                        empty.insert(0, scalar.to_string());
+                    }
+                    if shell.replace_indexed(name, empty).is_err() {
+                        // assign() already emitted the readonly-variable
+                        // error (bare `{name}: readonly variable`, no prefix).
+                        exit = 1;
+                        continue;
+                    }
+                }
                 shell.mark_readonly(name);
             }
             DeclArg::Assign(a) => match &a.target {
                 crate::command::AssignTarget::Bare(name) => {
                     if shell.is_readonly(name) {
-                        crate::sh_error_to!(
-                            shell,
-                            err,
-                            None,
-                            "readonly: {name}: readonly variable"
-                        );
+                        crate::sh_error_to!(shell, err, None, "{name}: readonly variable");
                         exit = 1;
                         continue;
                     }
@@ -1932,6 +1953,27 @@ fn builtin_readonly_decl(
                         );
                         exit = 1;
                         continue;
+                    }
+                    // `readonly -a NAME=value` / `readonly -a NAME=(...)`:
+                    // ensure NAME is an indexed array BEFORE
+                    // apply_one_assignment (mirrors want_associative above)
+                    // so a scalar RHS lands as element 0 too (bash: `-a
+                    // s=hello` -> `declare -ar s=([0]="hello")`), not just a
+                    // compound-literal RHS (which self-creates an array
+                    // regardless of `-a`). Skip when NAME is already
+                    // associative: `-A` wins (matches bash `-aA` together).
+                    if want_indexed
+                        && shell.get_associative(name).is_none()
+                        && shell.get_indexed(name).is_none()
+                    {
+                        let mut empty = std::collections::BTreeMap::new();
+                        if let Some(scalar) = shell.get(name) {
+                            empty.insert(0, scalar.to_string());
+                        }
+                        if shell.replace_indexed(name, empty).is_err() {
+                            exit = 1;
+                            continue;
+                        }
                     }
                     if crate::executor::apply_one_assignment(a, shell, err).is_err() {
                         exit = 1;
