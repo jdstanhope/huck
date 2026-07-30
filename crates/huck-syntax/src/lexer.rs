@@ -7522,6 +7522,12 @@ pub(crate) fn unescape_backtick_body(raw: &str) -> String {
         if b[i] == b'\\' && i + 1 < b.len() && matches!(b[i + 1], b'\\' | b'$' | b'`') {
             out.push(b[i + 1] as char); // drop the backslash, keep the escaped byte
             i += 2;
+        } else if b[i] == b'\\' && i + 1 < b.len() && b[i + 1] == b'\n' {
+            // `\<newline>` is a line continuation inside backticks — bash removes
+            // both bytes during the one-level unescape, BEFORE the body is parsed
+            // (so it applies even inside single quotes: `` `echo 'foo\<NL>bar'` ``
+            // → `foobar`). v346 (#334, R1/R2).
+            i += 2;
         } else {
             // Copy the next whole UTF-8 char verbatim (may be the lone `\`).
             let ch = raw[i..].chars().next().unwrap();
@@ -7730,7 +7736,9 @@ mod tests {
         assert_eq!(unescape_backtick_body(r#"\""#), r#"\""#); // \" kept
         assert_eq!(unescape_backtick_body(r"\'"), r"\'"); // \' kept
         assert_eq!(unescape_backtick_body(r"\n"), r"\n"); // \n kept (literal)
-        assert_eq!(unescape_backtick_body("a\\\nb"), "a\\\nb"); // \<newline> kept
+        // `\<newline>` is a line continuation — bash removes both bytes during
+        // the one-level unescape (v346 #334, R1/R2):
+        assert_eq!(unescape_backtick_body("a\\\nb"), "ab");
         // Runs collapse pairwise, left to right (the L-70 case):
         assert_eq!(unescape_backtick_body(r"\\\X"), r"\\X"); // \\\X -> \\X  (was mis-ordered)
         assert_eq!(unescape_backtick_body(r"\\\\"), r"\\"); // \\\\ -> \\

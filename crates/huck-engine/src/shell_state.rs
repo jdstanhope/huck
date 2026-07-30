@@ -2652,6 +2652,12 @@ impl Shell {
     /// Called once from `Shell::new` (after env-load + BASH_FUNC import) to
     /// populate the static builtin variables that are always present.
     fn install_builtin_vars(&mut self) {
+        // IFS: bash initializes it to the default $' \t\n' as a SET (not
+        // exported) variable, so `$IFS` expands to it and `${IFS+x}` /
+        // `${IFS-x}` see it set (v346 #334, R3). `Shell::ifs()` still falls
+        // back to this same default when IFS is later unset, so field-
+        // splitting is unchanged.
+        self.install_var("IFS", " \t\n".to_string(), false);
         // IDs (readonly)
         unsafe {
             self.install_var("UID", libc::getuid().to_string(), true);
