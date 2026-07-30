@@ -10,6 +10,10 @@ use crate::lexer::LexError;
 pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
     match error {
         ParseError::MissingCommand => "expected a command".to_string(),
+        // v345 (#329, R3): never actually rendered — see the variant's doc —
+        // but the message text mirrors `MissingCommand` defensively in case a
+        // future change lets it leak past its one intended catch site.
+        ParseError::EmptyCommandPosition => "expected a command".to_string(),
         ParseError::MissingRedirectTarget => "expected a filename after redirection".to_string(),
         ParseError::RedirectTargetIsOperator => "expected a filename after redirection".to_string(),
         ParseError::UnexpectedBackground => "'&' not allowed here".to_string(),

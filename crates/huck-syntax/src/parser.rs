@@ -2373,6 +2373,35 @@ fn skip_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
     Ok(())
 }
 
+/// v345 (#329, R3): `skip_newlines` plus a re-driven command-word alias
+/// expansion at the position that follows, looped.
+///
+/// An alias whose body begins with `#` (at a word boundary) starts a
+/// comment (the lexer's `maybe_expand_command_alias` arranges for the
+/// injected body's leading `#` to hit the same word-start comment gate a
+/// literal `#` would) — the comment then runs to the end of THAT line,
+/// producing a fresh `Newline` right where the command word used to be. A
+/// literal comment-only line already reduces to nothing at this exact
+/// point (the lexer swallows a leading `#` with no token at all, so
+/// `skip_newlines`'s caller never even sees it); the alias-injected case
+/// differs only in that the `Newline` was not yet buffered the FIRST time
+/// `skip_newlines` ran (the lexer had not injected the alias body yet). So:
+/// re-skip and re-try alias expansion — the next line may itself start with
+/// an alias expanding to `#` — until a real token surfaces or genuine EOF is
+/// reached. Mirrors bash accepting `true && comment\necho after` (an
+/// alias-comment "swallowing" the rest of a line does not end the
+/// enclosing list; the parser keeps looking for the next command).
+fn skip_newlines_through_alias_comments(iter: &mut Lexer) -> Result<(), ParseError> {
+    loop {
+        skip_newlines(iter)?;
+        iter.expand_command_alias()?;
+        if !matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// v250 T3: after consuming a `Newline` OUTSIDE of `skip_newlines` (a few
 /// call-sites consume their own connector token directly), drain any heredoc
 /// body groups the lexer emitted for that line. Thin wrapper so those
@@ -3320,21 +3349,70 @@ fn parse_simple_with_leading_word(
 /// All other keywords are terminators/closers that can never start a
 /// command → `UnexpectedKeyword` (v257 T3 fix; see the match arm below).
 fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
+    parse_command_impl(iter, false)
+}
+
+/// v345 (#329, R3): like `parse_command`, but tolerates a genuinely empty
+/// command position — used ONLY by `parse_sequence`/`parse_one_unit`'s own
+/// first-stage attempt (via `parse_command_then_pipeline_allow_empty`), where
+/// an empty result is a valid outcome (an empty sequence/unit). Every OTHER
+/// call site (coproc/pipeline-stage bodies, the and-or connector loop) keeps
+/// calling the ordinary `parse_command` — a command is MANDATORY there, so
+/// "nothing here" must stay a hard `MissingCommand` error, exactly as before.
+///
+/// This distinction can only be made AT `parse_command`'s own entry check
+/// (below) — by the time an error would propagate back up to a caller, there
+/// is no way to tell "genuinely nothing at the very first position" apart
+/// from "something deep inside (a coproc body, a nested stage) legitimately
+/// needed a command and didn't get one" (both surface as the identical
+/// `MissingCommand`). Threading `allow_empty` down to the ONE checkpoint that
+/// can raise it — rather than catching the error afterward — keeps every
+/// other `MissingCommand` production site (and consumer, e.g.
+/// `parse_compound_section`'s EOF-recovery match) completely unaffected.
+fn parse_command_allow_empty(iter: &mut Lexer) -> Result<Option<Command>, ParseError> {
+    match parse_command_impl(iter, true) {
+        Ok(cmd) => Ok(Some(cmd)),
+        Err(ParseError::EmptyCommandPosition) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The shared body of `parse_command` / `parse_command_allow_empty`.
+/// `allow_empty` governs ONLY the entry EOF check immediately below; the rest
+/// of the dispatch (compound keywords, funcdef, simple command) is completely
+/// unchanged and always returns a real `Command` or a real error — none of
+/// those nested `parse_command`/`parse_coproc_body`/etc. calls ever pass
+/// `allow_empty` onward (they call the plain `parse_command` wrapper above),
+/// so `EmptyCommandPosition` can never leak out of a nested/mandatory context.
+fn parse_command_impl(iter: &mut Lexer, allow_empty: bool) -> Result<Command, ParseError> {
     // Skip leading newlines (mirrors `parse_command_inner` command.rs:1019).
-    skip_newlines(iter)?;
     // Read-time alias expansion at command position (mirrors the oracle's
     // `command.rs:1020` + `:2302` sites — this ONE choke point covers both,
     // since `parse_pipeline` calls `parse_command` for the first stage and
     // `finish_pipeline` calls it for every subsequent stage). Must run BEFORE
     // the ArithBlock/LParen/keyword dispatch below so `alias x=if` expands to
     // the reserved word before the reserved-word check runs.
-    iter.expand_command_alias()?;
+    //
+    // v345 (#329, R3): looped via `skip_newlines_through_alias_comments`, not
+    // a one-shot pair — see that helper's doc for why (an alias expanding to
+    // a leading `#` starts a comment that reduces to a fresh `Newline` here,
+    // which must be crossed just like a literal comment-only line).
+    skip_newlines_through_alias_comments(iter)?;
     // EOF with no token. v314 (#211): NOT a near-token guard candidate — this
     // branch's own condition IS the EOF check (`peek_kind().is_none()`), so a
     // "real token present" guard here would never fire; stays `MissingCommand`
     // (handled by the Shape 2/3 unterminated-construct fallback upstream).
+    //
+    // v345 (#329, R3): `allow_empty` (set ONLY by `parse_command_allow_empty`)
+    // raises the internal `EmptyCommandPosition` sentinel instead — this is
+    // exactly the shape an alias expanding to a leading `#` produces (the
+    // comment swallows to end of line/EOF, leaving nothing here).
     if iter.peek_kind()?.is_none() {
-        return Err(ParseError::MissingCommand);
+        return Err(if allow_empty {
+            ParseError::EmptyCommandPosition
+        } else {
+            ParseError::MissingCommand
+        });
     }
     // `(( expr ))` at command position.  The Word-lexer emits a single
     // `ArithBlock`; the atom scanner instead emits two GLUED `Op(LParen)` atoms
@@ -3702,6 +3780,35 @@ fn parse_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
     finish_pipeline(iter, first, negate, bangs > 0)
 }
 
+/// v345 (#329, R3): like `parse_pipeline`, but tolerates a genuinely empty
+/// command position (see `parse_command_allow_empty`) — used ONLY by
+/// `parse_sequence`/`parse_one_unit`'s own first-stage attempt. A leading `!`
+/// makes a following command MANDATORY (bash requires one after `!`), so once
+/// any bang is consumed this falls back to the ordinary, non-tolerant path —
+/// "empty" is only a valid outcome for the very first token of all.
+fn parse_pipeline_allow_empty(iter: &mut Lexer) -> Result<Option<Command>, ParseError> {
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+        iter.next_kind()?;
+    }
+    let mut bangs = 0usize;
+    while iter.peek_kind()?.map(is_bang_word).unwrap_or(false) {
+        iter.next_kind()?;
+        bangs += 1;
+        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+            iter.next_kind()?;
+        }
+    }
+    if bangs > 0 {
+        let negate = bangs % 2 == 1;
+        let first = parse_command(iter)?;
+        return finish_pipeline(iter, first, negate, true).map(Some);
+    }
+    match parse_command_allow_empty(iter)? {
+        None => Ok(None),
+        Some(first) => finish_pipeline(iter, first, false, false).map(Some),
+    }
+}
+
 /// Given an already-parsed first stage, finish a pipeline: consume any `|`-joined
 /// stages and apply the oracle's wrapping rule. Split out of `parse_pipeline` so
 /// the coproc body parser can reuse the `|`-loop for a simple first stage (v257).
@@ -3795,6 +3902,15 @@ fn parse_command_then_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> 
     parse_pipeline(iter)
 }
 
+/// v345 (#329, R3): the `parse_command_allow_empty`-tolerant analogue of
+/// `parse_command_then_pipeline`, used ONLY by `parse_sequence`/
+/// `parse_one_unit`'s first-stage attempt.
+fn parse_command_then_pipeline_allow_empty(
+    iter: &mut Lexer,
+) -> Result<Option<Command>, ParseError> {
+    parse_pipeline_allow_empty(iter)
+}
+
 /// Parses the full flat and-or list (the complete `Sequence`).  Mirrors
 /// `parse_sequence_opts` in `command.rs` with `stop_at_top_newline = false`
 /// — the `parse` (non-unit) contract where a top-level `Newline` is a
@@ -3830,6 +3946,26 @@ fn parse_and_or_opts(
     stop_at_top_newline: bool,
 ) -> Result<Sequence, ParseError> {
     let first = parse_command_then_pipeline(iter)?;
+    finish_and_or_opts(iter, first, stop_at, stop_at_top_newline)
+}
+
+/// v345 (#329, R3): the connector-consuming loop of [`parse_and_or_opts`],
+/// given an ALREADY-parsed first stage. Split out so `parse_sequence` and
+/// `parse_one_unit` can parse the first stage THEMSELVES (to distinguish a
+/// `MissingCommand` there — nothing precedes it, so it means "this whole
+/// and-or list is empty", e.g. a blank line, a comment-only line, OR an alias
+/// expanding to a leading `#` that swallowed the rest of the line — from the
+/// SAME error raised deep inside this loop after a connector, e.g. `true &&`
+/// with truly nothing following, which — unlike the former — IS a genuine
+/// syntax error and must not be silently swallowed). Mirrors the existing
+/// `parse_pipeline`/`finish_pipeline` split, which exists for the analogous
+/// reason one level down (pipeline stages vs. the first stage).
+fn finish_and_or_opts(
+    iter: &mut Lexer,
+    first: Command,
+    stop_at: &[Keyword],
+    stop_at_top_newline: bool,
+) -> Result<Sequence, ParseError> {
     let mut rest: Vec<(Connector, Command)> = Vec::new();
     let mut background = false;
 
@@ -4280,7 +4416,24 @@ pub fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> 
     if iter.peek_kind()?.is_none() {
         return Ok(None);
     }
-    let mut seq = parse_and_or(iter, &[])?;
+    // v345 (#329, R3): parse the first stage via the empty-tolerant variant
+    // (rather than `parse_and_or`, which would use the ordinary, mandatory
+    // `parse_command_then_pipeline` internally) so that a command position
+    // which — after resolving any leading alias, including one whose
+    // expansion begins with `#` and swallows the rest of the line as a
+    // comment (see `parse_command_impl`'s `skip_newlines_through_alias_comments`)
+    // — turns out genuinely empty reduces to `Ok(None)`, same as a blank or
+    // comment-only line. See `parse_command_allow_empty`'s doc for why this
+    // MUST be threaded down to the entry checkpoint rather than caught from
+    // the error afterward (a deep, mandatory `MissingCommand` — e.g. `true
+    // &&` with truly nothing following, or `coproc` with no body — must
+    // remain a hard error, and is indistinguishable from "empty" by error
+    // shape alone once it has propagated up).
+    let first = match parse_command_then_pipeline_allow_empty(iter)? {
+        Some(cmd) => cmd,
+        None => return Ok(None),
+    };
+    let mut seq = finish_and_or_opts(iter, first, &[], false)?;
     // A leftover trailing `Blank` (atom path only — e.g. `"a; "`) is NOT
     // content; skip it so the stray-terminator check below sees the real
     // next token.
@@ -4315,7 +4468,16 @@ pub fn parse_one_unit(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> 
     if iter.peek_kind()?.is_none() {
         return Ok(None);
     }
-    let mut seq = parse_and_or_opts(iter, &[], true)?;
+    // v345 (#329, R3): parse the first stage via the empty-tolerant variant,
+    // same reasoning as `parse_sequence` — see its comment for why "nothing
+    // here" (most commonly an alias expanding to a leading `#`) must reduce
+    // to `Ok(None)` (this unit is empty) while the SAME shape deep in the
+    // connector loop, or inside a mandatory nested body, stays a real error.
+    let first = match parse_command_then_pipeline_allow_empty(iter)? {
+        Some(cmd) => cmd,
+        None => return Ok(None),
+    };
+    let mut seq = finish_and_or_opts(iter, first, &[], true)?;
     // Attach heredoc bodies collected for this unit (no stray-terminator check —
     // more units may follow; the caller loops).
     let mut bodies = iter.take_heredoc_bodies().into_iter();

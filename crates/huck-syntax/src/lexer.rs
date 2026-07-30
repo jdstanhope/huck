@@ -6669,6 +6669,15 @@ impl<'a> Lexer<'a> {
         // frame), so the anchor propagates outward-most automatically.
         self.cursor
             .push_injection(body.clone(), name.clone(), name_span);
+        // v345 (#329, R3): the body's first char is a fresh command-word start —
+        // `name`'s own Lit just cleared this flag when IT was scanned, but the
+        // injected body replaces that word entirely, so the flag must be set
+        // again here. Without this, a body beginning with `#` (e.g. `alias
+        // comment='#'`) would scan as a literal word (`#: command not found`)
+        // instead of hitting the comment gate (`Some('#') if
+        // self.cmd_at_word_start`) the way a literal leading `#` does — bash
+        // treats an alias expanding to a leading `#` as starting a comment.
+        self.cmd_at_word_start = true;
         // Re-drive: lex the body's first command word so a DIFFERENT leading alias
         // still expands. `name` is now on the stack, so it cannot re-expand itself.
         self.maybe_expand_command_alias()?;

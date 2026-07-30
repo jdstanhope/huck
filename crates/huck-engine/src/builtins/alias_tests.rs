@@ -311,3 +311,88 @@ fn command_word_alias_still_expands_with_no_leading_redirect() {
     );
     assert_eq!(out, "x\n");
 }
+
+// --- v345 (#329, R3): an alias whose expansion begins with `#` (at a word
+// boundary) starts a comment. ---
+//
+// bash's comment recognition applies to the injected alias BODY too: `alias
+// comment='#'; comment` is a no-op (the injected `#` is a fresh command word,
+// so it hits the same word-boundary comment gate a literal leading `#` would)
+// and the comment runs to the end of the LOGICAL (physical) line only — a
+// `;`-joined command on the SAME line is swallowed right along with it (a
+// real `#` comment doesn't stop at `;` either), but a command on the NEXT
+// physical line is unaffected and still runs. Both cases below feed the
+// whole multi-line program through ONE `process_line_in_sinks` call (an
+// embedded `\n`, mirroring how `-c` with embedded newlines — or a single
+// `eval`/`source`d chunk — parses: one `parse_sequence` over the full text),
+// so the alias's swallow-to-end-of-ITS-line and the following line's
+// independent parse are both exercised in a single assertion.
+//
+// Hand-checked against `bash --norc --noprofile` (5.2.21) via multi-line
+// input (same-line alias-definition-then-use does NOT expand in bash, so the
+// definition must be on its own line/`process_line` call — irrelevant here
+// since `shell.aliases` is populated directly, as the R2 tests above do).
+
+#[test]
+fn alias_expanding_to_bare_hash_is_a_comment() {
+    let mut shell = Shell::new();
+    shell.aliases.insert("comment".to_string(), "#".to_string());
+    let (outcome, out, err) = run_line_with_aliases("comment\necho done", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} out={out:?} err={err:?}"
+    );
+    // `comment`'s own line is a no-op (swallowed by the `#` it expands to);
+    // `echo done` on the NEXT line is unaffected.
+    assert_eq!(out, "done\n");
+    assert!(err.is_empty(), "err={err:?}");
+}
+
+#[test]
+fn alias_expanding_to_hash_prefix_swallows_rest_of_its_own_line() {
+    let mut shell = Shell::new();
+    shell
+        .aliases
+        .insert("lc".to_string(), "# for x in ".to_string());
+    let (outcome, out, err) = run_line_with_aliases("lc text after\necho k", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} out={out:?} err={err:?}"
+    );
+    // `lc`'s expansion `# for x in ` starts a comment that swallows
+    // ` text after` (same line) — but NOT `echo k` on the next line.
+    assert_eq!(out, "k\n");
+    assert!(err.is_empty(), "err={err:?}");
+}
+
+#[test]
+fn alias_expanding_to_hash_also_swallows_a_semicolon_joined_same_line_command() {
+    // A real `#` comment doesn't stop at `;` — it runs to the end of the
+    // PHYSICAL line, full stop. So an alias-turned-comment on the same line
+    // as a `;`-joined follow-on command swallows that follow-on too (unlike
+    // the embedded-newline cases above, where the follow-on is genuinely on
+    // a different line).
+    let mut shell = Shell::new();
+    shell.aliases.insert("comment".to_string(), "#".to_string());
+    let (outcome, out, err) = run_line_with_aliases("comment; echo done", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} out={out:?} err={err:?}"
+    );
+    assert_eq!(out, "");
+    assert!(err.is_empty(), "err={err:?}");
+}
+
+#[test]
+fn mid_word_hash_is_still_literal_after_alias_fix() {
+    // Regression: a `#` that is NOT at a word boundary (mid-word, no alias
+    // involved at all) must remain literal — the R3 fix must not make `#`
+    // start a comment anywhere it didn't before.
+    let mut shell = Shell::new();
+    let (outcome, out, err) = run_line_with_aliases("echo a#b", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} err={err:?}"
+    );
+    assert_eq!(out, "a#b\n");
+}
