@@ -146,7 +146,7 @@ pub fn expand_modifier_with_value(
                 if quoted {
                     ExpansionResult::Value(expand_word_to_string(word, shell))
                 } else {
-                    ExpansionResult::Fields(crate::expand::expand(word, shell))
+                    ExpansionResult::Fields(crate::expand::expand_operand_word(word, shell))
                 }
             } else {
                 ExpansionResult::Value(raw.unwrap_or_default())
@@ -204,7 +204,7 @@ pub fn expand_modifier_with_value(
             } else if quoted {
                 ExpansionResult::Value(expand_word_to_string(word, shell))
             } else {
-                ExpansionResult::Fields(crate::expand::expand(word, shell))
+                ExpansionResult::Fields(crate::expand::expand_operand_word(word, shell))
             }
         }
         ParamModifier::RemovePrefix { pattern, longest } => {
@@ -1111,6 +1111,63 @@ mod tests {
             expand_modifier_quoted("HUCK_M110_B", &m, true, &mut shell),
             ExpansionResult::Value("alt".to_string())
         );
+    }
+
+    // R4 (#334): the substituted `word` of an unquoted `${x:+word}` /
+    // `${x:-word}` alternate must undergo the SAME quote-removal + IFS
+    // field-splitting a normal command word does — a quoted-empty segment
+    // (`""`, `''`, `"$e"` with `e=`) produces an EMPTY field, and unquoted
+    // IFS whitespace between segments is a real field separator. bash:
+    // `x=x; e=; set -- ${x:+ ""}` -> `$#`==1 (one empty field). These are
+    // ENGINE-level (not `expand_modifier`) because the bug lives in the
+    // WORD -> Fields IFS field-splitting `crate::expand::expand` performs
+    // on the alternate/default operand, below what `expand_modifier`'s
+    // unit tests exercise (they use a plain `lit("alt")` operand with no
+    // embedded whitespace or quoted-empty segments).
+    fn run_set_dashes(frag: &str) -> Vec<String> {
+        let mut shell = Shell::new();
+        let line = format!("x=x; e=; set -- {frag}");
+        crate::shell::process_line(&line, &mut shell, false);
+        shell.positional_args
+    }
+
+    #[test]
+    fn use_alternate_leading_space_quoted_empty_is_one_field() {
+        // FIX: bash n=1 <>
+        assert_eq!(run_set_dashes(r#"${x:+ ""}"#), vec![""]);
+    }
+
+    #[test]
+    fn use_alternate_two_quoted_empty_space_separated_is_two_fields() {
+        // FIX: bash n=2 <><>
+        assert_eq!(run_set_dashes(r#"${x:+"$e" "$e"""}"#), vec!["", ""]);
+    }
+
+    #[test]
+    fn use_alternate_single_dquote_empty_stays_one_field() {
+        // KEEP: bash n=1 <>
+        assert_eq!(run_set_dashes(r#"${x:+""}"#), vec![""]);
+    }
+
+    #[test]
+    fn use_alternate_adjacent_quoted_empties_stay_one_field() {
+        // KEEP: bash n=1 <>
+        assert_eq!(run_set_dashes(r#"${x:+"$e""$e"""}"#), vec![""]);
+    }
+
+    #[test]
+    fn use_alternate_single_squote_empty_stays_one_field() {
+        // KEEP: bash n=1 <>
+        assert_eq!(run_set_dashes("${x:+''}"), vec![""]);
+    }
+
+    #[test]
+    fn use_default_leading_space_quoted_empty_is_one_field() {
+        // Same word->Fields root as UseAlternate — `${u:-word}` calls the
+        // same `crate::expand::expand` on its operand.
+        let mut shell = Shell::new();
+        crate::shell::process_line(r#"unset u; set -- ${u:- ""}"#, &mut shell, false);
+        assert_eq!(shell.positional_args, vec![""]);
     }
 
     #[test]

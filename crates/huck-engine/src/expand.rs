@@ -1098,6 +1098,19 @@ fn expand_array_param(
 /// in-progress `current` field, the accumulated `result` vector, and the
 /// `has_emitted` sentinel. Returns `ControlFlow::Break(())` when the callers
 /// should immediately return `result` (fatal parameter error / nounset).
+///
+/// `split_literal_ws` (R4, #334): when true, an UNQUOTED `Literal` part's
+/// raw text is itself subject to IFS field-splitting, exactly like an
+/// expansion's value. This is a no-op for ordinary command words — the
+/// lexer always terminates a word at an unquoted blank, so a `Literal`
+/// part built by ordinary tokenization never contains a raw space/tab/
+/// newline. It matters only for the substituted `word` operand of
+/// `${p:+word}` / `${p:-word}`, whose lexer mode (`ParamWordOperand`)
+/// deliberately preserves embedded, un-tokenized blanks so the *whole*
+/// operand can undergo normal quote-removal + field-splitting as one unit
+/// (`${x:+ ""}`'s operand is the literal " " followed by a quoted-empty
+/// `""` — the space is a real field separator, matching bash even under a
+/// custom non-whitespace `IFS`).
 fn expand_part(
     part: &WordPart,
     current: &mut Field,
@@ -1106,9 +1119,14 @@ fn expand_part(
     shell: &mut Shell,
     snapshot_status: i32,
     word: &Word,
+    split_literal_ws: bool,
 ) -> std::ops::ControlFlow<()> {
     use std::ops::ControlFlow;
     match part {
+        WordPart::Literal { text, quoted } if !*quoted && split_literal_ws => {
+            let ifs = shell.ifs();
+            emit_split_fields(text, &ifs, current, result, has_emitted);
+        }
         WordPart::Literal { text, quoted } => {
             current.push_str(text, *quoted);
             *has_emitted = true;
@@ -1437,6 +1455,7 @@ fn expand_part(
                     shell,
                     snapshot_status,
                     word,
+                    split_literal_ws,
                 )
                 .is_break()
                 {
@@ -1464,6 +1483,21 @@ fn expand_part(
 /// preserves the information that pathname expansion (glob) needs to skip
 /// quoted metacharacters.
 pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
+    expand_impl(word, shell, false)
+}
+
+/// Like [`expand`], but an UNQUOTED `Literal` part's raw text is itself
+/// subject to IFS field-splitting (see `split_literal_ws` on
+/// [`expand_part`]). Used only for the substituted `word` operand of
+/// `${p:+word}` / `${p:-word}` (R4, #334): `${x:+ ""}`'s operand is a
+/// literal " " followed by a quoted-empty `""`, and bash treats that
+/// leading blank as a real field separator (`set -- ${x:+ ""}` -> `$#`==1,
+/// one EMPTY field, not zero fields).
+pub(crate) fn expand_operand_word(word: &Word, shell: &mut Shell) -> Vec<Field> {
+    expand_impl(word, shell, true)
+}
+
+fn expand_impl(word: &Word, shell: &mut Shell, split_literal_ws: bool) -> Vec<Field> {
     // Snapshot $? at the start so every `LastStatus` part in this word sees
     // the same value — even if a `CommandSub` part earlier in the word
     // updates the live $?. This matches bash: substitutions update $? for
@@ -1482,6 +1516,7 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
             shell,
             snapshot_status,
             word,
+            split_literal_ws,
         )
         .is_break()
         {
@@ -2181,8 +2216,21 @@ fn emit_split_fields(
     let mut i = 0usize;
 
     // Skip leading IFS-whitespace.
+    let leading_ws_start = i;
     while i < bytes.len() && is_ws(bytes[i]) {
         i += 1;
+    }
+    // Leading IFS-whitespace consumed here is a field SEPARATOR between
+    // this value and whatever an earlier `WordPart` of the same word
+    // already contributed. If a pending field exists (`current` has
+    // chars, or `has_emitted` marks a zero-length one — e.g. a quoted-
+    // empty `""` immediately before an unquoted blank), close it now
+    // rather than silently merging across the boundary (R4, #334; also
+    // fixes plain adjacent unquoted expansions like `${x}${v}${x}` with
+    // `v=" "`, which bash treats as 2 fields, not a merged "aa").
+    if i > leading_ws_start && (*has_emitted || !current.is_empty()) {
+        result.push(std::mem::take(current));
+        *has_emitted = false;
     }
     if i >= bytes.len() {
         return;
