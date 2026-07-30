@@ -2003,4 +2003,139 @@ mod xtrace_quote_tests {
         assert_eq!(xtrace_quote("a\tb"), "$'a\\tb'");
         assert_eq!(xtrace_quote("a\nb"), "$'a\\nb'");
     }
+
+    // ── v347 (#337) Root A: `\}` escapes the operand's `}` delimiter ──────
+
+    #[test]
+    fn root_a_dquoted_operand_brace_escape_drops_backslash() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture(r#"x=1; echo "${x+\}z}""#);
+        assert_eq!(out.stdout.trim_end(), "}z");
+    }
+
+    #[test]
+    fn root_a_dquoted_operand_brace_escape_mid_word() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture(r#"x=1; echo "${x+a\}b}""#);
+        assert_eq!(out.stdout.trim_end(), "a}b");
+    }
+
+    #[test]
+    fn root_a_dquoted_operand_two_escaped_braces() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture(r#"x=1; echo "${x+\}\}}""#);
+        assert_eq!(out.stdout.trim_end(), "}}");
+    }
+
+    #[test]
+    fn root_a_nested_dquoted_operand_brace_escape() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture("x=1; y=1; echo \"${x+${y+\\}}}\"");
+        assert_eq!(out.stdout.trim_end(), "}");
+    }
+
+    #[test]
+    fn root_a_escaped_brace_inside_fake_squote_operand() {
+        // The `'...'` here is NOT a real single-quote span — the enclosing
+        // `${...}` is itself double-quoted, so bash treats the apostrophes
+        // as ordinary literal chars (second de-quoting pass).
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture("x=1; echo \"${x+'a\\}b'}\"");
+        assert_eq!(out.stdout.trim_end(), "'a}b'");
+    }
+
+    // KEEP baselines — must NOT change.
+
+    #[test]
+    fn root_a_keep_unquoted_brace_escape_already_works() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture(r"x=1; echo ${x+\}z}");
+        assert_eq!(out.stdout.trim_end(), "}z");
+    }
+
+    #[test]
+    fn root_a_keep_backslash_before_non_delimiter_char() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture(r#"x=1; echo "${x+\p}""#);
+        assert_eq!(out.stdout.trim_end(), r"\p");
+    }
+
+    #[test]
+    fn root_a_keep_dollar_escape_still_special() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture(r#"x=1; echo "${x+a\$b}""#);
+        assert_eq!(out.stdout.trim_end(), "a$b");
+    }
+
+    #[test]
+    fn root_a_keep_pattern_operand_no_match_unaffected() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture(r#"x=abc; echo "${x%\}}""#);
+        assert_eq!(out.stdout.trim_end(), "abc");
+    }
+
+    #[test]
+    fn root_a_keep_unquoted_substitution_pattern_unaffected() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture(r"x=a; echo ${x/a/\}}");
+        assert_eq!(out.stdout.trim_end(), "}");
+    }
+
+    // ── v347 (#337) Root B: `\<newline>` is a line continuation ───────────
+
+    #[test]
+    fn root_b_dquoted_operand_line_continuation_removed() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture("x=1; echo \"${x+foo\\\nbar}\"");
+        assert_eq!(out.stdout.trim_end(), "foobar");
+    }
+
+    #[test]
+    fn root_b_unquoted_operand_line_continuation_removed() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture("x=1; echo ${x+foo\\\nbar}");
+        assert_eq!(out.stdout.trim_end(), "foobar");
+    }
+
+    #[test]
+    fn root_b_inner_squote_operand_line_continuation_removed() {
+        // Fake single-quote span (enclosing `${...}` is double-quoted, so the
+        // apostrophes are literal, not a real quote) — the line continuation
+        // still applies inside it.
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture("x=1; echo \"${x+'foo\\\nbar'}\"");
+        assert_eq!(out.stdout.trim_end(), "'foobar'");
+    }
+
+    #[test]
+    fn root_b_inner_dquote_operand_line_continuation_removed() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture("x=1; echo \"${x+\"foo\\\nbar\"}\"");
+        assert_eq!(out.stdout.trim_end(), "foobar");
+    }
+
+    #[test]
+    fn root_b_unquoted_inner_dquote_operand_line_continuation_removed() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture("x=1; echo ${x+\"foo\\\nbar\"}");
+        assert_eq!(out.stdout.trim_end(), "foobar");
+    }
+
+    // KEEP baseline — a bare newline (no backslash) is preserved.
+
+    #[test]
+    fn root_b_keep_bare_newline_preserved() {
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture("x=1; echo \"${x+foo\nbar}\"");
+        assert_eq!(out.stdout.trim_end(), "foo\nbar");
+    }
+
+    #[test]
+    fn root_b_keep_real_squote_line_continuation_preserved() {
+        // A GENUINE unquoted `'...'` span (no enclosing dquote) is real
+        // single-quote semantics: backslash is never special inside it.
+        let mut e = crate::engine::Engine::new();
+        let out = e.capture("x=1; echo ${x+'foo\\\nbar'}");
+        assert_eq!(out.stdout.trim_end(), "foo\\\nbar");
+    }
 }

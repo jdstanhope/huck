@@ -2750,6 +2750,12 @@ impl<'a> Lexer<'a> {
                                 Span::new(off, l, c),
                             ));
                         }
+                        // Root B (v347 #337): `\<newline>` is a line continuation —
+                        // consume both bytes and emit nothing, even inside an inner
+                        // `"…"` span.
+                        Some('\n') => {
+                            self.cursor.next();
+                        }
                         _ => {
                             // v321 (#253): when the enclosing `${…}` is itself double-quoted,
                             // bash does a second de-quoting pass over a nested `"…"` span in a
@@ -3138,6 +3144,11 @@ impl<'a> Lexer<'a> {
                                         Span::new(in_off, in_l, in_c),
                                     ));
                                 }
+                                // Root B (v347 #337): `\<newline>` line continuation —
+                                // consume both bytes and emit nothing.
+                                Some('\n') => {
+                                    self.cursor.next();
+                                }
                                 _ => {
                                     // v321 (#253): same gate as the continuing-span
                                     // arm below — this is the FIRST char of the nested
@@ -3321,6 +3332,24 @@ impl<'a> Lexer<'a> {
                                 Span::new(off, l, c),
                             ));
                         }
+                        // Root B (v347 #337): `\<newline>` is a line continuation —
+                        // consume both bytes and emit nothing.
+                        Some('\n') => {
+                            self.cursor.next();
+                        }
+                        // Root A (v347 #337): `\` before the operand's own delimiter
+                        // (`}` for a value operand, `]` for a subscript) escapes it —
+                        // drop the backslash and emit the delimiter as a literal.
+                        Some(e) if e == end => {
+                            self.cursor.next();
+                            self.history.push(Token::new(
+                                TokenKind::Lit {
+                                    text: e.to_string(),
+                                    quoted: true,
+                                },
+                                Span::new(off, l, c),
+                            ));
+                        }
                         _ => {
                             let mut s = String::from("\\");
                             if let Some(ch) = self.cursor.next() {
@@ -3342,6 +3371,12 @@ impl<'a> Lexer<'a> {
                 // (mirrors `parse_braced_operand_opts` for the unquoted path).
                 Some('\\') => {
                     self.cursor.next(); // consume `\`
+                    // Root B (v347 #337): `\<newline>` is a line continuation —
+                    // consume both bytes and emit nothing.
+                    if self.cursor.peek() == Some(&'\n') {
+                        self.cursor.next();
+                        return Ok(Step::Produced);
+                    }
                     let text = match self.cursor.next() {
                         Some(ch) => ch.to_string(),
                         None => "\\".to_string(), // trailing `\` at EOF — keep as literal
@@ -3429,6 +3464,12 @@ impl<'a> Lexer<'a> {
                             probe.next(); // skip `\`
                             match probe.peek().copied() {
                                 Some('$' | '`' | '"' | '\\') | None => break,
+                                // Root A/B (v347 #337): `\` before the operand
+                                // delimiter or a newline needs the dedicated
+                                // backslash arm's handling (drop-and-emit-`end`,
+                                // or drop-both-and-emit-nothing) — stop the run
+                                // so the next call re-scans `\` as the first char.
+                                Some(nc) if nc == end || nc == '\n' => break,
                                 Some(next_ch) => {
                                     self.cursor.next(); // consume `\`
                                     self.cursor.next(); // consume next_ch
