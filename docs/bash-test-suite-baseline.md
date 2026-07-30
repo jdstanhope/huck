@@ -2,6 +2,25 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v348 (#339, 2026-07-30 UTC):** `exportfunc` flipped to PASS (0-diff)
+— four real behavioral roots (all verified: local bash 5.2.21 == `exportfunc.right`):
+**R1** import a hyphen-named exported function — `parse_imported_function` now
+accepts any bash function name (conservative metachar denylist; the parse +
+name-match remains the Shellshock guard), not only strict identifiers, so
+`export -f foo-a` round-trips. **R4** `export -f <name>` rejects a name that
+can't be env-encoded (`=`/`/`) with `export: <name>: cannot export` rc 1.
+**R3** enforce bash's `HEREDOC_MAX` = 16 (CVE-2014-7186) — the 17th heredoc on a
+command errors `maximum here-document count exceeded` (new
+`LexError::HeredocMaxExceeded`, bare message, fatal-abort of the parse). **R2**
+a syntax error whose source ends in an ODD count of trailing `\` (unescaped
+line-continuation at EOF) is reported one line higher (`eof_line_continuation_extra`),
+fixing the `eval 'X() { (a)>\'` line number. Summary PASS 35→36, FAIL 47→46.
+Only `exportfunc` flipped — full branch PASS-set diffed against the v347 baseline
+(exactly the 35 + `exportfunc`, NO regressions; R2 touches the shared syntax-error
+EOF-line path and R3 the shared heredoc lexer — verified explicitly). Follow-ups:
+#340 (HEREDOC_MAX abort doesn't unwind through source/eval to the top level),
+#341 (unquoted `export -f name=val` reports the truncated name) — both Minor,
+out-of-suite.
 **Updated by v347 (#337, 2026-07-30 UTC):** `posixexp2` flipped to PASS (0-diff)
 — two backslash rules in `${...}` operand scanning (`scan_step_param_operand`,
 localized to its backslash arms — NOT the deferred param-expansion-lexer
@@ -288,15 +307,15 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 ## Summary
 
 - Categories run: 82
-- PASS: 35
-- FAIL: 47
+- PASS: 36
+- FAIL: 46
 - TIMEOUT: 0
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
 
 (Counts refreshed by the v345 full-runner sweep, 2026-07-30 UTC — authoritative.
-The 35 PASS categories are: alias, appendop, array2, braces, casemod, cprint, dbg-support2,
-dynvar, extglob2, extglob3, func, getopts, herestr, ifs, input-test, invert, iquote,
+The 36 PASS categories are: alias, appendop, array2, braces, casemod, cprint, dbg-support2,
+dynvar, exportfunc, extglob2, extglob3, func, getopts, herestr, ifs, input-test, invert, iquote,
 lastpipe, nquote, nquote1, nquote2, nquote3, nquote5, parser, posix2, posixexp2, posixpat,
 precedence, procsub, quote, rhs-exp, set-x, strip, tilde, tilde2. Some per-category FAIL
 rows below still lag reality — the count above is the authoritative signal.)
@@ -341,7 +360,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | errors | FAIL | Multiple `set -o <option>: not yet supported` rejections misconfigure the test environment (posix, allexport, etc.). Also `alias -x` / `unalias -x` flags not recognized. Cascading from missing set options. |
 | execscript | FAIL | Error-message format differences — huck uses its own name as prefix rather than the script-file-and-line-number form bash uses. Executing a binary file produces a UTF-8 decoding error instead of bash's "cannot execute binary file" message. |
 | exp-tests | FAIL | Several real divergences now visible: `$'...'` strings containing control characters are displayed in `$'...'` escape notation by huck rather than as raw bytes; certain `${a[@]}` expansions collapse to fewer arguments than bash produces; `${!}` and similar empty-name parameter-expansion forms cause a huck syntax error while bash returns a value; high-byte characters in variable keys and values are formatted differently (huck uses a plain-string representation while bash uses `$'...'` notation in `declare -p` output); and word-splitting with non-standard IFS diverges for some adjacent-field cases. |
-| exportfunc | FAIL | M-09a (relaxed function-name characters) — function names containing hyphens (e.g., `foo-a`) are rejected by huck's identifier parser. Additional divergences in heredoc-count limits and export-flag error handling. |
+| exportfunc | PASS | v348 (#339): 0-diff PASS. Four roots — R1 import hyphen-named exported functions (relaxed `parse_imported_function` name check, shellshock guard retained); R4 `export -f` rejects un-encodable names (`=`/`/`); R3 enforce `HEREDOC_MAX`=16 (CVE-2014-7186); R2 eval EOF line-continuation line number. Follow-ups #340/#341 (Minor, out-of-suite). |
 | extglob | FAIL | A subset of extglob patterns involving backslash-escaped metacharacters inside extglob brackets diverge from bash (e.g., some `!([*)*`-class patterns are not correctly rejected). A temp-directory permission or working-directory issue also causes certain filesystem-based extglob tests to produce wrong results. Core extglob matching is mostly correct; edge cases remain. |
 | extglob2 | PASS | |
 | extglob3 | PASS | |
