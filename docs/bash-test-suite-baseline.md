@@ -2,6 +2,20 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v347 (#337, 2026-07-30 UTC):** `posixexp2` flipped to PASS (0-diff)
+— two backslash rules in `${...}` operand scanning (`scan_step_param_operand`,
+localized to its backslash arms — NOT the deferred param-expansion-lexer
+refactor): **Root A** `\}` before the `}` operand delimiter drops the backslash
+(escaping `}` as a literal brace) in a double-quoted operand (`"${x+\}z}"` →
+`}z`); the unquoted form already worked, and a backslash before a non-delimiter
+(`"${x+\p}"` → `\p`) or a special char (`"${x+a\$b}"` → `a$b`) is unchanged.
+**Root B** `\<newline>` in a `${...}` operand is a line continuation (both bytes
+removed), in the default/inner-single-quote/inner-double-quote sub-scanners
+(mirrors the v346 backtick rule; a bare newline is preserved). Summary PASS
+34→35, FAIL 48→47. Only `posixexp2` flipped — the operand scanner is shared by
+every `${...}`, so verified by diffing the full branch PASS-set against the v346
+baseline (exactly the 34 + `posixexp2`, NO regressions across nquote*/param/
+dollars/rhs-exp/quote/posixexp).
 **Updated by v346 (#334, 2026-07-30 UTC):** `quote` flipped to PASS (0-diff) —
 four word-expansion/quoting roots: **R4** empty-field generation in
 `${x:+word}`/`${x:-word}` alternates — the substituted `word` now undergoes the
@@ -274,16 +288,16 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 ## Summary
 
 - Categories run: 82
-- PASS: 34
-- FAIL: 48
+- PASS: 35
+- FAIL: 47
 - TIMEOUT: 0
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
 
 (Counts refreshed by the v345 full-runner sweep, 2026-07-30 UTC — authoritative.
-The 34 PASS categories are: alias, appendop, array2, braces, casemod, cprint, dbg-support2,
+The 35 PASS categories are: alias, appendop, array2, braces, casemod, cprint, dbg-support2,
 dynvar, extglob2, extglob3, func, getopts, herestr, ifs, input-test, invert, iquote,
-lastpipe, nquote, nquote1, nquote2, nquote3, nquote5, parser, posix2, posixpat,
+lastpipe, nquote, nquote1, nquote2, nquote3, nquote5, parser, posix2, posixexp2, posixpat,
 precedence, procsub, quote, rhs-exp, set-x, strip, tilde, tilde2. Some per-category FAIL
 rows below still lag reality — the count above is the authoritative signal.)
 
@@ -360,7 +374,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | parser | FAIL | v314 (#211) shrank the diff to 13 lines: the `for`/`case`-in-`for` syntax-error TEXT now matches bash's near-token/unexpected-EOF shapes byte-for-byte. Remaining: an unrelated `not a valid identifier` diagnostic wrongly carries a `line N:` prefix (not a top-level parse error, outside `render_syntax_diag`'s scope), plus a line-alignment artifact downstream of it. |
 | posix2 | PASS | v315 (#209): the `eval:` marker + eval line base resolved the diagnostic-prefix diff v314 (#211) had narrowed this to — huck now prints `eval: line 199:` with the correct outer line number, matching bash exactly. 0-diff PASS. |
 | posixexp | FAIL | Multiple real divergences: quoting-aware pattern removal (`${var//pattern}`) strips more content than bash; an unterminated `${...}` form that bash accepts causes a syntax error in huck; `$*` with a non-whitespace IFS joins with a space instead of the IFS character (producing `1 2` where bash produces `12`); IFS-splitting at word boundaries diverges (huck splits where bash keeps tokens joined); and the test-case label printed for IFS diagnostic output shows `(null)` in huck versus the actual IFS value in bash for some edge cases. |
-| posixexp2 | FAIL | `set: posix: not yet supported` misconfigures the test environment; also an unterminated `${...}` handling difference when posix mode is presumed active. |
+| posixexp2 | PASS | v347 (#337): 0-diff PASS. Two `${...}` operand backslash rules in `scan_step_param_operand` — Root A `\}` escapes the `}` delimiter (drop backslash) in a double-quoted operand; Root B `\<newline>` line-continuation removed in the operand sub-scanners. Localized (not the deferred param-expansion-lexer refactor). |
 | posixpat | PASS | v337 (#302): 0-diff PASS. Implemented POSIX.2 collating symbols `[[.name.]]` (POSIX.2 name→char table + `collsym`, `parse_class` atom-based ranges) and equivalence classes `[[=x=]]` (C-locale = match the char), wired to `extglob_match` via `has_collating_symbol`/`has_equivalence_class` at 4 match sites, plus the `[[:ascii:]]` glibc class. The char-class half already passed pre-v337. |
 | posixpipe | FAIL | `time` builtin output format differs (huck emits the system `time(1)` format while bash uses its own built-in format with `real`/`user`/`sys` labels). Also lastpipe behavior divergence. |
 | precedence | PASS | |
