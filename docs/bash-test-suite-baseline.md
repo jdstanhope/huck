@@ -2,6 +2,29 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v349 (#343, 2026-07-30 UTC):** `attr` flipped to PASS (0-diff) —
+four real `readonly`-attribute roots (all verified: local bash 5.2.21 ==
+`attr.right`): **Root A** `readonly -a` indexed-array attribute (was `invalid
+option`) — `readonly -a x=(1 2)` → `declare -ar x=([0]="1" [1]="2")`. **Root C**
+the readonly-variable error is bare (`x: readonly variable`) for a plain
+re-assignment, but keeps the `readonly:` prefix for an attribute-change attempt
+(`-a`/`-A` with a non-array-literal RHS). **Root D** a QUOTED `name=value` arg to
+a declaration builtin is an assignment (bash re-checks the expanded word) —
+`readonly 'x=hi'` == `readonly x=hi`; done in the executor's decl-arg
+construction (`decl_field_to_arg`), shared by declare/export/local/readonly.
+**Root B** under `-a`/`-A` a quoted `(...)` scalar value is coerced to an array
+literal (`readonly -a r='(7)'` → `[0]="7"`); without `-a` it stays literal.
+Summary PASS 36→37, FAIL 46→45. Only `attr` flipped — full branch PASS-set
+diffed against the v348 baseline (exactly the 36 + `attr`, NO regressions).
+Root D touches the shared decl-arg construction, so a caught+fixed regression:
+its split truncated `export -f name=value` errors to the bare name — the `-f`
+path now reconstructs the full token, which also closed the v348 follow-up #341.
+Follow-ups: #344 (quoted `name+=value` decl arg not append-split), #345
+(`readonly -a`/`-A` on an unset name materializes an empty array vs bash keeping
+it unset) — both Minor, out of scope. Two pre-existing out-of-scope divergences
+noted but not touched: `readonly 'a[0]=x'` error name-trim; `declare -r foo`
+render.
+
 **Updated by v348 (#339, 2026-07-30 UTC):** `exportfunc` flipped to PASS (0-diff)
 — four real behavioral roots (all verified: local bash 5.2.21 == `exportfunc.right`):
 **R1** import a hyphen-named exported function — `parse_imported_function` now
@@ -314,7 +337,7 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 - SKIP (from known-skips.txt): 4
 
 (Counts refreshed by the v345 full-runner sweep, 2026-07-30 UTC — authoritative.
-The 36 PASS categories are: alias, appendop, array2, braces, casemod, cprint, dbg-support2,
+The 37 PASS categories are: alias, appendop, array2, attr, braces, casemod, cprint, dbg-support2,
 dynvar, exportfunc, extglob2, extglob3, func, getopts, herestr, ifs, input-test, invert, iquote,
 lastpipe, nquote, nquote1, nquote2, nquote3, nquote5, parser, posix2, posixexp2, posixpat,
 precedence, procsub, quote, rhs-exp, set-x, strip, tilde, tilde2. Some per-category FAIL
@@ -340,7 +363,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | array | FAIL | `set +a` (all-export off) not supported, misconfiguring the test environment. Also an array literal whose element contains a background `&` operator is parsed differently than bash expects. |
 | array2 | FAIL | With helpers provisioned, the real divergence is in how certain array subscript/expansion forms pass word counts to commands: huck collapses some `${a[@]}`-style expansions into fewer arguments than bash produces, treating them more like `${a[*]}` in specific subscript contexts. |
 | assoc | FAIL | `BASH_ALIASES` and `BASH_CMDS` built-in assoc arrays are not present in huck. Also L-46 (bare attribute-only `declare -A` prints an empty-string assignment in `declare -p`) and L-44 (assoc-array iteration order). |
-| attr | FAIL | `readonly -a` (array readonly flag) not recognized — huck rejects the `-a` option. Error-message prefix format differs throughout. New bug. |
+| attr | PASS | v349 (#343): `readonly -a` (Root A), conditional readonly-var error prefix (Root C), quoted `name=value` arg as assignment (Root D), `-a`/`-A` `(...)`-scalar array coercion (Root B). |
 | braces | PASS | v341 (#44/#318): 0-diff PASS. Four roots fixed — negative step (sign ignored, `{10..1..-2}`→`10 8 6 4 2`); nested/unmatched outer brace still expands a balanced inner one (`a-{b{d,e}}-c`, `a-{bdef-{g,i}-c`); char range emits an empty element for `\`; and bare `$var{x,y}`→`$varx $vary` name-merge (new `braced` flag on `WordPart::Var`, since modifier-less `${var}` demotes to `Var`). #44 stays open for the broader brace-before-param ordering. |
 | builtins | FAIL | Multiple unimplemented `set -o` options (`posix`, `+p`) abort the test preamble. `ulimit` and `fc` are not found as commands. |
 | case | FAIL | L-43 (readonly-assignment abort) RESOLVED by v313 (#31) — a standalone readonly assignment now discards the current command, so the old cascade is gone. Two divergences remain (v313 re-sweep): (1) control-character case-PATTERN matching — patterns built from control bytes (soh/stx/del) match differently, yielding `ok1ok2ok3ok4ok5` where bash produces `fail1fail2fail3ok4fail5`; (2) arithmetic assignment to a readonly inside `(( ))` — `((xx++))` on a readonly emits one error + computes `1.1`, where bash emits a second `xx++: … (error token is "")` diagnostic and computes `1.0` (an arith-lvalue-on-readonly path, distinct from the run_assignment_list fix). |
