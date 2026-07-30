@@ -396,3 +396,114 @@ fn mid_word_hash_is_still_literal_after_alias_fix() {
     );
     assert_eq!(out, "a#b\n");
 }
+
+// --- v345 (#329, R1): a leading array-literal assignment (`a=(...)` /
+// `a+=(...)`) as the FIRST word of an injected alias body must parse as an
+// array literal, not surface a bare `(` and fail with
+// `ParseError::UnsupportedCommand`.
+//
+// Hand-checked against `bash --norc --noprofile` (5.2.21) via multi-line
+// input (alias def on its own line, per the same-line-timing rule — moot
+// here since `shell.aliases` is populated directly).
+
+#[test]
+fn leading_array_assign_in_alias_body_parses_as_array_literal() {
+    let mut shell = Shell::new();
+    shell
+        .aliases
+        .insert("foo".to_string(), "a=(1 2 3); echo ${a[@]}".to_string());
+    let (outcome, out, err) = run_line_with_aliases("foo", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} out={out:?} err={err:?}"
+    );
+    assert_eq!(out, "1 2 3\n");
+    assert!(err.is_empty(), "err={err:?}");
+}
+
+#[test]
+fn leading_array_append_in_alias_body_parses_as_array_literal() {
+    let mut shell = Shell::new();
+    shell
+        .aliases
+        .insert("foo".to_string(), "a+=(2 3); echo ${a[@]}".to_string());
+    let (outcome, out, err) = run_line_with_aliases("a=(1)\nfoo", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} out={out:?} err={err:?}"
+    );
+    assert_eq!(out, "1 2 3\n");
+    assert!(err.is_empty(), "err={err:?}");
+}
+
+#[test]
+fn non_leading_array_assign_in_alias_body_still_works() {
+    // Regression: array assignment NOT in leading-command-word position
+    // (already worked pre-fix) must keep working.
+    let mut shell = Shell::new();
+    shell.aliases.insert(
+        "foo".to_string(),
+        "echo x; a=(1 2); echo ${a[@]}".to_string(),
+    );
+    let (outcome, out, err) = run_line_with_aliases("foo", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} out={out:?} err={err:?}"
+    );
+    assert_eq!(out, "x\n1 2\n");
+    assert!(err.is_empty(), "err={err:?}");
+}
+
+#[test]
+fn leading_scalar_assign_in_alias_body_still_works() {
+    // Regression: a leading SCALAR assignment (`name=value`, no `(`) in an
+    // alias body already worked pre-fix and must keep working.
+    let mut shell = Shell::new();
+    shell
+        .aliases
+        .insert("foo".to_string(), "x=5; echo $x".to_string());
+    let (outcome, out, err) = run_line_with_aliases("foo", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} out={out:?} err={err:?}"
+    );
+    assert_eq!(out, "5\n");
+    assert!(err.is_empty(), "err={err:?}");
+}
+
+#[test]
+fn eval_leading_array_assign_still_works() {
+    // Regression: `eval` re-lexing a leading array literal (a separate code
+    // path from alias-body injection) must be unaffected by this fix.
+    let mut shell = Shell::new();
+    let (outcome, out, err) =
+        run_line_with_aliases(r#"eval "a=(1 2 3); echo \${a[@]}""#, &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} out={out:?} err={err:?}"
+    );
+    assert_eq!(out, "1 2 3\n");
+    assert!(err.is_empty(), "err={err:?}");
+}
+
+#[test]
+fn leading_array_assign_alias_name_collision_does_not_loop() {
+    // Edge case: an alias named the same as the array variable used in
+    // another alias's leading array assignment must not confuse the
+    // recursion guard or cause a hang/panic — `a` here is a COMMAND alias,
+    // unrelated to the `a=(...)` assignment target in `foo`'s body.
+    let mut shell = Shell::new();
+    shell
+        .aliases
+        .insert("a".to_string(), "echo notused".to_string());
+    shell
+        .aliases
+        .insert("foo".to_string(), "a=(1 2 3); echo ${a[@]}".to_string());
+    let (outcome, out, err) = run_line_with_aliases("foo", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} out={out:?} err={err:?}"
+    );
+    assert_eq!(out, "1 2 3\n");
+    assert!(err.is_empty(), "err={err:?}");
+}
