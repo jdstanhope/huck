@@ -2,6 +2,22 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v346 (#334, 2026-07-30 UTC):** `quote` flipped to PASS (0-diff) —
+four word-expansion/quoting roots: **R4** empty-field generation in
+`${x:+word}`/`${x:-word}` alternates — the substituted `word` now undergoes the
+same quote-removal + IFS field-splitting a normal word does, so a quoted-empty
+segment produces an empty field and internal IFS whitespace separates fields
+(new `expand_operand_word`; `emit_split_fields` closes a pending field on both
+leading and trailing IFS whitespace — the latter also fixes `$x$y` with a
+trailing-space `x` → 2 fields, and the `${foo:-…\}` tail). **R3** `IFS` is now
+initialized as a real SET variable (default `$' \t\n'`), so `$IFS` expands and
+`${IFS+x}`/`${IFS-x}` see it set (`Shell::ifs()` still falls back to the same
+default when unset — splitting unchanged). **R1/R2** a backtick body's
+`\<newline>` line-continuation is removed during the one-level unescape (even
+inside single quotes: `` `echo 'foo\<NL>bar'` `` → `foobar`). Summary PASS
+33→34, FAIL 49→48. Only `quote` flipped — full branch PASS-set diffed against
+the v345 baseline is exactly the 33 + `quote`, NO regressions (R3/R4 touch the
+shared param-expansion + field-splitting paths — verified explicitly).
 **Updated by v345 (#329, 2026-07-30 UTC):** `alias` flipped to PASS (0-diff) —
 four alias-expansion roots: **R2** a command-word alias preceded by leading
 redirections is now expanded (`< /dev/null foo`), order-sensitive vs
@@ -258,17 +274,17 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 ## Summary
 
 - Categories run: 82
-- PASS: 33
-- FAIL: 49
+- PASS: 34
+- FAIL: 48
 - TIMEOUT: 0
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
 
 (Counts refreshed by the v345 full-runner sweep, 2026-07-30 UTC — authoritative.
-The 33 PASS categories are: alias, appendop, array2, braces, casemod, cprint, dbg-support2,
+The 34 PASS categories are: alias, appendop, array2, braces, casemod, cprint, dbg-support2,
 dynvar, extglob2, extglob3, func, getopts, herestr, ifs, input-test, invert, iquote,
 lastpipe, nquote, nquote1, nquote2, nquote3, nquote5, parser, posix2, posixpat,
-precedence, procsub, rhs-exp, set-x, strip, tilde, tilde2. Some per-category FAIL
+precedence, procsub, quote, rhs-exp, set-x, strip, tilde, tilde2. Some per-category FAIL
 rows below still lag reality — the count above is the authoritative signal.)
 
 **v299 harness correction:** the two categories previously recorded as TIMEOUT
@@ -350,7 +366,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | precedence | PASS | |
 | printf | FAIL | Usage-message prefix format (`huck: printf: usage:` vs bare `printf: usage:`). Also some format-specifier differences (string width and `%b` handling). |
 | procsub | PASS | v318 (#218): `$!` from a process substitution + `wait "$!"` resolves (saved-status ring), and `f=<(…)` process-substitution assignment now parses/expands (lexer glues `<(…)` onto the assignment value; `expand_assignment` realizes it; drained per-command like bash). 0-diff. |
-| quote | FAIL | Backslash quoting edge cases — an escaped space inside a word is treated differently, and a backslash-newline line continuation produces two separate values rather than joining the words. New bugs in backslash-quote-in-word handling. |
+| quote | PASS | v346 (#334): 0-diff PASS. Four roots — R4 empty-field generation in `${x:+word}`/`${x:-word}` alternates (`expand_operand_word` + `emit_split_fields` leading/trailing IFS-whitespace field-close); R3 `IFS` initialized as a set variable (default `$' \t\n'`); R1/R2 backtick `\<newline>` line-continuation removed in `unescape_backtick_body`. |
 | quotearray | FAIL | Assoc-array keys containing escaped special characters (brackets, dollar signs, backslashes) cannot be used as arithmetic subscripts — the arith parser fails on the key content. New bug in special-character key handling in arithmetic array contexts. |
 | read | FAIL | v298 re-sweep: no longer TIMEOUT (the v268 hang — the foreground-wait latency / `read -t` block — is resolved; the category now runs to completion). Now FAILs with remaining output divergences (residual `read -t`/`read -u` fd-source edge cases, L-34 class); needs re-triage. |
 | redir | FAIL | v298 re-sweep: no longer TIMEOUT (the v268 hang — `<&N-`/`>&N-` dup-and-close leaving fd state inconsistent so a later `read` blocked on the tty — is resolved; move-fd redirects now supported and the category runs to completion). Now FAILs with remaining output divergences; needs re-triage. |
