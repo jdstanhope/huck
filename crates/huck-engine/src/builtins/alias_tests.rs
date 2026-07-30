@@ -1,5 +1,27 @@
 use super::*;
+use crate::executor::{StderrSink, StdoutSink};
 use crate::shell_state::Shell;
+
+/// Runs `line` through the engine's single-line entry point with alias
+/// expansion enabled (mirrors how `-c`/script execution decides the bool —
+/// see `crate::shell::process_line`'s callers), capturing stdout+stderr into
+/// owned `String`s alongside the outcome.
+fn run_line_with_aliases(line: &str, shell: &mut Shell) -> (ExecOutcome, String, String) {
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = crate::shell::process_line_in_sinks(
+        line,
+        shell,
+        true,
+        &mut StdoutSink::Capture(&mut out),
+        &mut StderrSink::Capture(&mut err),
+    );
+    (
+        outcome,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
 
 #[test]
 fn alias_no_args_lists_empty() {
@@ -130,4 +152,124 @@ fn unalias_no_args_returns_usage_status_2() {
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin("unalias", &[], &mut buf, &mut std::io::stderr(), &mut shell);
     assert!(matches!(outcome, ExecOutcome::Continue(2)));
+}
+
+// --- v345 (#329, R2): command-word alias expansion after leading
+// redirections / an inline-assignment prefix. ---
+//
+// bash expands a command-word alias regardless of what precedes it on the
+// line (leading redirects, an inline-assignment prefix) — only the WORD
+// POSITION matters, not what's ahead of it. `parse_command`'s one-shot
+// `expand_command_alias()` call at absolute command start only ever sees a
+// bare command-name `Lit`/`Word` when NOTHING precedes the command word; a
+// leading redirect operator or `AssignPrefix` token in that position made it
+// a no-op with nothing re-driving it once the redirect/assignment was
+// consumed and the parser reached the real command word.
+//
+// Every case below hand-checked against `bash --norc --noprofile` (5.2.21).
+// Two brief-example values needed correcting against that ground truth (see
+// task-1-report.md for the full hand-check log):
+//  - a bare leading OUTPUT redirect (`> /dev/null a`) redirects the aliased
+//    command's OWN stdout away, so real bash prints nothing for that exact
+//    fragment (rc 0, no output) — not "OK". Substituted `2>/dev/null a`
+//    (redirect stderr away, leaving stdout intact) to exercise the same
+//    "leading redirect precedes the alias command word" shape while still
+//    asserting the brief's literal "OK" stdout.
+//  - `echo hi < foo` with a NONEXISTENT `foo` never reaches `echo` at all in
+//    real bash: the redirect is set up before the command runs, and opening
+//    a missing file for input fails the command outright (rc 1, "No such
+//    file or directory", no "hi" on stdout). The brief's "no error about
+//    `bar`" is the meaningful assertion (proving `foo` — the literal target
+//    text — was opened, not the alias body `bar`); "hi" printing requires an
+//    ACTUAL readable file at that path, which the test below supplies.
+//
+// Also note: alias substitution is READ-TIME, so definitions taking effect
+// only for a LATER `process_line` call (not textually later in the same
+// line/`-c` string) is a separate, pre-existing, correct bash divergence —
+// unrelated to this fix. `shell.aliases` is populated directly here (as the
+// pre-existing tests above already do) specifically to sidestep that timing
+// concern and isolate the R2 root cause under test.
+
+#[test]
+fn command_word_alias_expands_after_leading_input_redirect() {
+    let mut shell = Shell::new();
+    shell.aliases.insert("foo".to_string(), "echo".to_string());
+    let (outcome, out, err) = run_line_with_aliases("< /dev/null foo bar", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} err={err:?}"
+    );
+    assert_eq!(out, "bar\n");
+}
+
+#[test]
+fn command_word_alias_expands_after_leading_output_redirect() {
+    let mut shell = Shell::new();
+    shell.aliases.insert("a".to_string(), "echo OK".to_string());
+    let (outcome, out, err) = run_line_with_aliases("2>/dev/null a", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} err={err:?}"
+    );
+    assert_eq!(out, "OK\n");
+}
+
+#[test]
+fn command_word_alias_expands_in_eval_body_after_leading_redirect() {
+    let mut shell = Shell::new();
+    shell.aliases.insert("e".to_string(), "echo".to_string());
+    let (outcome, out, err) = run_line_with_aliases(r#"eval "</dev/null e ok 3""#, &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} err={err:?}"
+    );
+    assert_eq!(out, "ok 3\n");
+}
+
+#[test]
+fn command_word_alias_expands_after_assignment_prefix() {
+    let mut shell = Shell::new();
+    shell.aliases.insert("e".to_string(), "echo".to_string());
+    let (outcome, out, err) = run_line_with_aliases("a=true e ok 4", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} err={err:?}"
+    );
+    assert_eq!(out, "ok 4\n");
+}
+
+#[test]
+fn redirect_target_word_is_not_alias_expanded() {
+    let target = tempfile::NamedTempFile::new().expect("create temp redirect target");
+    let target_path = target.path().to_str().expect("utf8 temp path").to_string();
+    let mut shell = Shell::new();
+    // If the redirect target were (wrongly) looked up as an alias, this body
+    // — a bogus command name, not a path — would make the open/exec fail.
+    shell.aliases.insert(
+        target_path.clone(),
+        "bogus_command_not_a_path_xyz".to_string(),
+    );
+    let (outcome, out, err) =
+        run_line_with_aliases(&format!("echo hi < {target_path}"), &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} err={err:?}"
+    );
+    assert_eq!(out, "hi\n");
+    assert!(
+        !err.contains("bogus_command_not_a_path_xyz"),
+        "redirect target was alias-expanded: {err:?}"
+    );
+}
+
+#[test]
+fn command_word_alias_still_expands_with_no_leading_redirect() {
+    let mut shell = Shell::new();
+    shell.aliases.insert("foo".to_string(), "echo".to_string());
+    let (outcome, out, err) = run_line_with_aliases("foo x", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?} err={err:?}"
+    );
+    assert_eq!(out, "x\n");
 }

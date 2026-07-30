@@ -3098,6 +3098,26 @@ fn parse_simple_with_leading_word(
                     | TokenKind::ExtglobOpen { .. }
             )
         ) {
+            // v345 (#329, R2): re-drive command-position alias expansion here
+            // when every word collected so far is still assignment-shaped
+            // (true vacuously when `all_words` is empty). `parse_command`'s
+            // own `expand_command_alias()` call only fires ONCE, at absolute
+            // command start — a no-op unless the very first token is already a
+            // bare command-name `Lit`/`Word`. Leading redirections (`< /dev/null
+            // foo`) or inline-assignment prefixes (`a=true foo`) sit in front of
+            // the command word in the token stream, so that first call always
+            // misses them (the token at absolute start is a redirect operator or
+            // an `AssignPrefix`, neither of which `expand_command_alias` matches).
+            // Re-driving it here, right before the word this branch is about to
+            // assemble, catches the real command-word position in both cases.
+            // Safe to call unconditionally under the guard: `expand_command_alias`
+            // is a no-op unless the CURRENT token is an unexpanded bare command
+            // name, so on every other iteration (another assignment-prefix word,
+            // or after the true command word has already been consumed/expanded)
+            // this is a harmless re-check, not a double expansion.
+            if all_words.iter().all(crate::command::is_assignment_word) {
+                iter.expand_command_alias()?;
+            }
             // v264 flip-fix (Finding 1): argument command words brace-expand
             // (1→N Words), matching the oracle's lex-time `emit_word_with_braces`.
             // Recovery cursor context (Task 4): this is an argument-position word.
