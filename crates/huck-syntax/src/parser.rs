@@ -2388,9 +2388,11 @@ fn skip_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
 /// `skip_newlines` ran (the lexer had not injected the alias body yet). So:
 /// re-skip and re-try alias expansion — the next line may itself start with
 /// an alias expanding to `#` — until a real token surfaces or genuine EOF is
-/// reached. Mirrors bash accepting `true && comment\necho after` (an
-/// alias-comment "swallowing" the rest of a line does not end the
-/// enclosing list; the parser keeps looking for the next command).
+/// reached. This covers the FIRST-stage / comment-only-line position (a line
+/// that reduces to an alias-comment then continues on the next line). It does
+/// NOT yet handle an alias-comment used as a mandatory connector RHS
+/// (`false && c` with `alias c=#`), which still errors where bash line-
+/// continues — see #330 (exotic, out of the alias-suite scope).
 fn skip_newlines_through_alias_comments(iter: &mut Lexer) -> Result<(), ParseError> {
     loop {
         skip_newlines(iter)?;
