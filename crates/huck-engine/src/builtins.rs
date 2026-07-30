@@ -1486,9 +1486,27 @@ fn builtin_export_decl(
     let mut any_error = false;
     for arg in operands {
         if func {
+            // Under `-f`, operands are function NAMES, never assignments —
+            // bash looks up (and reports) the whole token. A `name=value`
+            // operand reaches us as a `DeclArg::Assign` only because the
+            // executor's Root-D (#343) split fires ahead of flag parsing; here
+            // we reconstruct the original `name=value` token so the lookup and
+            // the `not a function` error use the full string (bash: `export -f
+            // foo=bar` → `foo=bar: not a function`, not `foo:`).
+            let assign_token;
             let name: &str = match arg {
                 DeclArg::Plain(s) => s.as_str(),
-                DeclArg::Assign(a) => a.target.name(),
+                DeclArg::Assign(a) => {
+                    let mut t = a.target.name().to_string();
+                    t.push_str(if a.append { "+=" } else { "=" });
+                    for p in &a.value.0 {
+                        if let crate::lexer::WordPart::Literal { text, .. } = p {
+                            t.push_str(text);
+                        }
+                    }
+                    assign_token = t;
+                    assign_token.as_str()
+                }
             };
             if unexport {
                 // export -nf NAME: remove the export mark (lenient — no-op if not
