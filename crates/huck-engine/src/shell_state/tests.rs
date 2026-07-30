@@ -188,6 +188,45 @@ fn import_accepts_simple_and_rejects_invalid_name() {
 }
 
 #[test]
+fn import_accepts_hyphenated_name() {
+    // R1 (#339): bash function names aren't POSIX identifiers — `foo-a` is
+    // routine and must round-trip on import, matching bash.
+    let body = parse_imported_function("foo-a", "() { echo hi; }");
+    assert!(body.is_some(), "hyphenated name must be accepted");
+}
+
+#[test]
+fn import_shellshock_body_guard_still_rejects() {
+    // CRITICAL: relaxing the NAME check must not weaken the BODY guard.
+    assert!(parse_imported_function("x", "() { :; }; touch /tmp/PWN").is_none());
+}
+
+#[test]
+fn import_rejects_name_injection_attempts() {
+    // Each of these embeds a shell metacharacter in the NAME that could, if
+    // accepted, turn the reconstructed "<name> <value>" text into something
+    // other than a lone function definition. All must be rejected.
+    let value = "() { :; }";
+    for bad_name in [
+        "x y",     // whitespace
+        "x;y",     // command separator
+        "x&y",     // background/and
+        "x|y",     // pipe
+        "x$y",     // substitution
+        "x`y",     // backtick command substitution
+        "x(y",     // subshell/paren
+        "x=y",     // assignment
+        "x\ny",    // newline
+        "x;touch", // classic injection shape
+    ] {
+        assert!(
+            parse_imported_function(bad_name, value).is_none(),
+            "name {bad_name:?} must be rejected"
+        );
+    }
+}
+
+#[test]
 fn exported_function_env_pairs() {
     let mut sh = Shell::new();
     sh.define_function("ef".to_string(), test_fn_body(), 0);

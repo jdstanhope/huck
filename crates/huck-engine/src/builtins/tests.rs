@@ -755,6 +755,91 @@ fn export_f_marks_existing_function() {
 }
 
 #[test]
+fn export_f_hyphenated_name_ok() {
+    // R1/R4 (#339): bash allows a hyphen in a function name; export -f must
+    // still succeed and round-trip via BASH_FUNC_<name>%%.
+    let mut shell = Shell::new();
+    let _ = crate::shell::process_line("foo-a(){ echo hi; }", &mut shell, false);
+    let mut out = Vec::new();
+    let oc = builtin_export_decl(
+        &[dp("-f"), dp("foo-a")],
+        &mut out,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
+    assert!(matches!(oc, ExecOutcome::Continue(0)), "{oc:?}");
+    assert!(shell.is_function_exported("foo-a"));
+    let env = shell.exported_function_env();
+    assert!(
+        env.iter().any(|(k, _)| k == "BASH_FUNC_foo-a%%"),
+        "expected BASH_FUNC_foo-a%% in exported env: {env:?}"
+    );
+}
+
+#[test]
+fn export_f_unencodable_name_cannot_export_rc1() {
+    // R4 (#339): a function name containing `=` can't be encoded as
+    // `BASH_FUNC_<name>%%` (the env key would split at the `=`). bash rejects
+    // it with "cannot export" / rc 1, even though the function itself exists.
+    let mut shell = Shell::new();
+    let _ = crate::shell::process_line("function foo=bar { echo hi; }", &mut shell, false);
+    assert!(
+        shell.functions.contains_key("foo=bar"),
+        "precondition: function must be defined"
+    );
+    let mut out = Vec::new();
+    let mut errbuf = Vec::new();
+    let oc = builtin_export_decl(
+        &[dp("-f"), dp("foo=bar")],
+        &mut out,
+        &mut errbuf,
+        &mut shell,
+    );
+    assert!(matches!(oc, ExecOutcome::Continue(1)), "{oc:?}");
+    assert!(
+        !shell.is_function_exported("foo=bar"),
+        "must NOT mark exported"
+    );
+    let env = shell.exported_function_env();
+    assert!(
+        env.is_empty(),
+        "must NOT emit a BASH_FUNC_ env pair: {env:?}"
+    );
+    let errs = String::from_utf8(errbuf).unwrap();
+    assert!(
+        errs.contains("export: foo=bar: cannot export"),
+        "unexpected stderr: {errs:?}"
+    );
+}
+
+#[test]
+fn export_f_slash_name_cannot_export_rc1() {
+    // R4 (#339): bash 5.2.21 empirically also rejects a `/`-containing name
+    // ("export -f /bin/echo" -> "cannot export", rc 1) even though `/` isn't
+    // an `=`. `function /bin/echo { ... }` is huck's own permissive
+    // function-keyword name grammar (matches bash), so this state IS
+    // reachable and must match bash's rc + message.
+    let mut shell = Shell::new();
+    let _ = crate::shell::process_line("function /bin/echo { echo bad; }", &mut shell, false);
+    assert!(shell.functions.contains_key("/bin/echo"));
+    let mut out = Vec::new();
+    let mut errbuf = Vec::new();
+    let oc = builtin_export_decl(
+        &[dp("-f"), dp("/bin/echo")],
+        &mut out,
+        &mut errbuf,
+        &mut shell,
+    );
+    assert!(matches!(oc, ExecOutcome::Continue(1)), "{oc:?}");
+    assert!(!shell.is_function_exported("/bin/echo"));
+    let errs = String::from_utf8(errbuf).unwrap();
+    assert!(
+        errs.contains("export: /bin/echo: cannot export"),
+        "unexpected stderr: {errs:?}"
+    );
+}
+
+#[test]
 fn export_f_not_a_function_rc1() {
     let mut shell = Shell::new();
     let mut out = Vec::new();

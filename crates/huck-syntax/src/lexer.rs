@@ -17,6 +17,12 @@ pub enum LexError {
     Substitution(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
     UnterminatedHeredoc,
+    /// bash's `HEREDOC_MAX` = 16: a 17th pending heredoc on one command line
+    /// (v348, #339, R3; CVE-2014-7186 fix mirror). Rendered WITHOUT the
+    /// `syntax error: ` wrapper other `LexError`s get — bash's own message
+    /// is bare `maximum here-document count exceeded` — see
+    /// `error_emit::render_diag_inner`'s special case.
+    HeredocMaxExceeded,
     BraceExpansionLimit,
     /// `${a[3` or `a[3=v` — missing `]` closing a subscript.
     UnterminatedSubscript,
@@ -965,6 +971,15 @@ impl PartialEq<Token> for TokenKind {
         self == &other.kind
     }
 }
+
+/// bash's here-document cap (CVE-2014-7186 fix): a command line may have at
+/// most this many pending heredocs; the 17th `<<`/`<<-` on one line errors
+/// with `maximum here-document count exceeded` instead of being accepted
+/// (v348, #339, R3). Verified against real bash 5.2.21: 16 heredocs on one
+/// `cat <<A <<B …` line run fine, 17 errors; two separate lines of 10 each
+/// (the queue drains at each line's terminating newline before the next
+/// line's openers are scanned) are unaffected.
+const HEREDOC_MAX: usize = 16;
 
 /// State for a heredoc whose body hasn't been collected yet.
 #[derive(Clone)]
@@ -5040,6 +5055,12 @@ impl<'a> Lexer<'a> {
                         } else {
                             false
                         };
+                        // v348 (#339, R3): bash's HEREDOC_MAX cap — the 17th
+                        // pending heredoc on this line errors instead of
+                        // being silently accepted (CVE-2014-7186 fix mirror).
+                        if self.atom_pending_heredocs.len() >= HEREDOC_MAX {
+                            return Err(LexError::HeredocMaxExceeded);
+                        }
                         let (delim, expand) = parse_heredoc_delim(&mut self.cursor)?;
                         push!(TokenKind::Heredoc {
                             body: Word(Vec::new()),

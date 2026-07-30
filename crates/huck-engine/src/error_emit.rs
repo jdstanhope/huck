@@ -190,7 +190,8 @@ fn render_diag_inner(
     // report `line 2`) — so this counts LOGICAL lines via `str::lines()`,
     // not raw `\n` bytes (a byte count under-counts by one for the common
     // no-trailing-newline case).
-    let eof_line = line_base + 1 + source.lines().count() as u32;
+    let eof_line =
+        line_base + 1 + source.lines().count() as u32 + eof_line_continuation_extra(source);
     let echo_line = source_logical_line(source, local_line);
     match err {
         // Shape 1: a real token is present but misplaced.
@@ -214,6 +215,18 @@ fn render_diag_inner(
             ..
         }) if is_matching_delim(*d) => {
             emit_matching(shell, *d, source, local_line, marker, line_base);
+        }
+        // v348 (#339, R3): bash's HEREDOC_MAX message has no `syntax error:`
+        // wrapper — it's bare `maximum here-document count exceeded` after
+        // the usual `<name>: [-c: ]line N: ` prologue.
+        ParseError::Lex(le) if matches!(**le, huck_syntax::lexer::LexError::HeredocMaxExceeded) => {
+            emit_syntax_error_ex(
+                shell,
+                display_line,
+                format_args!("maximum here-document count exceeded"),
+                None,
+                marker,
+            );
         }
         ParseError::Lex(le) => match lex_is_shape3(le) {
             Some(d) => emit_matching(shell, d, source, local_line, marker, line_base),
@@ -303,7 +316,8 @@ fn emit_matching(
     marker: Marker,
     line_base: u32,
 ) {
-    let eof_line = line_base + 1 + source.lines().count() as u32;
+    let eof_line =
+        line_base + 1 + source.lines().count() as u32 + eof_line_continuation_extra(source);
     let line = match d {
         Delim::DollarParen | Delim::Paren => eof_line,
         _ => line_base + local_line,
@@ -322,6 +336,24 @@ fn emit_matching(
         None,
         marker,
     );
+}
+
+/// bash's EOF line counter is "one past the last line read" — but when
+/// `source` ends in an unescaped line-continuation backslash (an ODD count
+/// of consecutive `\` at the very end, e.g. `if true\`), bash's line-oriented
+/// reader treats it as "read one more line to complete this escape" and
+/// bumps its internal line counter for that attempt even though there is no
+/// further input, reporting one line higher than it would for the same body
+/// without the trailing backslash (or with an EVEN count, which is a
+/// self-escaped `\\` — not a continuation). Verified against real bash
+/// 5.2.21 both for a top-level script (`if true\` at EOF) and for an
+/// `eval`'d string (`eval 'X() { (a)>\'`, exportfunc.tests/exportfunc1.right
+/// line 44, #339 R2) — both need this extra `+1` that a plain
+/// `source.lines().count()` misses. Returns `1` when `source` needs the
+/// bump, else `0`.
+fn eof_line_continuation_extra(source: &str) -> u32 {
+    let trailing_backslashes = source.bytes().rev().take_while(|&b| b == b'\\').count();
+    if trailing_backslashes % 2 == 1 { 1 } else { 0 }
 }
 
 /// Returns the `line`-th (1-based) logical line of `source`, trailing `\n`
@@ -448,6 +480,20 @@ mod tests {
     use super::*;
     use crate::err_thread_local::install_err_sinks;
     use crate::executor::{StderrSink, StdoutSink};
+
+    // v348 (#339, R2): an ODD count of trailing `\` at EOF is an unescaped
+    // line-continuation — bash bumps its EOF line counter by 1 for the
+    // "read one more line" attempt; an even count (`\\`, self-escaped) does
+    // not. Fixes the `eval 'X() { (a)>\'` syntax-error line number.
+    #[test]
+    fn eof_line_continuation_extra_counts_odd_trailing_backslashes() {
+        assert_eq!(eof_line_continuation_extra("if true\\"), 1);
+        assert_eq!(eof_line_continuation_extra("X() { (a)>\\"), 1);
+        assert_eq!(eof_line_continuation_extra("if true\\\\"), 0); // \\ = self-escaped
+        assert_eq!(eof_line_continuation_extra("if true\\\\\\"), 1); // 3 = odd
+        assert_eq!(eof_line_continuation_extra("if true"), 0); // no trailing backslash
+        assert_eq!(eof_line_continuation_extra(""), 0);
+    }
 
     #[test]
     fn emit_cli_error_is_basename_no_line() {

@@ -85,6 +85,7 @@ pub(crate) fn lex_error_message_impl(error: &LexError) -> String {
             )
         }
         LexError::UnterminatedHeredoc => ": unterminated here-document".to_string(),
+        LexError::HeredocMaxExceeded => ": maximum here-document count exceeded".to_string(),
         LexError::BraceExpansionLimit => ": brace expansion: too many elements".to_string(),
         LexError::UnterminatedSubscript => ": missing ']' in subscript".to_string(),
         LexError::UnterminatedArrayLiteral => ": unterminated array literal '('".to_string(),
