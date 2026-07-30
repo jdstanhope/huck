@@ -473,7 +473,12 @@ fn declare_quoted_paren_without_dash_a_keeps_scalar() {
 /// Root B (local): `local -a 'y=(3 4)'` coerces the quoted `(...)` value.
 #[test]
 fn local_dash_a_quoted_paren_coerces_to_array() {
+    // `y` is local to `f`, so copy it into a global to assert the coercion
+    // actually produced a 2-element indexed array (not a scalar).
     let mut s = Shell::new();
-    let outcome = run(&mut s, "f(){ local -a 'y=(3 4)'; declare -p y; }; f");
+    let outcome = run(&mut s, r#"f(){ local -a 'y=(3 4)'; g=("${y[@]}"); }; f"#);
     assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    let m = s.get_indexed("g").expect("g is an indexed array");
+    assert_eq!(m.get(&0).map(String::as_str), Some("3"));
+    assert_eq!(m.get(&1).map(String::as_str), Some("4"));
 }
