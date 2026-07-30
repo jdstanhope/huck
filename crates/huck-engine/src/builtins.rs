@@ -1933,7 +1933,29 @@ fn builtin_readonly_decl(
             DeclArg::Assign(a) => match &a.target {
                 crate::command::AssignTarget::Bare(name) => {
                     if shell.is_readonly(name) {
-                        crate::sh_error_to!(shell, err, None, "{name}: readonly variable");
+                        // v349 (#343, Root C): bash prefixes this error with
+                        // `readonly:` ONLY when an attribute flag (`-a`/`-A`)
+                        // is given AND the RHS is not an unquoted array literal
+                        // — i.e. an ATTRIBUTE-CHANGE attempt on a readonly var
+                        // (`readonly -a x=2`, `readonly -a x='(7)'`). A plain
+                        // assignment (`readonly x=2`) or an array-literal RHS
+                        // (`readonly -a x=(2)`) fails at the assignment level →
+                        // bare `{name}: readonly variable`.
+                        let is_array_lit = a
+                            .value
+                            .0
+                            .iter()
+                            .any(|p| matches!(p, crate::lexer::WordPart::ArrayLiteral(_)));
+                        if (want_indexed || want_associative) && !is_array_lit {
+                            crate::sh_error_to!(
+                                shell,
+                                err,
+                                None,
+                                "readonly: {name}: readonly variable"
+                            );
+                        } else {
+                            crate::sh_error_to!(shell, err, None, "{name}: readonly variable");
+                        }
                         exit = 1;
                         continue;
                     }
