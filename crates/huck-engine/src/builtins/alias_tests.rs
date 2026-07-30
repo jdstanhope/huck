@@ -507,3 +507,38 @@ fn leading_array_assign_alias_name_collision_does_not_loop() {
     assert_eq!(out, "1 2 3\n");
     assert!(err.is_empty(), "err={err:?}");
 }
+
+// v345 (#329, R4): an alias body ending in a numeric word, glued (no space) to
+// a following redirect operator, must NOT let that digit be the redirect's
+// fd-prefix — bash keeps it as the command's argument. `alias foo='echo 0';
+// foo>&2` runs `echo 0` (arg "0") with the command redirected to stderr, NOT
+// `echo 0>&2` (an fd-0 redirect stealing the argument).
+#[test]
+fn alias_body_trailing_number_does_not_glue_to_parent_redirect() {
+    let mut shell = Shell::new();
+    shell
+        .aliases
+        .insert("foo".to_string(), "echo 0".to_string());
+    let (outcome, out, err) = run_line_with_aliases("foo>&2", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?}"
+    );
+    // `echo 0` redirected to stderr: "0\n" on stderr, nothing on stdout.
+    assert_eq!(out, "", "stdout should be empty (echo went to stderr)");
+    assert_eq!(err, "0\n", "stderr should have the echoed 0");
+}
+
+// Regression: a plain (non-alias) `echo 0>&2` still parses `0>&2` as an fd-0
+// redirect (echo gets no argument), unaffected by the R4 boundary guard.
+#[test]
+fn plain_numeric_fd_prefix_redirect_still_glues() {
+    let mut shell = Shell::new();
+    let (outcome, out, _err) = run_line_with_aliases("echo 0>&2", &mut shell);
+    assert!(
+        matches!(outcome, ExecOutcome::Continue(0)),
+        "outcome={outcome:?}"
+    );
+    // echo with no args + `0>&2` redirect → a lone newline on stdout.
+    assert_eq!(out, "\n");
+}

@@ -179,6 +179,17 @@ impl<'a> CharCursor<'a> {
         self.peeked.as_ref()
     }
 
+    /// v345 (#329, R4): true when an injection frame is on the stack but EVERY
+    /// frame is exhausted, so the next `peek()`/`next()` reads from the PARENT
+    /// source — i.e. a `peek()` here straddles the injected-alias-body → parent
+    /// boundary. Used to stop an alias body's trailing digit-run from gluing
+    /// onto a following PARENT redirect operator as an fd-prefix: bash keeps the
+    /// body's `0` as a plain word (`alias foo='echo 0'; foo>&2` runs `echo 0`
+    /// with the redirect applied to the command, not `echo 0>&2`).
+    pub(crate) fn peek_crosses_injection_boundary(&self) -> bool {
+        !self.injected.is_empty() && self.injected.iter().all(|f| f.exhausted())
+    }
+
     /// Byte offset of the next char to be produced (start of the next token
     /// when the cursor sits on a token boundary). Equals `s.len()` at EOF.
     /// v266: while an injected alias body is active AND still has content, this
@@ -5340,6 +5351,12 @@ impl<'a> Lexer<'a> {
                 if !in_array_value
                     && at_word_start
                     && matches!(self.cursor.peek(), Some('<') | Some('>'))
+                    // v345 (#329, R4): the `<`/`>` must be in the SAME source as
+                    // the digit run. When the run is the last content of an
+                    // injected alias body, `peek()` falls through to the parent —
+                    // that redirect belongs to the command, not this word, so the
+                    // digit run stays a plain Lit (`alias foo='echo 0'; foo>&2`).
+                    && !self.cursor.peek_crosses_injection_boundary()
                 {
                     // Oracle special-case: a bare `1` glued to `>` (`1>`, `1>>`,
                     // `1>&2`, `1>|`) is a plain STDOUT redirect with the DEFAULT
