@@ -1667,6 +1667,30 @@ fn run_builtin_with_redirects(
 /// restored on scope exit), `inner` runs through the existing `sink`, and its
 /// status is returned. A redirect-open failure prints `huck: <target>: <err>`
 /// and returns `Continue(1)` WITHOUT running `inner`.
+/// The source line a command begins on (1-based, LOCAL to the parse; 0/None =
+/// unknown), recursing into compound bodies to the first sub-command. Used to
+/// stamp `$LINENO` for the `line N:` prologue on a COMPOUND command's redirect
+/// error (#170) — a simple command already sets `current_lineno` in `run_single`.
+fn command_line(cmd: &Command) -> Option<u32> {
+    use crate::command::{Command as C, SimpleCommand as S};
+    match cmd {
+        C::Simple(S::Exec(e)) => Some(e.line),
+        C::Simple(S::Assign(_, l)) => Some(*l),
+        C::For(c) => Some(c.line),
+        C::Case(c) => Some(c.line),
+        C::Select(c) => Some(c.line),
+        C::ArithFor(c) => Some(c.line),
+        C::FunctionDef { line, .. } => Some(*line),
+        C::BraceGroup(seq) => command_line(&seq.first),
+        C::Subshell { body } => command_line(&body.first),
+        C::Pipeline(p) => p.commands.first().and_then(command_line),
+        C::If(c) => command_line(&c.condition.first),
+        C::While(c) => command_line(&c.condition.first),
+        C::Redirected { inner, .. } => command_line(inner),
+        _ => None,
+    }
+}
+
 fn run_redirected(
     inner: &Command,
     redirects: &[crate::command::Redirection],
@@ -1674,6 +1698,14 @@ fn run_redirected(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
+    // #170: stamp `current_lineno` from the compound command's first sub-command
+    // BEFORE applying the trailing redirects, so a redirect-open error carries
+    // the `line N:` prologue (a simple command's redirect already does — that
+    // path goes through `run_single`, not here). A safe no-op when the line is
+    // unknown (0/None) — the prologue then omits `line N:`, unchanged from before.
+    if let Some(l) = command_line(inner).filter(|&l| l != 0) {
+        shell.current_lineno = shell.line_base() + l;
+    }
     with_redirect_scope(
         redirects,
         shell,
