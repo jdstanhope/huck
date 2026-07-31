@@ -4626,6 +4626,22 @@ fn run_exec_single_inner(
         // applied but makes the status reflect the open failure (bash:
         // `x=1 </missing` → `x` is set, rc 1) — with_redirect_scope returns the
         // open failure before running the body, so its status wins.
+        // #155: a null (no-command) command must NOT persist a `{var}` fd
+        // binding — bash only persists `{var}` for exec / a builtin / a compound
+        // command, never a redirect-only null command. Snapshot each named-fd
+        // var's prior value and restore it after the redirect scope (this branch
+        // is reached only for an empty program, so exec/builtin/compound paths
+        // are unaffected).
+        let named_fd_prior: Vec<(String, Option<String>)> = cmd
+            .redirects
+            .iter()
+            .filter_map(|r| match &r.fd {
+                crate::command::RedirFd::Var(n) => {
+                    Some((n.clone(), shell.get(n).map(|s| s.to_string())))
+                }
+                _ => None,
+            })
+            .collect();
         let st = run_assignment_list(&cmd.inline_assignments, shell, sink, err_sink);
         let outcome = with_redirect_scope(
             &cmd.redirects,
@@ -4634,6 +4650,12 @@ fn run_exec_single_inner(
             err_sink,
             move |_shell, _sink, _err_sink| ExecOutcome::Continue(st),
         );
+        for (name, prior) in named_fd_prior {
+            match prior {
+                Some(v) => shell.set(&name, v),
+                None => shell.unset(&name),
+            }
+        }
         drain_procsubs(shell, procsub_base);
         return outcome;
     }

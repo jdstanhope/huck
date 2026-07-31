@@ -54,6 +54,19 @@ fn in_process_compound_named_fd_writes_file_and_persists_var() {
 }
 
 #[test]
+fn null_command_named_fd_does_not_persist_var() {
+    // #155: a redirect-only NULL command must NOT persist `{var}` (bash leaves
+    // it unset), unlike exec / a builtin / a compound command.
+    let f = format!("/tmp/huck_null_v_{}", std::process::id());
+    let script = format!("{{v}}>{f}; echo \"${{v-UNSET}}\"; rm -f {f}");
+    assert_matches_bash(&script);
+    // A pre-existing value is RESTORED (not clobbered) after the null command.
+    let g = format!("/tmp/huck_null_v2_{}", std::process::id());
+    let script2 = format!("v=99; {{v}}>{g}; echo \"${{v-UNSET}}\"; rm -f {g}");
+    assert_matches_bash(&script2);
+}
+
+#[test]
 fn in_process_builtin_named_fd_persists_var() {
     // A bare in-process builtin (`:`) with `{fd}>file` still allocates the fd and
     // persists $fd >= 10 (bash leaves $fd set after a builtin command).
