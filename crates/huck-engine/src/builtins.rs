@@ -7744,7 +7744,20 @@ pub(crate) fn source_in_sink(
     {
         let mut err = crate::executor::err_writer(err_sink, sink);
         if args.is_empty() {
-            e!(&mut *err, ".: usage: . filename [arguments]");
+            // #232: bash emits a "filename argument required" ERROR line FIRST
+            // (with the `<prog>: line N:` prologue, prefixed with the INVOKED
+            // name `source`/`.`), then the usage line (no prologue). The usage
+            // synopsis also uses the invoked name.
+            crate::sh_error_to!(
+                shell,
+                &mut *err,
+                Some(invoked),
+                "filename argument required"
+            );
+            e!(
+                &mut *err,
+                "{invoked}: usage: {invoked} filename [arguments]"
+            );
             // POSIX case #1: missing-filename usage error (the not-found case at
             // resolve_source_path below was Task 2 and stays posix_fatal(1)).
             shell.builtin_usage_error = Some(2);
