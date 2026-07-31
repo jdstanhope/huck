@@ -52,12 +52,11 @@ check 'good-assign'       'x=1; echo $x done'
 # variable protection through the ordinary readonly machinery).
 check 'unset-readonly'    'readonly r=1; unset r; echo done'
 check 'declare-readonly'  'readonly r=1; declare r=2; echo done'
-# NOTE: two adjacent readonly cases are DELIBERATELY not tested here — they are
-# PRE-EXISTING divergences in OTHER code paths (not run_assignment_list / #31),
-# each filed separately: inline-prefix `r=2 cmd` skips the command bash runs
-# (#203); a for-loop var readonly bind double-prints the diagnostic (#205).
-# Adding them as huck-vs-bash controls would red this harness for reasons
-# unrelated to #31.
+# #205 (FIXED): a for-loop readonly var bind prints the diagnostic ONCE (bash),
+# aborts the loop, rc 1. Was double-printed before.
+check 'for-readonly'      'readonly r=1; for r in a b; do echo $r; done; echo END'
+# NOTE: the inline-prefix `r=2 cmd` case (#203) — skips the command bash runs —
+# is a separate PRE-EXISTING divergence and stays out of this harness.
 
 if [ $FAIL -ne 0 ]; then echo "readonly_assign_discard_diff_check FAILED" >&2; exit 1; fi
 echo "readonly_assign_discard_diff_check OK"

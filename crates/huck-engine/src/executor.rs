@@ -1849,11 +1849,21 @@ fn run_for_inner(
         if let Some(o) = check_interrupt(shell) {
             return o;
         }
-        if shell.try_set(&clause.var, value).is_err() {
+        // #205: precheck readonly on a plain (non-nameref) loop var and emit
+        // the error ONCE via the redirect-aware writer — calling `try_set` on a
+        // readonly var would ALSO emit it (via assign()'s thread-local sink),
+        // producing a duplicate diagnostic. A nameref falls through to
+        // `try_set`, which checks the RESOLVED target's readonly and reports.
+        if !shell.is_nameref(&clause.var) && shell.is_readonly(&clause.var) {
             {
                 let mut err = err_writer(err_sink, sink);
                 crate::sh_error_to!(shell, &mut *err, None, "{}: readonly variable", clause.var);
             }
+            shell.posix_fatal(127);
+            return ExecOutcome::Continue(1);
+        }
+        if shell.try_set(&clause.var, value).is_err() {
+            // Nameref to a readonly target: try_set already reported the error.
             shell.posix_fatal(127);
             return ExecOutcome::Continue(1);
         }
