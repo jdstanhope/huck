@@ -1679,11 +1679,13 @@ fn posix_assignment_before_special_is_fatal() {
     assert_eq!(shell.pending_fatal_status, Some(127));
 }
 #[test]
-fn posix_assignment_before_regular_is_not_fatal() {
-    // before a REGULAR command → abort-continue (deferred), NOT a shell exit.
+fn posix_readonly_prefix_before_regular_is_fatal() {
+    // #234/#203: bash --posix EXITS (non-interactively) on a readonly-variable
+    // prefix assignment error before ANY command — regular ones too, not just
+    // special builtins. Default mode runs the command instead (tested above).
     let mut shell = Shell::new();
     exec_script("set -o posix\nreadonly x=1\nx=2 true\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, None);
+    assert_eq!(shell.pending_fatal_status, Some(1));
 }
 #[test]
 fn default_assignment_no_command_is_not_fatal() {
@@ -1877,17 +1879,16 @@ fn top_level_assign_to_readonly_errors() {
 }
 
 #[test]
-fn inline_assignment_to_readonly_aborts_command() {
+fn inline_assignment_to_readonly_runs_command() {
     let mut shell = Shell::new();
     shell.set("X", "outer".to_string());
     shell.mark_readonly("X");
-    // Inline `X=new echo hi` — bash aborts the command. Use a
-    // builtin (echo) to keep the assertion deterministic.
+    // #234/#203: `X=new echo hi` with X readonly — bash reports the error but
+    // STILL RUNS the command with the old value; the failed prefix is skipped.
     exec_script("X=new echo hi\n", &mut shell);
-    // X is still its original value (not changed by the failed
-    // inline). The echo should NOT have run. Status is 1.
+    // X keeps its original value, the echo RAN, and status is the command's (0).
     assert_eq!(shell.lookup_var("X").as_deref(), Some("outer"));
-    assert_eq!(shell.last_status(), 1);
+    assert_eq!(shell.last_status(), 0);
 }
 
 #[test]

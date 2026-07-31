@@ -55,8 +55,10 @@ check 'declare-readonly'  'readonly r=1; declare r=2; echo done'
 # #205 (FIXED): a for-loop readonly var bind prints the diagnostic ONCE (bash),
 # aborts the loop, rc 1. Was double-printed before.
 check 'for-readonly'      'readonly r=1; for r in a b; do echo $r; done; echo END'
-# NOTE: the inline-prefix `r=2 cmd` case (#203) — skips the command bash runs —
-# is a separate PRE-EXISTING divergence and stays out of this harness.
+# #234/#203 (FIXED): a readonly command-PREFIX assignment error is reported, but
+# bash STILL RUNS the command with the old value (rc = the command's, r kept).
+check 'prefix-readonly-runs' 'readonly r=1; r=2 echo hi; echo "rc=$? r=$r"'
+check 'prefix-readonly-multi' 'readonly r=1; a=7 r=2 b=8 sh -c "echo \$a-\$b"; echo done'
 
 if [ $FAIL -ne 0 ]; then echo "readonly_assign_discard_diff_check FAILED" >&2; exit 1; fi
 echo "readonly_assign_discard_diff_check OK"

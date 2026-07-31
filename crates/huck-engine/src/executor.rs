@@ -7961,7 +7961,17 @@ fn apply_inline_assignments(
                 let mut err = err_writer(err_sink, sink);
                 crate::sh_error_to!(shell, &mut *err, None, "{name}: readonly variable");
             }
-            return Err(snap);
+            // #234/#203: a readonly-variable error in a command PREFIX assignment
+            // is reported, but bash still RUNS the command with the OLD value
+            // (rc = the command's exit) in default mode — it does NOT abort.
+            // POSIX non-interactive makes it fatal (exit 1) via `posix_fatal`.
+            if shell.shell_options.posix && !shell.is_interactive {
+                shell.posix_fatal(1);
+                return Err(snap);
+            }
+            // Skip this failed assignment (leave the old value) and continue —
+            // any remaining prefixes still apply and the command still runs.
+            continue;
         }
         if apply_one_assignment(a, shell, &mut *err_writer(err_sink, sink)).is_err() {
             return Err(snap);
