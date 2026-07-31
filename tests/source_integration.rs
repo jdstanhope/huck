@@ -136,3 +136,26 @@ fn source_path_lookup() {
         out
     );
 }
+
+/// #232: `source`/`.` with no operand emits `<name>: filename argument required`
+/// then `<name>: usage: <name> filename [arguments]`, using the INVOKED name.
+#[test]
+fn source_no_operand_uses_invoked_name_and_required_msg() {
+    for name in ["source", "."] {
+        let (_out, err) = run_capture(name);
+        assert!(
+            err.contains(&format!("{name}: filename argument required")),
+            "invoked as {name:?}, stderr: {err:?}"
+        );
+        assert!(
+            err.contains(&format!("{name}: usage: {name} filename [arguments]")),
+            "invoked as {name:?}, stderr: {err:?}"
+        );
+    }
+    // `.` must NOT be mislabeled `source` and vice-versa.
+    let (_o, err_dot) = run_capture(".");
+    assert!(
+        !err_dot.contains("source:"),
+        "dot output leaked 'source:': {err_dot:?}"
+    );
+}
