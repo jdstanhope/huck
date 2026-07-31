@@ -808,6 +808,85 @@ pub(crate) fn is_valid_name(s: &str) -> bool {
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
+/// v349 (#343, Root B): under a declaration builtin's `-a`/`-A` flag, a scalar
+/// assignment value of the shape `(...)` is re-parsed as an ARRAY LITERAL,
+/// matching bash (which re-runs array-literal parsing plus full word expansion
+/// on the value). `readonly -a 'd=(4)'` / `export -a r='(7)'` therefore land as
+/// `d=([0]="4")` rather than the literal scalar `(4)`. Returns the re-parsed
+/// value `Word` (a single `WordPart::ArrayLiteral`) on success, or `None` when
+/// the value is not a lone `(...)`-shaped scalar literal or fails to parse as
+/// an array assignment (in which case the caller keeps the literal scalar —
+/// so a NON-`-a` `readonly 'c=(3)'` still stores `c[0]="(3)"`).
+fn reparse_paren_scalar_as_array(
+    name: &str,
+    value: &crate::lexer::Word,
+) -> Option<crate::lexer::Word> {
+    use crate::lexer::WordPart;
+    // The value must be a pure SCALAR literal (Root D's single quoted Literal,
+    // or a quoted RHS like `r='(7)'` whose parts are `Literal("r=")` + a
+    // `Quoted` literal). Any expansion/substitution part, or an already-parsed
+    // `ArrayLiteral` (the unquoted `d=(…)` path), disqualifies it → keep the
+    // scalar. `word_scalar_literal_text` flattens the literal text or returns
+    // None.
+    fn word_scalar_literal_text(w: &crate::lexer::Word) -> Option<String> {
+        let mut out = String::new();
+        for p in &w.0 {
+            match p {
+                WordPart::Literal { text, .. } => out.push_str(text),
+                WordPart::Quoted { parts, .. } => {
+                    for ip in parts {
+                        match ip {
+                            WordPart::Literal { text, .. } => out.push_str(text),
+                            _ => return None,
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    let text = word_scalar_literal_text(value)?;
+    if !(text.starts_with('(') && text.ends_with(')')) {
+        return None;
+    }
+    let src = format!("{name}={text}");
+    let seq = crate::parser::parse(&src).ok().flatten()?;
+    if !seq.rest.is_empty() {
+        return None;
+    }
+    // A bare `name=(…)` line parses as a single-stage `Pipeline` wrapping a
+    // `Simple(Assign(…))` (or, in some contexts, the bare `Simple` directly).
+    let cmd = match seq.first {
+        crate::command::Command::Pipeline(mut p) if p.commands.len() == 1 => {
+            p.commands.pop().expect("len == 1")
+        }
+        other => other,
+    };
+    let assigns = match cmd {
+        crate::command::Command::Simple(crate::command::SimpleCommand::Assign(a, _)) => a,
+        _ => return None,
+    };
+    let mut it = assigns.into_iter();
+    let first = it.next()?;
+    if it.next().is_some() {
+        return None;
+    }
+    // Confirm the value parsed AS an array literal (guards against a value that
+    // is not really `(...)`-shaped once lexed, e.g. `(` inside further quoting).
+    if first
+        .value
+        .0
+        .iter()
+        .any(|p| matches!(p, WordPart::ArrayLiteral(_)))
+    {
+        Some(first.value)
+    } else {
+        None
+    }
+}
+
 fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     // Leading flags select the namespace and apply to all following names:
     // `-f` => function namespace, `-v` (or no flag) => variable namespace.
@@ -1407,9 +1486,27 @@ fn builtin_export_decl(
     let mut any_error = false;
     for arg in operands {
         if func {
+            // Under `-f`, operands are function NAMES, never assignments —
+            // bash looks up (and reports) the whole token. A `name=value`
+            // operand reaches us as a `DeclArg::Assign` only because the
+            // executor's Root-D (#343) split fires ahead of flag parsing; here
+            // we reconstruct the original `name=value` token so the lookup and
+            // the `not a function` error use the full string (bash: `export -f
+            // foo=bar` → `foo=bar: not a function`, not `foo:`).
+            let assign_token;
             let name: &str = match arg {
                 DeclArg::Plain(s) => s.as_str(),
-                DeclArg::Assign(a) => a.target.name(),
+                DeclArg::Assign(a) => {
+                    let mut t = a.target.name().to_string();
+                    t.push_str(if a.append { "+=" } else { "=" });
+                    for p in &a.value.0 {
+                        if let crate::lexer::WordPart::Literal { text, .. } = p {
+                            t.push_str(text);
+                        }
+                    }
+                    assign_token = t;
+                    assign_token.as_str()
+                }
             };
             if unexport {
                 // export -nf NAME: remove the export mark (lenient — no-op if not
@@ -1505,6 +1602,20 @@ fn builtin_export_decl(
                     any_error = true;
                     continue;
                 }
+                // v349 (#343, Root B): `export -a NAME='(v)'` coerces the quoted
+                // scalar `(...)` value into an array literal (matches bash).
+                let reparsed_owned;
+                let a = if saw_a && let Some(value) = reparse_paren_scalar_as_array(&name, &a.value)
+                {
+                    reparsed_owned = crate::command::Assignment {
+                        target: a.target.clone(),
+                        value,
+                        append: a.append,
+                    };
+                    &reparsed_owned
+                } else {
+                    a
+                };
                 if crate::executor::apply_one_assignment(a, shell, err).is_err() {
                     any_error = true;
                     continue;
@@ -1796,6 +1907,21 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
                 if let Some(fold) = minus_case_fold {
                     shell.set_case_fold(&name, fold);
                 }
+                // v349 (#343, Root B): under -a/-A, coerce a quoted scalar
+                // `(...)` value into an array literal before applying.
+                let reparsed_owned;
+                let a = if (want_array || want_associative)
+                    && let Some(value) = reparse_paren_scalar_as_array(&name, &a.value)
+                {
+                    reparsed_owned = crate::command::Assignment {
+                        target: a.target.clone(),
+                        value,
+                        append: a.append,
+                    };
+                    &reparsed_owned
+                } else {
+                    a
+                };
                 if crate::executor::apply_one_assignment(a, shell, err).is_err() {
                     exit = 1;
                     continue;
@@ -1819,15 +1945,20 @@ fn builtin_readonly_decl(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    // Parse leading flags (-p, -A). `--` terminates option processing.
+    // Parse leading flags (-p, -a, -A). `--` terminates option processing.
     let mut want_list = false;
     let mut want_associative = false;
+    let mut want_indexed = false;
     let mut idx = 0;
     while idx < args.len() {
         let DeclArg::Plain(s) = &args[idx] else { break };
         match s.as_str() {
             "-p" => {
                 want_list = true;
+                idx += 1;
+            }
+            "-a" => {
+                want_indexed = true;
                 idx += 1;
             }
             "-A" => {
@@ -1902,17 +2033,55 @@ fn builtin_readonly_decl(
                     exit = 1;
                     continue;
                 }
+                // `readonly -a NAME` (no value): ensure name is an indexed
+                // array before marking readonly (mirrors want_associative
+                // above; declare/local's -a bare-case pattern — promote an
+                // existing scalar to element 0, or create an empty array).
+                // Skip when NAME is already associative (e.g. `-aA` together,
+                // or a pre-existing `-A` array): `-A` wins, matching bash.
+                if want_indexed
+                    && shell.get_associative(name).is_none()
+                    && shell.get_indexed(name).is_none()
+                {
+                    let mut empty = std::collections::BTreeMap::new();
+                    if let Some(scalar) = shell.get(name) {
+                        empty.insert(0, scalar.to_string());
+                    }
+                    if shell.replace_indexed(name, empty).is_err() {
+                        // assign() already emitted the readonly-variable
+                        // error (bare `{name}: readonly variable`, no prefix).
+                        exit = 1;
+                        continue;
+                    }
+                }
                 shell.mark_readonly(name);
             }
             DeclArg::Assign(a) => match &a.target {
                 crate::command::AssignTarget::Bare(name) => {
                     if shell.is_readonly(name) {
-                        crate::sh_error_to!(
-                            shell,
-                            err,
-                            None,
-                            "readonly: {name}: readonly variable"
-                        );
+                        // v349 (#343, Root C): bash prefixes this error with
+                        // `readonly:` ONLY when an attribute flag (`-a`/`-A`)
+                        // is given AND the RHS is not an unquoted array literal
+                        // — i.e. an ATTRIBUTE-CHANGE attempt on a readonly var
+                        // (`readonly -a x=2`, `readonly -a x='(7)'`). A plain
+                        // assignment (`readonly x=2`) or an array-literal RHS
+                        // (`readonly -a x=(2)`) fails at the assignment level →
+                        // bare `{name}: readonly variable`.
+                        let is_array_lit = a
+                            .value
+                            .0
+                            .iter()
+                            .any(|p| matches!(p, crate::lexer::WordPart::ArrayLiteral(_)));
+                        if (want_indexed || want_associative) && !is_array_lit {
+                            crate::sh_error_to!(
+                                shell,
+                                err,
+                                None,
+                                "readonly: {name}: readonly variable"
+                            );
+                        } else {
+                            crate::sh_error_to!(shell, err, None, "{name}: readonly variable");
+                        }
                         exit = 1;
                         continue;
                     }
@@ -1933,6 +2102,44 @@ fn builtin_readonly_decl(
                         exit = 1;
                         continue;
                     }
+                    // `readonly -a NAME=value` / `readonly -a NAME=(...)`:
+                    // ensure NAME is an indexed array BEFORE
+                    // apply_one_assignment (mirrors want_associative above)
+                    // so a scalar RHS lands as element 0 too (bash: `-a
+                    // s=hello` -> `declare -ar s=([0]="hello")`), not just a
+                    // compound-literal RHS (which self-creates an array
+                    // regardless of `-a`). Skip when NAME is already
+                    // associative: `-A` wins (matches bash `-aA` together).
+                    if want_indexed
+                        && shell.get_associative(name).is_none()
+                        && shell.get_indexed(name).is_none()
+                    {
+                        let mut empty = std::collections::BTreeMap::new();
+                        if let Some(scalar) = shell.get(name) {
+                            empty.insert(0, scalar.to_string());
+                        }
+                        if shell.replace_indexed(name, empty).is_err() {
+                            exit = 1;
+                            continue;
+                        }
+                    }
+                    // v349 (#343, Root B): under -a/-A, coerce a quoted scalar
+                    // `(...)` value into an array literal before applying (the
+                    // readonly-variable check above already saw the original
+                    // scalar, preserving Root C's prefix decision).
+                    let reparsed_owned;
+                    let a = if (want_indexed || want_associative)
+                        && let Some(value) = reparse_paren_scalar_as_array(name, &a.value)
+                    {
+                        reparsed_owned = crate::command::Assignment {
+                            target: a.target.clone(),
+                            value,
+                            append: a.append,
+                        };
+                        &reparsed_owned
+                    } else {
+                        a
+                    };
                     if crate::executor::apply_one_assignment(a, shell, err).is_err() {
                         exit = 1;
                         continue;
@@ -2429,6 +2636,22 @@ fn builtin_declare_decl(
                 exit = 1;
                 continue;
             }
+            // v349 (#343, Root B): under -a/-A, coerce a quoted scalar `(...)`
+            // value into an array literal before applying (bash re-parses the
+            // value as an array literal).
+            let reparsed_owned;
+            let a = if (want_array || want_associative)
+                && let Some(value) = reparse_paren_scalar_as_array(name, &a.value)
+            {
+                reparsed_owned = crate::command::Assignment {
+                    target: a.target.clone(),
+                    value,
+                    append: a.append,
+                };
+                &reparsed_owned
+            } else {
+                a
+            };
             if crate::executor::apply_one_assignment(a, shell, err).is_err() {
                 exit = 1;
                 continue;

@@ -3586,6 +3586,33 @@ fn glob_expand_word(
     Ok(exp.words)
 }
 
+/// v349 (#343, Root D): a post-expansion field arriving at a declaration
+/// builtin (`declare`/`typeset`/`local`/`readonly`/`export`) of the shape
+/// `<valid-ident>=<value>` is an ASSIGNMENT, even when the original word was
+/// quoted (bash: `readonly 'x=hi'` == `readonly x=hi` after quote removal).
+/// Convert such a field into a `DeclArg::Assign` with a SCALAR (quoted)
+/// literal value so it is not re-expanded or globbed; the `-a`/`-A`
+/// array-literal coercion of a `(...)`-shaped value happens later inside the
+/// builtin (Root B). A field whose left-of-first-`=` is not a valid identifier
+/// (or that has no `=`) stays `Plain`.
+fn decl_field_to_arg(s: String) -> crate::command::DeclArg {
+    if let Some(eq) = s.find('=')
+        && builtins::is_valid_name(&s[..eq])
+    {
+        let name = s[..eq].to_string();
+        let val = s[eq + 1..].to_string();
+        return crate::command::DeclArg::Assign(crate::command::Assignment {
+            target: crate::command::AssignTarget::Bare(name),
+            value: crate::lexer::Word(vec![crate::lexer::WordPart::Literal {
+                text: val,
+                quoted: true,
+            }]),
+            append: false,
+        });
+    }
+    crate::command::DeclArg::Plain(s)
+}
+
 fn resolve(
     cmd: &ExecCommand,
     shell: &mut Shell,
@@ -3624,7 +3651,7 @@ fn resolve(
         // Plain, then drain `args` since the builtin won't read it.
         let mut v: Vec<crate::command::DeclArg> = Vec::with_capacity(args.len() + cmd.args.len());
         for s in args.drain(..) {
-            v.push(crate::command::DeclArg::Plain(s));
+            v.push(decl_field_to_arg(s));
         }
         Some(v)
     } else {
@@ -3656,7 +3683,7 @@ fn resolve(
         }
         if let Some(da) = decl_args.as_mut() {
             for s in fields {
-                da.push(crate::command::DeclArg::Plain(s));
+                da.push(decl_field_to_arg(s));
             }
         } else {
             args.extend(fields);

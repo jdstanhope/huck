@@ -133,3 +133,30 @@ fn shellshock_trailing_command_not_executed() {
     );
     let _ = std::fs::remove_file(&marker);
 }
+
+/// #341/#343 (v349): `export -f name=value` — quoted OR unquoted — reports the
+/// WHOLE token in the `not a function` error, not the truncated name. The
+/// executor's DeclArg split (`is_assignment_word` and Root D) turns `foo=bar`
+/// into an `Assign{foo}` before the `-f` path; the `-f` branch must
+/// reconstruct the full token. Captures stderr (the `run` helper is
+/// stdout-only). Regression guard for the v349 Root-D export fix.
+#[test]
+fn export_f_name_eq_value_reports_full_token() {
+    for frag in [
+        "export -f foo=bar",              // unquoted (#341)
+        "export -f 'foo=bar'",            // quoted (Root-D regression)
+        "foo(){ :; }; export -f foo=bar", // even when the bare name IS a function
+    ] {
+        let o = std::process::Command::new(huck())
+            .args(["-c", frag])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains("foo=bar: not a function"),
+            "frag {frag:?}: expected full-token error, got stderr {err:?}"
+        );
+        assert_eq!(o.status.code(), Some(1), "frag {frag:?} rc");
+    }
+}
