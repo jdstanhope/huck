@@ -2901,6 +2901,46 @@ fn is_char_boundary_complete(out: &[u8]) -> bool {
 /// `ifs` is the current value of the IFS variable (caller looks it
 /// up). Empty IFS means "no splitting" — assign whole line to first
 /// name, rest empty.
+/// Accumulate one word from `bytes` starting at `i`, then consume the
+/// separator run that follows it, returning the word text and the position
+/// AFTER the separator run. This is huck's port of bash's
+/// `get_word_from_string`: a non-ws IFS char delimits with exactly one
+/// occurrence + trailing ws-IFS; a ws-IFS run collapses, then optionally one
+/// non-ws IFS + trailing ws-IFS is consumed. No leading-IFS-whitespace is
+/// skipped here — the caller positions `i` at a word start.
+fn next_word(
+    bytes: &[u8],
+    mut i: usize,
+    is_ws: impl Fn(u8) -> bool,
+    is_nonws: impl Fn(u8) -> bool,
+    is_any: impl Fn(u8) -> bool,
+) -> (String, usize) {
+    let start = i;
+    while i < bytes.len() && !is_any(bytes[i]) {
+        i += 1;
+    }
+    let word = String::from_utf8_lossy(&bytes[start..i]).into_owned();
+    if i < bytes.len() {
+        if is_nonws(bytes[i]) {
+            i += 1;
+            while i < bytes.len() && is_ws(bytes[i]) {
+                i += 1;
+            }
+        } else {
+            while i < bytes.len() && is_ws(bytes[i]) {
+                i += 1;
+            }
+            if i < bytes.len() && is_nonws(bytes[i]) {
+                i += 1;
+                while i < bytes.len() && is_ws(bytes[i]) {
+                    i += 1;
+                }
+            }
+        }
+    }
+    (word, i)
+}
+
 fn split_into_names(line: &str, names: &[String], ifs: &str) -> Vec<(String, String)> {
     if names.is_empty() {
         return Vec::new();
@@ -2948,38 +2988,10 @@ fn split_into_names(line: &str, names: &[String], ifs: &str) -> Vec<(String, Str
     }
 
     while fields.len() < names.len() - 1 && i < bytes.len() {
-        // Consume one field.
-        let start = i;
-        while i < bytes.len() && !is_any_ifs(bytes[i]) {
-            i += 1;
-        }
-        let field = String::from_utf8_lossy(&bytes[start..i]).into_owned();
-        fields.push(field);
-
-        if i >= bytes.len() {
-            break;
-        }
-
-        // Consume the separator run.
-        // If the separator is a non-ws IFS char, consume EXACTLY one,
-        // then optionally trailing ws-IFS. If it's ws-IFS, consume
-        // all consecutive ws-IFS, then optionally a single non-ws-IFS.
-        if is_nonws(bytes[i]) {
-            i += 1;
-            while i < bytes.len() && is_ws(bytes[i]) {
-                i += 1;
-            }
-        } else {
-            while i < bytes.len() && is_ws(bytes[i]) {
-                i += 1;
-            }
-            if i < bytes.len() && is_nonws(bytes[i]) {
-                i += 1;
-                while i < bytes.len() && is_ws(bytes[i]) {
-                    i += 1;
-                }
-            }
-        }
+        // Extract one word + consume its separator run.
+        let (word, next) = next_word(bytes, i, &is_ws, &is_nonws, &is_any_ifs);
+        fields.push(word);
+        i = next;
     }
 
     // Pad missing fields.
@@ -2987,16 +2999,27 @@ fn split_into_names(line: &str, names: &[String], ifs: &str) -> Vec<(String, Str
         fields.push(String::new());
     }
 
-    // Last field: rest of line from position i, with trailing ws-IFS stripped.
-    // (B-03 — additionally stripping a trailing NON-ws IFS delimiter here — was
-    // reverted in v276: no simple heuristic matches bash's read.def last-field
-    // splitter across the ifs-posix suite's multi-char-IFS cases. Deferred to
-    // its own iteration that ports bash's algorithm faithfully.)
-    let mut end = bytes.len();
-    while end > i && is_ws(bytes[end - 1]) {
-        end -= 1;
-    }
-    let last = String::from_utf8_lossy(&bytes[i..end]).into_owned();
+    // Last field: bash's read.def last-variable rule (read.def ~1009-1037).
+    // The remainder starting at `i` becomes the last field, EXCEPT that a sole
+    // trailing delimiter run is dropped: extract one word with `next_word`; if
+    // that word + its separator run consumes to end of line, the last field is
+    // just the word (trailing delimiter dropped). Otherwise the last field is
+    // the RAW remainder with only trailing IFS-WHITESPACE stripped (interior
+    // and extra trailing non-ws delimiters KEPT).
+    let last = if i >= bytes.len() {
+        String::new()
+    } else {
+        let (word, p) = next_word(bytes, i, &is_ws, &is_nonws, &is_any_ifs);
+        if p >= bytes.len() {
+            word
+        } else {
+            let mut end = bytes.len();
+            while end > i && is_ws(bytes[end - 1]) {
+                end -= 1;
+            }
+            String::from_utf8_lossy(&bytes[i..end]).into_owned()
+        }
+    };
     fields.push(last);
 
     names
@@ -3031,32 +3054,9 @@ fn split_read_fields(line: &str, ifs: &str) -> Vec<String> {
         i += 1;
     }
     while i < bytes.len() {
-        let start = i;
-        while i < bytes.len() && !is_any(bytes[i]) {
-            i += 1;
-        }
-        fields.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
-        if i >= bytes.len() {
-            break;
-        }
-        // Consume one separator. Non-ws IFS: exactly one + trailing ws-IFS.
-        // ws-IFS: collapse the run, then optionally one non-ws IFS + trailing ws.
-        if is_nonws(bytes[i]) {
-            i += 1;
-            while i < bytes.len() && is_ws(bytes[i]) {
-                i += 1;
-            }
-        } else {
-            while i < bytes.len() && is_ws(bytes[i]) {
-                i += 1;
-            }
-            if i < bytes.len() && is_nonws(bytes[i]) {
-                i += 1;
-                while i < bytes.len() && is_ws(bytes[i]) {
-                    i += 1;
-                }
-            }
-        }
+        let (word, next) = next_word(bytes, i, &is_ws, &is_nonws, &is_any);
+        fields.push(word);
+        i = next;
     }
     fields
 }

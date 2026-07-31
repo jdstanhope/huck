@@ -275,36 +275,46 @@ fn split_into_names_custom_ifs_colon() {
 }
 
 #[test]
-fn split_last_field_strips_only_ws_ifs() {
-    // B-03 (stripping a trailing NON-ws IFS delimiter from the last field)
-    // was reverted in v276 — the last field strips only trailing IFS
-    // WHITESPACE, keeping any trailing non-ws delimiter verbatim. (A faithful
-    // fix requires porting bash's read.def last-field splitter; deferred.)
-    let n = vec!["x".to_string(), "y".to_string(), "z".to_string()];
-    let g = |s: &str| {
-        split_into_names(s, &n, ":")
+fn split_last_field_readdef_rule() {
+    // v350: huck ports bash's read.def last-field splitter. The last variable
+    // gets the raw remainder with only trailing IFS-WHITESPACE stripped —
+    // EXCEPT when the remainder is exactly one word followed by a single
+    // delimiter run consuming to end of line, in which case that sole trailing
+    // delimiter is dropped (bash's `get_word_from_string` behavior). Every row
+    // below is verified against bash 5.2.21.
+    let vals = |s: &str, names: &[&str], ifs: &str| {
+        let n = names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        split_into_names(s, &n, ifs)
             .into_iter()
             .map(|(_, v)| v)
             .collect::<Vec<_>>()
     };
-    assert_eq!(g(":a:b:"), vec!["", "a", "b:"]); // trailing ':' KEPT (deferred divergence)
-    assert_eq!(g("a:b:c:d"), vec!["a", "b", "c:d"]); // interior kept (matches bash)
-    let n2 = vec!["x".to_string(), "y".to_string()];
-    let g2 = |s: &str| {
-        split_into_names(s, &n2, ":")
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(g2("a:b::"), vec!["a", "b::"]); // trailing delims kept
-    // default ws-IFS: trailing whitespace IS trimmed from the last field.
-    let gw = |s: &str| {
-        split_into_names(s, &n2, " \t\n")
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(gw("a b  "), vec!["a", "b"]);
+
+    // Colon (non-ws) IFS, two vars.
+    assert_eq!(vals("a:b:", &["x", "y"], ":"), vec!["a", "b"]); // sole trailing dropped
+    assert_eq!(vals("a:b::", &["x", "y"], ":"), vec!["a", "b::"]); // double trailing kept
+    assert_eq!(vals("a:b:c:", &["x", "y"], ":"), vec!["a", "b:c:"]); // after interior kept
+    assert_eq!(vals("a::", &["x", "y"], ":"), vec!["a", ""]); // empty last, delim dropped
+    assert_eq!(vals("a:::", &["x", "y"], ":"), vec!["a", "::"]); // extra trailing kept
+    assert_eq!(vals(":::", &["x", "y"], ":"), vec!["", "::"]);
+
+    // Mixed IFS (colon + space).
+    assert_eq!(vals("a:b: ", &["x", "y"], ": "), vec!["a", "b"]); // trailing ws stripped too
+    assert_eq!(vals("a: :b", &["x", "y"], ": "), vec!["a", ":b"]);
+    assert_eq!(vals("a: :b", &["x", "y"], ":"), vec!["a", " :b"]); // space NOT in IFS
+    assert_eq!(vals("::", &["x", "y"], ": "), vec!["", ""]);
+    assert_eq!(vals(":a:", &["x", "y"], ": "), vec!["", "a"]);
+
+    // Three vars.
+    assert_eq!(vals(":a:b:", &["x", "y", "z"], ":"), vec!["", "a", "b"]);
+    assert_eq!(vals("a:b::", &["x", "y", "z"], ":"), vec!["a", "b", ""]);
+    assert_eq!(vals("a:::", &["x", "y", "z"], ":"), vec!["a", "", ""]);
+
+    // Leading-ws IFS: interior ws-run preserved in the last field.
+    assert_eq!(vals("a  b  c", &["x", "y"], " :"), vec!["a", "b  c"]);
+
+    // Default ws-IFS: trailing whitespace IS trimmed from the last field.
+    assert_eq!(vals("a b  ", &["x", "y"], " \t\n"), vec!["a", "b"]);
 }
 
 #[test]
