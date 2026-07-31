@@ -2,6 +2,28 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v351 (#350, 2026-07-31 UTC):** `case` flipped to PASS (0-diff) —
+two roots. **Root 1:** a backslash from an UNQUOTED expansion is a pattern escape
+(`\x`→`x`, `\*`→literal `*`, `\\`→literal `\`), spanning `case` / `[[ == ]]` /
+`${x#pat}`; huck pushed unquoted text raw into the pattern and `glob::Pattern`
+has no backslash escape. Fixed in the unquoted branch of
+`expand_word_with_quote_escape` (glob path only — gated by
+`collapse_unquoted_backslash`; the regex path keeps GNU-ERE `\b`/`\w`/`\s`
+active); a data backslash is emitted as `[\\]` so the extglob engine can't
+swallow a following metachar. **Root 2:** a `$((xx++))` readonly error in a case
+pattern — (2a) huck double-reported the readonly error (bare from `assign()` +
+wrapped from `render_error_body`); bash prints only the bare form for readonly
+(but still wraps div0/syntax) — suppressed the wrapper for `ArithErrorKind::
+ReadonlyVar` at all 6 arith-expansion sites via `should_wrap_expansion_error`;
+(2b) a failed arith expansion in a case pattern now discards the case with
+`$?`=1 (`set_last_status(1)` + early return in `case_item_matches`). Summary
+PASS 38→39, FAIL 44→43. Only `case` flipped — full branch PASS-set diffed against
+the v350 baseline (exactly the 38 + `case`, NO regressions; Root 1 touches shared
+pattern expansion — extglob/glob-test/nquote*/dbracket + 10 pattern integration
+bins verified). Follow-ups: #351 (assignment-form arith discard `$?`), #352
+(bare readonly line# off-by-one for `(( ))`/`[[ ]]`/case-subject) — both Minor,
+pre-existing, out of scope.
+
 **Updated by v350 (#2, 2026-07-31 UTC):** `ifs-posix` flipped to PASS (0-diff) —
 one root: `read name1 name2 …` with a non-whitespace (or mixed-class) IFS
 assigns the LAST variable per bash's `read.def` last-field rule. After the first
@@ -356,7 +378,7 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 - SKIP (from known-skips.txt): 4
 
 (Counts refreshed by the v345 full-runner sweep, 2026-07-30 UTC — authoritative.
-The 38 PASS categories are: alias, appendop, array2, attr, braces, casemod, cprint, dbg-support2,
+The 39 PASS categories are: alias, appendop, array2, attr, braces, case, casemod, cprint, dbg-support2,
 dynvar, exportfunc, extglob2, extglob3, func, getopts, herestr, ifs, ifs-posix, input-test, invert, iquote,
 lastpipe, nquote, nquote1, nquote2, nquote3, nquote5, parser, posix2, posixexp2, posixpat,
 precedence, procsub, quote, rhs-exp, set-x, strip, tilde, tilde2. Some per-category FAIL
@@ -385,7 +407,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | attr | PASS | v349 (#343): `readonly -a` (Root A), conditional readonly-var error prefix (Root C), quoted `name=value` arg as assignment (Root D), `-a`/`-A` `(...)`-scalar array coercion (Root B). |
 | braces | PASS | v341 (#44/#318): 0-diff PASS. Four roots fixed — negative step (sign ignored, `{10..1..-2}`→`10 8 6 4 2`); nested/unmatched outer brace still expands a balanced inner one (`a-{b{d,e}}-c`, `a-{bdef-{g,i}-c`); char range emits an empty element for `\`; and bare `$var{x,y}`→`$varx $vary` name-merge (new `braced` flag on `WordPart::Var`, since modifier-less `${var}` demotes to `Var`). #44 stays open for the broader brace-before-param ordering. |
 | builtins | FAIL | Multiple unimplemented `set -o` options (`posix`, `+p`) abort the test preamble. `ulimit` and `fc` are not found as commands. |
-| case | FAIL | L-43 (readonly-assignment abort) RESOLVED by v313 (#31) — a standalone readonly assignment now discards the current command, so the old cascade is gone. Two divergences remain (v313 re-sweep): (1) control-character case-PATTERN matching — patterns built from control bytes (soh/stx/del) match differently, yielding `ok1ok2ok3ok4ok5` where bash produces `fail1fail2fail3ok4fail5`; (2) arithmetic assignment to a readonly inside `(( ))` — `((xx++))` on a readonly emits one error + computes `1.1`, where bash emits a second `xx++: … (error token is "")` diagnostic and computes `1.0` (an arith-lvalue-on-readonly path, distinct from the run_assignment_list fix). |
+| case | PASS | v351 (#350): backslash-from-unquoted-expansion as a pattern escape (Root 1) + `$((xx++))` readonly in a case pattern reports once and discards with `$?`=1 (Root 2). |
 | casemod | PASS | v342 (#32/#321): 0-diff PASS. Two roots — L-44 associative-array hash iteration order (now a bash-faithful view: FNV-1, 1024 buckets, bucket-asc + newest-first), and `declare -c` (capitalize-first attribute) + a pre-existing `case_modify` `${v^pat}` first-char-only fix. |
 | complete | FAIL | M-92 (`${!prefix@}` variable-name-listing expansion) not implemented — `complete.tests` uses this inside a `[[ ]]` expression, causing an unterminated-compound-test parse error that prevents the entire suite from running. |
 | comsub | FAIL | Error-message format divergence (huck uses its own name as prefix, not the script-file-and-line form). Unterminated heredoc inside a command substitution is treated as a hard error that aborts the substitution, losing many expected output lines. Huck also fails to parse several complex nested-comsub forms (command substitutions containing `esac` tokens, bare-word `case` clauses, and `nest`/`DO`/`DONE` patterns) that bash handles by treating `)` as the comsub terminator. |

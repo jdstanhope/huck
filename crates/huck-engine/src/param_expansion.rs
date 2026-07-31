@@ -455,7 +455,9 @@ fn eval_substring_index(word: &Word, shell: &mut Shell) -> Result<i64, ()> {
     let expr = match crate::arith::parse(&s) {
         Ok(e) => e,
         Err(e) => {
-            crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&s, &e));
+            if crate::arith::should_wrap_expansion_error(&e) {
+                crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&s, &e));
+            }
             shell.set_last_status(1);
             return Err(());
         }
@@ -463,7 +465,9 @@ fn eval_substring_index(word: &Word, shell: &mut Shell) -> Result<i64, ()> {
     match crate::arith::eval(&expr, shell) {
         Ok(n) => Ok(n),
         Err(e) => {
-            crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&s, &e));
+            if crate::arith::should_wrap_expansion_error(&e) {
+                crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&s, &e));
+            }
             shell.set_last_status(1);
             Err(())
         }

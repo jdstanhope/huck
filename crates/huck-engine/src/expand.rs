@@ -1273,7 +1273,14 @@ fn expand_part(
                     // the shell (127) via `posix_fatal` (verified against bash
                     // 5.2.21 --posix). The empty contribution matches bash's
                     // empty $((..)) value on error either way.
-                    crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&src, &e));
+                    if crate::arith::should_wrap_expansion_error(&e) {
+                        crate::sh_error!(
+                            shell,
+                            None,
+                            "{}",
+                            crate::arith::render_error_body(&src, &e)
+                        );
+                    }
                     if shell.shell_options.posix && !shell.is_interactive {
                         shell.posix_fatal(127);
                     } else {
@@ -1928,12 +1935,14 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                         // non-interactive EXITS (127) via `posix_fatal` (verified
                         // against bash 5.2.21 --posix). Empty contribution to the
                         // value matches bash either way.
-                        crate::sh_error!(
-                            shell,
-                            None,
-                            "{}",
-                            crate::arith::render_error_body(&src, &e)
-                        );
+                        if crate::arith::should_wrap_expansion_error(&e) {
+                            crate::sh_error!(
+                                shell,
+                                None,
+                                "{}",
+                                crate::arith::render_error_body(&src, &e)
+                            );
+                        }
                         if shell.shell_options.posix && !shell.is_interactive {
                             shell.posix_fatal(127);
                         } else {
@@ -2110,6 +2119,7 @@ fn expand_word_with_quote_escape(
     word: &Word,
     shell: &mut Shell,
     escape: fn(&str) -> String,
+    collapse_unquoted_backslash: bool,
 ) -> String {
     // Snapshot `$?` so `LastStatus` parts read the value at the start of
     // the expansion, not whatever a preceding `$(cmd)` mutated it to.
@@ -2135,8 +2145,35 @@ fn expand_word_with_quote_escape(
         }
         if word_part_is_quoted(part) {
             result.push_str(&escape(&text));
-        } else {
+        } else if !collapse_unquoted_backslash {
+            // Regex operand: bash hands an unquoted expansion's value to
+            // `regcomp` verbatim, so glibc ERE backslash extensions (`\b`,
+            // `\w`, `\s`, `\<`, `\>`, …) stay active. Do NOT collapse — push raw.
             result.push_str(&text);
+        } else {
+            // Unquoted glob-pattern text: a backslash is an fnmatch escape.
+            // `\c` becomes a literal `c` — emit `escape(c)` so a `\*` matches a
+            // literal `*` (glob → `[*]`) while an unescaped metachar stays
+            // active. A trailing lone backslash is dropped (bash).
+            let mut chars = text.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    match chars.next() {
+                        // `\\` → a LITERAL backslash. Emit `[\\]` (a one-char
+                        // class): both the `glob` crate and the extglob engine
+                        // (and `regex`) treat it as a literal `\`, and it can't
+                        // accidentally escape a following metachar the way a
+                        // bare `\` would in the extglob engine.
+                        Some('\\') => result.push_str(r"[\\]"),
+                        Some(next) => result.push_str(&escape(&next.to_string())),
+                        // Trailing lone backslash — bash keeps it as a LITERAL
+                        // backslash (`case 'ab\' in ab\) matches). Emit `[\\]`.
+                        None => result.push_str(r"[\\]"),
+                    }
+                } else {
+                    result.push(c);
+                }
+            }
         }
     }
     result
@@ -2147,7 +2184,7 @@ fn expand_word_with_quote_escape(
 /// by a quoted part is escaped via `escape_pattern_literal`, so a quoted
 /// `*`/`?`/`[`/`|`/`(`/`)` matches literally while an unquoted one is special.
 pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
-    expand_word_with_quote_escape(word, shell, escape_pattern_literal)
+    expand_word_with_quote_escape(word, shell, escape_pattern_literal, true)
 }
 
 /// Expands `word` into a regex string for `[[ … =~ … ]]` matching. Like
@@ -2156,7 +2193,7 @@ pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
 /// while an unquoted one stays an active regex metacharacter (bash 3.2+). An
 /// unquoted `$var` expands to an active regex; a quoted `"$var"` is literal.
 pub fn expand_regex_operand(word: &Word, shell: &mut Shell) -> String {
-    expand_word_with_quote_escape(word, shell, regex::escape)
+    expand_word_with_quote_escape(word, shell, regex::escape, false)
 }
 
 /// Runs a sub-sequence as a substituted command: clones the parent `Shell`

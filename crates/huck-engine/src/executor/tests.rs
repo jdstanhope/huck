@@ -2208,3 +2208,114 @@ fn render_job_command_subshell_and_brace_group() {
         "{ sleep 0.3; echo hi; }"
     );
 }
+
+// ── v351 (#350): `$((…))` readonly-arith double-report + case-pattern discard ──
+
+/// Runs a whole script through the source driver (mirrors real script
+/// execution: cross-unit `$?` propagation + arith-discard continuation),
+/// capturing stdout and stderr.  Returns (stdout, stderr, final `$?`).
+fn run_script_capture_2351(src: &str) -> (String, String, i32) {
+    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut shell = Shell::new();
+    let mut out_buf: Vec<u8> = Vec::new();
+    let mut err_buf: Vec<u8> = Vec::new();
+    {
+        let mut out = StdoutSink::Capture(&mut out_buf);
+        let mut err = StderrSink::Capture(&mut err_buf);
+        crate::builtins::run_sourced_contents_in_sinks(
+            src,
+            std::path::Path::new("test"),
+            &mut shell,
+            &mut out,
+            &mut err,
+        );
+    }
+    let status = shell.last_status();
+    (
+        String::from_utf8_lossy(&out_buf).into_owned(),
+        String::from_utf8_lossy(&err_buf).into_owned(),
+        status,
+    )
+}
+
+fn count_occurrences(hay: &str, needle: &str) -> usize {
+    hay.matches(needle).count()
+}
+
+/// Root 2a: a `ReadonlyVar` arith error in `$((…))` is reported ONCE (the bare
+/// `xx: readonly variable` from `assign()`), NOT additionally wrapped by
+/// `render_error_body`.  bash prints only the bare form.
+#[test]
+fn arith_readonly_error_reported_once_in_cmdsub() {
+    let (_out, err, _st) = run_script_capture_2351("readonly xx=1\necho $((xx++))\n");
+    assert_eq!(
+        count_occurrences(&err, "readonly variable"),
+        1,
+        "readonly error must appear exactly once, got:\n{err}"
+    );
+    assert!(
+        !err.contains("error token"),
+        "readonly arith error must NOT be wrapped by render_error_body:\n{err}"
+    );
+}
+
+/// Root 2a KEEP: a division-by-zero arith error IS still wrapped
+/// (`1/0: division by 0 (error token is "0")`) — unchanged.
+#[test]
+fn arith_div_by_zero_still_wrapped() {
+    let (_out, err, _st) = run_script_capture_2351("echo $((1/0))\n");
+    assert!(
+        err.contains("division by 0 (error token is \"0\")"),
+        "div-by-zero must stay wrapped:\n{err}"
+    );
+}
+
+/// Root 2a KEEP: a syntax arith error IS still wrapped.
+#[test]
+fn arith_syntax_error_still_wrapped() {
+    let (_out, err, _st) = run_script_capture_2351("echo $((4 + ))\n");
+    assert!(
+        err.contains("syntax error") && err.contains("error token"),
+        "syntax error must stay wrapped:\n{err}"
+    );
+}
+
+/// Root 2b: a failed arith expansion in a `case` PATTERN discards the whole
+/// `case` (status 1), execution CONTINUES afterward, and neither body runs.
+/// bash: one readonly error, then `1.1`.
+#[test]
+fn case_pattern_arith_error_discards_and_sets_status_one() {
+    let (out, err, _st) = run_script_capture_2351(
+        "readonly xx=1\ncase 1 in $((xx++)) ) echo hi1 ;; *) echo hi2; esac\necho ${xx}.$?\n",
+    );
+    assert_eq!(out, "1.1\n", "case must discard (status 1), no body runs");
+    assert!(
+        !out.contains("hi1") && !out.contains("hi2"),
+        "no case body may run:\n{out}"
+    );
+    assert_eq!(
+        count_occurrences(&err, "readonly variable"),
+        1,
+        "exactly one readonly error:\n{err}"
+    );
+    assert!(!err.contains("error token"), "no wrapped readonly:\n{err}");
+}
+
+/// Root 2b: same discard for an arith error in the case SUBJECT.
+#[test]
+fn case_subject_arith_error_sets_status_one() {
+    let (out, _err, _st) = run_script_capture_2351(
+        "readonly xx=1\ncase $((xx++)) in 1) echo one ;; *) echo other ;; esac\necho after=$?\n",
+    );
+    assert_eq!(out, "after=1\n");
+}
+
+/// Root 2b KEEP: non-error arith patterns still evaluate normally — the
+/// `;&` fall-through body runs and `$?` is 0 (bash `1.0` / `end=0`).
+#[test]
+fn case_non_error_arith_patterns_unchanged() {
+    let (out, _err, _st) = run_script_capture_2351(
+        "x=0 y=1\ncase 1 in $((y=0)) ) ;; $((x=1)) ) ;& $((x=2)) ) echo $x.$y ;; esac\necho end=$?\n",
+    );
+    assert_eq!(out, "1.0\nend=0\n");
+}
