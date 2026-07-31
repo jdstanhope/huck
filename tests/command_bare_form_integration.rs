@@ -144,3 +144,35 @@ fn command_bypass_inline_assignment_is_temporary() {
     let (out, _rc) = run("true() { return 0; }\nFOO=zzz command true\necho \"after=[${FOO}]\"\n");
     assert_eq!(out, "after=[]\n");
 }
+
+/// #77: a `command`/`builtin` wrapper option/dispatch error under a trailing
+/// `2>&1` merges into the CAPTURED stdout (bash captures it) instead of leaking
+/// to the real stderr.
+#[test]
+fn wrapper_error_captured_under_2to1() {
+    for script in [
+        "x=$(command -Z 2>&1); printf '%s' \"$x\"\n",
+        "x=$(builtin nosuchbuiltin 2>&1); printf '%s' \"$x\"\n",
+    ] {
+        let out = Command::new(huck_bin())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                c.stdin.take().unwrap().write_all(script.as_bytes())?;
+                c.wait_with_output()
+            })
+            .expect("spawn");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("invalid option") || stdout.contains("not a shell builtin"),
+            "error not captured into stdout: stdout={stdout:?}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "wrapper error leaked to real stderr under 2>&1: {stderr:?}"
+        );
+    }
+}
