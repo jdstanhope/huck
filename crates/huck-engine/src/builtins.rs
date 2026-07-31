@@ -2892,15 +2892,6 @@ fn is_char_boundary_complete(out: &[u8]) -> bool {
     }
 }
 
-/// POSIX/bash `read`-style field splitting. Assigns fields to
-/// `names` left-to-right; the LAST name gets the remainder of the
-/// line (no further splitting). Trailing IFS-whitespace is stripped
-/// from the last assigned field. For a single name, the line is
-/// assigned whole with leading + trailing IFS-whitespace stripped.
-///
-/// `ifs` is the current value of the IFS variable (caller looks it
-/// up). Empty IFS means "no splitting" — assign whole line to first
-/// name, rest empty.
 /// Accumulate one word from `bytes` starting at `i`, then consume the
 /// separator run that follows it, returning the word text and the position
 /// AFTER the separator run. This is huck's port of bash's
@@ -2941,6 +2932,16 @@ fn next_word(
     (word, i)
 }
 
+/// POSIX/bash `read`-style field splitting. Assigns fields to
+/// `names` left-to-right; the LAST name gets the remainder of the line via
+/// bash's `read.def` rule (extract one more word — if it exhausts the line the
+/// trailing delimiter is dropped, otherwise the raw remainder is kept with only
+/// trailing IFS-whitespace stripped). For a single name, the line is assigned
+/// whole with leading + trailing IFS-whitespace stripped.
+///
+/// `ifs` is the current value of the IFS variable (caller looks it
+/// up). Empty IFS means "no splitting" — assign whole line to first
+/// name, rest empty.
 fn split_into_names(line: &str, names: &[String], ifs: &str) -> Vec<(String, String)> {
     if names.is_empty() {
         return Vec::new();
