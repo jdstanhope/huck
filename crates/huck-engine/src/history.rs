@@ -171,7 +171,17 @@ impl History {
     /// warning-diagnostic BODY (no invocation-name prefix, see `load` above) for
     /// the caller to emit via `sh_error!`. (v139)
     pub fn save_capped(&self, file_cap: Option<usize>) -> Option<String> {
-        let Some(path) = &self.file else { return None };
+        let path = self.file.clone()?;
+        self.save_capped_to(&path, file_cap)
+    }
+
+    /// Like `save_capped`, but to an explicit `path` (the caller resolved it
+    /// from the live `$HISTFILE` shell variable — #226).
+    pub fn save_capped_to(
+        &self,
+        path: &std::path::Path,
+        file_cap: Option<usize>,
+    ) -> Option<String> {
         let start = match file_cap {
             Some(cap) => self.entries.len().saturating_sub(cap),
             None => 0,

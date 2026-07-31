@@ -5799,8 +5799,10 @@ fn builtin_history(
                         idx += 1;
                         std::path::PathBuf::from(f)
                     }
-                    _ => match shell.history.file_path() {
-                        Some(p) => p.to_path_buf(),
+                    // #226: resolve the default from the LIVE $HISTFILE shell
+                    // variable, not the startup-cached value.
+                    _ => match shell.resolve_histfile_path() {
+                        Some(p) => p,
                         None => {
                             crate::sh_error_to!(
                                 shell,
