@@ -6314,11 +6314,19 @@ fn builtin_getopts(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
         None => shell.unset("OPTARG"),
     }
 
+    // Verbose getopts-internal option diagnostic (suppressed by OPTERR=0),
+    // prefixed with $0 (bash sets argv[0] = dollar_vars[0] for sh_getopt).
+    // #61: bash emits this BEFORE validating the name variable, so an invalid
+    // optstring option AND an invalid name var together print BOTH (this used
+    // to sit after the name check, printing only the identifier error).
+    if let Some(body) = step.error.as_deref()
+        && shell.lookup_var("OPTERR").as_deref() != Some("0")
+    {
+        e!(err, "{}: {body}", shell.shell_argv0);
+    }
+
     // Validate the name AFTER OPTIND/OPTARG are bound. Invalid identifier is a
     // hard error (bash EXECUTION_FAILURE = 1) with the full builtin prologue.
-    // This returns before the $0-prefixed option-diagnostic block below, so an
-    // invalid optstring option AND an invalid name var together print only the
-    // identifier error (bash prints both — an untested edge, accepted by spec).
     if !is_valid_name(&name) {
         crate::sh_error_to!(
             shell,
@@ -6331,14 +6339,6 @@ fn builtin_getopts(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
 
     // Assign the matched letter (or '?' / ':').
     let _ = shell.try_set(&name, step.name.clone());
-
-    // Verbose getopts-internal option diagnostic (suppressed by OPTERR=0),
-    // prefixed with $0 (bash sets argv[0] = dollar_vars[0] for sh_getopt).
-    if let Some(body) = step.error
-        && shell.lookup_var("OPTERR").as_deref() != Some("0")
-    {
-        e!(err, "{}: {body}", shell.shell_argv0);
-    }
     ExecOutcome::Continue(if step.done { 1 } else { 0 })
 }
 
