@@ -626,6 +626,15 @@ fn expand_indirect(
     shell: &mut Shell,
 ) -> crate::param_expansion::ExpansionResult {
     use crate::param_expansion::ExpansionResult;
+    // #85: `${!$}` / `${!!}` — `$` and `!` are special parameters bash does NOT
+    // allow as an indirect-expansion target (unlike `#`, `?`, `-`, the digits,
+    // and `*`/`@`, which ARE valid); they are a `bad substitution`, not a
+    // value-as-name indirection.
+    if subscript.is_none() && (name == "$" || name == "!") {
+        crate::sh_error!(shell, None, "${{!{name}}}: bad substitution");
+        shell.pending_fatal_status = Some(1);
+        return ExpansionResult::Fatal { status: 1 };
+    }
     // Nameref special case: ${!r} where r is a nameref yields the TARGET NAME
     // (the raw stored value), not value-as-name indirection (bash behavior).
     if subscript.is_none() && shell.is_nameref(name) {
