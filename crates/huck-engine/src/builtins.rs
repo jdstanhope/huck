@@ -1497,13 +1497,13 @@ fn builtin_export_decl(
             let name: &str = match arg {
                 DeclArg::Plain(s) => s.as_str(),
                 DeclArg::Assign(a) => {
+                    // #346: expand the value (so a `$var` part renders its
+                    // value) rather than concatenating only Literal parts —
+                    // `export -f foo=$x` (x=bar) must report `foo=bar`, not
+                    // `foo=`.
                     let mut t = a.target.name().to_string();
                     t.push_str(if a.append { "+=" } else { "=" });
-                    for p in &a.value.0 {
-                        if let crate::lexer::WordPart::Literal { text, .. } = p {
-                            t.push_str(text);
-                        }
-                    }
+                    t.push_str(&crate::expand::expand_assignment(&a.value, shell));
                     assign_token = t;
                     assign_token.as_str()
                 }
