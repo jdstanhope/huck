@@ -81,11 +81,15 @@ fn arg_count_at_star_regression() {
 }
 
 #[test]
-#[ignore = "known divergence, tracked in #85: huck does not flag ${!$}/${!!} as bad substitution"]
 fn indirect_dollar_bang_bad_subst() {
-    // ${!$} and ${!!} are bad substitutions in bash (rc 1), not special-param
-    // indirect.
-    let (_o, e, c) = run_file("echo before\necho ${!$}\necho after\n");
-    assert!(e.contains("bad substitution"), "stderr: {e}");
-    assert_ne!(c, 0);
+    // #85: ${!$} and ${!!} are bad substitutions in bash (rc 1), not
+    // special-param indirect (unlike ${!#}/${!1}/${!x}, which are valid).
+    for src in ["echo ${!$}\n", "echo ${!!}\n"] {
+        let (_o, e, c) = run_file(src);
+        assert!(e.contains("bad substitution"), "src {src:?}: stderr {e:?}");
+        assert_ne!(c, 0, "src {src:?}: rc");
+    }
+    // KEEP: a valid indirect through a plain variable still resolves.
+    let (o, _e, _c) = run_file("x=y\ny=hi\necho ${!x}\n");
+    assert!(o.contains("hi"), "valid indirect broke: {o:?}");
 }
