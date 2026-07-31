@@ -474,7 +474,12 @@ pub mod dispatch {
                         }
                     };
                     if is_dir {
-                        replacement.push('/');
+                        // #242: the `-o default` empty-fallback already appends
+                        // `/` to a directory result; don't stack a second one
+                        // (`alpha//`) when `name` already ends in `/`.
+                        if !replacement.ends_with('/') {
+                            replacement.push('/');
+                        }
                     } else if !effective_options.nospace {
                         replacement.push(' ');
                     }
@@ -813,6 +818,44 @@ mod tests {
         assert!(
             reps.iter().any(|r| r == &format!("{base}/alpha/")),
             "expected full path {base}/alpha/, got {reps:?}"
+        );
+    }
+
+    #[test]
+    fn spec_filenames_and_default_dir_single_slash() {
+        // #242: `complete -o filenames -o default`: a directory from the
+        // `-o default` empty-fallback (which already appends `/`) must get a
+        // SINGLE trailing `/`, not `alpha//` (the `-o filenames` branch used to
+        // stack a second one).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("alpha")).unwrap();
+        let base = dir.path().to_str().unwrap();
+        let mut sh = Shell::new();
+        let _ = crate::shell::process_line("_empty() { COMPREPLY=(); }", &mut sh, false);
+        std::rc::Rc::make_mut(&mut sh.completion_specs)
+            .by_command
+            .insert(
+                "cd".to_string(),
+                crate::completion_spec::CompletionSpec {
+                    function: Some("_empty".to_string()),
+                    options: crate::completion_spec::CompOptions {
+                        default: true,
+                        filenames: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        let line = format!("cd {base}/al");
+        let (_start, cands) = dispatch::resolve(&line, line.len(), &mut sh);
+        let reps: Vec<String> = cands.iter().map(|c| c.replacement.clone()).collect();
+        assert!(
+            reps.iter().any(|r| r == &format!("{base}/alpha/")),
+            "expected single-slash {base}/alpha/, got {reps:?}"
+        );
+        assert!(
+            !reps.iter().any(|r| r.ends_with("//")),
+            "no candidate should end in `//`, got {reps:?}"
         );
     }
 
