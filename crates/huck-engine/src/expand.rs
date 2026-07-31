@@ -894,7 +894,12 @@ fn expand_array_param(
             let idx = match eval_subscript(w, shell, name) {
                 Ok(i) => i,
                 Err(e) => {
-                    crate::sh_error!(shell, None, "{e}");
+                    // #201: if the subscript's own `$(( ))` expansion already
+                    // failed (arith error, `pending_discard` set + reported),
+                    // suppress the redundant secondary "bad array subscript".
+                    if !shell.pending_discard {
+                        crate::sh_error!(shell, None, "{e}");
+                    }
                     shell.pending_fatal_status = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
@@ -916,7 +921,12 @@ fn expand_array_param(
             let idx = match eval_subscript(w, shell, name) {
                 Ok(i) => i,
                 Err(e) => {
-                    crate::sh_error!(shell, None, "{e}");
+                    // #201: if the subscript's own `$(( ))` expansion already
+                    // failed (arith error, `pending_discard` set + reported),
+                    // suppress the redundant secondary "bad array subscript".
+                    if !shell.pending_discard {
+                        crate::sh_error!(shell, None, "{e}");
+                    }
                     shell.pending_fatal_status = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
