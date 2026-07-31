@@ -168,3 +168,26 @@ fn inline_prefix_with_array_rhs_restores_after_command() {
         "got: {out:?}"
     );
 }
+
+/// #201: reading an array element whose subscript is a FAILING `$(( ))`
+/// expansion emits a single diagnostic (the arith error) — the redundant
+/// secondary "bad array subscript" is suppressed once pending_discard is set.
+#[test]
+fn read_bad_arith_subscript_no_double_diagnostic() {
+    let (out, err, rc) = run_capture("a=(1 2); echo ${a[$((3.5))]}; echo AFTER\n");
+    assert_eq!(rc, 1, "arith-error subscript discards the command (rc 1)");
+    assert!(
+        !out.contains("AFTER"),
+        "command discarded; AFTER must not run: {out:?}"
+    );
+    assert!(
+        !err.contains("bad array subscript"),
+        "secondary 'bad array subscript' must be suppressed: {err:?}"
+    );
+    // Exactly one error line (the arith diagnostic).
+    let err_lines = err.lines().filter(|l| l.contains("line 1:")).count();
+    assert_eq!(
+        err_lines, 1,
+        "expected a single diagnostic line, got: {err:?}"
+    );
+}
