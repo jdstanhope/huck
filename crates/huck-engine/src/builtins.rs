@@ -2965,21 +2965,10 @@ fn split_into_names(line: &str, names: &[String], ifs: &str) -> Vec<(String, Str
         return out;
     }
 
-    // Single-name: strip leading + trailing IFS-whitespace, assign whole.
-    if names.len() == 1 {
-        let mut start = 0;
-        while start < bytes.len() && is_ws(bytes[start]) {
-            start += 1;
-        }
-        let mut end = bytes.len();
-        while end > start && is_ws(bytes[end - 1]) {
-            end -= 1;
-        }
-        let value = String::from_utf8_lossy(&bytes[start..end]).into_owned();
-        return vec![(names[0].clone(), value)];
-    }
-
-    // Multi-name walk.
+    // Field walk. For a single name, the n-1 loop runs zero times and the
+    // last-field block below applies bash's read.def rule to the whole line
+    // (so `IFS=: read x` on `a:` yields `a`, not `a:` — a sole trailing
+    // non-ws delimiter is dropped, exactly as for the last of many names).
     let mut fields: Vec<String> = Vec::new();
     let mut i = 0;
 

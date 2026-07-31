@@ -47,7 +47,10 @@ check "ws-first interior kept"  "a  b  c" 'IFS=" :" '"$XY"   # [a][b  c]
 
 # --- KEEP guards (must be unchanged) ---
 check "default ws read trims"   "  a  b  " "$XY"            # default IFS: [a][b]
-check "single name whole line"  "a:b:"    'IFS=: read x; echo "[$x]"'  # [a:b:]
+check "single name whole line"  "a:b:"    'IFS=: read x; echo "[$x]"'  # [a:b:] (multi-word remainder kept)
+check "single name sole trail"  "a:"      'IFS=: read x; echo "[$x]"'  # [a]    (sole trailing dropped)
+check "single name double trail" "a::"    'IFS=: read x; echo "[$x]"'  # [a::]  (double trailing kept)
+check "single name default-ws"   "  a  b  " 'read x; echo "[$x]"'       # [a  b] (lead+trail ws stripped)
 check "read -a unbounded"       "a:b:"    'IFS=: read -a arr; echo "${#arr[@]}:${arr[0]}:${arr[1]}"'
 check "more vars than fields"   "a"       "IFS=: $XY"       # [a][]
 

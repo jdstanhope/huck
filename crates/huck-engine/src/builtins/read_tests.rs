@@ -234,6 +234,21 @@ fn split_into_names_single_name_strip_ws() {
 }
 
 #[test]
+fn split_into_names_single_name_readdef_rule() {
+    // #2/v350: a single name follows the SAME read.def last-field rule — a sole
+    // trailing non-ws delimiter is dropped, but a multi-word remainder / double
+    // trailing delimiter is kept verbatim (all bash 5.2.21-verified).
+    let n = vec!["X".to_string()];
+    let v = |s: &str, ifs: &str| split_into_names(s, &n, ifs)[0].1.clone();
+    assert_eq!(v("a:", ":"), "a"); // sole trailing dropped (was "a:")
+    assert_eq!(v("bccb:", ":"), "bccb"); // sole trailing dropped
+    assert_eq!(v("a b:", ":"), "a b"); // sole trailing dropped, interior space kept
+    assert_eq!(v("a:b:", ":"), "a:b:"); // multi-word remainder → kept
+    assert_eq!(v("a::", ":"), "a::"); // double trailing → kept
+    assert_eq!(v("  a  b  ", " \t\n"), "a  b"); // default ws: lead+trail stripped
+}
+
+#[test]
 fn split_into_names_multi_simple() {
     let names = vec!["X".to_string(), "Y".to_string(), "Z".to_string()];
     let r = split_into_names("a b c d", &names, " \t\n");
