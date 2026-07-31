@@ -2,6 +2,25 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+**Updated by v350 (#2, 2026-07-31 UTC):** `ifs-posix` flipped to PASS (0-diff) —
+one root: `read name1 name2 …` with a non-whitespace (or mixed-class) IFS
+assigns the LAST variable per bash's `read.def` last-field rule. After the first
+n-1 variables consume their fields, the last variable extracts one more word W;
+if W exhausts the line the trailing delimiter is DROPPED (`IFS=: read x y` on
+`a:b:` → `[a][b]`), otherwise the raw remainder is kept with only trailing
+IFS-whitespace stripped (interior/extra trailing non-ws delimiters kept:
+`a:b::` → `[a][b::]`, `a:b:c:` → `[a][b:c:]`). Ported faithfully into
+`split_into_names` via a shared `next_word` helper (also used by the per-field
+loop and `split_read_fields`); a prior heuristic (B-03) was reverted in v276 —
+the distinguishing insight it missed is that the trailing delimiter is dropped
+ONLY when one-word extraction exhausts the remainder. `ifs-posix.tests` runs
+6856 sub-tests (huck failed exactly 528, all this root). Blast radius is bounded
+to named-variable `read`: `read -a`/`mapfile` use the separate (already-correct)
+`split_read_fields`, untouched. Summary PASS 37→38, FAIL 45→44. Only `ifs-posix`
+flipped — full branch PASS-set diffed against the v349 baseline (exactly the 37
++ `ifs-posix`, NO regressions; read/ifs integration bins + full diff-check sweep
+237/237 green). Closes the long-deferred #2.
+
 **Updated by v349 (#343, 2026-07-30 UTC):** `attr` flipped to PASS (0-diff) —
 four real `readonly`-attribute roots (all verified: local bash 5.2.21 ==
 `attr.right`): **Root A** `readonly -a` indexed-array attribute (was `invalid
@@ -337,8 +356,8 @@ Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven f
 - SKIP (from known-skips.txt): 4
 
 (Counts refreshed by the v345 full-runner sweep, 2026-07-30 UTC — authoritative.
-The 37 PASS categories are: alias, appendop, array2, attr, braces, casemod, cprint, dbg-support2,
-dynvar, exportfunc, extglob2, extglob3, func, getopts, herestr, ifs, input-test, invert, iquote,
+The 38 PASS categories are: alias, appendop, array2, attr, braces, casemod, cprint, dbg-support2,
+dynvar, exportfunc, extglob2, extglob3, func, getopts, herestr, ifs, ifs-posix, input-test, invert, iquote,
 lastpipe, nquote, nquote1, nquote2, nquote3, nquote5, parser, posix2, posixexp2, posixpat,
 precedence, procsub, quote, rhs-exp, set-x, strip, tilde, tilde2. Some per-category FAIL
 rows below still lag reality — the count above is the authoritative signal.)
@@ -396,7 +415,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | histexpand | FAIL | `set: history: not yet supported`, and history-expansion flags (`-p`, `-a`, `-s`, `-w`) not implemented (M-46). Entire test suite fails from the first rejected option. |
 | history | FAIL | M-46 (`history -d/-w/-r/-a` not supported), M-47 (`history N` numeric argument not supported), `fc` not found as a command, `set: history: not yet supported`. Multiple history-command gaps. |
 | ifs | PASS | Flipped FAIL→PASS since the v220 sweep: the v220-recorded divergence (joining `${a[*]}`/`$*` with a space instead of the first `IFS` character when `IFS` is non-whitespace) is resolved; the category is now byte-identical. |
-| ifs-posix | FAIL | IFS splitting semantics with the `read` builtin diverge when IFS contains both whitespace and non-whitespace characters — huck does not correctly handle certain adjacent mixed-class IFS-separator edge cases. New bug, separate from the unimplemented posix set option. |
+| ifs-posix | PASS | v350 (#2): `read name1 name2 …` last-field IFS splitting ported from bash's `read.def` rule into `split_into_names` (shared `next_word` helper). |
 | input-test | PASS | v298 re-sweep: 0-diff PASS (the v268 piped-input-to-child-script `read` divergence is resolved). |
 | invert | PASS | |
 | iquote | PASS | v298 re-sweep: 0-diff PASS (the v268 `$'...'` control-char/high-byte escape-expansion divergence is resolved). |

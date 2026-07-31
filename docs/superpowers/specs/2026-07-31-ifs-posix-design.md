@@ -90,8 +90,15 @@ Localized to `split_into_names()`'s final "last field" block only.
   - if `i >= len` → last = `""`.
   - else `(w, p) = next_word(bytes, i)`; if `p >= len` → last = `w`; else last
     = raw `bytes[i..]` with trailing IFS-whitespace stripped.
-- The `n == 1` single-name branch and the empty-IFS branch are unchanged (bash
-  assigns the whole line, trailing IFS-whitespace stripped — already correct).
+- The empty-IFS branch is unchanged (assign the whole line to the first name).
+  The `n == 1` single-name branch is **removed** so a single variable flows
+  through the same last-field block: bash runs its `read.def` last-field rule
+  with zero preceding fields, so `IFS=: read x` on `a:` yields `a` (sole
+  trailing non-ws delimiter dropped), while a multi-word remainder (`a:b:`) or a
+  double trailing delimiter (`a::`) is kept, and default-whitespace IFS still
+  strips leading+trailing whitespace (`  a  b  ` → `a  b`). (An earlier draft of
+  this spec wrongly called the old strip-only-whitespace single-name branch
+  "already correct" — it kept a trailing non-ws delimiter; corrected here.)
 
 ### Blast radius
 
