@@ -1539,7 +1539,7 @@ fn builtin_export_decl(
                             shell,
                             err,
                             None,
-                            "export: '{s}': not a valid identifier"
+                            "export: `{s}': not a valid identifier"
                         );
                         any_error = true;
                         continue;
@@ -1565,7 +1565,7 @@ fn builtin_export_decl(
                             shell,
                             err,
                             None,
-                            "export: '{s}': not a valid identifier"
+                            "export: `{s}': not a valid identifier"
                         );
                         any_error = true;
                         continue;

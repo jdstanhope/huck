@@ -187,3 +187,23 @@ fn export_invalid_subscript_names_full_target() {
         assert_eq!(o.status.code(), Some(1), "frag {frag:?} rc");
     }
 }
+
+/// #365: `export` invalid-identifier errors quote the token with a backtick +
+/// single-quote (`` `tok' ``), matching bash and huck's own readonly/declare.
+#[test]
+fn export_invalid_identifier_uses_backtick_quote() {
+    let o = std::process::Command::new(huck())
+        .args(["-c", "export 3bad=1"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("`3bad=1': not a valid identifier"),
+        "got {err:?}"
+    );
+    assert!(
+        !err.contains("'3bad=1'"),
+        "must not use single quotes: {err:?}"
+    );
+}
