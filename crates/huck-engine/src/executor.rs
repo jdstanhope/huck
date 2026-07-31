@@ -3723,6 +3723,26 @@ fn run_empty_command_tail(
     outcome
 }
 
+/// Emits a `command`/`builtin`-wrapper option/dispatch error (`msg` is the full
+/// body), honoring a trailing `2>&1` that merges stderr into a CAPTURED stdout
+/// (#77). The wrapper error path runs before `run_builtin_with_redirects`, so it
+/// bypasses that function's `2>&1` swap; replicate it here so
+/// `x=$(command -Z 2>&1)` captures the error like bash instead of leaking it.
+fn emit_wrapper_error(
+    cmd: &ExecCommand,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+    msg: &str,
+) {
+    let route =
+        matches!(*sink, StdoutSink::Capture(_)) && redirs_merge_err_into_out(&cmd.redirects, shell);
+    let mut merged = StderrSink::Merged;
+    let eff: &mut StderrSink = if route { &mut merged } else { err_sink };
+    let mut err = err_writer(eff, sink);
+    crate::sh_error_to!(shell, &mut *err, None, "{msg}");
+}
+
 /// Expands the program + argument words into a `ResolvedCommand`. Returns
 /// `Ok(None)` when the program word expands to ZERO fields and no argument field
 /// survives either — the caller then runs it as an empty command (#62).
@@ -4770,10 +4790,8 @@ fn run_exec_single_inner(
                     break;
                 }
                 Some(s) if s.starts_with('-') && s.len() > 1 => {
-                    {
-                        let mut err = err_writer(err_sink, sink);
-                        crate::sh_error_to!(shell, &mut *err, None, "command: {s}: invalid option");
-                    }
+                    let msg = format!("command: {s}: invalid option");
+                    emit_wrapper_error(cmd, shell, sink, err_sink, &msg);
                     drain_procsubs(shell, procsub_base);
                     return ExecOutcome::Continue(2);
                 }
@@ -4835,30 +4853,17 @@ fn run_exec_single_inner(
     // a documented divergence — bash runs it. The `builtin`-led forms are handled
     // by the pre-resolve interception with decl_args rebuilt.)
     if require_builtin && builtins::is_declaration_command(&resolved.program) {
-        {
-            let mut err = err_writer(err_sink, sink);
-            crate::sh_error_to!(
-                shell,
-                &mut *err,
-                None,
-                "builtin: {}: declaration builtins must not be wrapped by `command builtin`",
-                resolved.program
-            );
-        }
+        let msg = format!(
+            "builtin: {}: declaration builtins must not be wrapped by `command builtin`",
+            resolved.program
+        );
+        emit_wrapper_error(cmd, shell, sink, err_sink, &msg);
         drain_procsubs(shell, procsub_base);
         return ExecOutcome::Continue(1);
     }
     if require_builtin && !builtins::is_builtin(&resolved.program) {
-        {
-            let mut err = err_writer(err_sink, sink);
-            crate::sh_error_to!(
-                shell,
-                &mut *err,
-                None,
-                "builtin: {}: not a shell builtin",
-                resolved.program
-            );
-        }
+        let msg = format!("builtin: {}: not a shell builtin", resolved.program);
+        emit_wrapper_error(cmd, shell, sink, err_sink, &msg);
         drain_procsubs(shell, procsub_base);
         return ExecOutcome::Continue(1);
     }
