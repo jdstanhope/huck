@@ -449,6 +449,11 @@ fn run_andor_group(
         // Checked BEFORE pending_fatal_status: the discard flavor wins if both
         // were somehow raised by the same command.
         if shell.take_pending_discard() {
+            // #351: a discarded command's exit status is 1 (DiscardCommand maps
+            // to 1 at the driver). `set_last_status(c)` above wrote the "success"
+            // status of a bare assignment (`v=$((1/0))` → c=0); overwrite it so a
+            // following `$?` reads 1, matching bash.
+            shell.set_last_status(1);
             return ExecOutcome::Interrupted(InterruptReason::DiscardCommand);
         }
         if shell.pending_fatal_status.is_some() {
