@@ -1993,14 +1993,16 @@ fn run_arith(
         Ok(0) => ExecOutcome::Continue(1),
         Ok(_) => ExecOutcome::Continue(0),
         Err(e) => {
-            let mut err = err_writer(err_sink, sink);
-            crate::sh_error_to!(
-                shell,
-                &mut *err,
-                Some("(("),
-                "{}",
-                crate::arith::render_error_body(&src, &e)
-            );
+            if crate::arith::should_wrap_expansion_error(&e) {
+                let mut err = err_writer(err_sink, sink);
+                crate::sh_error_to!(
+                    shell,
+                    &mut *err,
+                    Some("(("),
+                    "{}",
+                    crate::arith::render_error_body(&src, &e)
+                );
+            }
             ExecOutcome::Continue(1)
         }
     }
@@ -2362,6 +2364,13 @@ fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool 
     let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
     for pattern_word in &item.patterns {
         let pattern = expand_pattern(pattern_word, shell);
+        // v351 (#350): a `$(( ))` arith error while expanding a pattern (e.g.
+        // `$((xx++))` on a readonly var) sets `pending_discard`. bash aborts the
+        // whole `case` at that point — stop testing further patterns; the caller's
+        // post-`case_item_matches` discard check unwinds the command (status 1).
+        if shell.pending_discard || shell.pending_fatal_status.is_some() {
+            return false;
+        }
         let hit = if (extglob && crate::glob_match::has_extglob(&pattern))
             || crate::glob_match::has_posix_class(&pattern)
             || crate::glob_match::has_collating_symbol(&pattern)
@@ -2443,9 +2452,15 @@ fn run_case_inner(
     while i < clause.items.len() {
         let item = &clause.items[i];
         let run_this = fall_through || case_item_matches(item, &subject, shell);
-        // v312 (#3/#49): a `$(( ))` arith error in the case subject discards the
-        // whole `case` command (unwind), mirroring pending_fatal_status below.
+        // v312 (#3/#49): a `$(( ))` arith error in the case subject OR a pattern
+        // (v351 #350) discards the whole `case` command (unwind), mirroring
+        // pending_fatal_status below. Set `$? = 1` here: unlike a plain command's
+        // discard (which flows through `run_andor_group`'s Continue conversion),
+        // `case` returns `Interrupted(DiscardCommand)` directly — the driver maps
+        // it to a continue-status 1 but never writes `shell.last_status`, so the
+        // next unit's `$?` would read the stale pre-error value without this.
         if shell.take_pending_discard() {
+            shell.set_last_status(1);
             return ExecOutcome::Interrupted(InterruptReason::DiscardCommand);
         }
         if let Some(status) = shell.pending_fatal_status {

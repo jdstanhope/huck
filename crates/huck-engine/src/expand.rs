@@ -1273,7 +1273,14 @@ fn expand_part(
                     // the shell (127) via `posix_fatal` (verified against bash
                     // 5.2.21 --posix). The empty contribution matches bash's
                     // empty $((..)) value on error either way.
-                    crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&src, &e));
+                    if crate::arith::should_wrap_expansion_error(&e) {
+                        crate::sh_error!(
+                            shell,
+                            None,
+                            "{}",
+                            crate::arith::render_error_body(&src, &e)
+                        );
+                    }
                     if shell.shell_options.posix && !shell.is_interactive {
                         shell.posix_fatal(127);
                     } else {
@@ -1928,12 +1935,14 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                         // non-interactive EXITS (127) via `posix_fatal` (verified
                         // against bash 5.2.21 --posix). Empty contribution to the
                         // value matches bash either way.
-                        crate::sh_error!(
-                            shell,
-                            None,
-                            "{}",
-                            crate::arith::render_error_body(&src, &e)
-                        );
+                        if crate::arith::should_wrap_expansion_error(&e) {
+                            crate::sh_error!(
+                                shell,
+                                None,
+                                "{}",
+                                crate::arith::render_error_body(&src, &e)
+                            );
+                        }
                         if shell.shell_options.posix && !shell.is_interactive {
                             shell.posix_fatal(127);
                         } else {

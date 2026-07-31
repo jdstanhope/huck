@@ -741,6 +741,20 @@ pub fn parse(input: &str) -> Result<ArithExpr, ArithError> {
 /// carries an explicit `token_end` (tokenize-time NUMBER errors), bash reports
 /// only the full number run: the echo is truncated to `src[..end]` and the
 /// token to `src[offset..end]` — no trailing content.
+/// Whether an arith-EXPANSION error site should emit the wrapped
+/// `render_error_body` diagnostic (`<expr>: <msg> (error token is "<tok>")`).
+///
+/// A `ReadonlyVar` error is already reported bare (`xx: readonly variable`) by
+/// `assign()` during eval — bash prints ONLY that bare form for a readonly
+/// arith write and does NOT additionally wrap it. Every other arith error kind
+/// (division by zero, syntax error, …) IS wrapped by bash. So the expansion
+/// error sites suppress the wrapped emission for `ReadonlyVar` and emit it for
+/// all other kinds. (Fatality — `pending_discard`/`posix_fatal` — is unaffected;
+/// this governs the MESSAGE only.)
+pub fn should_wrap_expansion_error(err: &ArithError) -> bool {
+    !matches!(err.kind, ArithErrorKind::ReadonlyVar(_))
+}
+
 pub fn render_error_body(src: &str, err: &ArithError) -> String {
     let (expr, tok): (&str, &str) = match (err.offset, err.token_end) {
         (Some(off), Some(end)) if end <= src.len() && off <= end => {

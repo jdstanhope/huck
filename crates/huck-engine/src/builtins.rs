@@ -7119,13 +7119,15 @@ fn builtin_let(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecO
         match crate::arith::parse(a).and_then(|e| crate::arith::eval(&e, shell)) {
             Ok(v) => last = v,
             Err(e) => {
-                crate::sh_error_to!(
-                    shell,
-                    err,
-                    Some("let"),
-                    "{}",
-                    crate::arith::render_error_body(a, &e)
-                );
+                if crate::arith::should_wrap_expansion_error(&e) {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        Some("let"),
+                        "{}",
+                        crate::arith::render_error_body(a, &e)
+                    );
+                }
                 return ExecOutcome::Continue(1);
             }
         }
