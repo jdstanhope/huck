@@ -146,6 +146,8 @@ fn export_f_name_eq_value_reports_full_token() {
         "export -f foo=bar",              // unquoted (#341)
         "export -f 'foo=bar'",            // quoted (Root-D regression)
         "foo(){ :; }; export -f foo=bar", // even when the bare name IS a function
+        "x=bar; export -f foo=$x",        // #346: value is expanded, not dropped
+        "b=b; a=r; export -f foo=ba$a",   // #346: mixed literal + expansion
     ] {
         let o = std::process::Command::new(huck())
             .args(["-c", frag])
