@@ -3611,19 +3611,25 @@ fn glob_expand_word(
 /// builtin (Root B). A field whose left-of-first-`=` is not a valid identifier
 /// (or that has no `=`) stays `Plain`.
 fn decl_field_to_arg(s: String) -> crate::command::DeclArg {
-    if let Some(eq) = s.find('=')
-        && builtins::is_valid_name(&s[..eq])
-    {
-        let name = s[..eq].to_string();
-        let val = s[eq + 1..].to_string();
-        return crate::command::DeclArg::Assign(crate::command::Assignment {
-            target: crate::command::AssignTarget::Bare(name),
-            value: crate::lexer::Word(vec![crate::lexer::WordPart::Literal {
-                text: val,
-                quoted: true,
-            }]),
-            append: false,
-        });
+    if let Some(eq) = s.find('=') {
+        let lhs = &s[..eq];
+        // `name+=value` is an APPEND assignment (#344); `name=value` a plain one.
+        // Only fire when the identifier left of `=`/`+=` is valid; else Plain.
+        let (name, append) = match lhs.strip_suffix('+') {
+            Some(n) => (n, true),
+            None => (lhs, false),
+        };
+        if builtins::is_valid_name(name) {
+            let val = s[eq + 1..].to_string();
+            return crate::command::DeclArg::Assign(crate::command::Assignment {
+                target: crate::command::AssignTarget::Bare(name.to_string()),
+                value: crate::lexer::Word(vec![crate::lexer::WordPart::Literal {
+                    text: val,
+                    quoted: true,
+                }]),
+                append,
+            });
+        }
     }
     crate::command::DeclArg::Plain(s)
 }

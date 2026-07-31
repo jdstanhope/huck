@@ -345,6 +345,34 @@ fn readonly_quoted_scalar_assignment_is_an_assignment() {
     assert!(s.is_readonly("x"));
 }
 
+/// #344: a QUOTED `'name+=value'` arg is an APPEND assignment (bash re-checks
+/// the expanded word) — `readonly 'y+=cd'` on `y=ab` gives `abcd`, on an unset
+/// name gives just the value.
+#[test]
+fn quoted_name_plus_eq_value_is_append_assignment() {
+    let mut s = Shell::new();
+    s.set("y", "ab".to_string());
+    assert!(matches!(
+        run(&mut s, "readonly 'y+=cd'"),
+        ExecOutcome::Continue(0)
+    ));
+    assert_eq!(s.get("y").as_deref(), Some("abcd"));
+    assert!(s.is_readonly("y"));
+    // Unset name: append to empty = the value.
+    let mut s2 = Shell::new();
+    assert!(matches!(
+        run(&mut s2, "declare 'z+=q'"),
+        ExecOutcome::Continue(0)
+    ));
+    assert_eq!(s2.get("z").as_deref(), Some("q"));
+    // KEEP: an empty name (`+=v`) is not a valid identifier → error, exit 1.
+    let mut s3 = Shell::new();
+    assert!(matches!(
+        run(&mut s3, "readonly '+=v'"),
+        ExecOutcome::Continue(1)
+    ));
+}
+
 /// Root D KEEP: an invalid-identifier `'3x=1'` stays a Plain arg → the
 /// not-a-valid-identifier error, exit 1.
 #[test]
