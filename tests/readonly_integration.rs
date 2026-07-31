@@ -53,14 +53,16 @@ fn readonly_blocks_unset() {
 }
 
 #[test]
-fn readonly_blocks_inline_assignment() {
+fn readonly_inline_assignment_error_still_runs_command() {
+    // #234/#203: a readonly command-prefix assignment error is reported, but the
+    // command STILL RUNS with the old value (rc = the command's exit).
     let (out, err) = run_capture("readonly X=1\nX=2 echo hi\nrc=$?\necho rc=$rc\nexit\n");
     assert!(err.contains("readonly"), "stderr: {err:?}");
-    assert!(out.lines().any(|l| l == "rc=1"), "stdout: {out:?}");
     assert!(
-        !out.lines().any(|l| l == "hi"),
-        "echo should not have run; stdout: {out:?}",
+        out.lines().any(|l| l == "hi"),
+        "echo should have run; stdout: {out:?}"
     );
+    assert!(out.lines().any(|l| l == "rc=0"), "stdout: {out:?}");
 }
 
 #[test]
