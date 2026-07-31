@@ -162,3 +162,28 @@ fn export_f_name_eq_value_reports_full_token() {
         assert_eq!(o.status.code(), Some(1), "frag {frag:?} rc");
     }
 }
+
+/// #114: `export NAME[subscript]=v` (an invalid identifier for export) names the
+/// FULL `NAME[subscript]` in the error, not the bare `NAME` — with the subscript
+/// after word expansion but not arithmetic eval.
+#[test]
+fn export_invalid_subscript_names_full_target() {
+    let cases = [
+        ("export AA[4]=1", "`AA[4]': not a valid identifier"),
+        ("x=9; export AA[$x]=1", "`AA[9]': not a valid identifier"),
+        ("export AA[2+2]=1", "`AA[2+2]': not a valid identifier"),
+    ];
+    for (frag, want) in cases {
+        let o = std::process::Command::new(huck())
+            .args(["-c", frag])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains(want),
+            "frag {frag:?}: want {want:?}, got {err:?}"
+        );
+        assert_eq!(o.status.code(), Some(1), "frag {frag:?} rc");
+    }
+}

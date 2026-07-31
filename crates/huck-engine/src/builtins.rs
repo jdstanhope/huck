@@ -1578,13 +1578,16 @@ fn builtin_export_decl(
                 }
             },
             DeclArg::Assign(a) => {
-                if matches!(&a.target, crate::command::AssignTarget::Indexed { .. }) {
-                    let name = a.target.name();
+                if let crate::command::AssignTarget::Indexed { name, subscript } = &a.target {
+                    // #114: name the FULL `name[subscript]` source, not the bare
+                    // name. bash shows the subscript after word expansion but
+                    // NOT arithmetic eval (`AA[$x]`→`AA[9]`, `AA[2+2]` stays).
+                    let sub = crate::expand::expand_assignment(subscript, shell);
                     crate::sh_error_to!(
                         shell,
                         err,
                         None,
-                        "export: `{name}': not a valid identifier"
+                        "export: `{name}[{sub}]': not a valid identifier"
                     );
                     // POSIX case #1: an invalid-identifier ASSIGNMENT (`AA[4]=1`)
                     // is a bad-assignment usage error → exit status 1. A bad name
