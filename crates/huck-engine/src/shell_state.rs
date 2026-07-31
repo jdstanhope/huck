@@ -1556,9 +1556,27 @@ impl Shell {
         h.add(line);
     }
 
+    /// Resolves the history file path from the LIVE `$HISTFILE` shell variable
+    /// (#226) — a script's `HISTFILE=…` must be honored — falling back to the
+    /// startup value (resolved from the inherited environment / `$HOME`) only
+    /// when `HISTFILE` is unset. A set-but-empty `HISTFILE` disables the file.
+    pub fn resolve_histfile_path(&self) -> Option<std::path::PathBuf> {
+        match self.get("HISTFILE") {
+            Some(v) if !v.is_empty() => Some(std::path::PathBuf::from(v.to_string())),
+            Some(_) => None,
+            None => self.history.file_path().map(|p| p.to_path_buf()),
+        }
+    }
+
     /// Saves history to the histfile, applying the `$HISTFILESIZE` cap. (v139)
     pub fn save_history(&self) {
-        if let Some(msg) = self.history.save_capped(self.resolve_histfilesize()) {
+        let Some(path) = self.resolve_histfile_path() else {
+            return;
+        };
+        if let Some(msg) = self
+            .history
+            .save_capped_to(&path, self.resolve_histfilesize())
+        {
             crate::sh_error!(self, None, "{msg}");
         }
     }

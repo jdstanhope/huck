@@ -91,3 +91,22 @@ fn history_persists_across_sessions() {
     assert!(out.contains("echo first"), "stdout: {out}");
     assert!(out.contains("echo second"), "stdout: {out}");
 }
+
+/// #226: `history -w` (and history save) honors a script's live `HISTFILE=…`
+/// shell variable, not the startup env value.
+#[test]
+fn histfile_shell_variable_is_honored_over_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let env_hf = dir.path().join("env_hist");
+    let script_hf = dir.path().join("script_hist");
+    let script = format!(
+        "echo keepme\nHISTFILE={}\nhistory -w\nexit\n",
+        script_hf.display()
+    );
+    let (_o, err) = run_with_histfile(&script, &env_hf);
+    assert!(err.is_empty() || !err.contains("cannot"), "stderr: {err:?}");
+    assert!(script_hf.exists(), "script-set HISTFILE not written");
+    assert!(!env_hf.exists(), "env HISTFILE should NOT be written");
+    let body = std::fs::read_to_string(&script_hf).unwrap();
+    assert!(body.contains("echo keepme"), "history not saved: {body:?}");
+}
