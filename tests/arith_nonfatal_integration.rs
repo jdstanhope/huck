@@ -42,6 +42,17 @@ fn arith_division_by_zero_does_not_halt_script_file() {
 }
 
 #[test]
+fn arith_error_in_assignment_word_sets_status_one() {
+    // #351: a failing `$(( ))` in an ASSIGNMENT-form word discards the command
+    // and leaves `$?` = 1 (bash), where huck left 0. The command form already
+    // gave 1; both must now report 1.
+    let script = "v=$((1/0))\necho \"assign_rc=$?\"\necho $((2/0))\necho \"cmd_rc=$?\"\n";
+    let (stdout, _stderr, _rc) = run_script_file(script, "assign_status");
+    assert!(stdout.contains("assign_rc=1"), "stdout={stdout:?}");
+    assert!(stdout.contains("cmd_rc=1"), "stdout={stdout:?}");
+}
+
+#[test]
 fn arith_invalid_lhs_does_not_halt_script_file() {
     let script = "y=$((1 + 2 = 3))\necho POST\n";
     let (stdout, _stderr, _rc) = run_script_file(script, "lhs");
