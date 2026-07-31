@@ -205,3 +205,25 @@ fn compound_high_fd_file_redirect() {
         "fd 3 should be closed after scope (rc=1), got: {out2:?}"
     );
 }
+
+/// #170: a redirect-OPEN error on a COMPOUND command carries the `line N:`
+/// prologue that bash includes (a simple command's already did).
+#[test]
+fn compound_redirect_error_has_line_prefix() {
+    for frag in [
+        "{ :; } 4>&77",
+        "( : ) 4>&77",
+        "while :; do break; done 4>&77",
+    ] {
+        let out = Command::new(huck_bin())
+            .args(["-c", frag])
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("line 1: 77: Bad file descriptor"),
+            "frag {frag:?}: missing `line 1:` prologue; stderr={err:?}"
+        );
+    }
+}
