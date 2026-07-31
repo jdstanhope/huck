@@ -253,6 +253,32 @@ fn declare_nameref_invalid_target_errors() {
 }
 
 #[test]
+fn declare_nameref_on_array_valued_name_refuses() {
+    // #227: `declare -n NAME` where NAME holds an array is refused (bash:
+    // `NAME: reference variable cannot be an array`, rc 1); the nameref
+    // attribute is NOT applied.
+    let mut shell = Shell::new();
+    assert!(matches!(
+        run(&["-a", "A=(x y)"], &mut shell).0,
+        ExecOutcome::Continue(0)
+    ));
+    let (oc, _) = run(&["-n", "A"], &mut shell);
+    assert!(matches!(oc, ExecOutcome::Continue(1)));
+    assert!(
+        !shell.is_nameref("A"),
+        "nameref must not be applied to an array"
+    );
+    // Associative too.
+    assert!(matches!(
+        run(&["-A", "M=([k]=v)"], &mut shell).0,
+        ExecOutcome::Continue(0)
+    ));
+    let (oc2, _) = run(&["-n", "M"], &mut shell);
+    assert!(matches!(oc2, ExecOutcome::Continue(1)));
+    assert!(!shell.is_nameref("M"));
+}
+
+#[test]
 fn declare_nameref_subscript_target() {
     // `declare -n e=arr[0]` should succeed.
     let mut shell = Shell::new();

@@ -2553,6 +2553,20 @@ fn builtin_declare_decl(
                 // applied) — it falls out of huck having no attribute-without-
                 // value state, so `readonly FOO` on an unset FOO creates FOO
                 // as set-to-empty and `shell.get` returns Some(""). See #225.
+                //
+                // #227: an array-valued name cannot become a nameref — bash
+                // refuses BEFORE validating the value (`shell.get` on an array
+                // returns element 0, which would otherwise slip through).
+                if shell.get_indexed(name).is_some() || shell.get_associative(name).is_some() {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "declare: {name}: reference variable cannot be an array"
+                    );
+                    exit = 1;
+                    continue;
+                }
                 let cur = cur.to_string();
                 let valid = is_valid_name(&cur)
                     || matches!(parse_subscripted_arg(&cur), Ok(Some((b, _))) if is_valid_name(b));
