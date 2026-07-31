@@ -1623,3 +1623,99 @@ fn transform_assign_decl_on_assoc_at() {
         other => panic!("expected Value, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// v351 Root 1: a backslash from an UNQUOTED expansion is a pattern escape.
+// ---------------------------------------------------------------------------
+
+/// Mirrors `case_item_matches` in the executor: expand an UNQUOTED `$p`
+/// (whose value is `p`) into a glob pattern, then match `subject`.
+fn unq_glob_match(p: &str, subject: &str) -> bool {
+    let mut shell = Shell::new();
+    shell.set("HUCK_P", p.to_string());
+    let pattern = expand_pattern(&var_unq("HUCK_P"), &mut shell);
+    if crate::glob_match::has_extglob(&pattern)
+        || crate::glob_match::has_posix_class(&pattern)
+        || crate::glob_match::has_collating_symbol(&pattern)
+        || crate::glob_match::has_equivalence_class(&pattern)
+    {
+        crate::glob_match::extglob_match(&pattern, subject, false)
+    } else {
+        let npat = crate::glob_match::translate_bracket_negation(&pattern);
+        glob::Pattern::new(&npat)
+            .map(|g| g.matches(subject))
+            .unwrap_or(false)
+    }
+}
+
+/// A QUOTED `"$p"` keeps the backslash literal (no escape processing).
+fn q_glob_match(p: &str, subject: &str) -> bool {
+    let mut shell = Shell::new();
+    shell.set("HUCK_P", p.to_string());
+    let pattern = expand_pattern(&var_q("HUCK_P"), &mut shell);
+    let npat = crate::glob_match::translate_bracket_negation(&pattern);
+    glob::Pattern::new(&npat)
+        .map(|g| g.matches(subject))
+        .unwrap_or(false)
+}
+
+#[test]
+fn unquoted_backslash_is_pattern_escape_truth_table() {
+    // Bash 5.2.21-verified rows (pattern is an UNQUOTED $p).
+    assert!(unq_glob_match(r"\x", "x")); // \x matches x
+    assert!(unq_glob_match(r"\*", "*")); // \* matches literal *
+    assert!(!unq_glob_match(r"\*", "ab")); // \* does NOT match ab
+    assert!(unq_glob_match(r"\?", "?")); // \? matches literal ?
+    assert!(unq_glob_match(r"\a", "a")); // \a matches a
+    assert!(unq_glob_match(r"a\*b", "a*b")); // a\*b matches a*b
+    assert!(unq_glob_match(r"\\", r"\")); // \\ matches a literal backslash
+    assert!(unq_glob_match("*", "ab")); // bare * stays an active wildcard
+}
+
+#[test]
+fn data_backslash_matches_literal_backslash() {
+    // A data backslash (from `\\`) must be a literal `\` in BOTH matchers.
+    // Plain-glob path:
+    assert!(unq_glob_match(r"\\", r"\"));
+    // extglob path (pattern also carries an extglob group):
+    assert!(unq_glob_match(r"\\@(x)", r"\x"));
+}
+
+#[test]
+fn escape_pattern_literal_backslash_is_literal() {
+    // escape_pattern_literal on a lone backslash yields a form both the glob
+    // crate and the extglob engine treat as a literal backslash.
+    let esc = escape_pattern_literal("\\");
+    assert!(glob::Pattern::new(&esc).map(|g| g.matches("\\")).unwrap());
+    assert!(crate::glob_match::extglob_match(&esc, "\\", false));
+}
+
+#[test]
+fn quoted_backslash_stays_literal_no_escape_processing() {
+    // KEEP: a quoted "$x" with x='\x' is a literal two-char pattern `\x`,
+    // which after escape becomes a literal `\x` — does NOT match `x`.
+    assert!(!q_glob_match(r"\x", "x"));
+    // but it DOES match the literal two-char string `\x`.
+    assert!(q_glob_match(r"\x", r"\x"));
+}
+
+#[test]
+fn unquoted_backslash_dbracket_eq_and_param_strip() {
+    use crate::lexer::ParamModifier;
+    use crate::param_expansion::ExpansionResult;
+    // [[ x == $p ]] shares expand_pattern; p='\x' matches x.
+    assert!(unq_glob_match(r"\x", "x"));
+    // ${v#$p} with v=xy, p='\x' strips the `x`, leaving `y`.
+    let mut shell = Shell::new();
+    shell.set("HUCK_V", "xy".to_string());
+    shell.set("HUCK_P", r"\x".to_string());
+    let m = ParamModifier::RemovePrefix {
+        pattern: var_unq("HUCK_P"),
+        longest: false,
+    };
+    let stripped = crate::param_expansion::expand_modifier("HUCK_V", &m, &mut shell);
+    match stripped {
+        ExpansionResult::Value(v) => assert_eq!(v, "y"),
+        other => panic!("expected Value(\"y\"), got {other:?}"),
+    }
+}

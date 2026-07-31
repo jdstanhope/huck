@@ -2136,7 +2136,29 @@ fn expand_word_with_quote_escape(
         if word_part_is_quoted(part) {
             result.push_str(&escape(&text));
         } else {
-            result.push_str(&text);
+            // Unquoted expansion text: a backslash is a pattern/regex escape
+            // (bash fnmatch semantics). `\c` becomes a literal `c` — emit
+            // `escape(c)` so a `\*` matches a literal `*` (glob → `[*]`,
+            // regex → `\*`) while an unescaped metachar stays active. A
+            // trailing lone backslash is dropped (bash).
+            let mut chars = text.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    match chars.next() {
+                        // `\\` → a LITERAL backslash. Emit `[\\]` (a one-char
+                        // class): both the `glob` crate and the extglob engine
+                        // (and `regex`) treat it as a literal `\`, and it can't
+                        // accidentally escape a following metachar the way a
+                        // bare `\` would in the extglob engine.
+                        Some('\\') => result.push_str(r"[\\]"),
+                        Some(next) => result.push_str(&escape(&next.to_string())),
+                        // Trailing lone backslash — dropped (bash).
+                        None => {}
+                    }
+                } else {
+                    result.push(c);
+                }
+            }
         }
     }
     result
