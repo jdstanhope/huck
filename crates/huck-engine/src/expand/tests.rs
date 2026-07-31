@@ -1648,6 +1648,33 @@ fn unq_glob_match(p: &str, subject: &str) -> bool {
     }
 }
 
+/// Regex operand from an UNQUOTED `$p`, matched anchored like `[[ =~ ]]`
+/// (full-string via a fresh regex). The regex path must NOT collapse
+/// backslashes — glibc ERE extensions stay active.
+fn unq_regex_match(p: &str, subject: &str) -> bool {
+    let mut shell = Shell::new();
+    shell.set("HUCK_P", p.to_string());
+    let pattern = expand_regex_operand(&var_unq("HUCK_P"), &mut shell);
+    regex::Regex::new(&pattern)
+        .map(|re| re.is_match(subject))
+        .unwrap_or(false)
+}
+
+#[test]
+fn regex_operand_keeps_backslash_extensions_from_unquoted_expansion() {
+    // #350/v351 Task-1 review (Critical): the backslash-as-glob-escape fix must
+    // NOT apply to the regex path — bash hands an unquoted expansion's value to
+    // regcomp verbatim, so GNU-ERE `\b`/`\w`/`\s`/`\<`/`\>` stay active. (Guards
+    // against re-routing the glob collapse through expand_regex_operand.)
+    assert!(unq_regex_match(r"\bx", "x")); // word boundary, then x
+    assert!(unq_regex_match(r"\w", "a")); // word char
+    assert!(unq_regex_match(r"\s", " ")); // whitespace
+    assert!(unq_regex_match(r"\<cat", "cat")); // start-of-word
+    assert!(unq_regex_match(r"foo\>", "foo")); // end-of-word
+    assert!(unq_regex_match(r"\.", ".")); // escaped dot = literal dot
+    assert!(!unq_regex_match(r"\.", "x")); // literal dot does NOT match x
+}
+
 /// A QUOTED `"$p"` keeps the backslash literal (no escape processing).
 fn q_glob_match(p: &str, subject: &str) -> bool {
     let mut shell = Shell::new();
