@@ -3681,11 +3681,56 @@ fn decl_field_to_arg(s: String) -> crate::command::DeclArg {
     crate::command::DeclArg::Plain(s)
 }
 
+/// Runs a command with NO program to execute (a syntactically-empty program, or
+/// one whose word expanded to zero fields — #62): apply the inline assignments,
+/// perform the redirects for side effects (with a no-op body), rc 0 (or the
+/// redirect-open failure). bash processes the assignments with the ORIGINAL
+/// (un-redirected) fds, so any readonly error / RHS command sub uses the
+/// inherited stderr, not the command's own `2>…`. #155: a null command must not
+/// persist a `{var}` fd binding — snapshot/restore each named-fd var.
+fn run_empty_command_tail(
+    cmd: &ExecCommand,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+    procsub_base: usize,
+) -> ExecOutcome {
+    let named_fd_prior: Vec<(String, Option<String>)> = cmd
+        .redirects
+        .iter()
+        .filter_map(|r| match &r.fd {
+            crate::command::RedirFd::Var(n) => {
+                Some((n.clone(), shell.get(n).map(|s| s.to_string())))
+            }
+            _ => None,
+        })
+        .collect();
+    let st = run_assignment_list(&cmd.inline_assignments, shell, sink, err_sink);
+    let outcome = with_redirect_scope(
+        &cmd.redirects,
+        shell,
+        sink,
+        err_sink,
+        move |_shell, _sink, _err_sink| ExecOutcome::Continue(st),
+    );
+    for (name, prior) in named_fd_prior {
+        match prior {
+            Some(v) => shell.set(&name, v),
+            None => shell.unset(&name),
+        }
+    }
+    drain_procsubs(shell, procsub_base);
+    outcome
+}
+
+/// Expands the program + argument words into a `ResolvedCommand`. Returns
+/// `Ok(None)` when the program word expands to ZERO fields and no argument field
+/// survives either — the caller then runs it as an empty command (#62).
 fn resolve(
     cmd: &ExecCommand,
     shell: &mut Shell,
     err: &mut dyn std::io::Write,
-) -> Result<ResolvedCommand, i32> {
+) -> Result<Option<ResolvedCommand>, i32> {
     let prog_fields = match glob_expand_word(&cmd.program, shell, err) {
         Ok(v) => v,
         Err(()) => return Err(1),
@@ -3699,9 +3744,42 @@ fn resolve(
     if shell.pending_discard {
         return Err(1);
     }
+    // #62: the program word split to ZERO fields (an empty unquoted expansion,
+    // e.g. `$Z echo hi` with `Z` unset). bash's word-splitting drops the empty
+    // leading word and PROMOTES the first surviving field of the remaining words
+    // as the command; if nothing survives it is an empty command (→ `Ok(None)`).
     if prog_fields.is_empty() {
-        crate::sh_error_to!(shell, err, None, "command not found:");
-        return Err(127);
+        let mut fields: Vec<String> = Vec::new();
+        for word in &cmd.args {
+            let f = match glob_expand_word(word, shell, err) {
+                Ok(v) => v,
+                Err(()) => return Err(1),
+            };
+            if let Some(status) = shell.pending_fatal_status {
+                return Err(status);
+            }
+            if shell.pending_discard {
+                return Err(1);
+            }
+            fields.extend(f);
+        }
+        if fields.is_empty() {
+            return Ok(None);
+        }
+        let program = fields.remove(0);
+        if builtins::is_declaration_command(&program) {
+            let decl_args = fields.into_iter().map(decl_field_to_arg).collect();
+            return Ok(Some(ResolvedCommand {
+                program,
+                args: Vec::new(),
+                decl_args: Some(decl_args),
+            }));
+        }
+        return Ok(Some(ResolvedCommand {
+            program,
+            args: fields,
+            decl_args: None,
+        }));
     }
     let mut iter = prog_fields.into_iter();
     let program = iter.next().unwrap();
@@ -3762,11 +3840,11 @@ fn resolve(
     // apply `cmd.redirects` in source order at execution time; the pipeline-stage
     // path reads `exec.slot_stdin/stdout/stderr()` directly off the AST. So
     // resolve() only expands the program + arguments.
-    Ok(ResolvedCommand {
+    Ok(Some(ResolvedCommand {
         program,
         args,
         decl_args,
-    })
+    }))
 }
 
 // ----- redirect file handling -----------------------------------------------
@@ -4649,51 +4727,18 @@ fn run_exec_single_inner(
                 return outcome;
             }
         }
-        // bash processes the assignments with the ORIGINAL (un-redirected) fds:
-        // RHS command substitutions and any readonly-variable error use the
-        // inherited stderr, NOT the command's own `2>…`. It then performs the
-        // redirections for their side effects only (e.g. `>f` truncation). So
-        // apply the assignments first, then open the redirects with a no-op
-        // body. A redirect that fails to open still leaves the assignment
-        // applied but makes the status reflect the open failure (bash:
-        // `x=1 </missing` → `x` is set, rc 1) — with_redirect_scope returns the
-        // open failure before running the body, so its status wins.
-        // #155: a null (no-command) command must NOT persist a `{var}` fd
-        // binding — bash only persists `{var}` for exec / a builtin / a compound
-        // command, never a redirect-only null command. Snapshot each named-fd
-        // var's prior value and restore it after the redirect scope (this branch
-        // is reached only for an empty program, so exec/builtin/compound paths
-        // are unaffected).
-        let named_fd_prior: Vec<(String, Option<String>)> = cmd
-            .redirects
-            .iter()
-            .filter_map(|r| match &r.fd {
-                crate::command::RedirFd::Var(n) => {
-                    Some((n.clone(), shell.get(n).map(|s| s.to_string())))
-                }
-                _ => None,
-            })
-            .collect();
-        let st = run_assignment_list(&cmd.inline_assignments, shell, sink, err_sink);
-        let outcome = with_redirect_scope(
-            &cmd.redirects,
-            shell,
-            sink,
-            err_sink,
-            move |_shell, _sink, _err_sink| ExecOutcome::Continue(st),
-        );
-        for (name, prior) in named_fd_prior {
-            match prior {
-                Some(v) => shell.set(&name, v),
-                None => shell.unset(&name),
-            }
-        }
-        drain_procsubs(shell, procsub_base);
-        return outcome;
+        return run_empty_command_tail(cmd, shell, sink, err_sink, procsub_base);
     }
 
-    let mut resolved = match resolve(cmd, shell, &mut *err_writer(err_sink, sink)) {
-        Ok(r) => r,
+    // Bind the result first so the `err_writer` borrow of sink/err_sink ends
+    // before the `Ok(None)` arm reuses them.
+    let resolved_result = resolve(cmd, shell, &mut *err_writer(err_sink, sink));
+    let mut resolved = match resolved_result {
+        Ok(Some(r)) => r,
+        // #62: the program word expanded to ZERO fields AND no arg field
+        // survived either — bash treats this as an empty command (assignments +
+        // redirects, rc 0), NOT `command not found`.
+        Ok(None) => return run_empty_command_tail(cmd, shell, sink, err_sink, procsub_base),
         Err(code) => {
             drain_procsubs(shell, procsub_base);
             return ExecOutcome::Continue(code);
@@ -9008,8 +9053,15 @@ fn spawn_external_with_fds(
     };
 
     // Resolve (expand) the command — same path as run_exec_single / run_multi_stage.
+    // A zero-field program in a pipeline stage (#62 `Ok(None)`) keeps the prior
+    // behavior here: an empty program flows to the NotRunnable diagnostic below.
     let resolved = resolve(exec, shell, &mut *err_writer(err_sink, sink))
-        .map_err(|code| io::Error::other(format!("resolve failed with code {code}")))?;
+        .map_err(|code| io::Error::other(format!("resolve failed with code {code}")))?
+        .unwrap_or(ResolvedCommand {
+            program: String::new(),
+            args: Vec::new(),
+            decl_args: None,
+        });
 
     // #78: if the program can't be run, don't spawn — fork a diagnostic child
     // that prints `<name>: <reason>` to the stage's own (redirected) fd 2 and

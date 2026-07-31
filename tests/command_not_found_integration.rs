@@ -68,3 +68,28 @@ fn quoted_empty_command_uses_bash_format() {
     );
     assert_eq!(c, 127);
 }
+
+/// #62: a leading command word that expands to ZERO fields is dropped by
+/// word-splitting — bash promotes the first surviving arg field as the command,
+/// or runs it as an empty command (assignments + redirects, rc 0) when nothing
+/// survives. huck used to print `command not found` (rc 127) in all cases.
+#[test]
+fn zero_field_command_word_promotes_or_is_empty() {
+    // Promote the first surviving field.
+    let (o, e, c) = run_file("unset Z\n$Z echo hi\n");
+    assert_eq!(o, "hi\n", "promotion failed; stdout={o:?}");
+    assert!(!e.contains("command not found"), "stderr={e:?}");
+    assert_eq!(c, 0);
+
+    // Nothing survives → empty command, rc 0, no error.
+    let (_o2, e2, c2) = run_file("unset Z\n$Z\necho rc=$?\n");
+    assert!(!e2.contains("command not found"), "stderr={e2:?}");
+    assert_eq!(c2, 0);
+
+    // Redirect-only empty command performs the redirect (rc 0).
+    let f = std::env::temp_dir().join(format!("huck-62-{}.out", std::process::id()));
+    let script = format!("unset Z\n$Z > {}\n", f.display());
+    let (_o3, _e3, _c3) = run_file(&script);
+    assert!(f.exists(), "redirect not performed on empty command");
+    let _ = std::fs::remove_file(&f);
+}
