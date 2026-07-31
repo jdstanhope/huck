@@ -182,3 +182,24 @@ fn invalid_name_still_binds_optind() {
         "stderr: {e:?}"
     );
 }
+
+/// #61: when a single getopts call hits BOTH an invalid optstring option
+/// (non-silent) AND an invalid name-variable identifier, both diagnostics are
+/// printed — the option diagnostic first, then the identifier error.
+#[test]
+fn both_invalid_option_and_invalid_name_print_both() {
+    let (_out, err, _rc) = run("getopts \"ab\" 1badname -x\n");
+    assert!(
+        err.contains("illegal option -- x"),
+        "missing option diag: {err:?}"
+    );
+    assert!(
+        err.contains("`1badname': not a valid identifier"),
+        "missing identifier error: {err:?}"
+    );
+    // Option diagnostic comes before the identifier error (bash order).
+    assert!(
+        err.find("illegal option").unwrap() < err.find("not a valid identifier").unwrap(),
+        "wrong order: {err:?}"
+    );
+}
