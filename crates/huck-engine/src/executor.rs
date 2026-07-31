@@ -4545,22 +4545,26 @@ fn run_assignment_list(
         }
         if shell.shell_options.xtrace {
             let op = if a.append { "+=" } else { "=" };
-            // Bare-scalar apply recorded the assigned RHS; array/assoc/indexed
-            // targets don't — fall back to the full value for those (their
-            // literal-source trace is a separate deferred divergence, #311).
-            // `match` (not `unwrap_or_else`) so the mut borrow from `take_…`
-            // fully ends before the `lookup_var` shared borrow.
-            let val = match shell.take_xtrace_assign_rhs() {
-                Some(rhs) => rhs,
-                None => shell.lookup_var(name).unwrap_or_default(),
+            // #311: an array-literal RHS traces as its LITERAL source
+            // (`a=(1 2 3)`, `a+=(4 5)`, `a=($x)`) — UNQUOTED — matching bash and
+            // the inline-prefix xtrace path. A scalar RHS uses the recorded value
+            // (xtrace_quoted as needed). `take_xtrace_assign_rhs` clears the slot.
+            let rendered = if let Some(elems) = array_literal_elements(&a.value) {
+                shell.take_xtrace_assign_rhs();
+                crate::generate::array_literal_to_source(elems)
+            } else {
+                // `match` (not `unwrap_or_else`) so the mut borrow from `take_…`
+                // fully ends before the `lookup_var` shared borrow.
+                let val = match shell.take_xtrace_assign_rhs() {
+                    Some(rhs) => rhs,
+                    None => shell.lookup_var(name).unwrap_or_default(),
+                };
+                crate::param_expansion::xtrace_quote(&val)
             };
             let p4 = ps4(shell);
             xtrace_emit(
                 xtrace_target_fd(shell),
-                &format!(
-                    "{p4}{name}{op}{}",
-                    crate::param_expansion::xtrace_quote(&val)
-                ),
+                &format!("{p4}{name}{op}{rendered}"),
             );
         }
     }

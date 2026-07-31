@@ -40,5 +40,14 @@ check "trace plain assign"     'set -x; x=hi'
 check "trace append assign"    'set -x; foo=one; foo+=two'
 check "trace append expand"    'y=world; set -x; foo=hello; foo+=" $y"'
 
+# #311: an array-literal assignment traces as its LITERAL source (unexpanded,
+# original quoting), not the first element / expanded values.
+check "trace array assign"     'set -x; a=(1 2 3)'
+check "trace array append"     'a=(1 2); set -x; a+=(3 4)'
+check "trace array source"     'x=hi; set -x; a=($x)'
+check "trace array quoted elt" $'set -x; a=(\'a b\' c)'
+check "trace array subscripts" 'set -x; a=([2]=x [5]=y)'
+check "trace assoc assign"     'declare -A m; set -x; m=([k]=v [j]=w)'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

@@ -797,7 +797,11 @@ fn assign_target_to_source(target: &crate::command::AssignTarget) -> String {
     }
 }
 
-fn array_literal_to_source(elems: &[crate::lexer::ArrayLiteralElement]) -> String {
+/// Renders a `name=(…)` array literal back to its SOURCE form (`(1 2 3)`,
+/// `([2]=x [5]=y)`, `($x)`, `('a b' c)` — unexpanded, original quoting) — used by
+/// the `set -x` trace of an array assignment (#311), which bash prints as the
+/// literal source, not the expanded values.
+pub fn array_literal_to_source(elems: &[crate::lexer::ArrayLiteralElement]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for e in elems {
         match &e.subscript {
