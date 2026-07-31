@@ -1697,6 +1697,9 @@ fn unquoted_backslash_is_pattern_escape_truth_table() {
     assert!(unq_glob_match(r"a\*b", "a*b")); // a\*b matches a*b
     assert!(unq_glob_match(r"\\", r"\")); // \\ matches a literal backslash
     assert!(unq_glob_match("*", "ab")); // bare * stays an active wildcard
+    // A TRAILING lone backslash is a LITERAL backslash (bash), not dropped:
+    assert!(unq_glob_match(r"ab\", r"ab\")); // `ab\` matches `ab\`
+    assert!(!unq_glob_match(r"ab\", "ab")); // and does NOT match `ab`
 }
 
 #[test]

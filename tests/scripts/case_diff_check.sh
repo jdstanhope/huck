@@ -33,6 +33,7 @@ check_script "glob \\* literal star" $'m() { case "$2" in $1) echo M;; *) echo n
 check_script "glob \\\\ literal bslash" $'m() { case "$2" in $1) echo M;; *) echo n;; esac; }\np=\'\\\\\\\\\'; m "$p" \'\\\\\'\n'
 check_script "glob a\\*b"            $'m() { case "$2" in $1) echo M;; *) echo n;; esac; }\np=\'a\\\\*b\'; m "$p" \'a*b\'; m "$p" axb\n'
 check_script "bare * stays active"  $'m() { case "$2" in $1) echo M;; *) echo n;; esac; }\np=\'*\'; m "$p" ab\n'
+check_script "trailing \\ is literal" $'m() { case "$2" in $1) echo M;; *) echo n;; esac; }\np=\'ab\\\\\'; m "$p" \'ab\\\\\'; m "$p" ab\n'
 check_script "KEEP quoted \"\$x\" literal" $'x=\'\\\\x\'\ncase x in "$x") echo M;; *) echo n;; esac\ncase \'\\\\x\' in "$x") echo M2;; *) echo n2;; esac\n'
 check_script "[[ == ]] \\x matches x" $'x=\'\\\\x\'\n[[ x == $x ]] && echo M || echo n\n'
 check_script "\${x#pat} strips \\x"  $'v=xy; p=\'\\\\x\'\necho "${v#$p}"\n'

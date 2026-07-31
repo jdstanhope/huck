@@ -2166,8 +2166,9 @@ fn expand_word_with_quote_escape(
                         // bare `\` would in the extglob engine.
                         Some('\\') => result.push_str(r"[\\]"),
                         Some(next) => result.push_str(&escape(&next.to_string())),
-                        // Trailing lone backslash — dropped (bash).
-                        None => {}
+                        // Trailing lone backslash — bash keeps it as a LITERAL
+                        // backslash (`case 'ab\' in ab\) matches). Emit `[\\]`.
+                        None => result.push_str(r"[\\]"),
                     }
                 } else {
                     result.push(c);
