@@ -104,16 +104,24 @@ checkf "op default quoted lit"  'HOME=/h; unset t; echo "${t:-~}"'        # ~
 checkf "op default inq lit"     'HOME=/h; unset t; echo "${t:-"~"}"'      # ~
 checkf "op default midcolon"    'HOME=/h; unset t; echo ${t:=~/a:~/b}; echo "$t"'  # /h/a:~/b (x2)
 checkf "op default not-start"   'HOME=/h; t=x; echo ${t:-$t~}'            # x~  (tilde not word-start)
-# NOTE: pattern-family operands (`${t#~}`, `${t%~}`, `${t/~/x}`, `${t^~}`, ...)
-# are a DIFFERENT, verified-separate divergence: real bash 5.2.21 also
-# word-start tilde-expands the PATTERN operand of `#`/`%`/`/`/`^`/`,` (confirmed
-# empirically: `t=/h; echo ${t#~}` -> "" in bash, since `~` in the pattern
-# expands to $HOME=/h and matches the whole prefix). That is NOT what Root B
-# fixes (Root B's word-start signal is keyed on the value ParamOpKind history
-# token -- UseDefault/AssignDefault/ErrorIfUnset/UseAlternate -- which never
-# appears preceding a pattern operand), and it is not covered by the real
-# tilde2.tests fixture. Left out of this harness; tracked as a follow-up
-# divergence, not attempted here.
+# #296 (FIXED): a word-start `~` in a PATTERN operand also tilde-expands —
+# the `#`/`##`/`%`/`%%` prefix/suffix operands, the `^`/`^^`/`,`/`,,` case-mod
+# pattern, and the pattern half of an UNANCHORED `/`/`//` substitution. The
+# anchored `/#`/`/%`, a quoted `~`, and a non-word-start `~` stay literal, as
+# do case-mod patterns whose expansion can't match (multi-char $HOME never
+# matches a single case-mod char).
+checkf "pat prefix #~"       'HOME=/h; t=/h; echo "[${t#~}]"'        # []
+checkf "pat prefix ##~"      'HOME=/h; t=/hx; echo "[${t##~}]"'      # [x]
+checkf "pat suffix %~"       'HOME=/h; t=a/h; echo "[${t%~}]"'       # [a]
+checkf "pat suffix %%~"      'HOME=/h; t=a/h; echo "[${t%%~}]"'      # [a]
+checkf "pat subst /~"        'HOME=/h; t=/h; echo "[${t/~/X}]"'      # [X]
+checkf "pat subst //~"       'HOME=/h; t=/h/h; echo "[${t//~/X}]"'   # [XX]
+checkf "pat subst anchored /#~" 'HOME=/h; t=/h; echo "[${t/#~/X}]"'  # [/h] (literal ~)
+checkf "pat subst anchored /%~" 'HOME=/h; t=/h; echo "[${t/%~/X}]"'  # [/h] (literal ~)
+checkf "pat casemod ^~"      'HOME=a; t=abc; echo "[${t^~}]"'        # [Abc]
+checkf "pat casemod ,~"      'HOME=A; t=ABC; echo "[${t,~}]"'        # [aBC]
+checkf "pat quoted lit"      'HOME=/h; t=/h; echo "[${t#"~"}]"'      # [/h] (literal ~)
+checkf "pat not-word-start"  'HOME=/h; t=a/h; echo "[${t#a~}]"'      # [] (a~ -> a/h prefix)
 
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
