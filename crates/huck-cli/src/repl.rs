@@ -189,6 +189,8 @@ pub fn run(args: &[String], version: &str) -> i32 {
     }
 
     // ----- interactive / piped-stdin REPL (unchanged below this line) -----
+    // This path reads commands from stdin — drives the trailing `s` in `$-` (#231).
+    shell_cell.borrow_mut().reads_stdin = true;
     let config = Config::builder()
         .completion_type(CompletionType::List)
         .build();

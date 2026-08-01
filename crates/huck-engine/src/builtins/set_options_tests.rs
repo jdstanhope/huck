@@ -45,18 +45,19 @@ fn set_plus_o_errexit_disables() {
 #[test]
 fn set_dollar_dash_reflects_flags() {
     let mut shell = Shell::new();
-    // No flags set, not interactive by default in tests.
+    // Default-on flags: hashall (h) and braceexpand (B) are set at startup
+    // like bash, so a fresh non-interactive shell reports "hB" (#231).
     let dash = shell.lookup_var("-").unwrap_or_default();
-    assert!(dash.is_empty() || dash == "i");
-    // Enable errexit.
+    assert!(dash.contains('h'), "dash={dash:?}");
+    assert!(dash.contains('B'), "dash={dash:?}");
+    // Enable errexit — `e` sorts before `h` in bash's `$-` order.
     run(&["-e"], &mut shell);
     let dash = shell.lookup_var("-").unwrap_or_default();
-    assert!(dash.contains('e'));
-    // Enable nounset.
+    assert_eq!(dash, "ehB", "dash={dash:?}");
+    // Enable nounset — `u` sorts after `h`/before `B`... actually between x and B.
     run(&["-u"], &mut shell);
     let dash = shell.lookup_var("-").unwrap_or_default();
-    assert!(dash.contains('e'));
-    assert!(dash.contains('u'));
+    assert_eq!(dash, "ehuB", "dash={dash:?}");
 }
 
 #[test]
