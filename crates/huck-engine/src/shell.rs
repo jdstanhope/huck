@@ -460,6 +460,21 @@ pub fn process_line_in_sinks(
     sink: &mut crate::executor::StdoutSink,
     err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
+    process_line_in_sinks_ex(line, shell, expand_aliases, false, sink, err_sink)
+}
+
+/// Core of [`process_line_in_sinks`]. `preserve_empty` controls the no-command
+/// (blank/comment) outcome: `false` reports success 0 (command contexts such as
+/// `eval`), `true` preserves the current `$?` (the interactive/piped-stdin top
+/// level — see [`process_top_level_line`] and #332).
+fn process_line_in_sinks_ex(
+    line: &str,
+    shell: &mut Shell,
+    expand_aliases: bool,
+    preserve_empty: bool,
+    sink: &mut crate::executor::StdoutSink,
+    err_sink: &mut crate::executor::StderrSink,
+) -> ExecOutcome {
     // This is a top-level BATCH parse of a COMPLETE program string (piped-stdin
     // logical command, `eval`, a trap/PROMPT_COMMAND action). Like bash, an open
     // here-document is delimited by end-of-input rather than erroring. The
@@ -486,7 +501,19 @@ pub fn process_line_in_sinks(
     lx.set_brace_expand(shell.shell_options.braceexpand);
     match parser::parse_sequence(&mut lx) {
         Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink, err_sink),
-        Ok(None) => ExecOutcome::Continue(0),
+        // A logical command with no command at all (blank line, comment-only,
+        // whitespace). At the interactive/piped-stdin top level bash leaves `$?`
+        // untouched (#332) — `preserve_empty` returns the current status so the
+        // caller's `set_last_status` is a no-op. Command contexts (`eval "# c"`,
+        // a comment-only trap action) instead report success 0, matching bash's
+        // "a builtin that ran nothing returns 0".
+        Ok(None) => {
+            if preserve_empty {
+                ExecOutcome::Continue(shell.last_status())
+            } else {
+                ExecOutcome::Continue(0)
+            }
+        }
         Err(e) => {
             // No AST-carried position for an immediate (non-EOF) parse error on
             // a single logical command: derive the line from the live lexer's
@@ -516,6 +543,16 @@ pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> Exec
     let mut sink = crate::executor::StdoutSink::Terminal;
     let mut err_sink = crate::executor::StderrSink::Terminal;
     process_line_in_sinks(line, shell, expand_aliases, &mut sink, &mut err_sink)
+}
+
+/// Top-level reader entry point (the interactive/piped-stdin REPL). Like
+/// [`process_line`] but a logical command with no command (blank line,
+/// comment-only) leaves `$?` untouched instead of resetting it to 0 — bash's
+/// top-level behavior (#332). Command contexts keep using [`process_line`].
+pub fn process_top_level_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> ExecOutcome {
+    let mut sink = crate::executor::StdoutSink::Terminal;
+    let mut err_sink = crate::executor::StderrSink::Terminal;
+    process_line_in_sinks_ex(line, shell, expand_aliases, true, &mut sink, &mut err_sink)
 }
 
 #[cfg(test)]
