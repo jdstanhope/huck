@@ -335,7 +335,7 @@ fn t6_ast_compounds() {
         t6_first("for ((i=0;i<3;i++)); do :; done"),
         Command::ArithFor(_)
     ));
-    assert!(matches!(t6_first("(( 1+2 ))"), Command::Arith(_)));
+    assert!(matches!(t6_first("(( 1+2 ))"), Command::Arith(_, _)));
 }
 
 #[test]

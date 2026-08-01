@@ -636,9 +636,14 @@ pub enum Command {
     DoubleBracket {
         expr: Box<TestExpr>,
         inline_assignments: Vec<Assignment>,
+        /// Source line of the `[[` (1-based; 0 = unknown, e.g. inside `$(...)`),
+        /// used to stamp `$LINENO` for a runtime error's `line N:` prologue (#352).
+        line: u32,
     },
     /// NEW (v78): standalone `((expr))` command. Exit 0 if non-zero, 1 if zero.
-    Arith(crate::lexer::Word),
+    /// The `u32` is the source line of the `((` (0 = unknown), for `$LINENO` on a
+    /// runtime error (#352).
+    Arith(crate::lexer::Word, u32),
     /// NEW (v78): C-style `for ((init; cond; step)) do BODY done`.
     ArithFor(Box<ArithForClause>),
     /// NEW (v81): `select NAME [in WORDS]; do BODY; done`.
@@ -895,7 +900,7 @@ pub(crate) fn is_function_body_shape(body: &Command) -> bool {
             | Command::BraceGroup(_)
             | Command::Subshell { .. }
             | Command::DoubleBracket { .. }
-            | Command::Arith(_)
+            | Command::Arith(..)
             | Command::ArithFor(_)
     )
 }
