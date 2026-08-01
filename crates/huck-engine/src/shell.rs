@@ -139,6 +139,35 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                     mode: RunMode::PrintVersion,
                 });
             }
+            // Bundled single-letter flags (#230): `-rc "cmd"`, `-nc`, `-rn`, …
+            // Each char is one flag; `c` takes its command from the NEXT argv
+            // element (never glued), and its position in the bundle does not
+            // matter (`-cr` == `-rc`). Scoped to the single-letter flags huck
+            // supports on the CLI (n, r, c); any other letter falls through to
+            // the unrecognized-option arm below.
+            s if s.len() > 2
+                && s.starts_with('-')
+                && s[1..].chars().all(|ch| matches!(ch, 'n' | 'r' | 'c')) =>
+            {
+                let mut cmd_flag = false;
+                for ch in s[1..].chars() {
+                    match ch {
+                        'n' => noexec = true,
+                        'r' => restricted = true,
+                        'c' => cmd_flag = true,
+                        _ => unreachable!("guarded by the match pattern above"),
+                    }
+                }
+                i += 1;
+                if cmd_flag {
+                    if i >= args.len() {
+                        return Err("-c: option requires an argument".to_string());
+                    }
+                    command = Some(args[i].clone());
+                    i += 1;
+                    break; // remaining args are operands, taken verbatim
+                }
+            }
             s if s.starts_with('-') && s.len() > 1 => {
                 return Err(format!("unrecognized option: {s}"));
             }
@@ -779,6 +808,56 @@ mod rc_tests {
                 .restricted
         );
         assert!(!parse_cli(&["script.sh".into()]).unwrap().restricted);
+    }
+
+    #[test]
+    fn parse_cli_bundled_rc() {
+        // `-rc "cmd"` → restricted + command from the next argv (#230).
+        let o = parse_cli(&["-rc".into(), "echo hi".into()]).unwrap();
+        assert!(o.restricted);
+        assert!(matches!(o.mode, RunMode::Command { command, .. } if command == "echo hi"));
+    }
+
+    #[test]
+    fn parse_cli_bundled_order_and_operands() {
+        // `-cr` == `-rc`; operands after the command become argv0/args.
+        let o = parse_cli(&["-cr".into(), "echo".into(), "foo".into(), "bar".into()]).unwrap();
+        assert!(o.restricted);
+        assert_eq!(
+            o.mode,
+            RunMode::Command {
+                command: "echo".into(),
+                argv0: Some("foo".into()),
+                args: vec!["bar".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cli_bundled_nc_noexec() {
+        // `-nc "cmd"` → noexec + command.
+        let o = parse_cli(&["-nc".into(), "echo hi".into()]).unwrap();
+        assert!(o.noexec);
+        assert!(matches!(o.mode, RunMode::Command { .. }));
+    }
+
+    #[test]
+    fn parse_cli_bundled_no_c_flags_only() {
+        // `-rn` (no c) → both flags, then the next operand is a script file.
+        let o = parse_cli(&["-rn".into(), "script.sh".into()]).unwrap();
+        assert!(o.restricted && o.noexec);
+        assert!(matches!(o.mode, RunMode::File { .. }));
+    }
+
+    #[test]
+    fn parse_cli_bundled_c_needs_arg() {
+        assert!(parse_cli(&["-rc".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_cli_bundled_unknown_letter_errors() {
+        // A letter huck does not support falls through to the unknown arm.
+        assert!(parse_cli(&["-rZc".into(), "echo".into()]).is_err());
     }
 
     #[test]
