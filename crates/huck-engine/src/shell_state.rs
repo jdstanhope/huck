@@ -786,6 +786,11 @@ pub struct Shell {
     /// script-file/stdin mode and for runtime errors entirely.
     pub is_command_string: bool,
 
+    /// True when the shell reads its commands from standard input (the
+    /// interactive REPL or a piped-stdin session), as opposed to `-c` or a
+    /// script file. Drives the trailing `s` letter in `$-` (#231).
+    pub reads_stdin: bool,
+
     /// True when this process is a forked subshell child. A subshell must NOT
     /// perform interactive job-control process-grouping for its inner pipelines
     /// (that deadlocks on a controlling terminal — M-104).
@@ -1143,6 +1148,7 @@ impl Shell {
             builtin_usage_error: None,
             is_interactive: std::io::stdin().is_terminal(),
             is_command_string: false,
+            reads_stdin: false,
             in_subshell: false,
             in_completion: false,
             xtrace_depth: 0,
@@ -1225,27 +1231,44 @@ impl Shell {
     /// `i` (interactive), `u` (nounset), `v` (verbose), `x` (xtrace),
     /// `C` (noclobber).
     pub fn dollar_dash_value(&self) -> String {
+        // bash builds `$-` by iterating its `shell_flags[]` table (flags.c) in a
+        // fixed order — a b e f h i k m n p r t u v x B C E H P T — appending the
+        // letter of each option that is ON, then a trailing invocation letter:
+        // `c` for `-c`, `s` when reading commands from stdin, nothing for a
+        // script file (#231).
+        let o = &self.shell_options;
         let mut out = String::new();
-        if self.shell_options.errexit {
-            out.push('e');
+        for (on, ch) in [
+            (o.allexport, 'a'),
+            (o.notify, 'b'),
+            (o.errexit, 'e'),
+            (o.noglob, 'f'),
+            (o.hashall, 'h'),
+            (self.is_interactive, 'i'),
+            (o.keyword, 'k'),
+            (o.monitor, 'm'),
+            (o.noexec, 'n'),
+            (o.privileged, 'p'),
+            (self.policy.is_restricted(), 'r'),
+            (o.onecmd, 't'),
+            (o.nounset, 'u'),
+            (o.verbose, 'v'),
+            (o.xtrace, 'x'),
+            (o.braceexpand, 'B'),
+            (o.noclobber, 'C'),
+            (o.errtrace, 'E'),
+            (o.histexpand, 'H'),
+            (o.physical, 'P'),
+            (o.functrace, 'T'),
+        ] {
+            if on {
+                out.push(ch);
+            }
         }
-        if self.shell_options.noglob {
-            out.push('f');
-        }
-        if self.is_interactive {
-            out.push('i');
-        }
-        if self.shell_options.nounset {
-            out.push('u');
-        }
-        if self.shell_options.verbose {
-            out.push('v');
-        }
-        if self.shell_options.xtrace {
-            out.push('x');
-        }
-        if self.shell_options.noclobber {
-            out.push('C');
+        if self.is_command_string {
+            out.push('c');
+        } else if self.reads_stdin {
+            out.push('s');
         }
         out
     }
