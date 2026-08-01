@@ -67,7 +67,13 @@ pub fn dispatch_pending_traps(shell: &mut Shell) {
             Some(Some(text)) => text.clone(),
             Some(None) | None => continue,
         };
+        // #287: hold $BASH_COMMAND fixed at the triggering command for the whole
+        // action. Pushing onto `firing_traps` makes the executor's freeze guard
+        // (run_single) skip re-stamping `current_command` while the action runs,
+        // exactly as it already does for DEBUG/ERR/RETURN.
+        shell.firing_traps.push(TrapSignal::Real(sig));
         let _ = crate::shell::process_line(&action, shell, false);
+        shell.firing_traps.pop();
     }
 }
 
@@ -79,7 +85,11 @@ pub fn fire_exit_trap(shell: &mut Shell) {
         Some(Some(text)) => text,
         _ => return,
     };
+    // #287: freeze $BASH_COMMAND at the triggering command for the action's
+    // whole run (see `dispatch_pending_traps`).
+    shell.firing_traps.push(TrapSignal::Exit);
     let _ = crate::shell::process_line(&action, shell, false);
+    shell.firing_traps.pop();
 }
 
 /// Fires the ERR pseudo-signal trap. Repeatable: the trap entry is
