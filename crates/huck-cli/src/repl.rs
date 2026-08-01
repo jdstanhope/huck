@@ -15,7 +15,7 @@ use rustyline::{CompletionType, Config, Editor};
 use huck_engine::builtins::ExecOutcome;
 use huck_engine::shell::{
     RunMode, fire_prompt_command, install_job_control_signals, install_sigchld_handler,
-    install_sigint_handler, maybe_source_rc_file, parse_cli, process_line,
+    install_sigint_handler, maybe_source_rc_file, parse_cli, process_top_level_line,
 };
 use huck_engine::shell_state::Shell;
 use huck_engine::{emit_cli_error, emit_error, emit_syntax_error};
@@ -288,7 +288,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
                     if !shell.is_interactive {
                         shell.stdin_line_base = lines_before;
                     }
-                    let outcome = process_line(&buffer, &mut shell, do_alias);
+                    let outcome = process_top_level_line(&buffer, &mut shell, do_alias);
                     if !shell.is_interactive {
                         lines_before += lines;
                         shell.stdin_line_base = lines_before;
