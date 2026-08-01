@@ -174,13 +174,33 @@ pub(crate) fn slice_word_list(
     length: Option<&Word>,
     shell: &mut Shell,
 ) -> Result<Vec<String>, String> {
+    slice_word_list_ex(values, offset, length, false, shell)
+}
+
+/// Core of [`slice_word_list`]. `assoc_offset` selects bash's associative-array
+/// quirk (#322): for a non-negative offset the effective start index is
+/// `max(offset - 1, 0)` instead of `offset` (so offset 0 and 1 both start at
+/// element 0). Negative offsets are unaffected. Indexed arrays and positional
+/// parameters pass `false` (plain 0-based offset).
+pub(crate) fn slice_word_list_ex(
+    values: &[String],
+    offset: &Word,
+    length: Option<&Word>,
+    assoc_offset: bool,
+    shell: &mut Shell,
+) -> Result<Vec<String>, String> {
     let off_s = crate::param_expansion::expand_word_to_string(offset, shell);
     let off_n = crate::arith::parse(&off_s)
         .and_then(|e| crate::arith::eval(&e, shell))
         .map_err(|_| "bad slice offset".to_string())?;
     let total = values.len() as i64;
     let start = if off_n >= 0 {
-        (off_n as usize).min(values.len())
+        let base = if assoc_offset {
+            (off_n - 1).max(0)
+        } else {
+            off_n
+        };
+        (base as usize).min(values.len())
     } else {
         ((total + off_n).max(0) as usize).min(values.len())
     };
@@ -462,11 +482,12 @@ fn expand_assoc_param(
         // variable name). Produce empty for parity with the indexed path.
         (PM::IndirectKeys, SK::Index(_)) => ExpansionResult::Value(String::new()),
         // ${m[@]:o:l} / ${m[*]:o:l} — slicing over the bash-hash-ordered
-        // snapshot (offset/length semantics: see #322 for a known bash-only
-        // off-by-one on the offset base that huck does not yet replicate).
+        // snapshot. bash applies an assoc-only off-by-one on a non-negative
+        // offset base (#322): offset 0 and 1 both start at element 0, offset 2
+        // starts at element 1, etc. `assoc_offset: true` selects that.
         (PM::Substring { offset, length }, SK::All)
         | (PM::Substring { offset, length }, SK::Star) => {
-            let sliced = match slice_word_list(&values, offset, length.as_ref(), shell) {
+            let sliced = match slice_word_list_ex(&values, offset, length.as_ref(), true, shell) {
                 Ok(v) => v,
                 Err(e) => {
                     crate::sh_error!(shell, None, "{name}: {e}");
