@@ -168,10 +168,11 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
             // bash prints subshells inline at the SAME indent: `( <body> )`.
             format!("( {} )", sequence_to_source(body, indent))
         }
-        Command::Arith(word) => format!("(({}))", arith_body_to_source(word)),
+        Command::Arith(word, _) => format!("(({}))", arith_body_to_source(word)),
         Command::DoubleBracket {
             expr,
             inline_assignments,
+            ..
         } => {
             let mut s = String::new();
             for a in inline_assignments {

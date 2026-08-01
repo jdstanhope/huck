@@ -975,9 +975,10 @@ fn run_command(
         Command::DoubleBracket {
             expr,
             inline_assignments,
-        } => run_double_bracket(expr, inline_assignments, shell, sink, err_sink),
+            line,
+        } => run_double_bracket(expr, inline_assignments, *line, shell, sink, err_sink),
         Command::ArithFor(clause) => run_arith_for(clause, shell, sink, err_sink),
-        Command::Arith(expr) => run_arith(expr, shell, sink, err_sink),
+        Command::Arith(expr, line) => run_arith(expr, *line, shell, sink, err_sink),
         Command::Select(clause) => run_select(clause, shell, sink, err_sink),
         Command::Redirected { inner, redirects } => {
             run_redirected(inner, redirects, shell, sink, err_sink)
@@ -2024,10 +2025,16 @@ fn format_select_menu(items: &[String], cols_width: usize) -> String {
 /// arith errors emit a diagnostic to stderr and exit 1.
 fn run_arith(
     body: &crate::lexer::Word,
+    line: u32,
     shell: &mut Shell,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
+    // #352: stamp `$LINENO` to the `((` source line so a runtime error's
+    // `line N:` prologue matches bash (0 = unknown, keep the prior value).
+    if line != 0 {
+        shell.current_lineno = shell.line_base() + line;
+    }
     xtrace_compound(
         shell,
         &format!(
@@ -2475,6 +2482,12 @@ fn run_case_inner(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
+    // #352: stamp `$LINENO` to the `case` source line BEFORE expanding the
+    // subject, so a `$(( ))` arith error in the subject reports the `case`
+    // line (bash), not the previous statement's stale value.
+    if clause.line != 0 {
+        shell.current_lineno = shell.line_base() + clause.line;
+    }
     let subject = expand_assignment(&clause.subject, shell);
     xtrace_compound(
         shell,
@@ -2483,9 +2496,6 @@ fn run_case_inner(
             crate::expand::reconstruct_word_source(&clause.subject)
         ),
     );
-    if clause.line != 0 {
-        shell.current_lineno = shell.line_base() + clause.line;
-    }
     match crate::traps::fire_debug_trap(shell) {
         crate::traps::DebugDecision::Proceed => {}
         // A DEBUG-skipped `case` returns 0 (bash: `return (EXECUTION_SUCCESS)`),
@@ -2599,10 +2609,16 @@ fn run_if(
 fn run_double_bracket(
     expr: &TestExpr,
     inline_assignments: &[crate::command::Assignment],
+    line: u32,
     shell: &mut Shell,
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
+    // #352: stamp `$LINENO` to the `[[` source line so a runtime error's
+    // `line N:` prologue matches bash (0 = unknown, keep the prior value).
+    if line != 0 {
+        shell.current_lineno = shell.line_base() + line;
+    }
     let snap = match apply_inline_assignments(inline_assignments, shell, sink, err_sink) {
         Ok(s) => s,
         Err(s) => {

@@ -59,6 +59,14 @@ check_sourced "sourced func" $'source %s\ncaller(){ libfn; }\ncaller\n' \
 check_sourced "src in func"  $'foo(){ source %s; }\nfoo\n' \
     $'echo "[${FUNCNAME[@]}]"\n'
 
+# --- #352: (( )) / [[ ]] / case-subject runtime errors report the compound's
+# own source line, not the previous statement's stale $LINENO. ---
+check_file "352 arith readonly" $'readonly xx=1\necho hi\n(( xx++ ))\n'
+check_file "352 arith divzero"  $'echo one\necho two\n(( 1/0 ))\n'
+check_file "352 case subj arith" $'echo hi\ncase $((1/0)) in\n a) ;;\nesac\n'
+check_file "352 arith in func"  $'f() {\n  readonly yy=1\n  (( yy++ ))\n}\necho start\nf\n'
+check_file "352 arith in comsub" $'readonly zz=1\necho $(( zz )) here\nx=$(  (( zz++ ))  )\n'
+
 echo ""
 echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

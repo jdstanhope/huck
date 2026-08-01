@@ -1641,8 +1641,8 @@ fn zero_lines_in_command(cmd: &mut Command) {
             *line = 0;
             zero_lines_in_command(body);
         }
-        Command::DoubleBracket { .. } => {} // no line field in TestExpr
-        Command::Arith(_) => {}
+        Command::DoubleBracket { line, .. } => *line = 0,
+        Command::Arith(_, line) => *line = 0,
         Command::ArithFor(clause) => {
             clause.line = 0;
             zero_lines_in_sequence(&mut clause.body);
@@ -2317,6 +2317,7 @@ pub(crate) fn parse_legacy_arith_expansion(
 /// `rewind` below re-scans correctly.
 fn parse_arith_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     let mark = iter.mark();
+    let line = iter.current_line()?; // source line of the `((` (#352)
     iter.next_kind()?; // consume first `(` (buffered Op(LParen))
     iter.next_kind()?; // consume second `(`
     iter.push_mode(Mode::Arith {
@@ -2330,7 +2331,7 @@ fn parse_arith_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     let result = parse_arith_body(iter, false);
     iter.pop_mode();
     match result? {
-        ArithBodyOutcome::Closed(body) => maybe_wrap_redirects(Command::Arith(body), iter),
+        ArithBodyOutcome::Closed(body) => maybe_wrap_redirects(Command::Arith(body, line), iter),
         ArithBodyOutcome::Bail => {
             iter.rewind(&mark);
             parse_subshell(iter)
@@ -4344,6 +4345,7 @@ fn fill_command(cmd: &mut Command, bodies: &mut impl Iterator<Item = Word>) {
         Command::DoubleBracket {
             expr,
             inline_assignments,
+            ..
         } => {
             for a in inline_assignments.iter_mut() {
                 if let AssignTarget::Indexed { subscript, .. } = &mut a.target {
@@ -4354,7 +4356,7 @@ fn fill_command(cmd: &mut Command, bodies: &mut impl Iterator<Item = Word>) {
             fill_test_expr(expr, bodies);
         }
         // `((expr))` is a bare arithmetic `Word`, no redirect list of its own.
-        Command::Arith(body) => fill_word(body, bodies),
+        Command::Arith(body, _) => fill_word(body, bodies),
         // C-style `for ((init;cond;step))`: the header sections are bare
         // `Word`s (no redirect list of their own); v260 CF1 fills them, in
         // source order, before the `Sequence` body.
@@ -5553,6 +5555,7 @@ fn parse_double_bracket(
     iter: &mut Lexer,
     inline_assignments: Vec<Assignment>,
 ) -> Result<Command, ParseError> {
+    let line = iter.current_line()?; // source line of the `[[` (#352)
     iter.next_kind()?; // consume `[[`
     skip_test_ws(iter)?;
     if iter.peek_kind()?.and_then(keyword_of_consumed) == Some(Keyword::DoubleBracketClose) {
@@ -5570,6 +5573,7 @@ fn parse_double_bracket(
     Ok(Command::DoubleBracket {
         expr: Box::new(expr),
         inline_assignments,
+        line,
     })
 }
 
