@@ -26,5 +26,13 @@ check "bashcmd in fn"    'f(){ echo $BASH_COMMAND; }; f'               # echo $B
 check "bashcmd after asn" 'x=1; echo $BASH_COMMAND'                    # echo $BASH_COMMAND
 check "bashcmd in debug"  'set -T; trap "echo D:\$BASH_COMMAND" DEBUG; :; true'  # match bash
 
+# #287: $BASH_COMMAND is frozen at the triggering command for the WHOLE action
+# of EXIT and real-signal traps too (previously only DEBUG/ERR/RETURN).
+check "bashcmd exit"      'trap "echo X:\$BASH_COMMAND" EXIT; true'
+check "bashcmd exit multi" 'trap "echo X:\$BASH_COMMAND" EXIT; true; false; : last'
+check "bashcmd exit fn"   'g(){ echo "X:\$BASH_COMMAND"; }; trap g EXIT; : trigger'
+check "bashcmd signal"    'trap "echo S:\$BASH_COMMAND" USR1; kill -USR1 \$\$; sleep 0.05; echo done'
+check "bashcmd signal fn" 'h(){ echo "S:\$BASH_COMMAND"; }; trap h USR1; kill -USR1 \$\$; sleep 0.05; echo end'
+
 if [ $FAIL -ne 0 ]; then echo "dynvar_vars_diff_check FAILED" >&2; exit 1; fi
 echo "dynvar_vars_diff_check OK"
