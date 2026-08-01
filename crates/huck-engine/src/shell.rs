@@ -492,15 +492,19 @@ pub fn process_line_in_sinks(
     process_line_in_sinks_ex(line, shell, expand_aliases, false, sink, err_sink)
 }
 
-/// Core of [`process_line_in_sinks`]. `preserve_empty` controls the no-command
-/// (blank/comment) outcome: `false` reports success 0 (command contexts such as
-/// `eval`), `true` preserves the current `$?` (the interactive/piped-stdin top
-/// level — see [`process_top_level_line`] and #332).
+/// Core of [`process_line_in_sinks`]. `top_level` marks the interactive /
+/// piped-stdin top-level reader (see [`process_top_level_line`]), which differs
+/// from command contexts (`eval`, traps) in two bash-matching ways:
+///   - a no-command line (blank/comment) preserves `$?` rather than reporting 0
+///     (#332);
+///   - a syntax error in a NON-interactive session aborts the rest of the input
+///     with status 2, like a script file, rather than continuing (#284).
+/// Command contexts pass `false` for both.
 fn process_line_in_sinks_ex(
     line: &str,
     shell: &mut Shell,
     expand_aliases: bool,
-    preserve_empty: bool,
+    top_level: bool,
     sink: &mut crate::executor::StdoutSink,
     err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
@@ -532,12 +536,12 @@ fn process_line_in_sinks_ex(
         Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink, err_sink),
         // A logical command with no command at all (blank line, comment-only,
         // whitespace). At the interactive/piped-stdin top level bash leaves `$?`
-        // untouched (#332) — `preserve_empty` returns the current status so the
+        // untouched (#332) — `top_level` returns the current status so the
         // caller's `set_last_status` is a no-op. Command contexts (`eval "# c"`,
         // a comment-only trap action) instead report success 0, matching bash's
         // "a builtin that ran nothing returns 0".
         Ok(None) => {
-            if preserve_empty {
+            if top_level {
                 ExecOutcome::Continue(shell.last_status())
             } else {
                 ExecOutcome::Continue(0)
@@ -561,6 +565,14 @@ fn process_line_in_sinks_ex(
             crate::err_thread_local::install_err_sinks(sink, err_sink, || {
                 crate::render_syntax_diag(shell, &e, line, ln);
             });
+            // #284: a non-interactive piped-stdin session aborts the rest of the
+            // input on a syntax error, like a script file (bash). Signal the REPL
+            // via the pending-fatal-status channel it already drains for fatal
+            // parameter-expansion errors. Command contexts (`eval`) never set
+            // `top_level`, so their syntax errors stay non-fatal.
+            if top_level && !shell.is_interactive {
+                shell.pending_fatal_status = Some(2);
+            }
             ExecOutcome::Continue(2)
         }
     }
