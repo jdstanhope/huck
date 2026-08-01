@@ -3403,16 +3403,21 @@ impl<'a> Lexer<'a> {
                     return Ok(Step::Produced);
                 }
 
-                // Root B (#294): a WORD-START `~` in an UNQUOTED VALUE operand is a tilde-prefix
-                // (`${x:-~}` → HOME). Gates: unquoted (`!in_dquote && !enclosing_dquote`); value
-                // operand (`!is_pattern` — patterns `#`/`%`/`/` are not tilde-expanded); word
-                // start — detected by a BACKWARD read of the last emitted token being the value
+                // Root B (#294): a WORD-START `~` in an UNQUOTED operand is a tilde-prefix
+                // (`${x:-~}` → HOME). Gates: unquoted (`!in_dquote && !enclosing_dquote`); word
+                // start — detected by a BACKWARD read of the last emitted token being the
                 // `ParamOp` (no operand atom emitted yet). bash expands only the leading tilde,
                 // not one after `:`, so this fires solely at operand start.
+                //
+                // #296: bash also tilde-expands a word-start `~` in a PATTERN operand — the
+                // `#`/`##`/`%`/`%%` prefix/suffix operands, the `^`/`^^`/`,`/`,,` case-mod
+                // pattern, and the pattern half of an UNANCHORED `/`/`//` substitution — but
+                // NOT the anchored `/#`/`/%` forms (there the `#`/`%` is the operand's first
+                // char, so `~` is not at word start). The precise `matches!` set is the real
+                // gate, so `is_pattern` is no longer consulted here.
                 Some('~')
                     if !in_dquote
                         && !enclosing_dquote
-                        && !is_pattern
                         && matches!(
                             self.history.last().map(|t| &t.kind),
                             Some(TokenKind::ParamOp(
@@ -3420,6 +3425,10 @@ impl<'a> Lexer<'a> {
                                     | ParamOpKind::AssignDefault(_)
                                     | ParamOpKind::ErrorIfUnset(_)
                                     | ParamOpKind::UseAlternate(_)
+                                    | ParamOpKind::RemovePrefix(_)
+                                    | ParamOpKind::RemoveSuffix(_)
+                                    | ParamOpKind::Case(_, _)
+                                    | ParamOpKind::Substitute(SubstKind::First | SubstKind::All)
                             )),
                         ) =>
                 {
