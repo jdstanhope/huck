@@ -167,12 +167,27 @@ alone, not fork targets):
 - **comsub `trap` listing** — a comsub's `trap` (no args) output omits bash's default
   `trap -- '' SIGTSTP` row; a subshell trap-listing detail, not fd routing.
 
-### Stage 2 — Temp-file the embedder boundary
+### Stage 2 — Temp-file the embedder boundary; drop streaming (decided 2026-08-02)
 
-Convert `ExecBuilder::capture`/`run_with_sinks`/`run_with_sinks_tee` to redirect the
-process's fd 1/2 to a temp file (one file under `merge`), run, read back. After this,
-nothing in the tree constructs a `Capture` or `Merged` sink. Handle cleanup on
-panic/signal and `TMPDIR`.
+Convert `ExecBuilder::capture` (and any non-streaming `run_with_sinks`) to redirect
+the process's fd 1/2 to a temp file (one file under `merge`), run, read back. Handle
+cleanup on panic and `TMPDIR`.
+
+**Decision (user, no API users exist):** the `run()` **streaming-callbacks** path
+(`push_stdout`/`push_stderr`, tee-to-saved-fd, `Callbacks`, `callbacks_thread_local`,
+the `LineDispatchWriter` callback firing) is **removed**, not re-architected. It was
+the only remaining user of the software `Capture`/`Merged` sink at the embedder
+boundary that a temp file cannot serve (streaming needs live, in-process
+observation; a pipe + drain thread would break the single-threaded-fork invariant,
+#184). Streaming is a nice-to-have to **revisit after the split is fully fixed** —
+and its whole reason for being in-process was **thread affinity**: callbacks must
+fire on the same thread that created the `Engine`, never a drain thread. Any future
+re-introduction must preserve that. `run()`'s existing no-callback **fast path** (fd
+1/2 inherit directly, already sink-free) is unchanged.
+
+After Stage 2, the only remaining `Capture`-sink user is `execute_capturing`
+(the in-process comsub capture kept for the lib unit tests + the `#[cfg(test)]`
+`run_substitution` path from Stage 1) — which Stage 3 removes.
 
 ### Stage 3 — Delete the software sink
 
