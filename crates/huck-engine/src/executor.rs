@@ -8701,18 +8701,19 @@ pub fn capture_via_fork(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     {
         Ok(pid) => pid,
         Err(e) => {
+            // `write_fd` was owned by the moved `ChildStdio` and is already
+            // closed (RAII) by `fork_and_run_in_subshell` on its error return;
+            // close only the parent-kept read end here.
             unsafe {
                 libc::close(read_fd);
-                libc::close(write_fd);
             }
             crate::sh_error!(shell, None, "fork: {}", crate::bash_io_error(&e));
             return (String::new(), 1);
         }
     };
-    // PARENT: close the write end so the read end sees EOF when the child exits.
-    unsafe {
-        libc::close(write_fd);
-    }
+    // PARENT: `write_fd` (the pipe write end) was owned by the moved `ChildStdio`
+    // and is already closed by the fork helper's RAII drop in the parent, so the
+    // read end below sees EOF when the child exits — do NOT close it again.
     let mut buf: Vec<u8> = Vec::new();
     {
         let mut f = unsafe { std::fs::File::from_raw_fd(read_fd) };
