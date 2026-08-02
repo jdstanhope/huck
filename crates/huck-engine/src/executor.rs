@@ -702,8 +702,24 @@ fn run_command(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
 /// differs from `>file 2>&1` and a `{var}`'s side effects (assign `$v`, allocate a
 /// persistent fd) are visible to the next redirection. A failure mid-list returns
 /// `Err(outcome)`; Drop then rolls back the entries already applied (atomic).
+/// `dup(fd)` into an OWNED handle, or `None` on EBADF (the fd was not open).
+/// The returned `OwnedFd` closes the dup on drop — the RAII basis for
+/// `RedirectScope`'s save/restore (#197 Class-A).
+fn own_dup(fd: RawFd) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let d = unsafe { libc::dup(fd) };
+    if d < 0 {
+        None
+    } else {
+        Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(d) })
+    }
+}
+
 struct RedirectScope {
-    saved: Vec<(RawFd, RawFd)>,
+    /// Per redirect: the real fd we replaced, and an OWNED dup of its original
+    /// contents (`None` when the target was unopened). Drop restores from the
+    /// owned dup, whose destructor then closes it — no manual close (#197 Class-A).
+    saved: Vec<(RawFd, Option<std::os::fd::OwnedFd>)>,
 }
 
 impl RedirectScope {
@@ -720,8 +736,8 @@ impl RedirectScope {
         unsafe {
             // `dup` fails with EBADF when target_fd is not open (e.g. a fresh
             // fd>2 like `>&3` when fd 3 was never opened). That is fine — record
-            // -1 so Drop closes target_fd back to its unopened state.
-            let saved = libc::dup(target_fd);
+            // `None` so Drop closes target_fd back to its unopened state.
+            let saved = own_dup(target_fd);
             if libc::dup2(new_fd, target_fd) < 0 {
                 {
                     let mut err = err_writer();
@@ -733,9 +749,7 @@ impl RedirectScope {
                         io::Error::last_os_error()
                     );
                 }
-                if saved >= 0 {
-                    libc::close(saved);
-                }
+                // `saved` (if Some) drops here → closes the dup automatically.
                 return Err(());
             }
             self.saved.push((target_fd, saved));
@@ -747,8 +761,8 @@ impl RedirectScope {
     /// restore it. EBADF (already closed) is lenient per bash.
     fn close_target(&mut self, target_fd: RawFd) {
         unsafe {
-            let saved = libc::dup(target_fd);
-            // Record the swap so Drop restores (saved == -1 if it was unopened).
+            // Record the swap so Drop restores (`None` if it was unopened).
+            let saved = own_dup(target_fd);
             self.saved.push((target_fd, saved));
             libc::close(target_fd);
         }
@@ -772,7 +786,7 @@ impl RedirectScope {
                             let _ = libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
                         }
                     }
-                    self.saved.push((target, -1));
+                    self.saved.push((target, None));
                 } else if self.redirect(shell, raw, target).is_err() {
                     return Err(ExecOutcome::Continue(1));
                 } else {
@@ -824,9 +838,10 @@ impl Drop for RedirectScope {
         // Restore in reverse application order.
         while let Some((target_fd, saved)) = self.saved.pop() {
             unsafe {
-                if saved >= 0 {
-                    libc::dup2(saved, target_fd);
-                    libc::close(saved);
+                if let Some(owned) = saved {
+                    use std::os::fd::AsRawFd;
+                    libc::dup2(owned.as_raw_fd(), target_fd);
+                    // `owned` drops here → closes the dup automatically.
                 } else {
                     // target_fd was not open before we redirected it — close it
                     // back to its unopened state.
@@ -4649,11 +4664,8 @@ fn apply_redirects_permanently(cmd: &ExecCommand, shell: &mut Shell) -> Result<(
     // Drop's restore loop has nothing to do. Draining first means Drop sees an
     // empty `saved` vec even if it somehow runs.
     for (_target, saved) in scope.saved.drain(..) {
-        if saved >= 0 {
-            unsafe {
-                libc::close(saved);
-            }
-        }
+        // Dropping the owned dup (if any) closes it; None was never open.
+        drop(saved);
         // saved == -1 means the target fd was previously free/closed — there is
         // no original fd to restore, so we leave the target fd open (permanent).
     }
