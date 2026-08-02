@@ -1,0 +1,187 @@
+# fd routing: collapse to one real-fd model — design
+
+**Issue:** [#197](https://github.com/jdstanhope/huck/issues/197) — *Architecture:
+prevent the fd-routing bug class — sink↔real-fd reconciliation invariant + inward
+OwnedFd migration.* This design pursues the **north star** that #197 itself
+records as out of its incremental scope: collapsing huck's two output models into
+**one real-fd model** by forking every captured execution region (bash's
+comsub-as-real-pipe). #197 stays the umbrella tracking issue; this document is the
+architecture + staging for the one-model end-state.
+
+## Problem
+
+huck keeps **two parallel models of "where output goes"**:
+
+1. the real OS fd table — `RedirectScope`/`dup2` (~18 refs), and
+2. an in-memory software sink — `StdoutSink`/`StderrSink` = `Terminal` /
+   `Capture(&mut Vec<u8>)` / `Merged` (~165/169 refs), plus `err_writer` (~101)
+   and the `redirs_merge_err_into_out` reconciliation predicate.
+
+Every **Class-B routing bug** (output sent to the wrong destination — leaked, lost,
+or mis-ordered) has been a spot where the two models *disagreed*: a real
+`2>&1`/`>&2` dup was applied while a capture sink was active, but the corresponding
+software sink was never reconciled. The fixed cluster (#144, #176, #191) and the
+open members (#195, #353, and the capture side of #77/#30) are all this shape. A
+`debug_assert` reconciliation invariant (the incremental #197 scope) turns the
+*next* such bug into a test failure; collapsing to **one model** removes the class
+**by construction** — there is nothing left to reconcile.
+
+### Where the two models actually diverge
+
+The software `Merged` variant is gated on `StdoutSink::Capture` (executor.rs:1332):
+it exists **only inside a captured region**. At the top level (Terminal sink) a
+builtin's `2>&1 >file` already goes through the *real* fd table (`RedirectScope`
+`dup2` + save/restore) exactly like an external command. So:
+
+- **Top level** — one model already (real fds).
+- **Inside `$(…)` / backticks / the embedder capture** — the software
+  `Capture`/`Merged` sink, because `run_substitution` (expand.rs:2243) **clones the
+  shell and runs the body in-process**, collecting output into a `Vec<u8>` rather
+  than forking a subshell with a real pipe. External commands *within* a capture
+  already get a real pipe (executor.rs:675); the sink exists to route **in-process**
+  writers (builtins + the interpreter driver) into the capture buffer.
+
+The in-process, no-fork capture is the entire reason the second model exists, and
+the entire home of the Class-B bug family.
+
+## End-state architecture
+
+**One invariant:** the real OS fd table is the *only* model of where output goes.
+Nothing in the interpreter consults an in-memory sink. A builtin writes to fd 1/2
+(as currently redirected) exactly like an external command. `StdoutSink`,
+`StderrSink`, `Merged`, `err_writer`, `redirs_merge_err_into_out`, and the
+reconciliation code are **deleted**.
+
+**Captured execution regions fork.** `$(…)`, backticks, and every
+`execute_capturing` region become:
+
+1. create a pipe;
+2. `fork_and_run_in_subshell` (the existing, battle-tested fork path — pgid, fd-close
+   discipline, `exec_guard::assert_single_threaded_fork`, child job-signal reset)
+   with the child's fd 1 dup2'd to the pipe **write**-end (and fd 2 → the pipe too
+   under an enclosing `2>&1`);
+3. the child runs the body as an ordinary real-fd subshell (Terminal-equivalent:
+   writes go to real fd 1/2, which *is* the pipe);
+4. the parent closes the write-end, drains the read-end **to EOF**, **then**
+   `waitpid`s for `$?`.
+
+The child is a real separate process, so parent-drains-while-child-writes cannot
+deadlock regardless of output size — which is precisely what the in-memory `Vec`
+was working around. Subshell isolation (state changes discarded, traps reset, `$$`
+unchanged, `$?` from `waitpid`) falls out of the fork for free and is *more*
+bash-faithful than today's clone-the-shell approach. The comsub child is a
+**transient foreground** child: waited directly, never entered in the `JobTable`
+and never setting `$!` (avoids the #175 non-interactive job-table leak class).
+
+**`$(<file)` is a file read, not a capture.** Recognized at expansion time and
+slurped directly into a string — no fork, no executor, no pipe. It is the one
+hot-path case that stays fork-free, legitimately: there is no command to run. It is
+not a captured *execution* region and never needs the sink.
+
+**Process substitution is already one-model.** `<(…)`/`>(…)` already back a real fd
+via a fork; they simply stop being special citizens — the same "fork + real fd"
+shape.
+
+**The embedder boundary (`ExecBuilder::capture` / `run_with_sinks`) uses a temp
+file.** It *is* the top-level process, so it cannot fork itself, and huck's
+single-threaded fork-safety rules out a concurrent drain thread. To let the sink
+type be deleted *entirely*, this boundary redirects the process's fd 1/2 to a temp
+file (both to one file under `merge`), runs the shell, and reads the file back —
+all-real-fd, no thread, no deadlock. The cost is temp-file I/O on the embedder
+capture API only (never on shell-internal comsub, which uses pipes via fork). This
+is the one deliberate trade: we pay temp-file I/O at the embedder boundary to
+achieve full deletion of the sink type rather than keeping a thin boundary-only
+sink.
+
+## Staging
+
+Each stage is an independently shippable iteration under the #197 umbrella, lands
+its own PR, and keeps every suite + the bash test harness green before the next
+begins. The "large change" is a sequence of verified small ones.
+
+### Stage 0 — Safety net (this iteration; **no behavior change**)
+
+Add bash-diff harnesses that pin the **current, correct** behavior of every
+combination Stage 1 will move, so Stage 1 either keeps them green or has a precise,
+pre-agreed target to change. Any case that is **already** diverging is recorded (it
+becomes a Stage-1 target, not a Stage-0 failure). Coverage:
+
+- `$(cmd 2>&1)`, `$(cmd >file 2>&1)`, `$(cmd 2>&1 >file)`, `$(builtin 2>&1)` —
+  ordering-dependent stderr routing under capture (the #195/#353 shapes).
+- **Large output**: a `$(…)` emitting well over one pipe buffer (>64 KB) — the
+  deadlock case the fork must handle.
+- **Nesting**: `$( $(…) )`, `$(…)` inside a pipeline stage, `$(…)` inside an
+  already-forked subshell, `$(…)` as the in-process lastpipe last stage.
+- **Subshell semantics**: `$?` after `$(exit N)`, `last_cmd_sub_status`,
+  trap-reset inside `$(…)`, a variable/`cd` mutated inside `$(…)` not leaking to the
+  parent, `$(sleep … &)` background-job-inside-comsub behavior, `$(cat)` reading the
+  shell's stdin.
+- **Builtin vs external** producers under capture, and `$(<file)` (must stay a plain
+  file read).
+
+Run the existing differential audits (`tools/redirect_audit.sh` + pipeline/bg
+variants, `tools/soak/`) and confirm green. Deliverable: new
+`*_diff_check.sh` harness(es) wired into `run_diff_checks.sh`, all green on the
+current tree. **No engine code changes in this iteration.**
+
+### Stage 1 — Fork `$(…)` and backticks (the prize)
+
+`run_substitution` stops cloning-and-capturing in-process; it forks (pipe + child
+real-fd subshell + drain-to-EOF + `waitpid`) as above, and `$(<file)` is split out
+first as a direct file read. **What dissolves by construction:** #195, #353, and the
+capture side of #77/#30. Highest value, highest risk → most verification.
+
+### Stage 2 — Temp-file the embedder boundary
+
+Convert `ExecBuilder::capture`/`run_with_sinks`/`run_with_sinks_tee` to redirect the
+process's fd 1/2 to a temp file (one file under `merge`), run, read back. After this,
+nothing in the tree constructs a `Capture` or `Merged` sink. Handle cleanup on
+panic/signal and `TMPDIR`.
+
+### Stage 3 — Delete the software sink
+
+Remove `StdoutSink`/`StderrSink`/`Merged`/`err_writer`/`redirs_merge_err_into_out`,
+the `LineDispatchWriter` sink coupling, and the reconciliation paths. Migrate the
+~30 `execute_capturing` unit tests (executor/tests.rs) to the fork-capture (or a
+small forking test helper), minding the `exec_guard` single-threaded assertion under
+`--test-threads 1`. The interpreter now has exactly one output model. `#197`'s
+inward `OwnedFd` migration (Class-A cleanup) can proceed independently afterward.
+
+## Risks & verification
+
+- **Deadlock (full pipe, >64 KB).** Parent closes write-end → drains to EOF →
+  `waitpid`, in that order. Stage-0 harness locks it in.
+- **Perf.** Fork per `$(…)` regresses comsub-heavy loops; accepted (correctness
+  first). `$(<file)` stays fork-free. Measured as info (`for i in {1..1000}; do
+  x=$(echo hi); done`), not a gate.
+- **Real-subshell semantics** may shift edges vs. today's clone (bg-job-in-comsub,
+  trap reset, `$?` from `waitpid`). Stage-0 harnesses pin bash's actual behavior so
+  each is a deliberate decision.
+- **JobTable/`$!`/pid-registry** hygiene — transient-foreground child, guarded by
+  `tools/soak`.
+- **`exec_guard`/single-thread** — the child forks-without-exec and runs the
+  interpreter; already asserted; unit tests run `--test-threads 1`.
+- **macOS** — more forking; CI is linux (`ubuntu-24.04`), so the harness verifies
+  linux; macOS remains a documented caveat (#96/#97).
+- **Embedder temp-file** — cleanup on panic/signal, `TMPDIR`, no fd leak (Stage 2).
+
+Verification net, constant across stages: differential audits + full per-crate
+suites + the bash test harness + the Stage-0 harnesses; **any harness red is a hard
+blocker.**
+
+## Success criteria
+
+The interpreter consults exactly one model of "where output goes" (the real fd
+table); `StdoutSink`/`StderrSink`/`Merged` and the reconciliation code are deleted;
+`$(…)` and backticks fork a real subshell over a pipe; `$(<file)` is a file read;
+the embedder capture uses a temp file; and the member routing divergences
+(#195, #353, capture side of #77/#30) are closed by construction with the full
+suites + bash harness green.
+
+## Non-goals
+
+- Not the inward `OwnedFd` / Class-A resource-safety migration (that is #197's other
+  half; it proceeds independently, easier once the sink is gone).
+- Not a change to top-level (non-captured) redirect handling, which is already
+  one-model.
+- No fork-free fast-path for general comsub beyond `$(<file)`.
