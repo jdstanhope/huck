@@ -72,33 +72,16 @@ fn check_restricted_redirect(
     Ok(())
 }
 
-/// Stream identifier for `LineDispatchWriter`.
-#[derive(Clone, Copy)]
-pub(crate) enum LineStream {
-    Stdout,
-    Stderr,
-}
-
-/// Writer that wraps an inner `Vec<u8>` AND notifies the active callbacks
-/// thread-local of any bytes written, so streaming line callbacks fire as
-/// builtins write to their capture buffer.
+/// Writer that appends every byte written into an inner `Vec<u8>` — the
+/// capture buffer for a `Capture` sink. Used by `execute_capturing` (the
+/// in-process command-substitution capture kept for tests).
 pub(crate) struct LineDispatchWriter<'a> {
     pub inner: &'a mut Vec<u8>,
-    pub stream: LineStream,
 }
 
 impl std::io::Write for LineDispatchWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.inner.extend_from_slice(bytes);
-        let stream = self.stream;
-        crate::callbacks_thread_local::with_callbacks(|cb| {
-            if let Some(cb) = cb {
-                match stream {
-                    LineStream::Stdout => cb.push_stdout(bytes),
-                    LineStream::Stderr => cb.push_stderr(bytes),
-                }
-            }
-        });
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -112,10 +95,7 @@ pub(crate) fn err_writer<'a>(
 ) -> Box<dyn std::io::Write + 'a> {
     match err_sink {
         StderrSink::Terminal => Box::new(std::io::stderr()),
-        StderrSink::Capture(buf) => Box::new(LineDispatchWriter {
-            inner: buf,
-            stream: LineStream::Stderr,
-        }),
+        StderrSink::Capture(buf) => Box::new(LineDispatchWriter { inner: buf }),
         StderrSink::Merged => match out_sink {
             // v308: builtin DIAGNOSTICS still go through `io::stdout()` while a
             // builtin's stdout now reaches the same fd 1 raw, via `FdWriter`.
@@ -125,10 +105,7 @@ pub(crate) fn err_writer<'a>(
             // buffer and be overtaken. Deliberate: bash cannot report a failed
             // diagnostic either, so this path stays on the swallowing sink.
             StdoutSink::Terminal => Box::new(std::io::stdout()),
-            StdoutSink::Capture(buf) => Box::new(LineDispatchWriter {
-                inner: buf,
-                stream: LineStream::Stdout,
-            }),
+            StdoutSink::Capture(buf) => Box::new(LineDispatchWriter { inner: buf }),
         },
     }
 }
@@ -323,19 +300,9 @@ pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
 /// must complete before their output is interpolated. Spawning real
 /// background children whose pids the parent's JobTable doesn't track
 /// would let them escape `wait`/`jobs` and litter the terminal.
-///
-/// Streaming-callback contract (v207 fixup): command substitution captures
-/// inner output and interpolates it back into the parent's command line — the
-/// bytes never reach the script's OUTERMOST stdout. So for the duration of
-/// this call we suspend the thread-local callbacks pointer; otherwise the
-/// builtin-path `LineDispatchWriter` and the external-path `with_callbacks`
-/// dispatch in `stream_loop::external_capture_loop` would leak hidden bytes
-/// (e.g. `$(echo hidden)`) into `on_stdout_line` callbacks. The guard's Drop
-/// restores the pointer on every exit path (including panics).
 // retained for executor unit tests + Stage 3 sink deletion (#197)
 #[allow(dead_code)]
 pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
-    let _suspend = crate::callbacks_thread_local::suspend();
     // Command substitution must complete before its output is interpolated, so
     // ALL backgrounding is ignored here: the trailing `&` (seq.background) and
     // any mid-list `&` separators (Connector::Amp) are run synchronously.
@@ -1483,13 +1450,9 @@ fn run_builtin_with_redirects(
                 // callbacks fire for the builtin's direct stderr writes too.
                 let mut side_err_buf: Vec<u8> = Vec::new();
                 let outcome = {
-                    let mut out_w = LineDispatchWriter {
-                        inner: ebuf,
-                        stream: LineStream::Stderr,
-                    };
+                    let mut out_w = LineDispatchWriter { inner: ebuf };
                     let mut side_err_w = LineDispatchWriter {
                         inner: &mut side_err_buf,
-                        stream: LineStream::Stderr,
                     };
                     run(&mut out_w, &mut side_err_w, shell)
                 };
@@ -1504,13 +1467,9 @@ fn run_builtin_with_redirects(
                 // means stderr converges on stdout from the embedder's view).
                 let mut side_err_buf: Vec<u8> = Vec::new();
                 let outcome = {
-                    let mut out_w = LineDispatchWriter {
-                        inner: obuf,
-                        stream: LineStream::Stdout,
-                    };
+                    let mut out_w = LineDispatchWriter { inner: obuf };
                     let mut side_err_w = LineDispatchWriter {
                         inner: &mut side_err_buf,
-                        stream: LineStream::Stdout,
                     };
                     run(&mut out_w, &mut side_err_w, shell)
                 };
@@ -1541,13 +1500,9 @@ fn run_builtin_with_redirects(
                 // stdout-stream events.
                 let mut side_err_buf: Vec<u8> = Vec::new();
                 let outcome = {
-                    let mut out_w = LineDispatchWriter {
-                        inner: obuf,
-                        stream: LineStream::Stdout,
-                    };
+                    let mut out_w = LineDispatchWriter { inner: obuf };
                     let mut side_err_w = LineDispatchWriter {
                         inner: &mut side_err_buf,
-                        stream: LineStream::Stdout,
                     };
                     run(&mut out_w, &mut side_err_w, shell)
                 };
@@ -1567,21 +1522,12 @@ fn run_builtin_with_redirects(
             StdoutSink::Capture(buf) => match err_sink {
                 StderrSink::Terminal => {
                     let mut err = io::stderr();
-                    let mut out_w = LineDispatchWriter {
-                        inner: buf,
-                        stream: LineStream::Stdout,
-                    };
+                    let mut out_w = LineDispatchWriter { inner: buf };
                     run(&mut out_w, &mut err, shell)
                 }
                 StderrSink::Capture(ebuf) => {
-                    let mut out_w = LineDispatchWriter {
-                        inner: buf,
-                        stream: LineStream::Stdout,
-                    };
-                    let mut err_w = LineDispatchWriter {
-                        inner: ebuf,
-                        stream: LineStream::Stderr,
-                    };
+                    let mut out_w = LineDispatchWriter { inner: buf };
+                    let mut err_w = LineDispatchWriter { inner: ebuf };
                     run(&mut out_w, &mut err_w, shell)
                 }
                 StderrSink::Merged => {
@@ -1596,14 +1542,8 @@ fn run_builtin_with_redirects(
                     // stdout from the embedder's view.
                     let mut side: Vec<u8> = Vec::new();
                     let outcome = {
-                        let mut out_w = LineDispatchWriter {
-                            inner: buf,
-                            stream: LineStream::Stdout,
-                        };
-                        let mut side_w = LineDispatchWriter {
-                            inner: &mut side,
-                            stream: LineStream::Stdout,
-                        };
+                        let mut out_w = LineDispatchWriter { inner: buf };
+                        let mut side_w = LineDispatchWriter { inner: &mut side };
                         run(&mut out_w, &mut side_w, shell)
                     };
                     buf.extend_from_slice(&side);
@@ -2351,11 +2291,6 @@ fn run_select_inner(
                     }
                     StdoutSink::Capture(buf) => {
                         buf.push(b'\n');
-                        crate::callbacks_thread_local::with_callbacks(|cb| {
-                            if let Some(cb) = cb {
-                                cb.push_stdout(b"\n");
-                            }
-                        });
                     }
                 }
                 return last;
@@ -4765,11 +4700,6 @@ fn run_exec_single_inner(
                     Ok(bytes) => {
                         if let StdoutSink::Capture(buf) = sink {
                             buf.extend_from_slice(&bytes);
-                            crate::callbacks_thread_local::with_callbacks(|cb| {
-                                if let Some(cb) = cb {
-                                    cb.push_stdout(&bytes);
-                                }
-                            });
                         }
                         ExecOutcome::Continue(0)
                     }
@@ -6120,10 +6050,7 @@ fn emit_exec_spawn_diag(
 ) {
     match sink {
         StdoutSink::Capture(obuf) if stderr_follows_stdout => {
-            let mut w = LineDispatchWriter {
-                inner: obuf,
-                stream: LineStream::Stdout,
-            };
+            let mut w = LineDispatchWriter { inner: obuf };
             crate::emit_error_to(shell, &mut w, None, body);
         }
         _ => {

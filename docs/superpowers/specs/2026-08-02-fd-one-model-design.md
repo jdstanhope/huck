@@ -167,7 +167,24 @@ alone, not fork targets):
 - **comsub `trap` listing** — a comsub's `trap` (no args) output omits bash's default
   `trap -- '' SIGTSTP` row; a subshell trap-listing detail, not fd routing.
 
-### Stage 2 — Temp-file the embedder boundary; drop streaming (decided 2026-08-02)
+### Stage 2 — Temp-file the embedder boundary; drop streaming — ✅ LANDED (2026-08-02)
+
+**Landed:** production `capture()` is sink-free (redirects real fd 1/2 to a temp
+file, runs with `Terminal` sinks, reads back — commit `f532237`), and the entire
+streaming-callbacks feature is removed (`f8ace1e`: deleted `callbacks_thread_local`,
+`line_buf`, `engine_stream_diff` example, `streaming_fd_serial`/`tee_inherit` test
+binaries; trimmed `on_stdout_line`/`on_stderr_line`, `Callbacks`, tee,
+`run_with_sinks_tee`). Because temp-file capture redirects PROCESS-GLOBAL fd 1/2 (it
+collides with libtest's fd-1 reporter in the parallel `--lib` binary — same class as
+Stage 1's fork guard), the lib test build keeps an in-memory `#[cfg(test)]`
+`capture()`; the production temp-file path is covered by the single-`#[test]`
+`capture_tempfile_serial` binary. Verified: sweep 245/245, redirect_audit 157/157
+0-diverge, engine lib 1961/1961 under `--test-threads 4`, bash-suite PASS-set
+unchanged. **Stage-3 residuals** (the only remaining `Capture`/`Merged` users):
+the `#[cfg(test)]` in-memory `capture()`, `run()`'s `merge_stderr` via
+`StderrSink::Merged`, and `execute_capturing` (comsub-in-tests) — Stage 3 converts
+`run()` merge to a real dup2, migrates the in-memory capture unit tests to a serial
+integration binary, and deletes the sink types.
 
 Convert `ExecBuilder::capture` (and any non-streaming `run_with_sinks`) to redirect
 the process's fd 1/2 to a temp file (one file under `merge`), run, read back. Handle
