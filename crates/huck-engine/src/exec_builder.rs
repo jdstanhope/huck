@@ -319,6 +319,169 @@ impl<'a> ExecBuilder<'a> {
     }
 
     /// Run the script; capture fd 1 and fd 2 into `Output`.
+    ///
+    /// Sink-free (Stage 2, #197): rather than routing output through in-memory
+    /// `Capture` sinks, we redirect the process's *real* fd 1 (and fd 2) to a
+    /// temp file, run the script with `Terminal` sinks, restore fd 1/2, and read
+    /// the file(s) back. This makes ALL output — builtins, externals, and forked
+    /// command-substitution children — land in the capture at the real-fd level,
+    /// in program order, exactly as a `.run()` to a terminal would produce it.
+    ///
+    /// Under `merge_stderr`, fd 2 is dup2'd onto the same temp file as fd 1, so
+    /// both streams interleave in the one file; `Output.stderr` is then empty.
+    ///
+    /// The lib test build uses the in-memory `capture()` below (parallel-safe);
+    /// production uses this temp-file path. Stage 3 (#197) migrates those tests +
+    /// deletes the `Capture`/`Merged` sinks. The temp-file path is exercised by
+    /// the `capture_tempfile_serial` integration binary (which builds the
+    /// non-test lib).
+    #[cfg(not(test))]
+    pub fn capture(self) -> Output {
+        use std::io::{Read, Seek, Write};
+        use std::os::fd::AsRawFd;
+
+        // Read a NamedTempFile from the start into a lossy String.
+        fn read_back(mut f: tempfile::NamedTempFile) -> String {
+            let file = f.as_file_mut();
+            if file.rewind().is_err() {
+                return String::new();
+            }
+            let mut buf = Vec::new();
+            if file.read_to_end(&mut buf).is_err() {
+                return String::new();
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+
+        let empty = || Output {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 1,
+        };
+
+        let merge = self.merge;
+
+        // No lock needed: production `Engine` use is single-threaded (the
+        // exec_guard invariant), so no two captures redirect fd 1/2 at once.
+
+        // 1. Create the temp file(s): one under merge, else one per stream.
+        let outfile = match tempfile::NamedTempFile::new() {
+            Ok(f) => f,
+            Err(_) => return empty(),
+        };
+        let errfile = if merge {
+            None
+        } else {
+            match tempfile::NamedTempFile::new() {
+                Ok(f) => Some(f),
+                Err(_) => return empty(),
+            }
+        };
+        let outfd = outfile.as_raw_fd();
+        let errfd = errfile.as_ref().map(|f| f.as_raw_fd());
+
+        // 2. Flush any Rust-buffered bytes on the process streams BEFORE we
+        // redirect, so prior output is not diverted into the capture.
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+
+        // 3. Save the real fd 1 and fd 2.
+        let saved1 = unsafe { libc::dup(1) };
+        let saved2 = unsafe { libc::dup(2) };
+        if saved1 < 0 || saved2 < 0 {
+            if saved1 >= 0 {
+                unsafe { libc::close(saved1) };
+            }
+            if saved2 >= 0 {
+                unsafe { libc::close(saved2) };
+            }
+            return empty();
+        }
+
+        // RAII guard: restore fd 1/2 from the saved dups and close the saves on
+        // EVERY exit path — normal return or panic unwind.
+        struct FdRestore {
+            saved1: libc::c_int,
+            saved2: libc::c_int,
+        }
+        impl Drop for FdRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::dup2(self.saved1, 1);
+                    libc::dup2(self.saved2, 2);
+                    libc::close(self.saved1);
+                    libc::close(self.saved2);
+                }
+            }
+        }
+        let _restore = FdRestore { saved1, saved2 };
+
+        // 4. Redirect fd 1 (and fd 2) onto the temp file(s). Under merge both
+        // fds share one open file description, so writes interleave in order.
+        unsafe {
+            libc::dup2(outfd, 1);
+            match errfd {
+                Some(fd) => {
+                    libc::dup2(fd, 2);
+                }
+                None => {
+                    // merge: fd 2 -> the same temp file as fd 1.
+                    libc::dup2(outfd, 2);
+                }
+            }
+        }
+
+        // 5. Run the script with Terminal sinks — output flows to real fd 1/2,
+        // now pointing at the temp file(s).
+        let ExecBuilder {
+            engine,
+            src,
+            stdin,
+            merge: _,
+            cwd,
+            restricted,
+            timeout,
+            on_stdout_line: _,
+            on_stderr_line: _,
+        } = self;
+        let cell = engine.shell_cell().clone();
+        let mut out = StdoutSink::Terminal;
+        let mut err = StderrSink::Terminal;
+        let exit_code = run_core(
+            &cell, &src, stdin, cwd, restricted, timeout, &mut out, &mut err,
+        );
+
+        // 6. Flush any Rust-buffered stdout/stderr into the redirected fds, then
+        // restore fd 1/2 (dropping the guard) before reading the file(s) back.
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        drop(_restore);
+
+        // 7. Read the temp file(s) back. Under merge, all bytes are in outfile
+        // and stderr is empty (matching the prior merge behavior).
+        let stdout = read_back(outfile);
+        let stderr = match errfile {
+            Some(f) => read_back(f),
+            None => String::new(),
+        };
+        Output {
+            stdout,
+            stderr,
+            exit_code,
+        }
+    }
+
+    /// Lib unit-test build: the multithreaded `--lib` test binary runs many
+    /// tests concurrently, so the production temp-file `capture()` — which
+    /// redirects the *process-global* fd 1/2 — would race libtest's own reporter
+    /// (its `test … ok` writes land on the redirected descriptor and corrupt the
+    /// capture; see `crates/huck-engine/tests/streaming_fd_serial.rs`). The
+    /// in-memory `Capture`/`Merged` sinks never touch global fd 1/2, so they are
+    /// parallel-safe. This is behavior-identical to the temp-file path for the
+    /// output it produces, and the temp-file path is exercised end-to-end by the
+    /// `capture_tempfile_serial` integration binary (built non-test). Stage 3
+    /// (#197) migrates these tests to that binary and deletes the sinks.
+    #[cfg(test)]
     pub fn capture(self) -> Output {
         let mut buf_out: Vec<u8> = Vec::new();
         let mut buf_err: Vec<u8> = Vec::new();
@@ -393,38 +556,7 @@ impl<'a> ExecBuilder<'a> {
                 None
             };
 
-            // 1. Spawn timer (if requested). Defend against a prior call leaving
-            // the timeout_flag set.
-            let timer = timeout.map(|dur| {
-                let flag = cell.borrow().timeout_flag.clone();
-                let pids = cell.borrow().live_external_children.clone();
-                flag.store(false, std::sync::atomic::Ordering::Relaxed);
-                crate::timeout::spawn_timer(dur, flag, pids)
-            });
-
-            // 2. Compose stdin -> cwd -> restricted+run via nested matches.
-            let code = match stdin {
-                Some(bytes) => crate::stdin_pipe::with_stdin_fd0(&bytes, &cell, || {
-                    run_cwd_then_inner(&cell, cwd.as_deref(), restricted, &src, out, err)
-                }),
-                None => run_cwd_then_inner(&cell, cwd.as_deref(), restricted, &src, out, err),
-            };
-
-            // 3. Cancel timer (joins the thread).
-            if let Some(t) = timer {
-                t.cancel();
-            }
-
-            // 4. If the timeout flag is set, override the natural exit code to 124.
-            if cell
-                .borrow()
-                .timeout_flag
-                .swap(false, std::sync::atomic::Ordering::Relaxed)
-            {
-                124
-            } else {
-                code
-            }
+            run_core(&cell, &src, stdin, cwd, restricted, timeout, out, err)
         };
 
         // After the run (and after the guard's Drop has cleared the
@@ -434,6 +566,56 @@ impl<'a> ExecBuilder<'a> {
             callbacks.flush_partials();
         }
 
+        code
+    }
+}
+
+/// Core run composition shared by `capture()` and `run_with_sinks_inner`:
+/// spawn the timeout timer (if any), install the stdin pipe (if any), apply the
+/// cwd/restricted guards, run the script into the given sinks, then convert a
+/// fired timeout into exit 124. Does NOT touch streaming callbacks/tee — those
+/// stay in `run_with_sinks_inner`.
+#[allow(clippy::too_many_arguments)]
+fn run_core(
+    cell: &Rc<RefCell<Shell>>,
+    src: &str,
+    stdin: Option<Vec<u8>>,
+    cwd: Option<PathBuf>,
+    restricted: bool,
+    timeout: Option<Duration>,
+    out: &mut StdoutSink,
+    err: &mut StderrSink,
+) -> i32 {
+    // 1. Spawn timer (if requested). Defend against a prior call leaving the
+    // timeout_flag set.
+    let timer = timeout.map(|dur| {
+        let flag = cell.borrow().timeout_flag.clone();
+        let pids = cell.borrow().live_external_children.clone();
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        crate::timeout::spawn_timer(dur, flag, pids)
+    });
+
+    // 2. Compose stdin -> cwd -> restricted+run via nested matches.
+    let code = match stdin {
+        Some(bytes) => crate::stdin_pipe::with_stdin_fd0(&bytes, cell, || {
+            run_cwd_then_inner(cell, cwd.as_deref(), restricted, src, out, err)
+        }),
+        None => run_cwd_then_inner(cell, cwd.as_deref(), restricted, src, out, err),
+    };
+
+    // 3. Cancel timer (joins the thread).
+    if let Some(t) = timer {
+        t.cancel();
+    }
+
+    // 4. If the timeout flag is set, override the natural exit code to 124.
+    if cell
+        .borrow()
+        .timeout_flag
+        .swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
+        124
+    } else {
         code
     }
 }
