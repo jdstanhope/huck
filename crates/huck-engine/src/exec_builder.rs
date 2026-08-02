@@ -12,7 +12,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::engine::{Engine, Output};
-use crate::executor::{StderrSink, StdoutSink};
 use crate::shell_state::Shell;
 
 pub struct ExecBuilder<'a> {
@@ -128,9 +127,7 @@ impl<'a> ExecBuilder<'a> {
     pub fn run(self) -> i32 {
         use std::io::Write;
         if !self.merge {
-            let mut out = StdoutSink::Terminal;
-            let mut err = StderrSink::Terminal;
-            return self.run_with_sinks(&mut out, &mut err);
+            return self.run_with_sinks();
         }
         // merge: flush, save fd 2, point it at fd 1, run, restore.
         let _ = std::io::stdout().flush();
@@ -138,9 +135,7 @@ impl<'a> ExecBuilder<'a> {
         let saved2 = unsafe { libc::dup(2) };
         if saved2 < 0 {
             // dup failed — fall back to running unmerged rather than aborting.
-            let mut out = StdoutSink::Terminal;
-            let mut err = StderrSink::Terminal;
-            return self.run_with_sinks(&mut out, &mut err);
+            return self.run_with_sinks();
         }
         struct Fd2Restore(libc::c_int);
         impl Drop for Fd2Restore {
@@ -155,9 +150,7 @@ impl<'a> ExecBuilder<'a> {
         unsafe {
             libc::dup2(1, 2);
         }
-        let mut out = StdoutSink::Terminal;
-        let mut err = StderrSink::Terminal;
-        let code = self.run_with_sinks(&mut out, &mut err);
+        let code = self.run_with_sinks();
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
         code
@@ -288,11 +281,7 @@ impl<'a> ExecBuilder<'a> {
             timeout,
         } = self;
         let cell = engine.shell_cell().clone();
-        let mut out = StdoutSink::Terminal;
-        let mut err = StderrSink::Terminal;
-        let exit_code = run_core(
-            &cell, &src, stdin, cwd, restricted, timeout, &mut out, &mut err,
-        );
+        let exit_code = run_core(&cell, &src, stdin, cwd, restricted, timeout);
 
         // 6. Flush any Rust-buffered stdout/stderr into the redirected fds, then
         // restore fd 1/2 (dropping the guard) before reading the file(s) back.
@@ -334,11 +323,7 @@ impl<'a> ExecBuilder<'a> {
         // separately. Externals (forked children) are NOT captured here — those
         // tests live in `capture_tempfile_serial` / `comsub_merge_stderr_diff_check`.
         let (buf_out, buf_err, exit_code) =
-            crate::capture_test_hook::with_capture(merge, true, || {
-                let mut out = StdoutSink::Terminal;
-                let mut err = StderrSink::Terminal;
-                self.run_with_sinks(&mut out, &mut err)
-            });
+            crate::capture_test_hook::with_capture(merge, true, || self.run_with_sinks());
         Output {
             stdout: String::from_utf8_lossy(&buf_out).into_owned(),
             stderr: String::from_utf8_lossy(&buf_err).into_owned(),
@@ -346,7 +331,7 @@ impl<'a> ExecBuilder<'a> {
         }
     }
 
-    fn run_with_sinks(self, out: &mut StdoutSink, err: &mut StderrSink) -> i32 {
+    fn run_with_sinks(self) -> i32 {
         let ExecBuilder {
             engine,
             src,
@@ -357,7 +342,7 @@ impl<'a> ExecBuilder<'a> {
             timeout,
         } = self;
         let cell = engine.shell_cell().clone();
-        run_core(&cell, &src, stdin, cwd, restricted, timeout, out, err)
+        run_core(&cell, &src, stdin, cwd, restricted, timeout)
     }
 }
 
@@ -365,7 +350,6 @@ impl<'a> ExecBuilder<'a> {
 /// spawn the timeout timer (if any), install the stdin pipe (if any), apply the
 /// cwd/restricted guards, run the script into the given sinks, then convert a
 /// fired timeout into exit 124.
-#[allow(clippy::too_many_arguments)]
 fn run_core(
     cell: &Rc<RefCell<Shell>>,
     src: &str,
@@ -373,8 +357,6 @@ fn run_core(
     cwd: Option<PathBuf>,
     restricted: bool,
     timeout: Option<Duration>,
-    out: &mut StdoutSink,
-    err: &mut StderrSink,
 ) -> i32 {
     // 1. Spawn timer (if requested). Defend against a prior call leaving the
     // timeout_flag set.
@@ -388,9 +370,9 @@ fn run_core(
     // 2. Compose stdin -> cwd -> restricted+run via nested matches.
     let code = match stdin {
         Some(bytes) => crate::stdin_pipe::with_stdin_fd0(&bytes, cell, || {
-            run_cwd_then_inner(cell, cwd.as_deref(), restricted, src, out, err)
+            run_cwd_then_inner(cell, cwd.as_deref(), restricted, src)
         }),
-        None => run_cwd_then_inner(cell, cwd.as_deref(), restricted, src, out, err),
+        None => run_cwd_then_inner(cell, cwd.as_deref(), restricted, src),
     };
 
     // 3. Cancel timer (joins the thread).
@@ -416,12 +398,10 @@ fn run_cwd_then_inner(
     cwd: Option<&std::path::Path>,
     restricted: bool,
     src: &str,
-    out: &mut StdoutSink,
-    err: &mut StderrSink,
 ) -> i32 {
     match cwd {
-        Some(p) => run_cwd_inner(cell, p, restricted, src, out, err),
-        None => run_restricted_then_inner(cell, restricted, src, out, err),
+        Some(p) => run_cwd_inner(cell, p, restricted, src),
+        None => run_restricted_then_inner(cell, restricted, src),
     }
 }
 
@@ -444,8 +424,6 @@ fn run_cwd_inner(
     path: &std::path::Path,
     restricted: bool,
     src: &str,
-    out: &mut StdoutSink,
-    err: &mut StderrSink,
 ) -> i32 {
     let shell_ptr: *mut Shell = {
         let mut refmut = cell.borrow_mut();
@@ -463,7 +441,7 @@ fn run_cwd_inner(
     // No other &mut Shell exists during either window.
     let shell_mut: &mut Shell = unsafe { &mut *shell_ptr };
     crate::cwd_scope::with_cwd(path, shell_mut, || {
-        run_restricted_then_inner(cell, restricted, src, out, err)
+        run_restricted_then_inner(cell, restricted, src)
     })
 }
 
@@ -482,13 +460,7 @@ fn run_cwd_inner(
 ///   while PATH stays readonly) that bash never produces.
 ///
 /// This is intentional, not a leak.
-fn run_restricted_then_inner(
-    cell: &Rc<RefCell<Shell>>,
-    restricted: bool,
-    src: &str,
-    out: &mut StdoutSink,
-    err: &mut StderrSink,
-) -> i32 {
+fn run_restricted_then_inner(cell: &Rc<RefCell<Shell>>, restricted: bool, src: &str) -> i32 {
     let prev_policy = cell.borrow().policy;
     let prev_startup = cell.borrow().restricted_at_startup;
     if restricted {
@@ -529,7 +501,7 @@ fn run_restricted_then_inner(
 
     let label = cell.borrow().shell_argv0.clone();
     let args = cell.borrow().positional_args.clone();
-    let code = crate::shell::run_program_in_sinks(src, None, args, &label, false, out, err, cell);
+    let code = crate::shell::run_program_in_sinks(src, None, args, &label, false, cell);
     cell.borrow_mut().set_last_status(code);
     code
 }

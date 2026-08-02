@@ -940,12 +940,7 @@ fn apply_inline_assignments_sets_and_exports_left_to_right() {
             }]),
         ),
     ];
-    let snap = {
-        let mut sink = StdoutSink::Terminal;
-        let mut err_sink = StderrSink::Terminal;
-        apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink)
-    }
-    .expect("ok");
+    let snap = { apply_inline_assignments(&assigns, &mut shell) }.expect("ok");
     assert_eq!(shell.get("A"), Some("1"));
     assert_eq!(shell.get("B"), Some("1"));
     assert!(shell.is_exported("A"));
@@ -957,12 +952,7 @@ fn apply_inline_assignments_sets_and_exports_left_to_right() {
 fn restore_inline_assignments_restores_prior_unset_state() {
     let mut shell = Shell::new();
     let assigns = vec![bare_assign("FOO", lit_word("bar"))];
-    let snap = {
-        let mut sink = StdoutSink::Terminal;
-        let mut err_sink = StderrSink::Terminal;
-        apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink)
-    }
-    .expect("ok");
+    let snap = { apply_inline_assignments(&assigns, &mut shell) }.expect("ok");
     assert_eq!(shell.get("FOO"), Some("bar"));
     restore_inline_assignments(snap, &mut shell);
     assert_eq!(shell.get("FOO"), None);
@@ -974,12 +964,7 @@ fn restore_inline_assignments_restores_prior_value_unexported() {
     shell.set("FOO", "outer".to_string());
     assert!(!shell.is_exported("FOO"));
     let assigns = vec![bare_assign("FOO", lit_word("inner"))];
-    let snap = {
-        let mut sink = StdoutSink::Terminal;
-        let mut err_sink = StderrSink::Terminal;
-        apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink)
-    }
-    .expect("ok");
+    let snap = { apply_inline_assignments(&assigns, &mut shell) }.expect("ok");
     assert_eq!(shell.get("FOO"), Some("inner"));
     assert!(shell.is_exported("FOO"));
     restore_inline_assignments(snap, &mut shell);
@@ -992,12 +977,7 @@ fn restore_inline_assignments_restores_prior_value_exported() {
     let mut shell = Shell::new();
     shell.export_set("FOO", "outer".to_string());
     let assigns = vec![bare_assign("FOO", lit_word("inner"))];
-    let snap = {
-        let mut sink = StdoutSink::Terminal;
-        let mut err_sink = StderrSink::Terminal;
-        apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink)
-    }
-    .expect("ok");
+    let snap = { apply_inline_assignments(&assigns, &mut shell) }.expect("ok");
     restore_inline_assignments(snap, &mut shell);
     assert_eq!(shell.get("FOO"), Some("outer"));
     assert!(shell.is_exported("FOO"));
@@ -1011,12 +991,7 @@ fn restore_inline_assignments_handles_repeated_name() {
         bare_assign("FOO", lit_word("a")),
         bare_assign("FOO", lit_word("b")),
     ];
-    let snap = {
-        let mut sink = StdoutSink::Terminal;
-        let mut err_sink = StderrSink::Terminal;
-        apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink)
-    }
-    .expect("ok");
+    let snap = { apply_inline_assignments(&assigns, &mut shell) }.expect("ok");
     assert_eq!(shell.get("FOO"), Some("b"));
     restore_inline_assignments(snap, &mut shell);
     assert_eq!(shell.get("FOO"), Some("outer"));
@@ -1244,8 +1219,6 @@ fn for_brace_body_iterates_with_break_continue() {
     let run = |src: &str| -> String {
         let mut shell = Shell::new();
         let (buf, _err, ()) = crate::capture_test_hook::with_capture(false, true, || {
-            let mut out = StdoutSink::Terminal;
-            let mut err = StderrSink::Terminal;
             let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
                 src,
                 &Default::default(),
@@ -1253,7 +1226,7 @@ fn for_brace_body_iterates_with_break_continue() {
             ))
             .expect("parse")
             .expect("seq");
-            execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
+            execute_with_sink(&seq, &mut shell, src);
         });
         String::from_utf8_lossy(&buf).into_owned()
     };
@@ -2142,14 +2115,10 @@ fn run_script_capture_2351(src: &str) -> (String, String, i32) {
     let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut shell = Shell::new();
     let (out_buf, err_buf, ()) = crate::capture_test_hook::with_capture(false, true, || {
-        let mut out = StdoutSink::Terminal;
-        let mut err = StderrSink::Terminal;
         crate::builtins::run_sourced_contents_in_sinks(
             src,
             std::path::Path::new("test"),
             &mut shell,
-            &mut out,
-            &mut err,
         );
     });
     let status = shell.last_status();

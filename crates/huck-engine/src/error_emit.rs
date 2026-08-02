@@ -478,19 +478,12 @@ macro_rules! sh_error_noline_to {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::err_thread_local::install_err_sinks;
-    use crate::executor::{StderrSink, StdoutSink};
-
-    /// Capture stderr diagnostics emitted through the installed sinks. Stage 3
-    /// (#197): the sinks are always `Terminal`, so this runs `f` under a
-    /// `#[cfg(test)]` thread-local capture that intercepts the `err_writer` /
-    /// `CaptureStderr` chokepoint every diagnostic routes through.
+    /// Capture stderr diagnostics. Stage 3 (#197): production is one-model, so
+    /// this runs `f` under a `#[cfg(test)]` thread-local capture that intercepts
+    /// the `err_writer` / `CaptureStderr` chokepoint every diagnostic routes
+    /// through.
     fn capture_err_diag(f: impl FnOnce()) -> Vec<u8> {
-        let (_out, err, ()) = crate::capture_test_hook::with_capture(false, true, || {
-            let mut out = StdoutSink::Terminal;
-            let mut err_sink = StderrSink::Terminal;
-            install_err_sinks(&mut out, &mut err_sink, f);
-        });
+        let (_out, err, ()) = crate::capture_test_hook::with_capture(false, true, f);
         err
     }
 

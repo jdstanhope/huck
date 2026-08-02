@@ -1,5 +1,4 @@
 use super::*;
-use crate::executor::{StderrSink, StdoutSink};
 use crate::shell_state::Shell;
 
 /// Runs `line` through the engine's single-line entry point with alias
@@ -10,13 +9,7 @@ fn run_line_with_aliases(line: &str, shell: &mut Shell) -> (ExecOutcome, String,
     // Stage 3 (#197): run with `Terminal` sinks under a thread-local capture
     // that intercepts in-process (builtin) stdout/stderr.
     let (out, err, outcome) = crate::capture_test_hook::with_capture(false, true, || {
-        crate::shell::process_line_in_sinks(
-            line,
-            shell,
-            true,
-            &mut StdoutSink::Terminal,
-            &mut StderrSink::Terminal,
-        )
+        crate::shell::process_line_in_sinks(line, shell, true)
     });
     (
         outcome,

@@ -1,7 +1,7 @@
 //! Crate-local stderr macro. `e!(err, "huck: foo {}", x)` is the structured
 //! analog of `eprintln!("huck: foo {}", x)`, except it writes to the threaded
-//! `err: &mut dyn Write` so the active `StderrSink` (Terminal / Merged /
-//! Capture) routes correctly. The write is fallible (ignored) because stderr
+//! `err: &mut dyn Write` (which routes to the real fd 2, honoring any
+//! `#[cfg(test)]` capture). The write is fallible (ignored) because stderr
 //! is best-effort and a write error here must not abort the shell.
 
 macro_rules! e {

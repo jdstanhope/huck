@@ -7091,12 +7091,7 @@ fn set_escape_value(v: &str) -> String {
 /// Returns the exit status of the last command in the re-parsed
 /// line. `exit N` / function-return / etc. propagate via the
 /// returned ExecOutcome.
-pub(crate) fn eval_in_sink(
-    args: &[String],
-    shell: &mut Shell,
-    sink: &mut crate::executor::StdoutSink,
-    err_sink: &mut crate::executor::StderrSink,
-) -> ExecOutcome {
+pub(crate) fn eval_in_sink(args: &[String], shell: &mut Shell) -> ExecOutcome {
     if args.is_empty() {
         return ExecOutcome::Continue(0);
     }
@@ -7111,16 +7106,14 @@ pub(crate) fn eval_in_sink(
     shell.eval_frame = Some(shell.current_lineno.max(1) + body_newlines);
     let saved = shell.xtrace_depth;
     shell.xtrace_depth += 1;
-    let r = crate::shell::process_line_in_sinks(&joined, shell, true, sink, err_sink);
+    let r = crate::shell::process_line_in_sinks(&joined, shell, true);
     shell.xtrace_depth = saved;
     shell.eval_frame = saved_frame;
     r
 }
 
 fn builtin_eval(args: &[String], shell: &mut Shell) -> ExecOutcome {
-    let mut sink = crate::executor::StdoutSink::Terminal;
-    let mut err_sink = crate::executor::StderrSink::Terminal;
-    eval_in_sink(args, shell, &mut sink, &mut err_sink)
+    eval_in_sink(args, shell)
 }
 
 /// `let EXPR...` — evaluate each argument as an arithmetic expression,
@@ -7725,19 +7718,13 @@ fn builtin_help(
     ExecOutcome::Continue(exit)
 }
 
-pub(crate) fn source_in_sink(
-    args: &[String],
-    invoked: &str,
-    shell: &mut Shell,
-    sink: &mut crate::executor::StdoutSink,
-    err_sink: &mut crate::executor::StderrSink,
-) -> ExecOutcome {
+pub(crate) fn source_in_sink(args: &[String], invoked: &str, shell: &mut Shell) -> ExecOutcome {
     if let Some(path) = args.first()
         && let Err(msg) = shell
             .policy
             .check(crate::policy::Op::SourcePath { invoked, path })
     {
-        let mut err = crate::executor::err_writer(err_sink, sink);
+        let mut err = crate::executor::err_writer();
         crate::sh_error_to!(shell, &mut *err, None, "{msg}");
         return ExecOutcome::Continue(1);
     }
@@ -7747,7 +7734,7 @@ pub(crate) fn source_in_sink(
     // elsewhere: `sink`/`err_sink` carry the executor's in-memory redirect
     // swap for this `source`/`.` invocation).
     {
-        let mut err = crate::executor::err_writer(err_sink, sink);
+        let mut err = crate::executor::err_writer();
         if args.is_empty() {
             // #232: bash emits a "filename argument required" ERROR line FIRST
             // (with the `<prog>: line N:` prologue, prefixed with the INVOKED
@@ -7782,7 +7769,7 @@ pub(crate) fn source_in_sink(
     let path = match resolve_source_path(filename, shell) {
         Some(p) => p,
         None => {
-            let mut err = crate::executor::err_writer(err_sink, sink);
+            let mut err = crate::executor::err_writer();
             // bash distinguishes a directory (opened, unusable → `.:` prefix) from a
             // genuinely-missing file (open fails → no `.:`, redirect-style).
             if std::path::Path::new(filename).is_dir() {
@@ -7802,7 +7789,7 @@ pub(crate) fn source_in_sink(
     let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
-            let mut err = crate::executor::err_writer(err_sink, sink);
+            let mut err = crate::executor::err_writer();
             if e.kind() == std::io::ErrorKind::InvalidData {
                 // Non-UTF-8 content: bash reports `.: <path>: cannot execute binary file`
                 // and exits with status 126.
@@ -7846,7 +7833,7 @@ pub(crate) fn source_in_sink(
         kind: crate::shell_state::FrameKind::Source,
     });
     shell.sync_call_arrays();
-    let result = run_sourced_contents_in_sinks(&contents, &path, shell, sink, err_sink);
+    let result = run_sourced_contents_in_sinks(&contents, &path, shell);
     shell.call_stack.pop();
     shell.sync_call_arrays();
     shell.source_depth -= 1;
@@ -7864,9 +7851,7 @@ fn builtin_source(
     shell: &mut Shell,
 ) -> ExecOutcome {
     let _ = err; // err writer not used: source_in_sink materializes from sinks
-    let mut sink = crate::executor::StdoutSink::Terminal;
-    let mut err_sink = crate::executor::StderrSink::Terminal;
-    source_in_sink(args, invoked, shell, &mut sink, &mut err_sink)
+    source_in_sink(args, invoked, shell)
 }
 
 fn resolve_source_path(
@@ -7922,8 +7907,6 @@ pub(crate) fn run_sourced_contents_in_sinks(
     contents: &str,
     _path: &std::path::Path,
     shell: &mut crate::shell_state::Shell,
-    sink: &mut crate::executor::StdoutSink,
-    err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
     // v315 follow-up (#209): `eval_frame` is per-eval-PARSE context, not
     // inherited by a file loaded via `source`/`.`. Without this, `eval
@@ -7944,7 +7927,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
     // `line_base()`'s stdin fallback (same reset discipline as `eval_frame`).
     let saved_stdin_base = shell.stdin_line_base;
     shell.stdin_line_base = 0;
-    let result = run_sourced_contents_in_sinks_inner(contents, _path, shell, sink, err_sink);
+    let result = run_sourced_contents_in_sinks_inner(contents, _path, shell);
     shell.stdin_line_base = saved_stdin_base;
     shell.eval_frame = saved_eval_frame;
     result
@@ -7954,8 +7937,6 @@ fn run_sourced_contents_in_sinks_inner(
     contents: &str,
     _path: &std::path::Path,
     shell: &mut crate::shell_state::Shell,
-    sink: &mut crate::executor::StdoutSink,
-    err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
     let mut last_status = shell.last_status();
 
@@ -8030,9 +8011,7 @@ fn run_sourced_contents_in_sinks_inner(
                         let line = line_of(start + tok_off) as u32;
                         let fatal = lex_error_is_fatal(&le);
                         let err = crate::command::ParseError::Lex(Box::new(le));
-                        crate::err_thread_local::install_err_sinks(sink, err_sink, || {
-                            crate::render_syntax_diag(shell, &err, contents, line);
-                        });
+                        crate::render_syntax_diag(shell, &err, contents, line);
                         last_status = 2;
                         if fatal {
                             return ExecOutcome::Continue(2);
@@ -8100,14 +8079,13 @@ fn run_sourced_contents_in_sinks_inner(
                     let unit_end_abs = start + unit_end_off;
 
                     if shell.shell_options.verbose {
-                        let mut err = crate::executor::err_writer(err_sink, sink);
+                        let mut err = crate::executor::err_writer();
                         let _ = write!(&mut *err, "{}", &contents[prev_end..unit_end_abs]);
                     }
                     prev_end = unit_end_abs;
 
                     let span = &contents[unit_start_abs..unit_end_abs];
-                    let outcome =
-                        crate::executor::execute_with_sink(&seq, shell, span, sink, err_sink);
+                    let outcome = crate::executor::execute_with_sink(&seq, shell, span);
 
                     match outcome {
                         ExecOutcome::Continue(c) => {
@@ -8175,9 +8153,7 @@ fn run_sourced_contents_in_sinks_inner(
                         let line = line_of(start + tok_off) as u32;
                         let fatal = lex_error_is_fatal(&le);
                         let err = crate::command::ParseError::Lex(Box::new(le));
-                        crate::err_thread_local::install_err_sinks(sink, err_sink, || {
-                            crate::render_syntax_diag(shell, &err, contents, line);
-                        });
+                        crate::render_syntax_diag(shell, &err, contents, line);
                         last_status = 2;
                         if fatal {
                             return ExecOutcome::Continue(2);
@@ -8199,9 +8175,7 @@ fn run_sourced_contents_in_sinks_inner(
                         unit_start_off
                     };
                     let line = line_of(start + foff) as u32;
-                    crate::err_thread_local::install_err_sinks(sink, err_sink, || {
-                        crate::render_syntax_diag(shell, &e, contents, line);
-                    });
+                    crate::render_syntax_diag(shell, &e, contents, line);
                     last_status = 2;
                     // v348 (#339, R3): a HEREDOC_MAX overflow is a lex error
                     // but, unlike other recoverable lex errors here, is FATAL
@@ -8254,9 +8228,7 @@ pub(crate) fn run_sourced_contents(
     shell: &mut crate::shell_state::Shell,
 ) -> ExecOutcome {
     let _ = err; // err is unused: in-sinks fn materializes writer from sinks.
-    let mut sink = crate::executor::StdoutSink::Terminal;
-    let mut err_sink = crate::executor::StderrSink::Terminal;
-    run_sourced_contents_in_sinks(contents, path, shell, &mut sink, &mut err_sink)
+    run_sourced_contents_in_sinks(contents, path, shell)
 }
 
 fn is_valid_alias_name(s: &str) -> bool {

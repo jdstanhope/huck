@@ -48,7 +48,6 @@ use std::path::Path;
 use std::rc::Rc;
 
 use crate::completion::Candidate;
-use crate::executor::{StderrSink, StdoutSink};
 use crate::shell_state::Shell;
 
 /// The captured result of [`Engine::capture`] (or [`ExecBuilder::capture`]).
@@ -108,8 +107,7 @@ impl Engine {
     /// Run a script string with `bash -c` semantics (no "main" call frame).
     /// stdout + stderr inherit the process. Returns the exit status.
     pub fn run(&mut self, src: &str) -> i32 {
-        let mut sink = StdoutSink::Terminal;
-        self.run_with(src, false, &mut sink)
+        self.run_with(src, false)
     }
 
     /// Run a script string, capturing stdout and stderr into separate buffers.
@@ -145,8 +143,7 @@ impl Engine {
     /// Run a script STRING with script semantics (a "main" frame; `$0` = `arg0`).
     pub fn run_script(&mut self, src: &str, arg0: &str) -> i32 {
         self.cell.borrow_mut().shell_argv0 = arg0.to_string();
-        let mut sink = StdoutSink::Terminal;
-        self.run_with_label(src, arg0, true, &mut sink)
+        self.run_with_label(src, arg0, true)
     }
 
     /// Read and run a script FILE with script semantics (`$0` = the path).
@@ -205,33 +202,18 @@ impl Engine {
         &self.cell
     }
 
-    fn run_with(&mut self, src: &str, push_main_frame: bool, sink: &mut StdoutSink) -> i32 {
+    fn run_with(&mut self, src: &str, push_main_frame: bool) -> i32 {
         let label = self.cell.borrow().shell_argv0.clone();
-        self.run_with_label(src, &label, push_main_frame, sink)
+        self.run_with_label(src, &label, push_main_frame)
     }
 
-    fn run_with_label(
-        &mut self,
-        src: &str,
-        label: &str,
-        push_main_frame: bool,
-        sink: &mut StdoutSink,
-    ) -> i32 {
+    fn run_with_label(&mut self, src: &str, label: &str, push_main_frame: bool) -> i32 {
         // Preserve the shell's current $0 + positionals (don't clobber them).
         let args = self.cell.borrow().positional_args.clone();
-        // stderr always inherits the process here; the public `Engine::prepare`
-        // builder will let callers opt into Capture/Merged later.
-        let mut err_sink = StderrSink::Terminal;
-        let code = crate::shell::run_program_in_sinks(
-            src,
-            None,
-            args,
-            label,
-            push_main_frame,
-            sink,
-            &mut err_sink,
-            &self.cell,
-        );
+        // stdout + stderr flow to the real fd table (#197 one-model); the public
+        // `Engine::prepare` builder lets callers opt into capture/merge later.
+        let code =
+            crate::shell::run_program_in_sinks(src, None, args, label, push_main_frame, &self.cell);
         // Mirror the run's exit code into `$?` so `last_status()` reflects it even
         // when the script short-circuited via `exit N` (which doesn't otherwise
         // update the shell's stored status). Matches bash's `bash -c '…'; echo $?`.

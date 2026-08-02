@@ -66,7 +66,6 @@ pub use error_emit::{
     render_syntax_diag,
 };
 pub use exec_builder::ExecBuilder;
-pub use executor::{StderrSink, StdoutSink};
 
 // Re-export the frontend so `huck_engine::lexer::`/`::command::` resolve downstream.
 pub use huck_syntax::escape_double_quote_value;

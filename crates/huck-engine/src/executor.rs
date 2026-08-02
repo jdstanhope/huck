@@ -18,25 +18,6 @@ use crate::shell_state::Shell;
 /// group leader; `N > 0` = join group `N`.
 const NO_PGROUP: i32 = -1;
 
-/// Where the terminal stage of a top-level pipeline sends its stdout when
-/// there's no explicit `> file` redirect.
-///
-/// Stage 3 (#197) reduced this to a single `Terminal` variant: production is
-/// one-model (all output flows to the real fd table), and the test-only
-/// in-process capture now intercepts at the writer chokepoints via
-/// `capture_test_hook` rather than through a `Capture` sink. The (now vestigial)
-/// `&mut StdoutSink` parameter is threaded through the executor still; Task 3
-/// strips it entirely.
-pub enum StdoutSink {
-    Terminal,
-}
-
-/// Where the active "errored" output stream goes. Symmetric to `StdoutSink`.
-/// Stage 3 (#197) reduced this to a single `Terminal` variant (see `StdoutSink`).
-pub enum StderrSink {
-    Terminal,
-}
-
 /// Refuse a file-target output redirect under a restricted policy. Input-only
 /// (`ReadOnly`) is never refused, and fd-duplication never reaches here — both
 /// match bash, where `<`, `>&2`, and `2>&1` stay permitted under `-r`.
@@ -50,8 +31,6 @@ fn check_restricted_redirect(
     path: &str,
     subject: &str,
     shell: &Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
 ) -> Result<(), ()> {
     if !matches!(
         mode,
@@ -63,28 +42,21 @@ fn check_restricted_redirect(
         .policy
         .check(crate::policy::Op::RedirectFile { path, subject })
     {
-        let mut err = err_writer(err_sink, sink);
+        let mut err = err_writer();
         crate::sh_error_to!(shell, &mut *err, None, "{msg}");
         return Err(());
     }
     Ok(())
 }
 
-/// Materialize the stderr writer for the active `StderrSink`. Post-Stage-3 the
-/// sink is always `Terminal`, so this is a `CaptureStderr` over `io::stderr()`:
-/// real writes go to fd 2, and a `#[cfg(test)]` capture (if active on the
-/// thread) intercepts them into the captured stderr buffer. The `out_sink`
-/// parameter is now vestigial (the deleted `Merged` variant used it) and is
-/// dropped in Task 3.
-pub(crate) fn err_writer(
-    err_sink: &mut StderrSink,
-    _out_sink: &mut StdoutSink,
-) -> Box<dyn std::io::Write> {
-    match err_sink {
-        StderrSink::Terminal => Box::new(crate::fd_writer::CaptureStderr::new(
-            crate::fd_writer::CaptureStream::Err,
-        )),
-    }
+/// Materialize the stderr writer. Production is one-model (#197 Stage 3): this
+/// is a `CaptureStderr` over `io::stderr()` — real writes go to fd 2, and a
+/// `#[cfg(test)]` capture (if active on the thread) intercepts them into the
+/// captured stderr buffer.
+pub(crate) fn err_writer() -> Box<dyn std::io::Write> {
+    Box::new(crate::fd_writer::CaptureStderr::new(
+        crate::fd_writer::CaptureStream::Err,
+    ))
 }
 
 /// Emit a path-bearing redirect-open failure in bash's format:
@@ -96,14 +68,8 @@ pub(crate) fn err_writer(
 /// through the CALLER's redirect-aware writer (built from `err_sink`/`out_sink`)
 /// rather than the thread-local sink, so an inner `2>&1`/capture on the
 /// surrounding command is honored (v269 T4fix).
-pub(crate) fn redir_open_error(
-    shell: &Shell,
-    err_sink: &mut StderrSink,
-    out_sink: &mut StdoutSink,
-    path: &str,
-    e: &std::io::Error,
-) {
-    let mut err = err_writer(err_sink, out_sink);
+pub(crate) fn redir_open_error(shell: &Shell, path: &str, e: &std::io::Error) {
+    let mut err = err_writer();
     crate::sh_error_to!(
         shell,
         &mut *err,
@@ -182,42 +148,18 @@ pub(crate) fn check_interrupt(shell: &Shell) -> Option<ExecOutcome> {
 }
 
 /// Runs a top-level sequence, sending the terminal pipeline-stage's stdout to
-/// the given `sink`. `execute` is the Terminal-sink wrapper; command
-/// substitution / `$()` capture supply a `Capture` sink so a captured `eval`
-/// or `source` (via the `*_in_sink` plumbing) lands in the right buffer.
-pub fn execute_with_sink(
-    seq: &Sequence,
-    shell: &mut Shell,
-    source: &str,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+/// the real fd table. Production is one-model (#197 Stage 3); `execute` is a
+/// thin wrapper.
+pub fn execute_with_sink(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
     // #184: mark this thread as executing for the duration of this call, so the
     // fork check in `fork_and_run_in_subshell` can tell whether any OTHER thread
     // is executing. Re-entrant (nested constructs, eval/source, function
     // bodies); the counters stay balanced. Dropped last, on scope exit/panic.
     let _exec_active = crate::exec_guard::ExecActive::enter();
-    // Install the sinks as the thread-local err sinks so deep call chains
-    // (`expand`, `param_expansion`, `Shell` methods, `jobs`) route their
-    // diagnostics through `with_err` to the active sink. The Guard inside
-    // `install_err_sinks` clears the pointer on scope exit (including panic).
-    // SAFETY contract: see `err_thread_local` module docs. We use the unsafe
-    // raw-pointer-install variant so the executor body can keep using its own
-    // `&mut sink`/`&mut err_sink` directly (the thread-local is consulted only
-    // by `with_err` in tight, leaf scopes).
-    let guard = unsafe { crate::err_thread_local::install_err_sinks_raw(sink, err_sink) };
-    let r = execute_with_sink_inner(seq, shell, source, sink, err_sink);
-    drop(guard);
-    r
+    execute_with_sink_inner(seq, shell, source)
 }
 
-fn execute_with_sink_inner(
-    seq: &Sequence,
-    shell: &mut Shell,
-    _source: &str,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn execute_with_sink_inner(seq: &Sequence, shell: &mut Shell, _source: &str) -> ExecOutcome {
     // Fast path: a trailing-`&` that backgrounds a SINGLE and-or group (no
     // `&`-separators inside the list). This preserves the real source-derived
     // job-display label for the common `cmd &` / `a && b &` / `a | b &` forms.
@@ -230,11 +172,11 @@ fn execute_with_sink_inner(
             // the unit for the normalized `jobs` display (#80).
             if let Command::Pipeline(p) = &seq.first {
                 let display = render_job_command(&seq.first);
-                return run_background_sequence(p, shell, sink, err_sink, &display);
+                return run_background_sequence(p, shell, &display);
             }
             if let Command::Subshell { .. } = &seq.first {
                 let display = render_job_command(&seq.first);
-                return run_background_subshell(&seq.first, shell, sink, err_sink, false, &display);
+                return run_background_subshell(&seq.first, shell, false, &display);
             }
         } else if seq
             .rest
@@ -258,18 +200,16 @@ fn execute_with_sink_inner(
             let subshell = Command::Subshell {
                 body: Box::new(inner),
             };
-            return run_background_subshell(&subshell, shell, sink, err_sink, false, &display);
+            return run_background_subshell(&subshell, shell, false, &display);
         }
     }
-    execute_sequence_body(seq, shell, sink, err_sink)
+    execute_sequence_body(seq, shell)
 }
 
 /// Runs a top-level sequence with stdout going to the terminal. Thin wrapper
 /// over `execute_with_sink` with a Terminal sink.
 pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
-    let mut sink = StdoutSink::Terminal;
-    let mut err_sink = StderrSink::Terminal;
-    execute_with_sink(seq, shell, source, &mut sink, &mut err_sink)
+    execute_with_sink(seq, shell, source)
 }
 
 /// Runs a sequence with stdout captured to a buffer. Used by command
@@ -282,7 +222,7 @@ pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
 /// `Terminal` sinks under a `capture_test_hook` thread-local capture, which
 /// intercepts in-process (builtin) stdout at the writer chokepoints. stderr is
 /// NOT captured (`capture_err = false`) so it still reaches the real fd 2,
-/// preserving this path's old `StderrSink::Terminal` behavior. It is `#[cfg(test)]`
+/// preserving this path's old terminal-stderr behavior. It is `#[cfg(test)]`
 /// only — production command substitution forks a real subshell over a pipe
 /// (`capture_via_fork`), which captures external output too.
 #[cfg(test)]
@@ -316,9 +256,7 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     let (buf, _err, outcome) = crate::capture_test_hook::with_capture(false, false, || {
         // stderr inside $() still inherits the process (real fd 2); capturing
         // stderr through command substitution isn't plumbed here.
-        let mut sink = StdoutSink::Terminal;
-        let mut err_sink = StderrSink::Terminal;
-        execute_sequence_body(&sanitized, shell, &mut sink, &mut err_sink)
+        execute_sequence_body(&sanitized, shell)
     });
     let status = match outcome {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
@@ -371,10 +309,8 @@ fn run_andor_group(
     first: &Command,
     rest: &[(Connector, &Command)],
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
-    let mut status = run_command(first, shell, sink, err_sink);
+    let mut status = run_command(first, shell);
     if let Some(o) = check_interrupt(shell) {
         return o;
     }
@@ -435,7 +371,7 @@ fn run_andor_group(
             Connector::Semi | Connector::Amp => true,
         };
         if should_run {
-            status = run_command(command, shell, sink, err_sink);
+            status = run_command(command, shell);
             if let Some(o) = check_interrupt(shell) {
                 return o;
             }
@@ -523,12 +459,7 @@ fn partition_into_groups(seq: &Sequence) -> Vec<AndOrGroup<'_>> {
     groups
 }
 
-fn execute_sequence_body(
-    seq: &Sequence,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn execute_sequence_body(seq: &Sequence, shell: &mut Shell) -> ExecOutcome {
     let groups = partition_into_groups(seq);
     // The status of the most recent FOREGROUND group; a list that ends with a
     // backgrounded group reports the launch status 0.
@@ -574,9 +505,9 @@ fn execute_sequence_body(
             };
             // Launch; ignore the Continue(0) it returns — the foreground status
             // is unchanged by a background launch.
-            run_background_subshell(&subshell, shell, sink, err_sink, inherit_stdin, &display);
+            run_background_subshell(&subshell, shell, inherit_stdin, &display);
         } else {
-            last_status = run_andor_group(group.first, &group.rest, shell, sink, err_sink);
+            last_status = run_andor_group(group.first, &group.rest, shell);
             // Propagate control-flow outcomes immediately.
             if matches!(
                 last_status,
@@ -594,12 +525,7 @@ fn execute_sequence_body(
 }
 
 /// Dispatches a single sequence element.
-fn run_command(
-    cmd: &Command,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_command(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
     // `set -n` / `-n` (noexec): read and parse but do not execute. Per-command
     // and non-interactive only (bash ignores -n interactively). Parsing already
     // happened (the reader caught any syntax error) — we simply skip running.
@@ -609,13 +535,13 @@ fn run_command(
         return ExecOutcome::Continue(0);
     }
     match cmd {
-        Command::Pipeline(p) => run_pipeline(p, shell, sink, err_sink),
-        Command::Simple(s) => run_single(s, shell, sink, err_sink),
-        Command::If(clause) => run_if(clause, shell, sink, err_sink),
-        Command::While(clause) => run_while(clause, shell, sink, err_sink),
-        Command::For(clause) => run_for(clause, shell, sink, err_sink),
-        Command::Case(clause) => run_case(clause, shell, sink, err_sink),
-        Command::BraceGroup(seq) => execute_sequence_body(seq, shell, sink, err_sink),
+        Command::Pipeline(p) => run_pipeline(p, shell),
+        Command::Simple(s) => run_single(s, shell),
+        Command::If(clause) => run_if(clause, shell),
+        Command::While(clause) => run_while(clause, shell),
+        Command::For(clause) => run_for(clause, shell),
+        Command::Case(clause) => run_case(clause, shell),
+        Command::BraceGroup(seq) => execute_sequence_body(seq, shell),
         Command::Subshell { .. } => {
             // Stage 3 (#197): the subshell's stdout/stderr always inherit the
             // shell's real fd 1/2. The deleted `Capture`/`Merged` sinks used to
@@ -636,7 +562,7 @@ fn run_command(
             ) {
                 Ok(p) => p,
                 Err(e) => {
-                    let mut err = err_writer(err_sink, sink);
+                    let mut err = err_writer();
                     crate::sh_error_to!(
                         shell,
                         &mut *err,
@@ -694,7 +620,7 @@ fn run_command(
                             .map(|j| crate::jobs::notification_line(j, '+'))
                             .unwrap_or_default();
                         {
-                            let mut err = err_writer(err_sink, sink);
+                            let mut err = err_writer();
                             e!(&mut *err, "\n{line}");
                         }
                         128 + sig
@@ -737,7 +663,7 @@ fn run_command(
             // non-interactive posix shell errors and exits (default mode allows it).
             if shell.shell_options.posix && builtins::is_special_builtin(name) {
                 {
-                    let mut err = err_writer(err_sink, sink);
+                    let mut err = err_writer();
                     crate::sh_error_to!(shell, &mut *err, None, "{name}: is a special builtin");
                 }
                 shell.posix_fatal(2);
@@ -750,17 +676,15 @@ fn run_command(
             expr,
             inline_assignments,
             line,
-        } => run_double_bracket(expr, inline_assignments, *line, shell, sink, err_sink),
-        Command::ArithFor(clause) => run_arith_for(clause, shell, sink, err_sink),
-        Command::Arith(expr, line) => run_arith(expr, *line, shell, sink, err_sink),
-        Command::Select(clause) => run_select(clause, shell, sink, err_sink),
-        Command::Redirected { inner, redirects } => {
-            run_redirected(inner, redirects, shell, sink, err_sink)
-        }
-        Command::Coproc { name, body } => run_coproc(name, body, shell, sink, err_sink),
+        } => run_double_bracket(expr, inline_assignments, *line, shell),
+        Command::ArithFor(clause) => run_arith_for(clause, shell),
+        Command::Arith(expr, line) => run_arith(expr, *line, shell),
+        Command::Select(clause) => run_select(clause, shell),
+        Command::Redirected { inner, redirects } => run_redirected(inner, redirects, shell),
+        Command::Coproc { name, body } => run_coproc(name, body, shell),
         _ => {
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "unsupported command variant");
             }
             ExecOutcome::Continue(1)
@@ -792,14 +716,7 @@ impl RedirectScope {
     /// `target_fd` is not currently open, the saved slot is recorded as `-1`
     /// (Drop closes it back to unopened) — bash leaves a fresh high fd open
     /// only for the command's duration.
-    fn redirect(
-        &mut self,
-        shell: &Shell,
-        new_fd: RawFd,
-        target_fd: RawFd,
-        sink: &mut StdoutSink,
-        err_sink: &mut StderrSink,
-    ) -> Result<(), ()> {
+    fn redirect(&mut self, shell: &Shell, new_fd: RawFd, target_fd: RawFd) -> Result<(), ()> {
         unsafe {
             // `dup` fails with EBADF when target_fd is not open (e.g. a fresh
             // fd>2 like `>&3` when fd 3 was never opened). That is fine — record
@@ -807,7 +724,7 @@ impl RedirectScope {
             let saved = libc::dup(target_fd);
             if libc::dup2(new_fd, target_fd) < 0 {
                 {
-                    let mut err = err_writer(err_sink, sink);
+                    let mut err = err_writer();
                     crate::sh_error_to!(
                         shell,
                         &mut *err,
@@ -842,13 +759,7 @@ impl RedirectScope {
     /// `lower_one_redirect(None)` already validated the source against the real
     /// fd table, and lower→apply for a single redirect is atomic w.r.t. the fd
     /// table, so re-validation would be redundant.
-    fn apply_one(
-        &mut self,
-        op: PlanOp,
-        shell: &mut Shell,
-        sink: &mut StdoutSink,
-        err_sink: &mut StderrSink,
-    ) -> Result<(), ExecOutcome> {
+    fn apply_one(&mut self, op: PlanOp, shell: &mut Shell) -> Result<(), ExecOutcome> {
         use std::os::fd::{AsRawFd, IntoRawFd};
         match op {
             PlanOp::InstallOwned { target, source } => {
@@ -862,17 +773,14 @@ impl RedirectScope {
                         }
                     }
                     self.saved.push((target, -1));
-                } else if self.redirect(shell, raw, target, sink, err_sink).is_err() {
+                } else if self.redirect(shell, raw, target).is_err() {
                     return Err(ExecOutcome::Continue(1));
                 } else {
                     drop(source);
                 }
             }
             PlanOp::InstallDup { target, source } => {
-                if self
-                    .redirect(shell, source, target, sink, err_sink)
-                    .is_err()
-                {
+                if self.redirect(shell, source, target).is_err() {
                     return Err(ExecOutcome::Continue(1));
                 }
             }
@@ -897,14 +805,11 @@ impl RedirectScope {
         &mut self,
         redirs: &[Redirection],
         shell: &mut Shell,
-        sink: &mut StdoutSink,
-        err_sink: &mut StderrSink,
     ) -> Result<(), ExecOutcome> {
         for redir in redirs {
-            let ops = lower_one_redirect(redir, shell, sink, err_sink, None)
-                .map_err(ExecOutcome::Continue)?;
+            let ops = lower_one_redirect(redir, shell, None).map_err(ExecOutcome::Continue)?;
             for op in ops {
-                self.apply_one(op, shell, sink, err_sink)?;
+                self.apply_one(op, shell)?;
             }
         }
         Ok(())
@@ -1006,15 +911,9 @@ fn final_dests_for_1_2(redirs: &[Redirection], shell: &mut Shell) -> (RedirectDe
 /// redirect-open failure prints `huck: <target>: <err>` and returns
 /// `Continue(1)` WITHOUT running `run_inner`. Shared by `run_redirected` for
 /// compound commands and by the function / eval / source call branches.
-fn with_redirect_scope<F>(
-    redirs: &[Redirection],
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-    run_inner: F,
-) -> ExecOutcome
+fn with_redirect_scope<F>(redirs: &[Redirection], shell: &mut Shell, run_inner: F) -> ExecOutcome
 where
-    F: FnOnce(&mut Shell, &mut StdoutSink, &mut StderrSink) -> ExecOutcome,
+    F: FnOnce(&mut Shell) -> ExecOutcome,
 {
     // Snapshot the procsub stack BEFORE expanding any redirect-target words.
     // Any process substitutions realized while expanding redirect words (e.g.
@@ -1037,7 +936,7 @@ where
     // Apply every redirection IN SOURCE ORDER, so `2>&1 >file` differs from
     // `>file 2>&1`. A failure mid-list returns early; the scope's Drop rolls
     // back the entries already applied (atomic, matching pre-v156 behavior).
-    if let Err(outcome) = scope.apply_redirects(redirs, shell, sink, err_sink) {
+    if let Err(outcome) = scope.apply_redirects(redirs, shell) {
         drop(scope);
         drain_procsubs(shell, procsub_base);
         return outcome;
@@ -1050,7 +949,7 @@ where
     // outright. (The deleted `Capture` sink needed an in-memory `force Terminal`
     // + `Merged` reroute here to keep a `$(...)` capture honoring `>file` /
     // `2>&1`; with capture done at the real-fd level that is unnecessary.)
-    let outcome = run_inner(shell, sink, err_sink);
+    let outcome = run_inner(shell);
     let _ = io::stdout().flush();
     // Restore the real fds BEFORE draining redirect-target process substitutions.
     // For an OUTPUT procsub (`cmd > >(consumer)`), the redirect dup'd the procsub's
@@ -1101,8 +1000,6 @@ fn run_builtin_with_redirects(
     resolved: &ResolvedCommand,
     redirs: &[Redirection],
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     let procsub_base = shell.procsub_pending.len();
     // Flush buffered terminal/builtin output BEFORE applying the real-fd
@@ -1145,7 +1042,7 @@ fn run_builtin_with_redirects(
     };
 
     let mut scope = RedirectScope::new();
-    if let Err(outcome) = scope.apply_redirects(redirs, shell, sink, err_sink) {
+    if let Err(outcome) = scope.apply_redirects(redirs, shell) {
         drop(scope);
         drain_procsubs(shell, procsub_base);
         return outcome;
@@ -1198,7 +1095,7 @@ fn run_builtin_with_redirects(
     let outcome = match fd1_writer.first_error() {
         Some(e) => {
             {
-                let mut ew = err_writer(err_sink, sink);
+                let mut ew = err_writer();
                 crate::sh_error_to!(
                     shell,
                     &mut *ew,
@@ -1258,8 +1155,6 @@ fn run_redirected(
     inner: &Command,
     redirects: &[crate::command::Redirection],
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     // #170: stamp `current_lineno` from the compound command's first sub-command
     // BEFORE applying the trailing redirects, so a redirect-open error carries
@@ -1269,44 +1164,28 @@ fn run_redirected(
     if let Some(l) = command_line(inner).filter(|&l| l != 0) {
         shell.current_lineno = shell.line_base() + l;
     }
-    with_redirect_scope(
-        redirects,
-        shell,
-        sink,
-        err_sink,
-        |shell, inner_sink, inner_err_sink| run_command(inner, shell, inner_sink, inner_err_sink),
-    )
+    with_redirect_scope(redirects, shell, |shell| run_command(inner, shell))
 }
 
 /// Runs a `while`/`until` loop. The body runs while the condition's
 /// exit status satisfies the loop's polarity. `break` ends the loop;
 /// `continue` jumps to the next condition test; `exit` propagates; a
 /// pending SIGINT (Ctrl-C) ends the loop with status 130.
-fn run_while(
-    clause: &WhileClause,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_while(clause: &WhileClause, shell: &mut Shell) -> ExecOutcome {
     shell.loop_depth = shell.loop_depth.saturating_add(1);
-    let result = run_while_inner(clause, shell, sink, err_sink);
+    let result = run_while_inner(clause, shell);
     shell.loop_depth = shell.loop_depth.saturating_sub(1);
     result
 }
 
-fn run_while_inner(
-    clause: &WhileClause,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_while_inner(clause: &WhileClause, shell: &mut Shell) -> ExecOutcome {
     let mut last = ExecOutcome::Continue(0);
     loop {
         if let Some(o) = check_interrupt(shell) {
             return o;
         }
         shell.err_suppressed_depth += 1;
-        let cond = execute_sequence_body(&clause.condition, shell, sink, err_sink);
+        let cond = execute_sequence_body(&clause.condition, shell);
         shell.err_suppressed_depth -= 1;
         let keep_going = match cond {
             ExecOutcome::Exit(_)
@@ -1327,7 +1206,7 @@ fn run_while_inner(
         if !keep_going {
             break;
         }
-        match execute_sequence_body(&clause.body, shell, sink, err_sink) {
+        match execute_sequence_body(&clause.body, shell) {
             ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
             ExecOutcome::LoopBreak(1, st) => {
                 last = ExecOutcome::Continue(st);
@@ -1358,24 +1237,14 @@ fn run_while_inner(
 /// `break` ends the loop, `continue` advances to the next value,
 /// `exit` propagates, and a pending SIGINT (Ctrl-C) ends the loop
 /// with status 130.
-fn run_for(
-    clause: &ForClause,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_for(clause: &ForClause, shell: &mut Shell) -> ExecOutcome {
     shell.loop_depth = shell.loop_depth.saturating_add(1);
-    let result = run_for_inner(clause, shell, sink, err_sink);
+    let result = run_for_inner(clause, shell);
     shell.loop_depth = shell.loop_depth.saturating_sub(1);
     result
 }
 
-fn run_for_inner(
-    clause: &ForClause,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_for_inner(clause: &ForClause, shell: &mut Shell) -> ExecOutcome {
     // bash accepts any word as the loop variable at parse time but requires a
     // valid identifier at runtime; a bad name is a NON-FATAL error (status 1,
     // body not run, the surrounding list continues). Reserved words like `if`
@@ -1387,7 +1256,7 @@ fn run_for_inner(
             shell.current_lineno = shell.line_base() + clause.line;
         }
         {
-            let mut err = err_writer(err_sink, sink);
+            let mut err = err_writer();
             crate::sh_error_to!(
                 shell,
                 &mut *err,
@@ -1406,7 +1275,7 @@ fn run_for_inner(
     let mut values: Vec<String> = Vec::new();
     if clause.has_in {
         for word in &clause.words {
-            match glob_expand_word(word, shell, &mut *err_writer(err_sink, sink)) {
+            match glob_expand_word(word, shell, &mut *err_writer()) {
                 Ok(v) => values.extend(v),
                 Err(()) => return ExecOutcome::Continue(1),
             }
@@ -1456,7 +1325,7 @@ fn run_for_inner(
         // `try_set`, which checks the RESOLVED target's readonly and reports.
         if !shell.is_nameref(&clause.var) && shell.is_readonly(&clause.var) {
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "{}: readonly variable", clause.var);
             }
             shell.posix_fatal(127);
@@ -1467,7 +1336,7 @@ fn run_for_inner(
             shell.posix_fatal(127);
             return ExecOutcome::Continue(1);
         }
-        match execute_sequence_body(&clause.body, shell, sink, err_sink) {
+        match execute_sequence_body(&clause.body, shell) {
             ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
             ExecOutcome::LoopBreak(1, st) => {
                 last = ExecOutcome::Continue(st);
@@ -1585,13 +1454,7 @@ fn format_select_menu(items: &[String], cols_width: usize) -> String {
 /// Runs a standalone `((expr))` arith command. Per bash semantics, the
 /// command exits 0 if the expression's value is non-zero, 1 if zero;
 /// arith errors emit a diagnostic to stderr and exit 1.
-fn run_arith(
-    body: &crate::lexer::Word,
-    line: u32,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_arith(body: &crate::lexer::Word, line: u32, shell: &mut Shell) -> ExecOutcome {
     // #352: stamp `$LINENO` to the `((` source line so a runtime error's
     // `line N:` prologue matches bash (0 = unknown, keep the prior value).
     if line != 0 {
@@ -1610,7 +1473,7 @@ fn run_arith(
         Ok(_) => ExecOutcome::Continue(0),
         Err(e) => {
             if crate::arith::should_wrap_expansion_error(&e) {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(
                     shell,
                     &mut *err,
@@ -1628,24 +1491,14 @@ fn run_arith(
 /// for-loop. Evaluates `init` once, then loops while `cond` is non-zero
 /// (None = always true). Evaluates `step` after each iteration body.
 /// Mirrors `run_for`'s break/continue/return/exit/SIGINT handling.
-fn run_arith_for(
-    clause: &crate::command::ArithForClause,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_arith_for(clause: &crate::command::ArithForClause, shell: &mut Shell) -> ExecOutcome {
     shell.loop_depth = shell.loop_depth.saturating_add(1);
-    let result = run_arith_for_inner(clause, shell, sink, err_sink);
+    let result = run_arith_for_inner(clause, shell);
     shell.loop_depth = shell.loop_depth.saturating_sub(1);
     result
 }
 
-fn run_arith_for_inner(
-    clause: &crate::command::ArithForClause,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_arith_for_inner(clause: &crate::command::ArithForClause, shell: &mut Shell) -> ExecOutcome {
     // 1. Eval init once (if present).
     if let Some(init) = &clause.init {
         xtrace_compound(
@@ -1675,7 +1528,7 @@ fn run_arith_for_inner(
         && let Err(e) = crate::expand::eval_arith_word(init, shell)
     {
         {
-            let mut err = err_writer(err_sink, sink);
+            let mut err = err_writer();
             crate::sh_error_to!(shell, &mut *err, None, "((: {e}");
         }
         return ExecOutcome::Continue(1);
@@ -1712,7 +1565,7 @@ fn run_arith_for_inner(
                 Ok(v) => v,
                 Err(e) => {
                     {
-                        let mut err = err_writer(err_sink, sink);
+                        let mut err = err_writer();
                         crate::sh_error_to!(shell, &mut *err, None, "((: {e}");
                     }
                     return ExecOutcome::Continue(1);
@@ -1724,7 +1577,7 @@ fn run_arith_for_inner(
         }
 
         // 3. Execute body.
-        match execute_sequence_body(&clause.body, shell, sink, err_sink) {
+        match execute_sequence_body(&clause.body, shell) {
             ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
             ExecOutcome::LoopBreak(1, st) => {
                 last = ExecOutcome::Continue(st);
@@ -1775,7 +1628,7 @@ fn run_arith_for_inner(
             && let Err(e) = crate::expand::eval_arith_word(step, shell)
         {
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "((: {e}");
             }
             return ExecOutcome::Continue(1);
@@ -1800,30 +1653,20 @@ fn read_line_into_reply(shell: &mut Shell) -> ExecOutcome {
 /// is read into `REPLY` per prompt via the `read` builtin. An empty list
 /// runs the body zero times; `break`/`continue N` bubble via the v79
 /// loop infrastructure. Wrapped to keep a single `loop_depth` return path.
-fn run_select(
-    clause: &crate::command::SelectClause,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_select(clause: &crate::command::SelectClause, shell: &mut Shell) -> ExecOutcome {
     shell.loop_depth = shell.loop_depth.saturating_add(1);
-    let result = run_select_inner(clause, shell, sink, err_sink);
+    let result = run_select_inner(clause, shell);
     shell.loop_depth = shell.loop_depth.saturating_sub(1);
     result
 }
 
-fn run_select_inner(
-    clause: &crate::command::SelectClause,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell) -> ExecOutcome {
     // 1. Build the item list: expand `in WORDS` (Some), or "$@" (None).
     let items: Vec<String> = match &clause.words {
         Some(words) => {
             let mut v = Vec::new();
             for w in words {
-                match glob_expand_word(w, shell, &mut *err_writer(err_sink, sink)) {
+                match glob_expand_word(w, shell, &mut *err_writer()) {
                     Ok(g) => v.extend(g),
                     Err(()) => return ExecOutcome::Continue(1),
                 }
@@ -1892,7 +1735,7 @@ fn run_select_inner(
         //     line. An empty line reprints the menu; EOF terminates the loop.
         let selection: String = loop {
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 if show_menu {
                     let _ = write!(&mut *err, "{}", format_select_menu(&items, cols_width));
                 }
@@ -1927,7 +1770,7 @@ fn run_select_inner(
         // 3c. Bind NAME (honor readonly like the other loop runners).
         if shell.try_set(&clause.var, selection).is_err() {
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "{}: readonly variable", clause.var);
             }
             return ExecOutcome::Continue(1);
@@ -1939,7 +1782,7 @@ fn run_select_inner(
         }
 
         // 3e. Run the body; bubble flow with the v79 decrement-and-bubble pattern.
-        match execute_sequence_body(&clause.body, shell, sink, err_sink) {
+        match execute_sequence_body(&clause.body, shell) {
             ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
             ExecOutcome::LoopBreak(1, st) => {
                 last = ExecOutcome::Continue(st);
@@ -2012,12 +1855,7 @@ fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool 
 /// terminator decides what happens: `;;` stops, `;&` runs the next
 /// clause's body unconditionally, `;;&` resumes pattern-testing.
 /// `case` is not a loop — `break`/`continue` propagate out unchanged.
-fn run_case(
-    clause: &CaseClause,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_case(clause: &CaseClause, shell: &mut Shell) -> ExecOutcome {
     // v318 (#218): the subject can be a process substitution (`case <(cmd)
     // in …`). `expand_assignment` realizes it and pushes onto
     // `procsub_pending`, but `case` — unlike a plain command — has no
@@ -2025,17 +1863,12 @@ fn run_case(
     // every exit path (bash realizes AND closes the fd / reaps the child for
     // the `case` command). The inner body owns all the early returns.
     let procsub_base = shell.procsub_pending.len();
-    let outcome = run_case_inner(clause, shell, sink, err_sink);
+    let outcome = run_case_inner(clause, shell);
     drain_procsubs(shell, procsub_base);
     outcome
 }
 
-fn run_case_inner(
-    clause: &CaseClause,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_case_inner(clause: &CaseClause, shell: &mut Shell) -> ExecOutcome {
     // #352: stamp `$LINENO` to the `case` source line BEFORE expanding the
     // subject, so a `$(( ))` arith error in the subject reports the `case`
     // line (bash), not the previous statement's stale value.
@@ -2083,7 +1916,7 @@ fn run_case_inner(
         }
         match &item.body {
             None => last = ExecOutcome::Continue(0),
-            Some(body) => match execute_sequence_body(body, shell, sink, err_sink) {
+            Some(body) => match execute_sequence_body(body, shell) {
                 ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
                 ExecOutcome::LoopBreak(n, st) => return ExecOutcome::LoopBreak(n, st),
                 ExecOutcome::LoopContinue(n) => return ExecOutcome::LoopContinue(n),
@@ -2110,14 +1943,9 @@ fn run_case_inner(
 /// Runs an `if` clause: evaluate the condition, then run the first
 /// branch whose condition succeeds (exit 0), or the `else` body, or
 /// nothing (status 0). An `exit` anywhere inside propagates.
-fn run_if(
-    clause: &IfClause,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_if(clause: &IfClause, shell: &mut Shell) -> ExecOutcome {
     shell.err_suppressed_depth += 1;
-    let cond = execute_sequence_body(&clause.condition, shell, sink, err_sink);
+    let cond = execute_sequence_body(&clause.condition, shell);
     shell.err_suppressed_depth -= 1;
     if matches!(
         cond,
@@ -2130,11 +1958,11 @@ fn run_if(
         return cond;
     }
     if matches!(cond, ExecOutcome::Continue(0)) {
-        return execute_sequence_body(&clause.then_body, shell, sink, err_sink);
+        return execute_sequence_body(&clause.then_body, shell);
     }
     for elif in &clause.elif_branches {
         shell.err_suppressed_depth += 1;
-        let elif_cond = execute_sequence_body(&elif.condition, shell, sink, err_sink);
+        let elif_cond = execute_sequence_body(&elif.condition, shell);
         shell.err_suppressed_depth -= 1;
         if matches!(
             elif_cond,
@@ -2147,11 +1975,11 @@ fn run_if(
             return elif_cond;
         }
         if matches!(elif_cond, ExecOutcome::Continue(0)) {
-            return execute_sequence_body(&elif.body, shell, sink, err_sink);
+            return execute_sequence_body(&elif.body, shell);
         }
     }
     if let Some(else_body) = &clause.else_body {
-        return execute_sequence_body(else_body, shell, sink, err_sink);
+        return execute_sequence_body(else_body, shell);
     }
     ExecOutcome::Continue(0)
 }
@@ -2165,15 +1993,13 @@ fn run_double_bracket(
     inline_assignments: &[crate::command::Assignment],
     line: u32,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     // #352: stamp `$LINENO` to the `[[` source line so a runtime error's
     // `line N:` prologue matches bash (0 = unknown, keep the prior value).
     if line != 0 {
         shell.current_lineno = shell.line_base() + line;
     }
-    let snap = match apply_inline_assignments(inline_assignments, shell, sink, err_sink) {
+    let snap = match apply_inline_assignments(inline_assignments, shell) {
         Ok(s) => s,
         Err(s) => {
             restore_inline_assignments(s, shell);
@@ -2194,7 +2020,7 @@ fn run_double_bracket(
         Ok(false) => ExecOutcome::Continue(1),
         Err(msg) => {
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "[[: {msg}");
             }
             ExecOutcome::Continue(2)
@@ -2554,12 +2380,7 @@ fn eval_binary(
     }
 }
 
-fn run_pipeline(
-    pipeline: &Pipeline,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> ExecOutcome {
     // #1: a `!`-negated pipeline's failure is EXPECTED (it is being tested), so
     // `set -e`/ERR must not fire for anything the body runs — including inner
     // executions like `eval` and brace groups that are NOT their own boundary.
@@ -2575,9 +2396,9 @@ fn run_pipeline(
     let outcome = if pipeline.commands.len() == 1 {
         // Single-stage pipeline: run directly in the parent shell (no fork needed).
         // This covers both Simple commands and compound commands as single stages.
-        run_command(&pipeline.commands[0], shell, sink, err_sink)
+        run_command(&pipeline.commands[0], shell)
     } else {
-        run_multi_stage(&pipeline.commands, shell, sink, err_sink)
+        run_multi_stage(&pipeline.commands, shell)
     };
     if pipeline.negate {
         shell.err_suppressed_depth -= 1;
@@ -2604,19 +2425,14 @@ fn is_negated_pipeline(cmd: &Command) -> bool {
 /// the unit must keep the shell's stdin regardless of interactivity (a bare
 /// multi-stage pipeline). Interactive always inherits. Otherwise stdin defaults
 /// to `/dev/null` (`Owned`); on open failure emit `/dev/null: <error>` + Err.
-fn async_default_stdin(
-    inherit: bool,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> Result<ChildFd, ()> {
+fn async_default_stdin(inherit: bool, shell: &mut Shell) -> Result<ChildFd, ()> {
     if inherit || shell.is_interactive {
         return Ok(ChildFd::Inherit);
     }
     match File::open("/dev/null") {
         Ok(f) => Ok(ChildFd::from(f)),
         Err(e) => {
-            let mut err = err_writer(err_sink, sink);
+            let mut err = err_writer();
             crate::sh_error_to!(
                 shell,
                 &mut *err,
@@ -2636,8 +2452,6 @@ fn async_default_stdin(
 fn run_background_subshell(
     cmd: &Command,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
     inherit_stdin: bool,
     display: &str,
 ) -> ExecOutcome {
@@ -2646,7 +2460,7 @@ fn run_background_subshell(
     // bash: an async command's stdin defaults to /dev/null (non-interactive, no
     // explicit input redirect) so it can't steal the terminal; a bare
     // multi-stage pipeline inherits instead (async_default_stdin, #126).
-    let stdin = match async_default_stdin(inherit_stdin, shell, sink, err_sink) {
+    let stdin = match async_default_stdin(inherit_stdin, shell) {
         Ok(c) => c,
         Err(()) => return ExecOutcome::Continue(1),
     };
@@ -2669,7 +2483,7 @@ fn run_background_subshell(
             // bash suppresses automatic job notices inside a subshell environment / completion funcs
             if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
                 {
-                    let mut err = err_writer(err_sink, sink);
+                    let mut err = err_writer();
                     e!(&mut *err, "[{id}] {pid}");
                 }
             }
@@ -2677,7 +2491,7 @@ fn run_background_subshell(
         }
         Err(e) => {
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "fork: {}", crate::bash_io_error(&e));
             }
             ExecOutcome::Continue(1)
@@ -2685,13 +2499,7 @@ fn run_background_subshell(
     }
 }
 
-fn run_background_sequence(
-    pipeline: &Pipeline,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-    display: &str,
-) -> ExecOutcome {
+fn run_background_sequence(pipeline: &Pipeline, shell: &mut Shell, display: &str) -> ExecOutcome {
     let display = display.to_string();
     let job_control = shell.job_control_active();
 
@@ -2702,13 +2510,7 @@ fn run_background_sequence(
     // reaps the partial pipeline via bail_teardown_pipeline(Background, …). All
     // that's left here is registering the job and returning immediately (no
     // wait) — that's what makes it "background".
-    let sp = match spawn_pipeline(
-        &pipeline.commands,
-        SpawnMode::Background,
-        shell,
-        sink,
-        err_sink,
-    ) {
+    let sp = match spawn_pipeline(&pipeline.commands, SpawnMode::Background, shell) {
         Ok(sp) => sp,
         Err(outcome) => return outcome,
     };
@@ -2755,7 +2557,7 @@ fn run_background_sequence(
     // bash suppresses automatic job notices inside a subshell environment / completion funcs
     if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
         {
-            let mut err = err_writer(err_sink, sink);
+            let mut err = err_writer();
             e!(&mut *err, "[{id}] {last_pid}");
         }
     }
@@ -3088,12 +2890,7 @@ fn resolve_fd_target(source: &crate::lexer::Word, shell: &mut Shell) -> Result<i
 /// add that via `validate_fd_open` (they perform the `dup2` in the parent);
 /// the child-plan sites defer the check to child replay. Returns `Err(())`
 /// after emitting the error.
-fn resolve_dup_source(
-    source: &crate::lexer::Word,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> Result<RawFd, ()> {
+fn resolve_dup_source(source: &crate::lexer::Word, shell: &mut Shell) -> Result<RawFd, ()> {
     // bash: a dup source that word-splits to 0 or >1 fields (e.g. `$v` unset,
     // `>&` empty) is an *ambiguous redirect* naming the raw word; a single
     // non-numeric field is `bad fd`. The error names the UN-expanded source
@@ -3101,14 +2898,14 @@ fn resolve_dup_source(
     let fields = expand(source, shell);
     let word_src = crate::expand::reconstruct_word_source(source);
     if fields.len() != 1 {
-        let mut err = err_writer(err_sink, sink);
+        let mut err = err_writer();
         crate::sh_error_to!(shell, &mut *err, None, "{word_src}: ambiguous redirect");
         return Err(());
     }
     match fields.into_iter().next().unwrap().chars.parse::<i32>() {
         Ok(fd) => Ok(fd),
         Err(_) => {
-            let mut err = err_writer(err_sink, sink);
+            let mut err = err_writer();
             crate::sh_error_to!(shell, &mut *err, None, "bad fd: {word_src}");
             Err(())
         }
@@ -3118,15 +2915,9 @@ fn resolve_dup_source(
 /// Check that `src` is currently an open fd; on failure write bash's
 /// `N: Bad file descriptor` and return `Err(())`. Used by the in-process
 /// dup/move apply sites before the parent-side `dup2`.
-fn validate_fd_open(
-    src: RawFd,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-    label: &str,
-) -> Result<(), ()> {
+fn validate_fd_open(src: RawFd, shell: &mut Shell, label: &str) -> Result<(), ()> {
     if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
-        let mut err = err_writer(err_sink, sink);
+        let mut err = err_writer();
         crate::sh_error_to!(shell, &mut *err, None, "{label}: Bad file descriptor");
         return Err(());
     }
@@ -3144,8 +2935,6 @@ fn validate_plan_source(
     src: RawFd,
     fd_state: &std::collections::HashMap<RawFd, bool>,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
     label: &str,
 ) -> Result<(), i32> {
     let open = match fd_state.get(&src) {
@@ -3153,7 +2942,7 @@ fn validate_plan_source(
         None => (unsafe { libc::fcntl(src, libc::F_GETFD) }) >= 0,
     };
     if !open {
-        let mut err = err_writer(err_sink, sink);
+        let mut err = err_writer();
         crate::sh_error_to!(shell, &mut *err, None, "{label}: Bad file descriptor");
         return Err(1);
     }
@@ -3182,13 +2971,11 @@ fn validate_source(
     src: RawFd,
     fd_state: Option<&std::collections::HashMap<RawFd, bool>>,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
     label: &str,
 ) -> Result<(), i32> {
     match fd_state {
-        Some(state) => validate_plan_source(src, state, shell, sink, err_sink, label),
-        None => validate_fd_open(src, shell, sink, err_sink, label).map_err(|()| 1),
+        Some(state) => validate_plan_source(src, state, shell, label),
+        None => validate_fd_open(src, shell, label).map_err(|()| 1),
     }
 }
 
@@ -3261,8 +3048,6 @@ fn decl_field_to_arg(s: String) -> crate::command::DeclArg {
 fn run_empty_command_tail(
     cmd: &ExecCommand,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
     procsub_base: usize,
 ) -> ExecOutcome {
     let named_fd_prior: Vec<(String, Option<String>)> = cmd
@@ -3275,14 +3060,10 @@ fn run_empty_command_tail(
             _ => None,
         })
         .collect();
-    let st = run_assignment_list(&cmd.inline_assignments, shell, sink, err_sink);
-    let outcome = with_redirect_scope(
-        &cmd.redirects,
-        shell,
-        sink,
-        err_sink,
-        move |_shell, _sink, _err_sink| ExecOutcome::Continue(st),
-    );
+    let st = run_assignment_list(&cmd.inline_assignments, shell);
+    let outcome = with_redirect_scope(&cmd.redirects, shell, move |_shell| {
+        ExecOutcome::Continue(st)
+    });
     for (name, prior) in named_fd_prior {
         match prior {
             Some(v) => shell.set(&name, v),
@@ -3298,13 +3079,7 @@ fn run_empty_command_tail(
 /// (#77). The wrapper error path runs before `run_builtin_with_redirects`, so it
 /// bypasses that function's `2>&1` swap; replicate it here so
 /// `x=$(command -Z 2>&1)` captures the error like bash instead of leaking it.
-fn emit_wrapper_error(
-    cmd: &ExecCommand,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-    msg: &str,
-) {
+fn emit_wrapper_error(cmd: &ExecCommand, shell: &mut Shell, msg: &str) {
     // The `command`/`builtin` wrapper detects an option error DURING its own
     // argument scan, before the command's redirects reach the real fds — so the
     // error must be emitted UNDER the command's own redirects, exactly as the
@@ -3313,17 +3088,11 @@ fn emit_wrapper_error(
     // apply uniformly: a real `2>&1`/`2>file` dup2 at a terminal/pipe (incl. the
     // forked comsub child, #197), and the software `Merged` route under a capture
     // sink. Replaces the earlier capture-sink-only `Merged` special case (#77).
-    with_redirect_scope(
-        &cmd.redirects,
-        shell,
-        sink,
-        err_sink,
-        |shell, sink, err_sink| {
-            let mut err = err_writer(err_sink, sink);
-            crate::sh_error_to!(shell, &mut *err, None, "{msg}");
-            ExecOutcome::Continue(2)
-        },
-    );
+    with_redirect_scope(&cmd.redirects, shell, |shell| {
+        let mut err = err_writer();
+        crate::sh_error_to!(shell, &mut *err, None, "{msg}");
+        ExecOutcome::Continue(2)
+    });
 }
 
 /// Expands the program + argument words into a `ResolvedCommand`. Returns
@@ -3733,12 +3502,7 @@ fn open_writable(path: &str, guard_noclobber: bool) -> io::Result<File> {
 // commands do. This matches bash: after `if cond; then ...; fi`, `$PIPESTATUS`
 // reflects the last inner pipeline (e.g. `cond`), not the `if` itself. Do NOT
 // add a set_pipestatus call to a compound runner.
-fn run_single(
-    cmd: &SimpleCommand,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_single(cmd: &SimpleCommand, shell: &mut Shell) -> ExecOutcome {
     // $BASH_COMMAND: the source text of the command about to run — stamped
     // before the DEBUG trap fires (bash sets it at the same point, so a DEBUG
     // action reading $BASH_COMMAND sees the command that triggered it). While
@@ -3754,7 +3518,7 @@ fn run_single(
         shell.current_command = render_job_simple(cmd);
     }
     let outcome = match cmd {
-        SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink, err_sink),
+        SimpleCommand::Exec(exec) => run_exec_single(exec, shell),
         SimpleCommand::Assign(items, line) => {
             // Stamp $LINENO before expanding RHS so it reflects this assignment's line.
             if *line != 0 {
@@ -3776,7 +3540,7 @@ fn run_single(
             match crate::traps::fire_debug_trap(shell) {
                 crate::traps::DebugDecision::Proceed => {
                     let procsub_base = shell.procsub_pending.len();
-                    let st = run_assignment_list(items, shell, sink, err_sink);
+                    let st = run_assignment_list(items, shell);
                     drain_procsubs(shell, procsub_base);
                     ExecOutcome::Continue(st)
                 }
@@ -3822,8 +3586,6 @@ pub(crate) fn call_function(
     body: Box<crate::command::Command>,
     args: Vec<String>,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     // FUNCNEST enforcement + recursion backstop. Refuse a call that would exceed
     // the effective nesting limit BEFORE any frame/positional/local setup, so the
@@ -3841,7 +3603,7 @@ pub(crate) fn call_function(
         .count();
     if depth >= limit {
         {
-            let mut err = err_writer(err_sink, sink);
+            let mut err = err_writer();
             crate::sh_error_to!(
                 shell,
                 &mut *err,
@@ -3901,7 +3663,7 @@ pub(crate) fn call_function(
     }
     let _ = crate::traps::fire_debug_trap(shell);
 
-    let result = run_command(&body, shell, sink, err_sink);
+    let result = run_command(&body, shell);
 
     // RETURN trap fires with $? set to the function's status AND the
     // function's positional args still in scope. After the action runs,
@@ -3948,9 +3710,7 @@ pub(crate) fn call_function_body(name: &str, args: Vec<String>, shell: &mut Shel
         Some(b) => b.clone(),
         None => return ExecOutcome::Continue(1),
     };
-    let mut sink = StdoutSink::Terminal;
-    let mut err_sink = StderrSink::Terminal;
-    call_function(name, body, args, shell, &mut sink, &mut err_sink)
+    call_function(name, body, args, shell)
 }
 
 fn ps4(shell: &mut Shell) -> String {
@@ -4106,12 +3866,7 @@ fn drain_procsubs_nonblocking(shell: &mut Shell, base: usize) {
 /// error keeps status 1). Shared by `SimpleCommand::Assign` (a bare assignment)
 /// and the assignment/redirect-only `ExecCommand` (empty program word, e.g.
 /// `VAR=val 2>err`).
-fn run_assignment_list(
-    items: &[crate::command::Assignment],
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> i32 {
+fn run_assignment_list(items: &[crate::command::Assignment], shell: &mut Shell) -> i32 {
     // Reset so only THESE assignments' RHS command substitutions count.
     shell.set_last_cmd_sub_status(None);
     let mut st = 0;
@@ -4121,7 +3876,7 @@ fn run_assignment_list(
         // RESOLVED target's readonly — a readonly nameref lets you write through.
         if !shell.is_nameref(name) && shell.is_readonly(name) {
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "{name}: readonly variable");
             }
             if shell.shell_options.posix && !shell.is_interactive {
@@ -4133,7 +3888,7 @@ fn run_assignment_list(
             break;
         }
         shell.set_xtrace_assign_rhs(None);
-        if apply_one_assignment(a, shell, &mut *err_writer(err_sink, sink)).is_err() {
+        if apply_one_assignment(a, shell, &mut *err_writer()).is_err() {
             if shell.shell_options.posix && !shell.is_interactive {
                 shell.posix_fatal(127); // EXITPROG (v226): POSIX non-interactive exits 127
             } else {
@@ -4179,13 +3934,8 @@ fn run_assignment_list(
     st
 }
 
-fn run_exec_single(
-    cmd: &ExecCommand,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
-    run_exec_single_inner(cmd, shell, sink, err_sink, false)
+fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell) -> ExecOutcome {
+    run_exec_single_inner(cmd, shell, false)
 }
 
 /// `wrapped` is true when this invocation was reached via the pre-resolve
@@ -4194,13 +3944,7 @@ fn run_exec_single(
 /// reset on recursion). It suppresses the bare-special-builtin posix-fatal
 /// consume so `command export AA[4]=1` / `builtin export AA[4]=1` strip the
 /// usage/assignment fatal, matching bash.
-fn run_exec_single_inner(
-    cmd: &ExecCommand,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-    wrapped: bool,
-) -> ExecOutcome {
+fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) -> ExecOutcome {
     // POSIX case #1: clear any usage-error signal a prior command may have left
     // un-consumed (e.g. a `command`-wrapped special builtin). Each special
     // builtin re-sets it at its own usage/assignment error site during dispatch.
@@ -4250,7 +3994,7 @@ fn run_exec_single_inner(
         // Pre-resolve recursion: no expansion yet, drain is a no-op but kept for uniformity.
         // `wrapped`: the inner decl builtin is `command`-wrapped → strip its usage fatal.
         drain_procsubs(shell, procsub_base);
-        return run_exec_single_inner(&inner, shell, sink, err_sink, true);
+        return run_exec_single_inner(&inner, shell, true);
     }
 
     // `builtin <decl-builtin> …` (v142): a declaration builtin reached via `builtin`
@@ -4276,7 +4020,7 @@ fn run_exec_single_inner(
         // Pre-resolve recursion: no expansion yet, drain is a no-op but kept for uniformity.
         // `wrapped`: the inner decl builtin is `builtin`-wrapped → strip its usage fatal.
         drain_procsubs(shell, procsub_base);
-        return run_exec_single_inner(&inner, shell, sink, err_sink, true);
+        return run_exec_single_inner(&inner, shell, true);
     }
 
     // Assignment/redirect-only command: no program word, just inline assignments
@@ -4309,7 +4053,7 @@ fn run_exec_single_inner(
             } = &redir.op
                 && redir.target_fd() == Some(0)
             {
-                let path = match expand_single(target, shell, &mut *err_writer(err_sink, sink)) {
+                let path = match expand_single(target, shell, &mut *err_writer()) {
                     Ok(p) => p,
                     Err(()) => {
                         drain_procsubs(shell, procsub_base);
@@ -4322,7 +4066,7 @@ fn run_exec_single_inner(
                         ExecOutcome::Continue(0)
                     }
                     Err(e) => {
-                        redir_open_error(shell, err_sink, sink, &path, &e);
+                        redir_open_error(shell, &path, &e);
                         ExecOutcome::Continue(1)
                     }
                 };
@@ -4330,18 +4074,18 @@ fn run_exec_single_inner(
                 return outcome;
             }
         }
-        return run_empty_command_tail(cmd, shell, sink, err_sink, procsub_base);
+        return run_empty_command_tail(cmd, shell, procsub_base);
     }
 
     // Bind the result first so the `err_writer` borrow of sink/err_sink ends
     // before the `Ok(None)` arm reuses them.
-    let resolved_result = resolve(cmd, shell, &mut *err_writer(err_sink, sink));
+    let resolved_result = resolve(cmd, shell, &mut *err_writer());
     let mut resolved = match resolved_result {
         Ok(Some(r)) => r,
         // #62: the program word expanded to ZERO fields AND no arg field
         // survived either — bash treats this as an empty command (assignments +
         // redirects, rc 0), NOT `command not found`.
-        Ok(None) => return run_empty_command_tail(cmd, shell, sink, err_sink, procsub_base),
+        Ok(None) => return run_empty_command_tail(cmd, shell, procsub_base),
         Err(code) => {
             drain_procsubs(shell, procsub_base);
             return ExecOutcome::Continue(code);
@@ -4370,7 +4114,7 @@ fn run_exec_single_inner(
                 }
                 Some(s) if s.starts_with('-') && s.len() > 1 => {
                     let msg = format!("command: {s}: invalid option");
-                    emit_wrapper_error(cmd, shell, sink, err_sink, &msg);
+                    emit_wrapper_error(cmd, shell, &msg);
                     drain_procsubs(shell, procsub_base);
                     return ExecOutcome::Continue(2);
                 }
@@ -4436,13 +4180,13 @@ fn run_exec_single_inner(
             "builtin: {}: declaration builtins must not be wrapped by `command builtin`",
             resolved.program
         );
-        emit_wrapper_error(cmd, shell, sink, err_sink, &msg);
+        emit_wrapper_error(cmd, shell, &msg);
         drain_procsubs(shell, procsub_base);
         return ExecOutcome::Continue(1);
     }
     if require_builtin && !builtins::is_builtin(&resolved.program) {
         let msg = format!("builtin: {}: not a shell builtin", resolved.program);
-        emit_wrapper_error(cmd, shell, sink, err_sink, &msg);
+        emit_wrapper_error(cmd, shell, &msg);
         drain_procsubs(shell, procsub_base);
         return ExecOutcome::Continue(1);
     }
@@ -4466,7 +4210,7 @@ fn run_exec_single_inner(
     // targets (regular builtins and externals). Persistent-scope targets
     // (control builtins, special builtins per POSIX 2.14, and functions per
     // POSIX 2.9.1) skip the restore step.
-    let snap = match apply_inline_assignments(&cmd.inline_assignments, shell, sink, err_sink) {
+    let snap = match apply_inline_assignments(&cmd.inline_assignments, shell) {
         Ok(s) => s,
         Err(s) => {
             restore_inline_assignments(s, shell);
@@ -4585,7 +4329,7 @@ fn run_exec_single_inner(
                 let RedirOp::File { mode, target: word } = &redir.op else {
                     continue;
                 };
-                let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
+                let path = match expand_single(word, shell, &mut *err_writer()) {
                     Ok(p) => p,
                     Err(()) => {
                         refused_redirect = true;
@@ -4596,7 +4340,7 @@ fn run_exec_single_inner(
                     RedirFd::Var(name) => name.as_str(),
                     _ => path.as_str(),
                 };
-                if check_restricted_redirect(mode, &path, subject, shell, sink, err_sink).is_err() {
+                if check_restricted_redirect(mode, &path, subject, shell).is_err() {
                     refused_redirect = true;
                     break;
                 }
@@ -4610,7 +4354,7 @@ fn run_exec_single_inner(
                 && match shell.policy.check(crate::policy::Op::Exec) {
                     Ok(()) => false,
                     Err(msg) => {
-                        let mut err = err_writer(err_sink, sink);
+                        let mut err = err_writer();
                         crate::sh_error_to!(shell, &mut *err, None, "{msg}");
                         true
                     }
@@ -4624,7 +4368,7 @@ fn run_exec_single_inner(
             drain_procsubs(shell, procsub_base);
             return ExecOutcome::Continue(1);
         }
-        let outcome = run_exec_builtin(&resolved, cmd, shell, sink, err_sink);
+        let outcome = run_exec_builtin(&resolved, cmd, shell);
         // POSIX case #1: `exec -z` (bad option) exits a non-interactive posix
         // shell. A `command exec`/`builtin exec` wrapper strips it (matches bash).
         // exec returns early here (it never reaches the post-dispatch consume), so
@@ -4656,7 +4400,7 @@ fn run_exec_single_inner(
         .check(crate::policy::Op::CommandName(&resolved.program))
     {
         {
-            let mut err = err_writer(err_sink, sink);
+            let mut err = err_writer();
             crate::sh_error_to!(shell, &mut *err, None, "{msg}");
         }
         finalize_inline_scope(snap, persistent, shell);
@@ -4674,23 +4418,17 @@ fn run_exec_single_inner(
         // exactly like compounds/externals. Control builtins persist their inline
         // assignments (POSIX special-builtin), so no restore on the redirect-open
         // failure path inside the helper.
-        run_builtin_with_redirects(&resolved, &cmd.redirects, shell, sink, err_sink)
+        run_builtin_with_redirects(&resolved, &cmd.redirects, shell)
     } else if !bypass_functions && let Some(body) = shell.functions.get(&resolved.program).cloned()
     {
         let name = resolved.program.clone();
         let args = resolved.args;
         if has_any_redirect(cmd) {
-            with_redirect_scope(
-                &cmd.redirects,
-                shell,
-                sink,
-                err_sink,
-                move |shell, inner_sink, inner_err_sink| {
-                    call_function(&name, body, args, shell, inner_sink, inner_err_sink)
-                },
-            )
+            with_redirect_scope(&cmd.redirects, shell, move |shell| {
+                call_function(&name, body, args, shell)
+            })
         } else {
-            call_function(&name, body, args, shell, sink, err_sink)
+            call_function(&name, body, args, shell)
         }
     // eval/source must run their commands with the ENCLOSING sink (so `$(eval …)`
     // / `$(source …)` captures the output) and honour redirects — like a function
@@ -4700,33 +4438,21 @@ fn run_exec_single_inner(
     } else if resolved.program == "eval" {
         let args = resolved.args;
         if has_any_redirect(cmd) {
-            with_redirect_scope(
-                &cmd.redirects,
-                shell,
-                sink,
-                err_sink,
-                move |shell, inner_sink, inner_err_sink| {
-                    builtins::eval_in_sink(&args, shell, inner_sink, inner_err_sink)
-                },
-            )
+            with_redirect_scope(&cmd.redirects, shell, move |shell| {
+                builtins::eval_in_sink(&args, shell)
+            })
         } else {
-            builtins::eval_in_sink(&args, shell, sink, err_sink)
+            builtins::eval_in_sink(&args, shell)
         }
     } else if resolved.program == "source" || resolved.program == "." {
         let args = resolved.args;
         let invoked = resolved.program.clone();
         if has_any_redirect(cmd) {
-            with_redirect_scope(
-                &cmd.redirects,
-                shell,
-                sink,
-                err_sink,
-                move |shell, inner_sink, inner_err_sink| {
-                    builtins::source_in_sink(&args, &invoked, shell, inner_sink, inner_err_sink)
-                },
-            )
+            with_redirect_scope(&cmd.redirects, shell, move |shell| {
+                builtins::source_in_sink(&args, &invoked, shell)
+            })
         } else {
-            builtins::source_in_sink(&args, &invoked, shell, sink, err_sink)
+            builtins::source_in_sink(&args, &invoked, shell)
         }
     } else if builtins::builtin_active(&resolved.program, shell) {
         // v156 task 7: ALL redirects flow through one ordered RedirectScope (via
@@ -4735,7 +4461,7 @@ fn run_exec_single_inner(
         // honor source order and fd>2 uniformly — no more last-wins bridge. On a
         // redirect-open failure the helper rolls back and returns Continue(1); we
         // still owe the inline-assignment restore for temporary-scope targets.
-        run_builtin_with_redirects(&resolved, &cmd.redirects, shell, sink, err_sink)
+        run_builtin_with_redirects(&resolved, &cmd.redirects, shell)
     } else {
         // v156 task 4: lower the FULL ordered redirect list (on the original
         // ExecCommand, not the bridged ResolvedCommand) into a child replay plan.
@@ -4743,8 +4469,8 @@ fn run_exec_single_inner(
         // in the parent here; the child replays the dup2/close ops in source
         // order. This handles fd>2,
         // `<&` dup-in, `N>&-` close, and `<>` uniformly with fds 0/1/2.
-        match build_child_redir_plan(&cmd.redirects, shell, sink, err_sink) {
-            Ok(plan) => run_subprocess(&resolved, plan, shell, sink, err_sink),
+        match build_child_redir_plan(&cmd.redirects, shell) {
+            Ok(plan) => run_subprocess(&resolved, plan, shell),
             Err(code) => {
                 finalize_inline_scope(snap, persistent, shell);
                 drain_procsubs(shell, procsub_base);
@@ -4894,12 +4620,7 @@ unsafe fn restore_exec_signals(prev: [libc::sighandler_t; 3]) {
 /// originals instead of restoring them. A redirect that fails to open prints a
 /// diagnostic, rolls back any already-applied redirects (the scope's Drop), and
 /// returns `Err` (atomic: all-or-nothing).
-fn apply_redirects_permanently(
-    cmd: &ExecCommand,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> Result<(), ()> {
+fn apply_redirects_permanently(cmd: &ExecCommand, shell: &mut Shell) -> Result<(), ()> {
     let mut scope = RedirectScope::new();
 
     // Resolve-then-apply each redirection INTERLEAVED in source order via the
@@ -4908,10 +4629,7 @@ fn apply_redirects_permanently(
     // uniformly. On failure, `scope` Drop rolls back any already-applied
     // redirects atomically (temporary semantics) and we return Err(()) to the
     // caller.
-    if scope
-        .apply_redirects(&cmd.redirects, shell, sink, err_sink)
-        .is_err()
-    {
+    if scope.apply_redirects(&cmd.redirects, shell).is_err() {
         // scope Drop restores the partially-applied redirects (atomic rollback).
         return Err(());
     }
@@ -4957,14 +4675,12 @@ fn run_exec_builtin(
     resolved: &ResolvedCommand,
     cmd: &ExecCommand,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     let flags = match parse_exec_flags(&resolved.args) {
         Ok(f) => f,
         Err(msg) => {
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "{msg}");
             }
             // POSIX case #1: bad option is a usage error (the exec interception
@@ -4987,7 +4703,7 @@ fn run_exec_builtin(
     };
     if has_any_redirect(cmd) {
         flush_stdout();
-        if apply_redirects_permanently(cmd, shell, sink, err_sink).is_err() {
+        if apply_redirects_permanently(cmd, shell).is_err() {
             return ExecOutcome::Continue(1);
         }
     }
@@ -5008,7 +4724,7 @@ fn run_exec_builtin(
                 ("not found", 127)
             };
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "exec: {name}: {msg}");
             }
             return exit_or_continue(code, shell);
@@ -5046,7 +4762,7 @@ fn run_exec_builtin(
         _ => 126, // EACCES / ENOEXEC / EISDIR / etc.: "cannot execute".
     };
     {
-        let mut errw = err_writer(err_sink, sink);
+        let mut errw = err_writer();
         crate::sh_error_to!(shell, &mut *errw, None, "exec: {name}: {err}");
     }
     exit_or_continue(code, shell)
@@ -5189,8 +4905,6 @@ fn relocate_high_cloexec(fd: RawFd) -> RawFd {
 fn lower_one_redirect(
     redir: &Redirection,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
     mut fd_state: Option<&mut std::collections::HashMap<RawFd, bool>>,
 ) -> Result<Vec<PlanOp>, i32> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -5202,7 +4916,7 @@ fn lower_one_redirect(
                 Ok(n) if n >= 0 => n,
                 _ => {
                     {
-                        let mut err = err_writer(err_sink, sink);
+                        let mut err = err_writer();
                         crate::sh_error_to!(shell, &mut *err, None, "{name}: ambiguous redirect");
                     }
                     return Err(1);
@@ -5225,13 +4939,13 @@ fn lower_one_redirect(
         let mut dup_source_word: Option<&crate::lexer::Word> = None;
         match &redir.op {
             RedirOp::File { mode, target: word } => {
-                let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
+                let path = match expand_single(word, shell, &mut *err_writer()) {
                     Ok(p) => p,
                     Err(()) => return Err(1),
                 };
                 // `{name}> f`: bash names the VARIABLE in the restricted
                 // diagnostic, not the resolved file.
-                if check_restricted_redirect(mode, &path, name, shell, sink, err_sink).is_err() {
+                if check_restricted_redirect(mode, &path, name, shell).is_err() {
                     return Err(1);
                 }
                 // RawLow: the {var}-fd relocation happens once below via dup_to_high_fd.
@@ -5243,13 +4957,13 @@ fn lower_one_redirect(
                 ) {
                     Ok(fd) => owned_src = Some(fd),
                     Err(e) => {
-                        redir_open_error(shell, err_sink, sink, &path, &e);
+                        redir_open_error(shell, &path, &e);
                         return Err(1);
                     }
                 }
             }
             RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
-                let src = resolve_dup_source(source, shell, sink, err_sink).map_err(|()| 1)?;
+                let src = resolve_dup_source(source, shell).map_err(|()| 1)?;
                 dup_src = Some(src);
                 dup_source_word = Some(source);
             }
@@ -5262,7 +4976,7 @@ fn lower_one_redirect(
                     }
                     Err(e) => {
                         {
-                            let mut err = err_writer(err_sink, sink);
+                            let mut err = err_writer();
                             crate::sh_error_to!(
                                 shell,
                                 &mut *err,
@@ -5285,7 +4999,7 @@ fn lower_one_redirect(
                     }
                     Err(e) => {
                         {
-                            let mut err = err_writer(err_sink, sink);
+                            let mut err = err_writer();
                             crate::sh_error_to!(
                                 shell,
                                 &mut *err,
@@ -5314,7 +5028,7 @@ fn lower_one_redirect(
             // let the normal validation emit the second (line-prefixed) and return Err.
             if !validate_source_is_open(s, fd_state.as_deref()) {
                 {
-                    let mut err = err_writer(err_sink, sink);
+                    let mut err = err_writer();
                     crate::sh_error_noline_to!(
                         shell,
                         &mut *err,
@@ -5324,7 +5038,7 @@ fn lower_one_redirect(
                     );
                 }
             }
-            validate_source(s, fd_state.as_deref(), shell, sink, err_sink, &label)?;
+            validate_source(s, fd_state.as_deref(), shell, &label)?;
         }
         let raw_src: RawFd = match (&owned_src, dup_src) {
             (Some(o), _) => o.as_raw_fd(),
@@ -5336,7 +5050,7 @@ fn lower_one_redirect(
             Err(e) => {
                 // owned_src drops here (closes it); a dup_src is the shell's, left open.
                 {
-                    let mut err = err_writer(err_sink, sink);
+                    let mut err = err_writer();
                     crate::sh_error_to!(
                         shell,
                         &mut *err,
@@ -5395,7 +5109,7 @@ fn lower_one_redirect(
     // #152); a future reader should not puzzle over why it wasn't updated.
     let Some(target) = redir.target_fd() else {
         {
-            let mut err = err_writer(err_sink, sink);
+            let mut err = err_writer();
             crate::sh_error_to!(shell, &mut *err, None, "ambiguous redirect");
         }
         return Err(1);
@@ -5403,11 +5117,11 @@ fn lower_one_redirect(
     let target = target as RawFd;
     match &redir.op {
         RedirOp::File { mode, target: word } => {
-            let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
+            let path = match expand_single(word, shell, &mut *err_writer()) {
                 Ok(p) => p,
                 Err(()) => return Err(1),
             };
-            if check_restricted_redirect(mode, &path, &path, shell, sink, err_sink).is_err() {
+            if check_restricted_redirect(mode, &path, &path, shell).is_err() {
                 return Err(1);
             }
             let owned = match open_redirect_file(
@@ -5418,7 +5132,7 @@ fn lower_one_redirect(
             ) {
                 Ok(fd) => fd,
                 Err(e) => {
-                    redir_open_error(shell, err_sink, sink, &path, &e);
+                    redir_open_error(shell, &path, &e);
                     return Err(1);
                 }
             };
@@ -5432,7 +5146,7 @@ fn lower_one_redirect(
         }
         RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
             let is_move = matches!(&redir.op, RedirOp::Move { .. });
-            let src = match resolve_dup_source(source, shell, sink, err_sink) {
+            let src = match resolve_dup_source(source, shell) {
                 Ok(n) => n,
                 Err(()) => return Err(1),
             };
@@ -5445,9 +5159,7 @@ fn lower_one_redirect(
                 // raw source word (`>&$v` -> `$v: Bad file descriptor`); a numeric
                 // literal (`>&9`) reconstructs back to its own number, unchanged.
                 let label = crate::expand::reconstruct_word_source(source);
-                if let Err(code) =
-                    validate_source(src, fd_state.as_deref(), shell, sink, err_sink, &label)
-                {
+                if let Err(code) = validate_source(src, fd_state.as_deref(), shell, &label) {
                     return Err(code);
                 }
                 ops.push(PlanOp::InstallDup {
@@ -5488,7 +5200,7 @@ fn lower_one_redirect(
                 }
                 Err(e) => {
                     {
-                        let mut err = err_writer(err_sink, sink);
+                        let mut err = err_writer();
                         crate::sh_error_to!(
                             shell,
                             &mut *err,
@@ -5519,7 +5231,7 @@ fn lower_one_redirect(
                 }
                 Err(e) => {
                     {
-                        let mut err = err_writer(err_sink, sink);
+                        let mut err = err_writer();
                         crate::sh_error_to!(
                             shell,
                             &mut *err,
@@ -5542,12 +5254,7 @@ fn lower_one_redirect(
 /// through each item so a same-plan dup source (e.g. `3>g 4>&3`) validates
 /// correctly. On any error it closes every fd opened so far (dropping
 /// `plan.ops`) and returns Err(code) with the diagnostic already printed.
-fn lower_redirects(
-    redirects: &[Redirection],
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> Result<RedirPlan, i32> {
+fn lower_redirects(redirects: &[Redirection], shell: &mut Shell) -> Result<RedirPlan, i32> {
     // Snapshot every `{var}` name a redirect in this batch will assign. During
     // lowering `lower_one_redirect` sets `$name` to the virtual fd so a later
     // sibling `2>&$v` resolves against it (#140d), but bash does NOT persist a
@@ -5572,7 +5279,7 @@ fn lower_redirects(
     let mut fd_state: std::collections::HashMap<RawFd, bool> = std::collections::HashMap::new();
     let mut plan = RedirPlan { ops: Vec::new() };
     for redir in redirects {
-        match lower_one_redirect(redir, shell, sink, err_sink, Some(&mut fd_state)) {
+        match lower_one_redirect(redir, shell, Some(&mut fd_state)) {
             Ok(ops) => plan.ops.extend(ops),
             Err(code) => {
                 // Dropping `plan.ops` closes every fd opened so far (heredoc
@@ -5593,12 +5300,8 @@ fn lower_redirects(
 fn build_child_redir_plan(
     redirects: &[Redirection],
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
 ) -> Result<ChildRedirPlan, i32> {
-    Ok(redir_plan_to_child(lower_redirects(
-        redirects, shell, sink, err_sink,
-    )?))
+    Ok(redir_plan_to_child(lower_redirects(redirects, shell)?))
 }
 
 /// Translate a neutral `RedirPlan` into the child dup2/close replay plan. Owned
@@ -5659,13 +5362,7 @@ fn redir_plan_to_child(plan: RedirPlan) -> ChildRedirPlan {
 /// write into the stdout capture buffer instead, so a `$(cmd 2>&1)` still
 /// sees the diagnostic. Mirrors `run_builtin_with_redirects`'s in-memory
 /// `route_err_to_out` (v205/L-25) for this one pre-fork external-command site.
-fn emit_exec_spawn_diag(
-    shell: &Shell,
-    _sink: &mut StdoutSink,
-    _err_sink: &mut StderrSink,
-    stderr_follows_stdout: bool,
-    body: std::fmt::Arguments,
-) {
+fn emit_exec_spawn_diag(shell: &Shell, stderr_follows_stdout: bool, body: std::fmt::Arguments) {
     // This diagnostic is emitted IN-PROCESS by the parent (the fork/exec never
     // happened), so a `#[cfg(test)]` capture can intercept it. Under a trailing
     // `2>&1` (fd 2 → fd 1) route it to the captured stdout so `$(cmd 2>&1)` sees
@@ -5693,10 +5390,8 @@ fn run_subprocess(
     cmd: &ResolvedCommand,
     mut plan: ChildRedirPlan,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
-    let interactive = shell.job_control_active() && matches!(sink, StdoutSink::Terminal);
+    let interactive = shell.job_control_active();
 
     let mut process = ProcessCommand::new(&cmd.program);
     process.args(&cmd.args);
@@ -5837,7 +5532,7 @@ fn run_subprocess(
                             .map(|j| crate::jobs::notification_line(j, '+'))
                             .unwrap_or_default();
                         {
-                            let mut err = err_writer(err_sink, sink);
+                            let mut err = err_writer();
                             e!(&mut *err, "\n{line}");
                         }
                         // The command was STOPPED: its process substitutions are
@@ -5894,7 +5589,7 @@ fn run_subprocess(
                     }
                     Err(e) => {
                         {
-                            let mut err = err_writer(err_sink, sink);
+                            let mut err = err_writer();
                             crate::sh_error_to!(
                                 shell,
                                 &mut *err,
@@ -5915,8 +5610,6 @@ fn run_subprocess(
             // precedes the phrase; error_prefix supplies the prologue + mode split).
             emit_exec_spawn_diag(
                 shell,
-                sink,
-                err_sink,
                 stderr_follows_stdout,
                 format_args!("{}: command not found", cmd.program),
             );
@@ -5925,8 +5618,6 @@ fn run_subprocess(
         Err(e) => {
             emit_exec_spawn_diag(
                 shell,
-                sink,
-                err_sink,
                 stderr_follows_stdout,
                 format_args!("{}: {}", cmd.program, crate::bash_io_error(&e)),
             );
@@ -5979,13 +5670,7 @@ struct SpawnedPipeline {
 /// NAME[1] (write), publish NAME_PID, $!, and a job. Returns 0 on a successful
 /// spawn (the coproc runs asynchronously), 1 on pipe/fork failure. coproc
 /// ALWAYS forks (no builtin/function fast-path).
-fn run_coproc(
-    name: &str,
-    body: &Command,
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
+fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
     // The parser accepts ANY single non-keyword word as the coproc NAME (bash's
     // grammar `coproc WORD compound-command`) and defers the valid-identifier
     // check to here (RUNTIME), matching bash: `coproc @ { :; }` parses, then at
@@ -5993,7 +5678,7 @@ fn run_coproc(
     // coprocess (exit status 1, body not run).
     if !crate::builtins::is_valid_name(name) {
         {
-            let mut err = err_writer(err_sink, sink);
+            let mut err = err_writer();
             crate::sh_error_to!(shell, &mut *err, None, "`{}': not a valid identifier", name);
         }
         return ExecOutcome::Continue(1);
@@ -6001,7 +5686,7 @@ fn run_coproc(
     // v157 single-active: warn (but proceed) if a coproc is already live.
     if let Some(existing) = shell.coprocs.first() {
         {
-            let mut err = err_writer(err_sink, sink);
+            let mut err = err_writer();
             crate::sh_error_to!(
                 shell,
                 &mut *err,
@@ -6019,7 +5704,7 @@ fn run_coproc(
         Ok(p) => p,
         Err(e) => {
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(
                     shell,
                     &mut *err,
@@ -6039,7 +5724,7 @@ fn run_coproc(
                 libc::close(in_w);
             }
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(
                     shell,
                     &mut *err,
@@ -6076,7 +5761,7 @@ fn run_coproc(
                 libc::close(out_r);
             }
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(
                     shell,
                     &mut *err,
@@ -6098,7 +5783,7 @@ fn run_coproc(
                 libc::close(in_w);
             }
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(
                     shell,
                     &mut *err,
@@ -6118,7 +5803,7 @@ fn run_coproc(
                 libc::close(in_w);
             }
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(
                     shell,
                     &mut *err,
@@ -6173,8 +5858,6 @@ fn spawn_pipeline(
     commands: &[Command],
     mode: SpawnMode,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
 ) -> Result<SpawnedPipeline, ExecOutcome> {
     // Job-control process-grouping is only correct in the top-level shell. Inside
     // a forked subshell it places the inner pipeline in a background process group
@@ -6182,7 +5865,7 @@ fn spawn_pipeline(
     // controlling terminal (M-104). A subshell's inner pipeline uses the
     // non-job-control path (stages stay in the subshell's pgrp), matching bash.
     let job_control = shell.job_control_active();
-    let interactive = job_control && matches!(sink, StdoutSink::Terminal);
+    let interactive = job_control;
     // Mode-aware process-grouping predicate. Foreground groups the pipeline only
     // when it owns the terminal (`interactive`); background groups whenever job
     // control is active (it never owns the terminal, but the job still needs its
@@ -6207,8 +5890,7 @@ fn spawn_pipeline(
     // are all out of scope here.
     let lastpipe = mode == SpawnMode::Foreground
         && shell.shopt_options.get("lastpipe").unwrap_or(false)
-        && !job_control
-        && matches!(sink, StdoutSink::Terminal);
+        && !job_control;
 
     // lastpipe: the in-process last stage's resolved stdin fd, preserved
     // through the parent bulk-close below.
@@ -6242,8 +5924,9 @@ fn spawn_pipeline(
     // bare multi-stage pipeline / interactive.
     let stage0_default: ChildFd = match mode {
         SpawnMode::Foreground => ChildFd::Inherit,
-        SpawnMode::Background => async_default_stdin(commands.len() > 1, shell, sink, err_sink)
-            .map_err(|()| ExecOutcome::Continue(1))?,
+        SpawnMode::Background => {
+            async_default_stdin(commands.len() > 1, shell).map_err(|()| ExecOutcome::Continue(1))?
+        }
     };
 
     // Snapshot the procsub stack before any stage word expansion. Process
@@ -6304,7 +5987,7 @@ fn spawn_pipeline(
                     }
                     Err(e) => {
                         {
-                            let mut err = err_writer(err_sink, sink);
+                            let mut err = err_writer();
                             crate::sh_error_to!(
                                 shell,
                                 &mut *err,
@@ -6336,7 +6019,7 @@ fn spawn_pipeline(
                 Ok(c) => c,
                 Err(e) => {
                     {
-                        let mut err = err_writer(err_sink, sink);
+                        let mut err = err_writer();
                         crate::sh_error_to!(
                             shell,
                             &mut *err,
@@ -6388,7 +6071,7 @@ fn spawn_pipeline(
                 }
                 Err(e) => {
                     {
-                        let mut err = err_writer(err_sink, sink);
+                        let mut err = err_writer();
                         crate::sh_error_to!(
                             shell,
                             &mut *err,
@@ -6417,7 +6100,7 @@ fn spawn_pipeline(
             } else {
                 &[]
             };
-        let snap = match apply_inline_assignments(inline_assignments, shell, sink, err_sink) {
+        let snap = match apply_inline_assignments(inline_assignments, shell) {
             Ok(s) => s,
             Err(s) => {
                 restore_inline_assignments(s, shell);
@@ -6476,7 +6159,7 @@ fn spawn_pipeline(
                     if let Some(r) = prev {
                         parent_held.retain(|&fd| fd != r);
                     }
-                    let expanded = expand_single(word, shell, &mut *err_writer(err_sink, sink));
+                    let expanded = expand_single(word, shell, &mut *err_writer());
                     match expanded {
                         Err(()) => {
                             // #145: ambiguous-redirect / expansion failure on this
@@ -6504,7 +6187,7 @@ fn spawn_pipeline(
                                 ChildFd::from(f)
                             }
                             Err(e) => {
-                                redir_open_error(shell, err_sink, sink, &path, &e);
+                                redir_open_error(shell, &path, &e);
                                 // #145: fail ONLY this stage; hand the previous
                                 // stage's pipe read-end to the exit-1 dummy (holds
                                 // it until _exit, matching bash's failed stage).
@@ -6536,7 +6219,7 @@ fn spawn_pipeline(
                         Ok(r) => unsafe { ChildFd::owned_raw(r) },
                         Err(e) => {
                             {
-                                let mut err = err_writer(err_sink, sink);
+                                let mut err = err_writer();
                                 crate::sh_error_to!(
                                     shell,
                                     &mut *err,
@@ -6575,7 +6258,7 @@ fn spawn_pipeline(
                         Ok(r) => unsafe { ChildFd::owned_raw(r) },
                         Err(e) => {
                             {
-                                let mut err = err_writer(err_sink, sink);
+                                let mut err = err_writer();
                                 crate::sh_error_to!(
                                     shell,
                                     &mut *err,
@@ -6608,7 +6291,7 @@ fn spawn_pipeline(
                             Ok(c) => c,
                             Err(e) => {
                                 {
-                                    let mut err = err_writer(err_sink, sink);
+                                    let mut err = err_writer();
                                     crate::sh_error_to!(
                                         shell,
                                         &mut *err,
@@ -6642,7 +6325,7 @@ fn spawn_pipeline(
                     Ok(c) => c,
                     Err(e) => {
                         {
-                            let mut err = err_writer(err_sink, sink);
+                            let mut err = err_writer();
                             crate::sh_error_to!(
                                 shell,
                                 &mut *err,
@@ -6725,7 +6408,7 @@ fn spawn_pipeline(
                 if exec.line != 0 {
                     shell.current_lineno = shell.line_base() + exec.line;
                 }
-                match build_child_redir_plan(&exec.redirects, shell, sink, err_sink) {
+                match build_child_redir_plan(&exec.redirects, shell) {
                     Ok(p) => Some(p),
                     Err(_) => {
                         // #145: error already reported by build_child_redir_plan;
@@ -6754,7 +6437,7 @@ fn spawn_pipeline(
                 }
                 Err(e) => {
                     {
-                        let mut err = err_writer(err_sink, sink);
+                        let mut err = err_writer();
                         crate::sh_error_to!(
                             shell,
                             &mut *err,
@@ -6857,8 +6540,6 @@ fn spawn_pipeline(
                 StageKind::External(simple) => spawn_external_with_fds(
                     simple,
                     shell,
-                    sink,
-                    err_sink,
                     child_stdio,
                     pgid_target,
                     &fds_to_close_in_child,
@@ -6878,7 +6559,7 @@ fn spawn_pipeline(
                 Ok(p) => p,
                 Err(e) => {
                     {
-                        let mut err = err_writer(err_sink, sink);
+                        let mut err = err_writer();
                         crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e));
                     }
                     // child_stdio (with all owned stdio fds) was consumed by the
@@ -6947,19 +6628,14 @@ fn spawn_pipeline(
 /// Foreground pipeline: spawn every stage via `spawn_pipeline`, then drain any
 /// capture pipes, hand back the terminal, wait for all stages (setting
 /// `$PIPESTATUS`), and drain process substitutions.
-fn run_multi_stage(
-    commands: &[Command],
-    shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
-) -> ExecOutcome {
-    let interactive = shell.job_control_active() && matches!(sink, StdoutSink::Terminal);
+fn run_multi_stage(commands: &[Command], shell: &mut Shell) -> ExecOutcome {
+    let interactive = shell.job_control_active();
     let SpawnedPipeline {
         first_pid,
         stages,
         pgid_target: _,
         procsub_base,
-    } = match spawn_pipeline(commands, SpawnMode::Foreground, shell, sink, err_sink) {
+    } = match spawn_pipeline(commands, SpawnMode::Foreground, shell) {
         Ok(sp) => sp,
         Err(outcome) => return outcome,
     };
@@ -6993,11 +6669,8 @@ fn run_multi_stage(
             // Handles an already-closed fd 0 (`exec 0<&-`): `dup(0)` fails
             // EBADF, `RedirectScope` records the saved slot as -1, and Drop
             // closes fd 0 back to unopened afterward — see `redirect`'s doc.
-            if scope
-                .redirect(shell, stdin_fd, libc::STDIN_FILENO, sink, err_sink)
-                .is_ok()
-            {
-                let outcome = run_command(&commands[commands.len() - 1], shell, sink, err_sink);
+            if scope.redirect(shell, stdin_fd, libc::STDIN_FILENO).is_ok() {
+                let outcome = run_command(&commands[commands.len() - 1], shell);
                 drop(scope); // restores (or re-closes) fd 0
                 unsafe {
                     libc::close(stdin_fd);
@@ -7034,8 +6707,6 @@ fn run_multi_stage(
         &stage_pids,
         first_pid,
         shell,
-        sink,
-        err_sink,
         interactive,
         inproc_status,
     );
@@ -7136,8 +6807,6 @@ fn wait_pipeline_raw(
     stage_pids: &[i32],
     first_pid: Option<i32>,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
     interactive: bool,
     inprocess_status: Option<i32>,
 ) -> PipelineWaitResult {
@@ -7197,7 +6866,7 @@ fn wait_pipeline_raw(
                         .map(|j| crate::jobs::notification_line(j, '+'))
                         .unwrap_or_default();
                     {
-                        let mut err = err_writer(err_sink, sink);
+                        let mut err = err_writer();
                         e!(&mut *err, "\n{line}");
                     }
                     return PipelineWaitResult::Stopped(sig);
@@ -7287,8 +6956,6 @@ struct AssignmentSnapshot {
 fn apply_inline_assignments(
     assignments: &[crate::command::Assignment],
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
 ) -> Result<AssignmentSnapshot, AssignmentSnapshot> {
     let mut snap = AssignmentSnapshot {
         vars: Vec::with_capacity(assignments.len()),
@@ -7320,7 +6987,7 @@ fn apply_inline_assignments(
         // For namerefs, skip the early readonly check; assign() checks the resolved target.
         if !shell.is_nameref(name) && shell.is_readonly(name) {
             {
-                let mut err = err_writer(err_sink, sink);
+                let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "{name}: readonly variable");
             }
             // #234/#203: a readonly-variable error in a command PREFIX assignment
@@ -7335,7 +7002,7 @@ fn apply_inline_assignments(
             // any remaining prefixes still apply and the command still runs.
             continue;
         }
-        if apply_one_assignment(a, shell, &mut *err_writer(err_sink, sink)).is_err() {
+        if apply_one_assignment(a, shell, &mut *err_writer()).is_err() {
             return Err(snap);
         }
         // Bash semantics: inline-prefix assignments are exported for the
@@ -8098,10 +7765,8 @@ pub fn fork_and_run_in_subshell(
         // interactive job-control process-grouping (deadlocks on a tty — M-104).
         shell.in_subshell = true;
         // 8. Run the body via the existing dispatcher.
-        //    The child's stdout is now fd 1 (the dup2'd pipe end), so
-        //    StdoutSink::Terminal routes writes to the right destination.
-        let mut sink = StdoutSink::Terminal;
-        let mut err_sink = StderrSink::Terminal;
+        //    The child's stdout is now fd 1 (the dup2'd pipe end), so writes
+        //    to the real fd table land at the right destination.
         // Anti-recursion guard: when a Command::Subshell is used as a
         // pipeline stage, the pipeline forks via this helper.  If we called
         // run_command here, it would fork AGAIN.  Instead, dispatch via
@@ -8111,7 +7776,7 @@ pub fn fork_and_run_in_subshell(
         // (the common case), preserving the single-fork invariant.
         let outcome = match cmd {
             Command::Subshell { body } => execute(body, shell, "(subshell)"),
-            other => run_command(other, shell, &mut sink, &mut err_sink),
+            other => run_command(other, shell),
         };
         // 9. Translate outcome to an 8-bit exit status.
         let status: i32 = match outcome {
@@ -8375,8 +8040,6 @@ fn classify_command_runnability(program: &str, shell: &Shell) -> StageRunnabilit
 fn spawn_external_with_fds(
     cmd: &SimpleCommand,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
     stdio: ChildStdio,
     pgid_target: i32,
     parent_fds_to_close: &[RawFd],
@@ -8399,7 +8062,7 @@ fn spawn_external_with_fds(
     // Resolve (expand) the command — same path as run_exec_single / run_multi_stage.
     // A zero-field program in a pipeline stage (#62 `Ok(None)`) keeps the prior
     // behavior here: an empty program flows to the NotRunnable diagnostic below.
-    let resolved = resolve(exec, shell, &mut *err_writer(err_sink, sink))
+    let resolved = resolve(exec, shell, &mut *err_writer())
         .map_err(|code| io::Error::other(format!("resolve failed with code {code}")))?
         .unwrap_or(ResolvedCommand {
             program: String::new(),

@@ -1,7 +1,7 @@
 //! `#[cfg(test)]` thread-local output capture for the in-process unit-test
 //! capture paths (`executor::execute_capturing` and the `#[cfg(test)]`
-//! `ExecBuilder::capture`). Replaces the deleted `StdoutSink::Capture` /
-//! `StderrSink::Capture` / `StderrSink::Merged` sink variants (#197 Stage 3).
+//! `ExecBuilder::capture`). Replaces the deleted software-sink capture/merge
+//! variants (#197 Stage 3).
 //!
 //! Thread-local, so each libtest worker captures independently with NO
 //! process-global fd redirect — the production temp-file `capture()` cannot run
@@ -30,7 +30,7 @@ mod inner {
         merge: bool,
         /// Whether stderr is captured at all. When false (`execute_capturing`),
         /// `push_err` returns false so stderr falls through to the real fd 2 —
-        /// preserving the old `StderrSink::Terminal` behavior of that path.
+        /// preserving the old terminal-stderr behavior of that path.
         capture_err: bool,
     }
 
