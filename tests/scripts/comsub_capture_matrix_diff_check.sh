@@ -52,15 +52,11 @@ check 'dup-then-redir-file-external' 'x=$(/bin/sh -c "/bin/echo out; /bin/echo e
 # 6. $(<file) file read.
 check 'comsub-file-read' 'printf "abc\n" >/tmp/s0m_f; x=$(</tmp/s0m_f); printf "<%s>" "$x"'
 
-# 7. readonly-arith error captured under $(cmd 2>&1) (the #353 shape).
-# bash merges the readonly error into the capture (x="bash: ...: readonly variable").
-# huck currently leaks the error onto its own real stdout AHEAD of the printf and
-# captures nothing (x=""). Pin huck's CURRENT output; a fork-comsub change should
-# either match bash or update this pin consciously.
-# STAGE-1 TARGET (#353)
-check_pin 'readonly-arith-2>&1' 'x=$(readonly r=1; (( r++ )) 2>&1); printf "<%s>" "$x"' \
-  'target/debug/huck: line 1: r: readonly variable
-<>' '' '0'
+# 7. readonly-arith error captured under $(cmd 2>&1) (#353, FIXED by the Stage-1
+# fork): bash merges the readonly error into the capture, and huck now does too
+# (the forked child's `2>&1` is a real dup2 onto the capture pipe). Byte-identical
+# except the program-name prefix, so normalize it and assert vs bash.
+check 'readonly-arith-2>&1' 'x=$(readonly r=1; (( r++ )) 2>&1); printf "<%s>" "${x#*: }"'
 
 # 8. extra same-family cases.
 check 'plain-group'          'x=$( { echo a; } ); printf "<%s>" "$x"'
