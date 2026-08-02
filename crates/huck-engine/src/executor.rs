@@ -7620,44 +7620,45 @@ unsafe fn install_child_stdio(stdio: ChildStdio) -> [RawFd; 3] {
 pub fn capture_via_fork(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     use crate::child_fd::{ChildFd, ChildStdio};
     use std::io::Read;
-    use std::os::unix::io::FromRawFd;
+    use std::os::fd::AsRawFd;
 
-    let (read_fd, write_fd) = match crate::child_fd::make_pipe(false) {
+    let (read, write) = match crate::child_fd::make_pipe_owned(false) {
         Ok(p) => p,
         Err(e) => {
             crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
             return (String::new(), 1);
         }
     };
+    // The child needs the parent's read-end fd NUMBER for its close list (else
+    // EOF never arrives). The parent keeps ownership of `read` (the OwnedFd).
+    let read_raw = read.as_raw_fd();
     // The body runs in-process in the child via a BraceGroup (one fork total).
     let body = Command::BraceGroup(Box::new(seq.clone()));
     let stdio = ChildStdio::new(
-        ChildFd::Inherit,                        // stdin: child reads the shell's stdin
-        unsafe { ChildFd::owned_raw(write_fd) }, // stdout: pipe write-end -> fd 1
-        ChildFd::Inherit,                        // stderr: terminal unless an inner 2>&1
+        ChildFd::Inherit,     // stdin: child reads the shell's stdin
+        ChildFd::from(write), // stdout: pipe write-end -> fd 1 (ownership -> child stdio)
+        ChildFd::Inherit,     // stderr: terminal unless an inner 2>&1
     );
     // Child closes the parent's read end (else EOF never arrives).
-    let pid = match fork_and_run_in_subshell(&body, shell, stdio, NO_PGROUP, &[read_fd], None, None)
-    {
-        Ok(pid) => pid,
-        Err(e) => {
-            // `write_fd` was owned by the moved `ChildStdio` and is already
-            // closed (RAII) by `fork_and_run_in_subshell` on its error return;
-            // close only the parent-kept read end here.
-            unsafe {
-                libc::close(read_fd);
+    let pid =
+        match fork_and_run_in_subshell(&body, shell, stdio, NO_PGROUP, &[read_raw], None, None) {
+            Ok(pid) => pid,
+            Err(e) => {
+                // `write` was owned by the moved `ChildStdio` and is already
+                // closed (RAII) by `fork_and_run_in_subshell` on its error
+                // return; the parent-kept `read` OwnedFd drops here, closing the
+                // read end — no manual close needed.
+                crate::sh_error!(shell, None, "fork: {}", crate::bash_io_error(&e));
+                return (String::new(), 1);
             }
-            crate::sh_error!(shell, None, "fork: {}", crate::bash_io_error(&e));
-            return (String::new(), 1);
-        }
-    };
-    // PARENT: `write_fd` (the pipe write end) was owned by the moved `ChildStdio`
+        };
+    // PARENT: `write` (the pipe write end) was owned by the moved `ChildStdio`
     // and is already closed by the fork helper's RAII drop in the parent, so the
-    // read end below sees EOF when the child exits — do NOT close it again.
+    // read end below sees EOF when the child exits.
     let mut buf: Vec<u8> = Vec::new();
     {
-        let mut f = unsafe { std::fs::File::from_raw_fd(read_fd) };
-        let _ = f.read_to_end(&mut buf); // f drops -> closes read_fd
+        let mut f = std::fs::File::from(read);
+        let _ = f.read_to_end(&mut buf); // f drops -> closes the read end
     }
     let mut raw: libc::c_int = 0;
     unsafe {
