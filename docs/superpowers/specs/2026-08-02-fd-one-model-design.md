@@ -131,6 +131,31 @@ real-fd subshell + drain-to-EOF + `waitpid`) as above, and `$(<file)` is split o
 first as a direct file read. **What dissolves by construction:** #195, #353, and the
 capture side of #77/#30. Highest value, highest risk → most verification.
 
+#### Stage-1 targets (pinned by Stage 0)
+
+The Stage 0 harnesses (Task 5) surveyed the capture combinations. Every case
+matched bash on the current tree **except** these, pinned to current huck as
+`check_pin` — the precise, pre-agreed change-set Stage 1 must flip green:
+
+- **#353** — `comsub_capture_matrix`, case `readonly-arith-2>&1`
+  (`x=$(readonly r=1; (( r++ )) 2>&1)`): bash captures the readonly-var error into
+  `x` (out `<…readonly variable>`, rc 0); huck leaks it onto its own real stdout
+  *ahead* of the capture and captures nothing. **Forking fixes it by construction**
+  (the child's stderr→`2>&1`→pipe is real).
+- **#195** — the still-diverging shape is the **compound-group**
+  `{ …; } 2>&1 >file` inside `$()`, already pinned in the existing
+  `comsub_merge_stderr_diff_check.sh`. Note: Stage 0 found the *bare-simple-command*
+  `>file 2>&1` / `2>&1 >file` orderings **already match** bash — so Stage 1's #195
+  scope is specifically the compound-group ordering.
+
+Two further pins are **orthogonal** to the fork (documented so Stage 1 leaves them
+alone, not fork targets):
+
+- **#387** — brace expansion capped at 65536 elements (a parse-time error where bash
+  expands); surfaced by a `{1..70000}` test case, unrelated to comsub plumbing.
+- **comsub `trap` listing** — a comsub's `trap` (no args) output omits bash's default
+  `trap -- '' SIGTSTP` row; a subshell trap-listing detail, not fd routing.
+
 ### Stage 2 — Temp-file the embedder boundary
 
 Convert `ExecBuilder::capture`/`run_with_sinks`/`run_with_sinks_tee` to redirect the
