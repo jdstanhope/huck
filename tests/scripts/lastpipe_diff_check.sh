@@ -10,15 +10,12 @@
 # Each fragment turns lastpipe on with `shopt -s lastpipe` and runs at the
 # top level (a Terminal-sink, non-interactive script — matching the gate).
 #
-# NOTE (dropped fragment): `shopt -s lastpipe; echo "cap:$(echo a b c | read
-# z; echo "[$z]")"` diverges — inside `$()` bash still runs the pipeline in
-# the subshell created for the command substitution, so `read z` persists
-# WITHIN that subshell and bash prints `cap:[a b c]`. huck's lastpipe gate
-# requires `StdoutSink::Terminal`, which a capture context is not, so huck
-# forks the last stage as before and prints `cap:[]`. Capture-context
-# lastpipe is an intentional follow-up (not filed as of this iteration) —
-# see docs/superpowers/plans/2026-07-26-lastpipe.md Task 2. Verified against
-# real bash 5.2.21 before locking in every fragment below.
+# NOTE (#307, FIXED by the #197 one-model arc): lastpipe INSIDE `$()` now works.
+# Before, huck's lastpipe gate required `StdoutSink::Terminal`, which a capture
+# context was not, so huck forked the last stage and printed `[]`. Now `$()`
+# forks a real subshell (Stage 1) and the software-sink gate is gone (Stage 3),
+# so the last stage runs in the comsub's subshell and `read z` persists there,
+# matching bash. Locked in as the `lastpipe in comsub` cases below.
 set -u
 
 HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
@@ -47,6 +44,14 @@ check() {
 # ---- variable persistence -------------------------------------------------
 
 # 1. `read` as the last stage: $foo persists after the pipeline (bash: "a b c").
+# #307: lastpipe inside a command substitution (the once-dropped fragment).
+check "in comsub read" \
+      'shopt -s lastpipe; echo "cap:$(echo a b c | read z; echo "[$z]")"'
+check "in comsub while" \
+      'shopt -s lastpipe; echo "$(seq 3 | while read n; do echo "n$n"; done)"'
+check "in comsub assign" \
+      'shopt -s lastpipe; x=$(printf "%s\n" 1 2 3 | { read a; read b; echo "$a-$b"; }); echo "$x"'
+
 check "persist read" \
       'shopt -s lastpipe; echo a b c | read foo; echo "foo=$foo"'
 
