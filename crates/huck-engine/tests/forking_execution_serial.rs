@@ -31,7 +31,6 @@ use huck_engine::Engine;
 fn forking_execution_scenarios() {
     subshell_stdout_and_stderr_captured_separately();
     nested_subshell_forks_single_threaded_without_tripping_the_guard();
-    pipeline_last_stage_dispatches_on_stdout_line();
     subshell_pipeline_stage_writes_through_the_pipe();
     background_assignment_does_not_leak_to_parent();
     background_pure_builtin_sets_bang_pid();
@@ -55,17 +54,6 @@ fn nested_subshell_forks_single_threaded_without_tripping_the_guard() {
     let mut e = Engine::new();
     let out = e.capture("( ( echo deep ) )");
     assert_eq!(out.stdout, "deep\n");
-}
-
-/// engine::tests::on_stdout_line_pipeline_last_stage — the on_stdout_line
-/// callback fires for a pipeline's last stage. Moved verbatim (already public).
-fn pipeline_last_stage_dispatches_on_stdout_line() {
-    let mut lines: Vec<String> = Vec::new();
-    let mut e = Engine::new();
-    e.prepare("echo hi | tr a-z A-Z")
-        .on_stdout_line(|line| lines.push(line.to_string()))
-        .capture();
-    assert_eq!(lines, vec!["HI"]);
 }
 
 /// executor::tests::fork_and_run_in_subshell_echo_stage_writes_to_pipe —

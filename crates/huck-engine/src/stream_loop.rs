@@ -1,10 +1,10 @@
 //! Shared external-process capture helper. Replaces the blocking-waitpid +
 //! drainer-thread shape from v205 with a poll-based loop on the embedder's
-//! thread. Reads pipe bytes as they arrive, line-buffers into the active
-//! Callbacks (via thread-local), AND appends bytes to a capture buffer
-//! for the tee with Output.stdout/stderr.
+//! thread. Reads pipe bytes as they arrive and appends them to a capture
+//! buffer (`Output.stdout`/`stderr`). Used by `executor::execute_capturing`'s
+//! external-under-capture drain (the in-process command-substitution capture
+//! kept for tests).
 
-use crate::callbacks_thread_local::with_callbacks;
 use crate::wait_loop::{Event, WaitLoop};
 use std::io;
 use std::os::fd::RawFd;
@@ -71,10 +71,10 @@ pub fn external_capture_loop(
             // Drain final bytes from both pipes (child may have written right
             // before exit).
             if pipe_out >= 0 {
-                drain_to_eof(pipe_out, sinks.stdout.as_deref_mut(), true)?;
+                drain_to_eof(pipe_out, sinks.stdout.as_deref_mut())?;
             }
             if pipe_err >= 0 {
-                drain_to_eof(pipe_err, sinks.stderr.as_deref_mut(), false)?;
+                drain_to_eof(pipe_err, sinks.stderr.as_deref_mut())?;
             }
             return Ok(status);
         }
@@ -96,10 +96,10 @@ pub fn external_capture_loop(
         for ev in events {
             match ev {
                 Event::Readable(fd) if fd == pipe_out => {
-                    read_and_dispatch(fd, sinks.stdout.as_deref_mut(), true)?;
+                    read_and_dispatch(fd, sinks.stdout.as_deref_mut())?;
                 }
                 Event::Readable(fd) if fd == pipe_err => {
-                    read_and_dispatch(fd, sinks.stderr.as_deref_mut(), false)?;
+                    read_and_dispatch(fd, sinks.stderr.as_deref_mut())?;
                 }
                 Event::Readable(_) | Event::ChildExited => {}
             }
@@ -169,14 +169,14 @@ pub fn pipeline_drain_loop(
         for ev in events {
             match ev {
                 Event::Readable(fd) if fd == pipe_out && !out_eof => {
-                    let eof = read_and_dispatch_eof(fd, sinks.stdout.as_deref_mut(), true)?;
+                    let eof = read_and_dispatch_eof(fd, sinks.stdout.as_deref_mut())?;
                     if eof {
                         out_eof = true;
                         wl.unregister_pipe(fd);
                     }
                 }
                 Event::Readable(fd) if fd == pipe_err && !err_eof => {
-                    let eof = read_and_dispatch_eof(fd, sinks.stderr.as_deref_mut(), false)?;
+                    let eof = read_and_dispatch_eof(fd, sinks.stderr.as_deref_mut())?;
                     if eof {
                         err_eof = true;
                         wl.unregister_pipe(fd);
@@ -190,11 +190,7 @@ pub fn pipeline_drain_loop(
 }
 
 /// Like `read_and_dispatch` but reports whether EOF was seen (read returned 0).
-fn read_and_dispatch_eof(
-    fd: RawFd,
-    mut sink: Option<&mut Vec<u8>>,
-    is_stdout: bool,
-) -> io::Result<bool> {
+fn read_and_dispatch_eof(fd: RawFd, mut sink: Option<&mut Vec<u8>>) -> io::Result<bool> {
     let mut buf = [0u8; CHUNK_SIZE];
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
@@ -203,15 +199,6 @@ fn read_and_dispatch_eof(
             if let Some(sink) = sink.as_deref_mut() {
                 sink.extend_from_slice(chunk);
             }
-            with_callbacks(|cb| {
-                if let Some(cb) = cb {
-                    if is_stdout {
-                        cb.push_stdout(chunk);
-                    } else {
-                        cb.push_stderr(chunk);
-                    }
-                }
-            });
             if (n as usize) < CHUNK_SIZE {
                 return Ok(false);
             }
@@ -245,7 +232,7 @@ fn set_nonblock(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn read_and_dispatch(fd: RawFd, mut sink: Option<&mut Vec<u8>>, is_stdout: bool) -> io::Result<()> {
+fn read_and_dispatch(fd: RawFd, mut sink: Option<&mut Vec<u8>>) -> io::Result<()> {
     let mut buf = [0u8; CHUNK_SIZE];
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
@@ -254,15 +241,6 @@ fn read_and_dispatch(fd: RawFd, mut sink: Option<&mut Vec<u8>>, is_stdout: bool)
             if let Some(sink) = sink.as_deref_mut() {
                 sink.extend_from_slice(chunk);
             }
-            with_callbacks(|cb| {
-                if let Some(cb) = cb {
-                    if is_stdout {
-                        cb.push_stdout(chunk);
-                    } else {
-                        cb.push_stderr(chunk);
-                    }
-                }
-            });
             if (n as usize) < CHUNK_SIZE {
                 return Ok(());
             }
@@ -283,7 +261,7 @@ fn read_and_dispatch(fd: RawFd, mut sink: Option<&mut Vec<u8>>, is_stdout: bool)
     }
 }
 
-fn drain_to_eof(fd: RawFd, sink: Option<&mut Vec<u8>>, is_stdout: bool) -> io::Result<()> {
+fn drain_to_eof(fd: RawFd, sink: Option<&mut Vec<u8>>) -> io::Result<()> {
     let mut buf = [0u8; CHUNK_SIZE];
     let mut sink = sink;
     loop {
@@ -293,15 +271,6 @@ fn drain_to_eof(fd: RawFd, sink: Option<&mut Vec<u8>>, is_stdout: bool) -> io::R
             if let Some(sink) = sink.as_deref_mut() {
                 sink.extend_from_slice(chunk);
             }
-            with_callbacks(|cb| {
-                if let Some(cb) = cb {
-                    if is_stdout {
-                        cb.push_stdout(chunk);
-                    } else {
-                        cb.push_stderr(chunk);
-                    }
-                }
-            });
         } else if n == 0 {
             return Ok(());
         } else {

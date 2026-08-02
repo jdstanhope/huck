@@ -14,7 +14,6 @@ pub(crate) mod assoc_map;
 pub(crate) mod assoc_order;
 #[doc(hidden)]
 pub mod builtins;
-pub(crate) mod callbacks_thread_local;
 pub(crate) mod child_fd;
 #[doc(hidden)]
 pub mod completion;
@@ -37,7 +36,6 @@ pub mod history;
 pub(crate) mod job_spec;
 #[doc(hidden)]
 pub mod jobs;
-pub(crate) mod line_buf;
 pub(crate) mod param_expansion;
 pub mod policy;
 pub(crate) mod procsub;
