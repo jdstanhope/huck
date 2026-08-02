@@ -45,8 +45,8 @@ use crate::executor::{StderrSink, StdoutSink, err_writer};
 // The thread-local stores `'static`-lifetimed NonNulls. The `'static` is a lie —
 // see `install_err_sinks` and the safety comment for why this is sound
 // (single-threaded, synchronous, RAII-cleared).
-type StdoutPtr = NonNull<StdoutSink<'static>>;
-type StderrPtr = NonNull<StderrSink<'static>>;
+type StdoutPtr = NonNull<StdoutSink>;
+type StderrPtr = NonNull<StderrSink>;
 
 thread_local! {
     static OUT_SINK_PTR: Cell<Option<StdoutPtr>> = const { Cell::new(None) };
@@ -109,20 +109,16 @@ impl Drop for ErrSinkGuard {
 ///   because `with_err`'s closure runs to completion before returning to the
 ///   executor body, and the writer it materialises is dropped before return.
 pub unsafe fn install_err_sinks_raw(
-    sink: &mut StdoutSink<'_>,
-    err_sink: &mut StderrSink<'_>,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ErrSinkGuard {
     // Erase the borrows' lifetimes to `'static` so they can sit in
     // thread-locals. The guard's `Drop` restores the prior pointers.
     let out_raw: StdoutPtr = unsafe {
-        std::mem::transmute::<NonNull<StdoutSink<'_>>, NonNull<StdoutSink<'static>>>(NonNull::from(
-            sink,
-        ))
+        std::mem::transmute::<NonNull<StdoutSink>, NonNull<StdoutSink>>(NonNull::from(sink))
     };
     let err_raw: StderrPtr = unsafe {
-        std::mem::transmute::<NonNull<StderrSink<'_>>, NonNull<StderrSink<'static>>>(NonNull::from(
-            err_sink,
-        ))
+        std::mem::transmute::<NonNull<StderrSink>, NonNull<StderrSink>>(NonNull::from(err_sink))
     };
     let prev_out = OUT_SINK_PTR.with(|c| c.replace(Some(out_raw)));
     let prev_err = ERR_SINK_PTR.with(|c| c.replace(Some(err_raw)));
@@ -132,7 +128,7 @@ pub unsafe fn install_err_sinks_raw(
 /// Convenience closure-style wrapper around [`install_err_sinks_raw`] for
 /// callers that want a scoped install without managing the guard explicitly.
 /// Mostly used by tests.
-pub fn install_err_sinks<F, R>(sink: &mut StdoutSink<'_>, err_sink: &mut StderrSink<'_>, f: F) -> R
+pub fn install_err_sinks<F, R>(sink: &mut StdoutSink, err_sink: &mut StderrSink, f: F) -> R
 where
     F: FnOnce() -> R,
 {
@@ -155,25 +151,25 @@ mod tests {
 
     #[test]
     fn install_routes_writes_to_capture_buffer() {
-        let mut buf: Vec<u8> = Vec::new();
-        {
+        // Stage 3 (#197): the sinks are always `Terminal`; a `#[cfg(test)]`
+        // thread-local capture intercepts the `err_writer` a `with_err` builds.
+        let (_out, err, ()) = crate::capture_test_hook::with_capture(false, true, || {
             let mut sink = StdoutSink::Terminal;
-            let mut err_sink = StderrSink::Capture(&mut buf);
+            let mut err_sink = StderrSink::Terminal;
             install_err_sinks(&mut sink, &mut err_sink, || {
                 with_err(|err| {
                     err.write_all(b"hello").unwrap();
                 });
             });
-        }
-        assert_eq!(buf, b"hello");
+        });
+        assert_eq!(err, b"hello");
     }
 
     #[test]
     fn install_is_cleared_after_call() {
         {
-            let mut buf: Vec<u8> = Vec::new();
             let mut sink = StdoutSink::Terminal;
-            let mut err_sink = StderrSink::Capture(&mut buf);
+            let mut err_sink = StderrSink::Terminal;
             install_err_sinks(&mut sink, &mut err_sink, || {});
         }
         let still_installed =
@@ -183,25 +179,24 @@ mod tests {
 
     #[test]
     fn merged_sink_routes_to_stdout_capture() {
-        let mut buf_out: Vec<u8> = Vec::new();
-        {
-            let mut sink = StdoutSink::Capture(&mut buf_out);
-            let mut err_sink = StderrSink::Merged;
+        // Under `merge` the captured stderr folds into stdout.
+        let (out, _err, ()) = crate::capture_test_hook::with_capture(true, true, || {
+            let mut sink = StdoutSink::Terminal;
+            let mut err_sink = StderrSink::Terminal;
             install_err_sinks(&mut sink, &mut err_sink, || {
                 with_err(|err| {
                     err.write_all(b"to-merged").unwrap();
                 });
             });
-        }
-        assert_eq!(buf_out, b"to-merged");
+        });
+        assert_eq!(out, b"to-merged");
     }
 
     #[test]
     fn install_clears_on_panic() {
-        let mut buf: Vec<u8> = Vec::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut sink = StdoutSink::Terminal;
-            let mut err_sink = StderrSink::Capture(&mut buf);
+            let mut err_sink = StderrSink::Terminal;
             install_err_sinks(&mut sink, &mut err_sink, || {
                 panic!("boom");
             });

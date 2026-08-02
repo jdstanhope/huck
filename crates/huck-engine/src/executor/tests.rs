@@ -1242,11 +1242,10 @@ fn export_prefix_persists_in_default_mode() {
 fn for_brace_body_iterates_with_break_continue() {
     let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let run = |src: &str| -> String {
-        let mut buf: Vec<u8> = Vec::new();
         let mut shell = Shell::new();
-        {
-            let mut out = StdoutSink::Capture(&mut buf);
-            let mut err = StderrSink::Capture(&mut Vec::new());
+        let (buf, _err, ()) = crate::capture_test_hook::with_capture(false, true, || {
+            let mut out = StdoutSink::Terminal;
+            let mut err = StderrSink::Terminal;
             let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
                 src,
                 &Default::default(),
@@ -1255,7 +1254,7 @@ fn for_brace_body_iterates_with_break_continue() {
             .expect("parse")
             .expect("seq");
             execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
-        }
+        });
         String::from_utf8_lossy(&buf).into_owned()
     };
     // Word-list brace body iterates.
@@ -1275,91 +1274,15 @@ fn for_brace_body_iterates_with_break_continue() {
 }
 
 // ----- external-process stderr capture / Merged --------------------------
-
-/// `/bin/sh -c 'echo out; echo err >&2'` with split capture sinks:
-/// stdout lands in `buf_out`, stderr lands in `buf_err`. Exercises the
-/// `run_subprocess` Capture-stderr branch (Stdio::piped on fd 2 + threaded
-/// drain). Bash-equivalent: `bash -c '...' 1>out 2>err`.
-#[test]
-#[cfg(unix)]
-fn external_process_stderr_is_captured() {
-    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut buf_out: Vec<u8> = Vec::new();
-    let mut buf_err: Vec<u8> = Vec::new();
-    let mut shell = Shell::new();
-    {
-        let mut out = StdoutSink::Capture(&mut buf_out);
-        let mut err = StderrSink::Capture(&mut buf_err);
-        let src = "/bin/sh -c 'echo out; echo err >&2'";
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
-            src,
-            &Default::default(),
-            crate::lexer::LexerOptions::default(),
-        ))
-        .expect("parse")
-        .expect("seq");
-        execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
-    }
-    assert_eq!(String::from_utf8_lossy(&buf_out), "out\n");
-    assert_eq!(String::from_utf8_lossy(&buf_err), "err\n");
-}
-
-/// `/bin/sh -c 'printf out; printf err 1>&2; printf out2'` with
-/// `StderrSink::Merged` routes fd 2 onto fd 1 (the capture pipe) in the
-/// child via a `pre_exec` dup2(1,2). Both streams hit the same kernel pipe;
-/// kernel-level ordering matches the source-code writes.
-/// Bash-equivalent: `bash -c '...' 2>&1`.
-#[test]
-#[cfg(unix)]
-fn external_process_merged_stderr_interleaves_via_kernel() {
-    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut buf: Vec<u8> = Vec::new();
-    let mut shell = Shell::new();
-    {
-        let mut out = StdoutSink::Capture(&mut buf);
-        let mut err = StderrSink::Merged;
-        let src = "/bin/sh -c 'printf out; printf err 1>&2; printf out2'";
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
-            src,
-            &Default::default(),
-            crate::lexer::LexerOptions::default(),
-        ))
-        .expect("parse")
-        .expect("seq");
-        execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
-    }
-    assert_eq!(String::from_utf8_lossy(&buf), "outerrout2");
-}
-
-/// Multi-stage pipeline with a stage writing to stderr — the shared
-/// `StderrSink::Capture` pipe (per-stage dup'd write-end) should collect
-/// every stage's stderr into the same buffer. Bash-equivalent:
-/// `bash -c 'echo a; echo err >&2 | cat' 1>out 2>err` (rough analog).
-#[test]
-#[cfg(unix)]
-fn pipeline_stage_stderr_is_captured() {
-    let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut buf_out: Vec<u8> = Vec::new();
-    let mut buf_err: Vec<u8> = Vec::new();
-    let mut shell = Shell::new();
-    {
-        let mut out = StdoutSink::Capture(&mut buf_out);
-        let mut err = StderrSink::Capture(&mut buf_err);
-        // First stage prints to stderr (visible in err buf), pipes nothing.
-        // Second stage `cat` reads (empty) and writes nothing → stdout empty.
-        let src = "/bin/sh -c 'echo err >&2' | cat";
-        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
-            src,
-            &Default::default(),
-            crate::lexer::LexerOptions::default(),
-        ))
-        .expect("parse")
-        .expect("seq");
-        execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
-    }
-    assert_eq!(String::from_utf8_lossy(&buf_out), "");
-    assert_eq!(String::from_utf8_lossy(&buf_err), "err\n");
-}
+//
+// The three tests that captured an EXTERNAL command's stdout/stderr through the
+// in-process `Capture`/`Merged` sinks (`external_process_stderr_is_captured`,
+// `external_process_merged_stderr_interleaves_via_kernel`,
+// `pipeline_stage_stderr_is_captured`) were removed in #197 Stage 3: the sinks
+// are gone, and a `#[cfg(test)]` thread-local capture cannot intercept a forked
+// child's real fd 1/2. That external-capture coverage now lives in the
+// binary-level `tests/scripts/comsub_merge_stderr_diff_check.sh` harness (real
+// `$()` capture of external stderr through the production fork+pipe path).
 
 // ----- classify_stage unit tests (Task 4) ----------------------------------
 
@@ -2218,11 +2141,9 @@ fn render_job_command_subshell_and_brace_group() {
 fn run_script_capture_2351(src: &str) -> (String, String, i32) {
     let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut shell = Shell::new();
-    let mut out_buf: Vec<u8> = Vec::new();
-    let mut err_buf: Vec<u8> = Vec::new();
-    {
-        let mut out = StdoutSink::Capture(&mut out_buf);
-        let mut err = StderrSink::Capture(&mut err_buf);
+    let (out_buf, err_buf, ()) = crate::capture_test_hook::with_capture(false, true, || {
+        let mut out = StdoutSink::Terminal;
+        let mut err = StderrSink::Terminal;
         crate::builtins::run_sourced_contents_in_sinks(
             src,
             std::path::Path::new("test"),
@@ -2230,7 +2151,7 @@ fn run_script_capture_2351(src: &str) -> (String, String, i32) {
             &mut out,
             &mut err,
         );
-    }
+    });
     let status = shell.last_status();
     (
         String::from_utf8_lossy(&out_buf).into_owned(),

@@ -326,25 +326,22 @@ impl<'a> ExecBuilder<'a> {
     /// (#197) migrates these tests to that binary and deletes the sinks.
     #[cfg(test)]
     pub fn capture(self) -> Output {
-        let mut buf_out: Vec<u8> = Vec::new();
-        let mut buf_err: Vec<u8> = Vec::new();
-        let (exit_code, stderr_str) = {
-            let mut out = StdoutSink::Capture(&mut buf_out);
-            // Merged: stderr writes go to the active stdout writer (buf_out).
-            // Non-merged: stderr writes go to a separate capture buffer.
-            if self.merge {
-                let mut err = StderrSink::Merged;
-                let code = self.run_with_sinks(&mut out, &mut err);
-                (code, String::new())
-            } else {
-                let mut err = StderrSink::Capture(&mut buf_err);
-                let code = self.run_with_sinks(&mut out, &mut err);
-                (code, String::from_utf8_lossy(&buf_err).into_owned())
-            }
-        };
+        let merge = self.merge;
+        // Stage 3 (#197): run with `Terminal` sinks under a `capture_test_hook`
+        // thread-local capture, which intercepts in-process (builtin) stdout/stderr
+        // at the writer chokepoints. `merge` folds captured stderr into stdout
+        // (leaving `Output.stderr` empty); otherwise the two streams are captured
+        // separately. Externals (forked children) are NOT captured here — those
+        // tests live in `capture_tempfile_serial` / `comsub_merge_stderr_diff_check`.
+        let (buf_out, buf_err, exit_code) =
+            crate::capture_test_hook::with_capture(merge, true, || {
+                let mut out = StdoutSink::Terminal;
+                let mut err = StderrSink::Terminal;
+                self.run_with_sinks(&mut out, &mut err)
+            });
         Output {
             stdout: String::from_utf8_lossy(&buf_out).into_owned(),
-            stderr: stderr_str,
+            stderr: String::from_utf8_lossy(&buf_err).into_owned(),
             exit_code,
         }
     }

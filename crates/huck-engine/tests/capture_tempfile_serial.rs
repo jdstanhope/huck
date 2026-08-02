@@ -81,6 +81,27 @@ fn run_merge_dup2_sends_stderr_to_fd1() {
     assert_eq!(buf, "a\nb\nc\n");
 }
 
+/// #197 Stage 3: `$(cat <<…)` runs the EXTERNAL `cat`; its output is captured
+/// through the production fork + fd-level path. (Moved from the engine unit
+/// tests, whose in-process thread-local capture can't intercept an external.)
+/// A heredoc delimiter word spanning a `\<newline>` continuation forms `EOT4`.
+fn heredoc_delim_line_continuation_in_comsub() {
+    let mut e = Engine::new();
+    let out = e.capture("x=$( cat <<\\EOT\\\n4\nd \\\ng\nEOT4\n)\necho \"$x\"");
+    assert_eq!(out.stdout, "d \\\ng\n");
+}
+
+/// #197 Stage 3 (moved): a heredoc opened INSIDE `$( … )` whose `)` closes on
+/// the opener line; the body is taken from the lines following the enclosing
+/// command line (delayed heredoc across the comsub boundary).
+fn heredoc_in_comsub_body_after_close() {
+    let mut e = Engine::new();
+    let out = e.capture("echo $(cat <<EOF)\nfoo\nbar\nEOF\n");
+    assert_eq!(out.stdout, "foo bar\n");
+    let out2 = e.capture("x=$(cat <<EOF)\none\ntwo\nEOF\necho \"[$x]\"");
+    assert_eq!(out2.stdout, "[one\ntwo]\n");
+}
+
 #[test]
 fn capture_tempfile_checks_run_serially() {
     plain_stdout_captured();
@@ -88,4 +109,6 @@ fn capture_tempfile_checks_run_serially() {
     merge_stderr_interleaves_into_stdout();
     exit_code_propagates();
     run_merge_dup2_sends_stderr_to_fd1();
+    heredoc_delim_line_continuation_in_comsub();
+    heredoc_in_comsub_body_after_close();
 }

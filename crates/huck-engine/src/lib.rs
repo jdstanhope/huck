@@ -14,6 +14,7 @@ pub(crate) mod assoc_map;
 pub(crate) mod assoc_order;
 #[doc(hidden)]
 pub mod builtins;
+pub(crate) mod capture_test_hook;
 pub(crate) mod child_fd;
 #[doc(hidden)]
 pub mod completion;

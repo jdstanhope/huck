@@ -35,23 +35,9 @@ fn try_clone_owned_yields_distinct_open_fd() {
     assert!(fd_is_open(orig_raw));
 }
 
-#[test]
-fn try_clone_resolving_inherit_dups_the_slot() {
-    // Use a fresh pipe read-end as the stand-in "slot" fd (NOT a real 0/1/2).
-    let mut fds = [0 as RawFd; 2];
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    let (r, w) = (fds[0], fds[1]);
-    let resolved = ChildFd::Inherit.try_clone_resolving(r).unwrap();
-    let dup_raw = resolved.raw().expect("Inherit resolved to an Owned dup");
-    assert_ne!(dup_raw, r, "resolved dup must be a new fd number");
-    assert!(fd_is_open(dup_raw));
-    // close-on-drop is std's contract; not asserted (parallel-runner fd-reuse race).
-    drop(resolved);
-    unsafe {
-        libc::close(r);
-        libc::close(w);
-    }
-}
+// `try_clone_resolving_inherit_dups_the_slot` removed in #197 Stage 3 — the
+// `try_clone_resolving` method (kernel-level merged-stderr helper) was deleted
+// along with the software-sink Merged variant.
 
 #[test]
 fn into_raw_does_not_close_but_drop_does() {

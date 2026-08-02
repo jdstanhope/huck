@@ -24,7 +24,7 @@
 //!     branch keeps the `ChildStdio` and drops it right after fork.
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 /// One child stdio slot.
 #[derive(Debug)]
@@ -68,24 +68,6 @@ impl ChildFd {
             Self::Inherit => Self::Inherit,
             Self::Owned(fd) => Self::Owned(fd.try_clone()?),
         })
-    }
-
-    /// Duplicate that RESOLVES `Inherit` against the shell's real fd at `slot`.
-    /// Used for kernel-level merged stderr ("stderr := a copy of whatever
-    /// stdout will be"): cloning stdout's `ChildFd` for the stderr slot must
-    /// dup the real fd 1 when stdout is `Inherit`.
-    pub(crate) fn try_clone_resolving(&self, slot: RawFd) -> io::Result<Self> {
-        match self {
-            Self::Inherit => {
-                // SAFETY: `slot` is one of the shell's live std fds (callers pass
-                // STDOUT_FILENO for merged stderr); the borrow lasts only for the
-                // dup below. A closed/invalid `slot` degrades to an EBADF error
-                // from `try_clone_to_owned`, not UB.
-                let real = unsafe { BorrowedFd::borrow_raw(slot) };
-                Ok(Self::Owned(real.try_clone_to_owned()?))
-            }
-            Self::Owned(fd) => Ok(Self::Owned(fd.try_clone()?)),
-        }
     }
 
     /// Consume into a raw fd WITHOUT closing (`Inherit` -> None). The fork

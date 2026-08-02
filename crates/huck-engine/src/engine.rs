@@ -328,28 +328,12 @@ mod tests {
     // sibling test's libtest output could truncate the captured body to empty
     // under the parallel harness (reproducible on macOS). See #297 and #90.
 
-    #[test]
-    fn heredoc_delim_line_continuation_in_comsub() {
-        // comsub4.sub block 2: a heredoc delimiter word that spans a `\<newline>`
-        // line continuation — `<<\EOT\` + newline + `4` forms delimiter `EOT4`
-        // (quoted → literal body, trailing backslash kept verbatim). Inside `$()`.
-        let mut e = Engine::new();
-        let out = e.capture("x=$( cat <<\\EOT\\\n4\nd \\\ng\nEOT4\n)\necho \"$x\"");
-        assert_eq!(out.stdout, "d \\\ng\n");
-    }
-
-    #[test]
-    fn heredoc_in_comsub_body_after_close() {
-        // heredoc7.sub: a heredoc opened INSIDE `$( … )` whose `)` closes on the
-        // opener line — `)` terminates the (unquoted) delimiter word, and the body
-        // is taken from the lines following the ENCLOSING command line (delayed
-        // heredoc across the comsub boundary). bash: `echo $(cat <<EOF)…` → body.
-        let mut e = Engine::new();
-        let out = e.capture("echo $(cat <<EOF)\nfoo\nbar\nEOF\n");
-        assert_eq!(out.stdout, "foo bar\n");
-        let out2 = e.capture("x=$(cat <<EOF)\none\ntwo\nEOF\necho \"[$x]\"");
-        assert_eq!(out2.stdout, "[one\ntwo]\n");
-    }
+    // `heredoc_delim_line_continuation_in_comsub` and
+    // `heredoc_in_comsub_body_after_close` moved to the `capture_tempfile_serial`
+    // integration binary in #197 Stage 3: their `$(cat <<…)` bodies run the
+    // EXTERNAL `cat`, whose output the in-process `#[cfg(test)]` capture can't
+    // intercept. The serial binary builds the non-test lib, so its `.capture()`
+    // takes the production temp-file path (real fork + fd-level capture).
 
     #[test]
     fn capture_collects_stdout_and_code() {
