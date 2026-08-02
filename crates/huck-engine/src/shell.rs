@@ -300,15 +300,12 @@ pub fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32>
 /// frame is pushed before executing and popped after, so that BASH_SOURCE and
 /// BASH_LINENO are populated at the top level and FUNCNAME gains the `main`
 /// entry inside functions. For `-c` and other non-file modes pass `false`.
-#[allow(clippy::too_many_arguments)]
 pub fn run_program_in_sinks(
     contents: &str,
     argv0: Option<String>,
     args: Vec<String>,
     label: &str,
     push_main_frame: bool,
-    sink: &mut crate::executor::StdoutSink,
-    err_sink: &mut crate::executor::StderrSink,
     shell_cell: &Rc<RefCell<Shell>>,
 ) -> i32 {
     let mut shell = shell_cell.borrow_mut();
@@ -332,8 +329,6 @@ pub fn run_program_in_sinks(
         contents,
         std::path::Path::new(label),
         &mut shell,
-        sink,
-        err_sink,
     );
 
     if push_main_frame {
@@ -368,18 +363,7 @@ pub fn run_program(
     push_main_frame: bool,
     shell_cell: &Rc<RefCell<Shell>>,
 ) -> i32 {
-    let mut sink = crate::executor::StdoutSink::Terminal;
-    let mut err_sink = crate::executor::StderrSink::Terminal;
-    run_program_in_sinks(
-        contents,
-        argv0,
-        args,
-        label,
-        push_main_frame,
-        &mut sink,
-        &mut err_sink,
-        shell_cell,
-    )
+    run_program_in_sinks(contents, argv0, args, label, push_main_frame, shell_cell)
 }
 
 /// Installs a SIGINT handler that sets the supplied flag. Called once at
@@ -482,14 +466,8 @@ pub fn fire_prompt_command(shell: &mut Shell) -> Option<i32> {
 }
 
 /// Tokenizes, parses, and executes a single input line.
-pub fn process_line_in_sinks(
-    line: &str,
-    shell: &mut Shell,
-    expand_aliases: bool,
-    sink: &mut crate::executor::StdoutSink,
-    err_sink: &mut crate::executor::StderrSink,
-) -> ExecOutcome {
-    process_line_in_sinks_ex(line, shell, expand_aliases, false, sink, err_sink)
+pub fn process_line_in_sinks(line: &str, shell: &mut Shell, expand_aliases: bool) -> ExecOutcome {
+    process_line_in_sinks_ex(line, shell, expand_aliases, false)
 }
 
 /// Core of [`process_line_in_sinks`]. `top_level` marks the interactive /
@@ -505,8 +483,6 @@ fn process_line_in_sinks_ex(
     shell: &mut Shell,
     expand_aliases: bool,
     top_level: bool,
-    sink: &mut crate::executor::StdoutSink,
-    err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
     // This is a top-level BATCH parse of a COMPLETE program string (piped-stdin
     // logical command, `eval`, a trap/PROMPT_COMMAND action). Like bash, an open
@@ -533,7 +509,7 @@ fn process_line_in_sinks_ex(
     // `set +o braceexpand` / `set +B` disables `{a,b}` brace expansion.
     lx.set_brace_expand(shell.shell_options.braceexpand);
     match parser::parse_sequence(&mut lx) {
-        Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink, err_sink),
+        Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line),
         // A logical command with no command at all (blank line, comment-only,
         // whitespace). At the interactive/piped-stdin top level bash leaves `$?`
         // untouched (#332) — `top_level` returns the current status so the
@@ -562,9 +538,7 @@ fn process_line_in_sinks_ex(
                     .iter()
                     .filter(|&&b| b == b'\n')
                     .count() as u32;
-            crate::err_thread_local::install_err_sinks(sink, err_sink, || {
-                crate::render_syntax_diag(shell, &e, line, ln);
-            });
+            crate::render_syntax_diag(shell, &e, line, ln);
             // #284: a non-interactive piped-stdin session aborts the rest of the
             // input on a syntax error, like a script file (bash). Signal the REPL
             // via the pending-fatal-status channel it already drains for fatal
@@ -581,9 +555,7 @@ fn process_line_in_sinks_ex(
 /// Terminal-sink wrapper around [`process_line_in_sinks`] — the entry point for
 /// callers (REPL, traps, helpers) that run at top level (stdout → terminal).
 pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> ExecOutcome {
-    let mut sink = crate::executor::StdoutSink::Terminal;
-    let mut err_sink = crate::executor::StderrSink::Terminal;
-    process_line_in_sinks(line, shell, expand_aliases, &mut sink, &mut err_sink)
+    process_line_in_sinks(line, shell, expand_aliases)
 }
 
 /// Top-level reader entry point (the interactive/piped-stdin REPL). Like
@@ -591,9 +563,7 @@ pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> Exec
 /// comment-only) leaves `$?` untouched instead of resetting it to 0 — bash's
 /// top-level behavior (#332). Command contexts keep using [`process_line`].
 pub fn process_top_level_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> ExecOutcome {
-    let mut sink = crate::executor::StdoutSink::Terminal;
-    let mut err_sink = crate::executor::StderrSink::Terminal;
-    process_line_in_sinks_ex(line, shell, expand_aliases, true, &mut sink, &mut err_sink)
+    process_line_in_sinks_ex(line, shell, expand_aliases, true)
 }
 
 #[cfg(test)]

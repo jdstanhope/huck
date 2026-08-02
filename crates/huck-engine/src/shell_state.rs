@@ -1214,8 +1214,7 @@ impl Shell {
     /// with `set -m` (`monitor`) active, not inside a subshell environment or a
     /// completion function. The single source of truth — replaces the inline
     /// `matches!(sink, Terminal) && !in_subshell && !in_completion` copies that
-    /// had drifted (they omitted `is_interactive`). Foreground callers
-    /// additionally require a `StdoutSink::Terminal` sink. #167: `set -m` makes
+    /// had drifted (they omitted `is_interactive`). #167: `set -m` makes
     /// this true non-interactively so scripted `fg`/`bg` on a live job get their
     /// own process group and can `waitpid(-pgid)` for the real status; terminal
     /// handoff is separately gated on a controlling tty at the call sites.

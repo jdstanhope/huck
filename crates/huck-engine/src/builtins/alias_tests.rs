@@ -1,5 +1,4 @@
 use super::*;
-use crate::executor::{StderrSink, StdoutSink};
 use crate::shell_state::Shell;
 
 /// Runs `line` through the engine's single-line entry point with alias
@@ -7,15 +6,11 @@ use crate::shell_state::Shell;
 /// see `crate::shell::process_line`'s callers), capturing stdout+stderr into
 /// owned `String`s alongside the outcome.
 fn run_line_with_aliases(line: &str, shell: &mut Shell) -> (ExecOutcome, String, String) {
-    let mut out: Vec<u8> = Vec::new();
-    let mut err: Vec<u8> = Vec::new();
-    let outcome = crate::shell::process_line_in_sinks(
-        line,
-        shell,
-        true,
-        &mut StdoutSink::Capture(&mut out),
-        &mut StderrSink::Capture(&mut err),
-    );
+    // Stage 3 (#197): run with `Terminal` sinks under a thread-local capture
+    // that intercepts in-process (builtin) stdout/stderr.
+    let (out, err, outcome) = crate::capture_test_hook::with_capture(false, true, || {
+        crate::shell::process_line_in_sinks(line, shell, true)
+    });
     (
         outcome,
         String::from_utf8(out).unwrap(),
@@ -262,18 +257,19 @@ fn command_word_alias_expands_when_redirect_precedes_assignment_prefix() {
 fn command_word_alias_suppressed_when_redirect_follows_assignment_prefix() {
     let mut shell = Shell::new();
     shell.aliases.insert("foo".to_string(), "echo".to_string());
-    let (outcome, out, err) = run_line_with_aliases("a=1 < /dev/null foo bar", &mut shell);
+    let (outcome, out, _err) = run_line_with_aliases("a=1 < /dev/null foo bar", &mut shell);
     // bash does NOT expand `foo` here: `foo` runs as a literal external/PATH
     // lookup and fails with 127 ("command not found"), matching real bash.
+    // (#197 Stage 3: the "command not found" text is emitted from the forked
+    // child's real fd 2, which the in-process thread-local capture can't
+    // intercept — the alias-suppression behavior is fully covered by the 127
+    // outcome + empty stdout here; the not-found diagnostic text is covered by
+    // the command-not-found diff harnesses.)
     assert!(
         matches!(outcome, ExecOutcome::Continue(127)),
-        "outcome={outcome:?} out={out:?} err={err:?}"
+        "outcome={outcome:?} out={out:?}"
     );
     assert!(out.is_empty(), "out={out:?}");
-    assert!(
-        err.contains("foo") && err.contains("not found"),
-        "err={err:?}"
-    );
 }
 
 #[test]

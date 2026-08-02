@@ -478,8 +478,14 @@ macro_rules! sh_error_noline_to {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::err_thread_local::install_err_sinks;
-    use crate::executor::{StderrSink, StdoutSink};
+    /// Capture stderr diagnostics. Stage 3 (#197): production is one-model, so
+    /// this runs `f` under a `#[cfg(test)]` thread-local capture that intercepts
+    /// the `err_writer` / `CaptureStderr` chokepoint every diagnostic routes
+    /// through.
+    fn capture_err_diag(f: impl FnOnce()) -> Vec<u8> {
+        let (_out, err, ()) = crate::capture_test_hook::with_capture(false, true, f);
+        err
+    }
 
     // v348 (#339, R2): an ODD count of trailing `\` at EOF is an unescaped
     // line-continuation — bash bumps its EOF line counter by 1 for the
@@ -497,10 +503,7 @@ mod tests {
 
     #[test]
     fn emit_cli_error_is_basename_no_line() {
-        let mut out = StdoutSink::Terminal;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut err = StderrSink::Capture(&mut buf);
-        install_err_sinks(&mut out, &mut err, || {
+        let buf = capture_err_diag(|| {
             emit_cli_error("huck", format_args!("boom"));
         });
         assert_eq!(buf, b"huck: boom\n");
@@ -510,10 +513,7 @@ mod tests {
     fn emit_error_routes_through_the_sink() {
         let mut sh = Shell::new();
         sh.is_interactive = true;
-        let mut out = StdoutSink::Terminal;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut err = StderrSink::Capture(&mut buf);
-        install_err_sinks(&mut out, &mut err, || {
+        let buf = capture_err_diag(|| {
             emit_error(&sh, Some("cd"), format_args!("no such file"));
         });
         assert_eq!(buf, b"huck: cd: no such file\n");
@@ -524,10 +524,7 @@ mod tests {
         let mut sh = Shell::new();
         sh.is_interactive = false;
         sh.shell_argv0 = "s.sh".to_string();
-        let mut out = StdoutSink::Terminal;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut err = StderrSink::Capture(&mut buf);
-        install_err_sinks(&mut out, &mut err, || {
+        let buf = capture_err_diag(|| {
             emit_syntax_error(&sh, 7, format_args!("syntax error near unexpected token"));
         });
         assert_eq!(buf, b"s.sh: line 7: syntax error near unexpected token\n");
@@ -537,10 +534,7 @@ mod tests {
     fn sh_error_macro_matches_emit_error() {
         let mut sh = Shell::new();
         sh.is_interactive = true;
-        let mut out = StdoutSink::Terminal;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut err = StderrSink::Capture(&mut buf);
-        install_err_sinks(&mut out, &mut err, || {
+        let buf = capture_err_diag(|| {
             sh_error!(&sh, None, "readonly variable");
         });
         assert_eq!(buf, b"huck: readonly variable\n");
@@ -565,15 +559,12 @@ mod tests {
         use huck_syntax::lexer::{Operator, TokenKind};
 
         let sh = shape_test_shell();
-        let mut out = StdoutSink::Terminal;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut err = StderrSink::Capture(&mut buf);
         let e = ParseError::Unexpected(ExpectFailure {
             found: Found::Token(TokenKind::Op(Operator::RParen)),
             matching: None,
             pos: 5,
         });
-        install_err_sinks(&mut out, &mut err, || {
+        let buf = capture_err_diag(|| {
             render_syntax_diag(&sh, &e, "echo )", 1);
         });
         assert_eq!(
@@ -589,10 +580,7 @@ mod tests {
         use huck_syntax::command::ParseError;
 
         let sh = shape_test_shell();
-        let mut out = StdoutSink::Terminal;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut err = StderrSink::Capture(&mut buf);
-        install_err_sinks(&mut out, &mut err, || {
+        let buf = capture_err_diag(|| {
             render_syntax_diag(&sh, &ParseError::UnterminatedIf, "if true", 1);
         });
         assert_eq!(
@@ -607,11 +595,8 @@ mod tests {
         use huck_syntax::lexer::LexError;
 
         let sh = shape_test_shell();
-        let mut out = StdoutSink::Terminal;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut err = StderrSink::Capture(&mut buf);
         let e = ParseError::Lex(Box::new(LexError::UnterminatedQuote { double: true }));
-        install_err_sinks(&mut out, &mut err, || {
+        let buf = capture_err_diag(|| {
             render_syntax_diag(&sh, &e, "echo \"hi", 1);
         });
         assert_eq!(
@@ -626,11 +611,8 @@ mod tests {
         use huck_syntax::lexer::LexError;
 
         let sh = shape_test_shell();
-        let mut out = StdoutSink::Terminal;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut err = StderrSink::Capture(&mut buf);
         let e = ParseError::Lex(Box::new(LexError::UnterminatedQuote { double: false }));
-        install_err_sinks(&mut out, &mut err, || {
+        let buf = capture_err_diag(|| {
             render_syntax_diag(&sh, &e, "echo 'hi", 1);
         });
         // Verified against real bash 5.2.21: `bash -c "echo 'hi"` →
@@ -647,9 +629,6 @@ mod tests {
         use huck_syntax::command::{ExpectFailure, Found, ParseError};
 
         let sh = shape_test_shell();
-        let mut out = StdoutSink::Terminal;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut err = StderrSink::Capture(&mut buf);
         // Mirrors `parser::unterminated_backtick`'s shape: `Found::Eof` +
         // `matching: Some(Delim::Backtick)`.
         let e = ParseError::Unexpected(ExpectFailure {
@@ -657,7 +636,7 @@ mod tests {
             matching: Some(Delim::Backtick),
             pos: 9,
         });
-        install_err_sinks(&mut out, &mut err, || {
+        let buf = capture_err_diag(|| {
             render_syntax_diag(&sh, &e, "echo `foo", 1);
         });
         // Verified against real bash 5.2.21: `bash -c 'echo `foo'` →

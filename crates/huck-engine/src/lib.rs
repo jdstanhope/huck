@@ -14,6 +14,7 @@ pub(crate) mod assoc_map;
 pub(crate) mod assoc_order;
 #[doc(hidden)]
 pub mod builtins;
+pub(crate) mod capture_test_hook;
 pub(crate) mod child_fd;
 #[doc(hidden)]
 pub mod completion;
@@ -65,7 +66,6 @@ pub use error_emit::{
     render_syntax_diag,
 };
 pub use exec_builder::ExecBuilder;
-pub use executor::{StderrSink, StdoutSink};
 
 // Re-export the frontend so `huck_engine::lexer::`/`::command::` resolve downstream.
 pub use huck_syntax::escape_double_quote_value;

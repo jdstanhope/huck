@@ -206,14 +206,24 @@ After Stage 2, the only remaining `Capture`-sink user is `execute_capturing`
 (the in-process comsub capture kept for the lib unit tests + the `#[cfg(test)]`
 `run_substitution` path from Stage 1) — which Stage 3 removes.
 
-### Stage 3 — Delete the software sink
+### Stage 3 — Delete the software sink — ✅ LANDED (2026-08-02) — ARC COMPLETE
 
-Remove `StdoutSink`/`StderrSink`/`Merged`/`err_writer`/`redirs_merge_err_into_out`,
-the `LineDispatchWriter` sink coupling, and the reconciliation paths. Migrate the
-~30 `execute_capturing` unit tests (executor/tests.rs) to the fork-capture (or a
-small forking test helper), minding the `exec_guard` single-threaded assertion under
-`--test-threads 1`. The interpreter now has exactly one output model. `#197`'s
-inward `OwnedFd` migration (Class-A cleanup) can proceed independently afterward.
+Delivered in three commits (Full, per the user — no dead code left in production):
+1. **`run()` merge → real `dup2`** (removes the last live production `Merged`; production is now strictly single-model).
+2. **`#[cfg(test)]` thread-local capture** (`capture_test_hook`, hooked at `FdWriter`/`CaptureStderr` write sites) replaces the `Capture` sink for the in-process unit tests (parallel-safe); **`Capture`/`Merged`/`LineDispatchWriter` + the external-under-capture pipe path deleted**; external-output-capturing tests migrated to the serial `capture_tempfile_serial` binary or dropped as redundant with `comsub_merge_stderr_diff_check.sh`. Both sink enums become single-variant `{ Terminal }`.
+3. **`StdoutSink`/`StderrSink` types deleted** and the vestigial `&mut StdoutSink`/`&mut StderrSink` parameter stripped from ~63 functions; `err_writer()` zero-arg; net −639 lines.
+
+**The interpreter now consults exactly ONE model of where output goes — the real fd
+table.** Verified at each step: build warning-clean, `git grep StdoutSink/StderrSink`
+empty, engine lib 1953/1953 under `--test-threads 4`, sweep 245/245, redirect_audit
+157/157 (0 diverge), bash-suite PASS-set unchanged (26 categories, 0 lost/gained).
+
+**Follow-on cleanup (tracked for a short next step, per the user):** `FdWriter::new`
+is now `#[cfg(test)]`; the in-memory compound `{…} 2>&1`-under-capture software merge
+was dropped as dead (production's fork + real-dup2 path and the diff-harness cover it);
+one `alias_tests` not-found stderr-text assertion was relaxed (a forked child's fd 2
+is uncapturable in-process — outcome + stdout still cover it). #197's inward `OwnedFd`
+migration (Class-A resource-safety) can now proceed independently.
 
 ## Risks & verification
 

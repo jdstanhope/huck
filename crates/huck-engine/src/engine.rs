@@ -48,7 +48,6 @@ use std::path::Path;
 use std::rc::Rc;
 
 use crate::completion::Candidate;
-use crate::executor::{StderrSink, StdoutSink};
 use crate::shell_state::Shell;
 
 /// The captured result of [`Engine::capture`] (or [`ExecBuilder::capture`]).
@@ -108,8 +107,7 @@ impl Engine {
     /// Run a script string with `bash -c` semantics (no "main" call frame).
     /// stdout + stderr inherit the process. Returns the exit status.
     pub fn run(&mut self, src: &str) -> i32 {
-        let mut sink = StdoutSink::Terminal;
-        self.run_with(src, false, &mut sink)
+        self.run_with(src, false)
     }
 
     /// Run a script string, capturing stdout and stderr into separate buffers.
@@ -145,8 +143,7 @@ impl Engine {
     /// Run a script STRING with script semantics (a "main" frame; `$0` = `arg0`).
     pub fn run_script(&mut self, src: &str, arg0: &str) -> i32 {
         self.cell.borrow_mut().shell_argv0 = arg0.to_string();
-        let mut sink = StdoutSink::Terminal;
-        self.run_with_label(src, arg0, true, &mut sink)
+        self.run_with_label(src, arg0, true)
     }
 
     /// Read and run a script FILE with script semantics (`$0` = the path).
@@ -205,33 +202,18 @@ impl Engine {
         &self.cell
     }
 
-    fn run_with(&mut self, src: &str, push_main_frame: bool, sink: &mut StdoutSink) -> i32 {
+    fn run_with(&mut self, src: &str, push_main_frame: bool) -> i32 {
         let label = self.cell.borrow().shell_argv0.clone();
-        self.run_with_label(src, &label, push_main_frame, sink)
+        self.run_with_label(src, &label, push_main_frame)
     }
 
-    fn run_with_label(
-        &mut self,
-        src: &str,
-        label: &str,
-        push_main_frame: bool,
-        sink: &mut StdoutSink,
-    ) -> i32 {
+    fn run_with_label(&mut self, src: &str, label: &str, push_main_frame: bool) -> i32 {
         // Preserve the shell's current $0 + positionals (don't clobber them).
         let args = self.cell.borrow().positional_args.clone();
-        // stderr always inherits the process here; the public `Engine::prepare`
-        // builder will let callers opt into Capture/Merged later.
-        let mut err_sink = StderrSink::Terminal;
-        let code = crate::shell::run_program_in_sinks(
-            src,
-            None,
-            args,
-            label,
-            push_main_frame,
-            sink,
-            &mut err_sink,
-            &self.cell,
-        );
+        // stdout + stderr flow to the real fd table (#197 one-model); the public
+        // `Engine::prepare` builder lets callers opt into capture/merge later.
+        let code =
+            crate::shell::run_program_in_sinks(src, None, args, label, push_main_frame, &self.cell);
         // Mirror the run's exit code into `$?` so `last_status()` reflects it even
         // when the script short-circuited via `exit N` (which doesn't otherwise
         // update the shell's stored status). Matches bash's `bash -c '…'; echo $?`.
@@ -328,28 +310,12 @@ mod tests {
     // sibling test's libtest output could truncate the captured body to empty
     // under the parallel harness (reproducible on macOS). See #297 and #90.
 
-    #[test]
-    fn heredoc_delim_line_continuation_in_comsub() {
-        // comsub4.sub block 2: a heredoc delimiter word that spans a `\<newline>`
-        // line continuation — `<<\EOT\` + newline + `4` forms delimiter `EOT4`
-        // (quoted → literal body, trailing backslash kept verbatim). Inside `$()`.
-        let mut e = Engine::new();
-        let out = e.capture("x=$( cat <<\\EOT\\\n4\nd \\\ng\nEOT4\n)\necho \"$x\"");
-        assert_eq!(out.stdout, "d \\\ng\n");
-    }
-
-    #[test]
-    fn heredoc_in_comsub_body_after_close() {
-        // heredoc7.sub: a heredoc opened INSIDE `$( … )` whose `)` closes on the
-        // opener line — `)` terminates the (unquoted) delimiter word, and the body
-        // is taken from the lines following the ENCLOSING command line (delayed
-        // heredoc across the comsub boundary). bash: `echo $(cat <<EOF)…` → body.
-        let mut e = Engine::new();
-        let out = e.capture("echo $(cat <<EOF)\nfoo\nbar\nEOF\n");
-        assert_eq!(out.stdout, "foo bar\n");
-        let out2 = e.capture("x=$(cat <<EOF)\none\ntwo\nEOF\necho \"[$x]\"");
-        assert_eq!(out2.stdout, "[one\ntwo]\n");
-    }
+    // `heredoc_delim_line_continuation_in_comsub` and
+    // `heredoc_in_comsub_body_after_close` moved to the `capture_tempfile_serial`
+    // integration binary in #197 Stage 3: their `$(cat <<…)` bodies run the
+    // EXTERNAL `cat`, whose output the in-process `#[cfg(test)]` capture can't
+    // intercept. The serial binary builds the non-test lib, so its `.capture()`
+    // takes the production temp-file path (real fork + fd-level capture).
 
     #[test]
     fn capture_collects_stdout_and_code() {
