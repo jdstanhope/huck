@@ -68,6 +68,8 @@ pub(crate) fn with_callbacks<R>(f: impl FnOnce(Option<&mut Callbacks<'_>>) -> R)
 /// their captured output doesn't reach the embedder's streaming callbacks —
 /// the contract is that callbacks fire only for bytes that flow to the
 /// script's OUTERMOST stdout (the one that becomes `Output.stdout`).
+// retained for executor unit tests + Stage 3 sink deletion (#197)
+#[allow(dead_code)]
 #[must_use = "guard must be held for the synchronous duration of the inner-capture scope"]
 pub(crate) struct SuspendGuard {
     prev: Option<CallbacksPtr>,
@@ -79,6 +81,8 @@ impl Drop for SuspendGuard {
     }
 }
 
+// retained for executor unit tests + Stage 3 sink deletion (#197)
+#[allow(dead_code)]
 pub(crate) fn suspend() -> SuspendGuard {
     let prev = CALLBACKS_PTR.with(|c| c.replace(None));
     SuspendGuard { prev }

@@ -332,6 +332,8 @@ pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
 /// dispatch in `stream_loop::external_capture_loop` would leak hidden bytes
 /// (e.g. `$(echo hidden)`) into `on_stdout_line` callbacks. The guard's Drop
 /// restores the pointer on every exit path (including panics).
+// retained for executor unit tests + Stage 3 sink deletion (#197)
+#[allow(dead_code)]
 pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     let _suspend = crate::callbacks_thread_local::suspend();
     // Command substitution must complete before its output is interpolated, so
@@ -3751,12 +3753,25 @@ fn emit_wrapper_error(
     err_sink: &mut StderrSink,
     msg: &str,
 ) {
-    let route =
-        matches!(*sink, StdoutSink::Capture(_)) && redirs_merge_err_into_out(&cmd.redirects, shell);
-    let mut merged = StderrSink::Merged;
-    let eff: &mut StderrSink = if route { &mut merged } else { err_sink };
-    let mut err = err_writer(eff, sink);
-    crate::sh_error_to!(shell, &mut *err, None, "{msg}");
+    // The `command`/`builtin` wrapper detects an option error DURING its own
+    // argument scan, before the command's redirects reach the real fds — so the
+    // error must be emitted UNDER the command's own redirects, exactly as the
+    // command itself would (`command -Z 2>file` → file; `$(command -Z 2>&1)` →
+    // captured). Run the emission inside `with_redirect_scope` so the redirects
+    // apply uniformly: a real `2>&1`/`2>file` dup2 at a terminal/pipe (incl. the
+    // forked comsub child, #197), and the software `Merged` route under a capture
+    // sink. Replaces the earlier capture-sink-only `Merged` special case (#77).
+    with_redirect_scope(
+        &cmd.redirects,
+        shell,
+        sink,
+        err_sink,
+        |shell, sink, err_sink| {
+            let mut err = err_writer(err_sink, sink);
+            crate::sh_error_to!(shell, &mut *err, None, "{msg}");
+            ExecOutcome::Continue(2)
+        },
+    );
 }
 
 /// Expands the program + argument words into a `ResolvedCommand`. Returns
@@ -8667,6 +8682,65 @@ unsafe fn install_child_stdio(stdio: ChildStdio) -> [RawFd; 3] {
         }
     }
     original_raws
+}
+
+/// Stage 1 (#197) SPIKE: run a command-substitution body by FORKING a real
+/// subshell whose stdout is a pipe the parent drains — replacing the in-process
+/// clone + `Capture` sink. The child writes to real fd 1 (the pipe), so an inner
+/// `2>&1` is a real dup2 onto the pipe (fixes #353/#195 by construction). The
+/// child is a transient foreground child in the shell's process group (not a
+/// job, no `$!`). Returns (captured stdout, exit status).
+// Used by `run_substitution` in non-test builds; the lib unit-test build routes
+// comsub through the in-process capture instead (see `expand::capture_command_output`).
+#[cfg_attr(test, allow(dead_code))]
+pub fn capture_via_fork(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
+    use crate::child_fd::{ChildFd, ChildStdio};
+    use std::io::Read;
+    use std::os::unix::io::FromRawFd;
+
+    let (read_fd, write_fd) = match crate::child_fd::make_pipe(false) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
+            return (String::new(), 1);
+        }
+    };
+    // The body runs in-process in the child via a BraceGroup (one fork total).
+    let body = Command::BraceGroup(Box::new(seq.clone()));
+    let stdio = ChildStdio::new(
+        ChildFd::Inherit,                        // stdin: child reads the shell's stdin
+        unsafe { ChildFd::owned_raw(write_fd) }, // stdout: pipe write-end -> fd 1
+        ChildFd::Inherit,                        // stderr: terminal unless an inner 2>&1
+    );
+    // Child closes the parent's read end (else EOF never arrives).
+    let pid = match fork_and_run_in_subshell(&body, shell, stdio, NO_PGROUP, &[read_fd], None, None)
+    {
+        Ok(pid) => pid,
+        Err(e) => {
+            // `write_fd` was owned by the moved `ChildStdio` and is already
+            // closed (RAII) by `fork_and_run_in_subshell` on its error return;
+            // close only the parent-kept read end here.
+            unsafe {
+                libc::close(read_fd);
+            }
+            crate::sh_error!(shell, None, "fork: {}", crate::bash_io_error(&e));
+            return (String::new(), 1);
+        }
+    };
+    // PARENT: `write_fd` (the pipe write end) was owned by the moved `ChildStdio`
+    // and is already closed by the fork helper's RAII drop in the parent, so the
+    // read end below sees EOF when the child exits — do NOT close it again.
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut f = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        let _ = f.read_to_end(&mut buf); // f drops -> closes read_fd
+    }
+    let mut raw: libc::c_int = 0;
+    unsafe {
+        libc::waitpid(pid, &mut raw, 0);
+    }
+    let status = raw_status_to_exit_code(raw, shell);
+    (String::from_utf8_lossy(&buf).into_owned(), status)
 }
 
 /// Forks a subshell and runs `cmd` in the child with the supplied stdio

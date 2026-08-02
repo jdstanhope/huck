@@ -124,12 +124,23 @@ variants, `tools/soak/`) and confirm green. Deliverable: new
 `*_diff_check.sh` harness(es) wired into `run_diff_checks.sh`, all green on the
 current tree. **No engine code changes in this iteration.**
 
-### Stage 1 — Fork `$(…)` and backticks (the prize)
+### Stage 1 — Fork `$(…)` and backticks (the prize) — ✅ LANDED (2026-08-02)
 
 `run_substitution` stops cloning-and-capturing in-process; it forks (pipe + child
 real-fd subshell + drain-to-EOF + `waitpid`) as above, and `$(<file)` is split out
 first as a direct file read. **What dissolves by construction:** #195, #353, and the
 capture side of #77/#30. Highest value, highest risk → most verification.
+
+**Landed as `executor::capture_via_fork` + a `run_substitution` rewire +
+`try_read_file_substitution` (`$(<file)` pre-fork read).** #353 and #195 closed
+(their Stage-0 pins became real `check`s vs bash). Verification: engine lib
+1980/1980, full sweep 245/245, `redirect_audit` 157/157 agree 0 diverge, 15
+comsub/subshell/pipeline/procsub/jobs integration bins green, and **perf ~0.9 ms per
+`$(…)` — slightly faster than bash** on a 1000-comsub loop (fork-per-comsub is a
+non-issue). One surprise: `$(trap)` now lists nothing like a plain `( trap )`
+subshell — a **general subshell-trap-display gap** (#389), orthogonal to the fork
+(the fork correctly makes comsub a subshell), re-pinned not fixed. `execute_capturing`
+is retained (`#[allow(dead_code)]`) for the executor unit tests until Stage 3.
 
 #### Stage-1 targets (pinned by Stage 0)
 

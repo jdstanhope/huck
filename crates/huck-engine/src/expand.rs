@@ -2241,13 +2241,98 @@ pub fn expand_regex_operand(word: &Word, shell: &mut Shell) -> String {
 /// `execute_capturing`, strips trailing newlines, and propagates the
 /// substituted command's exit status into the parent shell's `$?`.
 pub fn run_substitution(seq: &Sequence, shell: &mut Shell) -> String {
-    let mut cloned = shell.clone();
-    cloned.procsub_pending = Vec::new(); // a clone must not inherit/duplicate the parent's pending process substitutions
-    cloned.xtrace_depth += 1; // PS4 depth-repeat: $() / backticks add a level (bash)
-    let (output, status) = executor::execute_capturing(seq, &mut cloned);
+    // `$(<file)` — a body that is exactly one redirect-only command with a single
+    // stdin ReadOnly `<file` reads the file directly; no fork (design: file read).
+    if let Some(contents) = try_read_file_substitution(seq, shell) {
+        return strip_trailing_newlines(&contents);
+    }
+    // Stage 1 (#197): fork a real subshell over a pipe instead of the in-process
+    // clone + Capture sink. State isolation, `$?`, and stderr routing all come
+    // from the real subshell.
+    shell.xtrace_depth += 1; // PS4 depth-repeat: $() / backticks add a level (bash)
+    let (output, status) = capture_command_output(seq, shell);
+    shell.xtrace_depth -= 1;
     shell.set_last_status(status);
     shell.set_last_cmd_sub_status(Some(status)); // for bare-assignment exit status (v126)
     strip_trailing_newlines(&output)
+}
+
+/// Production: capture a command substitution by forking a real subshell over a
+/// pipe (Stage 1, #197).
+#[cfg(not(test))]
+fn capture_command_output(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
+    executor::capture_via_fork(seq, shell)
+}
+
+/// Lib unit-test build: the multithreaded `--lib` test binary runs many tests
+/// concurrently, so `capture_via_fork`'s single-threaded-fork guard (#184) would
+/// panic whenever another test is mid-execution (concurrent `ExecActive` inflates
+/// the global exec counter). The forked and in-process captures are
+/// behavior-identical, and the FORK path is exercised end-to-end by every
+/// integration binary, bash-diff harness, and the bash test-suite (all of which
+/// spawn the real, non-test build). So the internal unit tests — which exercise
+/// comsub *behavior* on internal APIs and cannot move to a single-threaded
+/// integration binary — use the in-process clone + capture here.
+#[cfg(test)]
+fn capture_command_output(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
+    let mut cloned = shell.clone();
+    cloned.procsub_pending = Vec::new();
+    executor::execute_capturing(seq, &mut cloned)
+}
+
+/// `$(<file)` fast path: if the comsub body is EXACTLY one redirect-only command
+/// whose sole redirect is a stdin `File{ReadOnly}` (`<file`, fd 0), read the file
+/// directly into the substitution result (bash special case) — no fork. Returns
+/// `Some(contents)` (empty string on read error, after diagnosing it) when the
+/// shape matches, `None` otherwise (caller forks). Sets `$?`/`$_cmd_sub` to 0 on
+/// success, 1 on read error. Models executor.rs's in-capture `$(<file)` branch.
+fn try_read_file_substitution(seq: &Sequence, shell: &mut Shell) -> Option<String> {
+    use crate::command::{Command, FileMode, RedirOp, SimpleCommand};
+
+    if !seq.rest.is_empty() {
+        return None;
+    }
+    // The body parses as either a bare `Simple(Exec)` or a single-stage,
+    // non-negated `Pipeline` wrapping one `Simple(Exec)`; accept both.
+    let cmd = match &seq.first {
+        Command::Simple(sc) => sc,
+        Command::Pipeline(p) if !p.negate && p.commands.len() == 1 => match &p.commands[0] {
+            Command::Simple(sc) => sc,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let SimpleCommand::Exec(ec) = cmd else {
+        return None;
+    };
+    if !ec.program.0.is_empty() || !ec.inline_assignments.is_empty() || ec.redirects.len() != 1 {
+        return None;
+    }
+    let redir = &ec.redirects[0];
+    let RedirOp::File {
+        mode: FileMode::ReadOnly,
+        target,
+    } = &redir.op
+    else {
+        return None;
+    };
+    if redir.target_fd() != Some(0) {
+        return None;
+    }
+    let path = crate::param_expansion::expand_word_to_string(target, shell);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            shell.set_last_status(0);
+            shell.set_last_cmd_sub_status(Some(0));
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        Err(e) => {
+            crate::sh_error!(shell, None, "{}: {}", path, crate::bash_io_error(&e));
+            shell.set_last_status(1);
+            shell.set_last_cmd_sub_status(Some(1));
+            Some(String::new())
+        }
+    }
 }
 
 fn strip_trailing_newlines(s: &str) -> String {

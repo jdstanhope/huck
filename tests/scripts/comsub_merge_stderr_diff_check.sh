@@ -47,17 +47,11 @@ check 'simple-2>&1'     'x=$( echo hi 2>&1 ); printf "<%s>" "$x"'
 check 'terminal-group'  '{ echo out; echo er >&2; } 2>&1'                        # no comsub, both -> term
 check 'stdout-to-file'  'x=$( { echo out; echo er >&2; } >/tmp/v310_f 2>&1 ); printf "<%s>[%s]" "$x" "$(cat /tmp/v310_f)"'  # both -> file
 
-# --- OUT OF SCOPE (#195): 2>&1 >file. bash captures er, huck currently leaks it.
-# Pin huck's CURRENT behavior so this fix neither fixes nor further breaks it.
-# (Deliberately compares huck-to-itself: a change here should be a conscious #195
-# decision, surfaced by this line flipping.)
-ho=$($HUCK -c 'x=$( { echo out; echo er >&2; } 2>&1 >/tmp/v310_g ); printf "cap=<%s>" "$x"' 2>/dev/null)
-# NOTE (deviation, see task-1-report.md): huck's leak for this case lands on
-# its real fd 1 (not fd 2), so the pin includes the leaked "er" line ahead of
-# the printf output rather than "cap=<>" alone.
-oos_expected='er
-cap=<>'
-if [ "$ho" = "$oos_expected" ]; then echo "PASS [oos-2>&1>file-pinned (#195)]"; else echo "FAIL [oos-2>&1>file changed: [$ho] — reconcile with #195]"; FAIL=1; fi
+# #195 (FIXED by the Stage-1 fork, #197): `2>&1 >file` inside $(). `2>&1` dups
+# fd 2 onto the capture pipe first, then `>file` sends fd 1 to the file — so `er`
+# is captured and `out` goes to the file, matching bash. Before the fork, huck
+# leaked `er` onto its own real fd 1. Now byte-identical to bash.
+check '195-2>&1>file' 'x=$( { echo out; echo er >&2; } 2>&1 >/tmp/v310_g ); printf "cap=<%s>[file=%s]" "$x" "$(cat /tmp/v310_g)"'
 
 rm -f /tmp/v310_be /tmp/v310_he /tmp/v310_f /tmp/v310_g
 if [ $FAIL -ne 0 ]; then echo "comsub_merge_stderr_diff_check FAILED" >&2; exit 1; fi
