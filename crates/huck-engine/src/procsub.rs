@@ -10,6 +10,7 @@ use crate::command::{Command, Sequence};
 use crate::lexer::ProcDir;
 use crate::shell_state::Shell;
 use std::io;
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 
@@ -51,41 +52,32 @@ fn realize_via_devfd(
     dir: ProcDir,
     shell: &mut Shell,
 ) -> io::Result<(String, ProcSub)> {
-    let (read_fd, write_fd) = crate::child_fd::make_pipe(false)?;
+    let (read, write) = crate::child_fd::make_pipe_owned(false)?;
 
-    // Which end the PARENT keeps (parent_fd), and which end the CHILD owns as its
-    // stdio (inner_end). The child owns inner_end via `ChildStdio`; the other
-    // stdio slot inherits. The parent-kept end stays raw.
+    // Which end the PARENT keeps (parent_owned), and which end the CHILD owns as
+    // its stdio (transferred into `ChildStdio` via `ChildFd::from`). The child
+    // owns its end via `ChildStdio`; the other stdio slot inherits.
     let inner = Command::Subshell {
         body: Box::new(seq.clone()),
     };
-    let (parent_fd, inner_end, child_stdio) = match dir {
+    let (parent_owned, child_stdio) = match dir {
         // <(cmd): child writes stdout to the pipe; parent reads.
         ProcDir::In => (
-            read_fd,
-            write_fd,
-            ChildStdio::new(
-                ChildFd::Inherit,
-                unsafe { ChildFd::owned_raw(write_fd) },
-                ChildFd::Inherit,
-            ),
+            read,
+            ChildStdio::new(ChildFd::Inherit, ChildFd::from(write), ChildFd::Inherit),
         ),
         // >(cmd): child reads stdin from the pipe; parent writes.
         ProcDir::Out => (
-            write_fd,
-            read_fd,
-            ChildStdio::new(
-                unsafe { ChildFd::owned_raw(read_fd) },
-                ChildFd::Inherit,
-                ChildFd::Inherit,
-            ),
+            write,
+            ChildStdio::new(ChildFd::from(read), ChildFd::Inherit, ChildFd::Inherit),
         ),
     };
 
     // Fork the inner sequence as a subshell. pgid_target = the shell's group so the
     // procsub child is NOT a foreground job and the terminal is never handed to it
     // (avoids the SIGTTOU / terminal-handoff deadlocks of v108/v124). No give_terminal_to.
-    let child_close_list = [parent_fd]; // the child must close the parent-kept end
+    let parent_raw = parent_owned.as_raw_fd();
+    let child_close_list = [parent_raw]; // the child must close the parent-kept end
     let pid = crate::executor::fork_and_run_in_subshell(
         &inner,
         shell,
@@ -94,14 +86,14 @@ fn realize_via_devfd(
         &child_close_list,
         None,
         None,
-    )
-    .inspect_err(|_| unsafe {
-        // child_stdio (owning inner_end) was already dropped on the error path;
-        // close only the parent-kept end here.
-        libc::close(parent_fd);
-    })?;
-    // inner_end was owned by child_stdio and closed in the parent by the call.
-    let _ = inner_end;
+    )?;
+    // On the error path above, `child_stdio` (owning the child's end) is dropped by
+    // the callee, and `parent_owned` drops here as the `?` returns — both pipe ends
+    // close automatically, so no manual close is needed.
+
+    // Success: the parent keeps its end for the `ProcSub`'s lifetime (closed by
+    // `cleanup`). Surrender the `OwnedFd` to the raw number stored in the record.
+    let parent_fd = parent_owned.into_raw_fd();
 
     // bash: a process substitution sets $! to its child's PID. v318 (#218).
     shell.last_bg_pid = Some(pid);
