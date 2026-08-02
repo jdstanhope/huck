@@ -2250,11 +2250,34 @@ pub fn run_substitution(seq: &Sequence, shell: &mut Shell) -> String {
     // clone + Capture sink. State isolation, `$?`, and stderr routing all come
     // from the real subshell.
     shell.xtrace_depth += 1; // PS4 depth-repeat: $() / backticks add a level (bash)
-    let (output, status) = executor::capture_via_fork(seq, shell);
+    let (output, status) = capture_command_output(seq, shell);
     shell.xtrace_depth -= 1;
     shell.set_last_status(status);
     shell.set_last_cmd_sub_status(Some(status)); // for bare-assignment exit status (v126)
     strip_trailing_newlines(&output)
+}
+
+/// Production: capture a command substitution by forking a real subshell over a
+/// pipe (Stage 1, #197).
+#[cfg(not(test))]
+fn capture_command_output(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
+    executor::capture_via_fork(seq, shell)
+}
+
+/// Lib unit-test build: the multithreaded `--lib` test binary runs many tests
+/// concurrently, so `capture_via_fork`'s single-threaded-fork guard (#184) would
+/// panic whenever another test is mid-execution (concurrent `ExecActive` inflates
+/// the global exec counter). The forked and in-process captures are
+/// behavior-identical, and the FORK path is exercised end-to-end by every
+/// integration binary, bash-diff harness, and the bash test-suite (all of which
+/// spawn the real, non-test build). So the internal unit tests — which exercise
+/// comsub *behavior* on internal APIs and cannot move to a single-threaded
+/// integration binary — use the in-process clone + capture here.
+#[cfg(test)]
+fn capture_command_output(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
+    let mut cloned = shell.clone();
+    cloned.procsub_pending = Vec::new();
+    executor::execute_capturing(seq, &mut cloned)
 }
 
 /// `$(<file)` fast path: if the comsub body is EXACTLY one redirect-only command

@@ -3753,12 +3753,25 @@ fn emit_wrapper_error(
     err_sink: &mut StderrSink,
     msg: &str,
 ) {
-    let route =
-        matches!(*sink, StdoutSink::Capture(_)) && redirs_merge_err_into_out(&cmd.redirects, shell);
-    let mut merged = StderrSink::Merged;
-    let eff: &mut StderrSink = if route { &mut merged } else { err_sink };
-    let mut err = err_writer(eff, sink);
-    crate::sh_error_to!(shell, &mut *err, None, "{msg}");
+    // The `command`/`builtin` wrapper detects an option error DURING its own
+    // argument scan, before the command's redirects reach the real fds — so the
+    // error must be emitted UNDER the command's own redirects, exactly as the
+    // command itself would (`command -Z 2>file` → file; `$(command -Z 2>&1)` →
+    // captured). Run the emission inside `with_redirect_scope` so the redirects
+    // apply uniformly: a real `2>&1`/`2>file` dup2 at a terminal/pipe (incl. the
+    // forked comsub child, #197), and the software `Merged` route under a capture
+    // sink. Replaces the earlier capture-sink-only `Merged` special case (#77).
+    with_redirect_scope(
+        &cmd.redirects,
+        shell,
+        sink,
+        err_sink,
+        |shell, sink, err_sink| {
+            let mut err = err_writer(err_sink, sink);
+            crate::sh_error_to!(shell, &mut *err, None, "{msg}");
+            ExecOutcome::Continue(2)
+        },
+    );
 }
 
 /// Expands the program + argument words into a `ResolvedCommand`. Returns
@@ -8677,6 +8690,9 @@ unsafe fn install_child_stdio(stdio: ChildStdio) -> [RawFd; 3] {
 /// `2>&1` is a real dup2 onto the pipe (fixes #353/#195 by construction). The
 /// child is a transient foreground child in the shell's process group (not a
 /// job, no `$!`). Returns (captured stdout, exit status).
+// Used by `run_substitution` in non-test builds; the lib unit-test build routes
+// comsub through the in-process capture instead (see `expand::capture_command_output`).
+#[cfg_attr(test, allow(dead_code))]
 pub fn capture_via_fork(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     use crate::child_fd::{ChildFd, ChildStdio};
     use std::io::Read;
