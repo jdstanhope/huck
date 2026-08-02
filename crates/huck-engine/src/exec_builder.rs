@@ -120,14 +120,47 @@ impl<'a> ExecBuilder<'a> {
     /// Run the script; fd 1 and fd 2 inherit (or merged-to-fd1 if `merge_stderr`).
     ///
     /// fd 1/2 inherit directly — no pipe interposition, no capture.
+    ///
+    /// Under `merge_stderr` the merge is a REAL `dup2(1, 2)` at the fd level
+    /// (saved + restored around the run), not the software `Merged` sink — so
+    /// `run()` is single-model (#197 Stage 3). Both streams reach the embedder's
+    /// fd 1 in program order, exactly as `bash 2>&1` would.
     pub fn run(self) -> i32 {
+        use std::io::Write;
+        if !self.merge {
+            let mut out = StdoutSink::Terminal;
+            let mut err = StderrSink::Terminal;
+            return self.run_with_sinks(&mut out, &mut err);
+        }
+        // merge: flush, save fd 2, point it at fd 1, run, restore.
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        let saved2 = unsafe { libc::dup(2) };
+        if saved2 < 0 {
+            // dup failed — fall back to running unmerged rather than aborting.
+            let mut out = StdoutSink::Terminal;
+            let mut err = StderrSink::Terminal;
+            return self.run_with_sinks(&mut out, &mut err);
+        }
+        struct Fd2Restore(libc::c_int);
+        impl Drop for Fd2Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::dup2(self.0, 2);
+                    libc::close(self.0);
+                }
+            }
+        }
+        let _restore = Fd2Restore(saved2);
+        unsafe {
+            libc::dup2(1, 2);
+        }
         let mut out = StdoutSink::Terminal;
-        let mut err = if self.merge {
-            StderrSink::Merged
-        } else {
-            StderrSink::Terminal
-        };
-        self.run_with_sinks(&mut out, &mut err)
+        let mut err = StderrSink::Terminal;
+        let code = self.run_with_sinks(&mut out, &mut err);
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        code
     }
 
     /// Run the script; capture fd 1 and fd 2 into `Output`.

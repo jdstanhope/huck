@@ -56,10 +56,36 @@ fn exit_code_propagates() {
     assert_eq!(out.exit_code, 7);
 }
 
+/// `run().merge_stderr()` merges stderr into fd 1 via a REAL dup2 (#197 Stage 3).
+/// Redirect this process's fd 1 to a temp file around the run and assert both
+/// streams landed there in program order.
+fn run_merge_dup2_sends_stderr_to_fd1() {
+    use std::io::{Read, Seek, Write};
+    use std::os::fd::AsRawFd;
+    let _ = std::io::stdout().flush();
+    let mut tf = tempfile::NamedTempFile::new().unwrap();
+    let saved1 = unsafe { libc::dup(1) };
+    assert!(saved1 >= 0);
+    unsafe { libc::dup2(tf.as_raw_fd(), 1) };
+    let mut e = Engine::new();
+    let code = e.prepare("echo a; echo b >&2; echo c").merge_stderr().run();
+    let _ = std::io::stdout().flush();
+    unsafe {
+        libc::dup2(saved1, 1);
+        libc::close(saved1);
+    }
+    tf.as_file_mut().rewind().unwrap();
+    let mut buf = String::new();
+    tf.as_file_mut().read_to_string(&mut buf).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(buf, "a\nb\nc\n");
+}
+
 #[test]
 fn capture_tempfile_checks_run_serially() {
     plain_stdout_captured();
     stdout_and_stderr_separated();
     merge_stderr_interleaves_into_stdout();
     exit_code_propagates();
+    run_merge_dup2_sends_stderr_to_fd1();
 }
