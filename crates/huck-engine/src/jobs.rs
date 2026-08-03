@@ -548,12 +548,16 @@ fn job_state_and_suffix(job: &Job) -> (String, &'static str) {
 
 /// Renders one notification/listing line for a job. The trailing `&` is
 /// included for Running and Done/Signaled jobs — Stopped jobs are not
-/// "running in the background" so the suffix would be misleading. Column
-/// width is 24 to fit `Stopped (tty output)`.
+/// "running in the background" so the suffix would be misleading.
+///
+/// #410: bash's layout is `[N]<flag>` + TWO spaces + the state in a 24-column
+/// left-justified field + the command IMMEDIATELY after it (no separator).
+/// huck used one space and a trailing one, which lands the command in the same
+/// column but shifts every state string one place left.
 pub fn notification_line(job: &Job, flag: char) -> String {
     let (state, suffix) = job_state_and_suffix(job);
     format!(
-        "[{}]{} {:<24} {}{}",
+        "[{}]{}  {:<24}{}{}",
         job.id, flag, state, job.command, suffix
     )
 }
@@ -566,8 +570,10 @@ pub fn notification_line_long(job: &Job, flag: char) -> Vec<String> {
     let (state, suffix) = job_state_and_suffix(job);
     let mut lines = Vec::with_capacity(job.pids.len().max(1));
     let first_pid = job.pids.first().copied().unwrap_or(job.pgid);
+    // #410: one space after the flag here (the pid takes the second column),
+    // then the same 24-wide state field butted against the command.
     lines.push(format!(
-        "[{}]{} {} {:<24} {}{}",
+        "[{}]{} {} {:<24}{}{}",
         job.id, flag, first_pid, state, job.command, suffix
     ));
     for pid in job.pids.iter().skip(1) {
@@ -818,7 +824,7 @@ mod tests {
         t.add(4242, vec![4242], "sleep 100".to_string());
         t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTSTP);
         let line = notification_line(&t.jobs_mut()[0], '+');
-        assert_eq!(line, "[1]+ Stopped                  sleep 100");
+        assert_eq!(line, "[1]+  Stopped                 sleep 100");
     }
 
     #[test]
@@ -826,7 +832,7 @@ mod tests {
         let mut t = JobTable::new();
         t.add_synthetic_done("echo hi".to_string(), 0);
         let line = notification_line(&t.jobs_mut()[0], ' ');
-        assert_eq!(line, "[1]  Done                     echo hi &");
+        assert_eq!(line, "[1]   Done                    echo hi &");
     }
 
     #[test]
@@ -834,7 +840,7 @@ mod tests {
         let mut t = JobTable::new();
         t.add_synthetic_done("test -z hi".to_string(), 1);
         let line = notification_line(&t.jobs_mut()[0], ' ');
-        assert_eq!(line, "[1]  Exit 1                   test -z hi &");
+        assert_eq!(line, "[1]   Exit 1                  test -z hi &");
     }
 
     #[test]
@@ -843,7 +849,7 @@ mod tests {
         t.add(4242, vec![4242], "cat".to_string());
         t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTTIN);
         let line = notification_line(&t.jobs_mut()[0], '+');
-        assert_eq!(line, "[1]+ Stopped (tty input)      cat");
+        assert_eq!(line, "[1]+  Stopped (tty input)     cat");
     }
 
     #[test]
