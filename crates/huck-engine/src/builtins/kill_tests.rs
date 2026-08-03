@@ -671,11 +671,40 @@ fn kill_usage_text_matches_bash() {
     );
 }
 
+/// #405: one decoder for every sigspec position — number or name, `SIG`
+/// prefix optional, case-insensitive, plus the name-only pseudo-signal EXIT.
+#[test]
+fn decode_signal_takes_numbers_and_names_alike() {
+    for (spec, want) in [
+        ("9", Some(libc::SIGKILL)),
+        (" 9 ", Some(libc::SIGKILL)), // numbers go through legal_number
+        ("0", Some(0)),
+        ("64", Some(64)), // any number kill(2) may be handed
+        ("65", None),
+        ("-1", None),
+        ("TERM", Some(libc::SIGTERM)),
+        ("SIGTERM", Some(libc::SIGTERM)),
+        ("term", Some(libc::SIGTERM)),
+        ("EXIT", Some(0)),
+        ("exit", Some(0)),
+        ("SIGEXIT", None), // EXIT takes no SIG prefix in bash
+        (" EXIT", None),   // names are not whitespace-tolerant
+        ("BOGUS", None),
+        ("", None),
+    ] {
+        assert_eq!(
+            decode_signal(spec),
+            want,
+            "decode_signal({spec:?}) should be {want:?}"
+        );
+    }
+}
+
 /// #402: a numeric target follows bash's `legal_number()` whitespace rules —
 /// strtol's leading-whitespace set, then trailing spaces/tabs only, with the
 /// whole string consumed.
 #[test]
-fn parse_pid_target_matches_legal_number() {
+fn parse_legal_number_matches_bash() {
     for (input, want) in [
         ("12", Some(12)),
         (" 12", Some(12)),
@@ -694,9 +723,9 @@ fn parse_pid_target_matches_legal_number() {
         ("1234567890123", None), // beyond pid_t
     ] {
         assert_eq!(
-            parse_pid_target(input),
+            parse_legal_number(input),
             want,
-            "parse_pid_target({input:?}) should be {want:?}"
+            "parse_legal_number({input:?}) should be {want:?}"
         );
     }
 }

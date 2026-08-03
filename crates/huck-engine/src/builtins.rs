@@ -5085,8 +5085,16 @@ fn handle_kill_l(
     }
 
     for arg in args {
-        if let Ok(n) = arg.parse::<i32>() {
+        if let Some(n) = parse_legal_number(arg) {
             let lookup = if n >= 128 { n - 128 } else { n };
+            // #405: 0 is EXIT — named by `kill -l 0` but absent from the
+            // listing, so it is not in `killable_signals()`. The 128+signo
+            // wait-status form does NOT decode to it (`kill -l 128` is an
+            // error in bash), hence the `n < 128` guard.
+            if lookup == 0 && n < 128 {
+                let _ = writeln!(out, "EXIT");
+                continue;
+            }
             match crate::traps::killable_signals()
                 .iter()
                 .find(|(_, num)| *num == lookup)
@@ -5105,6 +5113,12 @@ fn handle_kill_l(
                 }
             }
         } else {
+            // `EXIT` is a name-only pseudo-signal: bash accepts `kill -l exit`
+            // but not `kill -l SIGEXIT` (#405).
+            if arg.eq_ignore_ascii_case("EXIT") {
+                let _ = writeln!(out, "0");
+                continue;
+            }
             let upper = arg.to_ascii_uppercase();
             let name = upper.strip_prefix("SIG").unwrap_or(&upper);
             match crate::traps::killable_signals()
@@ -5189,13 +5203,11 @@ fn builtin_kill(
             // `kill -- --` still reports the SECOND `--` as a bad target).
             (libc::SIGTERM, &args[1..])
         } else if let Some(rest) = first.strip_prefix('-') {
-            // -<sig> form
-            let sig = match rest.parse::<i32>() {
-                Ok(n) if (0..=64).contains(&n) => n,
-                // #402: bash has ONE wording for every rejected sigspec,
-                // whatever form it took — `invalid signal specification`
-                // (`sh_invalidsig`), as the `-s`/`-n`/`-l` arms already use.
-                Ok(_) => {
+            // -<sig> form. #402: bash has ONE wording for every rejected
+            // sigspec, whatever form it took (`sh_invalidsig`).
+            let sig = match decode_signal(rest) {
+                Some(n) => n,
+                None => {
                     crate::sh_error_to!(
                         shell,
                         err,
@@ -5204,18 +5216,6 @@ fn builtin_kill(
                     );
                     return ExecOutcome::Continue(1);
                 }
-                Err(_) => match signal_by_name(rest) {
-                    Some(n) => n,
-                    None => {
-                        crate::sh_error_to!(
-                            shell,
-                            err,
-                            None,
-                            "kill: {rest}: invalid signal specification"
-                        );
-                        return ExecOutcome::Continue(1);
-                    }
-                },
             };
             (sig, strip_end_of_options(&args[1..]))
         } else {
@@ -5247,19 +5247,38 @@ fn builtin_kill(
 /// (and fails as "arguments must be process or job IDs"). Consuming it is what
 /// makes the negative-pid process-group form usable with the default signal
 /// (`kill -- -$pgid`), since a leading `-<n>` would otherwise be a sigspec.
-/// Resolves a non-`%` `kill` target to a pid the way bash's `legal_number()`
-/// does (#402): `strtol(3)` skips leading whitespace (the C `isspace` set),
-/// `legal_number` then skips trailing SPACES AND TABS ONLY, and the rest of
-/// the string must be consumed. So ` 12`, `12 `, `\t12\t` and ` -99999 ` are
-/// pids, while `12\n`, `0x10` and `12abc` are not. The value must also fit a
-/// `pid_t` — bash rejects an out-of-range number as a bad target too.
-fn parse_pid_target(target: &str) -> Option<i32> {
+/// Parses a number the way bash's `legal_number()` does (#402): `strtol(3)`
+/// skips leading whitespace (the C `isspace` set), `legal_number` then skips
+/// trailing SPACES AND TABS ONLY, and the rest of the string must be consumed.
+/// So ` 12`, `12 `, `\t12\t` and ` -99999 ` parse, while `12\n`, `0x10` and
+/// `12abc` do not. `kill` runs both its pid targets and its numeric sigspecs
+/// through this (an out-of-`i32` value is rejected either way); the caller
+/// applies whatever range the position requires.
+fn parse_legal_number(s: &str) -> Option<i32> {
     const STRTOL_LEADING: [char; 6] = [' ', '\t', '\n', '\u{b}', '\u{c}', '\r'];
-    target
-        .trim_start_matches(STRTOL_LEADING)
+    s.trim_start_matches(STRTOL_LEADING)
         .trim_end_matches([' ', '\t'])
         .parse::<i32>()
         .ok()
+}
+
+/// Decodes a sigspec in ANY position — `-SIG`, `-s SIG`, `-n SIG`, `kill -l
+/// SIG` — the way bash's single `decode_signal()` does (#405): a NUMBER in
+/// `0..=NSIG` (whatever the platform names, valid or not — bash hands it to
+/// `kill(2)` and lets the kernel judge), or a NAME with or without the `SIG`
+/// prefix, case-insensitively.
+///
+/// `EXIT` (0) is bash's pseudo-signal for "no signal": accepted as a name here
+/// and printed by `kill -l 0`, but deliberately NOT in `killable_signals()` —
+/// the `kill -l` listing starts at 1, and `SIGEXIT` is not a name bash knows.
+fn decode_signal(spec: &str) -> Option<i32> {
+    if let Some(n) = parse_legal_number(spec) {
+        return (0..=64).contains(&n).then_some(n);
+    }
+    if spec.eq_ignore_ascii_case("EXIT") {
+        return Some(0);
+    }
+    signal_by_name(spec)
 }
 
 fn strip_end_of_options(targets: &[String]) -> &[String] {
@@ -5281,7 +5300,9 @@ fn kill_with_s_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
             return ExecOutcome::Continue(1);
         }
     };
-    let sig = match signal_by_name(name) {
+    // #405: `-s` takes a NUMBER as readily as a name — bash decodes every
+    // position with the same function.
+    let sig = match decode_signal(name) {
         Some(n) => n,
         None => {
             crate::sh_error_to!(
@@ -5306,7 +5327,9 @@ fn kill_with_s_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
 
 /// Handles `kill -n SIGNUM [targets...]`. The `-n` token has already
 /// been consumed by the dispatcher; `args` is everything after it.
-/// Number must be in `killable_signals()` (matching `kill -l`'s set).
+/// #405: `-n` takes a NAME as readily as a number, and any number bash would
+/// hand to `kill(2)` — the old `killable_signals()` membership test rejected
+/// signal 0 and everything above the standard table.
 fn kill_with_n_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let num_arg = match args.first() {
         Some(s) => s,
@@ -5316,9 +5339,9 @@ fn kill_with_n_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
             return ExecOutcome::Continue(1);
         }
     };
-    let n = match num_arg.parse::<i32>() {
-        Ok(n) if (1..=64).contains(&n) => n,
-        _ => {
+    let n = match decode_signal(num_arg) {
+        Some(n) => n,
+        None => {
             crate::sh_error_to!(
                 shell,
                 err,
@@ -5328,18 +5351,6 @@ fn kill_with_n_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
             return ExecOutcome::Continue(1);
         }
     };
-    if !crate::traps::killable_signals()
-        .iter()
-        .any(|(_, num)| *num == n)
-    {
-        crate::sh_error_to!(
-            shell,
-            err,
-            None,
-            "kill: {num_arg}: invalid signal specification"
-        );
-        return ExecOutcome::Continue(1);
-    }
     let targets = strip_end_of_options(&args[1..]);
     if targets.is_empty() {
         e!(
@@ -5412,7 +5423,7 @@ fn send_signal_to_targets(
                 any_failed = true;
             }
         } else {
-            match parse_pid_target(target) {
+            match parse_legal_number(target) {
                 Some(pid) => {
                     // #4: bash passes the value straight to `kill(2)`, which
                     // interprets it itself: `>0` a single pid, `0` the caller's
