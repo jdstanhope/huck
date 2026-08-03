@@ -232,8 +232,10 @@ fn bg_with_multiple_args_returns_usage_status_2() {
     assert!(matches!(outcome, ExecOutcome::Continue(2)));
 }
 
+/// #411: an unresolvable job spec is 127 in bash, whatever its shape. Both
+/// of these tests asserted the old divergent 1.
 #[test]
-fn wait_with_bad_spec_errors_status_1() {
+fn wait_with_bad_spec_errors_status_127() {
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -243,11 +245,11 @@ fn wait_with_bad_spec_errors_status_1() {
         &mut std::io::stderr(),
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    assert!(matches!(outcome, ExecOutcome::Continue(127)));
 }
 
 #[test]
-fn wait_with_no_such_spec_errors_status_1() {
+fn wait_with_no_such_spec_errors_status_127() {
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -257,7 +259,7 @@ fn wait_with_no_such_spec_errors_status_1() {
         &mut std::io::stderr(),
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    assert!(matches!(outcome, ExecOutcome::Continue(127)));
 }
 
 #[test]
