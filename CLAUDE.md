@@ -59,7 +59,8 @@ Run the standard iteration loop without being asked:
      (CI runs it too, but catch regressions locally first.)
 6. **Open a pull request** (`gh pr create`) targeting `main`, with the body
    referencing the issue via `Closes #N`, and hand it to the user to review
-   and merge — do NOT merge to main yourself. Push the `vNN-<topic>` branch
+   and merge — do NOT merge a `vNN` iteration to main yourself (a bug-fix
+   round is different; see the cascade section). Push the `vNN-<topic>` branch
    to origin so the PR has a head. Before opening the PR, update the docs +
    memory as part of the branch:
    - If the work resolved a divergence, the merged PR auto-closes its issue
@@ -71,6 +72,36 @@ Run the standard iteration loop without being asked:
    - Record the iteration in the long-running memory files
      (`project_huck_iterations.md` + `MEMORY.md`). (The README no longer
      carries a per-version table.)
+
+## Bug-fix rounds and the follow-on cascade
+
+A **bug-fix round** — one issue, no `vNN`, no spec/plan — runs the short
+loop: branch → fix → a `<feature>_diff_check.sh` harness → build both
+binaries + full `tests/scripts/run_diff_checks.sh` sweep → PR
+(`Closes #N`) → **wait for the GitHub run to FINISH and pass** →
+squash-merge it yourself.
+
+Fixing one bug almost always turns up neighbouring divergences. File each
+as its own `divergence` issue (never smuggle it into the current PR),
+then **keep going without being asked**:
+
+1. Finish the current round and merge its PR (CI green — local green is
+   not enough).
+2. Take the issues you just filed, one round each, same short loop.
+3. Repeat until the cascade is dry, then report the whole chain.
+
+**Stop and hand back to the user** when the next issue is a *significant
+change that may affect multiple features*: a shared table or chokepoint
+several builtins read, a new subsystem, or a blast radius wider than the
+builtin you were fixing — anything that wants a spec + plan. Say what you
+found, why it is bigger, and let the user decide. Small, self-contained,
+harness-provable fixes keep cascading; anything else waits.
+
+**Never stack a PR on an unmerged branch.** Merge the parent to `main`
+first, then branch again from `main`. A PR based on a branch that then
+gets squash-merged is orphaned — it merges into the stale branch, not
+`main`, and GitHub still reports it as merged. If the follow-on cannot
+wait, branch from `main` and cherry-pick.
 
 ## Conventions
 
@@ -88,6 +119,9 @@ Run the standard iteration loop without being asked:
   the same fragments through bash and huck and assert byte-identical
   output. Adding a `<feature>_diff_check.sh` is the gold standard
   for verifying bash compat on a new feature.
-- **Don't push directly to main, and don't merge PRs yourself.** Iteration
-  work lands via a pull request that the user reviews and merges. Push the
-  feature branch and open the PR (`Closes #N`); leave the merge to the user.
+- **Don't push directly to main.** Everything lands via a pull request.
+  A `vNN` **iteration** PR is handed to the user to review and merge —
+  push the branch, open the PR (`Closes #N`), leave the merge alone. A
+  **bug-fix round** PR you squash-merge yourself once the GitHub run has
+  finished and passed, then move on to the issues that round filed (see
+  "Bug-fix rounds and the follow-on cascade" above).
