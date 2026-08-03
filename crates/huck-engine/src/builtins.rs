@@ -5184,14 +5184,27 @@ fn builtin_kill(
             // -<sig> form
             let sig = match rest.parse::<i32>() {
                 Ok(n) if (0..=64).contains(&n) => n,
+                // #402: bash has ONE wording for every rejected sigspec,
+                // whatever form it took — `invalid signal specification`
+                // (`sh_invalidsig`), as the `-s`/`-n`/`-l` arms already use.
                 Ok(_) => {
-                    crate::sh_error_to!(shell, err, None, "kill: {rest}: invalid signal number");
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "kill: {rest}: invalid signal specification"
+                    );
                     return ExecOutcome::Continue(1);
                 }
                 Err(_) => match signal_by_name(rest) {
                     Some(n) => n,
                     None => {
-                        crate::sh_error_to!(shell, err, None, "kill: {rest}: invalid signal");
+                        crate::sh_error_to!(
+                            shell,
+                            err,
+                            None,
+                            "kill: {rest}: invalid signal specification"
+                        );
                         return ExecOutcome::Continue(1);
                     }
                 },
@@ -5205,14 +5218,14 @@ fn builtin_kill(
     } else {
         e!(
             err,
-            "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ..."
+            "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]"
         );
         return ExecOutcome::Continue(2);
     };
     if targets.is_empty() {
         e!(
             err,
-            "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ..."
+            "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]"
         );
         return ExecOutcome::Continue(2);
     }
@@ -5226,6 +5239,21 @@ fn builtin_kill(
 /// (and fails as "arguments must be process or job IDs"). Consuming it is what
 /// makes the negative-pid process-group form usable with the default signal
 /// (`kill -- -$pgid`), since a leading `-<n>` would otherwise be a sigspec.
+/// Resolves a non-`%` `kill` target to a pid the way bash's `legal_number()`
+/// does (#402): `strtol(3)` skips leading whitespace (the C `isspace` set),
+/// `legal_number` then skips trailing SPACES AND TABS ONLY, and the rest of
+/// the string must be consumed. So ` 12`, `12 `, `\t12\t` and ` -99999 ` are
+/// pids, while `12\n`, `0x10` and `12abc` are not. The value must also fit a
+/// `pid_t` — bash rejects an out-of-range number as a bad target too.
+fn parse_pid_target(target: &str) -> Option<i32> {
+    const STRTOL_LEADING: [char; 6] = [' ', '\t', '\n', '\u{b}', '\u{c}', '\r'];
+    target
+        .trim_start_matches(STRTOL_LEADING)
+        .trim_end_matches([' ', '\t'])
+        .parse::<i32>()
+        .ok()
+}
+
 fn strip_end_of_options(targets: &[String]) -> &[String] {
     match targets.first() {
         Some(t) if t == "--" => &targets[1..],
@@ -5239,8 +5267,10 @@ fn kill_with_s_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
     let name = match args.first() {
         Some(n) => n,
         None => {
+            // bash reports a missing option argument with `sh_needarg` and
+            // EXECUTION_FAILURE (1) — not the usage status 2 (#402).
             crate::sh_error_to!(shell, err, None, "kill: -s: option requires an argument");
-            return ExecOutcome::Continue(2);
+            return ExecOutcome::Continue(1);
         }
     };
     let sig = match signal_by_name(name) {
@@ -5259,7 +5289,7 @@ fn kill_with_s_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
     if targets.is_empty() {
         e!(
             err,
-            "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ..."
+            "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]"
         );
         return ExecOutcome::Continue(2);
     }
@@ -5273,8 +5303,9 @@ fn kill_with_n_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
     let num_arg = match args.first() {
         Some(s) => s,
         None => {
+            // Missing option argument = status 1, as for `-s` above (#402).
             crate::sh_error_to!(shell, err, None, "kill: -n: option requires an argument");
-            return ExecOutcome::Continue(2);
+            return ExecOutcome::Continue(1);
         }
     };
     let n = match num_arg.parse::<i32>() {
@@ -5305,7 +5336,7 @@ fn kill_with_n_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
     if targets.is_empty() {
         e!(
             err,
-            "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ..."
+            "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]"
         );
         return ExecOutcome::Continue(2);
     }
@@ -5359,8 +5390,8 @@ fn send_signal_to_targets(
                 any_failed = true;
             }
         } else {
-            match target.parse::<i32>() {
-                Ok(pid) => {
+            match parse_pid_target(target) {
+                Some(pid) => {
                     // #4: bash passes the value straight to `kill(2)`, which
                     // interprets it itself: `>0` a single pid, `0` the caller's
                     // own process group, `<0` the process group `|pid|` (`-1` =
@@ -5373,7 +5404,7 @@ fn send_signal_to_targets(
                         any_failed = true;
                     }
                 }
-                Err(_) => {
+                None => {
                     crate::sh_error_to!(
                         shell,
                         err,
