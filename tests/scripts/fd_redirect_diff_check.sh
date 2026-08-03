@@ -23,6 +23,20 @@ check "external fd>2 inherit"   'f=$(mktemp); sh -c "echo hi >&3" 3>"$f"; cat "$
 check "pipeline stage fd>2"     'f=$(mktemp); sh -c "echo ps >&3" 3>"$f" | cat; echo "p=[$(cat "$f")]"; rm -f "$f"'
 check "bad source fd EBADF"     '(echo x >&9) 2>/dev/null; echo "rc=$?"'
 check "missing input file"      '(exec 3</no/such_xyz) 2>/dev/null; echo "rc=$?"'
+# #223: `>&word` / `1>&word` whose word is a single non-numeric, non-`-` field
+# is a synonym for `&>word` (redirect BOTH stdout+stderr to that file), NOT a
+# `bad fd` error. A numeric/`-` word stays a real dup/close.
+check "223 >&file both streams" 'f=$(mktemp); sh -c "echo O; echo E >&2" >&"$f"; sort "$f"; rm -f "$f"'
+check "223 1>&file both"        'f=$(mktemp); sh -c "echo O; echo E >&2" 1>&"$f"; sort "$f"; rm -f "$f"'
+check "223 builtin >&file"      'f=$(mktemp); echo hi >&"$f"; cat "$f"; rm -f "$f"'
+check "223 >&file var word"     'f=$(mktemp); w="$f"; echo hi >&"$w"; cat "$f"; rm -f "$f"'
+check "223 >&2 numeric dup"     'echo O >&2 2>/dev/null; echo "rc=$?"'
+# `>&$x` where x expands to `-` closes the fd (like a literal `>&-`); it must
+# NOT be taken as a filename `-`. (fd2 redirect on the GROUP, not the builtin,
+# to avoid the separate pre-existing builtin close+`2>/dev/null` ordering bug.)
+check "223 >&\$x x=- closes"    'x=-; { echo hi >&$x; } 2>/dev/null; echo "rc=$?"'
+check "223 >&\$x x=- no file"   'x=-; { echo hi >&$x; } 2>/dev/null; test -e ./- && echo LEAK || echo clean; rm -f ./-'
+check "223 >&\$comsub once"     'f=$(mktemp); echo hi >&"$(echo side >&2; echo "$f")" 2>&1 1>/dev/null; echo "n=$(grep -c side "$f" 2>/dev/null)$(cat "$f")"; rm -f "$f"'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

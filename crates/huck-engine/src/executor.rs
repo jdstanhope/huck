@@ -868,6 +868,7 @@ fn has_any_redirect(cmd: &ExecCommand) -> bool {
 /// whether the builtin-redirect path's in-memory `>&2` / `2>&1` software
 /// routing applies — it must fire ONLY when no earlier file/pipe redirect
 /// already intercepted the source fd.
+#[cfg(test)] // only the `#[cfg(test)]` capture-routing tags consult this
 enum RedirectDest {
     /// No redirect on this fd: inherits whatever the active sink provides.
     Sink,
@@ -890,6 +891,7 @@ enum RedirectDest {
 /// Source words on `Dup` are resolved via `resolve_fd_target`; an unresolvable
 /// source falls back to `External` (conservative: the real-fd scope will
 /// report the error and we want to skip software routing).
+#[cfg(test)] // production no longer expands the dup source for capture routing (#223)
 fn final_dests_for_1_2(redirs: &[Redirection], shell: &mut Shell) -> (RedirectDest, RedirectDest) {
     let mut fd1 = RedirectDest::Sink;
     let mut fd2 = RedirectDest::Sink;
@@ -1043,18 +1045,32 @@ fn run_builtin_with_redirects(
     //                     `>file` is honored over an outer capture (`None`).
     // In production no capture is active, so every stream does a real fd write
     // and the tags are inert — the real dup2 chain alone realizes the redirect.
-    use crate::fd_writer::CaptureStream;
-    let (final_1, final_2) = final_dests_for_1_2(redirs, shell);
-    let out_cap = match (&final_1, &final_2) {
-        (RedirectDest::Sink, _) => Some(CaptureStream::Out),
-        (RedirectDest::Follows(2), RedirectDest::Sink) => Some(CaptureStream::Err),
-        _ => None,
+    // `final_dests_for_1_2` resolves each `>&word` source (running any `$(...)`
+    // in it), so calling it in production would expand the dup source a SECOND
+    // time (`apply_redirects` below is the first) — `echo x >&"$(cmd)"` would run
+    // `cmd` twice. Its result feeds only the capture tags, which are inert unless
+    // a `#[cfg(test)]` capture is active, so gate the whole computation on `test`.
+    #[cfg(test)]
+    let (out_cap, err_cap) = {
+        use crate::fd_writer::CaptureStream;
+        let (final_1, final_2) = final_dests_for_1_2(redirs, shell);
+        let out_cap = match (&final_1, &final_2) {
+            (RedirectDest::Sink, _) => Some(CaptureStream::Out),
+            (RedirectDest::Follows(2), RedirectDest::Sink) => Some(CaptureStream::Err),
+            _ => None,
+        };
+        let err_cap = match (&final_2, &final_1) {
+            (RedirectDest::Sink, _) => Some(CaptureStream::Err),
+            (RedirectDest::Follows(1), RedirectDest::Sink) => Some(CaptureStream::Out),
+            _ => None,
+        };
+        (out_cap, err_cap)
     };
-    let err_cap = match (&final_2, &final_1) {
-        (RedirectDest::Sink, _) => Some(CaptureStream::Err),
-        (RedirectDest::Follows(1), RedirectDest::Sink) => Some(CaptureStream::Out),
-        _ => None,
-    };
+    #[cfg(not(test))]
+    let (out_cap, err_cap): (
+        Option<crate::fd_writer::CaptureStream>,
+        Option<crate::fd_writer::CaptureStream>,
+    ) = (None, None);
 
     let mut scope = RedirectScope::new();
     if let Err(outcome) = scope.apply_redirects(redirs, shell) {
@@ -2891,6 +2907,7 @@ fn expand_single(
 /// Expands `source` to a string and parses it as an fd number (e.g. "1" or "2").
 /// Used for `RedirectSlot::Dup { source }` to obtain the target fd pre-fork.
 /// Errors with "bad fd: ..." if the expansion is not a valid non-negative integer.
+#[cfg(test)] // only `final_dests_for_1_2` (test-only) + its unit tests use this
 fn resolve_fd_target(source: &crate::lexer::Word, shell: &mut Shell) -> Result<i32, io::Error> {
     let expanded = expand_assignment(source, shell);
     expanded
@@ -5157,9 +5174,75 @@ fn lower_one_redirect(
         }
         RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
             let is_move = matches!(&redir.op, RedirOp::Move { .. });
-            let src = match resolve_dup_source(source, shell) {
-                Ok(n) => n,
-                Err(()) => return Err(1),
+            let is_output_dup = matches!(&redir.op, RedirOp::Dup { output: true, .. });
+            // #223: `>&word` / `1>&word` (an OUTPUT dup on fd 1) whose word is a
+            // single NON-NUMERIC, non-`-` field is a synonym for `&>word` —
+            // redirect BOTH stdout and stderr to that file. Resolve from ONE
+            // expansion (so a `>&$(cmd)` source isn't run twice) and take the
+            // fallback when the word is not an fd number.
+            let src = if is_output_dup && !is_move && target == libc::STDOUT_FILENO {
+                // Expand exactly like a `>file` target (`expand_single`): a single
+                // field after glob/split, or "<word>: ambiguous redirect" + Err on
+                // many — so `>&*.two-matches` and `>&$x`(x="a b") diverge to the
+                // same error bash gives. Also runs any `$(...)` in the source once.
+                let field = match expand_single(source, shell, &mut *err_writer()) {
+                    Ok(p) => p,
+                    Err(()) => return Err(1),
+                };
+                if field == "-" {
+                    // `>&$x` with `x=-` closes the target fd, exactly like a
+                    // literal `>&-` (which the parser routes to `RedirOp::Close`
+                    // before reaching here). Do NOT treat `-` as a filename.
+                    ops.push(PlanOp::Close { target });
+                    if let Some(st) = fd_state.as_deref_mut() {
+                        st.insert(target, false);
+                    }
+                    return Ok(ops);
+                }
+                match field.parse::<RawFd>() {
+                    Ok(fd) => fd, // `>&2` etc. — a normal dup; fall through below.
+                    Err(_) => {
+                        // `&>file` fallback: open the file on fd 1, then fd 2 <- fd 1.
+                        use crate::command::FileMode;
+                        if check_restricted_redirect(&FileMode::Truncate, &field, &field, shell)
+                            .is_err()
+                        {
+                            return Err(1);
+                        }
+                        let owned = match open_redirect_file(
+                            &FileMode::Truncate,
+                            &field,
+                            shell.shell_options.noclobber,
+                            FdPlacement::Relocated,
+                        ) {
+                            Ok(fd) => fd,
+                            Err(e) => {
+                                redir_open_error(shell, &field, &e);
+                                return Err(1);
+                            }
+                        };
+                        ops.push(PlanOp::InstallOwned {
+                            target: libc::STDOUT_FILENO,
+                            source: owned,
+                        });
+                        if let Some(st) = fd_state.as_deref_mut() {
+                            st.insert(libc::STDOUT_FILENO, true);
+                        }
+                        ops.push(PlanOp::InstallDup {
+                            target: libc::STDERR_FILENO,
+                            source: libc::STDOUT_FILENO,
+                        });
+                        if let Some(st) = fd_state.as_deref_mut() {
+                            st.insert(libc::STDERR_FILENO, true);
+                        }
+                        return Ok(ops);
+                    }
+                }
+            } else {
+                match resolve_dup_source(source, shell) {
+                    Ok(n) => n,
+                    Err(()) => return Err(1),
+                }
             };
             // Degenerate `N>&N-` (source == target): bash no-op (redir.c's
             // `redir_fd != redirector` guard). Contributes nothing.
