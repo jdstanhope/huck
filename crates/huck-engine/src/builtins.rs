@@ -5176,7 +5176,11 @@ fn builtin_kill(
         _ => {}
     }
     let (sig, targets) = if let Some(first) = args.first() {
-        if let Some(rest) = first.strip_prefix('-') {
+        if first == "--" {
+            // Bare `--`: no sigspec, and the `--` is consumed here (so
+            // `kill -- --` still reports the SECOND `--` as a bad target).
+            (libc::SIGTERM, &args[1..])
+        } else if let Some(rest) = first.strip_prefix('-') {
             // -<sig> form
             let sig = match rest.parse::<i32>() {
                 Ok(n) if (0..=64).contains(&n) => n,
@@ -5192,15 +5196,10 @@ fn builtin_kill(
                     }
                 },
             };
-            if args.len() < 2 {
-                e!(
-                    err,
-                    "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ..."
-                );
-                return ExecOutcome::Continue(2);
-            }
-            (sig, &args[1..])
+            (sig, strip_end_of_options(&args[1..]))
         } else {
+            // A non-option first word ends option processing immediately, so a
+            // later `--` is an ordinary (invalid) target, not a separator.
             (libc::SIGTERM, args)
         }
     } else {
@@ -5210,8 +5209,28 @@ fn builtin_kill(
         );
         return ExecOutcome::Continue(2);
     };
+    if targets.is_empty() {
+        e!(
+            err,
+            "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ..."
+        );
+        return ExecOutcome::Continue(2);
+    }
 
     send_signal_to_targets(sig, targets, err, shell)
+}
+
+/// Drops a single leading `--` from a `kill` target list. bash's `kill.def`
+/// breaks out of its option loop on the first `--`, so only ONE is consumed
+/// and only at the head of the targets — any later `--` is an ordinary target
+/// (and fails as "arguments must be process or job IDs"). Consuming it is what
+/// makes the negative-pid process-group form usable with the default signal
+/// (`kill -- -$pgid`), since a leading `-<n>` would otherwise be a sigspec.
+fn strip_end_of_options(targets: &[String]) -> &[String] {
+    match targets.first() {
+        Some(t) if t == "--" => &targets[1..],
+        _ => targets,
+    }
 }
 
 /// Handles `kill -s SIGNAME [targets...]`. The `-s` token has already
@@ -5236,7 +5255,7 @@ fn kill_with_s_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
             return ExecOutcome::Continue(1);
         }
     };
-    let targets = &args[1..];
+    let targets = strip_end_of_options(&args[1..]);
     if targets.is_empty() {
         e!(
             err,
@@ -5282,7 +5301,7 @@ fn kill_with_n_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
         );
         return ExecOutcome::Continue(1);
     }
-    let targets = &args[1..];
+    let targets = strip_end_of_options(&args[1..]);
     if targets.is_empty() {
         e!(
             err,
@@ -5335,21 +5354,26 @@ fn send_signal_to_targets(
                 r
             };
             if rc != 0 {
-                let errno = std::io::Error::last_os_error();
+                let errno = crate::bash_io_error(&std::io::Error::last_os_error());
                 crate::sh_error_to!(shell, err, None, "kill: ({target}) - {errno}");
                 any_failed = true;
             }
         } else {
             match target.parse::<i32>() {
-                Ok(pid) if pid > 0 => {
+                Ok(pid) => {
+                    // #4: bash passes the value straight to `kill(2)`, which
+                    // interprets it itself: `>0` a single pid, `0` the caller's
+                    // own process group, `<0` the process group `|pid|` (`-1` =
+                    // every process the caller may signal). Only a NON-numeric
+                    // target is rejected as not-a-process-or-job below.
                     let rc = unsafe { libc::kill(pid, sig) };
                     if rc != 0 {
-                        let errno = std::io::Error::last_os_error();
+                        let errno = crate::bash_io_error(&std::io::Error::last_os_error());
                         crate::sh_error_to!(shell, err, None, "kill: ({pid}) - {errno}");
                         any_failed = true;
                     }
                 }
-                _ => {
+                Err(_) => {
                     crate::sh_error_to!(
                         shell,
                         err,
