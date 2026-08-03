@@ -41,6 +41,13 @@ check "fg %1 no jobs"       'set -m; fg %1; echo rc=$?'
 # in a subshell, where it reports "no job control" instead. Both of those are
 # separate, pre-existing divergences, filed.)
 
+# --- #417: bg takes a LIST of specs; status 1 if any operand failed ---------
+check "two specs, none exist"  "${J}bg %1 %2; echo rc=\$?"
+check "one live, one missing"  "${J}sleep 2 & bg %1 %2; echo rc=\$?${R}"
+check "missing then live"      "${J}sleep 2 & bg %2 %1; echo rc=\$?${R}"
+check "two live jobs"          "${J}sleep 2 & sleep 2 & bg %1 %2; echo rc=\$?; kill -KILL %1 %2 2>/dev/null; wait 2>/dev/null"
+check "same job twice"         "${J}sleep 2 & bg %1 %1; echo rc=\$?${R}"
+
 # --- usage / option errors are unchanged ------------------------------------
 check "bg -x"            'set -m; bg -x; echo rc=$?'
 
