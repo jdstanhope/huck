@@ -193,6 +193,15 @@ Each iteration follows the same loop:
 5. **Verify** against bash via a per-feature `tests/scripts/*_diff_check.sh`
    harness; the merged PR closes its `divergence` issue
 
+Smaller **bug-fix rounds** skip the spec and plan: branch → fix → harness →
+full diff-check sweep → PR (`Closes #N`) → merge once CI passes. Because
+fixing one divergence usually exposes its neighbours, each round files what
+it finds as new `divergence` issues and then works through them in the same
+way, round after round, until the cascade is dry. A follow-on that would
+reach beyond the piece under repair — a shared table, a chokepoint several
+builtins read, anything wanting a design — stops there and goes back through
+the full iteration loop above instead.
+
 Tests live alongside each module in `#[cfg(test)] mod tests` blocks, plus
 binary-driven integration tests under `tests/`. Interactive features (tab
 completion, history recall, Ctrl-C, job control) are covered by PTY-driven
