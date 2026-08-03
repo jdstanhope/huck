@@ -4991,7 +4991,33 @@ fn lower_one_redirect(
                 }
             }
             RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
-                let src = resolve_dup_source(source, shell).map_err(|()| 1)?;
+                // #154: a `{var}`-fd dup whose source is not a valid fd NUMBER —
+                // a multi/zero-field expansion (`{zz}>&$unset`) OR a single
+                // non-numeric field (`{zz}>&foo`) — is an `ambiguous redirect`
+                // naming the `{var}` NAME (bash), not the source word or `bad fd`
+                // (that is `resolve_dup_source`'s plain-fd rule). A numeric source
+                // proceeds to the dup validation below, which names the NUMBER on
+                // a closed fd (`{zz}>&7` → `7: Bad file descriptor`).
+                let fields = expand(source, shell);
+                let parsed = if fields.len() == 1 {
+                    fields
+                        .into_iter()
+                        .next()
+                        .unwrap()
+                        .chars
+                        .parse::<RawFd>()
+                        .ok()
+                } else {
+                    None
+                };
+                let src = match parsed {
+                    Some(fd) => fd,
+                    None => {
+                        let mut err = err_writer();
+                        crate::sh_error_to!(shell, &mut *err, None, "{name}: ambiguous redirect");
+                        return Err(1);
+                    }
+                };
                 dup_src = Some(src);
                 dup_source_word = Some(source);
             }
