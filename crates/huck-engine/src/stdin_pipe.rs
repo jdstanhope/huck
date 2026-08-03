@@ -13,7 +13,7 @@
 
 use std::cell::RefCell;
 use std::io::{self, Write};
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 
 use crate::shell_state::Shell;
@@ -35,7 +35,7 @@ pub fn with_stdin_fd0<R>(
     shell_cell: &Rc<RefCell<Shell>>,
     f: impl FnOnce() -> R,
 ) -> R {
-    let (r, w) = match crate::child_fd::make_pipe(true) {
+    let (r, w) = match crate::child_fd::make_pipe_owned(true) {
         Ok(pair) => pair,
         Err(e) => {
             // Hard-fail before any state change.
@@ -58,14 +58,13 @@ pub fn with_stdin_fd0<R>(
             "dup: {}",
             crate::bash_io_error(&e)
         );
-        unsafe {
-            libc::close(r);
-            libc::close(w);
-        }
+        // `r` and `w` (OwnedFds) drop as we return, closing both pipe ends.
         return f();
     }
+    // Own the saved fd 0 so it closes exactly once via drop (#197 Class-A).
+    let saved = unsafe { OwnedFd::from_raw_fd(saved) };
 
-    if unsafe { libc::dup2(r, 0) } < 0 {
+    if unsafe { libc::dup2(r.as_raw_fd(), 0) } < 0 {
         let e = io::Error::last_os_error();
         crate::sh_error!(
             &*shell_cell.borrow(),
@@ -73,26 +72,21 @@ pub fn with_stdin_fd0<R>(
             "dup2: {}",
             crate::bash_io_error(&e)
         );
-        unsafe {
-            libc::close(r);
-            libc::close(w);
-            libc::close(saved);
-        }
+        // `r`, `w`, and `saved` (all OwnedFds) drop as we return.
         return f();
     }
-    unsafe {
-        libc::close(r);
-    }
+    // fd 0 now aliases the pipe read end; drop our own copy of it.
+    drop(r);
 
     struct Restore {
-        saved: RawFd,
+        saved: OwnedFd,
     }
     impl Drop for Restore {
         fn drop(&mut self) {
             let _ = io::stdout().flush();
+            // Restore fd 0 from the owned save; the OwnedFd then drops → closes it.
             unsafe {
-                libc::dup2(self.saved, 0);
-                libc::close(self.saved);
+                libc::dup2(self.saved.as_raw_fd(), 0);
             }
         }
     }
@@ -100,19 +94,18 @@ pub fn with_stdin_fd0<R>(
 
     if input.len() <= INLINE_STDIN_THRESHOLD {
         // Write inline, close, then run.
-        let written = unsafe { libc::write(w, input.as_ptr().cast(), input.len()) };
+        let written = unsafe { libc::write(w.as_raw_fd(), input.as_ptr().cast(), input.len()) };
         let _ = written; // best-effort; pipe writes ≤ PIPE_BUF are atomic
-        unsafe {
-            libc::close(w);
-        }
+        drop(w); // closes the write end
         f()
     } else {
         // Spawn a writer thread that owns `w` and exits when it's closed by EPIPE
-        // or by completing the write.
+        // or by completing the write. Ownership of the write end moves into the
+        // thread (the OwnedFd), so it closes exactly once when the thread's File
+        // drops.
         let input_owned: Vec<u8> = input.to_vec();
         let handle = std::thread::spawn(move || {
-            use std::os::fd::FromRawFd;
-            let mut file = unsafe { std::fs::File::from_raw_fd(w) };
+            let mut file = std::fs::File::from(w);
             let _ = file.write_all(&input_owned);
             // file dropped here -> w closed.
         });

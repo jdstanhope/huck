@@ -234,5 +234,19 @@ pub(crate) fn make_pipe(cloexec: bool) -> io::Result<(RawFd, RawFd)> {
     Ok((r, w))
 }
 
+/// `make_pipe`, but the ends come back as `OwnedFd` (read, write) so each closes
+/// itself on drop. Same `pipe2(O_CLOEXEC)` / fcntl-fallback + `>= 3` relocation
+/// as `make_pipe` — this is the RAII face callers migrate to (a parent-kept end
+/// drops instead of a hand-written `libc::close`; a transferred end reaches its
+/// handoff via `.into_raw_fd()`). The `make_pipe` error paths already close both
+/// raw ends before returning, so no fd escapes on Err.
+pub(crate) fn make_pipe_owned(cloexec: bool) -> io::Result<(OwnedFd, OwnedFd)> {
+    let (r, w) = make_pipe(cloexec)?;
+    // SAFETY: `make_pipe` just created these two ends and returns them to us with
+    // exclusive ownership; wrapping each in an `OwnedFd` makes this call the sole
+    // owner, closing each exactly once on drop.
+    Ok(unsafe { (OwnedFd::from_raw_fd(r), OwnedFd::from_raw_fd(w)) })
+}
+
 #[cfg(test)]
 mod tests;

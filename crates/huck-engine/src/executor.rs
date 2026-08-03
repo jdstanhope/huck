@@ -702,8 +702,24 @@ fn run_command(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
 /// differs from `>file 2>&1` and a `{var}`'s side effects (assign `$v`, allocate a
 /// persistent fd) are visible to the next redirection. A failure mid-list returns
 /// `Err(outcome)`; Drop then rolls back the entries already applied (atomic).
+/// `dup(fd)` into an OWNED handle, or `None` on EBADF (the fd was not open).
+/// The returned `OwnedFd` closes the dup on drop — the RAII basis for
+/// `RedirectScope`'s save/restore (#197 Class-A).
+fn own_dup(fd: RawFd) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let d = unsafe { libc::dup(fd) };
+    if d < 0 {
+        None
+    } else {
+        Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(d) })
+    }
+}
+
 struct RedirectScope {
-    saved: Vec<(RawFd, RawFd)>,
+    /// Per redirect: the real fd we replaced, and an OWNED dup of its original
+    /// contents (`None` when the target was unopened). Drop restores from the
+    /// owned dup, whose destructor then closes it — no manual close (#197 Class-A).
+    saved: Vec<(RawFd, Option<std::os::fd::OwnedFd>)>,
 }
 
 impl RedirectScope {
@@ -720,8 +736,8 @@ impl RedirectScope {
         unsafe {
             // `dup` fails with EBADF when target_fd is not open (e.g. a fresh
             // fd>2 like `>&3` when fd 3 was never opened). That is fine — record
-            // -1 so Drop closes target_fd back to its unopened state.
-            let saved = libc::dup(target_fd);
+            // `None` so Drop closes target_fd back to its unopened state.
+            let saved = own_dup(target_fd);
             if libc::dup2(new_fd, target_fd) < 0 {
                 {
                     let mut err = err_writer();
@@ -733,9 +749,7 @@ impl RedirectScope {
                         io::Error::last_os_error()
                     );
                 }
-                if saved >= 0 {
-                    libc::close(saved);
-                }
+                // `saved` (if Some) drops here → closes the dup automatically.
                 return Err(());
             }
             self.saved.push((target_fd, saved));
@@ -747,8 +761,8 @@ impl RedirectScope {
     /// restore it. EBADF (already closed) is lenient per bash.
     fn close_target(&mut self, target_fd: RawFd) {
         unsafe {
-            let saved = libc::dup(target_fd);
-            // Record the swap so Drop restores (saved == -1 if it was unopened).
+            // Record the swap so Drop restores (`None` if it was unopened).
+            let saved = own_dup(target_fd);
             self.saved.push((target_fd, saved));
             libc::close(target_fd);
         }
@@ -772,7 +786,7 @@ impl RedirectScope {
                             let _ = libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
                         }
                     }
-                    self.saved.push((target, -1));
+                    self.saved.push((target, None));
                 } else if self.redirect(shell, raw, target).is_err() {
                     return Err(ExecOutcome::Continue(1));
                 } else {
@@ -824,9 +838,10 @@ impl Drop for RedirectScope {
         // Restore in reverse application order.
         while let Some((target_fd, saved)) = self.saved.pop() {
             unsafe {
-                if saved >= 0 {
-                    libc::dup2(saved, target_fd);
-                    libc::close(saved);
+                if let Some(owned) = saved {
+                    use std::os::fd::AsRawFd;
+                    libc::dup2(owned.as_raw_fd(), target_fd);
+                    // `owned` drops here → closes the dup automatically.
                 } else {
                     // target_fd was not open before we redirected it — close it
                     // back to its unopened state.
@@ -3269,14 +3284,14 @@ fn heredoc_body_to_fd(bytes: &[u8], tmpdir: Option<&str>) -> Result<RawFd, io::E
 /// file description, so the reader's end (a distinct description) stays blocking
 /// and the probe is invisible downstream.
 fn heredoc_body_to_pipe(bytes: &[u8]) -> Option<RawFd> {
-    let (r, w) = crate::child_fd::make_pipe(false).ok()?;
-    // SAFETY: `r`/`w` are freshly-opened fds owned by us; every path below closes
-    // both or returns `r` to the caller.
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    let (r, w) = crate::child_fd::make_pipe_owned(false).ok()?;
+    // `r`/`w` are OwnedFds: every early `return None` drops both (closing them),
+    // and the success path drops `w` then transfers `r` out via `into_raw_fd`
+    // (#197 Class-A — no manual close on any path).
     unsafe {
-        let fl = libc::fcntl(w, libc::F_GETFL);
-        if fl < 0 || libc::fcntl(w, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
-            libc::close(r);
-            libc::close(w);
+        let fl = libc::fcntl(w.as_raw_fd(), libc::F_GETFL);
+        if fl < 0 || libc::fcntl(w.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
             return None;
         }
     }
@@ -3285,7 +3300,7 @@ fn heredoc_body_to_pipe(bytes: &[u8]) -> Option<RawFd> {
         // SAFETY: writing from a live slice into an open fd.
         let n = unsafe {
             libc::write(
-                w,
+                w.as_raw_fd(),
                 bytes[off..].as_ptr() as *const libc::c_void,
                 bytes.len() - off,
             )
@@ -3297,25 +3312,18 @@ fn heredoc_body_to_pipe(bytes: &[u8]) -> Option<RawFd> {
             }
             // EAGAIN: this platform's pipe is smaller than the body. Anything
             // else: let the temp-file path have a go. Either way, discard.
-            unsafe {
-                libc::close(r);
-                libc::close(w);
-            }
             return None;
         }
         if n == 0 {
-            unsafe {
-                libc::close(r);
-                libc::close(w);
-            }
             return None;
         }
         off += n as usize;
     }
-    // Close the write end so the reader sees EOF after the body. An empty body
-    // lands here directly — a pipe that is immediately at EOF.
-    unsafe { libc::close(w) };
-    Some(r)
+    // Drop the write end so the reader sees EOF after the body, then hand the
+    // read end to the caller. An empty body lands here directly — a pipe that is
+    // immediately at EOF.
+    drop(w);
+    Some(r.into_raw_fd())
 }
 
 /// Spool `bytes` to an unlinked temp file and return a read-only fd at offset 0.
@@ -3347,6 +3355,7 @@ fn heredoc_body_to_file(bytes: &[u8], tmpdir: Option<&str>) -> Result<RawFd, io:
 /// file 0600 (owner-only) and the unlink makes it unreachable by name at once,
 /// so it also cannot survive a crash.
 fn heredoc_body_to_file_in(bytes: &[u8], dir: &str) -> Result<RawFd, io::Error> {
+    use std::os::fd::{AsRawFd, FromRawFd};
     let mut tmpl: Vec<u8> = Vec::with_capacity(dir.len() + 16);
     tmpl.extend_from_slice(dir.as_bytes());
     if !tmpl.ends_with(b"/") {
@@ -3360,6 +3369,10 @@ fn heredoc_body_to_file_in(bytes: &[u8], dir: &str) -> Result<RawFd, io::Error> 
     if rw < 0 {
         return Err(io::Error::last_os_error());
     }
+    // Own the writable fd so every error path closes it exactly once via drop —
+    // the unlink stays explicit (it is not a close) (#197 Class-A).
+    let rw = unsafe { std::os::fd::OwnedFd::from_raw_fd(rw) };
+    let rw_fd = rw.as_raw_fd();
     let path = tmpl.as_ptr() as *const libc::c_char;
 
     let mut off = 0usize;
@@ -3367,7 +3380,7 @@ fn heredoc_body_to_file_in(bytes: &[u8], dir: &str) -> Result<RawFd, io::Error> 
         // SAFETY: writing from a live slice into an open fd.
         let n = unsafe {
             libc::write(
-                rw,
+                rw_fd,
                 bytes[off..].as_ptr() as *const libc::c_void,
                 bytes.len() - off,
             )
@@ -3379,14 +3392,12 @@ fn heredoc_body_to_file_in(bytes: &[u8], dir: &str) -> Result<RawFd, io::Error> 
             }
             unsafe {
                 libc::unlink(path);
-                libc::close(rw);
             }
-            return Err(e);
+            return Err(e); // `rw` drops here → closes the writable fd
         }
         if n == 0 {
             unsafe {
                 libc::unlink(path);
-                libc::close(rw);
             }
             return Err(io::Error::from_raw_os_error(libc::ENOSPC));
         }
@@ -3403,8 +3414,8 @@ fn heredoc_body_to_file_in(bytes: &[u8], dir: &str) -> Result<RawFd, io::Error> 
     };
     unsafe {
         libc::unlink(path);
-        libc::close(rw);
     }
+    drop(rw); // close the writable fd (was a manual libc::close)
     match err {
         Some(e) => Err(e),
         None => Ok(ro),
@@ -3832,6 +3843,9 @@ fn drain_procsubs_nonblocking(shell: &mut Shell, base: usize) {
     while shell.procsub_pending.len() > base {
         if let Some(ps) = shell.procsub_pending.pop() {
             // Close the parent end so the inner child sees EOF / SIGPIPE.
+            // #197 Class-A: owned but left raw — `parent_fd` lives in the
+            // `ProcSub` record, which must stay `Clone` (Shell derives Clone);
+            // `OwnedFd` is not `Clone`, so it stays `RawFd` and is closed here.
             if ps.parent_fd >= 0 {
                 unsafe {
                     libc::close(ps.parent_fd);
@@ -4649,11 +4663,8 @@ fn apply_redirects_permanently(cmd: &ExecCommand, shell: &mut Shell) -> Result<(
     // Drop's restore loop has nothing to do. Draining first means Drop sees an
     // empty `saved` vec even if it somehow runs.
     for (_target, saved) in scope.saved.drain(..) {
-        if saved >= 0 {
-            unsafe {
-                libc::close(saved);
-            }
-        }
+        // Dropping the owned dup (if any) closes it; None was never open.
+        drop(saved);
         // saved == -1 means the target fd was previously free/closed — there is
         // no original fd to restore, so we leave the target fd open (permanent).
     }
@@ -5700,6 +5711,14 @@ fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
     // `child_fd::make_pipe` returns (read_end, write_end).
     // pipe_in: shell writes in_w -> coproc reads in_r (its stdin).
     // pipe_out: coproc writes out_w (its stdout) -> shell reads out_r.
+    //
+    // #197 Class-A: owned but left raw. These four ends are entangled beyond a
+    // safe OwnedFd migration: `in_r`/`out_w` transfer into the forked child via
+    // `ChildFd::owned_raw`, `in_w`/`out_r` are relocated by `move_to_high_fd`
+    // (which consumes a RawFd), and the surviving parent ends are stored as
+    // `RawFd` in the `Coproc` record — which must stay `Clone` (Shell derives
+    // Clone), and `OwnedFd` is not `Clone`. Half-migrating any single end would
+    // risk a double-close on this path, so the whole set stays raw.
     let (in_r, in_w) = match crate::child_fd::make_pipe(false) {
         Ok(p) => p,
         Err(e) => {
@@ -5908,6 +5927,17 @@ fn spawn_pipeline(
     let mut stages: Vec<PipelineStage> = Vec::with_capacity(n);
 
     // Read-end of the pipe from the previous stage (None for stage 0).
+    //
+    // #197 Class-A: this inter-stage wiring is owned but deliberately left raw.
+    // Each inter-stage read end is tracked simultaneously by fd NUMBER in BOTH
+    // `prev_pipe_read` and `parent_held`, while its single true owner alternates
+    // between "held for the next stage" and "moved into `ChildFd::owned_raw`"
+    // (which transfers it to the child). The `retain`/`position`/`.raw()` filters
+    // downstream all key on fd-number identity. Introducing `OwnedFd` into either
+    // container without also collapsing the double-tracking would create two
+    // owners of one fd — the exact double-close hazard on this hot path — so the
+    // whole state machine stays `RawFd` (a coherent migration would be a
+    // behavior-visible restructure, out of scope for this sweep).
     let mut prev_pipe_read: Option<RawFd> = None;
 
     // All raw fds the parent currently holds (for the child's
@@ -7608,44 +7638,45 @@ unsafe fn install_child_stdio(stdio: ChildStdio) -> [RawFd; 3] {
 pub fn capture_via_fork(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     use crate::child_fd::{ChildFd, ChildStdio};
     use std::io::Read;
-    use std::os::unix::io::FromRawFd;
+    use std::os::fd::AsRawFd;
 
-    let (read_fd, write_fd) = match crate::child_fd::make_pipe(false) {
+    let (read, write) = match crate::child_fd::make_pipe_owned(false) {
         Ok(p) => p,
         Err(e) => {
             crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
             return (String::new(), 1);
         }
     };
+    // The child needs the parent's read-end fd NUMBER for its close list (else
+    // EOF never arrives). The parent keeps ownership of `read` (the OwnedFd).
+    let read_raw = read.as_raw_fd();
     // The body runs in-process in the child via a BraceGroup (one fork total).
     let body = Command::BraceGroup(Box::new(seq.clone()));
     let stdio = ChildStdio::new(
-        ChildFd::Inherit,                        // stdin: child reads the shell's stdin
-        unsafe { ChildFd::owned_raw(write_fd) }, // stdout: pipe write-end -> fd 1
-        ChildFd::Inherit,                        // stderr: terminal unless an inner 2>&1
+        ChildFd::Inherit,     // stdin: child reads the shell's stdin
+        ChildFd::from(write), // stdout: pipe write-end -> fd 1 (ownership -> child stdio)
+        ChildFd::Inherit,     // stderr: terminal unless an inner 2>&1
     );
     // Child closes the parent's read end (else EOF never arrives).
-    let pid = match fork_and_run_in_subshell(&body, shell, stdio, NO_PGROUP, &[read_fd], None, None)
-    {
-        Ok(pid) => pid,
-        Err(e) => {
-            // `write_fd` was owned by the moved `ChildStdio` and is already
-            // closed (RAII) by `fork_and_run_in_subshell` on its error return;
-            // close only the parent-kept read end here.
-            unsafe {
-                libc::close(read_fd);
+    let pid =
+        match fork_and_run_in_subshell(&body, shell, stdio, NO_PGROUP, &[read_raw], None, None) {
+            Ok(pid) => pid,
+            Err(e) => {
+                // `write` was owned by the moved `ChildStdio` and is already
+                // closed (RAII) by `fork_and_run_in_subshell` on its error
+                // return; the parent-kept `read` OwnedFd drops here, closing the
+                // read end — no manual close needed.
+                crate::sh_error!(shell, None, "fork: {}", crate::bash_io_error(&e));
+                return (String::new(), 1);
             }
-            crate::sh_error!(shell, None, "fork: {}", crate::bash_io_error(&e));
-            return (String::new(), 1);
-        }
-    };
-    // PARENT: `write_fd` (the pipe write end) was owned by the moved `ChildStdio`
+        };
+    // PARENT: `write` (the pipe write end) was owned by the moved `ChildStdio`
     // and is already closed by the fork helper's RAII drop in the parent, so the
-    // read end below sees EOF when the child exits — do NOT close it again.
+    // read end below sees EOF when the child exits.
     let mut buf: Vec<u8> = Vec::new();
     {
-        let mut f = unsafe { std::fs::File::from_raw_fd(read_fd) };
-        let _ = f.read_to_end(&mut buf); // f drops -> closes read_fd
+        let mut f = std::fs::File::from(read);
+        let _ = f.read_to_end(&mut buf); // f drops -> closes the read end
     }
     let mut raw: libc::c_int = 0;
     unsafe {

@@ -1897,6 +1897,9 @@ impl Shell {
             return;
         };
         let c = self.coprocs.remove(idx);
+        // #197 Class-A: owned but left raw — the parent-held coproc ends live in
+        // the `Coproc` record, which must stay `Clone` (Shell derives Clone).
+        // `OwnedFd` is not `Clone`, so these stay `RawFd` and are closed here.
         unsafe {
             libc::close(c.read_fd);
             libc::close(c.write_fd);
