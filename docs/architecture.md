@@ -38,10 +38,14 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   returned from `Engine::prepare(src)` — it supports stdin feed (`.stdin(bytes)`)
   and stderr-as-merged into stdout (`.merge_stderr()`), then runs either as
   `.run() -> i32` (fd 1/2 inherit) or `.capture() -> Output { stdout, stderr,
-  exit_code }` (both buffers populated). Internally,
-  `huck_engine::StderrSink::{Terminal, Merged, Capture}` is the symmetric
-  counterpart of `StdoutSink`, threaded through the executor and the
-  builtin-dispatch path; engine-level stdin redirection lives in
+  exit_code }` (both buffers populated). Internally there is now **one output
+  model — the real OS fd table** (the #197 one-model arc): builtins write to fd
+  1/2 through `fd_writer::{FdWriter, CaptureStderr}`, `.capture()` snapshots the
+  real fd 1/2 to a temp file (a `#[cfg(test)]` thread-local hook,
+  `capture_test_hook`, stands in for the unit tests), and command substitution
+  `$(...)` forks a real subshell over a pipe. The old software
+  `StdoutSink`/`StderrSink`/`Merged`/`Capture` sinks were deleted. Engine-level
+  stdin redirection lives in
   `crates/huck-engine/src/stdin_pipe.rs` (`child_fd::make_pipe(true)` — a
   >=3-relocated, CLOEXEC pipe — + dup2(r, 0) save/restore guard). Sandbox knobs
   (v206) layer on top: `.cwd(path)` chdirs for the call
@@ -53,18 +57,13 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   `ExecOutcome::Interrupted` carries an `InterruptReason::{Sigint,Timeout}`
   discriminator so the top-level reducer can map to 130 (SIGINT) or 124
   (timeout).
-  Streaming callbacks (v207) layer on top: `.on_stdout_line(|line| …)` and
-  `.on_stderr_line(…)` fire per complete line, on the embedder's thread (no
-  `Send` bound), in real time even for external processes. Internally, builtin
-  writes go through a thread-local `Callbacks` pointer that line-buffers via
-  `line_buf.rs`; external-process waits use a new poll-based loop
-  (`stream_loop.rs` + `wait_loop.rs` — `signalfd`/`poll` on Linux, `kqueue` on
-  macOS) that replaces v205/v206's blocking `waitpid` + drainer-thread.
-  Callbacks tee with `.run()` and `.capture()` — output still reaches the
-  embedder's terminal / `Output.stdout` buffer in addition to firing events.
-  Inner-capture scopes (command substitution `$(...)` and backticks)
-  suspend callback dispatch via `callbacks_thread_local::suspend()` so the
-  substitution's captured bytes don't leak to the embedder's view.
+  External-process waits use a poll-based loop (`stream_loop.rs` +
+  `wait_loop.rs` — `signalfd`/`poll` on Linux, `kqueue` on macOS) rather than a
+  blocking `waitpid` + drainer thread; it is the timeout-aware wait path.
+  (Per-line streaming callbacks — `.on_stdout_line`/`.on_stderr_line`, v207 —
+  were removed in the #197 one-model arc along with `line_buf` /
+  `callbacks_thread_local`; a future re-add must preserve thread-affinity,
+  firing on the Engine-creating thread.)
   Completion (v208) is exposed as `Engine::complete(line, cursor) -> Completion
   { start, candidates }`. `Candidate` gains a `kind: CandidateKind` tag
   (`Command` / `Variable` / `File` / `Directory` / `Custom`) so IDE / TUI

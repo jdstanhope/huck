@@ -44,18 +44,6 @@ pub(crate) struct FdWriter {
 }
 
 impl FdWriter {
-    /// A plain real-fd writer (no capture routing). Only the unit tests below
-    /// construct one directly; the executor always tags a capture stream via
-    /// `with_capture`.
-    #[cfg(test)]
-    pub(crate) fn new(fd: RawFd) -> Self {
-        Self {
-            fd,
-            first_errno: None,
-            cap_stream: None,
-        }
-    }
-
     /// The executor's constructor: feeds `cap_stream` when a test capture is
     /// active, else writes the real `fd`.
     pub(crate) fn with_capture(fd: RawFd, cap_stream: Option<CaptureStream>) -> Self {
@@ -215,7 +203,7 @@ mod tests {
     #[test]
     fn write_to_read_only_fd_surfaces_ebadf() {
         let fd = ro_fd();
-        let mut w = FdWriter::new(fd);
+        let mut w = FdWriter::with_capture(fd, None);
         let e = w
             .write_all(b"x")
             .expect_err("write to a read-only fd must fail");
@@ -227,7 +215,7 @@ mod tests {
     fn write_to_closed_fd_surfaces_ebadf() {
         let fd = ro_fd();
         unsafe { libc::close(fd) };
-        let mut w = FdWriter::new(fd);
+        let mut w = FdWriter::with_capture(fd, None);
         let e = w
             .write_all(b"x")
             .expect_err("write to a closed fd must fail");
@@ -238,7 +226,7 @@ mod tests {
     #[test]
     fn write_to_dev_full_surfaces_enospc() {
         let fd = full_fd();
-        let mut w = FdWriter::new(fd);
+        let mut w = FdWriter::with_capture(fd, None);
         let e = w.write_all(b"x").expect_err("write to /dev/full must fail");
         assert_eq!(e.raw_os_error(), Some(libc::ENOSPC));
         unsafe { libc::close(fd) };
@@ -251,7 +239,7 @@ mod tests {
     #[test]
     fn write_to_broken_pipe_surfaces_epipe() {
         let fd = broken_pipe_fd();
-        let mut w = FdWriter::new(fd);
+        let mut w = FdWriter::with_capture(fd, None);
         let e = w
             .write_all(b"x")
             .expect_err("write to a broken pipe must fail");
@@ -266,7 +254,7 @@ mod tests {
     #[test]
     fn empty_write_performs_no_syscall_on_a_bad_fd() {
         let fd = ro_fd();
-        let mut w = FdWriter::new(fd);
+        let mut w = FdWriter::with_capture(fd, None);
         assert_eq!(w.write(b"").expect("empty write must succeed"), 0);
         w.write_all(b"").expect("empty write_all must succeed");
         assert!(
@@ -279,7 +267,7 @@ mod tests {
     #[test]
     fn records_first_error_only() {
         let fd = ro_fd();
-        let mut w = FdWriter::new(fd);
+        let mut w = FdWriter::with_capture(fd, None);
         let _ = w.write_all(b"x");
         let _ = w.write_all(b"y");
         let e = w.first_error().expect("an error must be recorded");
@@ -291,7 +279,7 @@ mod tests {
     fn no_error_recorded_on_success() {
         let mut fds = [0i32; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let mut w = FdWriter::new(fds[1]);
+        let mut w = FdWriter::with_capture(fds[1], None);
         w.write_all(b"hello").expect("write to a pipe must succeed");
         assert!(w.first_error().is_none());
         unsafe {
@@ -322,7 +310,7 @@ mod tests {
             unsafe { libc::close(r) };
             got.len()
         });
-        let mut w = FdWriter::new(wfd);
+        let mut w = FdWriter::with_capture(wfd, None);
         w.write_all(&payload).expect("write_all must complete");
         assert!(w.first_error().is_none());
         unsafe { libc::close(wfd) };
@@ -332,7 +320,7 @@ mod tests {
     #[test]
     fn flush_is_a_noop_and_succeeds() {
         let fd = ro_fd();
-        let mut w = FdWriter::new(fd);
+        let mut w = FdWriter::with_capture(fd, None);
         w.flush().expect("flush must be a no-op that succeeds");
         unsafe { libc::close(fd) };
     }
