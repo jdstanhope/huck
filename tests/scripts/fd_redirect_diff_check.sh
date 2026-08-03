@@ -36,6 +36,15 @@ check "223 >&2 numeric dup"     'echo O >&2 2>/dev/null; echo "rc=$?"'
 # to avoid the separate pre-existing builtin close+`2>/dev/null` ordering bug.)
 check "223 >&\$x x=- closes"    'x=-; { echo hi >&$x; } 2>/dev/null; echo "rc=$?"'
 check "223 >&\$x x=- no file"   'x=-; { echo hi >&$x; } 2>/dev/null; test -e ./- && echo LEAK || echo clean; rm -f ./-'
+# #154: a `{var}`-fd dup whose source is not a valid fd number names the `{var}`
+# NAME in "ambiguous redirect" (bash), not the source word or `bad fd`. The
+# `sed` strips the leading `prog:` so the `$0` diff (`bash` vs huck's path) does
+# not mask the message; a numeric-but-closed source still names the NUMBER.
+check "154 {v}>&\$unset amb"    '{ {zz}>&$x; } 2>&1 | sed -E "s#^[^:]*: ##"'
+check "154 {v}>&foo amb"        '{ {zz}>&foo; } 2>&1 | sed -E "s#^[^:]*: ##"'
+check "154 {v}<&\$unset amb"    '{ {zz}<&$x; } 2>&1 | sed -E "s#^[^:]*: ##"'
+check "154 {v}>&split amb"      'x="a b"; { {zz}>&$x; } 2>&1 | sed -E "s#^[^:]*: ##"'
+check "154 {v}>&7 names number"  '{ {zz}>&7; } 2>&1 | sed -E "s#^[^:]*: ##"'
 check "223 >&\$comsub once"     'f=$(mktemp); echo hi >&"$(echo side >&2; echo "$f")" 2>&1 1>/dev/null; echo "n=$(grep -c side "$f" 2>/dev/null)$(cat "$f")"; rm -f "$f"'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
