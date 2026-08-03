@@ -218,6 +218,24 @@ table.** Verified at each step: build warning-clean, `git grep StdoutSink/Stderr
 empty, engine lib 1953/1953 under `--test-threads 4`, sweep 245/245, redirect_audit
 157/157 (0 diverge), bash-suite PASS-set unchanged (26 categories, 0 lost/gained).
 
+### Class-A — inward OwnedFd migration — ✅ LANDED (2026-08-02)
+
+The resource-safety half of #197 (plan:
+`docs/superpowers/plans/2026-08-02-owned-fd-migration.md`). Interior OWNED fds now
+have `OwnedFd`/`File` RAII owners so they cannot leak or double-close: `RedirectScope`
+saved fds (`own_dup`), `make_pipe_owned`, `capture_via_fork`, procsub, stdin_pipe,
+heredoc pipe/file, `exec_builder`'s `FdRestore`/`Fd2Restore`, and `wait_loop`'s
+`sigchld_fd`/`kq`. Interior manual `libc::close` count **97 → 54** (~43 retired). The
+residual raw closes are either **genuinely borrowed** (fd numbers 0/1/2, dup2 targets,
+child-side post-fork closes) or **owned-but-entangled and documented as left raw**:
+the pipeline inter-stage wiring (double-tracked by fd *number* with alternating
+ownership — an `OwnedFd` there would create two owners → double-close on a hot path)
+and coproc/procsub records (stored in `Clone` structs; `OwnedFd` isn't `Clone`).
+Verified behavior-neutral: sweep 245/245, redirect_audit 0-diverge, engine lib 1953
+under `--test-threads 4`, and the **`tools/soak` harness PASS — the resting fd floor is
+flat (0 delta over ~925→1250 iterations), i.e. no leak.** (The macOS `kq` conversion
+mirrors the Linux one but is unverified on the Linux CI box.)
+
 **Follow-on cleanup (tracked for a short next step, per the user):** `FdWriter::new`
 is now `#[cfg(test)]`; the in-memory compound `{…} 2>&1`-under-capture software merge
 was dropped as dead (production's fork + real-dup2 path and the diff-harness cover it);
