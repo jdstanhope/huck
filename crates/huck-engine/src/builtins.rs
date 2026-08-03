@@ -4625,9 +4625,23 @@ fn builtin_jobs(
     ExecOutcome::Continue(0)
 }
 
-/// A single positional `wait` target. Built by `parse_wait_args` from a
-/// `%spec` (resolved to a job id) or a positive integer PID.
+/// A single positional `wait` target, as classified by `parse_wait_args`.
+///
+/// #411: classification never fails and never aborts the operand list — bash
+/// processes EVERY operand, diagnosing each bad one where it stands, and
+/// returns the status of the LAST one. A `%spec` is therefore kept unresolved
+/// until the wait loop reaches it, and a word that is neither a pid nor a spec
+/// becomes `Bad` rather than an early return.
 enum WaitTarget {
+    Pid(i32),
+    Spec(String),
+    Bad(String),
+}
+
+/// A `wait -n` target after resolution. `-n` reports and drops everything it
+/// cannot resolve up front, so the polling helpers only ever see these two —
+/// the type makes the unresolved forms unrepresentable there.
+enum LiveTarget {
     Job(u32),
     Pid(i32),
 }
@@ -4698,24 +4712,21 @@ fn parse_wait_args(
     let mut targets = Vec::with_capacity(args.len() - idx);
     while idx < args.len() {
         let arg = &args[idx];
-        if arg.starts_with('%') {
-            let id = resolve_spec_or_error(arg, "wait", err, shell)?;
-            targets.push(WaitTarget::Job(id));
-        } else {
-            match arg.parse::<i32>() {
-                Ok(pid) if pid > 0 => targets.push(WaitTarget::Pid(pid)),
-                _ => {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "wait: `{arg}': not a pid or valid job spec"
-                    );
-                    // bash returns 1 for a malformed spec (not 2/usage).
-                    return Err(ExecOutcome::Continue(1));
-                }
+        // A pid operand must START with a digit (`wait +12` and `wait " 12"`
+        // are bad words in bash, though `legal_number` itself would take
+        // them); the value then follows `legal_number`, so `12 ` is pid 12.
+        // `0` is a legal pid word — it is diagnosed as "not a child" later,
+        // never handed to `waitpid`, where it would mean "my process group".
+        targets.push(if arg.starts_with('%') {
+            WaitTarget::Spec(arg.clone())
+        } else if arg.starts_with(|c: char| c.is_ascii_digit()) {
+            match parse_legal_number(arg) {
+                Some(pid) => WaitTarget::Pid(pid),
+                None => WaitTarget::Bad(arg.clone()),
             }
-        }
+        } else {
+            WaitTarget::Bad(arg.clone())
+        });
         idx += 1;
     }
 
@@ -4739,13 +4750,43 @@ fn builtin_wait(
 
     match (parsed.wait_any, parsed.targets.len()) {
         (false, 0) => wait_all(shell),
-        (false, 1) => match &parsed.targets[0] {
-            WaitTarget::Job(id) => wait_for_job(*id, shell),
-            WaitTarget::Pid(pid) => wait_for_pid(*pid, err, shell),
-        },
         (false, _) => wait_for_all(parsed.targets, err, shell),
         (true, 0) => wait_any_pending(parsed.pid_var, shell),
-        (true, _) => wait_any_of(parsed.targets, parsed.pid_var, shell),
+        (true, _) => {
+            // #411: `-n` has its own error model — EVERY operand that is not a
+            // live job or child is reported as "no such job" (whatever its
+            // form), and 127 comes back only when none of them was live.
+            let mut live = Vec::with_capacity(parsed.targets.len());
+            for t in parsed.targets {
+                match t {
+                    WaitTarget::Spec(spec) => {
+                        match crate::job_spec::parse_job_spec(&spec)
+                            .ok()
+                            .and_then(|s| shell.jobs.resolve(&s).ok())
+                        {
+                            Some(id) => live.push(LiveTarget::Job(id)),
+                            None => {
+                                crate::sh_error_to!(shell, err, None, "wait: {spec}: no such job");
+                            }
+                        }
+                    }
+                    WaitTarget::Pid(pid) => {
+                        if shell.jobs.iter().any(|j| j.pids.contains(&pid)) {
+                            live.push(LiveTarget::Pid(pid));
+                        } else {
+                            crate::sh_error_to!(shell, err, None, "wait: {pid}: no such job");
+                        }
+                    }
+                    WaitTarget::Bad(word) => {
+                        crate::sh_error_to!(shell, err, None, "wait: {word}: no such job");
+                    }
+                }
+            }
+            if live.is_empty() {
+                return ExecOutcome::Continue(127);
+            }
+            wait_any_of(live, parsed.pid_var, shell)
+        }
     }
 }
 
@@ -4865,9 +4906,34 @@ fn wait_for_pid(pid: i32, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome
 fn wait_for_all(targets: Vec<WaitTarget>, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let mut last = 0;
     for t in targets {
+        // #411: each operand is resolved WHERE IT STANDS — a failure is
+        // reported and the loop moves on, so `wait %1 %2` diagnoses both. The
+        // status of the last operand is the builtin's status: 127 for one that
+        // named no job/child, 1 for a word that was no kind of id at all.
         let outcome = match t {
-            WaitTarget::Job(id) => wait_for_job(id, shell),
-            WaitTarget::Pid(pid) => wait_for_pid(pid, err, shell),
+            WaitTarget::Pid(pid) if pid > 0 => wait_for_pid(pid, err, shell),
+            WaitTarget::Pid(pid) => {
+                crate::sh_error_to!(
+                    shell,
+                    err,
+                    None,
+                    "wait: pid {pid} is not a child of this shell"
+                );
+                ExecOutcome::Continue(127)
+            }
+            WaitTarget::Spec(spec) => match resolve_spec_or_error(&spec, "wait", err, shell) {
+                Ok(id) => wait_for_job(id, shell),
+                Err(_) => ExecOutcome::Continue(127),
+            },
+            WaitTarget::Bad(word) => {
+                crate::sh_error_to!(
+                    shell,
+                    err,
+                    None,
+                    "wait: `{word}': not a pid or valid job spec"
+                );
+                ExecOutcome::Continue(1)
+            }
         };
         match outcome {
             ExecOutcome::Continue(c) => last = c,
@@ -4945,7 +5011,7 @@ fn wait_any_pending(pid_var: Option<String>, shell: &mut Shell) -> ExecOutcome {
 /// If at entry no target can ever finish (all unknown / not children),
 /// returns 127 with `$pid_var = ""`.
 fn wait_any_of(
-    targets: Vec<WaitTarget>,
+    targets: Vec<LiveTarget>,
     pid_var: Option<String>,
     shell: &mut Shell,
 ) -> ExecOutcome {
@@ -4962,8 +5028,8 @@ fn wait_any_of(
     // mere WIFSTOPPED stop, which leaves the coproc alive).
     let mut inlined_reaped_pid: Option<i32> = None;
     let any_active = targets.iter().any(|t| match t {
-        WaitTarget::Job(id) => shell.jobs.iter().any(|j| j.id == *id),
-        WaitTarget::Pid(pid) => {
+        LiveTarget::Job(id) => shell.jobs.iter().any(|j| j.id == *id),
+        LiveTarget::Pid(pid) => {
             let mut s: libc::c_int = 0;
             let r = unsafe { libc::waitpid(*pid, &mut s, libc::WNOHANG | libc::WUNTRACED) };
             if r > 0 {
@@ -5019,12 +5085,12 @@ fn wait_any_of(
 /// Returns `(captured_pid, exit_status)` for the first target that is
 /// currently terminal, or `None`.
 ///
-/// For `WaitTarget::Job(id)` the captured pid is the job's `pgid`. For
-/// `WaitTarget::Pid(pid)` the captured pid is the literal PID arg.
-fn check_targets_terminal(targets: &[WaitTarget], shell: &Shell) -> Option<(i32, i32)> {
+/// For `LiveTarget::Job(id)` the captured pid is the job's `pgid`. For
+/// `LiveTarget::Pid(pid)` the captured pid is the literal PID arg.
+fn check_targets_terminal(targets: &[LiveTarget], shell: &Shell) -> Option<(i32, i32)> {
     for t in targets {
         match t {
-            WaitTarget::Job(id) => {
+            LiveTarget::Job(id) => {
                 if let Some(job) = shell.jobs.iter().find(|j| j.id == *id) {
                     match job.state {
                         crate::jobs::JobState::Done(c) => return Some((job.pgid, c)),
@@ -5033,7 +5099,7 @@ fn check_targets_terminal(targets: &[WaitTarget], shell: &Shell) -> Option<(i32,
                     }
                 }
             }
-            WaitTarget::Pid(pid) => {
+            LiveTarget::Pid(pid) => {
                 if let Some(job) = shell.jobs.iter().find(|j| j.pids.contains(pid)) {
                     match job.state {
                         crate::jobs::JobState::Done(c) => return Some((*pid, c)),
