@@ -226,7 +226,7 @@ fn bg_with_running_spec_reports_already_in_background() {
 }
 
 #[test]
-fn bg_with_multiple_args_returns_usage_status_2() {
+fn bg_with_multiple_specs_reports_each_and_returns_1() {
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -236,7 +236,9 @@ fn bg_with_multiple_args_returns_usage_status_2() {
         &mut std::io::stderr(),
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    // #417: bg takes a LIST — both specs are reported (no job table here,
+    // so both fail) and the status is 1, not the old usage 2.
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
 }
 
 /// #411: an unresolvable job spec is 127 in bash, whatever its shape. Both

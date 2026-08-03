@@ -5791,14 +5791,45 @@ fn builtin_bg(
         e!(err, "bg: usage: bg [job_spec ...]");
         return ExecOutcome::Continue(2);
     }
+    // #417: bg takes a LIST of job specs, as its own usage line says. Each is
+    // resolved and reported in turn; the status is 1 if any operand failed and
+    // 0 otherwise (a job that was already running counts as success). With no
+    // operand at all there is exactly one implicit operand: the current job.
+    // (A spec without its leading `%` is not accepted yet — filed separately.)
+    if args.len() > 1 && args.iter().any(|a| !a.starts_with('%')) {
+        e!(err, "bg: usage: bg [job_spec ...]");
+        return ExecOutcome::Continue(2);
+    }
+    let mut any_failed = false;
+    if args.is_empty() {
+        if bg_one(None, err, shell).is_err() {
+            any_failed = true;
+        }
+    } else {
+        for spec in args {
+            if !spec.starts_with('%') {
+                e!(err, "bg: usage: bg [job_spec ...]");
+                return ExecOutcome::Continue(2);
+            }
+            if bg_one(Some(spec), err, shell).is_err() {
+                any_failed = true;
+            }
+        }
+    }
+    ExecOutcome::Continue(if any_failed { 1 } else { 0 })
+}
+
+/// Resumes ONE `bg` operand: `Some(spec)` for an explicit `%spec`, `None` for
+/// the implicit current job. Diagnostics are printed here so a list keeps
+/// going after a bad operand. `Err(())` means this operand failed; a job that
+/// was already running is a notice, i.e. `Ok(())`.
+fn bg_one(spec: Option<&String>, err: &mut dyn Write, shell: &mut Shell) -> Result<(), ()> {
     // #412: with no operand bash takes the CURRENT job — the most recent
     // stopped one, or, when nothing is stopped, the most recent job full stop
-    // (which then reports "already in background"). huck only ever looked for
-    // a stopped job, so a running current job came back as "no current job".
-    // The spec text names the operand in diagnostics, or `current` when there
-    // was none, as `fg` already does.
-    let (id, spec) = match args.len() {
-        0 => match shell
+    // (which then reports "already in background"). The spec text names the
+    // operand in diagnostics, or `current` when there was none, as `fg` does.
+    let (id, spec) = match spec {
+        None => match shell
             .jobs
             .current_stopped_id()
             .or_else(|| shell.jobs.current_id())
@@ -5806,17 +5837,13 @@ fn builtin_bg(
             Some(id) => (id, "current".to_string()),
             None => {
                 crate::sh_error_to!(shell, err, None, "bg: current: no such job");
-                return ExecOutcome::Continue(1);
+                return Err(());
             }
         },
-        1 if args[0].starts_with('%') => match resolve_spec_or_error(&args[0], "bg", err, shell) {
-            Ok(id) => (id, args[0].clone()),
-            Err(outcome) => return outcome,
+        Some(spec) => match resolve_spec_or_error(spec, "bg", err, shell) {
+            Ok(id) => (id, spec.clone()),
+            Err(_) => return Err(()),
         },
-        _ => {
-            e!(err, "bg: usage: bg [job_spec ...]");
-            return ExecOutcome::Continue(2);
-        }
     };
     // #162: a job the entry-reap already completed is gone — match bash's
     // "no such job" + drop the phantom entry, before the not-stopped check
@@ -5824,7 +5851,7 @@ fn builtin_bg(
     if job_already_terminal(shell, id) {
         crate::sh_error_to!(shell, err, None, "bg: {spec}: no such job");
         shell.jobs.jobs_mut().retain(|j| j.id != id);
-        return ExecOutcome::Continue(1);
+        return Err(());
     }
     // #412: a job that is already running is not an error — bash says so and
     // exits 0, naming the job by its bare id.
@@ -5836,7 +5863,7 @@ fn builtin_bg(
         .unwrap_or(false);
     if !is_stopped {
         crate::sh_error_to!(shell, err, None, "bg: job {id} already in background");
-        return ExecOutcome::Continue(0);
+        return Ok(());
     }
     let (pgid, command) = {
         if let Some(job) = shell.jobs.jobs_mut().iter_mut().find(|j| j.id == id) {
@@ -5844,8 +5871,8 @@ fn builtin_bg(
             job.notified = true;
             (job.pgid, job.command.clone())
         } else {
-            crate::sh_error_to!(shell, err, None, "bg: current: no such job");
-            return ExecOutcome::Continue(1);
+            crate::sh_error_to!(shell, err, None, "bg: {spec}: no such job");
+            return Err(());
         }
     };
 
@@ -5854,7 +5881,7 @@ fn builtin_bg(
     }
 
     e!(err, "[{id}]+ {command} &");
-    ExecOutcome::Continue(0)
+    Ok(())
 }
 
 fn builtin_history(
