@@ -3284,14 +3284,14 @@ fn heredoc_body_to_fd(bytes: &[u8], tmpdir: Option<&str>) -> Result<RawFd, io::E
 /// file description, so the reader's end (a distinct description) stays blocking
 /// and the probe is invisible downstream.
 fn heredoc_body_to_pipe(bytes: &[u8]) -> Option<RawFd> {
-    let (r, w) = crate::child_fd::make_pipe(false).ok()?;
-    // SAFETY: `r`/`w` are freshly-opened fds owned by us; every path below closes
-    // both or returns `r` to the caller.
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    let (r, w) = crate::child_fd::make_pipe_owned(false).ok()?;
+    // `r`/`w` are OwnedFds: every early `return None` drops both (closing them),
+    // and the success path drops `w` then transfers `r` out via `into_raw_fd`
+    // (#197 Class-A — no manual close on any path).
     unsafe {
-        let fl = libc::fcntl(w, libc::F_GETFL);
-        if fl < 0 || libc::fcntl(w, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
-            libc::close(r);
-            libc::close(w);
+        let fl = libc::fcntl(w.as_raw_fd(), libc::F_GETFL);
+        if fl < 0 || libc::fcntl(w.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
             return None;
         }
     }
@@ -3300,7 +3300,7 @@ fn heredoc_body_to_pipe(bytes: &[u8]) -> Option<RawFd> {
         // SAFETY: writing from a live slice into an open fd.
         let n = unsafe {
             libc::write(
-                w,
+                w.as_raw_fd(),
                 bytes[off..].as_ptr() as *const libc::c_void,
                 bytes.len() - off,
             )
@@ -3312,25 +3312,18 @@ fn heredoc_body_to_pipe(bytes: &[u8]) -> Option<RawFd> {
             }
             // EAGAIN: this platform's pipe is smaller than the body. Anything
             // else: let the temp-file path have a go. Either way, discard.
-            unsafe {
-                libc::close(r);
-                libc::close(w);
-            }
             return None;
         }
         if n == 0 {
-            unsafe {
-                libc::close(r);
-                libc::close(w);
-            }
             return None;
         }
         off += n as usize;
     }
-    // Close the write end so the reader sees EOF after the body. An empty body
-    // lands here directly — a pipe that is immediately at EOF.
-    unsafe { libc::close(w) };
-    Some(r)
+    // Drop the write end so the reader sees EOF after the body, then hand the
+    // read end to the caller. An empty body lands here directly — a pipe that is
+    // immediately at EOF.
+    drop(w);
+    Some(r.into_raw_fd())
 }
 
 /// Spool `bytes` to an unlinked temp file and return a read-only fd at offset 0.
@@ -3362,6 +3355,7 @@ fn heredoc_body_to_file(bytes: &[u8], tmpdir: Option<&str>) -> Result<RawFd, io:
 /// file 0600 (owner-only) and the unlink makes it unreachable by name at once,
 /// so it also cannot survive a crash.
 fn heredoc_body_to_file_in(bytes: &[u8], dir: &str) -> Result<RawFd, io::Error> {
+    use std::os::fd::{AsRawFd, FromRawFd};
     let mut tmpl: Vec<u8> = Vec::with_capacity(dir.len() + 16);
     tmpl.extend_from_slice(dir.as_bytes());
     if !tmpl.ends_with(b"/") {
@@ -3375,6 +3369,10 @@ fn heredoc_body_to_file_in(bytes: &[u8], dir: &str) -> Result<RawFd, io::Error> 
     if rw < 0 {
         return Err(io::Error::last_os_error());
     }
+    // Own the writable fd so every error path closes it exactly once via drop —
+    // the unlink stays explicit (it is not a close) (#197 Class-A).
+    let rw = unsafe { std::os::fd::OwnedFd::from_raw_fd(rw) };
+    let rw_fd = rw.as_raw_fd();
     let path = tmpl.as_ptr() as *const libc::c_char;
 
     let mut off = 0usize;
@@ -3382,7 +3380,7 @@ fn heredoc_body_to_file_in(bytes: &[u8], dir: &str) -> Result<RawFd, io::Error> 
         // SAFETY: writing from a live slice into an open fd.
         let n = unsafe {
             libc::write(
-                rw,
+                rw_fd,
                 bytes[off..].as_ptr() as *const libc::c_void,
                 bytes.len() - off,
             )
@@ -3394,14 +3392,12 @@ fn heredoc_body_to_file_in(bytes: &[u8], dir: &str) -> Result<RawFd, io::Error> 
             }
             unsafe {
                 libc::unlink(path);
-                libc::close(rw);
             }
-            return Err(e);
+            return Err(e); // `rw` drops here → closes the writable fd
         }
         if n == 0 {
             unsafe {
                 libc::unlink(path);
-                libc::close(rw);
             }
             return Err(io::Error::from_raw_os_error(libc::ENOSPC));
         }
@@ -3418,8 +3414,8 @@ fn heredoc_body_to_file_in(bytes: &[u8], dir: &str) -> Result<RawFd, io::Error> 
     };
     unsafe {
         libc::unlink(path);
-        libc::close(rw);
     }
+    drop(rw); // close the writable fd (was a manual libc::close)
     match err {
         Some(e) => Err(e),
         None => Ok(ro),
@@ -3847,6 +3843,9 @@ fn drain_procsubs_nonblocking(shell: &mut Shell, base: usize) {
     while shell.procsub_pending.len() > base {
         if let Some(ps) = shell.procsub_pending.pop() {
             // Close the parent end so the inner child sees EOF / SIGPIPE.
+            // #197 Class-A: owned but left raw — `parent_fd` lives in the
+            // `ProcSub` record, which must stay `Clone` (Shell derives Clone);
+            // `OwnedFd` is not `Clone`, so it stays `RawFd` and is closed here.
             if ps.parent_fd >= 0 {
                 unsafe {
                     libc::close(ps.parent_fd);
@@ -5712,6 +5711,14 @@ fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
     // `child_fd::make_pipe` returns (read_end, write_end).
     // pipe_in: shell writes in_w -> coproc reads in_r (its stdin).
     // pipe_out: coproc writes out_w (its stdout) -> shell reads out_r.
+    //
+    // #197 Class-A: owned but left raw. These four ends are entangled beyond a
+    // safe OwnedFd migration: `in_r`/`out_w` transfer into the forked child via
+    // `ChildFd::owned_raw`, `in_w`/`out_r` are relocated by `move_to_high_fd`
+    // (which consumes a RawFd), and the surviving parent ends are stored as
+    // `RawFd` in the `Coproc` record — which must stay `Clone` (Shell derives
+    // Clone), and `OwnedFd` is not `Clone`. Half-migrating any single end would
+    // risk a double-close on this path, so the whole set stays raw.
     let (in_r, in_w) = match crate::child_fd::make_pipe(false) {
         Ok(p) => p,
         Err(e) => {
@@ -5920,6 +5927,17 @@ fn spawn_pipeline(
     let mut stages: Vec<PipelineStage> = Vec::with_capacity(n);
 
     // Read-end of the pipe from the previous stage (None for stage 0).
+    //
+    // #197 Class-A: this inter-stage wiring is owned but deliberately left raw.
+    // Each inter-stage read end is tracked simultaneously by fd NUMBER in BOTH
+    // `prev_pipe_read` and `parent_held`, while its single true owner alternates
+    // between "held for the next stage" and "moved into `ChildFd::owned_raw`"
+    // (which transfers it to the child). The `retain`/`position`/`.raw()` filters
+    // downstream all key on fd-number identity. Introducing `OwnedFd` into either
+    // container without also collapsing the double-tracking would create two
+    // owners of one fd — the exact double-close hazard on this hot path — so the
+    // whole state machine stays `RawFd` (a coherent migration would be a
+    // behavior-visible restructure, out of scope for this sweep).
     let mut prev_pipe_read: Option<RawFd> = None;
 
     // All raw fds the parent currently holds (for the child's

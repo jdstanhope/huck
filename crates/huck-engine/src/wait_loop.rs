@@ -7,7 +7,7 @@
 //! macOS: kqueue with EVFILT_SIGNAL(SIGCHLD) + EVFILT_READ on pipes.
 
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
 #[allow(dead_code)]
@@ -23,7 +23,8 @@ mod linux {
 
     #[allow(dead_code)]
     pub struct WaitLoop {
-        sigchld_fd: Option<RawFd>,
+        // Owned signalfd: its Drop closes it exactly once (#197 Class-A).
+        sigchld_fd: Option<OwnedFd>,
         pipes: Vec<RawFd>,
         // Old signal mask so Drop can restore.
         saved_mask: Option<libc::sigset_t>,
@@ -70,7 +71,7 @@ mod linux {
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
-            self.sigchld_fd = Some(fd);
+            self.sigchld_fd = Some(unsafe { OwnedFd::from_raw_fd(fd) });
             Ok(())
         }
 
@@ -95,7 +96,7 @@ mod linux {
                     revents: 0,
                 })
                 .collect();
-            if let Some(fd) = self.sigchld_fd {
+            if let Some(fd) = self.sigchld_fd.as_ref().map(|f| f.as_raw_fd()) {
                 pollfds.push(libc::pollfd {
                     fd,
                     events: libc::POLLIN,
@@ -121,7 +122,7 @@ mod linux {
                 if pfd.revents == 0 {
                     continue;
                 }
-                if Some(pfd.fd) == self.sigchld_fd {
+                if self.sigchld_fd.as_ref().map(|f| f.as_raw_fd()) == Some(pfd.fd) {
                     // Drain the signalfd so it returns to non-ready.
                     let mut buf = [0u8; std::mem::size_of::<libc::signalfd_siginfo>() * 4];
                     let _ = unsafe { libc::read(pfd.fd, buf.as_mut_ptr() as *mut _, buf.len()) };
@@ -136,9 +137,7 @@ mod linux {
 
     impl Drop for WaitLoop {
         fn drop(&mut self) {
-            if let Some(fd) = self.sigchld_fd.take() {
-                unsafe { libc::close(fd) };
-            }
+            // `sigchld_fd` (Option<OwnedFd>) closes itself on drop (#197 Class-A).
             if let Some(mask) = self.saved_mask.take() {
                 let _ = unsafe {
                     libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut())
@@ -153,7 +152,8 @@ mod macos {
     use super::*;
 
     pub struct WaitLoop {
-        kq: RawFd,
+        // Owned kqueue fd: its Drop closes it exactly once (#197 Class-A).
+        kq: OwnedFd,
         #[allow(dead_code)]
         pipes: Vec<RawFd>,
         #[allow(dead_code)]
@@ -167,6 +167,7 @@ mod macos {
             if kq < 0 {
                 return Err(io::Error::last_os_error());
             }
+            let kq = unsafe { OwnedFd::from_raw_fd(kq) };
             Ok(Self {
                 kq,
                 pipes: Vec::new(),
@@ -185,7 +186,14 @@ mod macos {
                 udata: std::ptr::null_mut(),
             };
             let ret = unsafe {
-                libc::kevent(self.kq, &kev, 1, std::ptr::null_mut(), 0, std::ptr::null())
+                libc::kevent(
+                    self.kq.as_raw_fd(),
+                    &kev,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                )
             };
             if ret < 0 {
                 return Err(io::Error::last_os_error());
@@ -207,7 +215,14 @@ mod macos {
                 udata: std::ptr::null_mut(),
             };
             let _ = unsafe {
-                libc::kevent(self.kq, &kev, 1, std::ptr::null_mut(), 0, std::ptr::null())
+                libc::kevent(
+                    self.kq.as_raw_fd(),
+                    &kev,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                )
             };
             self.pipes.retain(|&f| f != fd);
         }
@@ -233,7 +248,14 @@ mod macos {
                 udata: std::ptr::null_mut(),
             };
             let ret = unsafe {
-                libc::kevent(self.kq, &kev, 1, std::ptr::null_mut(), 0, std::ptr::null())
+                libc::kevent(
+                    self.kq.as_raw_fd(),
+                    &kev,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                )
             };
             if ret < 0 {
                 return Err(io::Error::last_os_error());
@@ -257,7 +279,7 @@ mod macos {
             let mut out: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
             let n = unsafe {
                 libc::kevent(
-                    self.kq,
+                    self.kq.as_raw_fd(),
                     std::ptr::null(),
                     0,
                     out.as_mut_ptr(),
@@ -286,7 +308,7 @@ mod macos {
 
     impl Drop for WaitLoop {
         fn drop(&mut self) {
-            unsafe { libc::close(self.kq) };
+            // `kq` (OwnedFd) closes itself on drop (#197 Class-A).
             if let Some(mask) = self.saved_mask.take() {
                 let _ = unsafe {
                     libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut())

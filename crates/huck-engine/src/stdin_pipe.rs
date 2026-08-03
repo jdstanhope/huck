@@ -13,7 +13,7 @@
 
 use std::cell::RefCell;
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 
 use crate::shell_state::Shell;
@@ -61,6 +61,8 @@ pub fn with_stdin_fd0<R>(
         // `r` and `w` (OwnedFds) drop as we return, closing both pipe ends.
         return f();
     }
+    // Own the saved fd 0 so it closes exactly once via drop (#197 Class-A).
+    let saved = unsafe { OwnedFd::from_raw_fd(saved) };
 
     if unsafe { libc::dup2(r.as_raw_fd(), 0) } < 0 {
         let e = io::Error::last_os_error();
@@ -70,24 +72,21 @@ pub fn with_stdin_fd0<R>(
             "dup2: {}",
             crate::bash_io_error(&e)
         );
-        // `r` and `w` drop as we return; only the raw `saved` dup needs a close.
-        unsafe {
-            libc::close(saved);
-        }
+        // `r`, `w`, and `saved` (all OwnedFds) drop as we return.
         return f();
     }
     // fd 0 now aliases the pipe read end; drop our own copy of it.
     drop(r);
 
     struct Restore {
-        saved: RawFd,
+        saved: OwnedFd,
     }
     impl Drop for Restore {
         fn drop(&mut self) {
             let _ = io::stdout().flush();
+            // Restore fd 0 from the owned save; the OwnedFd then drops → closes it.
             unsafe {
-                libc::dup2(self.saved, 0);
-                libc::close(self.saved);
+                libc::dup2(self.saved.as_raw_fd(), 0);
             }
         }
     }

@@ -137,16 +137,18 @@ impl<'a> ExecBuilder<'a> {
             // dup failed — fall back to running unmerged rather than aborting.
             return self.run_with_sinks();
         }
-        struct Fd2Restore(libc::c_int);
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // The owned save of fd 2: Drop restores it, then the OwnedFd closes it —
+        // no manual close (#197 Class-A).
+        struct Fd2Restore(OwnedFd);
         impl Drop for Fd2Restore {
             fn drop(&mut self) {
                 unsafe {
-                    libc::dup2(self.0, 2);
-                    libc::close(self.0);
+                    libc::dup2(self.0.as_raw_fd(), 2);
                 }
             }
         }
-        let _restore = Fd2Restore(saved2);
+        let _restore = Fd2Restore(unsafe { OwnedFd::from_raw_fd(saved2) });
         unsafe {
             libc::dup2(1, 2);
         }
@@ -176,7 +178,7 @@ impl<'a> ExecBuilder<'a> {
     #[cfg(not(test))]
     pub fn capture(self) -> Output {
         use std::io::{Read, Seek, Write};
-        use std::os::fd::AsRawFd;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
         // Read a NamedTempFile from the start into a lossy String.
         fn read_back(mut f: tempfile::NamedTempFile) -> String {
@@ -227,28 +229,31 @@ impl<'a> ExecBuilder<'a> {
         let saved1 = unsafe { libc::dup(1) };
         let saved2 = unsafe { libc::dup(2) };
         if saved1 < 0 || saved2 < 0 {
+            // Own whichever dup succeeded so its drop closes it (#197 Class-A);
+            // a -1 (failed dup) is not owned and is left alone.
             if saved1 >= 0 {
-                unsafe { libc::close(saved1) };
+                drop(unsafe { OwnedFd::from_raw_fd(saved1) });
             }
             if saved2 >= 0 {
-                unsafe { libc::close(saved2) };
+                drop(unsafe { OwnedFd::from_raw_fd(saved2) });
             }
             return empty();
         }
+        // Own both saves: their Drop closes them exactly once (#197 Class-A).
+        let saved1 = unsafe { OwnedFd::from_raw_fd(saved1) };
+        let saved2 = unsafe { OwnedFd::from_raw_fd(saved2) };
 
-        // RAII guard: restore fd 1/2 from the saved dups and close the saves on
-        // EVERY exit path — normal return or panic unwind.
+        // RAII guard: restore fd 1/2 from the saved dups on EVERY exit path
+        // (normal return or panic unwind); the owned saves then close themselves.
         struct FdRestore {
-            saved1: libc::c_int,
-            saved2: libc::c_int,
+            saved1: OwnedFd,
+            saved2: OwnedFd,
         }
         impl Drop for FdRestore {
             fn drop(&mut self) {
                 unsafe {
-                    libc::dup2(self.saved1, 1);
-                    libc::dup2(self.saved2, 2);
-                    libc::close(self.saved1);
-                    libc::close(self.saved2);
+                    libc::dup2(self.saved1.as_raw_fd(), 1);
+                    libc::dup2(self.saved2.as_raw_fd(), 2);
                 }
             }
         }
