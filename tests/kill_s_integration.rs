@@ -33,9 +33,12 @@ fn kill_s_invalid_name_errors_status_1() {
 }
 
 #[test]
-fn kill_s_missing_arg_errors_status_2() {
+fn kill_s_missing_arg_errors_status_1() {
+    // #402: bash reports a missing option argument with `sh_needarg` and
+    // EXECUTION_FAILURE (1), not the usage status 2. This test asserted the
+    // old divergent 2.
     let (out, _) = run("kill -s\necho $?\nexit\n");
-    assert!(out.lines().any(|l| l == "2"), "stdout: {:?}", out);
+    assert!(out.lines().any(|l| l == "1"), "stdout: {:?}", out);
 }
 
 #[test]

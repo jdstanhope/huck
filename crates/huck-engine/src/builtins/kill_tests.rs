@@ -349,8 +349,10 @@ fn kill_s_lowercase_name_resolves() {
     assert!(matches!(outcome, ExecOutcome::Continue(0)));
 }
 
+/// #402: a missing option argument is `sh_needarg` + EXECUTION_FAILURE in
+/// bash, NOT the usage status 2.
 #[test]
-fn kill_s_missing_arg_returns_usage_status_2() {
+fn kill_s_missing_arg_returns_status_1() {
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -360,7 +362,7 @@ fn kill_s_missing_arg_returns_usage_status_2() {
         &mut std::io::stderr(),
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
 }
 
 #[test]
@@ -407,7 +409,7 @@ fn kill_n_with_number_resolves_and_dispatches() {
 }
 
 #[test]
-fn kill_n_missing_arg_returns_usage_status_2() {
+fn kill_n_missing_arg_returns_status_1() {
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -417,7 +419,7 @@ fn kill_n_missing_arg_returns_usage_status_2() {
         &mut std::io::stderr(),
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
 }
 
 #[test]
@@ -560,6 +562,76 @@ fn kill_dash_dash_with_no_targets_returns_usage_status_2() {
         assert!(
             matches!(outcome, ExecOutcome::Continue(2)),
             "kill {args:?} should be a usage error, got {outcome:?}"
+        );
+    }
+}
+
+/// #402: every rejected sigspec form shares bash's one wording.
+#[test]
+fn kill_invalid_sigspec_wording_is_uniform() {
+    for args in [
+        vec!["-123".to_string(), "1".to_string()],
+        vec!["-FOO".to_string(), "1".to_string()],
+        vec!["-s".to_string(), "BOGUS".to_string(), "1".to_string()],
+        vec!["-n".to_string(), "99".to_string(), "1".to_string()],
+        vec!["-l".to_string(), "xyz".to_string()],
+    ] {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut errbuf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &args, &mut buf, &mut errbuf, &mut shell);
+        assert!(
+            matches!(outcome, ExecOutcome::Continue(1)),
+            "kill {args:?} should fail with status 1, got {outcome:?}"
+        );
+        let s = String::from_utf8(errbuf).unwrap();
+        assert!(
+            s.contains("invalid signal specification"),
+            "kill {args:?} wording: {s:?}"
+        );
+    }
+}
+
+/// #402: the usage text is bash's, verbatim.
+#[test]
+fn kill_usage_text_matches_bash() {
+    let mut shell = Shell::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut errbuf: Vec<u8> = Vec::new();
+    let outcome = run_builtin("kill", &[], &mut buf, &mut errbuf, &mut shell);
+    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    assert_eq!(
+        String::from_utf8(errbuf).unwrap(),
+        "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]\n"
+    );
+}
+
+/// #402: a numeric target follows bash's `legal_number()` whitespace rules —
+/// strtol's leading-whitespace set, then trailing spaces/tabs only, with the
+/// whole string consumed.
+#[test]
+fn parse_pid_target_matches_legal_number() {
+    for (input, want) in [
+        ("12", Some(12)),
+        (" 12", Some(12)),
+        ("12 ", Some(12)),
+        ("\t12\t", Some(12)),
+        ("\n12", Some(12)), // strtol skips \n as leading whitespace
+        ("12\n", None),     // legal_number's trailing set is space+tab
+        (" -99999 ", Some(-99999)),
+        ("+12", Some(12)),
+        ("-0", Some(0)),
+        ("0x10", None),
+        ("12abc", None),
+        ("1 2", None),
+        (" ", None),
+        ("", None),
+        ("1234567890123", None), // beyond pid_t
+    ] {
+        assert_eq!(
+            parse_pid_target(input),
+            want,
+            "parse_pid_target({input:?}) should be {want:?}"
         );
     }
 }
