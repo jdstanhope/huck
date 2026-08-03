@@ -5598,7 +5598,7 @@ fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Ex
         match shell.jobs.current_id() {
             Some(id) => vec![id],
             None => {
-                crate::sh_error_to!(shell, err, None, "disown: no current job");
+                crate::sh_error_to!(shell, err, None, "disown: current: no such job");
                 return ExecOutcome::Continue(1);
             }
         }
@@ -5669,7 +5669,7 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
         0 => match shell.jobs.current_id() {
             Some(id) => id,
             None => {
-                crate::sh_error_to!(shell, err, None, "fg: no current job");
+                crate::sh_error_to!(shell, err, None, "fg: current: no such job");
                 return ExecOutcome::Continue(1);
             }
         },
@@ -5698,7 +5698,7 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
             job.notified = true;
             (job.pgid, job.pids.clone(), job.command.clone())
         } else {
-            crate::sh_error_to!(shell, err, None, "fg: no current job");
+            crate::sh_error_to!(shell, err, None, "fg: current: no such job");
             return ExecOutcome::Continue(1);
         }
     };
@@ -5791,53 +5791,60 @@ fn builtin_bg(
         e!(err, "bg: usage: bg [job_spec ...]");
         return ExecOutcome::Continue(2);
     }
-    let id = match args.len() {
-        0 => match shell.jobs.current_stopped_id() {
-            Some(id) => id,
+    // #412: with no operand bash takes the CURRENT job — the most recent
+    // stopped one, or, when nothing is stopped, the most recent job full stop
+    // (which then reports "already in background"). huck only ever looked for
+    // a stopped job, so a running current job came back as "no current job".
+    // The spec text names the operand in diagnostics, or `current` when there
+    // was none, as `fg` already does.
+    let (id, spec) = match args.len() {
+        0 => match shell
+            .jobs
+            .current_stopped_id()
+            .or_else(|| shell.jobs.current_id())
+        {
+            Some(id) => (id, "current".to_string()),
             None => {
-                crate::sh_error_to!(shell, err, None, "bg: no current job");
+                crate::sh_error_to!(shell, err, None, "bg: current: no such job");
                 return ExecOutcome::Continue(1);
             }
         },
-        1 if args[0].starts_with('%') => {
-            let id = match resolve_spec_or_error(&args[0], "bg", err, shell) {
-                Ok(id) => id,
-                Err(outcome) => return outcome,
-            };
-            // #162: a job the entry-reap already completed is gone — match bash's
-            // "no such job" + drop the phantom entry, before the not-stopped
-            // check below would misreport it as "already running".
-            if job_already_terminal(shell, id) {
-                let spec = &args[0];
-                crate::sh_error_to!(shell, err, None, "bg: {spec}: no such job");
-                shell.jobs.jobs_mut().retain(|j| j.id != id);
-                return ExecOutcome::Continue(1);
-            }
-            // Verify the resolved job is actually Stopped.
-            let is_stopped = shell
-                .jobs
-                .iter()
-                .find(|j| j.id == id)
-                .map(|j| matches!(j.state, crate::jobs::JobState::Stopped(_)))
-                .unwrap_or(false);
-            if !is_stopped {
-                crate::sh_error_to!(shell, err, None, "bg: job %{id} already running");
-                return ExecOutcome::Continue(1);
-            }
-            id
-        }
+        1 if args[0].starts_with('%') => match resolve_spec_or_error(&args[0], "bg", err, shell) {
+            Ok(id) => (id, args[0].clone()),
+            Err(outcome) => return outcome,
+        },
         _ => {
             e!(err, "bg: usage: bg [job_spec ...]");
             return ExecOutcome::Continue(2);
         }
     };
+    // #162: a job the entry-reap already completed is gone — match bash's
+    // "no such job" + drop the phantom entry, before the not-stopped check
+    // below would misreport it as already in background.
+    if job_already_terminal(shell, id) {
+        crate::sh_error_to!(shell, err, None, "bg: {spec}: no such job");
+        shell.jobs.jobs_mut().retain(|j| j.id != id);
+        return ExecOutcome::Continue(1);
+    }
+    // #412: a job that is already running is not an error — bash says so and
+    // exits 0, naming the job by its bare id.
+    let is_stopped = shell
+        .jobs
+        .iter()
+        .find(|j| j.id == id)
+        .map(|j| matches!(j.state, crate::jobs::JobState::Stopped(_)))
+        .unwrap_or(false);
+    if !is_stopped {
+        crate::sh_error_to!(shell, err, None, "bg: job {id} already in background");
+        return ExecOutcome::Continue(0);
+    }
     let (pgid, command) = {
         if let Some(job) = shell.jobs.jobs_mut().iter_mut().find(|j| j.id == id) {
             job.state = crate::jobs::JobState::Running;
             job.notified = true;
             (job.pgid, job.command.clone())
         } else {
-            crate::sh_error_to!(shell, err, None, "bg: no current job");
+            crate::sh_error_to!(shell, err, None, "bg: current: no such job");
             return ExecOutcome::Continue(1);
         }
     };
