@@ -434,6 +434,156 @@ fn kill_n_invalid_number_returns_status_1() {
     assert!(matches!(outcome, ExecOutcome::Continue(1)));
 }
 
+/// #4: a negative or zero target is handed to `kill(2)` unchanged — `0` is the
+/// caller's own process group, `-N` the group `N`. Signal 0 keeps these pure
+/// existence probes (the test process is IN the group it names).
+#[test]
+fn kill_zero_and_negative_targets_reach_kill_syscall() {
+    let own_pgid = unsafe { libc::getpgrp() };
+    for target in ["0", "-0", &format!("-{own_pgid}")] {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-0".to_string(), target.to_string()],
+            &mut buf,
+            &mut std::io::stderr(),
+            &mut shell,
+        );
+        assert!(
+            matches!(outcome, ExecOutcome::Continue(0)),
+            "kill -0 {target} should probe the process group, got {outcome:?}"
+        );
+    }
+}
+
+/// A target too large for the pid type is still a bad target, not a group.
+#[test]
+fn kill_overflowing_negative_target_is_a_bad_target() {
+    let mut shell = Shell::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "kill",
+        &["-0".to_string(), "-1234567890123".to_string()],
+        &mut buf,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+}
+
+/// A sigspec is only recognised as the FIRST word; a later `-N` is a group.
+#[test]
+fn kill_sigspec_is_only_the_first_word() {
+    let own_pgid = unsafe { libc::getpgrp() };
+    let mut shell = Shell::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "kill",
+        &[
+            "-0".to_string(),
+            unsafe { libc::getpid() }.to_string(),
+            format!("-{own_pgid}"),
+        ],
+        &mut buf,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+}
+
+/// `--` ends option processing so `kill -- -$pgid` signals a group with the
+/// default SIGTERM instead of parsing `-$pgid` as a sigspec.
+#[test]
+fn kill_dash_dash_makes_the_next_word_a_target() {
+    let own_pgid = unsafe { libc::getpgrp() };
+    // `kill -- -$pgid` with no explicit signal would send SIGTERM to our own
+    // group, so exercise the parse (not the delivery) with an explicit -0.
+    for args in [
+        vec!["--".to_string(), "-99999".to_string()],
+        vec!["-0".to_string(), "--".to_string(), format!("-{own_pgid}")],
+        vec![
+            "-s".to_string(),
+            "WINCH".to_string(),
+            "--".to_string(),
+            unsafe { libc::getpid() }.to_string(),
+        ],
+        vec![
+            "-n".to_string(),
+            libc::SIGWINCH.to_string(),
+            "--".to_string(),
+            unsafe { libc::getpid() }.to_string(),
+        ],
+    ] {
+        let expected = if args[0] == "--" { 1 } else { 0 }; // -99999: ESRCH
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &args, &mut buf, &mut std::io::stderr(), &mut shell);
+        assert!(
+            matches!(outcome, ExecOutcome::Continue(n) if n == expected),
+            "kill {args:?} expected Continue({expected}), got {outcome:?}"
+        );
+    }
+}
+
+/// Only ONE leading `--` is consumed; a second is an ordinary (bad) target.
+#[test]
+fn kill_second_dash_dash_is_a_bad_target() {
+    let mut shell = Shell::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "kill",
+        &["--".to_string(), "--".to_string()],
+        &mut buf,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+}
+
+/// `--` with nothing after it is a usage error, like a bare `kill`.
+#[test]
+fn kill_dash_dash_with_no_targets_returns_usage_status_2() {
+    for args in [
+        vec!["--".to_string()],
+        vec!["-0".to_string(), "--".to_string()],
+        vec!["-s".to_string(), "TERM".to_string(), "--".to_string()],
+        vec![
+            "-n".to_string(),
+            libc::SIGTERM.to_string(),
+            "--".to_string(),
+        ],
+    ] {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &args, &mut buf, &mut std::io::stderr(), &mut shell);
+        assert!(
+            matches!(outcome, ExecOutcome::Continue(2)),
+            "kill {args:?} should be a usage error, got {outcome:?}"
+        );
+    }
+}
+
+/// Failure diagnostics carry bash's bare strerror text, with no Rust
+/// `(os error N)` tail.
+#[test]
+fn kill_error_text_has_no_rust_os_error_suffix() {
+    let mut shell = Shell::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut errbuf: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "kill",
+        &["-0".to_string(), "-99999".to_string()],
+        &mut buf,
+        &mut errbuf,
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    let s = String::from_utf8(errbuf).unwrap();
+    assert!(s.contains("kill: (-99999) - No such process"), "got {s:?}");
+    assert!(!s.contains("os error"), "leaked Rust errno suffix: {s:?}");
+}
+
 #[test]
 fn kill_dash_sig_short_form_still_works_after_refactor() {
     let mut shell = Shell::new();
