@@ -45,13 +45,19 @@ fn bg_with_percent_spec_arg_and_no_job_errors_status_1() {
     assert!(matches!(outcome, ExecOutcome::Continue(1)));
 }
 
+/// #412: bare `bg` takes the current job even when it is already running, and
+/// says so with a notice and status 0. This test asserted the old divergent
+/// "no current job" + 1.
 #[test]
-fn bg_on_running_job_returns_no_current_job() {
+fn bg_on_running_job_reports_already_in_background() {
     let mut shell = Shell::new();
     shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
     let mut buf: Vec<u8> = Vec::new();
-    let outcome = run_builtin("bg", &[], &mut buf, &mut std::io::stderr(), &mut shell);
-    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    let mut errbuf: Vec<u8> = Vec::new();
+    let outcome = run_builtin("bg", &[], &mut buf, &mut errbuf, &mut shell);
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    let s = String::from_utf8(errbuf).unwrap();
+    assert!(s.contains("bg: job 1 already in background"), "{s:?}");
 }
 
 #[test]
@@ -204,7 +210,7 @@ fn bg_with_no_such_job_spec_errors_status_1() {
 }
 
 #[test]
-fn bg_with_running_spec_errors_already_running() {
+fn bg_with_running_spec_reports_already_in_background() {
     let mut shell = Shell::new();
     shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
     let mut buf: Vec<u8> = Vec::new();
@@ -215,7 +221,8 @@ fn bg_with_running_spec_errors_already_running() {
         &mut std::io::stderr(),
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    // #412: a notice, not an error — the job is named by its bare id.
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
 }
 
 #[test]
