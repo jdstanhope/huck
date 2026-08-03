@@ -13,7 +13,6 @@ pub enum JobSpec {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum JobSpecError {
-    Empty,
     BadNumber,
     BadSymbol,
 }
@@ -24,7 +23,9 @@ pub fn parse_job_spec(s: &str) -> Result<JobSpec, JobSpecError> {
         None => return Err(JobSpecError::BadSymbol),
     };
     if rest.is_empty() {
-        return Err(JobSpecError::Empty);
+        // #406: "A single % (with no accompanying job specification) also
+        // refers to the current job" — same as `%%` / `%+`, not an error.
+        return Ok(JobSpec::Current);
     }
     match rest {
         "+" | "%" => return Ok(JobSpec::Current),
@@ -56,9 +57,11 @@ pub fn parse_job_spec(s: &str) -> Result<JobSpec, JobSpecError> {
 mod tests {
     use super::*;
 
+    /// #406: bare `%` is the current job, like `%%`/`%+`. This test asserted
+    /// the old divergent "empty spec is an error".
     #[test]
-    fn parse_percent_alone_is_empty_error() {
-        assert_eq!(parse_job_spec("%"), Err(JobSpecError::Empty));
+    fn parse_percent_alone_is_current() {
+        assert_eq!(parse_job_spec("%"), Ok(JobSpec::Current));
     }
 
     #[test]
