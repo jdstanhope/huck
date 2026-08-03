@@ -566,6 +566,71 @@ fn kill_dash_dash_with_no_targets_returns_usage_status_2() {
     }
 }
 
+/// #406: the empty target is neither a spec nor a pid, and bash names it in
+/// backquotes with its own message.
+#[test]
+fn kill_empty_target_has_its_own_message() {
+    let mut shell = Shell::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut errbuf: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "kill",
+        &["-0".to_string(), String::new()],
+        &mut buf,
+        &mut errbuf,
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    let s = String::from_utf8(errbuf).unwrap();
+    assert!(s.contains("kill: `': not a pid or valid job spec"), "{s:?}");
+}
+
+/// #406: `kill -l` swallows ONE leading `-` word (the sigspec slot `-l` makes
+/// irrelevant); a second one is an operand and is decoded.
+#[test]
+fn kill_l_swallows_one_leading_option_word() {
+    // `-x` swallowed, `TERM` decoded.
+    let mut shell = Shell::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "kill",
+        &["-l".to_string(), "-x".to_string(), "TERM".to_string()],
+        &mut buf,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    assert_eq!(
+        String::from_utf8(buf).unwrap().trim(),
+        libc::SIGTERM.to_string()
+    );
+
+    // Only the first: `-3` here is an operand, and an invalid one.
+    let mut shell = Shell::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "kill",
+        &["-l".to_string(), "-x".to_string(), "-3".to_string()],
+        &mut buf,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+
+    // Swallowed word with nothing left → the full listing.
+    let mut shell = Shell::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "kill",
+        &["-l".to_string(), "-TERM".to_string()],
+        &mut buf,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    assert!(String::from_utf8(buf).unwrap().contains("SIGHUP"));
+}
+
 /// #402: every rejected sigspec form shares bash's one wording.
 #[test]
 fn kill_invalid_sigspec_wording_is_uniform() {

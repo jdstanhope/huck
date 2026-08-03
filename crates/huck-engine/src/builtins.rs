@@ -5071,6 +5071,14 @@ fn handle_kill_l(
     err: &mut dyn Write,
     shell: &Shell,
 ) -> ExecOutcome {
+    // #406: bash's option loop swallows ONE leading `-` word after `-l` — it
+    // lands in the sigspec slot, which `-l` makes irrelevant, so it is never
+    // validated (`kill -l -x 15` prints TERM, `kill -l -TERM` lists). Only the
+    // FIRST such word: `kill -l -x -3` still rejects `-3` as an operand.
+    let args = match args.first() {
+        Some(a) if a.starts_with('-') => &args[1..],
+        _ => args,
+    };
     if args.is_empty() {
         print_killable_table(out);
         return ExecOutcome::Continue(0);
@@ -5354,6 +5362,20 @@ fn send_signal_to_targets(
 ) -> ExecOutcome {
     let mut any_failed = false;
     for target in targets {
+        if target.is_empty() {
+            // #406: bash has a distinct message for the empty word — it is
+            // neither a `%`-spec nor a number, and `sh_badjob` names it in
+            // backquotes. A whitespace-only word still takes the bad-target
+            // path below.
+            crate::sh_error_to!(
+                shell,
+                err,
+                None,
+                "kill: `{target}': not a pid or valid job spec"
+            );
+            any_failed = true;
+            continue;
+        }
         if let Some(_rest) = target.strip_prefix('%') {
             let id = match resolve_spec_or_error(target, "kill", err, shell) {
                 Ok(id) => id,
@@ -5480,13 +5502,12 @@ fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Ex
                             return ExecOutcome::Continue(1);
                         }
                     },
+                    // #406: bash reports EVERY unresolvable `disown` operand
+                    // the same way, whether it is a live-looking pid, a word,
+                    // or empty — `no such job`, as the pid arm above already
+                    // did.
                     _ => {
-                        crate::sh_error_to!(
-                            shell,
-                            err,
-                            None,
-                            "disown: {arg}: not a valid job spec"
-                        );
+                        crate::sh_error_to!(shell, err, None, "disown: {arg}: no such job");
                         return ExecOutcome::Continue(1);
                     }
                 }
