@@ -186,7 +186,7 @@ pub fn run_builtin(
         "unset" => builtin_unset(args, err, shell),
         "jobs" => builtin_jobs(args, out, err, shell),
         "wait" => builtin_wait(args, out, err, shell),
-        "fg" => builtin_fg(args, err, shell),
+        "fg" => builtin_fg(args, out, err, shell),
         "bg" => builtin_bg(args, out, err, shell),
         "kill" => builtin_kill(args, out, err, shell),
         "disown" => builtin_disown(args, err, shell),
@@ -4583,8 +4583,19 @@ fn builtin_jobs(
         Err(outcome) => return outcome,
     };
     let (current, previous) = shell.jobs.current_and_previous();
+    // #426: with operands, bash prints one line per OPERAND, in the order
+    // given — so `jobs %2 %1` lists 2 then 1, and `jobs %1 %1` lists twice.
+    // Without operands it walks the table in job order.
+    let order: Vec<u32> = if parsed.targets.is_empty() {
+        shell.jobs.iter().map(|j| j.id).collect()
+    } else {
+        parsed.targets.clone()
+    };
     let mut printed_ids: Vec<u32> = Vec::new();
-    for job in shell.jobs.iter() {
+    for id in order {
+        let Some(job) = shell.jobs.iter().find(|j| j.id == id) else {
+            continue;
+        };
         if !matches_jobs_filter(&parsed, job) {
             continue;
         }
@@ -5679,7 +5690,12 @@ fn job_already_terminal(shell: &Shell, id: u32) -> bool {
     })
 }
 
-fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_fg(
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
     // #158: drain pending STOP/CONT before resolving/acting on the job.
     crate::jobs::reap_completed(shell);
     // #161: fg takes no options; a leading-dash argument (other than `--`) is
@@ -5728,7 +5744,9 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
         }
     };
 
-    e!(err, "{command}");
+    // #425: bash writes the command it is foregrounding to STDOUT (bg's
+    // `[N]+ cmd &` notice, by contrast, really does go to stderr).
+    e!(out, "{command}");
 
     // #167: hand the terminal to the job's group only when stdin is a
     // controlling tty. Under `set -m` in a script/pipe there is no tty, but the

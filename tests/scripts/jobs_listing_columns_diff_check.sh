@@ -35,6 +35,18 @@ check "longer command"     "set -m; sleep 3.5 & jobs; $K"
 check "jobs -l one"        "set -m; sleep 3 & jobs -l; $K"
 check "jobs -l two"        "set -m; sleep 3 & sleep 3 & jobs -l; $K"
 
+# --- #426: one line per OPERAND, in the order given -------------------------
+check "operand order"      "set -m; sleep 3 & sleep 3 & jobs %2 %1; $K"
+check "same operand twice" "set -m; sleep 3 & jobs %1 %1; $K"
+check "operand order -r"   "set -m; sleep 3 & sleep 3 & jobs -r %2 %1; $K"
+check "operand order -l"   "set -m; sleep 3 & sleep 3 & jobs -l %2 %1; $K"
+check "-p operand count"   "set -m; sleep 3 & sleep 3 & jobs -p %2 %1 | wc -l; $K"
+check "no operands"        "set -m; sleep 3 & sleep 3 & jobs; $K"
+
+# --- #425: fg writes the resumed command to STDOUT --------------------------
+check "fg stdout"          "set -m; sleep 0.3 & fg %1 > /dev/null; echo rc=\$?"
+check "fg not stderr"      "set -m; sleep 0.3 & fg %1 2> /dev/null; echo rc=\$?"
+
 # --- selectors that share the formatter -------------------------------------
 check "jobs %1"            "set -m; sleep 3 & sleep 3 & jobs %1; $K"
 check "jobs -r"            "set -m; sleep 3 & jobs -r; $K"
