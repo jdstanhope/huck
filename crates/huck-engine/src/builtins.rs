@@ -4537,12 +4537,8 @@ fn parse_jobs_args(
 
     let mut targets = Vec::new();
     for arg in &args[idx..] {
-        if !arg.starts_with('%') {
-            crate::sh_error_to!(shell, err, None, "jobs: {arg}: no such job");
-            return Err(ExecOutcome::Continue(1));
-        }
-        let id = resolve_spec_or_error(arg, "jobs", err, shell)?;
-        targets.push(id);
+        // #423: the `%` is optional here — `jobs 1` is `jobs %1`.
+        targets.push(resolve_job_operand(arg, "jobs", err, shell)?);
     }
 
     Ok(JobsArgs {
@@ -5226,6 +5222,34 @@ fn signal_by_name(s: &str) -> Option<i32> {
 /// Parses `arg` as a job spec and resolves it to a job id. On parse or
 /// resolution failure, prints a `huck: <builtin>: ...` error to stderr
 /// and returns `Err(ExecOutcome::Continue(1))` so the caller can `?` it.
+/// Resolves a job-spec operand for the JOB-ONLY builtins (`fg`, `bg`, `jobs`),
+/// where bash's `get_job_spec` makes the leading `%` optional (#423): `1` is
+/// job 1 and `foo` is a command-prefix match, exactly as `%1` and `%foo` are.
+/// Diagnostics echo the operand as the user wrote it, without the `%`.
+///
+/// The pid-taking builtins must NOT use this: for `kill`, `wait` and `disown`
+/// a bare number is a PID, which is why bash answers `disown: 1: no such job`
+/// even when job 1 exists.
+fn resolve_job_operand(
+    arg: &str,
+    builtin: &str,
+    err: &mut dyn Write,
+    shell: &Shell,
+) -> Result<u32, ExecOutcome> {
+    let spec = if arg.starts_with('%') {
+        arg.to_string()
+    } else {
+        format!("%{arg}")
+    };
+    crate::job_spec::parse_job_spec(&spec)
+        .ok()
+        .and_then(|s| shell.jobs.resolve(&s).ok())
+        .ok_or_else(|| {
+            crate::sh_error_to!(shell, err, None, "{builtin}: {arg}: no such job");
+            ExecOutcome::Continue(1)
+        })
+}
+
 fn resolve_spec_or_error(
     arg: &str,
     builtin: &str,
@@ -5673,7 +5697,8 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
                 return ExecOutcome::Continue(1);
             }
         },
-        1 if args[0].starts_with('%') => match resolve_spec_or_error(&args[0], "fg", err, shell) {
+        // #423: the `%` is optional — `fg 1` is `fg %1`.
+        1 => match resolve_job_operand(&args[0], "fg", err, shell) {
             Ok(id) => id,
             Err(outcome) => return outcome,
         },
@@ -5796,10 +5821,6 @@ fn builtin_bg(
     // 0 otherwise (a job that was already running counts as success). With no
     // operand at all there is exactly one implicit operand: the current job.
     // (A spec without its leading `%` is not accepted yet — filed separately.)
-    if args.len() > 1 && args.iter().any(|a| !a.starts_with('%')) {
-        e!(err, "bg: usage: bg [job_spec ...]");
-        return ExecOutcome::Continue(2);
-    }
     let mut any_failed = false;
     if args.is_empty() {
         if bg_one(None, err, shell).is_err() {
@@ -5807,10 +5828,6 @@ fn builtin_bg(
         }
     } else {
         for spec in args {
-            if !spec.starts_with('%') {
-                e!(err, "bg: usage: bg [job_spec ...]");
-                return ExecOutcome::Continue(2);
-            }
             if bg_one(Some(spec), err, shell).is_err() {
                 any_failed = true;
             }
@@ -5840,7 +5857,7 @@ fn bg_one(spec: Option<&String>, err: &mut dyn Write, shell: &mut Shell) -> Resu
                 return Err(());
             }
         },
-        Some(spec) => match resolve_spec_or_error(spec, "bg", err, shell) {
+        Some(spec) => match resolve_job_operand(spec, "bg", err, shell) {
             Ok(id) => (id, spec.clone()),
             Err(_) => return Err(()),
         },

@@ -153,8 +153,11 @@ fn fg_with_no_such_job_spec_errors_status_1() {
     assert!(matches!(outcome, ExecOutcome::Continue(1)));
 }
 
+/// #423: `fg 1` is `fg %1` — the `%` is optional for the job-only builtins.
+/// With no job table the operand simply resolves to nothing. This test
+/// asserted the old usage refusal.
 #[test]
-fn fg_with_non_percent_arg_returns_usage_status_2() {
+fn fg_with_non_percent_arg_is_a_job_spec() {
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -164,7 +167,7 @@ fn fg_with_non_percent_arg_returns_usage_status_2() {
         &mut std::io::stderr(),
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
 }
 
 #[test]
