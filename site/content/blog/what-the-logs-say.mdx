@@ -1,0 +1,84 @@
+---
+title: "What 350 iterations of logs actually say"
+date: 2026-08-04
+summary: "Three months of design docs, commits, pull requests and issues, read as evidence rather than memory: the process inverted itself, the same two bug shapes keep recurring, and 'done' turned out to need a definition."
+tags: ["process", "retrospective"]
+version: null
+draft: false
+---
+
+huck has an unusually complete paper trail: a design document and an
+implementation plan per iteration, a commit history, and — since July — an
+issue tracker and a pull request per change. That is enough to check what the
+project actually did against what it remembers doing. Three things stand out.
+
+## The process inverted
+
+| | design docs | issues opened | PRs merged |
+|---|---|---|---|
+| May | 63 | — | — |
+| June | 170 | — | — |
+| July | 107 | 262 | 112 |
+| August (4 days) | 2 | 34 | 39 |
+
+May and June were design-first: brainstorm a feature, write a spec, write a
+plan, execute it, merge. That is the right shape when the answer to "what
+should this do?" is genuinely open — nobody can tell you from the code what
+`select` ought to print.
+
+By August the ratio has inverted almost completely: two design docs against
+thirty-nine merged pull requests. Nothing was abandoned; the *question*
+changed. Once the feature surface is broad, the work stops being "what should
+this do" and becomes "what does bash do here, exactly?" — and that question
+has an authoritative answer available in about four seconds by running the
+real shell. Writing a design document to decide it is not rigour, it's
+ceremony. The project now sizes the process to the question: a design arc when
+a decision is genuinely open, a branch-fix-harness-merge round when it isn't.
+
+## The same two bug shapes keep coming back
+
+Read the fix history in bulk and the individual bugs blur, but two silhouettes
+stay sharp.
+
+**Duplication that drifts.** The old lexer had six near-copies of the routine
+that reads a `${...}` body, because each new feature needed *almost* what an
+existing one did. Fixes landed in one copy and not the other five, so the same
+bug kept reappearing somewhere new. It took a month-long front-end rewrite to
+end it.
+
+**Two representations of one fact.** huck tracked where output goes twice —
+the real file descriptors, and a software sink threaded through the
+interpreter. Every leaked, lost or mis-ordered byte for months lived exactly
+where those two disagreed. Deleting one of them removed the whole class.
+
+Both look like ordinary bugs one at a time. Both are only visible as a
+pattern, and neither could be out-run by being careful at the call site. The
+practical lesson is about *when* to look: not after the first bug, or the
+second, but when a fix reveals a sibling in a parallel path — that's the
+signal that the shape, not the instance, is the problem.
+
+## "Done" needed a definition
+
+268 differences from bash have been recorded. 24 of them are closed as
+**kept on purpose** — places where huck deliberately does something else, each
+with a written reason. That distinction turns out to be load-bearing. Without
+it, "compatible with bash" is a goal you can never be finished with, and every
+divergence is an open wound. With it, the tracker answers a sharper question:
+is this difference an accident or a decision?
+
+The measurement that keeps that honest is bash's own test suite — 5 of 82
+categories byte-identical at the first run in June, 39 today. It is not a
+score you can flatter, which is the entire point of borrowing someone else's
+tests.
+
+## A footnote on writing this
+
+These posts were backfilled by rebuilding huck at nine historical commits and
+running the examples, rather than by remembering what it used to do. Two of
+those runs turned up bugs in the *current* shell that nobody had noticed —
+`${x/#/prefix}` silently doing nothing, and an `EXIT` trap inside a subshell
+never firing. Both are now filed.
+
+Which is its own small lesson. The archaeology found live bugs because it did
+something the test suite never does: ran ordinary shell fragments and looked
+at the output with fresh eyes.

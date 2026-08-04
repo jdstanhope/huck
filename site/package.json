@@ -7,7 +7,7 @@
   },
   "scripts": {
     "dev": "velite && next dev",
-    "build": "velite && next build",
+    "build": "velite --strict && next build",
     "start": "next start",
     "lint": "eslint",
     "velite": "velite"

@@ -1,0 +1,60 @@
+name: Site
+
+# The marketing/blog site under site/ is a separate toolchain (Node + Next +
+# Velite) from the Rust workspace, so it gets its own workflow rather than a
+# job in ci.yml — a Rust-only change shouldn't pay for an npm install.
+#
+# What this actually guards: `npm run build` is `velite --strict && next
+# build`. Velite compiles every post in site/content/blog/*.mdx and validates
+# its frontmatter against the schema in site/velite.config.ts, so a blog entry
+# with a bad date, an over-long summary, or MDX that fails to parse (a bare `{`
+# or `<` outside a code span is read as JSX) fails here, not at deploy.
+#
+# `--strict` is load-bearing: plain `velite` PRINTS schema issues and still
+# exits 0, which would let a broken post sail through a green build.
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'site/**'
+      - '.github/workflows/site.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/site.yml'
+
+# Cancel an in-progress run when a newer commit is pushed to the same ref.
+concurrency:
+  group: site-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NEXT_TELEMETRY_DISABLED: '1'
+
+jobs:
+  build:
+    name: site build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          # Matches the dev box (nvm default 24.18.0); package.json requires >=20.
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (velite content pipeline + next build)
+        # `next build` also fetches the Google fonts declared in app/layout.tsx,
+        # so this step needs network access — it has it on GitHub runners.
+        run: npm run build

@@ -1,0 +1,121 @@
+---
+title: "Traps that never fired, and traps that fired twice"
+date: 2026-08-04
+summary: "A round of fixes to huck's RETURN and ERR traps: per-function cleanup handlers that silently did nothing, an ERR handler that quietly overwrote $?, and inherited traps that fired one time too many."
+tags: ["traps", "bash-compat", "bugfix"]
+version: null
+draft: false
+---
+
+Traps are the shell's error handling. If they misfire, scripts don't crash —
+they quietly do the wrong thing. This round fixed four ways huck got them
+wrong inside functions, and all four were the silent kind.
+
+## Cleanup handlers that never ran
+
+A `RETURN` trap is how a function cleans up after itself — close the handle,
+remove the temp file, log the exit. huck ran the function and skipped the
+handler:
+
+```bash
+# before
+$ huck -c 'cleanup() { echo "closing $1"; }
+           f() { trap "cleanup db" RETURN; echo querying; }
+           f; echo next'
+querying
+next
+```
+
+```bash
+# after
+$ huck -c 'cleanup() { echo "closing $1"; }
+           f() { trap "cleanup db" RETURN; echo querying; }
+           f; echo next'
+querying
+closing db
+next
+```
+
+huck was asking the wrong question at the wrong moment: *is trap inheritance
+turned on?* — checked when the function returned. bash asks a different
+question, and asks it on the way in: when a function starts, bash puts the
+caller's `RETURN` trap aside for the duration, then runs whatever trap is
+installed when the function returns. A trap the function set **for itself**
+was never inherited from anyone, so nothing has to be turned on for it to run.
+Same rule, moved to the right place, and three other behaviours fell out of it
+for free — the caller's trap is now invisible to `trap -p` inside the body,
+a trap the body installs outlives the call, and a body that resets the trap
+gets the caller's back.
+
+## `$?` that lied
+
+This one is the reason the round is worth a post. Any script with an `ERR`
+trap got a corrupted exit status after *every* failing command:
+
+```bash
+# before
+$ huck -c 'trap "echo error hit" ERR; false; echo "status=$?"'
+error hit
+status=0
+```
+
+`$?` was the `echo` inside the trap, not the `false` that triggered it. Every
+`if [ $? -ne 0 ]` after a failure took the wrong branch — silently, in exactly
+the scripts careful enough to install an error handler.
+
+```bash
+# after
+$ huck -c 'trap "echo error hit" ERR; false; echo "status=$?"'
+error hit
+status=1
+```
+
+A trap action has to be transparent to `$?`: save the status, run the handler,
+put the status back. huck already did that for `DEBUG` traps and not for the
+other two.
+
+## Errors reported twice
+
+The last pair was over-reporting. A function that failed announced itself once
+for the failing command inside, and again for the call:
+
+```bash
+# before
+$ huck -c 'trap "echo ERROR" ERR; check() { false; }; check; echo "rc=$?"'
+ERROR
+ERROR
+rc=0
+```
+
+```bash
+# after
+$ huck -c 'trap "echo ERROR" ERR; check() { false; }; check; echo "rc=$?"'
+ERROR
+rc=1
+```
+
+Two separate rules, both from bash. A function doesn't inherit the caller's
+`ERR` trap unless you ask for it with `set -E` — same entry-time move as
+`RETURN`. And bash decides whether a failure is trap-worthy *before* running
+the command, so a function that installs an `ERR` trap isn't caught by the
+trap it just installed. `set -e` is deliberately unaffected by that rule: a
+failing function still exits the script whether or not a handler is armed.
+
+## What's covered, and what isn't
+
+Each fix ships with a harness that runs the same fragments through huck and
+real bash and asserts byte-identical output — 54 new fragments across the two
+files, on top of a suite that is now 262 harnesses, all green.
+
+Four neighbouring gaps turned up while fixing these and are filed rather than
+smuggled in: `exit` inside a trap action doesn't exit the shell, `DEBUG` traps
+need the same entry-time treatment, `ERR` still fires twice inside `{ }` /
+`for` / `case`, and a sourced script never fires `RETURN` at all. They all
+touch machinery shared across features, which is a different-sized job than a
+bug-fix round.
+
+*Issues [#434](https://github.com/jdstanhope/huck/issues/434),
+[#437](https://github.com/jdstanhope/huck/issues/437),
+[#438](https://github.com/jdstanhope/huck/issues/438),
+[#441](https://github.com/jdstanhope/huck/issues/441),
+[#444](https://github.com/jdstanhope/huck/issues/444).*

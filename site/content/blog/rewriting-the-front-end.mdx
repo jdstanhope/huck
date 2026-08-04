@@ -1,0 +1,76 @@
+---
+title: "We rewrote the front end and nothing changed"
+date: 2026-07-08
+summary: "Thirty iterations replaced huck's lexer and parser with a parser-driven mode stack. The whole point was that you can't tell from the outside — and why a rewrite nobody notices was worth a month."
+tags: ["history", "refactor", "parser"]
+version: null
+draft: false
+---
+
+Here is the headline result of about thirty iterations of work:
+
+```bash
+# huck, 23 June — before the rewrite
+$ printf 'echo $(case x in x) echo inner;; esac)\n' | huck
+inner
+$ printf 'echo `echo \\`echo deep\\``\n' | huck
+deep
+
+# huck, 8 July — after the rewrite
+$ printf 'echo $(case x in x) echo inner;; esac)\n' | huck
+inner
+$ printf 'echo `echo \\`echo deep\\``\n' | huck
+deep
+```
+
+Identical. That was the goal.
+
+## What was actually wrong
+
+huck's original lexer was one batch loop: hand the whole input in, get a list
+of tokens back. To do that it had to guess context it couldn't know, carrying
+about ten ad-hoc mode flags — *are we inside double quotes, inside `[[ ]]`,
+expecting a regex, in an assignment's right-hand side* — and roughly thirty
+hand-written sub-scanners. Six of those scanners existed to read a `${...}`
+body. Six, because each new feature needed *almost* what an existing scanner
+did, and copying it was cheaper than generalising it.
+
+Six near-copies of one routine is not a style problem. They drift. A fix
+applied to one is missing from the other five, so the same class of bug keeps
+reappearing somewhere new — which is precisely what happened across a chain of
+parameter-expansion bugs. Each one looked local. None of them were.
+
+The replacement inverts the relationship: the **parser drives the lexer**. The
+parser knows it just consumed `$(`, or `${`, or `((`, or `[[`, so it pushes
+that context onto a mode stack and the lexer scans the next token according to
+the mode on top. One scanner per context, in one place, with the parser — the
+component that actually knows the grammar — deciding which applies.
+
+## Why do it that way
+
+The interesting part is the *shape* of the migration, not the destination.
+The new front end was built alongside the old one, construct by construct — a
+mode for command substitution, one for backticks, one for arithmetic, one for
+`[[ ]]`, one for heredocs, one for array literals — each dormant, each landing
+in its own iteration with its own tests, while the old path kept running the
+shell. Only after every construct had a mode did one iteration flip the
+switch. Two iterations later the old lexer was deleted.
+
+That is the boring way to do it, and it is the only way that keeps a project
+usable while its foundation is replaced. The alternative — branch off, rewrite
+everything, merge in a month — means a month of not knowing whether you've
+broken anything.
+
+## How you know it worked
+
+The suite of harnesses that run identical fragments through huck and bash is
+the safety net, and for a refactor the expectation is unusually strict: a
+behaviour-preserving change should require **zero** edits to expected values.
+Any test you have to update is a behaviour change you didn't intend. That rule
+caught real mistakes during the flip, and it's the reason the before/after
+above is so boring.
+
+The payoff wasn't a feature. It was that the next two months of work — the
+run of edge cases where huck's output had to match bash exactly, character for
+character, in contexts nested three deep — became changes to one scanner
+instead of archaeology across six.

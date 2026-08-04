@@ -102,6 +102,50 @@ Run the standard iteration loop without being asked:
    - Record the iteration in the long-running memory files
      (`project_huck_iterations.md` + `MEMORY.md`). (The README no longer
      carries a per-version table.)
+   - Write the blog entry (see "Blog every work pass").
+
+## Blog every work pass
+
+**Every work pass ends with a blog entry** — a `vNN` iteration, a bug-fix
+round, or a whole cascade of rounds (one entry per pass, not per PR). It
+lands in the same branch/PR as the work, or in its own PR when the work is
+already merged.
+
+- **Where**: `site/content/blog/<descriptive-slug>.mdx` — no date prefix in
+  the filename, the date lives in the frontmatter. Velite schema
+  (`site/velite.config.ts`) requires `title` (≤120), `date`, `summary`
+  (≤300), and takes `tags`, `version` (`"vNN"` for an iteration, `null` for a
+  fix round), `draft`.
+- **Audience**: someone who uses shells, not someone who reads the diff.
+  Lead with the user-visible symptom — what silently did the wrong thing —
+  then a short plain-language description of the fix. Skip module names,
+  function names and line counts.
+- **Show it**: every entry carries at least one `# before` / `# after` pair
+  of fenced `bash` blocks with REAL output. Get the "before" by building the
+  pre-fix commit in a throwaway worktree (`git worktree add <tmp> <sha>`) and
+  running the fragment — do not reconstruct it from memory.
+- **Length**: short. A few hundred words, 2-4 examples. Close with what is
+  still open (the issues the pass filed) and link the issues.
+- MDX gotchas: `{` and `<` outside code spans are parsed as JSX; keep them
+  inside backticks or fences.
+- **Validate before committing** — the content pipeline compiles the MDX and
+  enforces the schema:
+
+      cd site && export NVM_DIR="$HOME/.nvm" && . "$NVM_DIR/nvm.sh" \
+        && nvm use node >/dev/null \
+        && ( ulimit -v 12000000; node_modules/.bin/velite --strict )
+
+  Traps in that line, every one of which has bitten: **`--strict` is
+  mandatory** (plain `velite` prints schema issues and still exits 0); a
+  non-interactive shell never loads nvm (`.bashrc` returns before it); `nvm
+  use` in a PIPELINE sets PATH in a subshell and is lost; and the usual
+  `ulimit -v 1500000` guard makes shiki's WASM highlighter fail with "Cannot
+  allocate Wasm memory" — it needs a much larger VIRTUAL reservation than it
+  actually uses. A post whose filename starts with `_` is silently SKIPPED by
+  velite's glob — it will never publish and never error.
+- The full `next build` cannot run on this box (WASM allocation failure at
+  1.9 GB); CI runs it. `.github/workflows/site.yml` builds the site on any
+  `site/**` change.
 
 ## Bug-fix rounds and the follow-on cascade
 
@@ -118,7 +162,8 @@ then **keep going without being asked**:
 1. Finish the current round and merge its PR (CI green — local green is
    not enough).
 2. Take the issues you just filed, one round each, same short loop.
-3. Repeat until the cascade is dry, then report the whole chain.
+3. Repeat until the cascade is dry, then write ONE blog entry for the whole
+   cascade (see "Blog every work pass") and report the chain.
 
 **Stop and hand back to the user** when the next issue is a *significant
 change that may affect multiple features*: a shared table or chokepoint
