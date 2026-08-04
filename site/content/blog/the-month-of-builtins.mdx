@@ -1,0 +1,78 @@
+---
+title: "The month of builtins: arrays, locals, and the things scripts actually use"
+date: 2026-06-10
+summary: "Control flow made huck a language. It still couldn't declare an array, scope a variable, or set a shell option — the unglamorous surface that every real script depends on. Two weeks of filling it in."
+tags: ["history", "builtins", "arrays"]
+version: null
+draft: false
+---
+
+By the end of May huck had loops, functions, `case`, heredocs — the parts of
+a shell you'd describe if someone asked what a shell is. Then you try to run
+an actual script and discover what you left out:
+
+```bash
+# huck, 28 May
+$ printf 'f() { local v=in; echo $v; }; f\n' | huck
+huck: command not found: local
+
+$ printf 'set -o pipefail; false | true; echo "rc=$?"\n' | huck
+huck: command not found: set
+rc=0
+
+$ printf 'a=(x y z); echo "${a[1]} ${#a[@]}"\n' | huck
+huck: syntax error: invalid parameter-expansion modifier: [
+```
+
+None of those are exotic. `local` is in nearly every function anyone writes.
+`set -o pipefail` is the first line of every careful script. Arrays are how
+you hold a list of filenames without getting word splitting wrong. A shell
+without them is a demo.
+
+Two weeks later:
+
+```bash
+# huck, 10 June
+$ printf 'f() { local v=in; echo $v; }; f\n' | huck
+in
+
+$ printf 'set -o pipefail; false | true; echo "rc=$?"\n' | huck
+rc=1
+
+$ printf 'a=(x y z); echo "${a[1]} ${#a[@]}"\n' | huck
+y 3
+
+$ printf 'declare -A m; m[key]=v; echo "${m[key]}"\n' | huck
+v
+```
+
+## Where the work actually is
+
+Arrays look like a data-structure feature and are mostly a *syntax* feature.
+`a[1]` has to be understood inside `${...}`, in an assignment, in `declare
+-A`, in `unset`, in `for x in "${a[@]}"`. Associative arrays add a second
+subscript grammar to the same brackets. Every one of those is a separate
+place in the front end that has to agree with the others — which is exactly
+the kind of duplication that came back to bite later, and forced a
+re-architecture of the whole lexer in July.
+
+Some of this fortnight was pure detail work against real bash. `printf %q`,
+for instance, quietly changed its mind about how to quote:
+
+```bash
+# huck, 28 May          # huck, 10 June (and bash)
+$ printf '%q\n' 'a b'   $ printf '%q\n' 'a b'
+'a b'                   a\ b
+```
+
+Both are valid shell quoting; only one is what bash prints. That distinction
+— *works* versus *matches* — is the whole game, and it's why every feature
+ships with a harness that runs the same fragment through huck and bash and
+compares byte for byte. The bug isn't that the output is wrong. The bug is
+that it's different.
+
+By mid-June the builtin surface was broad enough that the interesting
+failures stopped being "huck doesn't have that" and started being "huck has
+that, and it behaves subtly differently under `set -e` inside a subshell in
+a pipeline". Which is a much harder kind of bug, and where the next few
+months went.

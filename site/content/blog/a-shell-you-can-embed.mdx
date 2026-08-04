@@ -1,0 +1,66 @@
+---
+title: "Process substitution, namerefs, and a shell you can embed"
+date: 2026-06-23
+summary: "Two weeks that added the features scripts reach for when they get clever — and split huck into crates so the interpreter could be used as a library, with no terminal attached."
+tags: ["history", "architecture", "embedding"]
+version: null
+draft: false
+---
+
+Some shell features exist for the person typing. Others exist for the person
+who has been writing shell for fifteen years and has stopped being reasonable
+about it. Mid-June was the second kind.
+
+```bash
+# huck, 10 June
+$ printf 'diff <(echo same) <(echo same) && echo procsub-ok\n' | huck
+huck: syntax error: expected a filename after redirection
+
+$ printf 'declare -n ref=real; real=42; echo "$ref"\n' | huck
+huck: declare: -n: not yet implemented in this version
+```
+
+```bash
+# huck, 23 June
+$ printf 'diff <(echo same) <(echo same) && echo procsub-ok\n' | huck
+procsub-ok
+
+$ printf 'declare -n ref=real; real=42; echo "$ref"\n' | huck
+42
+```
+
+Process substitution is a small miracle of plumbing: `<(echo same)` runs a
+command in the background, hands its output a filename — on Linux, something
+under `/dev/fd` — and passes *that* to `diff`, which believes it is reading an
+ordinary file. Namerefs (`declare -n`) are the shell's one concession to
+indirection: a variable whose value is the *name* of another variable, so
+assigning through it writes somewhere else. Neither is common. Both appear in
+exactly the scripts you can't afford to break.
+
+## The other half: huck as a library
+
+The bigger change that fortnight isn't visible from a prompt at all. huck was
+split into crates — a syntax front end, an interpreter, and the terminal
+program on top — so the interpreter could run with no terminal, no readline,
+and no assumptions about who's calling it:
+
+```rust
+let mut engine = Engine::new();
+let out = engine.prepare("echo hello; echo world").capture();
+assert_eq!(out.stdout, "hello\nworld\n");
+assert_eq!(out.stderr, "");
+assert_eq!(out.exit_code, 0);
+```
+
+That opened up knobs an embedder needs and an interactive shell never thinks
+about: feed stdin from a byte buffer, merge stderr into stdout, set the
+working directory, run under a timeout, or run *restricted* — a sandbox mode
+where a script can't wander off into the filesystem.
+
+Why do that six weeks into a shell? Because "can this run headless, from
+another program, with output captured" is a brutally effective test of
+architecture. Anything that secretly depended on a terminal, or wrote
+straight to the process's real stdout because that was convenient, gets
+exposed immediately. huck failed that test in a dozen places, and the fixes
+were the beginning of a much longer thread about where output goes — one that
+didn't finish until August.

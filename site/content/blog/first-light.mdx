@@ -1,0 +1,84 @@
+---
+title: "First light: a shell that runs commands but can't run a script"
+date: 2026-05-28
+summary: "Two weeks in, huck could pipe, redirect, expand variables and substitute commands — and had never heard of a for loop. What the first forty iterations built, in the order they built it."
+tags: ["history", "parser", "control-flow"]
+version: null
+draft: false
+---
+
+Two weeks after the first commit, huck could do this:
+
+```bash
+# huck, 20 May
+$ printf 'echo hello | tr a-z A-Z\n' | huck
+HELLO
+$ printf 'ls /nonexistent 2>/dev/null || echo fallback\n' | huck
+fallback
+$ printf 'echo "user=$USER" $(echo nested) $((2 + 3 * 4)) ${x:-default} ~/docs\n' | huck
+user=john nested 14 default /home/john/docs
+```
+
+Pipes, redirection, `||`, quoting, command substitution, arithmetic,
+parameter defaults, tilde expansion. That's most of what people actually
+type at a prompt.
+
+It could not do this:
+
+```bash
+# huck, 20 May
+$ printf 'for i in 1 2 3; do echo $i; done\n' | huck
+huck: command not found: for
+huck: command not found: do
+huck: command not found: done
+
+$ printf 'greet() { echo "hello, $1"; }\n' | huck
+huck: command not found: greet()
+huck: command not found: }
+```
+
+Not "syntax error" — **command not found**. To that shell, `for` was just a
+word, and a word in command position is a program to look up on `$PATH`. The
+loop wasn't broken, it didn't exist; the parser had no concept of a compound
+command at all. Same for functions: `greet()` was a program name, and `}` was
+another one.
+
+## What the order says
+
+The order things got built wasn't an accident. A shell is really two systems
+wearing one coat: an *expansion engine* that turns text into arguments, and a
+*language* with control flow. huck built the expansion engine first, because
+that's the part you can't fake and the part every other feature leans on —
+word splitting, quoting rules, `$IFS`, the sequence expansions happen in. Get
+that wrong and every feature built on top inherits the mistake.
+
+The language came second, one construct per iteration, each with its own
+design doc, plan and test suite: `if`, `while`, `for`, `case`, functions,
+heredocs. Eight days later:
+
+```bash
+# huck, 28 May
+$ printf 'for i in 1 2 3; do echo $i; done\n' | huck
+1
+2
+3
+$ printf 'greet() { echo "hello, $1"; }\ngreet world\n' | huck
+hello, world
+$ printf 'case abc in a*) echo matched;; esac\n' | huck
+matched
+$ printf 'cat <<EOF\nheredoc line\nEOF\n' | huck
+heredoc line
+```
+
+## The `-c` you may have noticed
+
+Every example above is piped into huck rather than passed with `-c`. That's
+not stylistic — `huck -c 'echo hi'` on the 20 May build exits silently with
+status 0, and on the 28 May build it hangs waiting on standard input. The
+flag arrived later, with script-file mode.
+
+There's something clarifying about a shell that can run a pipeline before it
+can run a script. The interactive core — the thing you use a hundred times a
+day — turns out to be the small half. The other half is everything that makes
+a shell a programming language, and that's where the next few hundred
+iterations went.

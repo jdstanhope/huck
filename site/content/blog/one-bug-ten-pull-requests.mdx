@@ -1,0 +1,74 @@
+---
+title: "One bug, ten pull requests"
+date: 2026-08-03
+summary: "Fixing how `kill` handles a negative process ID turned up a neighbour, which turned up two more. A day later ten pull requests had merged — and the interesting part is the rule that decided when to stop."
+tags: ["process", "job-control", "bugfix"]
+version: null
+draft: false
+---
+
+Bugs are gregarious. You fix one, and while you're in there with the lights
+on you notice three more standing nearby. What you do about those three is a
+process question, and it has a wrong answer that feels productive: fix them
+too, in the same change, because you're right there.
+
+The rule huck settled on instead is: **file every neighbour as its own issue,
+then work them one at a time, each with its own branch, its own test harness,
+its own pull request.** In early August that turned a single report about
+`kill` and negative process IDs into ten merged pull requests in a day.
+
+## What the neighbours look like
+
+They are rarely dramatic. Here is one, in full:
+
+```bash
+# huck, 2 August
+$ huck -c 'sleep 0.3 & jobs'
+[1]+ Running                  sleep 0.3 &
+
+# bash
+[1]+  Running                 sleep 0.3 &
+```
+
+One space. bash puts two spaces after the job marker and pads the status
+column to a fixed width; huck used one space and padded from a different
+origin. Nothing is broken. Every script that parses `jobs` output by column
+position is broken, and any test asserting byte-identical output fails on it.
+
+```bash
+# huck, 4 August
+$ huck -c 'sleep 0.3 & jobs'
+[1]+  Running                 sleep 0.3 &
+```
+
+The rest of the chain was the same flavour: which diagnostics `kill` prints
+for a bad signal name, whether `bg` accepts more than one job spec, whether a
+job spec still works without its leading `%`, where a stopped job's output
+goes. Individually, none of these justifies interrupting anyone. Together they
+are the difference between a shell that mostly works and one you can point a
+script at without reading its source first.
+
+## The part that matters: knowing when to stop
+
+Chaining fixes only works if something reliably ends the chain. Two rules do
+that here.
+
+The first is about size. A fix keeps the chain going if it is small,
+self-contained, and provable with a harness that runs the fragment through
+both shells. The moment the next issue means changing a table several builtins
+read, or introducing a new subsystem, the chain stops and the work goes back
+to the human with an explanation of why it got bigger. Four issues from that
+day are still open for exactly that reason — real-time signals, background
+children ignoring stop signals, and two others whose blast radius is wider
+than the builtin that surfaced them.
+
+The second is about proof. Each pull request waits for continuous integration
+to finish and pass before it merges — not because local tests are
+untrustworthy, but because this development box has one core and CI has four,
+and a race that can't lose locally loses there. Local green is a prediction.
+CI green is a result.
+
+The failure mode this all guards against is the heroic thousand-line
+"cleanup" pull request that fixes eleven things, breaks two, and can't be
+reverted without losing the other nine. Ten small ones are more work to
+create, and enormously less work to live with.

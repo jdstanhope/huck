@@ -1,0 +1,75 @@
+---
+title: "Two ideas about where output goes, and the bugs in between"
+date: 2026-08-02
+summary: "huck tracked output twice — the real file descriptors, and a software 'sink' the interpreter passed around. Every leak, loss and mis-ordering for months lived where the two disagreed. Deleting one of them ended the whole bug class."
+tags: ["history", "refactor", "file-descriptors"]
+version: null
+draft: false
+---
+
+For most of huck's life, the answer to "where does this command's output go?"
+depended on who you asked.
+
+There was the real answer — the operating system's file descriptor table, the
+thing `>`, `2>&1` and pipes actually manipulate. And there was huck's own
+answer: a software *sink* passed down through the interpreter, saying whether
+output should go to the terminal, or be captured into a buffer for `$(...)`,
+or be merged with stderr.
+
+Two answers to one question is fine right up until they disagree:
+
+```bash
+# huck, 30 July
+$ huck -c 'echo "[$(exec 2>&1; echo to-err >&2)]"'
+to-err          <- leaked to the terminal
+[]              <- and the capture came back empty
+
+# bash
+[to-err]
+```
+
+Inside `$( )`, `exec 2>&1` is a real dup on the real fd table: stderr now
+points wherever stdout points, which is the capture. huck performed that dup
+faithfully — and the software sink knew nothing about it, so the interpreter
+kept writing stderr to the terminal and the capture stayed empty. The output
+didn't just go to the wrong place; it went to the wrong place *and* was
+missing from the right one.
+
+That bug had siblings, months of them: output lost from a background
+pipeline, stderr interleaved in the wrong order inside a captured group,
+`2>&1` honoured by an external command but not by a builtin. Each got fixed
+where it was found. None of the fixes made the next one less likely, because
+every one of them was the same shape — a place where the two models had to be
+reconciled by hand, and weren't.
+
+## Deleting a model
+
+So the August arc did the thing that had been avoidable for months: get rid
+of the software sink entirely and keep only the real fd table. If the
+interpreter never gets to have an opinion about where output goes, it can't
+hold a wrong one.
+
+That meant command substitution had to become what it is in bash — a real
+forked subshell writing into a real pipe — rather than an in-process
+execution writing to a buffer. With that in place, the sinks came out: the
+capture types deleted, and the parameter threading them through roughly sixty
+call sites deleted with them.
+
+```bash
+# huck, 2 August
+$ huck -c 'echo "[$(exec 2>&1; echo to-err >&2)]"'
+[to-err]
+```
+
+## The general lesson
+
+The reason this is worth a post isn't the fix, it's the diagnosis. A bug you
+fix is a bug. Bugs that keep arriving in different code with the same shape
+are a *design* telling you something, and no amount of care at the individual
+call site will out-run it. The tell here was in the fix history: each patch
+reconciled two representations of one fact, which is an admission that one of
+them shouldn't exist.
+
+Removing a model is a strange kind of progress — nothing new works that didn't
+work before, and the diff is mostly red. What changed is the class of bug that
+can be written at all.

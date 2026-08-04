@@ -1,0 +1,77 @@
+---
+title: "Scoring against bash's own test suite"
+date: 2026-07-31
+summary: "bash ships a test suite. Pointing it at huck gave a scoreboard that can't be argued with — 5 categories passing at first run, 39 a month later — and forced fixes nobody would have thought to look for, like the order an associative array iterates in."
+tags: ["history", "testing", "bash-compat"]
+version: null
+draft: false
+---
+
+bash ships its own test suite: 82 files of shell fragments, each with the
+exact output the real shell produces. It is designed to test bash. Pointed at
+huck, it becomes something better than a test suite — an *external* scoreboard,
+written by someone with no interest in flattering this project.
+
+A category counts as passing only when huck's output is byte-identical to
+bash's. Not "equivalent". Identical.
+
+The first sweep, in late June, passed **5 of 82**. By the end of July, **39**.
+
+## What that kind of scoreboard is for
+
+Left to your own judgment, you fix the bugs you can imagine. A suite written
+by the people who wrote the shell tests the things they know are load-bearing,
+including plenty you would never invent. Some of what it found was ordinary —
+brace ranges with a negative step, which huck simply didn't parse:
+
+```bash
+# huck, 20 July          # huck, 30 July (and bash)
+$ echo {5..1..-2}        $ echo {5..1..-2}
+{5..1..-2}               5 3 1
+```
+
+And some of it was this:
+
+```bash
+# huck, 20 July
+$ declare -A m=([a]=1 [b]=2 [c]=3); echo "${!m[@]}"
+a b c
+
+# bash
+c b a
+```
+
+huck listed the keys in the order you inserted them, which is the obvious
+choice, and defensible, and wrong. bash iterates an associative array in the
+order its internal **hash table** happens to hold the keys. There is no
+specification for that order. It is an implementation detail — and it is
+observable from every script that loops over `"${!m[@]}"`, so a shell that
+wants identical output has to reproduce the detail exactly.
+
+So it got reverse-engineered against the real shell: bash hashes keys with
+32-bit FNV-1, distributes them over 1024 buckets, walks the buckets in
+ascending order, and within a bucket returns the most recently inserted key
+first. That last clause is why `c b a` comes out reversed here — three keys
+that all land in different buckets, walked in an order that has nothing to do
+with insertion, and every one of them a fresh chain head.
+
+```bash
+# huck, 30 July
+$ declare -A m=([a]=1 [b]=2 [c]=3); echo "${!m[@]}"
+c b a
+```
+
+The rule that made that safe to attempt: validate the reverse-engineered
+algorithm against the real shell across hundreds of generated key sets
+*before* writing any of it into huck. A hash function you inferred from three
+examples is a hypothesis, not a specification.
+
+## What the score is actually measuring
+
+Not "how much of bash is implemented" — huck implements far more than 39/82
+suggests. Byte-identical is a brutal bar: one category can fail on a single
+error message with the wrong wording, or a line number off by one, while
+hundreds of assertions around it pass. What the number measures is how much of
+bash huck can be *substituted for* without anyone noticing. That's the only
+definition of compatibility that means anything, and it's why the failures are
+worth chasing one category at a time.

@@ -1,0 +1,75 @@
+---
+title: "The shell that slept 100 milliseconds at a time"
+date: 2026-07-17
+summary: "Every external command huck ran cost a tenth of a second doing nothing at all. Finding it meant admitting that five 'flaky timeouts' in the test suite were one performance bug wearing a disguise."
+tags: ["history", "performance", "file-descriptors"]
+version: null
+draft: false
+---
+
+Twenty invocations of `/bin/true`, timed:
+
+```bash
+# huck, 8 July
+$ time huck -c 'i=0; while [ $i -lt 20 ]; do /bin/true; i=$((i+1)); done'
+2.02 s
+
+# bash 5.2, same loop
+0.10 s
+```
+
+Two seconds to run twenty commands that do nothing. Roughly 100 milliseconds
+each, almost exactly — and *almost exactly* is the tell. Real work is never
+that punctual. That's a sleep.
+
+It was. The code that waits for a foreground command to finish was polling:
+check whether the child has exited, sleep 100 ms, check again. For a
+long-running command nobody notices. For `/bin/true` — or for `git rev-parse`
+in a prompt, which is the one that would have made huck feel broken — you pay
+the full tick every single time. The fix is to stop polling and block on the
+child until the kernel says it's done.
+
+```bash
+# huck, 20 July
+$ time huck -c 'i=0; while [ $i -lt 20 ]; do /bin/true; i=$((i+1)); done'
+0.10 s
+```
+
+## Why it hid for so long
+
+Nobody noticed because it never *failed*. Every test passed; a handful in the
+interactive suite occasionally hit their timeout and got mentally filed under
+"flaky PTY tests", which is a phrase that should always be treated as a
+confession rather than a diagnosis. When those five timeouts were finally
+looked at together, they weren't five problems. They were two — and the big
+one was this: not a bug in any feature, but a tax on every feature at once.
+
+The second one was a genuine hang, in the same neighbourhood:
+
+```bash
+# huck, 8 July
+$ huck -c 'exec 3< /etc/hostname; exec 4<&3-; read line <&4; echo "got=$line"'
+huck: line 1: bad fd: 3-
+huck: line 1: 4: Bad file descriptor
+got=
+
+# huck, 20 July
+got=devbox
+```
+
+`4<&3-` is the *move* form of a redirect: duplicate fd 3 onto fd 4 and close
+the original. huck didn't implement the trailing `-`, so it rejected the
+redirect, dropped it, and carried on — which left a later `read` waiting on
+the terminal for input that was never coming. A test that hangs forever
+because a redirect was silently skipped is a good argument for a rule huck now
+follows: an unsupported redirect is an error that stops the command, not a
+warning you step over.
+
+## The thread this belongs to
+
+Both fixes came out of a week spent on file-descriptor plumbing — how
+redirects, pipelines, background jobs and captured output all decide where fd
+0, 1 and 2 point. That week fixed a lot of individual bugs, and left behind a
+suspicion that the *pattern* of the bugs mattered more than any of them: each
+fix landed in a slightly different code path doing slightly the same thing.
+Which is a story for August.
