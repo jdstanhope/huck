@@ -310,6 +310,11 @@ fn run_andor_group(
     rest: &[(Connector, &Command)],
     shell: &mut Shell,
 ) -> ExecOutcome {
+    // #438: bash captures `was_error_trap` BEFORE running a command and fires
+    // the ERR trap on failure only if the trap was armed back then — so a
+    // command that INSTALLS the ERR trap (typically a function trapping for
+    // itself) is not itself caught by it. Captured per command, not per group.
+    let err_armed_first = crate::traps::err_trap_armed(shell);
     let mut status = run_command(first, shell);
     if let Some(o) = check_interrupt(shell) {
         return o;
@@ -356,7 +361,10 @@ fn run_andor_group(
         // is last iff there is no `rest`.
         let is_last = rest.is_empty();
         if c != 0 && shell.err_suppressed_depth == 0 && is_last && !is_negated_pipeline(first) {
-            crate::traps::fire_err_trap(shell);
+            // errexit is NOT gated on the armed flag — only the trap fire is.
+            if err_armed_first {
+                crate::traps::fire_err_trap(shell);
+            }
             if let Some(out) = maybe_errexit(shell, c) {
                 return out;
             }
@@ -371,6 +379,7 @@ fn run_andor_group(
             Connector::Semi | Connector::Amp => true,
         };
         if should_run {
+            let err_armed = crate::traps::err_trap_armed(shell);
             status = run_command(command, shell);
             if let Some(o) = check_interrupt(shell) {
                 return o;
@@ -407,7 +416,9 @@ fn run_andor_group(
                     && is_last
                     && !is_negated_pipeline(command)
                 {
-                    crate::traps::fire_err_trap(shell);
+                    if err_armed {
+                        crate::traps::fire_err_trap(shell);
+                    }
                     if let Some(out) = maybe_errexit(shell, c) {
                         return out;
                     }
@@ -3684,6 +3695,8 @@ pub(crate) fn call_function(
     // entry DEBUG fire, as in bash's execute_function) so the body, and any
     // `trap -p RETURN` it runs, sees the trap gone.
     let saved_return_trap = crate::traps::take_return_trap_for_call(shell);
+    // #438: same story for ERR, gated on `errtrace` (`set -E`) instead.
+    let saved_err_trap = crate::traps::take_err_trap_for_call(shell);
 
     // v329 (#274): fire the DEBUG trap ONCE on function ENTRY (after the
     // call-site fire, before the first body command), with $LINENO stamped to
@@ -3717,6 +3730,7 @@ pub(crate) fn call_function(
     // #434: the trap that just fired (if any) is the body's own; the caller's
     // saved one comes back only if the body left RETURN untrapped.
     crate::traps::restore_return_trap_after_call(shell, saved_return_trap);
+    crate::traps::restore_err_trap_after_call(shell, saved_err_trap);
 
     // Pop local scope and restore each snapshotted variable. Runs
     // AFTER the RETURN trap so the trap action still sees the

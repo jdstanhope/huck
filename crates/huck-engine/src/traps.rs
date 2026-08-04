@@ -208,13 +208,41 @@ pub fn take_return_trap_for_call(shell: &mut Shell) -> Option<String> {
     if shell.shell_options.functrace || shell.extdebug() {
         return None;
     }
-    if !matches!(shell.traps.get(&TrapSignal::Return), Some(Some(_))) {
+    take_trap_for_call(shell, TrapSignal::Return)
+}
+
+/// The same entry treatment for the ERR trap, gated on `errtrace` (`set -E` /
+/// `shopt -s extdebug`, which turns errtrace on) instead of functrace —
+/// bash's `execute_function` runs `restore_default_signal (ERROR_TRAP)` under
+/// exactly the same shape. #438
+pub fn take_err_trap_for_call(shell: &mut Shell) -> Option<String> {
+    if shell.shell_options.errtrace || shell.extdebug() {
         return None;
     }
-    match shell.traps.remove(&TrapSignal::Return) {
+    take_trap_for_call(shell, TrapSignal::Err)
+}
+
+/// Removes `sig`'s action for the duration of a call, returning it for the
+/// matching `restore_*_after_call`. An *ignored* trap (`trap '' SIG`) is left
+/// alone — see the note on `take_return_trap_for_call`.
+fn take_trap_for_call(shell: &mut Shell, sig: TrapSignal) -> Option<String> {
+    if !matches!(shell.traps.get(&sig), Some(Some(_))) {
+        return None;
+    }
+    match shell.traps.remove(&sig) {
         Some(Some(action)) => Some(action),
         _ => None,
     }
+}
+
+/// True when the ERR trap is armed — set and not ignored, bash's
+/// `signal_is_trapped (ERROR_TRAP) && signal_is_ignored (ERROR_TRAP) == 0`.
+/// bash captures this in `was_error_trap` BEFORE running a command and fires
+/// the trap on failure only if it held then, so a command that INSTALLS the
+/// ERR trap (typically a function that traps for itself) does not trigger it
+/// with its own failure. #438
+pub fn err_trap_armed(shell: &Shell) -> bool {
+    matches!(shell.traps.get(&TrapSignal::Err), Some(Some(_)))
 }
 
 /// The function-EXIT half, bash's `maybe_set_return_trap`: the saved action
@@ -223,10 +251,19 @@ pub fn take_return_trap_for_call(shell: &mut Shell) -> Option<String> {
 /// that reset RETURN (`trap - RETURN`) gets the caller's trap back. `trap ''
 /// RETURN` counts as trapped, so it too survives. (bash) #434
 pub fn restore_return_trap_after_call(shell: &mut Shell, saved: Option<String>) {
+    restore_trap_after_call(shell, TrapSignal::Return, saved);
+}
+
+/// The ERR counterpart, bash's `maybe_set_error_trap`. #438
+pub fn restore_err_trap_after_call(shell: &mut Shell, saved: Option<String>) {
+    restore_trap_after_call(shell, TrapSignal::Err, saved);
+}
+
+fn restore_trap_after_call(shell: &mut Shell, sig: TrapSignal, saved: Option<String>) {
     if let Some(action) = saved
-        && !shell.traps.contains_key(&TrapSignal::Return)
+        && !shell.traps.contains_key(&sig)
     {
-        shell.traps.insert(TrapSignal::Return, Some(action));
+        shell.traps.insert(sig, Some(action));
     }
 }
 
