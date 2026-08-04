@@ -8,7 +8,15 @@ fn run(value: &str, ifs: &str) -> Vec<String> {
     let mut current = Field::default();
     let mut result: Vec<Field> = Vec::new();
     let mut has_emitted = false;
-    emit_split_fields(value, ifs, &mut current, &mut result, &mut has_emitted);
+    let mut pending_ws_sep = false;
+    emit_split_fields(
+        value,
+        ifs,
+        &mut current,
+        &mut result,
+        &mut has_emitted,
+        &mut pending_ws_sep,
+    );
     if has_emitted {
         result.push(current);
     }
@@ -97,12 +105,14 @@ fn current_field_continuation() {
     current.push_str("prefix-", false);
     let mut result: Vec<Field> = Vec::new();
     let mut has_emitted = true;
+    let mut pending_ws_sep = false;
     emit_split_fields(
         "a b c",
         " \t\n",
         &mut current,
         &mut result,
         &mut has_emitted,
+        &mut pending_ws_sep,
     );
     result.push(current);
     let words: Vec<String> = result.into_iter().map(|f| f.chars).collect();
