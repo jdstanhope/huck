@@ -17,6 +17,12 @@ fn huck_bin() -> &'static str {
 
 /// Writes `body` to a temp file, runs `huck <file>` with stdin severed (so a
 /// backgrounded first stage cannot inherit the harness's stdin), returns stderr.
+///
+/// #461: the child runs with the temp dir as its CWD. cargo runs this binary
+/// from the workspace root, so a fragment's relative redirect (`… >out`) used
+/// to drop a stray `out` next to `Cargo.toml` on every test run — which then
+/// got committed by accident. The script path is absolute, so nothing else
+/// depends on the inherited cwd, and the temp dir takes the artifact with it.
 fn run_script_stderr(body: &str) -> String {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.sh");
@@ -26,6 +32,7 @@ fn run_script_stderr(body: &str) -> String {
         .unwrap();
     let out = Command::new(huck_bin())
         .arg(&path)
+        .current_dir(dir.path())
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();

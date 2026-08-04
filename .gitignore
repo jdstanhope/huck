@@ -1,6 +1,10 @@
 /target
 /dist
 .claude/
+# Stray redirect target a test fragment used to drop here (#461). The test now
+# runs in a temp cwd; this keeps an accidental one from being committed again.
+/out
+
 # Generated parse/sweep artifacts (regenerate the corpus via find_shell_scripts.sh)
 /tools/*.tsv
 tools/run_results.tsv
