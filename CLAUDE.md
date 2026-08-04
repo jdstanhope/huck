@@ -31,6 +31,36 @@ The README's iteration table indexes the v1–vNN history at a glance.
 For per-iteration design context, `docs/superpowers/specs/` and
 `docs/superpowers/plans/` hold the paper trail (one pair per `vNN`).
 
+## Size the ceremony before starting
+
+**Match the process to the work, and say which one you are running.** The
+full iteration loop below exists for work that needs a design; running it on
+a small fix wastes an hour of the user's time.
+
+Default to a **bug-fix round** (see "Bug-fix rounds and the follow-on
+cascade"): no brainstorm, no spec, no plan. Branch, fix, harness, sweep, PR.
+That is the right shape for a known-shaped divergence, however many files it
+touches.
+
+Escalate to a **`vNN` iteration** — brainstorm → spec → plan → subagent
+tasks — only when at least one is true:
+
+- the work needs a decision the code and bash cannot answer between them
+  (a new model, a policy, a trade-off the user must pick);
+- it changes a shared subsystem's semantics, so the blast radius spans
+  features rather than a builtin;
+- it is a bash-suite **category flip** or a multi-day arc.
+
+**Abort the ceremony when the design turns out small.** If a brainstorm lands
+on something implementable in roughly a hundred lines behind one harness, say
+so and switch to a bug-fix round instead of writing the plan. A spec that is
+already written is not a reason to keep going — it is a cheap artifact; the
+user's time is not. (v352 is the cautionary case: an hour of design for a
+gate flip and a string table.)
+
+Even inside an iteration, prefer probing the real shell over discussing:
+a measured answer settles a question that a design conversation cannot.
+
 ## When the user says "start vNN: <feature>"
 
 Run the standard iteration loop without being asked:

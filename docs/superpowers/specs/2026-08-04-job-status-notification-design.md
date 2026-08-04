@@ -243,3 +243,34 @@ green, since they share the formatter.
 - `tests/scripts/job_notify_diff_check.sh` — new
 - existing `set -m` harnesses — adjusted only where the new notices change
   their output
+
+## As built
+
+Three things the design did not anticipate, all found by probing while
+implementing:
+
+**bash only reaps while it is BLOCKED on a child.** A run of builtins never
+notices a background death, so `set -m; sleep 3 & kill -TERM %1; echo A; echo
+B` announces nothing in bash, while huck — which reaps at every command
+boundary — announced it. huck now records `blocked_on_child` wherever it waits
+(the foreground external path and `wait_with_untraced`), and the
+between-command pass announces only when that flag was set since the last
+pass. Passes that do not announce leave the job PENDING rather than draining
+it, so a notice is never silently consumed.
+
+**`wait` consumes a signal death.** A job that died from a signal and whose
+status `wait` collected is not announced — bash reported it through the 128+N
+status. A job that exited normally still gets its `[N]+ Done` line after a
+`wait`. `mark_signaled_jobs_notified` handles this at the `wait` chokepoint.
+
+**The notice pass moved from the head of a command group to its tail.** bash
+notices a death during the command and prints afterwards, carrying THAT
+command's line number; running huck's pass at the tail reproduces both the
+ordering and the number, which removed the line-number risk the spec flagged
+without needing a fix to the error prologue.
+
+Two harness rows were dropped rather than made to pass: SIGINT, and any trap
+that is not "ignore". huck's background job leader is a forked shell that
+never execs, so it keeps huck's own SIGINT handler and the parent's trap table
+and absorbs signals that kill bash's exec'd child. That is
+[#428](https://github.com/jdstanhope/huck/issues/428)'s territory.

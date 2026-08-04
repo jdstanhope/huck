@@ -41,6 +41,9 @@ pub struct Job {
     /// job shares the shell's process group (a non-interactive background job,
     /// since v173): signal it per-pid, never `killpg`. Bash's `J_JOBCONTROL`.
     pub own_pgroup: bool,
+    /// Set when the job died from a signal that dumped core, so the notice can
+    /// carry bash's ` (core dumped)` suffix (#420).
+    pub core_dumped: bool,
 }
 
 /// Cap on the saved terminal-status ring (`last_statuses`). Bounded so that
@@ -141,6 +144,7 @@ impl JobTable {
             created_at: self.next_created_at,
             marked_for_nohup: false,
             own_pgroup,
+            core_dumped: false,
         };
         self.insert_job(job)
     }
@@ -163,6 +167,7 @@ impl JobTable {
             created_at: self.next_created_at,
             marked_for_nohup: false,
             own_pgroup: true,
+            core_dumped: false,
         };
         self.insert_job(job)
     }
@@ -214,6 +219,7 @@ impl JobTable {
                 if job.reaped.iter().all(|&b| b) {
                     let raw = job.last_status.unwrap_or(0);
                     job.state = decode_status(raw);
+                    job.core_dumped = libc::WIFSIGNALED(raw) && core_dumped(raw);
                 }
                 return;
             }
@@ -500,12 +506,99 @@ pub fn reap_owned_once(shell: &mut crate::shell_state::Shell) -> bool {
     reaped_any
 }
 
-/// Reaps and then prints `[N]<flag> <state> <cmd> &` for any newly-completed
-/// jobs. Drops the printed jobs from the table.
+/// What the shell should say about one job whose state just changed (#418,
+/// #420). `SignalLine` is bash's non-interactive form for a signal death.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Notice {
+    /// `[1]+  Terminated              sleep 5`
+    JobLine(String),
+    /// `huck: line 3: 4179740 Killed                  sleep 5` — the prologue
+    /// is added by the caller, which owns the program name and line number.
+    SignalLine(String),
+}
+
+/// The three shell facts the decision depends on.
+#[derive(Debug, Clone, Copy)]
+pub struct NoticeCtx {
+    pub interactive: bool,
+    /// `is_interactive || set -m`: bash announces nothing without it.
+    pub job_control: bool,
+    /// Whether the signal that killed this job has a trap installed.
+    pub trapped: bool,
+}
+
+/// Decides what to announce for `job`, or `None` for silence. Pure: the whole
+/// per-signal matrix is unit-testable without a Shell or a child process.
+///
+/// bash uses the pid-prefixed form when ALL of: the shell is non-interactive,
+/// the job died from a signal, that signal is not SIGINT/SIGTERM/SIGPIPE, and
+/// the signal is untrapped. Everything else takes the `[N]+` form.
+pub fn job_notice(job: &Job, flag: char, ctx: NoticeCtx) -> Option<Notice> {
+    if !ctx.job_control {
+        return None;
+    }
+    if matches!(job.state, JobState::Running) {
+        return None;
+    }
+    if let JobState::Signaled(sig) = job.state {
+        let quiet_signal = sig == libc::SIGINT || sig == libc::SIGTERM || sig == libc::SIGPIPE;
+        if !ctx.interactive && !quiet_signal && !ctx.trapped {
+            let (state, _) = job_state_and_suffix(job);
+            let pid = job.pids.first().copied().unwrap_or(job.pgid);
+            return Some(Notice::SignalLine(format!(
+                "{pid} {state:<24}{}",
+                job.command
+            )));
+        }
+    }
+    // #418: bash precedes a STOP notice with a bare newline, and only that one.
+    let lead = if matches!(job.state, JobState::Stopped(_)) {
+        "\n"
+    } else {
+        ""
+    };
+    Some(Notice::JobLine(format!(
+        "{lead}{}",
+        notification_line(job, flag)
+    )))
+}
+
+/// Reaps, announces any newly-changed job, and drops the terminal ones.
+///
+/// #418/#420: the announcement is gated on JOB CONTROL, not on interactivity —
+/// bash reports a background job's state change in a non-interactive `set -m`
+/// shell too. Notices stay suppressed inside a subshell and inside completion
+/// functions, matching bash's suppression in a subshell environment.
 pub fn reap_and_notify(shell: &mut crate::shell_state::Shell) {
+    reap_and_notify_ex(shell, true)
+}
+
+/// `announce = false` reaps and prunes SILENTLY. The between-command pass
+/// passes `false` when the group that just ran never blocked on a child (#418):
+/// bash only reaps while blocked, so a run of builtins leaves a background
+/// death unnoticed — `sleep 3 & kill -TERM %1; echo A; echo B` says nothing in
+/// bash, and huck must not invent a notice there.
+pub fn reap_and_notify_ex(shell: &mut crate::shell_state::Shell, announce: bool) {
     reap_completed(shell);
+    let job_control = (shell.is_interactive || shell.shell_options.monitor)
+        && !shell.in_subshell
+        && !shell.in_completion;
+    // With job control on but no blocking point since the last pass, bash has
+    // not noticed this death yet — so leave the job PENDING rather than
+    // draining it. Draining here would mark it notified and silence it
+    // forever, which is what made the notice depend on a race. Without job
+    // control there is no notice to lose, and the silent drain+prune of #175
+    // still applies.
+    if job_control && !announce {
+        return;
+    }
     let (current, previous) = shell.jobs.current_and_previous();
     let notifs = shell.jobs.drain_notifications();
+    let ctx_base = NoticeCtx {
+        interactive: shell.is_interactive,
+        job_control,
+        trapped: false,
+    };
     for job in notifs {
         let flag = if Some(job.id) == current {
             '+'
@@ -514,35 +607,75 @@ pub fn reap_and_notify(shell: &mut crate::shell_state::Shell) {
         } else {
             ' '
         };
-        // bash suppresses automatic job notices inside a subshell environment / completion funcs
-        if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
-            with_err(|err| e!(err, "{}", notification_line(&job, flag)));
+        let trapped = match job.state {
+            // bash's `signal_is_trapped()`: a trap set to ignore ("") counts.
+            JobState::Signaled(sig) => shell
+                .traps
+                .contains_key(&crate::traps::TrapSignal::Real(sig)),
+            _ => false,
+        };
+        match job_notice(
+            &job,
+            flag,
+            NoticeCtx {
+                trapped,
+                ..ctx_base
+            },
+        ) {
+            Some(Notice::JobLine(line)) => with_err(|err| e!(err, "{line}")),
+            Some(Notice::SignalLine(body)) => {
+                crate::sh_error!(shell, None, "{}", body);
+            }
+            None => {}
         }
     }
     shell.jobs.remove_notified();
 }
 
+/// bash's wording for a signal, taken from the SAME source bash uses — the
+/// system's signal-description list (#420). `strsignal(3)` yields `Hangup`,
+/// `Killed`, `Terminated`, `Broken pipe`, `User defined signal 1` and the rest
+/// verbatim, so there is no table to transcribe or keep in sync per platform.
+fn signal_description(sig: i32) -> String {
+    // SAFETY: strsignal returns a pointer to a static (or thread-local) string
+    // for any int; it is never null on glibc/macOS for the values we pass.
+    let p = unsafe { libc::strsignal(sig) };
+    if p.is_null() {
+        return format!("Signal {sig}");
+    }
+    unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub fn render_state(state: &JobState) -> String {
     match state {
         JobState::Running => "Running".to_string(),
-        JobState::Stopped(s) => match *s {
-            libc::SIGTSTP => "Stopped".to_string(),
-            libc::SIGTTIN => "Stopped (tty input)".to_string(),
-            libc::SIGTTOU => "Stopped (tty output)".to_string(),
-            n => format!("Stopped (signal {n})"),
-        },
+        // #420: bash prints a plain `Stopped` for EVERY stop signal — SIGSTOP,
+        // SIGTSTP and SIGTTIN alike, verified non-interactively and under a
+        // PTY. It does NOT use the system description here, which would say
+        // `Stopped (signal)` / `Stopped (tty input)`.
+        JobState::Stopped(_) => "Stopped".to_string(),
         JobState::Done(0) => "Done".to_string(),
         JobState::Done(n) => format!("Exit {n}"),
-        JobState::Signaled(s) => format!("Killed (signal {s})"),
+        JobState::Signaled(s) => signal_description(*s),
     }
 }
 
 fn job_state_and_suffix(job: &Job) -> (String, &'static str) {
     let state = render_state(&job.state);
-    let suffix = match job.state {
-        JobState::Stopped(_) => "",
-        _ => " &",
+    // #420: the trailing `&` marks a job that is running in the background —
+    // bash puts it on Running lines only, not on Done / Exit n / Stopped / a
+    // signal death.
+    let suffix = if matches!(job.state, JobState::Running) {
+        " &"
+    } else {
+        ""
     };
+    let mut state = state;
+    if job.core_dumped {
+        state.push_str(" (core dumped)");
+    }
     (state, suffix)
 }
 
@@ -580,6 +713,12 @@ pub fn notification_line_long(job: &Job, flag: char) -> Vec<String> {
         lines.push(format!("     {}", pid));
     }
     lines
+}
+
+/// WCOREDUMP is not exposed by the `libc` crate on every target; the bit is
+/// 0x80 in the low byte of the wait status on Linux and the BSDs alike.
+fn core_dumped(raw: libc::c_int) -> bool {
+    raw & 0x80 != 0
 }
 
 /// Decodes a raw waitpid status into a JobState terminal variant.
@@ -797,25 +936,168 @@ mod tests {
         assert_eq!(render_state(&JobState::Stopped(libc::SIGTSTP)), "Stopped");
     }
 
+    fn signaled_job(sig: i32) -> Job {
+        let mut t = JobTable::new();
+        t.add(4242, vec![4242], "sleep 5".to_string());
+        t.jobs_mut()[0].state = JobState::Signaled(sig);
+        t.jobs_mut().remove(0)
+    }
+
+    fn ctx(interactive: bool, job_control: bool, trapped: bool) -> NoticeCtx {
+        NoticeCtx {
+            interactive,
+            job_control,
+            trapped,
+        }
+    }
+
+    /// #418/#420: nothing is announced without job control, whatever happened.
     #[test]
-    fn render_state_stopped_sigttin_includes_tty_input() {
+    fn job_notice_is_silent_without_job_control() {
+        let job = signaled_job(libc::SIGKILL);
+        assert_eq!(job_notice(&job, '+', ctx(false, false, false)), None);
+        let mut t = JobTable::new();
+        t.add(1, vec![1], "x".to_string());
+        t.jobs_mut()[0].state = JobState::Done(0);
         assert_eq!(
-            render_state(&JobState::Stopped(libc::SIGTTIN)),
-            "Stopped (tty input)"
+            job_notice(&t.jobs_mut()[0], '+', ctx(true, false, false)),
+            None
         );
     }
 
+    /// A still-running job is not news.
     #[test]
-    fn render_state_stopped_sigttou_includes_tty_output() {
+    fn job_notice_is_silent_for_a_running_job() {
+        let mut t = JobTable::new();
+        t.add(1, vec![1], "x".to_string());
         assert_eq!(
-            render_state(&JobState::Stopped(libc::SIGTTOU)),
-            "Stopped (tty output)"
+            job_notice(&t.jobs_mut()[0], '+', ctx(false, true, false)),
+            None
         );
     }
 
+    /// #420: the pid form is for a NON-interactive shell, an untrapped signal,
+    /// and a signal outside bash's quiet set.
     #[test]
-    fn render_state_stopped_unknown_signal_falls_back_to_numeric() {
-        assert_eq!(render_state(&JobState::Stopped(99)), "Stopped (signal 99)");
+    fn job_notice_form_matrix() {
+        for sig in [libc::SIGKILL, libc::SIGHUP, libc::SIGUSR1, libc::SIGALRM] {
+            let job = signaled_job(sig);
+            assert!(
+                matches!(
+                    job_notice(&job, '+', ctx(false, true, false)),
+                    Some(Notice::SignalLine(_))
+                ),
+                "signal {sig} non-interactive untrapped should take the pid form"
+            );
+            // Interactive, or trapped, flips it back to the job line.
+            assert!(matches!(
+                job_notice(&job, '+', ctx(true, true, false)),
+                Some(Notice::JobLine(_))
+            ));
+            assert!(matches!(
+                job_notice(&job, '+', ctx(false, true, true)),
+                Some(Notice::JobLine(_))
+            ));
+        }
+        // bash's quiet set keeps the job-line form even non-interactively.
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGPIPE] {
+            let job = signaled_job(sig);
+            assert!(
+                matches!(
+                    job_notice(&job, '+', ctx(false, true, false)),
+                    Some(Notice::JobLine(_))
+                ),
+                "signal {sig} should stay in the job-line form"
+            );
+        }
+    }
+
+    /// The pid form is `<pid> <state padded to 24><command>`, with the
+    /// `prog: line N:` prologue left to the caller.
+    #[test]
+    fn job_notice_signal_line_layout() {
+        let job = signaled_job(libc::SIGKILL);
+        match job_notice(&job, '+', ctx(false, true, false)) {
+            Some(Notice::SignalLine(body)) => {
+                assert_eq!(body, "4242 Killed                  sleep 5");
+            }
+            other => panic!("expected a SignalLine, got {other:?}"),
+        }
+    }
+
+    /// #418: a stop notice carries a leading blank line; nothing else does.
+    #[test]
+    fn job_notice_stop_line_leads_with_a_newline() {
+        let mut t = JobTable::new();
+        t.add(4242, vec![4242], "sleep 5".to_string());
+        t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTSTP);
+        match job_notice(&t.jobs_mut()[0], '+', ctx(false, true, false)) {
+            Some(Notice::JobLine(line)) => {
+                assert_eq!(line, "\n[1]+  Stopped                 sleep 5")
+            }
+            other => panic!("expected a JobLine, got {other:?}"),
+        }
+        t.jobs_mut()[0].state = JobState::Done(0);
+        t.jobs_mut()[0].notified = false;
+        match job_notice(&t.jobs_mut()[0], '+', ctx(false, true, false)) {
+            Some(Notice::JobLine(line)) => {
+                assert_eq!(line, "[1]+  Done                    sleep 5")
+            }
+            other => panic!("expected a JobLine, got {other:?}"),
+        }
+    }
+
+    /// #420: a core-dumping death carries bash's suffix. Probed out of the
+    /// harness because apport makes those signals nondeterministic here.
+    #[test]
+    fn core_dumped_job_carries_the_suffix() {
+        let mut t = JobTable::new();
+        t.add(4242, vec![4242], "crash".to_string());
+        t.jobs_mut()[0].state = JobState::Signaled(libc::SIGQUIT);
+        t.jobs_mut()[0].core_dumped = true;
+        assert_eq!(
+            notification_line(&t.jobs_mut()[0], '+'),
+            "[1]+  Quit (core dumped)      crash"
+        );
+    }
+
+    /// #420: bash prints a plain `Stopped` for EVERY stop signal — probed for
+    /// SIGSTOP, SIGTSTP and SIGTTIN, non-interactively and under a PTY. These
+    /// used to assert glibc's `strsignal` wording (`Stopped (tty input)`,
+    /// `Stopped (tty output)`, `Stopped (signal N)`), which bash does not use
+    /// on this path.
+    #[test]
+    fn render_state_stopped_is_plain_for_every_stop_signal() {
+        for sig in [
+            libc::SIGSTOP,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+            99,
+        ] {
+            assert_eq!(
+                render_state(&JobState::Stopped(sig)),
+                "Stopped",
+                "stop signal {sig} should render plain"
+            );
+        }
+    }
+
+    /// #420: a terminated job takes its wording from the system signal list,
+    /// which is where bash's table comes from too.
+    #[test]
+    fn render_state_signaled_uses_the_system_description() {
+        assert_eq!(
+            render_state(&JobState::Signaled(libc::SIGTERM)),
+            "Terminated"
+        );
+        assert_eq!(render_state(&JobState::Signaled(libc::SIGKILL)), "Killed");
+        assert_eq!(render_state(&JobState::Signaled(libc::SIGHUP)), "Hangup");
+        assert_eq!(render_state(&JobState::Signaled(libc::SIGINT)), "Interrupt");
+        assert_eq!(
+            render_state(&JobState::Signaled(libc::SIGPIPE)),
+            "Broken pipe"
+        );
     }
 
     #[test]
@@ -828,11 +1110,12 @@ mod tests {
     }
 
     #[test]
-    fn notification_line_for_done_includes_ampersand() {
+    fn notification_line_for_done_omits_ampersand() {
         let mut t = JobTable::new();
         t.add_synthetic_done("echo hi".to_string(), 0);
         let line = notification_line(&t.jobs_mut()[0], ' ');
-        assert_eq!(line, "[1]   Done                    echo hi &");
+        // #420: no trailing `&` — bash marks only a RUNNING job that way.
+        assert_eq!(line, "[1]   Done                    echo hi");
     }
 
     #[test]
@@ -840,16 +1123,16 @@ mod tests {
         let mut t = JobTable::new();
         t.add_synthetic_done("test -z hi".to_string(), 1);
         let line = notification_line(&t.jobs_mut()[0], ' ');
-        assert_eq!(line, "[1]   Exit 1                  test -z hi &");
+        assert_eq!(line, "[1]   Exit 1                  test -z hi");
     }
 
     #[test]
-    fn notification_line_for_stopped_tty_input_shows_reason() {
+    fn notification_line_for_stopped_tty_input_is_plain() {
         let mut t = JobTable::new();
         t.add(4242, vec![4242], "cat".to_string());
         t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTTIN);
         let line = notification_line(&t.jobs_mut()[0], '+');
-        assert_eq!(line, "[1]+  Stopped (tty input)     cat");
+        assert_eq!(line, "[1]+  Stopped                 cat");
     }
 
     #[test]

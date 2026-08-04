@@ -4755,7 +4755,7 @@ fn builtin_wait(
         Err(outcome) => return outcome,
     };
 
-    match (parsed.wait_any, parsed.targets.len()) {
+    let outcome = match (parsed.wait_any, parsed.targets.len()) {
         (false, 0) => wait_all(shell),
         (false, _) => wait_for_all(parsed.targets, err, shell),
         (true, 0) => wait_any_pending(parsed.pid_var, shell),
@@ -4794,7 +4794,9 @@ fn builtin_wait(
             }
             wait_any_of(live, parsed.pid_var, shell)
         }
-    }
+    };
+    mark_signaled_jobs_notified(shell);
+    outcome
 }
 
 fn wait_all(shell: &mut Shell) -> ExecOutcome {
@@ -4814,6 +4816,27 @@ fn wait_all(shell: &mut Shell) -> ExecOutcome {
     // Print Done lines for anything that just transitioned during the wait.
     crate::jobs::reap_and_notify(shell);
     ExecOutcome::Continue(0)
+}
+
+/// #418: a job that DIED FROM A SIGNAL and whose status `wait` collected is not
+/// announced — `wait` already reported the death through its 128+N status, and
+/// bash stays silent for it in both notice forms:
+///
+/// ```text
+/// set -m; sleep 3 & kill -TERM %1; wait      # bash: nothing
+/// set -m; sleep 3 & kill -TERM %1; sleep 0.3 # bash: [1]+  Terminated  sleep 3
+/// ```
+///
+/// A job that exited NORMALLY still gets its `[N]+ Done` line after a `wait`.
+/// Marking them here rather than in each wait path also removes a race: whether
+/// the boundary pass or `wait` reaped first used to decide whether the notice
+/// appeared at all.
+fn mark_signaled_jobs_notified(shell: &mut Shell) {
+    for job in shell.jobs.jobs_mut() {
+        if matches!(job.state, crate::jobs::JobState::Signaled(_)) {
+            job.notified = true;
+        }
+    }
 }
 
 fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
