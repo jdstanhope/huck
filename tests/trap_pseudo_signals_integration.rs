@@ -141,10 +141,25 @@ fn return_fires_after_function_return() {
 
 #[test]
 fn return_action_sees_function_status() {
-    // The action runs with $? set to the function's return status.
+    // #441: after an EXPLICIT `return N` the action still sees the status of
+    // the last command run BEFORE the `return` (here the function definition's
+    // 0, verified against bash 5.2.21); N is installed for the CALLER only.
     // v327: RETURN is inherited into a function only under functrace (`set -T`).
     let (out, _err, _) =
         run("trap 'echo got=$?' RETURN\nset -T\nf() { return 7; }\nf\necho done=$?\nexit\n");
-    assert!(out.lines().any(|l| l == "got=7"), "stdout: {out}");
+    assert!(out.lines().any(|l| l == "got=0"), "stdout: {out}");
     assert!(out.lines().any(|l| l == "done=7"), "stdout: {out}");
+
+    // With a failing command before the `return`, that failure is what the
+    // action sees — the returned value still reaches the caller.
+    let (out, _err, _) =
+        run("trap 'echo got=$?' RETURN\nset -T\nf() { false; return 7; }\nf\necho done=$?\nexit\n");
+    assert!(out.lines().any(|l| l == "got=1"), "stdout: {out}");
+    assert!(out.lines().any(|l| l == "done=7"), "stdout: {out}");
+
+    // A function that falls off the end: the action sees that same status.
+    let (out, _err, _) =
+        run("trap 'echo got=$?' RETURN\nset -T\nf() { false; }\nf\necho done=$?\nexit\n");
+    assert!(out.lines().any(|l| l == "got=1"), "stdout: {out}");
+    assert!(out.lines().any(|l| l == "done=1"), "stdout: {out}");
 }

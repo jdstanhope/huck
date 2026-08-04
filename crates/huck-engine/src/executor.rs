@@ -3720,7 +3720,13 @@ pub(crate) fn call_function(
     // function's positional args still in scope. After the action runs,
     // restore the caller's frame.
     let status_for_trap = match &result {
-        ExecOutcome::FunctionReturn(n) => *n,
+        // #441: an EXPLICIT `return N` does not install N before the trap runs
+        // — bash's run_return_trap() saves last_command_exit_value and the
+        // action still sees the status of the last command executed BEFORE the
+        // `return` (`f() { trap "echo \$?" RETURN; return 4; }` prints the
+        // trap builtin's 0, not 4). N is installed for the CALLER afterwards,
+        // by this function's `FunctionReturn(n) => Continue(n)` tail. (bash)
+        ExecOutcome::FunctionReturn(_) => shell.last_status(),
         ExecOutcome::Continue(c) => *c,
         // Exit/LoopBreak/LoopContinue propagate up; keep $? as-is.
         _ => shell.last_status(),

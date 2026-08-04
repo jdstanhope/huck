@@ -51,9 +51,13 @@ check "recursion"               'f() { trap "echo R$1" RETURN; [ "$1" -gt 0 ] &&
 # --- status and args seen by the action ------------------------------------
 check "explicit return rc"   'f() { trap "echo RET" RETURN; return 7; }; f; echo "rc=$?"'
 check "action sees \$?"      'f() { trap "echo st=\$?" RETURN; false; }; f; echo "rc=$?"'
-# NOT covered: `$?` inside the action after an EXPLICIT `return N` — bash shows
-# the status of the last command run BEFORE the `return`, huck shows N. That
-# predates this fix (it is visible under `set -T` on main) and is its own issue.
+# #441: after an EXPLICIT `return N` the action still sees the status of the
+# last command run BEFORE the `return` — N is installed for the caller only.
+check "\$? before return N"  'f() { trap "echo st=\$?" RETURN; return 4; }; f; echo "rc=$?"'
+check "\$? after a failure"  'f() { trap "echo st=\$?" RETURN; false; return 4; }; f; echo "rc=$?"'
+check "\$? bare return"      'f() { trap "echo st=\$?" RETURN; (exit 6); return; }; f; echo "rc=$?"'
+check "\$? return under -T"  'set -T; f() { trap "echo st=\$?" RETURN; return 9; }; f; echo "rc=$?"'
+check "\$? compound then N"  'f() { trap "echo st=\$?" RETURN; if false; then :; fi; return 5; }; f; echo "rc=$?"'
 check "action sees args"     'f() { trap "echo args=\$*" RETURN; echo body; }; f a b; echo done'
 check "action sees FUNCNAME" 'f() { trap "echo fn=\${FUNCNAME[0]}" RETURN; echo body; }; f; echo done'
 check "action sees local"    'f() { local v=inner; trap "echo v=\$v" RETURN; echo body; }; v=outer; f; echo "after=$v"'
