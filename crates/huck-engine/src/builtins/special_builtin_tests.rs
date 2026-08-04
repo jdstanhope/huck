@@ -99,7 +99,10 @@ fn trap_p_lists_pseudo_signals_in_order() {
     assert!(matches!(outcome, ExecOutcome::Continue(0)));
     let out = String::from_utf8(buf).unwrap();
     let lines: Vec<&str> = out.lines().collect();
-    // The four pseudo-signals should appear in EXIT, ERR, DEBUG, RETURN order.
+    // bash's order is its trap-table walk: EXIT (signal 0) first, then the
+    // real signals by number, then DEBUG, ERR, RETURN. This test asserted
+    // EXIT/ERR/DEBUG/RETURN, which is huck's old grouping, not bash's —
+    // verified against bash 5.2.21 while fixing the listing format.
     let pseudo_lines: Vec<&&str> = lines
         .iter()
         .filter(|l| {
@@ -117,13 +120,13 @@ fn trap_p_lists_pseudo_signals_in_order() {
         pseudo_lines[0]
     );
     assert!(
-        pseudo_lines[1].contains("ERR"),
-        "second line should be ERR: {}",
+        pseudo_lines[1].contains("DEBUG"),
+        "second line should be DEBUG: {}",
         pseudo_lines[1]
     );
     assert!(
-        pseudo_lines[2].contains("DEBUG"),
-        "third line should be DEBUG: {}",
+        pseudo_lines[2].contains("ERR"),
+        "third line should be ERR: {}",
         pseudo_lines[2]
     );
     assert!(
