@@ -1156,6 +1156,10 @@ fn expand_part(
     current: &mut Field,
     result: &mut Vec<Field>,
     has_emitted: &mut bool,
+    // #335: the previous part ended inside a whitespace-IFS separator run,
+    // which POSIX lets absorb ONE non-whitespace IFS char — so a leading `:`
+    // in THIS part continues that delimiter instead of closing an empty field.
+    pending_ws_sep: &mut bool,
     shell: &mut Shell,
     snapshot_status: i32,
     word: &Word,
@@ -1165,7 +1169,7 @@ fn expand_part(
     match part {
         WordPart::Literal { text, quoted } if !*quoted && split_literal_ws => {
             let ifs = shell.ifs();
-            emit_split_fields(text, &ifs, current, result, has_emitted);
+            emit_split_fields(text, &ifs, current, result, has_emitted, pending_ws_sep);
         }
         WordPart::Literal { text, quoted } => {
             current.push_str(text, *quoted);
@@ -1225,7 +1229,7 @@ fn expand_part(
                 }
             };
             let ifs = shell.ifs();
-            emit_split_fields(&value, &ifs, current, result, has_emitted);
+            emit_split_fields(&value, &ifs, current, result, has_emitted, pending_ws_sep);
         }
         WordPart::AllArgs {
             quoted: false,
@@ -1241,7 +1245,7 @@ fn expand_part(
                 if i > 0 && !current.is_empty() {
                     result.push(std::mem::take(current));
                 }
-                emit_split_fields(arg, &ifs, current, result, has_emitted);
+                emit_split_fields(arg, &ifs, current, result, has_emitted, pending_ws_sep);
             }
         }
         WordPart::AllArgs {
@@ -1278,7 +1282,7 @@ fn expand_part(
         WordPart::LastStatus { quoted: false } => {
             let value = snapshot_status.to_string();
             let ifs = shell.ifs();
-            emit_split_fields(&value, &ifs, current, result, has_emitted);
+            emit_split_fields(&value, &ifs, current, result, has_emitted, pending_ws_sep);
         }
         WordPart::CommandSub {
             sequence,
@@ -1294,7 +1298,7 @@ fn expand_part(
         } => {
             let output = run_substitution(sequence, shell);
             let ifs = shell.ifs();
-            emit_split_fields(&output, &ifs, current, result, has_emitted);
+            emit_split_fields(&output, &ifs, current, result, has_emitted, pending_ws_sep);
         }
         WordPart::Arith { body, quoted: _ } => {
             let (src, res) = eval_arith_word_src(body, shell);
@@ -1379,7 +1383,7 @@ fn expand_part(
                         *has_emitted = true;
                     } else {
                         let ifs = shell.ifs();
-                        emit_split_fields(&v, &ifs, current, result, has_emitted);
+                        emit_split_fields(&v, &ifs, current, result, has_emitted, pending_ws_sep);
                     }
                 }
                 crate::param_expansion::ExpansionResult::Empty => {
@@ -1431,7 +1435,14 @@ fn expand_part(
                             // them — exactly bash's element-boundary behavior in these cases.
                             let sep = ifs_join_sep(&ifs);
                             let joined = words.join(&sep);
-                            emit_split_fields(&joined, &ifs, current, result, has_emitted);
+                            emit_split_fields(
+                                &joined,
+                                &ifs,
+                                current,
+                                result,
+                                has_emitted,
+                                pending_ws_sep,
+                            );
                         }
                     }
                 }
@@ -1499,6 +1510,7 @@ fn expand_part(
                     current,
                     result,
                     has_emitted,
+                    pending_ws_sep,
                     shell,
                     snapshot_status,
                     word,
@@ -1552,6 +1564,7 @@ fn expand_impl(word: &Word, shell: &mut Shell, split_literal_ws: bool) -> Vec<Fi
     let snapshot_status = shell.last_status();
     let mut current = Field::new();
     let mut has_emitted = false;
+    let mut pending_ws_sep = false;
     let mut result: Vec<Field> = Vec::new();
 
     for part in &word.0 {
@@ -1560,6 +1573,7 @@ fn expand_impl(word: &Word, shell: &mut Shell, split_literal_ws: bool) -> Vec<Fi
             &mut current,
             &mut result,
             &mut has_emitted,
+            &mut pending_ws_sep,
             shell,
             snapshot_status,
             word,
@@ -2356,6 +2370,7 @@ fn emit_split_fields(
     current: &mut Field,
     result: &mut Vec<Field>,
     has_emitted: &mut bool,
+    pending_ws_sep: &mut bool,
 ) {
     // POSIX § 2.6.5 field splitting. Two IFS classes:
     //   - whitespace IFS: subset of IFS bytes that are ' ' / '\t' / '\n'.
@@ -2394,9 +2409,26 @@ fn emit_split_fields(
         result.push(std::mem::take(current));
         *has_emitted = false;
     }
+    // #335: POSIX makes "a whitespace-IFS run plus AT MOST ONE non-whitespace
+    // IFS char" a SINGLE delimiter. When the previous part ended inside such a
+    // run, a non-whitespace IFS char at the head of this part belongs to that
+    // same delimiter — `IFS=" :"; a="a "; b=":b"; set -- $a$b` is two fields in
+    // bash, not three. Consume it (and any whitespace after it) instead of
+    // letting the loop below read an empty field before it.
+    if *pending_ws_sep && i < bytes.len() && is_nonws(bytes[i]) {
+        i += 1;
+        while i < bytes.len() && is_ws(bytes[i]) {
+            i += 1;
+        }
+    }
     if i >= bytes.len() {
+        // A value that was ENTIRELY separator leaves the delimiter open only if
+        // it contributed no non-whitespace IFS char of its own.
+        *pending_ws_sep = *pending_ws_sep && !value.as_bytes().iter().any(|&b| is_nonws(b));
         return;
     }
+    // Real content follows, so the carried delimiter is closed.
+    *pending_ws_sep = false;
 
     let mut first_field = true;
 
@@ -2431,7 +2463,9 @@ fn emit_split_fields(
         //   - If the first IFS byte is whitespace, consume the whole
         //     whitespace run. Then OPTIONALLY consume one non-whitespace
         //     IFS byte plus its trailing whitespace-IFS run.
+        let mut sep_took_nonws = false;
         if is_nonws(bytes[i]) {
+            sep_took_nonws = true;
             i += 1;
             while i < bytes.len() && is_ws(bytes[i]) {
                 i += 1;
@@ -2442,6 +2476,7 @@ fn emit_split_fields(
                 i += 1;
             }
             if i < bytes.len() && is_nonws(bytes[i]) {
+                sep_took_nonws = true;
                 i += 1;
                 while i < bytes.len() && is_ws(bytes[i]) {
                     i += 1;
@@ -2466,6 +2501,10 @@ fn emit_split_fields(
                 result.push(std::mem::take(current));
                 *has_emitted = false;
             }
+            // #335: the value ended INSIDE this separator. If it was pure
+            // whitespace, the delimiter can still absorb one non-whitespace
+            // IFS char from the next part.
+            *pending_ws_sep = !sep_took_nonws;
             break;
         }
     }
