@@ -2017,11 +2017,19 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                     crate::param_expansion::ExpansionResult::Value(v) => result.push_str(&v),
                     crate::param_expansion::ExpansionResult::Empty => {}
                     crate::param_expansion::ExpansionResult::WordList(words) => {
-                        // Assignment context: no field splitting. Join
-                        // with first IFS char (matches `${a[*]}` and the
-                        // existing `WordPart::AllArgs` assignment path).
-                        let ifs = shell.ifs();
-                        let sep = ifs_join_sep(&ifs);
+                        // #292: in a NO-SPLIT context (assignment RHS, `case`
+                        // subject, `[[ ]]` operand) a `@` expansion joins with
+                        // a SPACE whatever IFS says — bash gives `x y` for
+                        // `IFS=,; v=${a[@]}` and even for `IFS=`. A `*` still
+                        // joins with IFS[0] (`IFS=,; v=${a[*]}` is `x,y`).
+                        let star =
+                            matches!(subscript.as_ref(), Some(crate::lexer::SubscriptKind::Star))
+                                || (subscript.is_none() && name == "*");
+                        let sep = if star {
+                            ifs_join_sep(&shell.ifs())
+                        } else {
+                            " ".to_string()
+                        };
                         result.push_str(&words.join(&sep));
                     }
                     crate::param_expansion::ExpansionResult::Fields(fields) => {
@@ -2040,9 +2048,16 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                     }
                 }
             }
-            WordPart::AllArgs { .. } => {
-                // No field splitting in assignment context; join with space.
-                let joined = shell.positional_args.join(" ");
+            WordPart::AllArgs { joined: star, .. } => {
+                // #292: `$@` joins with a SPACE here, but `$*` joins with
+                // IFS[0] — `set -- a b; IFS=,; v="$*"` is `a,b` in bash while
+                // `v="$@"` is `a b`. No field splitting either way.
+                let sep = if *star {
+                    ifs_join_sep(&shell.ifs())
+                } else {
+                    " ".to_string()
+                };
+                let joined = shell.positional_args.join(&sep);
                 result.push_str(&joined);
             }
             WordPart::AssignPrefix { target, append } => {
