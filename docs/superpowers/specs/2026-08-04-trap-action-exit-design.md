@@ -178,13 +178,27 @@ run no shell body and are untouched. The two `_exit` calls outside `executor.rs`
 production paths. So `fork_and_run_in_subshell` is the only place a forked child
 ever runs shell code, and therefore the only place an EXIT trap can be owed.
 
-### 6. The wait loop
+### 6. The wait loop — no work needed, and why
 
-`trap "exit 9" USR1; ( sleep .1; kill -USR1 $$ ) & wait` exits 9 in bash, so the
-`wait` polling loop must notice `pending_exit` after dispatching a signal trap
-and return an `ExitRequested` outcome rather than continuing to wait. This is the
-one place the request is raised outside the executor's command boundaries, and
-it gets a dedicated harness fragment.
+`trap "exit 9" USR1; ( sleep .1; kill -USR1 $$ ) & wait` exits 9 in bash, which
+looks like it needs a `pending_exit` check inside `wait`. Measured, it does not:
+
+- `wait_all` (`builtins.rs:4803`) already polls `check_interrupt` on every
+  iteration, so the moment the flag is set it returns the outcome — no new
+  check;
+- and huck does not dispatch signal traps inside `wait` at all today. It defers
+  them to the next command boundary, so the action (and its `exit`) runs after
+  `wait` returns. Timed: `trap "kill %1" USR1; sleep 3 & ( sleep .3; kill -USR1
+  $$ ) & wait` finishes in 0.31 s under bash and 3.03 s under huck.
+
+That lateness is a real divergence — filed as
+[#453](https://github.com/jdstanhope/huck/issues/453) — but it is **out of scope
+here**, and it does not weaken this iteration's harness: the row still matches
+bash byte-for-byte, because either way the unwind lands before the next command
+runs. Only the timing differs, which a diff harness does not observe.
+
+The implementer should therefore **not** touch the wait loop. If the harness row
+fails, the bug is in the propagation, not in `wait`.
 
 ## Data flow, worked
 
@@ -249,9 +263,9 @@ exit code 7, matching bash.
 1. `run_trap_action()` — collapse the five fire helpers, no behaviour change.
 2. `finish_command()` — extract the duplicated epilogue, no behaviour change
    (zero-edit gate).
-3. `pending_exit` + `ExitRequested` + the three status arms — #442 for the four
-   non-signal trap kinds.
-4. The wait-loop checkpoint — #442 for signal traps.
-5. The child exit path — #449.
-6. Harnesses, sweep, bash-suite PASS-set diff, docs (`bash-divergences.md` entry
+3. `pending_exit` + `ExitRequested` + the three status arms — #442 for all five
+   trap kinds (signal traps included: `wait_all` already polls
+   `check_interrupt`, so no wait-loop change — see §6).
+4. The child exit path — #449.
+5. Harnesses, sweep, bash-suite PASS-set diff, docs (`bash-divergences.md` entry
    + `by-design` issue for the RETURN-trap recursion).
