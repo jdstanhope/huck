@@ -69,5 +69,19 @@ check 'cstyle-for'     'for ((i=3.5; i<1; i++)); do :; done; echo done'
 check 'let-builtin'    'let "3.5"; echo done'
 check 'valid-arith'    'echo $((1+1)); echo done'
 
+# #455: `$?` after a discarded command is 1 in bash, in EVERY and-or position.
+# huck only did this for the FIRST command of a list until the epilogue was
+# unified in v353 — `true && v=$((1/0))` left 0 behind.
+check 'discard-rc-first'  'v=$((1/0))
+echo "rc=$?"'
+check 'discard-rc-and'    'true && v=$((1/0))
+echo "rc=$?"'
+check 'discard-rc-or'     'false || v=$((1/0))
+echo "rc=$?"'
+check 'discard-rc-chain'  'true && true && v=$((1/0))
+echo "rc=$?"'
+check 'discard-rc-semi'   'true; v=$((1/0))
+echo "rc=$?"'
+
 if [ $FAIL -ne 0 ]; then echo "arith_expansion_discard_diff_check FAILED" >&2; exit 1; fi
 echo "arith_expansion_discard_diff_check OK"

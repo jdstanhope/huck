@@ -305,6 +305,60 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
 /// plus `$?` propagation, pending-trap dispatch, ERR-trap firing, and errexit
 /// handling. Returns the group's final `ExecOutcome` (which may be
 /// `Exit`/`LoopBreak`/`LoopContinue`/`FunctionReturn` to propagate upward).
+/// The post-command epilogue shared by every element of an and-or list.
+///
+/// Runs after a command has produced `Continue(c)`: status propagation, the two
+/// pending-unwind checks, signal-trap dispatch, the ERR trap and errexit.
+/// Returns `Some(outcome)` when the caller must return it immediately, `None`
+/// to carry on with the rest of the list.
+///
+/// `is_last` is bash's and-or rule: only the SYNTACTICALLY last command of the
+/// list fires ERR/errexit — a command followed by `&&` or `||` is "part of a
+/// list being tested", not a standalone failure. `err_armed` is the
+/// PRE-command snapshot of whether the ERR trap was set (#444, bash's
+/// `was_error_trap`), so a command that installs the ERR trap is not itself
+/// caught by it; errexit is deliberately NOT gated on it.
+fn finish_command(
+    cmd: &Command,
+    c: i32,
+    is_last: bool,
+    err_armed: bool,
+    shell: &mut Shell,
+) -> Option<ExecOutcome> {
+    // B-11: propagate `$?` across sequence connectors. The top-level loop in
+    // shell.rs only refreshes `shell.last_status` after `process_line` returns,
+    // so without this update the second command in `false; echo $?` would see a
+    // stale value.
+    shell.set_last_status(c);
+    // v312 (#3/#49): a pending arithmetic-discard converts this command's
+    // outcome into the Interrupted(DiscardCommand) unwind — the current
+    // top-level command is discarded (out of loops/functions), contained at a
+    // comsub boundary, and continued (not exited) at the driver loop. Checked
+    // BEFORE pending_fatal_status: the discard flavor wins if both were somehow
+    // raised by the same command.
+    if shell.take_pending_discard() {
+        // #351: a discarded command's exit status is 1 (DiscardCommand maps to
+        // 1 at the driver). `set_last_status(c)` above wrote the "success"
+        // status of a bare assignment (`v=$((1/0))` → c=0); overwrite it so a
+        // following `$?` reads 1, matching bash.
+        shell.set_last_status(1);
+        return Some(ExecOutcome::Interrupted(InterruptReason::DiscardCommand));
+    }
+    if shell.pending_fatal_status.is_some() {
+        return Some(ExecOutcome::Continue(c));
+    }
+    crate::traps::dispatch_pending_traps(shell);
+    if c != 0 && shell.err_suppressed_depth == 0 && is_last && !is_negated_pipeline(cmd) {
+        if err_armed {
+            crate::traps::fire_err_trap(shell);
+        }
+        if let Some(out) = maybe_errexit(shell, c) {
+            return Some(out);
+        }
+    }
+    None
+}
+
 fn run_andor_group(
     first: &Command,
     rest: &[(Connector, &Command)],
@@ -329,46 +383,11 @@ fn run_andor_group(
     ) {
         return status;
     }
-    // B-11: propagate `$?` across sequence connectors. The top-level loop
-    // in shell.rs only refreshes `shell.last_status` after `process_line`
-    // returns, so without this update the second command in `false; echo $?`
-    // would see a stale value.
-    if let ExecOutcome::Continue(c) = status {
-        shell.set_last_status(c);
-        // v312 (#3/#49): a pending arithmetic-discard converts this command's
-        // outcome into the Interrupted(DiscardCommand) unwind — the current
-        // top-level command is discarded (out of loops/functions), contained at
-        // a comsub boundary, and continued (not exited) at the driver loop.
-        // Checked BEFORE pending_fatal_status: the discard flavor wins if both
-        // were somehow raised by the same command.
-        if shell.take_pending_discard() {
-            // #351: a discarded command's exit status is 1 (DiscardCommand maps
-            // to 1 at the driver). `set_last_status(c)` above wrote the "success"
-            // status of a bare assignment (`v=$((1/0))` → c=0); overwrite it so a
-            // following `$?` reads 1, matching bash.
-            shell.set_last_status(1);
-            return ExecOutcome::Interrupted(InterruptReason::DiscardCommand);
-        }
-        if shell.pending_fatal_status.is_some() {
-            return ExecOutcome::Continue(c);
-        }
-        crate::traps::dispatch_pending_traps(shell);
-        // errexit / ERR fire for first's failure only when it is the
-        // SYNTACTICALLY LAST command in this and-or list. bash exempts every
-        // and-or-list command except the last, regardless of whether the
-        // following connector is `&&` or `||` (a command followed by either is
-        // "part of a list being tested", not a standalone failure). `first`
-        // is last iff there is no `rest`.
-        let is_last = rest.is_empty();
-        if c != 0 && shell.err_suppressed_depth == 0 && is_last && !is_negated_pipeline(first) {
-            // errexit is NOT gated on the armed flag — only the trap fire is.
-            if err_armed_first {
-                crate::traps::fire_err_trap(shell);
-            }
-            if let Some(out) = maybe_errexit(shell, c) {
-                return out;
-            }
-        }
+    // `first` is the last command of the list iff there is no `rest`.
+    if let ExecOutcome::Continue(c) = status
+        && let Some(out) = finish_command(first, c, rest.is_empty(), err_armed_first, shell)
+    {
+        return out;
     }
     for i in 0..rest.len() {
         let (connector, command) = &rest[i];
@@ -394,35 +413,11 @@ fn run_andor_group(
             ) {
                 return status;
             }
-            if let ExecOutcome::Continue(c) = status {
-                shell.set_last_status(c);
-                // v312 (#3/#49): pending arithmetic-discard → unwind (see the
-                // sibling conversion above for the `first` command).
-                if shell.take_pending_discard() {
-                    return ExecOutcome::Interrupted(InterruptReason::DiscardCommand);
-                }
-                if shell.pending_fatal_status.is_some() {
-                    return ExecOutcome::Continue(c);
-                }
-                crate::traps::dispatch_pending_traps(shell);
-                // errexit / ERR fire only when this failing command is the
-                // SYNTACTICALLY LAST in the and-or list. A command followed by
-                // `&&` OR `||` is exempt (bash rule) — the two differ from the
-                // old `!next_is_or` gate only in the `&&`-next case, which was
-                // the bug. This command is last iff there is no rest[i+1].
-                let is_last = i + 1 == rest.len();
-                if c != 0
-                    && shell.err_suppressed_depth == 0
-                    && is_last
-                    && !is_negated_pipeline(command)
-                {
-                    if err_armed {
-                        crate::traps::fire_err_trap(shell);
-                    }
-                    if let Some(out) = maybe_errexit(shell, c) {
-                        return out;
-                    }
-                }
+            // This command is the last of the list iff there is no rest[i+1].
+            if let ExecOutcome::Continue(c) = status
+                && let Some(out) = finish_command(command, c, i + 1 == rest.len(), err_armed, shell)
+            {
+                return out;
             }
         }
     }
