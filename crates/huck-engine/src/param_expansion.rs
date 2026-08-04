@@ -570,9 +570,18 @@ fn substitute(
     all: bool,
     extglob: bool,
 ) -> String {
-    // Bash treats an empty pattern as a no-op (`${var//}` → `$var`).
+    // #448: an empty pattern matches nothing ANYWHERE — except at an anchor,
+    // where the empty match lands at the anchored end and the replacement is
+    // inserted there. That is what makes `${x/#/pre}` the idiomatic prepend
+    // and `${x/%/suf}` the append (and, over `${a[@]}`, per element).
+    // Unanchored (`${x//}`, `${x///-}`) stays a no-op, and so does the
+    // replace-all form of an anchor (`${x//#/pre}` → unchanged in bash).
     if pattern.is_empty() {
-        return value.to_string();
+        return match anchor {
+            SubstAnchor::Prefix if !all => format!("{replacement}{value}"),
+            SubstAnchor::Suffix if !all => format!("{value}{replacement}"),
+            _ => value.to_string(),
+        };
     }
     if glob::Pattern::new(pattern).is_err() && !(extglob && crate::glob_match::has_extglob(pattern))
     {
