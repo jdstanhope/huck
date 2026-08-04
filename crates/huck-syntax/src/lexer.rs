@@ -3415,8 +3415,15 @@ impl<'a> Lexer<'a> {
                 // NOT the anchored `/#`/`/%` forms (there the `#`/`%` is the operand's first
                 // char, so `~` is not at word start). The precise `matches!` set is the real
                 // gate, so `is_pattern` is no longer consulted here.
+                // #380: the REPLACEMENT half of `${x/pat/rep}` expands a
+                // word-start `~` too — and unlike every operand above, it does
+                // so even when the whole `${…}` sits in double quotes:
+                // `"${x/a/~}"` is $HOME, while `"${x:-~}"` stays literal. So
+                // that arm reads ParamSep (the `/` before the replacement) and
+                // ignores `enclosing_dquote`, while an `in_dquote` tilde —
+                // `${x/a/"~"}` — stays literal in both.
                 Some('~')
-                    if !in_dquote
+                    if (!in_dquote
                         && !enclosing_dquote
                         && matches!(
                             self.history.last().map(|t| &t.kind),
@@ -3430,7 +3437,12 @@ impl<'a> Lexer<'a> {
                                     | ParamOpKind::Case(_, _)
                                     | ParamOpKind::Substitute(SubstKind::First | SubstKind::All)
                             )),
-                        ) =>
+                        ))
+                        || (!in_dquote
+                            && matches!(
+                                self.history.last().map(|t| &t.kind),
+                                Some(TokenKind::ParamSep)
+                            )) =>
                 {
                     self.cursor.next(); // consume `~`
                     // `end` (`}`/`]`) closes the operand word, so it must ALSO
