@@ -1,0 +1,119 @@
+---
+title: "When the tests were the bug"
+date: 2026-08-04
+summary: "A routine 'run the tests' turned up three defects with nothing wrong in the shell itself: assertions that only held on Linux, a suite racing itself for file descriptors, and a test quietly writing into the repo. Plus a build cache that reported failures for code it never compiled."
+tags: ["testing", "tooling", "macos"]
+version: null
+draft: false
+---
+
+Sometimes you run the test suite and the suite is what is broken. Three
+separate defects turned up in one pass, and none of them was a bug in the
+shell — but each was busy hiding real ones.
+
+## Assertions that were only true on Linux
+
+huck takes its wording for a job's death from the same place bash does: the
+system's signal list, via `strsignal(3)`. No table to transcribe, no drift.
+The tests, though, wrote the answers down by hand — and glibc's answers are
+not everyone's.
+
+```bash
+# before — cargo test on macOS
+---- jobs::tests::render_state_signaled_uses_the_system_description ----
+  left: "Terminated: 15"
+ right: "Terminated"
+---- jobs::tests::job_notice_signal_line_layout ----
+  left: "4242 Killed: 9               sleep 5"
+ right: "4242 Killed                  sleep 5"
+```
+
+macOS appends the signal number. So the shell was right — and so is bash,
+which prints exactly the same thing there:
+
+```bash
+$ bash -c 'sleep 30 & p=$!; sleep 0.2; kill -9 $p; wait $p'
+bash: line 1: 20720 Killed: 9                  sleep 30
+```
+
+The exact glibc strings still earn their keep on the compatibility target, so
+they stayed — pinned to Linux. Everywhere else the tests check what is
+actually portable: the column layout, and that the description leads with
+bash's word for the signal.
+
+```bash
+# after
+test result: ok. 49 passed; 0 failed
+```
+
+## A suite racing itself for file descriptors
+
+About 1,970 tests run as threads in one process, and a shell moves file
+descriptors around **by number**. So one test's redirect could reach into
+another's:
+
+```bash
+# before — roughly one run in three
+unexpected error during closedir: Bad file descriptor
+left: "got:\n"   right: "got:hello\n"
+```
+
+The nastiest one had already been "handled". A test redirects output to a
+file and reads it back, and the test runner's own progress chatter lands in
+that file too — so the assertion had been loosened to accept any line
+equalling `HI`. That cannot work, because the chatter arrives in pieces and
+the payload gets glued onto the end of one:
+
+```bash
+got "ok\ntest ...default_readonly_for_var_is_not_fatal ... okHI\n\n"
+```
+
+No line equals `HI`. Tolerating noise line-by-line is hopeless when the noise
+splits a line. Four such tests moved out to run alone, where nothing else is
+writing — which let the assertion get *stricter*, not looser: it now demands
+the file contain exactly `HI` and nothing else.
+
+## A test writing into the repository
+
+Every test run left the working tree dirty:
+
+```bash
+# before
+$ cargo test --workspace
+$ git status --short
+ M out
+```
+
+`out` was a real, committed file holding `0`. A test fragment ended
+`… | wc -l >out &` — a relative path, and the tests run from the project
+root, so the shell dutifully wrote it next to `Cargo.toml`. It had been
+committed by accident months earlier, and its contents flip-flopped between
+`0` and `       0` depending on whose `wc` last ran. The child now runs in a
+temporary directory, which takes the file with it when it goes.
+
+```bash
+# after
+$ cargo test --workspace
+$ git status --short
+$
+```
+
+## The one that reported failures for code it never compiled
+
+A bonus, because it cost the most time. `cargo check` insisted on errors that
+the source flatly contradicted — a field that was plainly there, an enum
+variant sitting on line 25. Cargo decides what to rebuild by comparing
+timestamps, not contents, so anything that restores a file with an *older*
+timestamp convinces it there is nothing to do. It had been happily reporting
+results for a binary built from code that no longer existed.
+
+If output ever contradicts the source in front of you, suspect the cache
+before the code: `cargo clean -p <crate>` costs seconds.
+
+## Still open
+
+One cluster survives: the tests that feed data to a program's standard input
+still lose that descriptor to a neighbour about once in twenty-five runs,
+failing together as a group. It spans two modules and reaches into internals,
+so it gets a proper design pass rather than another round of moving tests —
+[#460](https://github.com/jdstanhope/huck/issues/460).
