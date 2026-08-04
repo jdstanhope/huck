@@ -1,0 +1,75 @@
+---
+title: "The prefix that went missing"
+date: 2026-08-04
+summary: "A substitution that silently did nothing: ${x/#/prefix} — the idiomatic way to prepend to a value, or to every element of an array — returned the value untouched. Found by rebuilding a three-month-old huck to write a blog post."
+tags: ["expansion", "arrays", "bugfix"]
+version: null
+draft: false
+---
+
+Shell has a compact idiom for prepending to every element of an array:
+
+```bash
+files=(report.txt notes.txt)
+printf '%s\n' "${files[@]/#/backup-}"
+```
+
+In bash that prints `backup-report.txt` and `backup-notes.txt`. huck printed
+the filenames back at you, unchanged:
+
+```bash
+# before
+$ huck -c 'files=(report.txt notes.txt); printf "%s\n" "${files[@]/#/backup-}"'
+report.txt
+notes.txt
+
+# after
+backup-report.txt
+backup-notes.txt
+```
+
+The scalar form was equally quiet — `${s/#/pre}` on `abc` gave back `abc`
+rather than `preabc`.
+
+## Why it did nothing
+
+`${x/pattern/replacement}` substitutes; the `#` says *anchor the match at the
+start* (and `%` at the end). What makes the prepend idiom work is that the
+pattern here is **empty**, so the match is empty too, and an empty match at
+the start is exactly the position you want the replacement inserted.
+
+huck's substitution routine opened with a reasonable-looking shortcut: an
+empty pattern matches nothing, so return the value unchanged. That is true
+everywhere *except* at an anchor — which is the one place the empty pattern is
+ever deliberately used. The shortcut ran before the anchor was consulted, so
+the interesting case never got a chance.
+
+The fix moves the shortcut after the anchor check. Anchored, an empty pattern
+now inserts at that end; unanchored (`${x//}`, `${x///-}`) it stays the no-op
+it should be, as does the replace-all spelling `${x//#/pre}`, which bash also
+leaves alone.
+
+## Where it came from
+
+This one is a footnote to the blog itself. The posts backfilled this week
+quote real output, which meant rebuilding huck at nine historical commits and
+running fragments through them. One of those runs printed a v71-era message:
+
+```
+huck: ${a[…]}: modifier Substitute { … anchor: Prefix … } not supported on array in v71
+```
+
+The array path was implemented later — and the anchored-empty-pattern case
+inside it quietly became a no-op instead of an error. It had gone from loud
+to silent, which is the worst direction for a bug to travel, and no test
+noticed because nothing exercised the idiom.
+
+Twenty-seven byte-identical fragments now do, covering the insert cases, the
+six no-op spellings, and arrays — indexed, associative, `@`, `*`, and elements
+containing spaces.
+
+*Issue [#448](https://github.com/jdstanhope/huck/issues/448). Also filed and
+still open from the same archaeology: [#449](https://github.com/jdstanhope/huck/issues/449),
+an `EXIT` trap set inside a subshell never firing — which turns out to need
+the same plumbing as [#442](https://github.com/jdstanhope/huck/issues/442),
+where `exit` inside any trap action is swallowed.*
