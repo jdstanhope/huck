@@ -6986,10 +6986,15 @@ fn builtin_set_inner(
                     // so `restricted_at_startup` deliberately stays false —
                     // bash reports `shopt restricted_shell` as `off` here even
                     // though the shell is now fully restricted.
-                    b'r' => {
-                        shell.policy = crate::policy::Policy::Rbash;
-                        shell.apply_restricted_readonly();
-                    }
+                    //
+                    // #229: it also does NOT mark SHELL/PATH/HISTFILE/ENV/
+                    // BASH_ENV readonly. bash applies those marks only when
+                    // restriction engages at STARTUP (`-r`, or invocation as
+                    // `rbash`), so `set -r; PATH=/x` succeeds in bash while
+                    // `bash -r -c 'PATH=/x'` reports `PATH: readonly variable`.
+                    // Every other restriction (cd, `/`-containing command
+                    // names, redirections, `exec`, …) applies immediately.
+                    b'r' => shell.policy = crate::policy::Policy::Rbash,
                     b'o' => {
                         i += 1;
                         if i >= args.len() {

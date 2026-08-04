@@ -584,18 +584,17 @@ mod tests {
             out.stderr
         );
 
-        // The readonly half, in the same shell — read the value BACK rather
-        // than grepping stdout: a refused assignment aborts the rest of the
-        // script, so a trailing `echo` would never run and any "does not
-        // contain" assertion would pass vacuously.
-        let before = e.var("PATH");
+        // #229: the readonly half is NOT part of `set -r`. bash marks
+        // SHELL/PATH/HISTFILE/ENV/BASH_ENV readonly only when restriction
+        // engages at STARTUP, so `set -r; PATH=/x` succeeds — this test used to
+        // assert the opposite. Read the value back rather than grepping stdout.
         let out = e.prepare("PATH=/hijacked").capture();
-        assert!(
-            out.stderr.contains("PATH: readonly variable"),
-            "PATH writable again: {:?}",
+        assert_eq!(
+            out.exit_code, 0,
+            "set -r must not make PATH readonly: {:?}",
             out.stderr
         );
-        assert_eq!(e.var("PATH"), before, "PATH was actually overwritten");
+        assert_eq!(e.var("PATH").as_deref(), Some("/hijacked"));
     }
 
     #[test]
