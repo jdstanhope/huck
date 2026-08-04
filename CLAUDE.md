@@ -127,9 +127,19 @@ already merged.
 - **Length**: short. A few hundred words, 2-4 examples. Close with what is
   still open (the issues the pass filed) and link the issues.
 - MDX gotchas: `{` and `<` outside code spans are parsed as JSX; keep them
-  inside backticks or fences. There is no Node toolchain on the dev box, so
-  the Velite schema cannot be checked locally — check the frontmatter limits
-  by hand.
+  inside backticks or fences.
+- **Validate before committing** — the content pipeline compiles the MDX and
+  enforces the schema:
+
+      cd site && export NVM_DIR="$HOME/.nvm" && . "$NVM_DIR/nvm.sh" \
+        && nvm use node >/dev/null \
+        && ( ulimit -v 12000000; node_modules/.bin/velite )
+
+  Three traps in that line: a non-interactive shell never loads nvm (`.bashrc`
+  returns before it), `nvm use` in a PIPELINE sets PATH in a subshell and is
+  lost, and the usual `ulimit -v 1500000` guard makes shiki's WASM highlighter
+  fail with "Cannot allocate Wasm memory" — it needs a much larger VIRTUAL
+  reservation than it actually uses.
 
 ## Bug-fix rounds and the follow-on cascade
 
