@@ -1153,27 +1153,11 @@ mod tests {
 
     // ============== COMPOSITION ==============
 
-    #[test]
-    fn exec_all_knobs_compose() {
-        use std::time::Duration;
-        let _g = crate::test_support::CWD_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _g2 = crate::test_support::STDIN_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let mut e = Engine::new();
-        let out = e
-            .prepare("read x; echo \"got:$x\"")
-            .cwd(tmp.path())
-            .restricted()
-            .timeout(Duration::from_secs(2))
-            .stdin(b"hello\n".to_vec())
-            .capture();
-        assert_eq!(out.exit_code, 0, "stderr={:?}", out.stderr);
-        assert_eq!(out.stdout, "got:hello\n");
-    }
+    // `exec_all_knobs_compose` lives in `tests/capture_tempfile_serial.rs`
+    // (#458): its `.stdin()` knob dup2s the process-global fd 0, and a
+    // sibling's `< file` redirect could take fd 0 first, leaving `read x`
+    // with nothing. STDIN_LOCK does not help — a shell-level redirect takes
+    // no such lock.
 
     #[test]
     fn exec_cwd_and_restricted() {
@@ -1364,14 +1348,10 @@ mod tests {
         assert_eq!(cand.kind, crate::CandidateKind::Custom);
     }
 
-    #[test]
-    fn complete_does_not_modify_last_status() {
-        let mut e = Engine::new();
-        let _ = e.run("false");
-        assert_eq!(e.last_status(), 1);
-        let _ = e.complete("ec", 2);
-        assert_eq!(e.last_status(), 1, "complete() must not alter $?");
-    }
+    // `complete_does_not_modify_last_status` lives in
+    // `tests/completion_path_scan_serial.rs` (#458): `ec` is in command
+    // position, so it scans `$PATH` and a sibling's numbered redirect stole
+    // the descriptor its `DIR` held.
 
     #[test]
     fn complete_sees_engine_vars() {
