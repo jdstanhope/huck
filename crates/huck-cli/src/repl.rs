@@ -370,7 +370,12 @@ pub fn run(args: &[String], version: &str) -> i32 {
 /// every REPL exit path stays consistent (the `ReadError` path previously
 /// skipped `save_history`).
 fn shell_exit(shell: &mut Shell, code: i32) -> i32 {
+    // #442: clear any pending request BEFORE the EXIT trap runs (a set flag
+    // would abort the action at its first checkpoint), then let the EXIT trap
+    // have the final word over it.
+    let requested = shell.take_pending_exit();
     huck_engine::traps::fire_exit_trap(shell);
+    let code = shell.take_pending_exit().or(requested).unwrap_or(code);
     shell.hangup_jobs();
     shell.save_history();
     code

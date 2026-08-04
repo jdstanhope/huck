@@ -112,6 +112,13 @@ pub(crate) fn run_trap_action(
     shell.firing_traps.pop();
     let status = shell.last_status();
     shell.set_last_status(saved_status);
+    // #442: the action ran `exit N`. Record it so the request survives this
+    // function returning — every caller discards the outcome. OVERWRITE rather
+    // than latch: bash lets the last exit win, which is how an EXIT trap
+    // overrides an earlier request from ERR.
+    if let crate::builtins::ExecOutcome::Exit(n) = outcome {
+        shell.pending_exit = Some(n);
+    }
     TrapActionResult { outcome, status }
 }
 
@@ -345,6 +352,8 @@ pub fn clear_for_subshell(shell: &mut Shell) {
     shell.trap_pending = Arc::new(AtomicU32::new(0));
     shell.firing_traps.clear();
     shell.err_suppressed_depth = 0;
+    // #442: a request recorded before the fork is the PARENT's business.
+    shell.pending_exit = None;
 }
 
 /// Installs a trap action for `sig`. `action = Some(text)` registers;

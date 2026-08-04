@@ -144,6 +144,13 @@ pub(crate) fn check_interrupt(shell: &Shell) -> Option<ExecOutcome> {
     if shell.timeout_flag.load(Ordering::Relaxed) {
         return Some(ExecOutcome::Interrupted(InterruptReason::Timeout));
     }
+    // #442: a trap action asked to exit. Reported LAST: SIGINT and a timeout
+    // are externally imposed and outrank the script's own request. Peeked, not
+    // taken — `check_interrupt` holds `&Shell`, and the value is consumed at
+    // the run boundary (the same shape as `timeout_flag`).
+    if let Some(n) = shell.pending_exit {
+        return Some(ExecOutcome::Interrupted(InterruptReason::ExitRequested(n)));
+    }
     None
 }
 
@@ -293,6 +300,13 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
                 // `after`). Unlike the Sigint/Timeout arms above, no flag is
                 // re-stored: the discard died at this boundary.
                 InterruptReason::DiscardCommand => 1,
+                // #442: an exit request is NOT contained here — bash's
+                // `trap "exit 9" ERR; x=$(false); echo after` exits 9 and never
+                // runs `after`. `check_interrupt` PEEKS at `pending_exit`
+                // rather than taking it, so the flag is still set and the
+                // enclosing list observes it at its next checkpoint; nothing to
+                // re-store.
+                InterruptReason::ExitRequested(n) => n,
             }
         }
     };
@@ -348,15 +362,40 @@ fn finish_command(
         return Some(ExecOutcome::Continue(c));
     }
     crate::traps::dispatch_pending_traps(shell);
+    // #442: a trap action (including one just dispatched above) ran `exit N`.
+    // Checked BEFORE errexit so a trap's exit beats the errexit status — bash's
+    // `set -e; trap "exit 9" ERR; false` exits 9, not 1.
+    if let Some(n) = shell.pending_exit {
+        return Some(ExecOutcome::Interrupted(InterruptReason::ExitRequested(n)));
+    }
     if c != 0 && shell.err_suppressed_depth == 0 && is_last && !is_negated_pipeline(cmd) {
         if err_armed {
             crate::traps::fire_err_trap(shell);
+            // #442: the ERR action itself ran `exit N`. Checked here, AFTER the
+            // fire and BEFORE errexit, so a trap's exit beats the errexit
+            // status: bash's `set -e; trap "exit 9" ERR; false` exits 9, not 1.
+            if let Some(n) = shell.pending_exit {
+                return Some(ExecOutcome::Interrupted(InterruptReason::ExitRequested(n)));
+            }
         }
         if let Some(out) = maybe_errexit(shell, c) {
             return Some(out);
         }
     }
     None
+}
+
+/// Fires the DEBUG trap and folds in #442: an `exit N` performed by the DEBUG
+/// action must abort the PENDING command, because DEBUG fires BEFORE it —
+/// bash's `trap "exit 9" DEBUG; echo a` never prints `a`. `Err` carries the
+/// outcome the dispatch site must return immediately; `Ok` is the usual
+/// Proceed / SkipCommand / ReturnFromSub decision.
+fn debug_trap_gate(shell: &mut Shell) -> Result<crate::traps::DebugDecision, ExecOutcome> {
+    let decision = crate::traps::fire_debug_trap(shell);
+    match shell.pending_exit {
+        Some(n) => Err(ExecOutcome::Interrupted(InterruptReason::ExitRequested(n))),
+        None => Ok(decision),
+    }
 }
 
 fn run_andor_group(
@@ -1343,7 +1382,10 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell) -> ExecOutcome {
         if clause.line != 0 {
             shell.current_lineno = shell.line_base() + clause.line;
         }
-        match crate::traps::fire_debug_trap(shell) {
+        match match debug_trap_gate(shell) {
+            Ok(d) => d,
+            Err(o) => return o,
+        } {
             crate::traps::DebugDecision::Proceed => {}
             // bash's execute_cmd.c does a C `continue` here (inside `for
             // (retval = ...; list; list = list->next)`), not a break: only
@@ -1556,7 +1598,10 @@ fn run_arith_for_inner(clause: &crate::command::ArithForClause, shell: &mut Shel
         shell.current_lineno = shell.line_base() + clause.line;
     }
     let mut run_init = true;
-    match crate::traps::fire_debug_trap(shell) {
+    match match debug_trap_gate(shell) {
+        Ok(d) => d,
+        Err(o) => return o,
+    } {
         crate::traps::DebugDecision::Proceed => {}
         crate::traps::DebugDecision::SkipCommand => run_init = false,
         crate::traps::DebugDecision::ReturnFromSub(n) => {
@@ -1591,7 +1636,10 @@ fn run_arith_for_inner(clause: &crate::command::ArithForClause, shell: &mut Shel
         if clause.line != 0 {
             shell.current_lineno = shell.line_base() + clause.line;
         }
-        match crate::traps::fire_debug_trap(shell) {
+        match match debug_trap_gate(shell) {
+            Ok(d) => d,
+            Err(o) => return o,
+        } {
             crate::traps::DebugDecision::Proceed => {}
             crate::traps::DebugDecision::SkipCommand => break,
             crate::traps::DebugDecision::ReturnFromSub(n) => {
@@ -1656,7 +1704,10 @@ fn run_arith_for_inner(clause: &crate::command::ArithForClause, shell: &mut Shel
             shell.current_lineno = shell.line_base() + clause.line;
         }
         let mut run_step = true;
-        match crate::traps::fire_debug_trap(shell) {
+        match match debug_trap_gate(shell) {
+            Ok(d) => d,
+            Err(o) => return o,
+        } {
             crate::traps::DebugDecision::Proceed => {}
             crate::traps::DebugDecision::SkipCommand => run_step = false,
             crate::traps::DebugDecision::ReturnFromSub(n) => {
@@ -1758,7 +1809,10 @@ fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell) ->
         if clause.line != 0 {
             shell.current_lineno = shell.line_base() + clause.line;
         }
-        match crate::traps::fire_debug_trap(shell) {
+        match match debug_trap_gate(shell) {
+            Ok(d) => d,
+            Err(o) => return o,
+        } {
             crate::traps::DebugDecision::Proceed => {}
             // A DEBUG-skipped `select` returns 0 (bash: `return
             // (EXECUTION_SUCCESS)`), not the loop's EOF-default status 1.
@@ -1923,7 +1977,10 @@ fn run_case_inner(clause: &CaseClause, shell: &mut Shell) -> ExecOutcome {
             crate::expand::reconstruct_word_source(&clause.subject)
         ),
     );
-    match crate::traps::fire_debug_trap(shell) {
+    match match debug_trap_gate(shell) {
+        Ok(d) => d,
+        Err(o) => return o,
+    } {
         crate::traps::DebugDecision::Proceed => {}
         // A DEBUG-skipped `case` returns 0 (bash: `return (EXECUTION_SUCCESS)`),
         // not the prior command's status.
@@ -3574,7 +3631,10 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell) -> ExecOutcome {
             // group/function/subshell/`$()` — never across a later command —
             // so a plain per-command drain is the bash-matching lifetime; no
             // extension needed.
-            match crate::traps::fire_debug_trap(shell) {
+            match match debug_trap_gate(shell) {
+                Ok(d) => d,
+                Err(o) => return o,
+            } {
                 crate::traps::DebugDecision::Proceed => {
                     let procsub_base = shell.procsub_pending.len();
                     let st = run_assignment_list(items, shell);
@@ -3707,7 +3767,9 @@ pub(crate) fn call_function(
     {
         shell.current_lineno = def_line;
     }
-    let _ = crate::traps::fire_debug_trap(shell);
+    if let Err(o) = debug_trap_gate(shell) {
+        return o;
+    }
 
     let result = run_command(&body, shell);
 
@@ -4021,7 +4083,10 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
     // runs. The two recursive pre-resolve paths (command/builtin re-dispatch)
     // return before any expansion, so the drain is a no-op on those paths.
     let procsub_base = shell.procsub_pending.len();
-    match crate::traps::fire_debug_trap(shell) {
+    match match debug_trap_gate(shell) {
+        Ok(d) => d,
+        Err(o) => return o,
+    } {
         crate::traps::DebugDecision::Proceed => {}
         crate::traps::DebugDecision::SkipCommand => {
             return ExecOutcome::Continue(shell.last_status());
@@ -6116,7 +6181,9 @@ fn spawn_pipeline(
         // pipeline stage, in stage order — its action's output must reach the
         // terminal, not the pipe, so this must run here (before any fork
         // below), not inside the forked child. Decision ignored (#262).
-        let _ = crate::traps::fire_debug_trap(shell);
+        if let Err(o) = debug_trap_gate(shell) {
+            return Err(o);
+        }
 
         // ---- Assign-only stages: no-op, just pass stdin through as empty ----
         // Skipped under `is_last && lastpipe`: falling through lets the
@@ -7964,6 +8031,9 @@ pub fn fork_and_run_in_subshell(
             ExecOutcome::FunctionReturn(n) => n,
             ExecOutcome::Interrupted(InterruptReason::Sigint) => 130,
             ExecOutcome::Interrupted(InterruptReason::Timeout) => 124,
+            // #442: the body (or a trap it fired) asked to exit — that is this
+            // CHILD's status.
+            ExecOutcome::Interrupted(InterruptReason::ExitRequested(n)) => n,
             // v312 (#3/#49): a discard reaching a subshell/child reducer decodes
             // to 1 (the driver normally handles it; defensive here).
             ExecOutcome::Interrupted(InterruptReason::DiscardCommand) => 1,
