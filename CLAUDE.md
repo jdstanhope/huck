@@ -133,13 +133,19 @@ already merged.
 
       cd site && export NVM_DIR="$HOME/.nvm" && . "$NVM_DIR/nvm.sh" \
         && nvm use node >/dev/null \
-        && ( ulimit -v 12000000; node_modules/.bin/velite )
+        && ( ulimit -v 12000000; node_modules/.bin/velite --strict )
 
-  Three traps in that line: a non-interactive shell never loads nvm (`.bashrc`
-  returns before it), `nvm use` in a PIPELINE sets PATH in a subshell and is
-  lost, and the usual `ulimit -v 1500000` guard makes shiki's WASM highlighter
-  fail with "Cannot allocate Wasm memory" — it needs a much larger VIRTUAL
-  reservation than it actually uses.
+  Traps in that line, every one of which has bitten: **`--strict` is
+  mandatory** (plain `velite` prints schema issues and still exits 0); a
+  non-interactive shell never loads nvm (`.bashrc` returns before it); `nvm
+  use` in a PIPELINE sets PATH in a subshell and is lost; and the usual
+  `ulimit -v 1500000` guard makes shiki's WASM highlighter fail with "Cannot
+  allocate Wasm memory" — it needs a much larger VIRTUAL reservation than it
+  actually uses. A post whose filename starts with `_` is silently SKIPPED by
+  velite's glob — it will never publish and never error.
+- The full `next build` cannot run on this box (WASM allocation failure at
+  1.9 GB); CI runs it. `.github/workflows/site.yml` builds the site on any
+  `site/**` change.
 
 ## Bug-fix rounds and the follow-on cascade
 
