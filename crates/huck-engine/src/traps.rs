@@ -264,9 +264,20 @@ fn fire_pseudo_trap(shell: &mut Shell, sig: TrapSignal) {
         Some(Some(text)) => text.clone(),
         _ => return,
     };
+    // #437: a trap action must be transparent to `$?`. bash saves
+    // `last_command_exit_value` around the action and puts it back after, so
+    // the command that TRIGGERED the trap is still what `$?` reports:
+    //
+    //     trap "echo E" ERR; false; echo $?     -> 1, not the echo's 0
+    //
+    // `fire_debug_trap` already does this for DEBUG (it needs the action's own
+    // status first, to compute the DebugDecision); ERR and RETURN come through
+    // here and had no such save. (bash)
+    let saved_status = shell.last_status();
     shell.firing_traps.push(sig);
     let _ = crate::shell::process_line(&action, shell, false);
     shell.firing_traps.pop();
+    shell.set_last_status(saved_status);
 }
 
 /// Resets all trap state in a freshly-forked subshell child. POSIX:
