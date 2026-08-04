@@ -102,6 +102,34 @@ Run the standard iteration loop without being asked:
    - Record the iteration in the long-running memory files
      (`project_huck_iterations.md` + `MEMORY.md`). (The README no longer
      carries a per-version table.)
+   - Write the blog entry (see "Blog every work pass").
+
+## Blog every work pass
+
+**Every work pass ends with a blog entry** — a `vNN` iteration, a bug-fix
+round, or a whole cascade of rounds (one entry per pass, not per PR). It
+lands in the same branch/PR as the work, or in its own PR when the work is
+already merged.
+
+- **Where**: `site/content/blog/<descriptive-slug>.mdx` — no date prefix in
+  the filename, the date lives in the frontmatter. Velite schema
+  (`site/velite.config.ts`) requires `title` (≤120), `date`, `summary`
+  (≤300), and takes `tags`, `version` (`"vNN"` for an iteration, `null` for a
+  fix round), `draft`.
+- **Audience**: someone who uses shells, not someone who reads the diff.
+  Lead with the user-visible symptom — what silently did the wrong thing —
+  then a short plain-language description of the fix. Skip module names,
+  function names and line counts.
+- **Show it**: every entry carries at least one `# before` / `# after` pair
+  of fenced `bash` blocks with REAL output. Get the "before" by building the
+  pre-fix commit in a throwaway worktree (`git worktree add <tmp> <sha>`) and
+  running the fragment — do not reconstruct it from memory.
+- **Length**: short. A few hundred words, 2-4 examples. Close with what is
+  still open (the issues the pass filed) and link the issues.
+- MDX gotchas: `{` and `<` outside code spans are parsed as JSX; keep them
+  inside backticks or fences. There is no Node toolchain on the dev box, so
+  the Velite schema cannot be checked locally — check the frontmatter limits
+  by hand.
 
 ## Bug-fix rounds and the follow-on cascade
 
@@ -118,7 +146,8 @@ then **keep going without being asked**:
 1. Finish the current round and merge its PR (CI green — local green is
    not enough).
 2. Take the issues you just filed, one round each, same short loop.
-3. Repeat until the cascade is dry, then report the whole chain.
+3. Repeat until the cascade is dry, then write ONE blog entry for the whole
+   cascade (see "Blog every work pass") and report the chain.
 
 **Stop and hand back to the user** when the next issue is a *significant
 change that may affect multiple features*: a shared table or chokepoint
