@@ -465,18 +465,6 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell) -> ExecOutcome {
     // backgrounded group reports the launch status 0.
     let mut last_status = ExecOutcome::Continue(0);
     for group in &groups {
-        // #175: non-interactive between-command job-table maintenance. bash
-        // silently prunes completed (Done/Signaled) background jobs at each
-        // command boundary; Running/Stopped are kept. The interactive REPL
-        // already prunes per-prompt (repl.rs) and prints its async notices
-        // there, so restrict this to non-interactive shells to avoid emitting
-        // mid-line notices — `reap_and_notify`'s printing is also gated on
-        // `is_interactive`, so this prunes silently. (The driver loop in
-        // `run_sourced_contents_in_sinks` only iterates per newline-terminated
-        // unit, so `;`/`&`-separated commands on one line are pruned here.)
-        if !shell.is_interactive {
-            crate::jobs::reap_and_notify(shell);
-        }
         if group.backgrounded {
             // Background the group: wrap its commands into a synthetic
             // foreground `Sequence`, then a `Subshell`, and reuse the existing
@@ -519,6 +507,17 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell) -> ExecOutcome {
             ) {
                 return last_status;
             }
+        }
+        // #175/#418: between-command job-table maintenance — reap, announce any
+        // state change, prune the terminal jobs. bash notices a death while
+        // running the command, so the notice lands AFTER that command's output
+        // and carries ITS line number; running the pass at the end of the group
+        // reproduces both. The interactive REPL does the same per prompt
+        // (`repl.rs`), so this is restricted to non-interactive shells to avoid
+        // a mid-line notice there.
+        if !shell.is_interactive {
+            let blocked = std::mem::take(&mut shell.blocked_on_child);
+            crate::jobs::reap_and_notify_ex(shell, blocked);
         }
     }
     last_status
@@ -602,6 +601,7 @@ fn run_command(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
                 if stdin_is_tty() {
                     give_terminal_to(pid);
                 }
+                note_blocked_on_child(shell);
                 let outcome = match wait_with_untraced(pid) {
                     Ok((raw_status, true)) => {
                         let sig = libc::WSTOPSIG(raw_status);
@@ -642,6 +642,9 @@ fn run_command(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
                     stdout: None,
                     stderr: None,
                 };
+                // #418: about to BLOCK on a foreground child — bash reaps (and so may
+                // announce a background job's death) exactly at such a point.
+                note_blocked_on_child(shell);
                 let loop_result = crate::stream_loop::external_capture_loop(
                     pid as libc::pid_t,
                     -1,
@@ -5633,6 +5636,7 @@ fn run_subprocess(
                 // wait_with_untraced already waitpid'd the child, so each arm
                 // mem::forget's the Child to keep its Drop from re-reaping
                 // (already-reaped pid would give -ECHILD).
+                note_blocked_on_child(shell);
                 match wait_with_untraced(pid) {
                     Ok((raw_status, true)) => {
                         // Child was stopped (e.g. Ctrl-Z / SIGTSTP).
@@ -5691,6 +5695,9 @@ fn run_subprocess(
                     stdout: None,
                     stderr: None,
                 };
+                // #418: about to BLOCK on a foreground child — bash reaps (and so may
+                // announce a background job's death) exactly at such a point.
+                note_blocked_on_child(shell);
                 let loop_result = crate::stream_loop::external_capture_loop(
                     pid as libc::pid_t,
                     -1,
@@ -7658,6 +7665,13 @@ fn give_terminal_to(pgid: i32) {
 /// Block-wait for a single child pid with WUNTRACED. Returns:
 ///   `Ok((raw_status, stopped))` where `stopped` is true if WIFSTOPPED.
 ///   `Err(())` on waitpid failure.
+/// Marks the shell as having blocked on a child (#418). Called wherever huck
+/// waits, so the between-command pass knows a bash-equivalent reap point
+/// happened and a pending job notice may be announced.
+fn note_blocked_on_child(shell: &mut Shell) {
+    shell.blocked_on_child = true;
+}
+
 fn wait_with_untraced(pid: i32) -> Result<(libc::c_int, bool), ()> {
     let mut status: libc::c_int = 0;
     let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };

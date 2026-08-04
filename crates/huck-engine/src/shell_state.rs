@@ -686,6 +686,12 @@ pub struct Shell {
     #[allow(dead_code)]
     pub jobs: JobTable,
     pub sigchld_flag: Arc<AtomicBool>,
+    /// #418: set whenever the shell BLOCKS waiting on a child (a foreground
+    /// external command, or the `wait` builtin). bash only reaps — and so only
+    /// ever announces a background job's death — while it is blocked like this;
+    /// a run of builtins never notices. The between-command pass consumes and
+    /// clears this, so huck announces exactly where bash would.
+    pub blocked_on_child: bool,
     pub sigint_flag: Arc<AtomicBool>,
     /// Set by a timer thread when an `ExecBuilder::timeout` deadline elapses.
     /// Polled by `executor::check_interrupt`; when seen, the executor aborts the
@@ -1126,6 +1132,7 @@ impl Shell {
             aliases: std::collections::HashMap::new(),
             jobs: JobTable::new(),
             sigchld_flag: Arc::new(AtomicBool::new(false)),
+            blocked_on_child: false,
             sigint_flag: Arc::new(AtomicBool::new(false)),
             timeout_flag: Arc::new(AtomicBool::new(false)),
             live_external_children: Arc::new(Mutex::new(Vec::new())),
