@@ -57,24 +57,62 @@ pub fn drain_pending(shell: &mut Shell) -> Vec<i32> {
 }
 
 /// Drains pending signals and executes registered trap actions in
-/// signal-number order. Trap actions run via `process_line` in the
-/// current shell scope; return values from `process_line` are
-/// ignored (an `exit` from within a trap action propagates through
-/// the outer caller's normal exit handling).
+/// signal-number order, via `run_trap_action` in the current shell scope.
+///
+/// The action's outcome is discarded here, so an `exit` performed by a signal
+/// trap action does NOT currently end the shell — that is #442, whose fix
+/// consumes the outcome this now returns.
 pub fn dispatch_pending_traps(shell: &mut Shell) {
     for sig in drain_pending(shell) {
         let action = match shell.traps.get(&TrapSignal::Real(sig)) {
             Some(Some(text)) => text.clone(),
             Some(None) | None => continue,
         };
-        // #287: hold $BASH_COMMAND fixed at the triggering command for the whole
-        // action. Pushing onto `firing_traps` makes the executor's freeze guard
-        // (run_single) skip re-stamping `current_command` while the action runs,
-        // exactly as it already does for DEBUG/ERR/RETURN.
-        shell.firing_traps.push(TrapSignal::Real(sig));
-        let _ = crate::shell::process_line(&action, shell, false);
-        shell.firing_traps.pop();
+        let _ = run_trap_action(shell, TrapSignal::Real(sig), &action);
     }
+}
+
+/// What a trap action left behind.
+///
+/// `status` is the action's OWN `$?`, sampled before the surrounding value is
+/// restored. `fire_debug_trap` needs it to compute its `DebugDecision` and it
+/// is unrecoverable afterwards — reading `shell.last_status()` at the call site
+/// yields the PRE-action status and would silently disable extdebug's
+/// SkipCommand / ReturnFromSub.
+pub(crate) struct TrapActionResult {
+    /// The action's own outcome. Every caller discards it today; #442's next
+    /// step reads an `ExecOutcome::Exit(n)` from it to honour an `exit`
+    /// performed by a trap action, which is the whole point of returning it.
+    #[allow(dead_code)]
+    pub outcome: crate::builtins::ExecOutcome,
+    pub status: i32,
+}
+
+/// Runs one trap action — the single place a trap body executes.
+///
+/// Three obligations, previously duplicated (and drifted) across the five fire
+/// helpers:
+/// - #287: freeze `$BASH_COMMAND` for the action's whole run. Pushing onto
+///   `firing_traps` makes the executor's freeze guard (`run_single`) skip
+///   re-stamping `current_command`, and doubles as the per-signal recursion
+///   guard the callers check before getting here.
+/// - #437: the action is transparent to `$?` — the command that TRIGGERED the
+///   trap is still what the next command sees.
+/// - The action's outcome is returned rather than discarded, so a caller can
+///   see an `exit` the action performed (#442) and DEBUG can read the action's
+///   own status.
+pub(crate) fn run_trap_action(
+    shell: &mut Shell,
+    sig: TrapSignal,
+    action: &str,
+) -> TrapActionResult {
+    let saved_status = shell.last_status();
+    shell.firing_traps.push(sig);
+    let outcome = crate::shell::process_line(action, shell, false);
+    shell.firing_traps.pop();
+    let status = shell.last_status();
+    shell.set_last_status(saved_status);
+    TrapActionResult { outcome, status }
 }
 
 /// Fires the EXIT pseudo-signal trap, if one is registered. Self-
@@ -85,11 +123,7 @@ pub fn fire_exit_trap(shell: &mut Shell) {
         Some(Some(text)) => text,
         _ => return,
     };
-    // #287: freeze $BASH_COMMAND at the triggering command for the action's
-    // whole run (see `dispatch_pending_traps`).
-    shell.firing_traps.push(TrapSignal::Exit);
-    let _ = crate::shell::process_line(&action, shell, false);
-    shell.firing_traps.pop();
+    let _ = run_trap_action(shell, TrapSignal::Exit, &action);
 }
 
 /// Fires the ERR pseudo-signal trap. Repeatable: the trap entry is
@@ -163,21 +197,15 @@ pub fn fire_debug_trap(shell: &mut Shell) -> DebugDecision {
     if shell.current_lineno != 0 {
         shell.eval_frame = Some(shell.current_lineno);
     }
-    // Save $? across the trap firing: like bash's other traps, the DEBUG
-    // action's own commands run in their own status context, but the
-    // pending command (or, on Proceed, the command right after) must still
-    // see the ORIGINAL $? — not whatever the trap action itself last set.
-    // `debug_decision` reads the action's own status (captured below, before
-    // the restore) purely to decide Proceed/Skip/Return; that decision does
-    // not leak into the surface $?.
-    let saved_status = shell.last_status();
     // #274-adjacent: the DEBUG action's own commands (incl. function calls)
     // must not leak their line number into the surrounding code's $LINENO —
     // bash restores LINENO across the trap action. Save/restore current_lineno.
     let saved_lineno = shell.current_lineno;
-    shell.firing_traps.push(TrapSignal::Debug);
-    let _ = crate::shell::process_line(&action, shell, false);
-    shell.firing_traps.pop();
+    // `run_trap_action` keeps the action transparent to `$?` (#437). The
+    // action's OWN status comes back in `.status` — it must NOT be read from
+    // `shell.last_status()` here, which is now the restored pre-action value;
+    // doing so would silently disable extdebug's Skip/Return decisions.
+    let r = run_trap_action(shell, TrapSignal::Debug, &action);
     shell.current_lineno = saved_lineno;
     shell.eval_frame = prev_frame;
 
@@ -185,9 +213,7 @@ pub fn fire_debug_trap(shell: &mut Shell) -> DebugDecision {
     // return-2-simulation predicate is the same "function or sourced script"
     // check, and `shell.call_stack` is unchanged across the trap action (any
     // function calls made by the action push and pop symmetrically).
-    let decision = debug_decision(shell.extdebug(), shell.last_status(), in_subroutine);
-    shell.set_last_status(saved_status);
-    decision
+    debug_decision(shell.extdebug(), r.status, in_subroutine)
 }
 
 /// bash's function-ENTRY half of the RETURN trap's non-inheritance
@@ -301,20 +327,9 @@ fn fire_pseudo_trap(shell: &mut Shell, sig: TrapSignal) {
         Some(Some(text)) => text.clone(),
         _ => return,
     };
-    // #437: a trap action must be transparent to `$?`. bash saves
-    // `last_command_exit_value` around the action and puts it back after, so
-    // the command that TRIGGERED the trap is still what `$?` reports:
-    //
-    //     trap "echo E" ERR; false; echo $?     -> 1, not the echo's 0
-    //
-    // `fire_debug_trap` already does this for DEBUG (it needs the action's own
-    // status first, to compute the DebugDecision); ERR and RETURN come through
-    // here and had no such save. (bash)
-    let saved_status = shell.last_status();
-    shell.firing_traps.push(sig);
-    let _ = crate::shell::process_line(&action, shell, false);
-    shell.firing_traps.pop();
-    shell.set_last_status(saved_status);
+    // #437's `$?` save/restore now lives in `run_trap_action`, shared with the
+    // other four fire helpers.
+    let _ = run_trap_action(shell, sig, &action);
 }
 
 /// Resets all trap state in a freshly-forked subshell child. POSIX:
@@ -643,6 +658,30 @@ mod tests {
             .fetch_or(1 << libc::SIGUSR1, Ordering::SeqCst);
         dispatch_pending_traps(&mut shell);
         assert_eq!(shell.trap_pending.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn run_trap_action_is_transparent_to_status_and_reports_action_status() {
+        let mut shell = Shell::new();
+        shell.set_last_status(42);
+        // The action's own `$?` is 7; the surrounding `$?` must be restored to 42.
+        let r = run_trap_action(&mut shell, TrapSignal::Err, "(exit 7)");
+        assert_eq!(
+            r.status, 7,
+            "action status must be observable to the caller"
+        );
+        assert_eq!(shell.last_status(), 42, "surrounding $? must be restored");
+    }
+
+    #[test]
+    fn run_trap_action_reports_exit_outcome() {
+        let mut shell = Shell::new();
+        let r = run_trap_action(&mut shell, TrapSignal::Err, "exit 9");
+        assert!(
+            matches!(r.outcome, crate::builtins::ExecOutcome::Exit(9)),
+            "expected Exit(9), got {:?}",
+            r.outcome
+        );
     }
 
     #[test]

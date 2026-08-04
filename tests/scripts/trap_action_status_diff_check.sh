@@ -35,6 +35,11 @@ check "return N kept"       'f() { trap "echo RET" RETURN; return 7; }; f; echo 
 check "failing RET action"  'f() { trap "false" RETURN; return 7; }; f; echo rc=$?'
 check "implicit status"     'f() { trap "true" RETURN; false; }; f; echo rc=$?'
 
+# --- signal traps: the action must not leak its status either (#454) -------
+check "signal action rc"     'trap "(exit 3)" USR1; kill -USR1 $$; echo "rc=$?"'
+check "signal failing act"   'trap "false" USR1; (exit 5); kill -USR1 $$; echo "rc=$?"'
+check "signal after failure" 'trap "true" USR1; kill -USR1 $$; false; echo "rc=$?"'
+
 # --- DEBUG already saved/restored; keep it covered here too ----------------
 check "DEBUG transparent"   'trap "echo D" DEBUG; false; echo rc=$?'
 check "DEBUG failing action" 'trap "false" DEBUG; true; echo rc=$?'
