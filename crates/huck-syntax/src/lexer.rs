@@ -6849,11 +6849,56 @@ fn word_contains_unquoted_brace(parts: &[WordPart]) -> bool {
 /// text is appended verbatim. Other parts (quoted Literals, Var,
 /// Arith, CommandSub, Tilde, etc.) get a sentinel block
 /// `\u{E000}<idx>\u{E001}` and are recorded in `placeholders`.
+/// Byte index just past the `}` matching the `{` at the start of `text`,
+/// counting nested braces. `None` when the brace is never closed inside this
+/// literal run (#319).
+fn matching_brace_end(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in text.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + c.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn build_concat_with_sentinels(parts: &[WordPart]) -> (String, Vec<WordPart>) {
     let mut concat = String::new();
     let mut placeholders: Vec<WordPart> = Vec::new();
+    // #319: bash brace-expands the RAW word, where a `{` directly after a `$`
+    // reads as the start of a parameter expansion and is skipped — so
+    // `echo $${x,y}` prints `<pid>{x,y}`, while `$?{x,y}` and `${HOME}{x,y}`
+    // do expand. The only part that ends in an unquoted `$` here is `$$`
+    // (`Var { name: "$" }`); a quoted or escaped `$` never suppresses.
+    let mut prev_was_bare_dollar = false;
     for p in parts {
         match p {
+            WordPart::Literal {
+                text,
+                quoted: false,
+            } if prev_was_bare_dollar && text.starts_with('{') => {
+                // bash skips the whole would-be `${…}` construct, so the region
+                // through the MATCHING `}` is protected — `$${a,{b,c}}` keeps
+                // its inner brace literal too. An unmatched `{` protects just
+                // itself, which is enough: what follows has no opener left.
+                let end = matching_brace_end(text).unwrap_or(1);
+                let idx = placeholders.len();
+                placeholders.push(WordPart::Literal {
+                    text: text[..end].to_string(),
+                    quoted: false,
+                });
+                concat.push('\u{E000}');
+                concat.push_str(&idx.to_string());
+                concat.push('\u{E001}');
+                concat.push_str(&text[end..]);
+            }
             WordPart::Literal {
                 text,
                 quoted: false,
@@ -6868,6 +6913,14 @@ fn build_concat_with_sentinels(parts: &[WordPart]) -> (String, Vec<WordPart>) {
                 concat.push('\u{E001}');
             }
         }
+        prev_was_bare_dollar = matches!(
+            p,
+            WordPart::Var {
+                name,
+                quoted: false,
+                ..
+            } if name == "$"
+        );
     }
     (concat, placeholders)
 }
