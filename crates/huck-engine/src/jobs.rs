@@ -1014,12 +1014,20 @@ mod tests {
 
     /// The pid form is `<pid> <state padded to 24><command>`, with the
     /// `prog: line N:` prologue left to the caller.
+    ///
+    /// #456: the wording comes from the system signal list, which differs off
+    /// the compat target (macOS says `Killed: 9`), so the expectation is built
+    /// from it and only Linux pins the literal.
     #[test]
     fn job_notice_signal_line_layout() {
         let job = signaled_job(libc::SIGKILL);
+        let killed = render_state(&JobState::Signaled(libc::SIGKILL));
+        let expected = format!("4242 {killed:<24}sleep 5");
+        #[cfg(target_os = "linux")]
+        assert_eq!(expected, "4242 Killed                  sleep 5");
         match job_notice(&job, '+', ctx(false, true, false)) {
             Some(Notice::SignalLine(body)) => {
-                assert_eq!(body, "4242 Killed                  sleep 5");
+                assert_eq!(body, expected);
             }
             other => panic!("expected a SignalLine, got {other:?}"),
         }
@@ -1049,16 +1057,22 @@ mod tests {
 
     /// #420: a core-dumping death carries bash's suffix. Probed out of the
     /// harness because apport makes those signals nondeterministic here.
+    ///
+    /// #456: the suffix goes INSIDE the 24-column state field, after the
+    /// system's wording for the signal — which is `Quit` on the compat target
+    /// and `Quit: 3` on macOS, so only Linux pins the literal.
     #[test]
     fn core_dumped_job_carries_the_suffix() {
         let mut t = JobTable::new();
         t.add(4242, vec![4242], "crash".to_string());
         t.jobs_mut()[0].state = JobState::Signaled(libc::SIGQUIT);
         t.jobs_mut()[0].core_dumped = true;
-        assert_eq!(
-            notification_line(&t.jobs_mut()[0], '+'),
-            "[1]+  Quit (core dumped)      crash"
-        );
+        let quit = render_state(&JobState::Signaled(libc::SIGQUIT));
+        let field = format!("{quit} (core dumped)");
+        let expected = format!("[1]+  {field:<24}crash");
+        #[cfg(target_os = "linux")]
+        assert_eq!(expected, "[1]+  Quit (core dumped)      crash");
+        assert_eq!(notification_line(&t.jobs_mut()[0], '+'), expected);
     }
 
     /// #420: bash prints a plain `Stopped` for EVERY stop signal — probed for
@@ -1085,19 +1099,26 @@ mod tests {
 
     /// #420: a terminated job takes its wording from the system signal list,
     /// which is where bash's table comes from too.
+    ///
+    /// #456: that list is the platform's, so the exact strings hold only on
+    /// the compat target (ubuntu-24.04 / bash 5.2.21). macOS's `strsignal`
+    /// appends the number — `Killed: 9`, `Terminated: 15` — and real bash on
+    /// macOS prints that too, so everywhere else asserts the prefix.
     #[test]
     fn render_state_signaled_uses_the_system_description() {
-        assert_eq!(
-            render_state(&JobState::Signaled(libc::SIGTERM)),
-            "Terminated"
-        );
-        assert_eq!(render_state(&JobState::Signaled(libc::SIGKILL)), "Killed");
-        assert_eq!(render_state(&JobState::Signaled(libc::SIGHUP)), "Hangup");
-        assert_eq!(render_state(&JobState::Signaled(libc::SIGINT)), "Interrupt");
-        assert_eq!(
-            render_state(&JobState::Signaled(libc::SIGPIPE)),
-            "Broken pipe"
-        );
+        for (sig, word) in [
+            (libc::SIGTERM, "Terminated"),
+            (libc::SIGKILL, "Killed"),
+            (libc::SIGHUP, "Hangup"),
+            (libc::SIGINT, "Interrupt"),
+            (libc::SIGPIPE, "Broken pipe"),
+        ] {
+            let got = render_state(&JobState::Signaled(sig));
+            #[cfg(target_os = "linux")]
+            assert_eq!(got, word, "signal {sig}");
+            #[cfg(not(target_os = "linux"))]
+            assert!(got.starts_with(word), "signal {sig}: {got:?}");
+        }
     }
 
     #[test]
