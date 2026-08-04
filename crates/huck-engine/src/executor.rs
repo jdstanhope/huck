@@ -3678,6 +3678,13 @@ pub(crate) fn call_function(
     shell.sync_call_arrays();
     shell.local_scopes.push(std::collections::HashMap::new());
 
+    // #434: without functrace the body does not inherit the caller's RETURN
+    // trap — bash unsets it for the duration of the call and puts it back on
+    // return only if the body left RETURN untrapped. Taken here (before the
+    // entry DEBUG fire, as in bash's execute_function) so the body, and any
+    // `trap -p RETURN` it runs, sees the trap gone.
+    let saved_return_trap = crate::traps::take_return_trap_for_call(shell);
+
     // v329 (#274): fire the DEBUG trap ONCE on function ENTRY (after the
     // call-site fire, before the first body command), with $LINENO stamped to
     // the function's DEFINITION line — matching bash's function-tracing
@@ -3707,6 +3714,9 @@ pub(crate) fn call_function(
     };
     shell.set_last_status(status_for_trap);
     crate::traps::fire_return_trap(shell);
+    // #434: the trap that just fired (if any) is the body's own; the caller's
+    // saved one comes back only if the body left RETURN untrapped.
+    crate::traps::restore_return_trap_after_call(shell, saved_return_trap);
 
     // Pop local scope and restore each snapshotted variable. Runs
     // AFTER the RETURN trap so the trap action still sees the

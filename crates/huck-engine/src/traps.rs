@@ -190,19 +190,55 @@ pub fn fire_debug_trap(shell: &mut Shell) -> DebugDecision {
     decision
 }
 
+/// bash's function-ENTRY half of the RETURN trap's non-inheritance
+/// (`execute_function`): without functrace (`set -T` / `shopt -s extdebug`,
+/// which bash couples to the same function_trace_mode flag) a called
+/// function does not inherit the caller's RETURN trap, so bash saves the
+/// action and unsets RETURN for the duration of the body
+/// (`restore_default_signal (RETURN_TRAP)`). The trap is therefore also
+/// invisible to `trap -p RETURN` inside the body, and a trap the function
+/// installs FOR ITSELF fires on its own return with no functrace needed.
+/// Returns the saved action for `restore_return_trap_after_call`.
+///
+/// An *ignored* RETURN trap (`trap '' RETURN`) is left in place: bash's
+/// `TRAP_STRING()` yields NULL for an ignored trap, so the save-and-unset
+/// block is skipped and the ignore stays visible inside the function.
+/// (bash) #434
+pub fn take_return_trap_for_call(shell: &mut Shell) -> Option<String> {
+    if shell.shell_options.functrace || shell.extdebug() {
+        return None;
+    }
+    if !matches!(shell.traps.get(&TrapSignal::Return), Some(Some(_))) {
+        return None;
+    }
+    match shell.traps.remove(&TrapSignal::Return) {
+        Some(Some(action)) => Some(action),
+        _ => None,
+    }
+}
+
+/// The function-EXIT half, bash's `maybe_set_return_trap`: the saved action
+/// comes back ONLY if the function left RETURN untrapped. A trap the body
+/// installed for itself survives the call and replaces the caller's; a body
+/// that reset RETURN (`trap - RETURN`) gets the caller's trap back. `trap ''
+/// RETURN` counts as trapped, so it too survives. (bash) #434
+pub fn restore_return_trap_after_call(shell: &mut Shell, saved: Option<String>) {
+    if let Some(action) = saved
+        && !shell.traps.contains_key(&TrapSignal::Return)
+    {
+        shell.traps.insert(TrapSignal::Return, Some(action));
+    }
+}
+
 /// Fires the RETURN pseudo-signal trap. Repeatable; recursion-guarded.
 pub fn fire_return_trap(shell: &mut Shell) {
-    // RETURN is inherited into a function/sourced script only under
-    // functrace (`set -T` / `shopt -s extdebug`, which bash couples to the
-    // same function_trace_mode flag — verified against real bash 5.2.21);
-    // without it the trap does not fire on return. The sole call site
-    // (`call_function`) is a function return, so this blanket gate is
-    // correct there; huck does not yet fire RETURN on sourced-script
-    // completion at all (a separate, pre-existing gap outside this task).
-    // (bash)
-    if !(shell.shell_options.functrace || shell.extdebug()) {
-        return;
-    }
+    // No functrace gate here: bash's fire site is unconditional, and
+    // non-inheritance is implemented at the function's ENTRY instead (see
+    // `take_return_trap_for_call`). A RETURN trap that is still installed
+    // when a function returns therefore always fires. (huck does not yet
+    // fire RETURN on sourced-script completion at all — a separate,
+    // pre-existing gap.) (bash) #434
+    //
     // #273: RETURN does not fire for a function/source that returns while the
     // DEBUG trap action is executing (bash suppresses the RETURN trap for the
     // duration of the DEBUG trap). ERR does NOT suppress RETURN; the same-signal
