@@ -1718,18 +1718,10 @@ mod tests {
         cursor_to_completion(&cur, line, line.len(), &mut sh).1
     }
 
-    #[test]
-    fn mapper_command_position_yields_commands() {
-        // `if whi` / bare word / inside $( → command candidates.
-        for line in ["if whi", "whi", "echo $(whi", "echo \"$(whi"] {
-            let c = map(line);
-            assert!(
-                c.iter().any(|x| x.display == "while"),
-                "{line:?}: {:?}",
-                c.iter().map(|x| &x.display).collect::<Vec<_>>()
-            );
-        }
-    }
+    // `mapper_command_position_yields_commands` lives in
+    // `tests/completion_path_scan_serial.rs` (#458): it walks every `$PATH`
+    // entry with `read_dir`, and a sibling test's numbered redirect stole the
+    // descriptor its `DIR` held, failing `closedir` with EBADF.
 
     #[test]
     fn mapper_variable_position_yields_variables() {

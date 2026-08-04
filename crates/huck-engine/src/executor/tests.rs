@@ -1835,37 +1835,11 @@ fn local_readonly_in_function_errors() {
     assert_eq!(shell.last_status(), 1);
 }
 
-/// Smoke-test for `with_redirect_scope` via `run_redirected`: a brace
-/// group redirected to a file writes its output there (not to stdout).
-///
-/// Cross-process FD-1 race: while this test has FD 1 dup2'd to the
-/// target file, `cargo test`'s libtest runner may print sibling test
-/// progress lines (`"test foo ... ok\n"`) to the same FD 1 from a
-/// peer thread, and those land in our file too. We can't serialize
-/// against libtest (it doesn't take our lock) and we can't redirect
-/// libtest's writes (they go to the inherited real FD 1). So the
-/// assertion verifies the actual claim — that the redirected
-/// `echo HI` output is present as an exact line — and tolerates any
-/// libtest noise that may have leaked in alongside it. (In real
-/// shell use no other thread writes to FD 1 during the redirect
-/// window; the noise is a `cargo test` artifact only.)
-#[test]
-fn compound_stdout_redirect_writes_to_file() {
-    let dir = std::env::temp_dir().join(format!("huck_redir_{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let p = dir.join("out.txt");
-    let _ = std::fs::remove_file(&p);
-
-    let mut shell = Shell::new();
-    exec_script(&format!("{{ echo HI; }} > {}\n", p.display()), &mut shell);
-
-    let content = std::fs::read_to_string(&p).expect("redirect target file should exist");
-    assert!(
-        content.lines().any(|l| l == "HI"),
-        "redirected `echo HI` should appear as a line in the file, got {content:?}",
-    );
-    let _ = std::fs::remove_file(&p);
-}
+// `compound_stdout_redirect_writes_to_file` lives in
+// `tests/redirect_fd1_serial.rs` (#458): it dup2s the process-global fd 1 onto
+// a file and reads it back, so libtest's concurrent progress output leaked into
+// the file — sometimes glued onto the payload mid-line, which no in-binary
+// assertion can tolerate. Alone in its own binary it asserts exact contents.
 
 #[test]
 fn classify_runnability_bare_not_found_is_127() {

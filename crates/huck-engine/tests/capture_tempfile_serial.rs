@@ -102,6 +102,26 @@ fn heredoc_in_comsub_body_after_close() {
     assert_eq!(out2.stdout, "[one\ntwo]\n");
 }
 
+/// #458 (moved from `engine::tests`): every `ExecBuilder` knob at once. The
+/// `.stdin()` knob dup2s the process-global fd 0, so under the parallel `--lib`
+/// harness a sibling's `< file` redirect could land on fd 0 first and `read x`
+/// saw nothing — `got:\n` instead of `got:hello\n`. `STDIN_LOCK` did not help:
+/// a shell-level redirect takes no such lock.
+fn all_knobs_compose() {
+    use std::time::Duration;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut e = Engine::new();
+    let out = e
+        .prepare("read x; echo \"got:$x\"")
+        .cwd(tmp.path())
+        .restricted()
+        .timeout(Duration::from_secs(2))
+        .stdin(b"hello\n".to_vec())
+        .capture();
+    assert_eq!(out.exit_code, 0, "stderr={:?}", out.stderr);
+    assert_eq!(out.stdout, "got:hello\n");
+}
+
 #[test]
 fn capture_tempfile_checks_run_serially() {
     plain_stdout_captured();
@@ -111,4 +131,5 @@ fn capture_tempfile_checks_run_serially() {
     run_merge_dup2_sends_stderr_to_fd1();
     heredoc_delim_line_continuation_in_comsub();
     heredoc_in_comsub_body_after_close();
+    all_knobs_compose();
 }
