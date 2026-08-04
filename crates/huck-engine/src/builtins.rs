@@ -6248,9 +6248,12 @@ fn print_active_traps(
 ) {
     use crate::traps::TrapSignal;
 
-    // Collect entries in (sort-key, signal, action) form. Pseudo-signals
-    // (EXIT=0, ERR=1, DEBUG=2, RETURN=3) sort first; real signals (100+n)
-    // sort after pseudo-signals.
+    // Collect entries in (sort-key, signal, action) form. bash walks its trap
+    // table by SIGNAL NUMBER — EXIT is signal 0, so it comes first, then the
+    // real signals in ascending order — and prints the pseudo-signals it keeps
+    // past the end of that table (DEBUG, ERR, RETURN) afterwards, in that
+    // order. huck used to group all four pseudo-signals ahead of every real
+    // one, which put ERR/DEBUG/RETURN in the wrong place.
     let mut entries: Vec<(i32, TrapSignal, &Option<String>)> = Vec::new();
     for (sig, action) in &shell.traps {
         if let Some(f) = filter
@@ -6260,10 +6263,10 @@ fn print_active_traps(
         }
         let key = match sig {
             TrapSignal::Exit => 0,
-            TrapSignal::Err => 1,
-            TrapSignal::Debug => 2,
-            TrapSignal::Return => 3,
-            TrapSignal::Real(n) => 100 + *n,
+            TrapSignal::Real(n) => *n,
+            TrapSignal::Debug => 1000,
+            TrapSignal::Err => 1001,
+            TrapSignal::Return => 1002,
         };
         entries.push((key, *sig, action));
     }
@@ -6275,7 +6278,12 @@ fn print_active_traps(
             TrapSignal::Err => "ERR".to_string(),
             TrapSignal::Debug => "DEBUG".to_string(),
             TrapSignal::Return => "RETURN".to_string(),
-            TrapSignal::Real(n) => signal_number_to_name(n).unwrap_or_else(|| n.to_string()),
+            // bash prints a real signal with its SIG prefix here (`SIGUSR1`),
+            // unlike `kill -l`, which lists bare names. The pseudo-signals
+            // above never take the prefix.
+            TrapSignal::Real(n) => signal_number_to_name(n)
+                .map(|nm| format!("SIG{nm}"))
+                .unwrap_or_else(|| n.to_string()),
         };
         let text = action.as_deref().unwrap_or("");
         // Escape single quotes in action text via the standard bash
