@@ -247,3 +247,14 @@ huck enforces `FUNCNEST` exactly like bash, but additionally clamps the effectiv
 - **Workaround**: none needed — huck's negation is correct.
 
 ---
+
+### `return` inside a RETURN trap runs once instead of exhausting memory
+
+[Issue #464 · by-design](https://github.com/jdstanhope/huck/issues/464)
+
+- **huck**: the per-signal recursion guard (`Shell::firing_traps`) runs the action once and the function returns normally — `f() { trap "echo RET; return 3" RETURN; return 7; }; f` prints `RET` once and leaves `$?` = 7.
+- **bash**: the `return` inside the action re-triggers the RETURN trap, unbounded, until the process dies with `environment: xmalloc: cannot allocate 16 bytes` and exit status 2.
+- **Why intentional**: reproducing an out-of-memory crash is not a compatibility goal, and the guard that prevents it is the same one that makes every other trap kind non-reentrant (a trap never re-enters itself). The divergence only exists for a script that is already unbounded under bash. The fragment is genuinely hostile — run without a bound it exhausted a 1.9 GB machine and killed the surrounding session twice — so it is deliberately excluded from `tests/scripts/trap_action_exit_diff_check.sh`, which records why.
+- **Workaround**: none needed — huck's behaviour is the terminating one.
+
+---
