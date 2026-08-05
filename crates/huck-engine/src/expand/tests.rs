@@ -973,7 +973,7 @@ fn expand_arith_part_division_by_zero_raises_discard() {
     let word = Word(vec![arith_part("1 / 0")]);
     let _ = expand(&word, &mut shell);
     assert_eq!(shell.pending_fatal_status, None);
-    assert!(shell.pending_discard);
+    assert!(shell.unwind.discard);
 }
 
 #[test]
@@ -995,7 +995,7 @@ fn expand_arith_part_invalid_lhs_assignment_raises_discard() {
     let word = Word(vec![arith_part("1 + 2 = 3")]);
     let _ = expand(&word, &mut shell);
     assert_eq!(shell.pending_fatal_status, None);
-    assert!(shell.pending_discard);
+    assert!(shell.unwind.discard);
 }
 
 #[test]

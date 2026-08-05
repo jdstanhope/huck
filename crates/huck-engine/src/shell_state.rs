@@ -655,6 +655,10 @@ pub struct Unwind {
     /// earlier request from ERR (`trap "exit 7" EXIT; trap "exit 9" ERR;
     /// false` exits 7, not 9).
     pub(crate) exit: Option<i32>,
+    /// v312 (#3/#31): a fatal arithmetic-expansion or readonly-assignment
+    /// error DISCARDS the current command (status 1) without exiting the
+    /// shell. Distinct from `fatal`, which does exit.
+    pub(crate) discard: bool,
 }
 
 /// Per-session shell state: variables (each either exported or not) and the
@@ -791,11 +795,6 @@ pub struct Shell {
     /// `take_pending_fatal_status` to decide whether to exit (in
     /// non-interactive mode) or return to prompt (interactive).
     pub pending_fatal_status: Option<i32>,
-    /// v312 (#3/#49): a fatal arithmetic expansion error is pending — the current
-    /// command must be DISCARDED (converted to `Interrupted(DiscardCommand)`).
-    /// Sibling of `pending_fatal_status` but the DISCARD flavor (unwind the
-    /// current top-level command, status 1) rather than exit-shell.
-    pub pending_discard: bool,
     /// #442: an `exit N` performed BY a trap action. Set in
     /// `traps::run_trap_action`, surfaced by `executor::check_interrupt` as
     /// `InterruptReason::ExitRequested(n)`, and consumed at a run boundary —
@@ -1179,7 +1178,6 @@ impl Shell {
             function_source: std::collections::HashMap::new(),
             function_def_line: std::collections::HashMap::new(),
             pending_fatal_status: None,
-            pending_discard: false,
             unwind: Unwind::default(),
             builtin_usage_error: None,
             is_interactive: std::io::stdin().is_terminal(),
@@ -3275,8 +3273,17 @@ impl Shell {
     }
 
     /// Returns and clears the pending arithmetic-discard flag (v312 #3/#49).
-    pub fn take_pending_discard(&mut self) -> bool {
-        std::mem::take(&mut self.pending_discard)
+    /// Marks the current command for discard (v312 #3/#31): it unwinds out of
+    /// loops and functions with status 1, but the shell does NOT exit.
+    pub fn raise_discard(&mut self) {
+        self.unwind.discard = true;
+    }
+
+    /// Consumes the discard flag. The caller pairs this with
+    /// `set_last_status(1)` (#351) — that write is why the reporter reports
+    /// but never consumes.
+    pub fn take_discard(&mut self) -> bool {
+        std::mem::take(&mut self.unwind.discard)
     }
 
     /// Records an `exit N` performed by a trap action (#442). Overwrites: the

@@ -927,7 +927,7 @@ fn expand_array_param(
                     // #201: if the subscript's own `$(( ))` expansion already
                     // failed (arith error, `pending_discard` set + reported),
                     // suppress the redundant secondary "bad array subscript".
-                    if !shell.pending_discard {
+                    if !shell.unwind.discard {
                         crate::sh_error!(shell, None, "{e}");
                     }
                     shell.pending_fatal_status = Some(1);
@@ -954,7 +954,7 @@ fn expand_array_param(
                     // #201: if the subscript's own `$(( ))` expansion already
                     // failed (arith error, `pending_discard` set + reported),
                     // suppress the redundant secondary "bad array subscript".
-                    if !shell.pending_discard {
+                    if !shell.unwind.discard {
                         crate::sh_error!(shell, None, "{e}");
                     }
                     shell.pending_fatal_status = Some(1);
@@ -1328,7 +1328,7 @@ fn expand_part(
                     if shell.shell_options.posix && !shell.is_interactive {
                         shell.posix_fatal(127);
                     } else {
-                        shell.pending_discard = true;
+                        shell.raise_discard();
                     }
                     *has_emitted = true;
                 }
@@ -2000,7 +2000,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                         if shell.shell_options.posix && !shell.is_interactive {
                             shell.posix_fatal(127);
                         } else {
-                            shell.pending_discard = true;
+                            shell.raise_discard();
                         }
                     }
                 }

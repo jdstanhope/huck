@@ -350,7 +350,7 @@ fn finish_command(
     // comsub boundary, and continued (not exited) at the driver loop. Checked
     // BEFORE pending_fatal_status: the discard flavor wins if both were somehow
     // raised by the same command.
-    if shell.take_pending_discard() {
+    if shell.take_discard() {
         // #351: a discarded command's exit status is 1 (DiscardCommand maps to
         // 1 at the driver). `set_last_status(c)` above wrote the "success"
         // status of a bare assignment (`v=$((1/0))` → c=0); overwrite it so a
@@ -1913,7 +1913,7 @@ fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool 
         // `$((xx++))` on a readonly var) sets `pending_discard`. bash aborts the
         // whole `case` at that point — stop testing further patterns; the caller's
         // post-`case_item_matches` discard check unwinds the command (status 1).
-        if shell.pending_discard || shell.pending_fatal_status.is_some() {
+        if shell.unwind.discard || shell.pending_fatal_status.is_some() {
             return false;
         }
         let hit = if (extglob && crate::glob_match::has_extglob(&pattern))
@@ -2000,7 +2000,7 @@ fn run_case_inner(clause: &CaseClause, shell: &mut Shell) -> ExecOutcome {
         // `case` returns `Interrupted(DiscardCommand)` directly — the driver maps
         // it to a continue-status 1 but never writes `shell.last_status`, so the
         // next unit's `$?` would read the stale pre-error value without this.
-        if shell.take_pending_discard() {
+        if shell.take_discard() {
             shell.set_last_status(1);
             return ExecOutcome::Interrupted(InterruptReason::DiscardCommand);
         }
@@ -3211,7 +3211,7 @@ fn resolve(
     // v312 (#3/#49): a `$(( ))` arith error while expanding the program word
     // discards the command — skip resolution so it never runs (converted to
     // Interrupted(DiscardCommand) at the and-or conversion points).
-    if shell.pending_discard {
+    if shell.unwind.discard {
         return Err(1);
     }
     // #62: the program word split to ZERO fields (an empty unquoted expansion,
@@ -3228,7 +3228,7 @@ fn resolve(
             if let Some(status) = shell.pending_fatal_status {
                 return Err(status);
             }
-            if shell.pending_discard {
+            if shell.unwind.discard {
                 return Err(1);
             }
             fields.extend(f);
@@ -3294,7 +3294,7 @@ fn resolve(
         }
         // v312 (#3/#49): a `$(( ))` arith error while expanding an argument word
         // discards the command — skip so it never runs.
-        if shell.pending_discard {
+        if shell.unwind.discard {
             return Err(1);
         }
         if let Some(da) = decl_args.as_mut() {
@@ -4003,7 +4003,7 @@ fn run_assignment_list(items: &[crate::command::Assignment], shell: &mut Shell) 
             if shell.shell_options.posix && !shell.is_interactive {
                 shell.posix_fatal(127); // EXITPROG (v226): POSIX non-interactive exits 127
             } else {
-                shell.pending_discard = true; // DISCARD (v312/#31): discard the current command, rc 1
+                shell.raise_discard(); // DISCARD (v312/#31): discard the current command, rc 1
             }
             st = 1;
             break;
@@ -4013,7 +4013,7 @@ fn run_assignment_list(items: &[crate::command::Assignment], shell: &mut Shell) 
             if shell.shell_options.posix && !shell.is_interactive {
                 shell.posix_fatal(127); // EXITPROG (v226): POSIX non-interactive exits 127
             } else {
-                shell.pending_discard = true; // DISCARD (v312/#31): discard the current command, rc 1
+                shell.raise_discard(); // DISCARD (v312/#31): discard the current command, rc 1
             }
             st = 1;
             break;
@@ -7565,7 +7565,7 @@ pub(crate) fn apply_one_assignment(
                     // already raised the discard, the command is being unwound —
                     // suppress the secondary "bad array subscript" diagnostic
                     // (bash prints only the arith error, then discards).
-                    if !shell.pending_discard {
+                    if !shell.unwind.discard {
                         crate::sh_error_to!(shell, err, None, "{msg}");
                     }
                     return Err(());
@@ -7706,7 +7706,7 @@ fn expand_array_elements(
                 };
                 map.insert(idx, value);
                 implicit = idx + 1;
-                if shell.pending_fatal_status.is_some() || shell.pending_discard {
+                if shell.pending_fatal_status.is_some() || shell.unwind.discard {
                     return Err(());
                 }
             }
@@ -7715,7 +7715,7 @@ fn expand_array_elements(
                     map.insert(implicit, field);
                     implicit += 1;
                 }
-                if shell.pending_fatal_status.is_some() || shell.pending_discard {
+                if shell.pending_fatal_status.is_some() || shell.unwind.discard {
                     return Err(());
                 }
             }

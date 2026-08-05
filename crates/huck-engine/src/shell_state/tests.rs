@@ -811,3 +811,20 @@ fn unwind_exit_slot_overwrites_rather_than_latching() {
     shell.raise_exit(7);
     assert_eq!(shell.take_exit(), Some(7));
 }
+
+#[test]
+fn unwind_discard_slot_is_independent_of_exit() {
+    // The slots must NOT share storage: a discard and an exit can both be
+    // pending, and `finish_command` resolves between them. A single
+    // `Option<Unwind>` would turn "discard wins" into "last writer wins".
+    let mut shell = Shell::new();
+    shell.raise_discard();
+    shell.raise_exit(9);
+    assert!(shell.take_discard(), "discard survived raising an exit");
+    assert_eq!(
+        shell.exit_pending(),
+        Some(9),
+        "exit survived taking a discard"
+    );
+    assert!(!shell.take_discard(), "take clears the discard");
+}
