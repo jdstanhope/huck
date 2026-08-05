@@ -1,0 +1,89 @@
+---
+title: "Five ways to say stop"
+date: 2026-08-05
+summary: "huck had five separate mechanisms for 'abandon this command', each with its own storage and its own idea of what outranks what. Unifying them changed no behaviour at all — which is the entire point, and the reason it was worth doing."
+tags: ["refactor", "architecture", "process"]
+version: "v354"
+draft: false
+---
+
+Here is the complete list of user-visible changes in this release:
+
+```bash
+# before
+$ huck -c 'set -e; trap "exit 9" ERR; false; echo after'   # exit 9
+$ huck -c '( trap "echo cleanup" EXIT; echo work )'        # work / cleanup
+
+# after
+$ huck -c 'set -e; trap "exit 9" ERR; false; echo after'   # exit 9
+$ huck -c '( trap "echo cleanup" EXIT; echo work )'        # work / cleanup
+```
+
+Nothing. That's the deliverable.
+
+## What was actually wrong
+
+A shell needs several ways to abandon what it's doing. Someone pressed Ctrl-C.
+A timeout fired. An arithmetic expression divided by zero, which in bash
+discards the current command without killing the shell. A different expansion
+error is fatal and *does* kill it. A trap handler ran `exit`.
+
+huck had all five. Each had its own storage, its own check, and its own
+position in an order that nobody had written down — it was whatever order the
+`if` statements happened to appear in, across two functions in different parts
+of the file. Adding a sixth meant noticing the pattern from scratch and
+guessing where your check belonged.
+
+That shape had already cost real bugs. Twice in the previous release, while
+consolidating duplicated code, a bug fell out that nobody had reported: a fix
+applied to two of five copies of one routine, and another applied to one of two
+copies of another. Both were invisible until the copies were forced to become
+one.
+
+## What changed
+
+The three signals the shell raises itself now live in one named place, reached
+only through methods — so adding a sixth means joining a family rather than
+inventing a field. The two raised from *outside* the interpreter — the Ctrl-C
+handler and the timeout thread — deliberately stayed exactly as they were,
+because a signal handler runs under rules where almost nothing is safe to do,
+and "tidying" it into the same structure would have been a bug, not an
+improvement.
+
+And the order is now written down, once, in the one function that decides it.
+
+The interesting part is what that function *doesn't* do. The two checkpoints in
+the shell genuinely ask different questions today: the one around a command
+considers Ctrl-C, timeouts and trap exits, and never looks at discards; the one
+after a command considers discards, fatal errors and trap exits, and never
+looks at Ctrl-C. Making them agree would be more elegant. It would also be a
+behaviour change — outcomes would start firing at places that had never
+consulted them — smuggled inside something labelled a refactor. So the
+asymmetry is preserved, and now it's a table you can read instead of an
+accident you have to reconstruct.
+
+## How you prove a change that changes nothing
+
+The claim "no behaviour changed" is only worth anything if it can be falsified.
+The rule was: **no test may have its expected value edited.** Not "tests still
+pass" — tests can be made to pass. If any assertion needed adjusting, the
+refactor broke something and gets redone.
+
+It held. 265 differential harnesses comparing huck against real bash, byte for
+byte: unchanged. 1,977 unit tests: unchanged. bash's own 82-category test
+suite, run against both versions and compared as a *set* rather than a count,
+in case one category quietly flipped each way: identical.
+
+Two near-misses are worth admitting, because both would have shipped silently.
+The obvious way to clear the new structure before forking a subshell also
+cleared two sibling fields that had never been cleared there — correct today,
+wrong the moment the next field arrived. And a search-and-replace that
+rewrote callers also rewrote the definitions it was pointing at, turning five
+accessors into functions that called themselves. Every one compiled. One of
+them was infinite recursion.
+
+Both were caught by reading the result rather than trusting a green build,
+which is the small, boring lesson under a change whose entire output is a
+diff that does nothing.
+
+*Issue [#466](https://github.com/jdstanhope/huck/issues/466).*
