@@ -1,0 +1,99 @@
+---
+title: "The traps that couldn't stop the shell"
+date: 2026-08-05
+summary: "`trap 'exit 1' ERR` is how a careful script aborts on error. huck ran the handler and kept going — in all five kinds of trap. Fixing it also fixed two bugs nobody had reported, both hiding in code that had been copy-pasted."
+tags: ["traps", "bash-compat", "refactor"]
+version: "v353"
+draft: false
+---
+
+Here is a line that appears near the top of a lot of careful shell scripts:
+
+```bash
+trap 'exit 1' ERR
+```
+
+It means: if any command fails, stop. huck ran the handler and carried on
+regardless.
+
+```bash
+# before
+$ huck -c 'trap "exit 1" ERR; grep -q pattern /etc/hostname; echo "still running"'
+still running          # and exit status 0
+
+# after (and bash)
+$ huck -c 'trap "exit 1" ERR; grep -q pattern /etc/hostname; echo "still running"'
+                       # nothing, exit status 1
+```
+
+The script did not stop, and it reported success. That's the worst shape a bug
+can have: a safety net that silently isn't there.
+
+The same hole existed in all five kinds of trap — `EXIT`, `ERR`, `DEBUG`,
+`RETURN`, and traps on real signals like `SIGUSR1`. Every one of them ran the
+handler through the same line of code, and that line threw away the handler's
+result. An `exit` performed inside a trap was simply never heard.
+
+## The other half: cleanup that never ran
+
+A subshell that trapped its own exit had a matching problem — the handler
+never ran at all:
+
+```bash
+# before
+$ huck -c '( trap "echo cleanup" EXIT; echo work )'
+work
+
+# after (and bash)
+$ huck -c '( trap "echo cleanup" EXIT; echo work )'
+work
+cleanup
+```
+
+That affected every kind of child process: `( … )`, background jobs, pipeline
+stages, and `$( … )`. It turned out all four go through a single piece of
+code, so it was one fix rather than four.
+
+## Where the interesting part is
+
+The exit request has to travel a long way. If a trap fires deep inside a
+function, inside a loop, inside a subshell, the shell has to unwind all of it
+— and it can't simply quit on the spot, because bash still runs the `EXIT`
+trap on the way out. So the request now rides the same machinery huck already
+uses for Ctrl-C and for timeouts: something raises a flag, the next checkpoint
+turns it into an unwind, and the normal exit path runs the `EXIT` trap before
+the process ends.
+
+Getting that ordering right took three corrections, each caught by a test
+rather than by reading the code. The one worth repeating: a pending exit
+request left set while the `EXIT` trap runs will abort *that* handler at its
+first command. `trap "exit 7" EXIT` combined with `trap "exit 9" ERR` has to
+end with status 7 — the `EXIT` trap runs last, so it gets the final word — and
+that only works if the earlier request is cleared before the handler starts.
+
+## Two bugs that fell out of tidying up
+
+Before fixing anything, the work removed some duplication: five near-identical
+copies of "run a trap handler", and one post-command sequence written out
+twice. Both consolidations immediately exposed a real bug that had been hiding
+in the mismatch between copies.
+
+A previous fix had made trap handlers leave `$?` alone — but only in two of
+the five copies, so a signal handler still corrupted it. And a fix that set
+the exit status after a fatal arithmetic error had been applied to one of the
+two post-command copies, so `true && v=$((1/0))` reported success where
+`v=$((1/0))` alone reported failure.
+
+Neither was reported by anyone. Both appeared the moment two copies of the
+same idea were forced to become one. That's the argument for consolidation put
+better than any style guide could: duplicated code doesn't just age badly, it
+hides the evidence.
+
+*Issues [#442](https://github.com/jdstanhope/huck/issues/442),
+[#449](https://github.com/jdstanhope/huck/issues/449), plus
+[#454](https://github.com/jdstanhope/huck/issues/454) and
+[#455](https://github.com/jdstanhope/huck/issues/455) found on the way. One
+deliberate difference is recorded rather than fixed: `return` inside a `RETURN`
+trap re-enters until real bash runs out of memory
+([#464](https://github.com/jdstanhope/huck/issues/464)) — huck runs it once and
+stops.*

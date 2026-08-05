@@ -82,3 +82,35 @@ fn or_short_circuit_unchanged() {
         "true || false must not exit"
     );
 }
+
+/// v353 Task 2 characterisation: pins the epilogue's ORDER before it is
+/// extracted into `finish_command`. The ERR trap must run before errexit ends
+/// the sequence, and the action must stay transparent to `$?` (#437) so
+/// errexit still reports the FAILING command's status, not the action's.
+#[test]
+fn err_trap_runs_before_errexit_and_keeps_the_failing_status() {
+    let mut s = Shell::new();
+    s.shell_options.errexit = true;
+    // The action succeeds (status 0). If its status leaked, errexit would
+    // carry 0 instead of `false`'s 1.
+    let _ = crate::shell::process_line("trap 'true' ERR", &mut s, false);
+    let out = crate::shell::process_line("false", &mut s, false);
+    assert!(
+        matches!(out, ExecOutcome::Exit(1)),
+        "expected Exit(1) from errexit after the ERR trap ran, got {out:?}"
+    );
+}
+
+/// The ERR trap fires only for the syntactically LAST command of an and-or
+/// list, and errexit is NOT gated on the trap being armed (#444).
+#[test]
+fn errexit_fires_without_an_err_trap_installed() {
+    assert!(
+        errexit_fired("false"),
+        "errexit must fire with no ERR trap installed"
+    );
+    assert!(
+        !errexit_fired("false || true"),
+        "a non-last failure stays exempt"
+    );
+}

@@ -18,6 +18,11 @@ pub enum InterruptReason {
     /// expansion error (#3) and a readonly-variable assignment error (#31);
     /// contained at execution boundaries; the driver loop continues on it.
     DiscardCommand,
+    /// #442: a trap action ran `exit N`. Unwinds like `DiscardCommand` — out of
+    /// loops, functions, subshells and command substitutions — but the shell
+    /// DOES exit, with `n`, after the EXIT trap has had its turn. Raised by
+    /// `executor::check_interrupt` from `Shell::pending_exit`.
+    ExitRequested(i32),
 }
 
 /// The result of running a command — either the shell continues (carrying the

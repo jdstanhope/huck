@@ -777,6 +777,16 @@ pub struct Shell {
     /// Sibling of `pending_fatal_status` but the DISCARD flavor (unwind the
     /// current top-level command, status 1) rather than exit-shell.
     pub pending_discard: bool,
+    /// #442: an `exit N` performed BY a trap action. Set in
+    /// `traps::run_trap_action`, surfaced by `executor::check_interrupt` as
+    /// `InterruptReason::ExitRequested(n)`, and consumed at a run boundary —
+    /// the same lifecycle as `timeout_flag`, which is why `check_interrupt`
+    /// can stay `&Shell`.
+    ///
+    /// OVERWRITTEN, not latched: bash lets the LAST exit win, which is how the
+    /// EXIT trap overrides an earlier request from ERR
+    /// (`trap "exit 7" EXIT; trap "exit 9" ERR; false` exits 7, not 9).
+    pub pending_exit: Option<i32>,
     /// Set by a POSIX special builtin when it hits a usage / bad-option /
     /// bad-assignment error (NOT a runtime error). Consumed by the executor's
     /// bare special-builtin dispatch to fire `posix_fatal`. Cleared per command.
@@ -1152,6 +1162,7 @@ impl Shell {
             function_def_line: std::collections::HashMap::new(),
             pending_fatal_status: None,
             pending_discard: false,
+            pending_exit: None,
             builtin_usage_error: None,
             is_interactive: std::io::stdin().is_terminal(),
             is_command_string: false,
@@ -3248,6 +3259,13 @@ impl Shell {
     /// Returns and clears the pending arithmetic-discard flag (v312 #3/#49).
     pub fn take_pending_discard(&mut self) -> bool {
         std::mem::take(&mut self.pending_discard)
+    }
+
+    /// Consumes a pending trap-action `exit` (#442). Called at the run
+    /// boundaries — the top-level reducer, the REPL and the forked-child exit
+    /// path — AFTER the EXIT trap has had its chance to overwrite it.
+    pub fn take_pending_exit(&mut self) -> Option<i32> {
+        self.pending_exit.take()
     }
 
     /// Mark a POSIX-mode fatal error: a non-interactive posix shell exits with

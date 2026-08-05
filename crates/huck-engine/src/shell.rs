@@ -348,8 +348,17 @@ pub fn run_program_in_sinks(
         // v312 (#3/#49): a discard that reaches the top-level reducer decodes to
         // 1 (the driver loop normally consumes it and continues; defensive).
         ExecOutcome::Interrupted(InterruptReason::DiscardCommand) => 1,
+        // #442: a trap action ran `exit N`.
+        ExecOutcome::Interrupted(InterruptReason::ExitRequested(n)) => n,
     };
+    // #442: clear any pending request BEFORE the EXIT trap runs — it is
+    // already reflected in `code`, and leaving it set would abort the EXIT
+    // action at its first checkpoint. The EXIT trap then gets the final word:
+    // its own `exit` overwrites (`trap "exit 7" EXIT; trap "exit 9" ERR;
+    // false` exits 7, not 9).
+    let requested = shell.take_pending_exit();
     crate::traps::fire_exit_trap(&mut shell);
+    let code = shell.take_pending_exit().or(requested).unwrap_or(code);
     shell.hangup_jobs();
     code
 }

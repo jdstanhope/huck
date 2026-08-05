@@ -54,9 +54,19 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   (`timeout.rs`) that, on deadline, sets `Shell.timeout_flag` (polled by
   `executor::check_interrupt`) and SIGTERMs every pid in
   `Shell.live_external_children`, with the call returning exit 124.
-  `ExecOutcome::Interrupted` carries an `InterruptReason::{Sigint,Timeout}`
-  discriminator so the top-level reducer can map to 130 (SIGINT) or 124
-  (timeout).
+  `ExecOutcome::Interrupted` carries an
+  `InterruptReason::{Sigint,Timeout,DiscardCommand,ExitRequested}` discriminator
+  so the top-level reducer can map to 130 (SIGINT), 124 (timeout), 1 (a v312
+  arithmetic/readonly discard) or the requested status. `ExitRequested(n)` is
+  v353/#442: a trap action that ran `exit N` records it in
+  `Shell::pending_exit`, `check_interrupt` surfaces it, and the existing unwind
+  carries it out of functions, loops, subshells and command substitutions —
+  unlike `DiscardCommand`, a comsub boundary does NOT contain it. It is
+  consumed at the run boundary AFTER `fire_exit_trap`, so the EXIT trap still
+  runs when another trap ends the shell and its own `exit` wins. Every trap
+  action runs through one `traps::run_trap_action`, which owns the
+  `$BASH_COMMAND` freeze (#287), the `$?` transparency (#437) and that
+  recording.
   External-process waits use a poll-based loop (`stream_loop.rs` +
   `wait_loop.rs` — `signalfd`/`poll` on Linux, `kqueue` on macOS) rather than a
   blocking `waitpid` + drainer thread; it is the timeout-aware wait path.
