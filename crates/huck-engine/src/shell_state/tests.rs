@@ -789,3 +789,25 @@ fn unset_posixly_correct_disables_posix() {
     sh.unset("POSIXLY_CORRECT");
     assert!(!sh.shell_options.posix);
 }
+
+// ----- v354 (#466): the Unwind family ---------------------------------------
+
+#[test]
+fn unwind_exit_slot_raises_peeks_and_takes() {
+    let mut shell = Shell::new();
+    assert_eq!(shell.exit_pending(), None, "clean shell has no request");
+    shell.raise_exit(9);
+    assert_eq!(shell.exit_pending(), Some(9), "peek does not consume");
+    assert_eq!(shell.exit_pending(), Some(9), "still there after a peek");
+    assert_eq!(shell.take_exit(), Some(9), "take consumes");
+    assert_eq!(shell.exit_pending(), None, "gone after take");
+}
+
+#[test]
+fn unwind_exit_slot_overwrites_rather_than_latching() {
+    // #442: the LAST exit wins — an EXIT trap overrides an earlier request.
+    let mut shell = Shell::new();
+    shell.raise_exit(9);
+    shell.raise_exit(7);
+    assert_eq!(shell.take_exit(), Some(7));
+}

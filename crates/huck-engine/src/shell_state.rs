@@ -637,6 +637,25 @@ pub struct Coproc {
     pub read_fd: std::os::unix::io::RawFd,
     pub write_fd: std::os::unix::io::RawFd,
 }
+/// The shell's own "stop what you are doing" signals: set deep in expansion or
+/// execution, consulted at a command boundary, converted into an
+/// `ExecOutcome::Interrupted(..)`.
+///
+/// Slots are INDEPENDENT and may be set at once — a discard and a fatal can
+/// both be raised during one command's expansion, and resolving between them
+/// belongs to `executor::pending_unwind`, not to storage.
+///
+/// The externally-raised signals (`Shell::sigint_flag`, `Shell::timeout_flag`)
+/// are deliberately NOT here: a signal handler and the timer thread write them
+/// from outside this thread, so they must stay `Arc<AtomicBool>`. (v354 #466)
+#[derive(Debug, Default, Clone)]
+pub struct Unwind {
+    /// #442: an `exit N` performed BY a trap action. Overwritten, not latched
+    /// — bash lets the last exit win, which is how an EXIT trap overrides an
+    /// earlier request from ERR (`trap "exit 7" EXIT; trap "exit 9" ERR;
+    /// false` exits 7, not 9).
+    pub(crate) exit: Option<i32>,
+}
 
 /// Per-session shell state: variables (each either exported or not) and the
 /// last command's exit status. The initial set of variables is seeded from
@@ -783,10 +802,9 @@ pub struct Shell {
     /// the same lifecycle as `timeout_flag`, which is why `check_interrupt`
     /// can stay `&Shell`.
     ///
-    /// OVERWRITTEN, not latched: bash lets the LAST exit win, which is how the
-    /// EXIT trap overrides an earlier request from ERR
-    /// (`trap "exit 7" EXIT; trap "exit 9" ERR; false` exits 7, not 9).
-    pub pending_exit: Option<i32>,
+    /// v354 (#466): the shell-raised unwind signals in one named home. Reached
+    /// through `raise_*` / `take_*` / `*_pending`, never poked directly.
+    pub unwind: Unwind,
     /// Set by a POSIX special builtin when it hits a usage / bad-option /
     /// bad-assignment error (NOT a runtime error). Consumed by the executor's
     /// bare special-builtin dispatch to fire `posix_fatal`. Cleared per command.
@@ -1162,7 +1180,7 @@ impl Shell {
             function_def_line: std::collections::HashMap::new(),
             pending_fatal_status: None,
             pending_discard: false,
-            pending_exit: None,
+            unwind: Unwind::default(),
             builtin_usage_error: None,
             is_interactive: std::io::stdin().is_terminal(),
             is_command_string: false,
@@ -3261,11 +3279,22 @@ impl Shell {
         std::mem::take(&mut self.pending_discard)
     }
 
+    /// Records an `exit N` performed by a trap action (#442). Overwrites: the
+    /// last exit wins, which is how an EXIT trap overrides an earlier request.
+    pub fn raise_exit(&mut self, n: i32) {
+        self.unwind.exit = Some(n);
+    }
+
+    /// Peeks at a pending trap-action exit without consuming it.
+    pub fn exit_pending(&self) -> Option<i32> {
+        self.unwind.exit
+    }
+
     /// Consumes a pending trap-action `exit` (#442). Called at the run
     /// boundaries — the top-level reducer, the REPL and the forked-child exit
     /// path — AFTER the EXIT trap has had its chance to overwrite it.
-    pub fn take_pending_exit(&mut self) -> Option<i32> {
-        self.pending_exit.take()
+    pub fn take_exit(&mut self) -> Option<i32> {
+        self.unwind.exit.take()
     }
 
     /// Mark a POSIX-mode fatal error: a non-interactive posix shell exits with

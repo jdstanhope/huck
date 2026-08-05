@@ -356,9 +356,9 @@ pub fn run_program_in_sinks(
     // action at its first checkpoint. The EXIT trap then gets the final word:
     // its own `exit` overwrites (`trap "exit 7" EXIT; trap "exit 9" ERR;
     // false` exits 7, not 9).
-    let requested = shell.take_pending_exit();
+    let requested = shell.take_exit();
     crate::traps::fire_exit_trap(&mut shell);
-    let code = shell.take_pending_exit().or(requested).unwrap_or(code);
+    let code = shell.take_exit().or(requested).unwrap_or(code);
     shell.hangup_jobs();
     code
 }

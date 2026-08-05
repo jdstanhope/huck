@@ -148,7 +148,7 @@ pub(crate) fn check_interrupt(shell: &Shell) -> Option<ExecOutcome> {
     // are externally imposed and outrank the script's own request. Peeked, not
     // taken — `check_interrupt` holds `&Shell`, and the value is consumed at
     // the run boundary (the same shape as `timeout_flag`).
-    if let Some(n) = shell.pending_exit {
+    if let Some(n) = shell.exit_pending() {
         return Some(ExecOutcome::Interrupted(InterruptReason::ExitRequested(n)));
     }
     None
@@ -365,7 +365,7 @@ fn finish_command(
     // #442: a trap action (including one just dispatched above) ran `exit N`.
     // Checked BEFORE errexit so a trap's exit beats the errexit status — bash's
     // `set -e; trap "exit 9" ERR; false` exits 9, not 1.
-    if let Some(n) = shell.pending_exit {
+    if let Some(n) = shell.exit_pending() {
         return Some(ExecOutcome::Interrupted(InterruptReason::ExitRequested(n)));
     }
     if c != 0 && shell.err_suppressed_depth == 0 && is_last && !is_negated_pipeline(cmd) {
@@ -374,7 +374,7 @@ fn finish_command(
             // #442: the ERR action itself ran `exit N`. Checked here, AFTER the
             // fire and BEFORE errexit, so a trap's exit beats the errexit
             // status: bash's `set -e; trap "exit 9" ERR; false` exits 9, not 1.
-            if let Some(n) = shell.pending_exit {
+            if let Some(n) = shell.exit_pending() {
                 return Some(ExecOutcome::Interrupted(InterruptReason::ExitRequested(n)));
             }
         }
@@ -392,7 +392,7 @@ fn finish_command(
 /// Proceed / SkipCommand / ReturnFromSub decision.
 fn debug_trap_gate(shell: &mut Shell) -> Result<crate::traps::DebugDecision, ExecOutcome> {
     let decision = crate::traps::fire_debug_trap(shell);
-    match shell.pending_exit {
+    match shell.exit_pending() {
         Some(n) => Err(ExecOutcome::Interrupted(InterruptReason::ExitRequested(n))),
         None => Ok(decision),
     }
@@ -8049,9 +8049,9 @@ pub fn fork_and_run_in_subshell(
         // lines), and with the pending request CLEARED first — leaving it set
         // aborts the action at its first checkpoint, the same trap #442 hit at
         // the top-level exit path. The trap's own `exit N` then wins.
-        let requested = shell.take_pending_exit();
+        let requested = shell.take_exit();
         crate::traps::fire_exit_trap(shell);
-        let status = shell.take_pending_exit().or(requested).unwrap_or(status);
+        let status = shell.take_exit().or(requested).unwrap_or(status);
         let status = status.rem_euclid(256);
         // Flush the builtin's buffered stdout to the dup2'd fd 1 (pipe or
         // terminal) before _exit (M-118): _exit skips Rust's flush, which is
