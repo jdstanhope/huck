@@ -8092,9 +8092,27 @@ pub(crate) fn source_in_sink(args: &[String], invoked: &str, shell: &mut Shell) 
     });
     shell.sync_call_arrays();
     let result = run_sourced_contents_in_sinks(&contents, &path, shell);
+    // #440: a sourced script fires the RETURN trap when it finishes, whether it
+    // ran off the end or hit `return N`. Unlike a function call there is NO
+    // entry-unset: bash runs an INHERITED trap here with or without functrace
+    // (`trap "echo R" RETURN; . f` prints R in bash even without `set -T`).
+    //
     shell.call_stack.pop();
     shell.sync_call_arrays();
     shell.source_depth -= 1;
+    // Fired AFTER the frame is popped: bash runs this action in the CALLER's
+    // context, not the file's — `trap 'echo [${BASH_SOURCE[0]}] ${#FUNCNAME[@]}'
+    // RETURN; . f` prints `[] 0` at top level, and inside a function reports
+    // that function, not the sourced file. (A FUNCTION's RETURN trap is the
+    // other way round — `call_function` fires it with its own frame still on
+    // the stack, which is also what bash does.)
+    //
+    // `$?` is LEFT ALONE — it already holds the last command the file ran,
+    // which is what bash's action sees. Installing the file's return value
+    // first would diverge after `return N` exactly as #441 did for functions:
+    // bash runs the action with `$?` = 0 for `echo body; return 3`, and gives
+    // the CALLER 3.
+    crate::traps::fire_return_trap(shell);
 
     if let Some(saved) = saved_positional {
         shell.positional_args = saved;
