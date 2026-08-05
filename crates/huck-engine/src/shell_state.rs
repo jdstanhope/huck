@@ -864,6 +864,15 @@ pub struct Shell {
     /// installed trap handler. Used by `traps::reset` to unregister.
     pub trap_sigids: std::collections::HashMap<i32, signal_hook::SigId>,
 
+    /// #474: signal number → signal-hook SigId for the "perform the default
+    /// action" handler installed by `traps::reset`. signal_hook never restores
+    /// a signal's original disposition, so a reset registers an emulator
+    /// instead of poking `SIG_DFL` behind the registry's back. `install`
+    /// removes the emulator before registering a real trap action, otherwise
+    /// the two would both run and the default would kill the shell after the
+    /// trap.
+    pub default_sigids: std::collections::HashMap<i32, signal_hook::SigId>,
+
     /// Stack of currently-firing pseudo-traps. Pushed on entry to
     /// fire_err/fire_debug/fire_return; popped on exit. A trap is
     /// suppressed if it is ANYWHERE on this stack (not just at the top) —
@@ -1188,6 +1197,7 @@ impl Shell {
             traps: std::collections::HashMap::new(),
             trap_pending: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             trap_sigids: std::collections::HashMap::new(),
+            default_sigids: std::collections::HashMap::new(),
             firing_traps: Vec::new(),
             err_suppressed_depth: 0,
             source_depth: 0,
