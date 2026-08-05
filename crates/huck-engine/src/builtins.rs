@@ -4809,6 +4809,14 @@ fn wait_all(shell: &mut Shell) -> ExecOutcome {
         if let Some(o) = crate::executor::check_interrupt(shell) {
             return o;
         }
+        // #453: a TRAPPED signal interrupts `wait`. bash runs the action and
+        // returns 128+n immediately, leaving the remaining jobs running —
+        // it does not resume waiting. An ignored (`trap '' SIG`) or untrapped
+        // signal does not interrupt, which `dispatch_pending_traps` encodes by
+        // reporting only actions it actually ran.
+        if let Some(sig) = crate::traps::dispatch_pending_traps(shell) {
+            return ExecOutcome::Continue(128 + sig);
+        }
         // #183: reap only children we OWN. This used to be `waitpid(-1)`, which
         // reaps ANY child of the process — right for a standalone shell, wrong for
         // huck-engine as a library (it steals the embedder's children) and fatal in
@@ -4866,6 +4874,14 @@ fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
         if let Some(o) = crate::executor::check_interrupt(shell) {
             return o;
         }
+        // #453: a TRAPPED signal interrupts `wait`. bash runs the action and
+        // returns 128+n immediately, leaving the remaining jobs running —
+        // it does not resume waiting. An ignored (`trap '' SIG`) or untrapped
+        // signal does not interrupt, which `dispatch_pending_traps` encodes by
+        // reporting only actions it actually ran.
+        if let Some(sig) = crate::traps::dispatch_pending_traps(shell) {
+            return ExecOutcome::Continue(128 + sig);
+        }
         // #183: reap only children we OWN. This used to be `waitpid(-1)`, which
         // reaps ANY child of the process — right for a standalone shell, wrong for
         // huck-engine as a library (it steals the embedder's children) and fatal in
@@ -4882,6 +4898,14 @@ fn wait_for_pid(pid: i32, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome
     loop {
         if let Some(o) = crate::executor::check_interrupt(shell) {
             return o;
+        }
+        // #453: a TRAPPED signal interrupts `wait`. bash runs the action and
+        // returns 128+n immediately, leaving the remaining jobs running —
+        // it does not resume waiting. An ignored (`trap '' SIG`) or untrapped
+        // signal does not interrupt, which `dispatch_pending_traps` encodes by
+        // reporting only actions it actually ran.
+        if let Some(sig) = crate::traps::dispatch_pending_traps(shell) {
+            return ExecOutcome::Continue(128 + sig);
         }
         let mut status: libc::c_int = 0;
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
@@ -5028,6 +5052,14 @@ fn wait_any_pending(pid_var: Option<String>, shell: &mut Shell) -> ExecOutcome {
         if let Some(o) = crate::executor::check_interrupt(shell) {
             return o;
         }
+        // #453: a TRAPPED signal interrupts `wait`. bash runs the action and
+        // returns 128+n immediately, leaving the remaining jobs running —
+        // it does not resume waiting. An ignored (`trap '' SIG`) or untrapped
+        // signal does not interrupt, which `dispatch_pending_traps` encodes by
+        // reporting only actions it actually ran.
+        if let Some(sig) = crate::traps::dispatch_pending_traps(shell) {
+            return ExecOutcome::Continue(128 + sig);
+        }
         // #183: reap only children we OWN. This used to be `waitpid(-1)`, which
         // reaps ANY child of the process — right for a standalone shell, wrong for
         // huck-engine as a library (it steals the embedder's children) and fatal in
@@ -5098,6 +5130,14 @@ fn wait_any_of(
     loop {
         if let Some(o) = crate::executor::check_interrupt(shell) {
             return o;
+        }
+        // #453: a TRAPPED signal interrupts `wait`. bash runs the action and
+        // returns 128+n immediately, leaving the remaining jobs running —
+        // it does not resume waiting. An ignored (`trap '' SIG`) or untrapped
+        // signal does not interrupt, which `dispatch_pending_traps` encodes by
+        // reporting only actions it actually ran.
+        if let Some(sig) = crate::traps::dispatch_pending_traps(shell) {
+            return ExecOutcome::Continue(128 + sig);
         }
         // #183: reap only children we OWN. This used to be `waitpid(-1)`, which
         // reaps ANY child of the process — right for a standalone shell, wrong for
