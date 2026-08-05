@@ -6,16 +6,16 @@ fn posix_fatal_is_gated_on_posix_and_noninteractive() {
     sh.is_interactive = false;
     // default mode → no-op
     sh.posix_fatal(127);
-    assert_eq!(sh.unwind.fatal, None);
+    assert_eq!(sh.fatal_status(), None);
     // posix + non-interactive → sets
     sh.shell_options.posix = true;
     sh.posix_fatal(127);
-    assert_eq!(sh.unwind.fatal, Some(127));
+    assert_eq!(sh.fatal_status(), Some(127));
     // posix + interactive → no-op (clear first)
-    sh.unwind.fatal = None;
+    sh.clear_fatal();
     sh.is_interactive = true;
     sh.posix_fatal(2);
-    assert_eq!(sh.unwind.fatal, None);
+    assert_eq!(sh.fatal_status(), None);
 }
 
 #[test]

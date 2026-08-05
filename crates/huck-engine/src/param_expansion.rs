@@ -1748,7 +1748,7 @@ mod tests {
         let r = expand_modifier("HUCK_TEST_PE_FATAL6", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Empty);
         // The flag must remain set (not cleared by the guard).
-        assert_eq!(shell.unwind.fatal, Some(1));
+        assert_eq!(shell.fatal_status(), Some(1));
     }
 
     #[test]

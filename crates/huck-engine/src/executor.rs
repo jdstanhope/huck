@@ -127,31 +127,82 @@ impl Drop for LiveChildGuard<'_> {
 /// SIGINT is pending; `None` when none is pending OR when a user `INT` trap
 /// (handler or ignore-form) is installed — the existing trap dispatch then
 /// handles it and execution continues, matching bash. (v138)
-pub(crate) fn check_interrupt(shell: &Shell) -> Option<ExecOutcome> {
+/// Which question a checkpoint is asking.
+///
+/// The two phases differ TODAY, and v354 preserves that asymmetry rather than
+/// normalising it — making every site consult everything would fire outcomes
+/// at sites that have never consulted them, which is a behaviour change
+/// wearing a refactor's clothes. Writing the two orders down here is the
+/// point: previously they were implied by statement order in two functions in
+/// different parts of the file.
+pub(crate) enum UnwindPhase {
+    /// Around a command — the six `check_interrupt` sites and the wait loops.
+    /// SIGINT -> timeout -> exit. Never consults discard or fatal.
+    Around,
+    /// After a command produced `Continue(c)` — `finish_command` only.
+    /// discard -> fatal -> exit. Never consults the atomics.
+    After,
+}
+
+/// The single place that decides what stops a command, and in what order.
+///
+/// REPORTS but never CONSUMES: the caller does the taking, because a discard's
+/// take must pair with `set_last_status(1)` (#351) and a `&Shell` reporter
+/// cannot write that.
+pub(crate) fn pending_unwind(shell: &Shell, phase: UnwindPhase) -> Option<ExecOutcome> {
     use std::sync::atomic::Ordering;
-    if shell
-        .sigint_flag
-        .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok()
-    {
-        if shell.trap_sigids.contains_key(&libc::SIGINT) {
-            return None;
+    match phase {
+        UnwindPhase::Around => {
+            // SIGINT is CONSUMED here (compare_exchange). When SIGINT is
+            // trapped we return None HAVING CLEARED it, so the trap action
+            // runs instead of the command being interrupted.
+            if shell
+                .sigint_flag
+                .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                if shell.trap_sigids.contains_key(&libc::SIGINT) {
+                    return None;
+                }
+                return Some(ExecOutcome::Interrupted(InterruptReason::Sigint));
+            }
+            // The timeout flag stays SET — the builder's epilogue does a
+            // single `swap(false)` at the run boundary to override to 124.
+            if shell.timeout_flag.load(Ordering::Relaxed) {
+                return Some(ExecOutcome::Interrupted(InterruptReason::Timeout));
+            }
+            // #442: peeked, not taken — consumed at the run boundary. Reported
+            // LAST: SIGINT and a timeout are externally imposed and outrank
+            // the script's own request.
+            shell
+                .exit_pending()
+                .map(|n| ExecOutcome::Interrupted(InterruptReason::ExitRequested(n)))
         }
-        return Some(ExecOutcome::Interrupted(InterruptReason::Sigint));
+        UnwindPhase::After => {
+            // v312 (#3/#49): the discard flavour wins if both it and a fatal
+            // were raised by the same command.
+            if shell.discard_pending() {
+                return Some(ExecOutcome::Interrupted(InterruptReason::DiscardCommand));
+            }
+            // A pending fatal is NOT reported as an outcome here: its arm must
+            // return `Continue(c)`, and `c` belongs to the caller, so
+            // reporting it would mean inventing a status. `finish_command`
+            // keeps an explicit `fatal_pending()` check immediately after this
+            // call, in the position it occupies today.
+            if shell.fatal_pending() {
+                return None;
+            }
+            shell
+                .exit_pending()
+                .map(|n| ExecOutcome::Interrupted(InterruptReason::ExitRequested(n)))
+        }
     }
-    // Timeout poll. The flag stays set — the builder's epilogue does a single
-    // `swap(false)` at the run boundary to override the exit code to 124.
-    if shell.timeout_flag.load(Ordering::Relaxed) {
-        return Some(ExecOutcome::Interrupted(InterruptReason::Timeout));
-    }
-    // #442: a trap action asked to exit. Reported LAST: SIGINT and a timeout
-    // are externally imposed and outrank the script's own request. Peeked, not
-    // taken — `check_interrupt` holds `&Shell`, and the value is consumed at
-    // the run boundary (the same shape as `timeout_flag`).
-    if let Some(n) = shell.exit_pending() {
-        return Some(ExecOutcome::Interrupted(InterruptReason::ExitRequested(n)));
-    }
-    None
+}
+
+/// Around-phase checkpoint. A named wrapper so its six call sites read
+/// unchanged.
+pub(crate) fn check_interrupt(shell: &Shell) -> Option<ExecOutcome> {
+    pending_unwind(shell, UnwindPhase::Around)
 }
 
 /// Runs a top-level sequence, sending the terminal pipeline-stage's stdout to
@@ -350,14 +401,26 @@ fn finish_command(
     // comsub boundary, and continued (not exited) at the driver loop. Checked
     // BEFORE pending_fatal_status: the discard flavor wins if both were somehow
     // raised by the same command.
-    if shell.take_discard() {
-        // #351: a discarded command's exit status is 1 (DiscardCommand maps to
-        // 1 at the driver). `set_last_status(c)` above wrote the "success"
-        // status of a bare assignment (`v=$((1/0))` → c=0); overwrite it so a
-        // following `$?` reads 1, matching bash.
-        shell.set_last_status(1);
-        return Some(ExecOutcome::Interrupted(InterruptReason::DiscardCommand));
+    // v354 (#466): the reporter DECIDES (precedence in one place), the caller
+    // CONSUMES. This is the call where all three shell-raised signals can be
+    // pending at once, so it is what makes the `After` precedence
+    // load-bearing rather than decorative.
+    match pending_unwind(shell, UnwindPhase::After) {
+        Some(ExecOutcome::Interrupted(InterruptReason::DiscardCommand)) => {
+            shell.take_discard();
+            // #351: a discarded command's exit status is 1 (DiscardCommand
+            // maps to 1 at the driver). `set_last_status(c)` above wrote the
+            // "success" status of a bare assignment (`v=$((1/0))` → c=0);
+            // overwrite it so a following `$?` reads 1, matching bash.
+            shell.set_last_status(1);
+            return Some(ExecOutcome::Interrupted(InterruptReason::DiscardCommand));
+        }
+        Some(other) => return Some(other),
+        None => {}
     }
+    // A pending fatal returns `Continue(c)`, which the reporter cannot build
+    // (it has no `c`) — hence an explicit check here, in the position it has
+    // always occupied.
     if shell.fatal_pending() {
         return Some(ExecOutcome::Continue(c));
     }
@@ -365,8 +428,8 @@ fn finish_command(
     // #442: a trap action (including one just dispatched above) ran `exit N`.
     // Checked BEFORE errexit so a trap's exit beats the errexit status — bash's
     // `set -e; trap "exit 9" ERR; false` exits 9, not 1.
-    if let Some(n) = shell.exit_pending() {
-        return Some(ExecOutcome::Interrupted(InterruptReason::ExitRequested(n)));
+    if let Some(o) = pending_unwind(shell, UnwindPhase::After) {
+        return Some(o);
     }
     if c != 0 && shell.err_suppressed_depth == 0 && is_last && !is_negated_pipeline(cmd) {
         if err_armed {
@@ -374,8 +437,8 @@ fn finish_command(
             // #442: the ERR action itself ran `exit N`. Checked here, AFTER the
             // fire and BEFORE errexit, so a trap's exit beats the errexit
             // status: bash's `set -e; trap "exit 9" ERR; false` exits 9, not 1.
-            if let Some(n) = shell.exit_pending() {
-                return Some(ExecOutcome::Interrupted(InterruptReason::ExitRequested(n)));
+            if let Some(o) = pending_unwind(shell, UnwindPhase::After) {
+                return Some(o);
             }
         }
         if let Some(out) = maybe_errexit(shell, c) {
@@ -1913,7 +1976,7 @@ fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool 
         // `$((xx++))` on a readonly var) sets `pending_discard`. bash aborts the
         // whole `case` at that point — stop testing further patterns; the caller's
         // post-`case_item_matches` discard check unwinds the command (status 1).
-        if shell.unwind.discard || shell.fatal_pending() {
+        if shell.discard_pending() || shell.fatal_pending() {
             return false;
         }
         let hit = if (extglob && crate::glob_match::has_extglob(&pattern))
@@ -2004,7 +2067,7 @@ fn run_case_inner(clause: &CaseClause, shell: &mut Shell) -> ExecOutcome {
             shell.set_last_status(1);
             return ExecOutcome::Interrupted(InterruptReason::DiscardCommand);
         }
-        if let Some(status) = shell.unwind.fatal {
+        if let Some(status) = shell.fatal_status() {
             return ExecOutcome::Continue(status);
         }
         if !run_this {
@@ -3205,13 +3268,13 @@ fn resolve(
         Ok(v) => v,
         Err(()) => return Err(1),
     };
-    if let Some(status) = shell.unwind.fatal {
+    if let Some(status) = shell.fatal_status() {
         return Err(status);
     }
     // v312 (#3/#49): a `$(( ))` arith error while expanding the program word
     // discards the command — skip resolution so it never runs (converted to
     // Interrupted(DiscardCommand) at the and-or conversion points).
-    if shell.unwind.discard {
+    if shell.discard_pending() {
         return Err(1);
     }
     // #62: the program word split to ZERO fields (an empty unquoted expansion,
@@ -3225,10 +3288,10 @@ fn resolve(
                 Ok(v) => v,
                 Err(()) => return Err(1),
             };
-            if let Some(status) = shell.unwind.fatal {
+            if let Some(status) = shell.fatal_status() {
                 return Err(status);
             }
-            if shell.unwind.discard {
+            if shell.discard_pending() {
                 return Err(1);
             }
             fields.extend(f);
@@ -3289,12 +3352,12 @@ fn resolve(
             Ok(v) => v,
             Err(()) => return Err(1),
         };
-        if let Some(status) = shell.unwind.fatal {
+        if let Some(status) = shell.fatal_status() {
             return Err(status);
         }
         // v312 (#3/#49): a `$(( ))` arith error while expanding an argument word
         // discards the command — skip so it never runs.
-        if shell.unwind.discard {
+        if shell.discard_pending() {
             return Err(1);
         }
         if let Some(da) = decl_args.as_mut() {
@@ -7565,7 +7628,7 @@ pub(crate) fn apply_one_assignment(
                     // already raised the discard, the command is being unwound —
                     // suppress the secondary "bad array subscript" diagnostic
                     // (bash prints only the arith error, then discards).
-                    if !shell.unwind.discard {
+                    if !shell.discard_pending() {
                         crate::sh_error_to!(shell, err, None, "{msg}");
                     }
                     return Err(());
@@ -7706,7 +7769,7 @@ fn expand_array_elements(
                 };
                 map.insert(idx, value);
                 implicit = idx + 1;
-                if shell.fatal_pending() || shell.unwind.discard {
+                if shell.fatal_pending() || shell.discard_pending() {
                     return Err(());
                 }
             }
@@ -7715,7 +7778,7 @@ fn expand_array_elements(
                     map.insert(implicit, field);
                     implicit += 1;
                 }
-                if shell.fatal_pending() || shell.unwind.discard {
+                if shell.fatal_pending() || shell.discard_pending() {
                     return Err(());
                 }
             }

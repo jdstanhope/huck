@@ -927,7 +927,7 @@ fn expand_array_param(
                     // #201: if the subscript's own `$(( ))` expansion already
                     // failed (arith error, `pending_discard` set + reported),
                     // suppress the redundant secondary "bad array subscript".
-                    if !shell.unwind.discard {
+                    if !shell.discard_pending() {
                         crate::sh_error!(shell, None, "{e}");
                     }
                     shell.raise_fatal(1);
@@ -954,7 +954,7 @@ fn expand_array_param(
                     // #201: if the subscript's own `$(( ))` expansion already
                     // failed (arith error, `pending_discard` set + reported),
                     // suppress the redundant secondary "bad array subscript".
-                    if !shell.unwind.discard {
+                    if !shell.discard_pending() {
                         crate::sh_error!(shell, None, "{e}");
                     }
                     shell.raise_fatal(1);

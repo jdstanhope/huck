@@ -654,15 +654,15 @@ pub struct Unwind {
     /// — bash lets the last exit win, which is how an EXIT trap overrides an
     /// earlier request from ERR (`trap "exit 7" EXIT; trap "exit 9" ERR;
     /// false` exits 7, not 9).
-    pub(crate) exit: Option<i32>,
+    exit: Option<i32>,
     /// v312 (#3/#31): a fatal arithmetic-expansion or readonly-assignment
     /// error DISCARDS the current command (status 1) without exiting the
     /// shell. Distinct from `fatal`, which does exit.
-    pub(crate) discard: bool,
+    discard: bool,
     /// `Some(status)` after a fatal parameter-expansion error: the shell exits
     /// with it once the current command unwinds. Distinct from `discard`,
     /// which unwinds WITHOUT exiting.
-    pub(crate) fatal: Option<i32>,
+    fatal: Option<i32>,
 }
 
 /// Per-session shell state: variables (each either exported or not) and the
@@ -3275,9 +3275,19 @@ impl Shell {
         self.unwind.fatal.is_some()
     }
 
+    /// The pending fatal status, if any. Does not consume.
+    pub fn fatal_status(&self) -> Option<i32> {
+        self.unwind.fatal
+    }
+
     /// Consumes the pending fatal status.
     pub fn take_fatal(&mut self) -> Option<i32> {
         self.unwind.fatal.take()
+    }
+
+    /// Drops a pending fatal status without reading it.
+    pub fn clear_fatal(&mut self) {
+        self.unwind.fatal = None;
     }
 
     /// Returns and clears the pending arithmetic-discard flag (v312 #3/#49).
@@ -3285,6 +3295,11 @@ impl Shell {
     /// loops and functions with status 1, but the shell does NOT exit.
     pub fn raise_discard(&mut self) {
         self.unwind.discard = true;
+    }
+
+    /// True when the current command is marked for discard. Does not consume.
+    pub fn discard_pending(&self) -> bool {
+        self.unwind.discard
     }
 
     /// Consumes the discard flag. The caller pairs this with
