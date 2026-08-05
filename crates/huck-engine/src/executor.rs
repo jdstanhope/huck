@@ -8038,6 +8038,20 @@ pub fn fork_and_run_in_subshell(
             // to 1 (the driver normally handles it; defensive here).
             ExecOutcome::Interrupted(InterruptReason::DiscardCommand) => 1,
         };
+        // #449: a child runs the EXIT trap it installed for ITSELF. The
+        // inherited one was cleared by `clear_for_subshell` above, so anything
+        // registered now belongs to this child. This is the only production
+        // path where a forked child runs shell code, so it covers `( )`, `&`,
+        // a pipeline stage and `$( )` alike.
+        //
+        // Fired BEFORE flush_stdout so the action's output reaches the
+        // captured pipe (`x=$( trap "echo t" EXIT; echo b )` captures both
+        // lines), and with the pending request CLEARED first — leaving it set
+        // aborts the action at its first checkpoint, the same trap #442 hit at
+        // the top-level exit path. The trap's own `exit N` then wins.
+        let requested = shell.take_pending_exit();
+        crate::traps::fire_exit_trap(shell);
+        let status = shell.take_pending_exit().or(requested).unwrap_or(status);
         let status = status.rem_euclid(256);
         // Flush the builtin's buffered stdout to the dup2'd fd 1 (pipe or
         // terminal) before _exit (M-118): _exit skips Rust's flush, which is
