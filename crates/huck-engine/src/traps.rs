@@ -394,6 +394,12 @@ pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Re
                 shell.traps.insert(TrapSignal::Real(signum), action);
                 return Ok(());
             }
+            // #474: a previous `trap - SIG` left a "perform the default action"
+            // emulator registered. Drop it first, or it would run alongside the
+            // new trap action and kill the shell right after it.
+            if let Some(id) = shell.default_sigids.remove(&signum) {
+                signal_hook::low_level::unregister(id);
+            }
             // Remove any existing handler before installing a new one
             // so we don't accumulate multiple trap closures per signal.
             if let Some(sigid) = shell.trap_sigids.remove(&signum) {
@@ -453,6 +459,49 @@ pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Re
 /// — signal-hook's existing SIGINT/SIGCHLD handlers (installed by
 /// `shell::install_sigint_handler` etc.) are unaffected because they
 /// were registered separately and have their own SigIds.
+/// #474: put a signal back to its DEFAULT action after `trap - SIG`.
+///
+/// Unregistering the trap action leaves signal_hook's own sigaction handler
+/// installed, which silently turns the signal into "caught and does nothing" —
+/// i.e. ignored. bash restores the default disposition, so a re-untrapped
+/// SIGTERM kills the shell again.
+///
+/// Doing that with `libc::signal(signum, SIG_DFL)` looks simpler and is WRONG:
+/// it changes the disposition behind signal_hook's back, so the registry still
+/// believes a handler is installed and a later `trap 'y' SIG` registers an
+/// action that never reaches the kernel — the next signal then kills the shell
+/// instead of running the new trap. Registering an action that PERFORMS the
+/// default keeps the registry's view and the kernel's in agreement.
+///
+/// Three signals are excluded:
+/// - SIGINT and SIGCHLD, because huck registers always-on flag handlers for
+///   them at startup (Ctrl-C polling, child reaping) that must survive
+///   `trap - INT` / `trap - CHLD`;
+/// - SIGQUIT until #478, because bash IGNORES it in a non-interactive shell,
+///   so the correct restore target there is IGNORE rather than default —
+///   emulating the default would turn an existing startup divergence into a
+///   new one on the reset path.
+fn restore_default_disposition(shell: &mut Shell, signum: i32) {
+    if signum == libc::SIGINT
+        || signum == libc::SIGCHLD
+        || signum == libc::SIGQUIT
+        || shell.default_sigids.contains_key(&signum)
+    {
+        return;
+    }
+    // SAFETY: the registered closure is async-signal-safe —
+    // `emulate_default_handler` is signal_hook's own implementation of "do what
+    // the default disposition would have done", intended for this use.
+    let registered = unsafe {
+        signal_hook_registry::register_unchecked(signum, move |_: &_| {
+            let _ = signal_hook::low_level::emulate_default_handler(signum);
+        })
+    };
+    if let Ok(id) = registered {
+        shell.default_sigids.insert(signum, id);
+    }
+}
+
 pub fn reset(shell: &mut Shell, sig: TrapSignal) -> Result<(), String> {
     match sig {
         TrapSignal::Exit | TrapSignal::Err | TrapSignal::Debug | TrapSignal::Return => {
@@ -465,6 +514,7 @@ pub fn reset(shell: &mut Shell, sig: TrapSignal) -> Result<(), String> {
             }
             if let Some(sigid) = shell.trap_sigids.remove(&signum) {
                 signal_hook::low_level::unregister(sigid);
+                restore_default_disposition(shell, signum);
             }
             shell.traps.remove(&TrapSignal::Real(signum));
             Ok(())
