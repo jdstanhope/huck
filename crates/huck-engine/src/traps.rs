@@ -59,17 +59,26 @@ pub fn drain_pending(shell: &mut Shell) -> Vec<i32> {
 /// Drains pending signals and executes registered trap actions in
 /// signal-number order, via `run_trap_action` in the current shell scope.
 ///
+/// Returns the number of the LAST signal whose action actually ran, or `None`
+/// if nothing was handled. `wait` uses that to return 128+n and stop waiting
+/// (#453); every other caller ignores it.
+///
 /// The action's outcome is discarded here, so an `exit` performed by a signal
 /// trap action does NOT currently end the shell — that is #442, whose fix
 /// consumes the outcome this now returns.
-pub fn dispatch_pending_traps(shell: &mut Shell) {
+pub fn dispatch_pending_traps(shell: &mut Shell) -> Option<i32> {
+    let mut ran = None;
     for sig in drain_pending(shell) {
         let action = match shell.traps.get(&TrapSignal::Real(sig)) {
             Some(Some(text)) => text.clone(),
+            // An IGNORED trap (`trap '' SIG`) is not "handled" for #453's
+            // purposes: bash does not interrupt `wait` for one.
             Some(None) | None => continue,
         };
         let _ = run_trap_action(shell, TrapSignal::Real(sig), &action);
+        ran = Some(sig);
     }
+    ran
 }
 
 /// What a trap action left behind.
