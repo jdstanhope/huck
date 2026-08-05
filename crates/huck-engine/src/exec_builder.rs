@@ -396,7 +396,7 @@ fn run_core(
         // #442: an `exit N` performed by a trap action decides the status. The
         // EXIT trap has already fired inside the run above, so any override it
         // requested is the one recorded here. A timeout still outranks it.
-        cell.borrow_mut().take_pending_exit().unwrap_or(code)
+        cell.borrow_mut().take_exit().unwrap_or(code)
     }
 }
 

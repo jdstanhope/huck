@@ -8355,7 +8355,7 @@ fn run_sourced_contents_in_sinks_inner(
                             // !is_interactive so interactive source/. and the rc
                             // path keep continuing past the error.
                             if !shell.is_interactive
-                                && let Some(st) = shell.take_pending_fatal_status()
+                                && let Some(st) = shell.take_fatal()
                             {
                                 return ExecOutcome::Exit(st);
                             }

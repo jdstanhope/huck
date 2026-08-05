@@ -117,7 +117,7 @@ pub(crate) fn run_trap_action(
     // than latch: bash lets the last exit win, which is how an EXIT trap
     // overrides an earlier request from ERR.
     if let crate::builtins::ExecOutcome::Exit(n) = outcome {
-        shell.pending_exit = Some(n);
+        shell.raise_exit(n);
     }
     TrapActionResult { outcome, status }
 }
@@ -353,7 +353,11 @@ pub fn clear_for_subshell(shell: &mut Shell) {
     shell.firing_traps.clear();
     shell.err_suppressed_depth = 0;
     // #442: a request recorded before the fork is the PARENT's business.
-    shell.pending_exit = None;
+    // Targeted, NOT `unwind = Default::default()`: the sibling slots
+    // (`discard`, `fatal` — v354) are deliberately NOT cleared here, because
+    // this function never cleared them and a subshell fork must not start
+    // doing so.
+    let _ = shell.take_exit();
 }
 
 /// Installs a trap action for `sig`. `action = Some(text)` registers;

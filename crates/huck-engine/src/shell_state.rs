@@ -637,6 +637,33 @@ pub struct Coproc {
     pub read_fd: std::os::unix::io::RawFd,
     pub write_fd: std::os::unix::io::RawFd,
 }
+/// The shell's own "stop what you are doing" signals: set deep in expansion or
+/// execution, consulted at a command boundary, converted into an
+/// `ExecOutcome::Interrupted(..)`.
+///
+/// Slots are INDEPENDENT and may be set at once — a discard and a fatal can
+/// both be raised during one command's expansion, and resolving between them
+/// belongs to `executor::pending_unwind`, not to storage.
+///
+/// The externally-raised signals (`Shell::sigint_flag`, `Shell::timeout_flag`)
+/// are deliberately NOT here: a signal handler and the timer thread write them
+/// from outside this thread, so they must stay `Arc<AtomicBool>`. (v354 #466)
+#[derive(Debug, Default, Clone)]
+pub struct Unwind {
+    /// #442: an `exit N` performed BY a trap action. Overwritten, not latched
+    /// — bash lets the last exit win, which is how an EXIT trap overrides an
+    /// earlier request from ERR (`trap "exit 7" EXIT; trap "exit 9" ERR;
+    /// false` exits 7, not 9).
+    exit: Option<i32>,
+    /// v312 (#3/#31): a fatal arithmetic-expansion or readonly-assignment
+    /// error DISCARDS the current command (status 1) without exiting the
+    /// shell. Distinct from `fatal`, which does exit.
+    discard: bool,
+    /// `Some(status)` after a fatal parameter-expansion error: the shell exits
+    /// with it once the current command unwinds. Distinct from `discard`,
+    /// which unwinds WITHOUT exiting.
+    fatal: Option<i32>,
+}
 
 /// Per-session shell state: variables (each either exported or not) and the
 /// last command's exit status. The initial set of variables is seeded from
@@ -766,27 +793,15 @@ pub struct Shell {
     /// firing the DEBUG trap on function ENTRY, matching bash's
     /// function-tracing entry fire.
     pub function_def_line: std::collections::HashMap<String, u32>,
-    /// `Some(status)` after a fatal parameter-expansion error fires
-    /// inside an `expand_*` call. The executor peeks this to bail the
-    /// current simple command; the REPL loop drains it via
-    /// `take_pending_fatal_status` to decide whether to exit (in
-    /// non-interactive mode) or return to prompt (interactive).
-    pub pending_fatal_status: Option<i32>,
-    /// v312 (#3/#49): a fatal arithmetic expansion error is pending — the current
-    /// command must be DISCARDED (converted to `Interrupted(DiscardCommand)`).
-    /// Sibling of `pending_fatal_status` but the DISCARD flavor (unwind the
-    /// current top-level command, status 1) rather than exit-shell.
-    pub pending_discard: bool,
     /// #442: an `exit N` performed BY a trap action. Set in
     /// `traps::run_trap_action`, surfaced by `executor::check_interrupt` as
     /// `InterruptReason::ExitRequested(n)`, and consumed at a run boundary —
     /// the same lifecycle as `timeout_flag`, which is why `check_interrupt`
     /// can stay `&Shell`.
     ///
-    /// OVERWRITTEN, not latched: bash lets the LAST exit win, which is how the
-    /// EXIT trap overrides an earlier request from ERR
-    /// (`trap "exit 7" EXIT; trap "exit 9" ERR; false` exits 7, not 9).
-    pub pending_exit: Option<i32>,
+    /// v354 (#466): the shell-raised unwind signals in one named home. Reached
+    /// through `raise_*` / `take_*` / `*_pending`, never poked directly.
+    pub unwind: Unwind,
     /// Set by a POSIX special builtin when it hits a usage / bad-option /
     /// bad-assignment error (NOT a runtime error). Consumed by the executor's
     /// bare special-builtin dispatch to fire `posix_fatal`. Cleared per command.
@@ -1160,9 +1175,7 @@ impl Shell {
             inline_scalar_export: Vec::new(),
             function_source: std::collections::HashMap::new(),
             function_def_line: std::collections::HashMap::new(),
-            pending_fatal_status: None,
-            pending_discard: false,
-            pending_exit: None,
+            unwind: Unwind::default(),
             builtin_usage_error: None,
             is_interactive: std::io::stdin().is_terminal(),
             is_command_string: false,
@@ -3252,27 +3265,73 @@ impl Shell {
     }
 
     /// Returns and clears the pending fatal-PE-error flag.
-    pub fn take_pending_fatal_status(&mut self) -> Option<i32> {
-        self.pending_fatal_status.take()
+    /// Records a fatal expansion error's exit status.
+    pub fn raise_fatal(&mut self, n: i32) {
+        self.unwind.fatal = Some(n);
+    }
+
+    /// True when a fatal status is pending. Does not consume.
+    pub fn fatal_pending(&self) -> bool {
+        self.unwind.fatal.is_some()
+    }
+
+    /// The pending fatal status, if any. Does not consume.
+    pub fn fatal_status(&self) -> Option<i32> {
+        self.unwind.fatal
+    }
+
+    /// Consumes the pending fatal status.
+    pub fn take_fatal(&mut self) -> Option<i32> {
+        self.unwind.fatal.take()
+    }
+
+    /// Drops a pending fatal status without reading it.
+    pub fn clear_fatal(&mut self) {
+        self.unwind.fatal = None;
     }
 
     /// Returns and clears the pending arithmetic-discard flag (v312 #3/#49).
-    pub fn take_pending_discard(&mut self) -> bool {
-        std::mem::take(&mut self.pending_discard)
+    /// Marks the current command for discard (v312 #3/#31): it unwinds out of
+    /// loops and functions with status 1, but the shell does NOT exit.
+    pub fn raise_discard(&mut self) {
+        self.unwind.discard = true;
+    }
+
+    /// True when the current command is marked for discard. Does not consume.
+    pub fn discard_pending(&self) -> bool {
+        self.unwind.discard
+    }
+
+    /// Consumes the discard flag. The caller pairs this with
+    /// `set_last_status(1)` (#351) — that write is why the reporter reports
+    /// but never consumes.
+    pub fn take_discard(&mut self) -> bool {
+        std::mem::take(&mut self.unwind.discard)
+    }
+
+    /// Records an `exit N` performed by a trap action (#442). Overwrites: the
+    /// last exit wins, which is how an EXIT trap overrides an earlier request.
+    pub fn raise_exit(&mut self, n: i32) {
+        self.unwind.exit = Some(n);
+    }
+
+    /// Peeks at a pending trap-action exit without consuming it.
+    pub fn exit_pending(&self) -> Option<i32> {
+        self.unwind.exit
     }
 
     /// Consumes a pending trap-action `exit` (#442). Called at the run
     /// boundaries — the top-level reducer, the REPL and the forked-child exit
     /// path — AFTER the EXIT trap has had its chance to overwrite it.
-    pub fn take_pending_exit(&mut self) -> Option<i32> {
-        self.pending_exit.take()
+    pub fn take_exit(&mut self) -> Option<i32> {
+        self.unwind.exit.take()
     }
 
     /// Mark a POSIX-mode fatal error: a non-interactive posix shell exits with
     /// `status`. No-op in default mode or interactively (matches bash).
     pub fn posix_fatal(&mut self, status: i32) {
         if self.shell_options.posix && !self.is_interactive {
-            self.pending_fatal_status = Some(status);
+            self.raise_fatal(status);
         }
     }
 

@@ -6,16 +6,16 @@ fn posix_fatal_is_gated_on_posix_and_noninteractive() {
     sh.is_interactive = false;
     // default mode → no-op
     sh.posix_fatal(127);
-    assert_eq!(sh.pending_fatal_status, None);
+    assert_eq!(sh.fatal_status(), None);
     // posix + non-interactive → sets
     sh.shell_options.posix = true;
     sh.posix_fatal(127);
-    assert_eq!(sh.pending_fatal_status, Some(127));
+    assert_eq!(sh.fatal_status(), Some(127));
     // posix + interactive → no-op (clear first)
-    sh.pending_fatal_status = None;
+    sh.clear_fatal();
     sh.is_interactive = true;
     sh.posix_fatal(2);
-    assert_eq!(sh.pending_fatal_status, None);
+    assert_eq!(sh.fatal_status(), None);
 }
 
 #[test]
@@ -788,4 +788,56 @@ fn unset_posixly_correct_disables_posix() {
     assert!(sh.shell_options.posix);
     sh.unset("POSIXLY_CORRECT");
     assert!(!sh.shell_options.posix);
+}
+
+// ----- v354 (#466): the Unwind family ---------------------------------------
+
+#[test]
+fn unwind_exit_slot_raises_peeks_and_takes() {
+    let mut shell = Shell::new();
+    assert_eq!(shell.exit_pending(), None, "clean shell has no request");
+    shell.raise_exit(9);
+    assert_eq!(shell.exit_pending(), Some(9), "peek does not consume");
+    assert_eq!(shell.exit_pending(), Some(9), "still there after a peek");
+    assert_eq!(shell.take_exit(), Some(9), "take consumes");
+    assert_eq!(shell.exit_pending(), None, "gone after take");
+}
+
+#[test]
+fn unwind_exit_slot_overwrites_rather_than_latching() {
+    // #442: the LAST exit wins — an EXIT trap overrides an earlier request.
+    let mut shell = Shell::new();
+    shell.raise_exit(9);
+    shell.raise_exit(7);
+    assert_eq!(shell.take_exit(), Some(7));
+}
+
+#[test]
+fn unwind_discard_slot_is_independent_of_exit() {
+    // The slots must NOT share storage: a discard and an exit can both be
+    // pending, and `finish_command` resolves between them. A single
+    // `Option<Unwind>` would turn "discard wins" into "last writer wins".
+    let mut shell = Shell::new();
+    shell.raise_discard();
+    shell.raise_exit(9);
+    assert!(shell.take_discard(), "discard survived raising an exit");
+    assert_eq!(
+        shell.exit_pending(),
+        Some(9),
+        "exit survived taking a discard"
+    );
+    assert!(!shell.take_discard(), "take clears the discard");
+}
+
+#[test]
+fn unwind_fatal_slot_coexists_with_the_others() {
+    let mut shell = Shell::new();
+    shell.raise_fatal(2);
+    shell.raise_discard();
+    shell.raise_exit(9);
+    assert!(shell.fatal_pending(), "fatal is pending");
+    assert!(shell.take_discard(), "discard unaffected");
+    assert_eq!(shell.take_fatal(), Some(2), "fatal carries its status");
+    assert!(!shell.fatal_pending(), "gone after take");
+    assert_eq!(shell.exit_pending(), Some(9), "exit unaffected");
 }

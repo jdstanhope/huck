@@ -76,7 +76,7 @@ pub fn expand_modifier_with_value(
     quoted: bool,
     shell: &mut Shell,
 ) -> ExpansionResult {
-    if shell.pending_fatal_status.is_some() {
+    if shell.fatal_pending() {
         return ExpansionResult::Empty;
     }
     // `get_raw` returns the value to test against null/unset. For
@@ -1739,7 +1739,7 @@ mod tests {
         // flag, expand_modifier returns Empty immediately without doing
         // work — no eprintln, no side-effects.
         let mut shell = Shell::new();
-        shell.pending_fatal_status = Some(1);
+        shell.raise_fatal(1);
         shell.export_set("HUCK_TEST_PE_FATAL6", "abc".to_string());
         let m = ParamModifier::Substring {
             offset: lit("0"),
@@ -1748,7 +1748,7 @@ mod tests {
         let r = expand_modifier("HUCK_TEST_PE_FATAL6", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Empty);
         // The flag must remain set (not cleared by the guard).
-        assert_eq!(shell.pending_fatal_status, Some(1));
+        assert_eq!(shell.fatal_status(), Some(1));
     }
 
     #[test]

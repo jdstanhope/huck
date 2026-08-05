@@ -54,6 +54,21 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   (`timeout.rs`) that, on deadline, sets `Shell.timeout_flag` (polled by
   `executor::check_interrupt`) and SIGTERMs every pid in
   `Shell.live_external_children`, with the call returning exit 124.
+  The five pending-unwind signals (v354, #466) split by WHO RAISES THEM: the
+  three the shell raises itself live in `Shell::unwind` (`Unwind { discard,
+  fatal, exit }`, PRIVATE slots reached via `raise_*` / `take_*` /
+  `*_pending`), while `sigint_flag` and `timeout_flag` stay
+  `Arc<AtomicBool>` because a signal handler and the timer thread write them
+  from outside the interpreter's thread. Slots are independent — a discard and
+  a fatal can both be raised during one command's expansion — so resolving
+  between them belongs to the reporter, not to storage.
+  `executor::pending_unwind(shell, phase)` is that single reporter, and it
+  takes a phase because the two checkpoints genuinely ask different questions:
+  `Around` (the six `check_interrupt` sites) is SIGINT -> timeout -> exit and
+  never consults discard/fatal; `After` (`finish_command`) is discard -> fatal
+  -> exit and never consults the atomics. That asymmetry is PRESERVED
+  deliberately. The reporter REPORTS but never CONSUMES — a discard's take
+  must pair with `set_last_status(1)` (#351), which a `&Shell` cannot write.
   `ExecOutcome::Interrupted` carries an
   `InterruptReason::{Sigint,Timeout,DiscardCommand,ExitRequested}` discriminator
   so the top-level reducer can map to 130 (SIGINT), 124 (timeout), 1 (a v312

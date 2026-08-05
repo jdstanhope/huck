@@ -1522,19 +1522,19 @@ fn exec_script(src: &str, shell: &mut Shell) {
 fn posix_source_not_found_is_fatal() {
     let mut shell = Shell::new();
     exec_script("set -o posix\n. /no/such/huck_file_xyz\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, Some(1));
+    assert_eq!(shell.fatal_status(), Some(1));
 }
 #[test]
 fn default_source_not_found_is_not_fatal() {
     let mut shell = Shell::new();
     exec_script(". /no/such/huck_file_xyz\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, None);
+    assert_eq!(shell.fatal_status(), None);
 }
 #[test]
 fn posix_function_named_special_builtin_is_fatal() {
     let mut shell = Shell::new();
     exec_script("set -o posix\neval() { :; }\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, Some(2));
+    assert_eq!(shell.fatal_status(), Some(2));
     assert!(
         !shell.functions.contains_key("eval"),
         "function not defined"
@@ -1544,7 +1544,7 @@ fn posix_function_named_special_builtin_is_fatal() {
 fn default_function_named_special_builtin_is_allowed() {
     let mut shell = Shell::new();
     exec_script("eval() { :; }\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, None);
+    assert_eq!(shell.fatal_status(), None);
     assert!(shell.functions.contains_key("eval"));
 }
 #[test]
@@ -1554,25 +1554,25 @@ fn posix_readonly_for_var_is_fatal() {
         "set -o posix\nreadonly i=1\nfor i in a b; do :; done\n",
         &mut shell,
     );
-    assert_eq!(shell.pending_fatal_status, Some(127));
+    assert_eq!(shell.fatal_status(), Some(127));
 }
 #[test]
 fn default_readonly_for_var_is_not_fatal() {
     let mut shell = Shell::new();
     exec_script("readonly i=1\nfor i in a b; do :; done\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, None);
+    assert_eq!(shell.fatal_status(), None);
 }
 #[test]
 fn posix_assignment_no_command_is_fatal() {
     let mut shell = Shell::new();
     exec_script("set -o posix\nreadonly x=1\nx=2\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, Some(127));
+    assert_eq!(shell.fatal_status(), Some(127));
 }
 #[test]
 fn posix_assignment_before_special_is_fatal() {
     let mut shell = Shell::new();
     exec_script("set -o posix\nreadonly x=1\nx=2 export y\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, Some(127));
+    assert_eq!(shell.fatal_status(), Some(127));
 }
 #[test]
 fn posix_readonly_prefix_before_regular_is_fatal() {
@@ -1581,20 +1581,20 @@ fn posix_readonly_prefix_before_regular_is_fatal() {
     // special builtins. Default mode runs the command instead (tested above).
     let mut shell = Shell::new();
     exec_script("set -o posix\nreadonly x=1\nx=2 true\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, Some(1));
+    assert_eq!(shell.fatal_status(), Some(1));
 }
 #[test]
 fn default_assignment_no_command_is_not_fatal() {
     let mut shell = Shell::new();
     exec_script("readonly x=1\nx=2\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, None);
+    assert_eq!(shell.fatal_status(), None);
 }
 
 // ----- Case #1: special-builtin usage / assignment errors are posix-fatal --
 fn posix_run(src: &str) -> Option<i32> {
     let mut shell = Shell::new();
     exec_script(&format!("set -o posix\n{src}\n"), &mut shell);
-    shell.pending_fatal_status
+    shell.fatal_status()
 }
 #[test]
 fn posix_special_builtin_usage_errors_exit() {
@@ -2183,4 +2183,46 @@ fn case_non_error_arith_patterns_unchanged() {
         "x=0 y=1\ncase 1 in $((y=0)) ) ;; $((x=1)) ) ;& $((x=2)) ) echo $x.$y ;; esac\necho end=$?\n",
     );
     assert_eq!(out, "1.0\nend=0\n");
+}
+
+// ----- v354 (#466): the two-phase unwind reporter ---------------------------
+
+#[test]
+fn pending_unwind_around_ignores_shell_raised_signals() {
+    // The Around phase is what `check_interrupt` asks: the atomics plus a
+    // trap's exit. It must NOT report a discard or a fatal — those belong to
+    // the After phase, and reporting them here would fire at six sites that
+    // have never consulted them.
+    let mut shell = Shell::new();
+    shell.raise_discard();
+    shell.raise_fatal(2);
+    assert!(
+        pending_unwind(&shell, UnwindPhase::Around).is_none(),
+        "Around must ignore discard and fatal"
+    );
+    shell.raise_exit(9);
+    assert!(
+        matches!(
+            pending_unwind(&shell, UnwindPhase::Around),
+            Some(ExecOutcome::Interrupted(InterruptReason::ExitRequested(9)))
+        ),
+        "Around reports a trap's exit"
+    );
+}
+
+#[test]
+fn pending_unwind_after_prefers_discard_over_the_others() {
+    // The documented precedence of the After phase, in one place: a discard
+    // outranks a fatal and an exit raised by the same command.
+    let mut shell = Shell::new();
+    shell.raise_discard();
+    shell.raise_fatal(2);
+    shell.raise_exit(9);
+    assert!(
+        matches!(
+            pending_unwind(&shell, UnwindPhase::After),
+            Some(ExecOutcome::Interrupted(InterruptReason::DiscardCommand))
+        ),
+        "discard outranks fatal and exit"
+    );
 }

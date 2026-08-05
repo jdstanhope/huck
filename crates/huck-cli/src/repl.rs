@@ -309,7 +309,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
                         // (stdin not a TTY), exit immediately with the fatal
                         // status. Interactive: $? already set; fall through
                         // to the next prompt iteration.
-                        if let Some(fatal_status) = shell.take_pending_fatal_status()
+                        if let Some(fatal_status) = shell.take_fatal()
                             && !shell.is_interactive
                         {
                             return shell_exit(&mut shell, fatal_status);
@@ -373,9 +373,9 @@ fn shell_exit(shell: &mut Shell, code: i32) -> i32 {
     // #442: clear any pending request BEFORE the EXIT trap runs (a set flag
     // would abort the action at its first checkpoint), then let the EXIT trap
     // have the final word over it.
-    let requested = shell.take_pending_exit();
+    let requested = shell.take_exit();
     huck_engine::traps::fire_exit_trap(shell);
-    let code = shell.take_pending_exit().or(requested).unwrap_or(code);
+    let code = shell.take_exit().or(requested).unwrap_or(code);
     shell.hangup_jobs();
     shell.save_history();
     code

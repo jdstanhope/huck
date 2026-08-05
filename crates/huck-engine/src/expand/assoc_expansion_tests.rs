@@ -150,7 +150,7 @@ fn nounset_on_missing_key_fires_pe_error() {
     let mut s = shell_with_m();
     s.shell_options.nounset = true;
     let _ = expand_for_test(&mut s, "${m[nope]}");
-    assert!(s.pending_fatal_status.is_some());
+    assert!(s.fatal_pending());
 }
 
 #[test]
@@ -177,7 +177,7 @@ fn modifier_no_colon_on_missing_key_uses_default() {
 fn error_if_unset_on_missing_associative_key_fires() {
     let mut s = shell_with_m();
     let _ = expand_for_test(&mut s, "${m[nope]:?missing}");
-    assert!(s.pending_fatal_status.is_some());
+    assert!(s.fatal_pending());
 }
 
 // v73 regression: ${m[k]:+alt} on a missing key returns empty (the

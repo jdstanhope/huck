@@ -972,8 +972,8 @@ fn expand_arith_part_division_by_zero_raises_discard() {
     let mut shell = Shell::new();
     let word = Word(vec![arith_part("1 / 0")]);
     let _ = expand(&word, &mut shell);
-    assert_eq!(shell.pending_fatal_status, None);
-    assert!(shell.pending_discard);
+    assert_eq!(shell.fatal_status(), None);
+    assert!(shell.discard_pending());
 }
 
 #[test]
@@ -983,7 +983,7 @@ fn expand_arith_error_is_posix_fatal() {
     shell.is_interactive = false;
     let word = Word(vec![arith_part("1 + ")]);
     let _ = expand(&word, &mut shell);
-    assert_eq!(shell.pending_fatal_status, Some(127));
+    assert_eq!(shell.fatal_status(), Some(127));
 }
 
 #[test]
@@ -994,8 +994,8 @@ fn expand_arith_part_invalid_lhs_assignment_raises_discard() {
     let mut shell = Shell::new();
     let word = Word(vec![arith_part("1 + 2 = 3")]);
     let _ = expand(&word, &mut shell);
-    assert_eq!(shell.pending_fatal_status, None);
-    assert!(shell.pending_discard);
+    assert_eq!(shell.fatal_status(), None);
+    assert!(shell.discard_pending());
 }
 
 #[test]
@@ -1116,7 +1116,7 @@ fn expand_param_expansion_error_yields_empty_field_sets_status() {
     // pending_fatal_status and returning the partial (empty) result
     // without the end-of-word push, so fields is empty.
     assert_eq!(fields.len(), 0);
-    assert_eq!(shell.pending_fatal_status, Some(1));
+    assert_eq!(shell.fatal_status(), Some(1));
 }
 
 #[test]
