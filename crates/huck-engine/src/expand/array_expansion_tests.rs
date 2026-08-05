@@ -157,7 +157,7 @@ fn nounset_on_unset_element_fires_pe_error() {
     let mut s = shell_with_a();
     s.shell_options.nounset = true;
     let _ = expand_for_test(&mut s, "${a[99]}");
-    assert!(s.pending_fatal_status.is_some());
+    assert!(s.fatal_pending());
 }
 
 #[test]
@@ -176,7 +176,7 @@ fn length_of_element_at_bad_subscript_errors() {
     // rather than silently using idx 0.
     let mut s = Shell::new();
     let _ = expand_for_test(&mut s, "${#nonexistent[-1]}");
-    assert!(s.pending_fatal_status.is_some());
+    assert!(s.fatal_pending());
 }
 
 // v73 regression: ${a[i]:-default} on a missing index must substitute
@@ -205,7 +205,7 @@ fn modifier_no_colon_on_missing_index_uses_default() {
 fn error_if_unset_on_missing_index_fires() {
     let mut s = shell_with_a();
     let _ = expand_for_test(&mut s, "${a[99]:?missing}");
-    assert!(s.pending_fatal_status.is_some());
+    assert!(s.fatal_pending());
 }
 
 // v73 regression: ${a[i]:+alt} on a missing index returns empty (the

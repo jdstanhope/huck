@@ -6,16 +6,16 @@ fn posix_fatal_is_gated_on_posix_and_noninteractive() {
     sh.is_interactive = false;
     // default mode → no-op
     sh.posix_fatal(127);
-    assert_eq!(sh.pending_fatal_status, None);
+    assert_eq!(sh.unwind.fatal, None);
     // posix + non-interactive → sets
     sh.shell_options.posix = true;
     sh.posix_fatal(127);
-    assert_eq!(sh.pending_fatal_status, Some(127));
+    assert_eq!(sh.unwind.fatal, Some(127));
     // posix + interactive → no-op (clear first)
-    sh.pending_fatal_status = None;
+    sh.unwind.fatal = None;
     sh.is_interactive = true;
     sh.posix_fatal(2);
-    assert_eq!(sh.pending_fatal_status, None);
+    assert_eq!(sh.unwind.fatal, None);
 }
 
 #[test]
@@ -827,4 +827,17 @@ fn unwind_discard_slot_is_independent_of_exit() {
         "exit survived taking a discard"
     );
     assert!(!shell.take_discard(), "take clears the discard");
+}
+
+#[test]
+fn unwind_fatal_slot_coexists_with_the_others() {
+    let mut shell = Shell::new();
+    shell.raise_fatal(2);
+    shell.raise_discard();
+    shell.raise_exit(9);
+    assert!(shell.fatal_pending(), "fatal is pending");
+    assert!(shell.take_discard(), "discard unaffected");
+    assert_eq!(shell.take_fatal(), Some(2), "fatal carries its status");
+    assert!(!shell.fatal_pending(), "gone after take");
+    assert_eq!(shell.exit_pending(), Some(9), "exit unaffected");
 }

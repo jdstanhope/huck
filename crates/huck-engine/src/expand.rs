@@ -445,7 +445,7 @@ fn expand_assoc_param(
             let val = shell.lookup_associative_element(name, &key);
             if val.is_none() && shell.shell_options.nounset {
                 crate::sh_error!(shell, None, "{name}[{key}]: unbound variable");
-                shell.pending_fatal_status = Some(1);
+                shell.raise_fatal(1);
                 return ExpansionResult::Fatal { status: 1 };
             }
             ExpansionResult::Value(val.unwrap_or_default())
@@ -491,7 +491,7 @@ fn expand_assoc_param(
                 Ok(v) => v,
                 Err(e) => {
                     crate::sh_error!(shell, None, "{name}: {e}");
-                    shell.pending_fatal_status = Some(1);
+                    shell.raise_fatal(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
@@ -653,7 +653,7 @@ fn expand_indirect(
     // value-as-name indirection.
     if subscript.is_none() && (name == "$" || name == "!") {
         crate::sh_error!(shell, None, "${{!{name}}}: bad substitution");
-        shell.pending_fatal_status = Some(1);
+        shell.raise_fatal(1);
         return ExpansionResult::Fatal { status: 1 };
     }
     // Nameref special case: ${!r} where r is a nameref yields the TARGET NAME
@@ -854,7 +854,7 @@ fn expand_array_param(
     use crate::param_expansion::ExpansionResult;
     use crate::shell_state::ResolvedName;
 
-    if shell.pending_fatal_status.is_some() {
+    if shell.fatal_pending() {
         return ExpansionResult::Empty;
     }
 
@@ -930,14 +930,14 @@ fn expand_array_param(
                     if !shell.unwind.discard {
                         crate::sh_error!(shell, None, "{e}");
                     }
-                    shell.pending_fatal_status = Some(1);
+                    shell.raise_fatal(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
             let val = shell.lookup_indexed_element(name, idx);
             if val.is_none() && shell.shell_options.nounset {
                 crate::sh_error!(shell, None, "{name}[{idx}]: unbound variable");
-                shell.pending_fatal_status = Some(1);
+                shell.raise_fatal(1);
                 return ExpansionResult::Fatal { status: 1 };
             }
             ExpansionResult::Value(val.unwrap_or_default())
@@ -957,7 +957,7 @@ fn expand_array_param(
                     if !shell.unwind.discard {
                         crate::sh_error!(shell, None, "{e}");
                     }
-                    shell.pending_fatal_status = Some(1);
+                    shell.raise_fatal(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
@@ -986,7 +986,7 @@ fn expand_array_param(
                 Ok(v) => v,
                 Err(e) => {
                     crate::sh_error!(shell, None, "{name}: {e}");
-                    shell.pending_fatal_status = Some(1);
+                    shell.raise_fatal(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
@@ -1199,7 +1199,7 @@ fn expand_part(
                 None => {
                     if shell.shell_options.nounset {
                         crate::sh_error!(shell, None, "{name}: unbound variable");
-                        shell.pending_fatal_status = Some(1);
+                        shell.raise_fatal(1);
                         return ControlFlow::Break(());
                     }
                 }
@@ -1222,7 +1222,7 @@ fn expand_part(
                 None => {
                     if shell.shell_options.nounset {
                         crate::sh_error!(shell, None, "{name}: unbound variable");
-                        shell.pending_fatal_status = Some(1);
+                        shell.raise_fatal(1);
                         return ControlFlow::Break(());
                     }
                     String::new()
@@ -1355,7 +1355,7 @@ fn expand_part(
             {
                 if shell.lookup_var(name).is_none() && shell.shell_options.nounset {
                     crate::sh_error!(shell, None, "{name}: unbound variable");
-                    shell.pending_fatal_status = Some(1);
+                    shell.raise_fatal(1);
                     return ControlFlow::Break(());
                 }
             }
@@ -1465,7 +1465,7 @@ fn expand_part(
                     }
                 }
                 crate::param_expansion::ExpansionResult::Fatal { status } => {
-                    shell.pending_fatal_status = Some(status);
+                    shell.raise_fatal(status);
                     return ControlFlow::Break(());
                 }
             }
@@ -1692,7 +1692,7 @@ fn emit_bad_subst(modifier: &crate::lexer::ParamModifier, word: &Word, shell: &m
     if let crate::lexer::ParamModifier::BadSubst { .. } = modifier {
         let src = reconstruct_word_source_inner(word);
         crate::sh_error!(shell, None, "{src}: bad substitution");
-        shell.pending_fatal_status = Some(1);
+        shell.raise_fatal(1);
         true
     } else {
         false
@@ -1964,7 +1964,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 None => {
                     if shell.shell_options.nounset {
                         crate::sh_error!(shell, None, "{name}: unbound variable");
-                        shell.pending_fatal_status = Some(1);
+                        shell.raise_fatal(1);
                         return result;
                     }
                 }
@@ -2057,7 +2057,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                         result.push_str(&joined);
                     }
                     crate::param_expansion::ExpansionResult::Fatal { status } => {
-                        shell.pending_fatal_status = Some(status);
+                        shell.raise_fatal(status);
                         return result;
                     }
                 }
@@ -2129,7 +2129,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 // wrapper exists only for source reconstruction.
                 for inner in parts {
                     result.push_str(&expand_assignment(&Word(vec![inner.clone()]), shell));
-                    if shell.pending_fatal_status.is_some() {
+                    if shell.fatal_pending() {
                         return result;
                     }
                 }
@@ -2209,7 +2209,7 @@ fn expand_word_with_quote_escape(
         } else {
             expand_assignment(&Word(vec![part.clone()]), shell)
         };
-        if shell.pending_fatal_status.is_some() {
+        if shell.fatal_pending() {
             return result;
         }
         if word_part_is_quoted(part) {

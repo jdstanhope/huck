@@ -341,7 +341,7 @@ pub fn run_program_in_sinks(
         // run_sourced_contents normalizes FunctionReturn -> Continue, so this arm is
         // defensive; treat a stray top-level return code as the exit status.
         ExecOutcome::FunctionReturn(n) => n,
-        ExecOutcome::Continue(s) => shell.take_pending_fatal_status().unwrap_or(s),
+        ExecOutcome::Continue(s) => shell.take_fatal().unwrap_or(s),
         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
         ExecOutcome::Interrupted(InterruptReason::Sigint) => 130,
         ExecOutcome::Interrupted(InterruptReason::Timeout) => 124,
@@ -554,7 +554,7 @@ fn process_line_in_sinks_ex(
             // parameter-expansion errors. Command contexts (`eval`) never set
             // `top_level`, so their syntax errors stay non-fatal.
             if top_level && !shell.is_interactive {
-                shell.pending_fatal_status = Some(2);
+                shell.raise_fatal(2);
             }
             ExecOutcome::Continue(2)
         }

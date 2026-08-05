@@ -659,6 +659,10 @@ pub struct Unwind {
     /// error DISCARDS the current command (status 1) without exiting the
     /// shell. Distinct from `fatal`, which does exit.
     pub(crate) discard: bool,
+    /// `Some(status)` after a fatal parameter-expansion error: the shell exits
+    /// with it once the current command unwinds. Distinct from `discard`,
+    /// which unwinds WITHOUT exiting.
+    pub(crate) fatal: Option<i32>,
 }
 
 /// Per-session shell state: variables (each either exported or not) and the
@@ -789,12 +793,6 @@ pub struct Shell {
     /// firing the DEBUG trap on function ENTRY, matching bash's
     /// function-tracing entry fire.
     pub function_def_line: std::collections::HashMap<String, u32>,
-    /// `Some(status)` after a fatal parameter-expansion error fires
-    /// inside an `expand_*` call. The executor peeks this to bail the
-    /// current simple command; the REPL loop drains it via
-    /// `take_pending_fatal_status` to decide whether to exit (in
-    /// non-interactive mode) or return to prompt (interactive).
-    pub pending_fatal_status: Option<i32>,
     /// #442: an `exit N` performed BY a trap action. Set in
     /// `traps::run_trap_action`, surfaced by `executor::check_interrupt` as
     /// `InterruptReason::ExitRequested(n)`, and consumed at a run boundary —
@@ -1177,7 +1175,6 @@ impl Shell {
             inline_scalar_export: Vec::new(),
             function_source: std::collections::HashMap::new(),
             function_def_line: std::collections::HashMap::new(),
-            pending_fatal_status: None,
             unwind: Unwind::default(),
             builtin_usage_error: None,
             is_interactive: std::io::stdin().is_terminal(),
@@ -3268,8 +3265,19 @@ impl Shell {
     }
 
     /// Returns and clears the pending fatal-PE-error flag.
-    pub fn take_pending_fatal_status(&mut self) -> Option<i32> {
-        self.pending_fatal_status.take()
+    /// Records a fatal expansion error's exit status.
+    pub fn raise_fatal(&mut self, n: i32) {
+        self.unwind.fatal = Some(n);
+    }
+
+    /// True when a fatal status is pending. Does not consume.
+    pub fn fatal_pending(&self) -> bool {
+        self.unwind.fatal.is_some()
+    }
+
+    /// Consumes the pending fatal status.
+    pub fn take_fatal(&mut self) -> Option<i32> {
+        self.unwind.fatal.take()
     }
 
     /// Returns and clears the pending arithmetic-discard flag (v312 #3/#49).
@@ -3308,7 +3316,7 @@ impl Shell {
     /// `status`. No-op in default mode or interactively (matches bash).
     pub fn posix_fatal(&mut self, status: i32) {
         if self.shell_options.posix && !self.is_interactive {
-            self.pending_fatal_status = Some(status);
+            self.raise_fatal(status);
         }
     }
 

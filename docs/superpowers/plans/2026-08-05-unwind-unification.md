@@ -18,7 +18,7 @@
 - **Formatting:** `cargo fmt --all` before every commit; CI enforces `--check`.
 - **This box has 1 core and 1.9 GB.** Never `cargo test --workspace` — it OOM-kills the session. Build with `cargo build -p huck --bin huck`.
 - **Engine lib tests run with 4 threads:** `cargo test -p huck-engine --lib --jobs 1 -- --test-threads 4`.
-- **Guard sweeps:** `( ulimit -v 1500000; timeout 3000 tests/scripts/run_diff_checks.sh )`. The sweep count on `main` is **266**.
+- **Guard sweeps:** `( ulimit -v 1500000; timeout 3000 tests/scripts/run_diff_checks.sh )`. The sweep RUNS **265** harnesses (266 files minus `bash_test_suite_runner_diff_check.sh`, which the sweep skips by name).
 - **Branch:** `v354-unwind-unification`, cut from `main` at or after `0d011358`. Never push to `main`.
 
 ---
@@ -366,7 +366,7 @@ cargo build -p huck --bin huck
 ( ulimit -v 1500000; timeout 3000 tests/scripts/run_diff_checks.sh 2>&1 | tail -2 )
 ```
 
-Expected: engine lib green, sweep **266 passed, 0 failed**, **no expected value edited**.
+Expected: engine lib green, sweep **265 passed, 0 failed**, **no expected value edited**.
 
 - [ ] **Step 7: Commit**
 
@@ -378,7 +378,7 @@ Third and largest of the three — ~21 writes and ~14 reads across 11 files,
 all mechanical and compiler-enumerated. set_pending_fatal keeps its name and
 its POSIX-mode gating; only its body moves.
 
-No behavior change: sweep 266/266, zero expected-value edits.
+No behavior change: sweep 265/265, zero expected-value edits.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -581,7 +581,7 @@ for t in trap_integration trap_pseudo_signals_integration subshell_integration \
 done
 ```
 
-Expected: sweep **266 passed, 0 failed**, all binaries green, **no expected value edited**.
+Expected: sweep **265 passed, 0 failed**, all binaries green, **no expected value edited**.
 
 - [ ] **Step 8: Commit**
 
@@ -603,7 +603,7 @@ writes, because the discard arm must pair with set_last_status(1) (#351).
 Sealing Unwind's slots private is what proves the migration complete — the
 compile errors were the checklist.
 
-No behavior change: sweep 266/266, zero expected-value edits.
+No behavior change: sweep 265/265, zero expected-value edits.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -670,7 +670,7 @@ git push -u origin v354-unwind-unification
 gh pr create --base main --title 'v354: unify the pending-unwind signals (#466)' --body '...'
 ```
 
-The body must state: the storage split and why the atomics stayed, the preserved `Around`/`After` asymmetry, sweep 266/266, the bash-suite PASS-set diff result, **that zero expected values were edited**, and any issues filed rather than fixed. Then poll `gh pr checks <N>` until both workflows finish and pass. Do **not** self-merge — a `vNN` iteration is the user's to merge.
+The body must state: the storage split and why the atomics stayed, the preserved `Around`/`After` asymmetry, sweep 265/265, the bash-suite PASS-set diff result, **that zero expected values were edited**, and any issues filed rather than fixed. Then poll `gh pr checks <N>` until both workflows finish and pass. Do **not** self-merge — a `vNN` iteration is the user's to merge.
 
 ---
 

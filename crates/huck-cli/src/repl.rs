@@ -309,7 +309,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
                         // (stdin not a TTY), exit immediately with the fatal
                         // status. Interactive: $? already set; fall through
                         // to the next prompt iteration.
-                        if let Some(fatal_status) = shell.take_pending_fatal_status()
+                        if let Some(fatal_status) = shell.take_fatal()
                             && !shell.is_interactive
                         {
                             return shell_exit(&mut shell, fatal_status);

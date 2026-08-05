@@ -1522,19 +1522,19 @@ fn exec_script(src: &str, shell: &mut Shell) {
 fn posix_source_not_found_is_fatal() {
     let mut shell = Shell::new();
     exec_script("set -o posix\n. /no/such/huck_file_xyz\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, Some(1));
+    assert_eq!(shell.unwind.fatal, Some(1));
 }
 #[test]
 fn default_source_not_found_is_not_fatal() {
     let mut shell = Shell::new();
     exec_script(". /no/such/huck_file_xyz\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, None);
+    assert_eq!(shell.unwind.fatal, None);
 }
 #[test]
 fn posix_function_named_special_builtin_is_fatal() {
     let mut shell = Shell::new();
     exec_script("set -o posix\neval() { :; }\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, Some(2));
+    assert_eq!(shell.unwind.fatal, Some(2));
     assert!(
         !shell.functions.contains_key("eval"),
         "function not defined"
@@ -1544,7 +1544,7 @@ fn posix_function_named_special_builtin_is_fatal() {
 fn default_function_named_special_builtin_is_allowed() {
     let mut shell = Shell::new();
     exec_script("eval() { :; }\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, None);
+    assert_eq!(shell.unwind.fatal, None);
     assert!(shell.functions.contains_key("eval"));
 }
 #[test]
@@ -1554,25 +1554,25 @@ fn posix_readonly_for_var_is_fatal() {
         "set -o posix\nreadonly i=1\nfor i in a b; do :; done\n",
         &mut shell,
     );
-    assert_eq!(shell.pending_fatal_status, Some(127));
+    assert_eq!(shell.unwind.fatal, Some(127));
 }
 #[test]
 fn default_readonly_for_var_is_not_fatal() {
     let mut shell = Shell::new();
     exec_script("readonly i=1\nfor i in a b; do :; done\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, None);
+    assert_eq!(shell.unwind.fatal, None);
 }
 #[test]
 fn posix_assignment_no_command_is_fatal() {
     let mut shell = Shell::new();
     exec_script("set -o posix\nreadonly x=1\nx=2\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, Some(127));
+    assert_eq!(shell.unwind.fatal, Some(127));
 }
 #[test]
 fn posix_assignment_before_special_is_fatal() {
     let mut shell = Shell::new();
     exec_script("set -o posix\nreadonly x=1\nx=2 export y\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, Some(127));
+    assert_eq!(shell.unwind.fatal, Some(127));
 }
 #[test]
 fn posix_readonly_prefix_before_regular_is_fatal() {
@@ -1581,20 +1581,20 @@ fn posix_readonly_prefix_before_regular_is_fatal() {
     // special builtins. Default mode runs the command instead (tested above).
     let mut shell = Shell::new();
     exec_script("set -o posix\nreadonly x=1\nx=2 true\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, Some(1));
+    assert_eq!(shell.unwind.fatal, Some(1));
 }
 #[test]
 fn default_assignment_no_command_is_not_fatal() {
     let mut shell = Shell::new();
     exec_script("readonly x=1\nx=2\n", &mut shell);
-    assert_eq!(shell.pending_fatal_status, None);
+    assert_eq!(shell.unwind.fatal, None);
 }
 
 // ----- Case #1: special-builtin usage / assignment errors are posix-fatal --
 fn posix_run(src: &str) -> Option<i32> {
     let mut shell = Shell::new();
     exec_script(&format!("set -o posix\n{src}\n"), &mut shell);
-    shell.pending_fatal_status
+    shell.unwind.fatal
 }
 #[test]
 fn posix_special_builtin_usage_errors_exit() {

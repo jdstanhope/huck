@@ -358,7 +358,7 @@ fn finish_command(
         shell.set_last_status(1);
         return Some(ExecOutcome::Interrupted(InterruptReason::DiscardCommand));
     }
-    if shell.pending_fatal_status.is_some() {
+    if shell.fatal_pending() {
         return Some(ExecOutcome::Continue(c));
     }
     crate::traps::dispatch_pending_traps(shell);
@@ -1913,7 +1913,7 @@ fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool 
         // `$((xx++))` on a readonly var) sets `pending_discard`. bash aborts the
         // whole `case` at that point — stop testing further patterns; the caller's
         // post-`case_item_matches` discard check unwinds the command (status 1).
-        if shell.unwind.discard || shell.pending_fatal_status.is_some() {
+        if shell.unwind.discard || shell.fatal_pending() {
             return false;
         }
         let hit = if (extglob && crate::glob_match::has_extglob(&pattern))
@@ -2004,7 +2004,7 @@ fn run_case_inner(clause: &CaseClause, shell: &mut Shell) -> ExecOutcome {
             shell.set_last_status(1);
             return ExecOutcome::Interrupted(InterruptReason::DiscardCommand);
         }
-        if let Some(status) = shell.pending_fatal_status {
+        if let Some(status) = shell.unwind.fatal {
             return ExecOutcome::Continue(status);
         }
         if !run_this {
@@ -3205,7 +3205,7 @@ fn resolve(
         Ok(v) => v,
         Err(()) => return Err(1),
     };
-    if let Some(status) = shell.pending_fatal_status {
+    if let Some(status) = shell.unwind.fatal {
         return Err(status);
     }
     // v312 (#3/#49): a `$(( ))` arith error while expanding the program word
@@ -3225,7 +3225,7 @@ fn resolve(
                 Ok(v) => v,
                 Err(()) => return Err(1),
             };
-            if let Some(status) = shell.pending_fatal_status {
+            if let Some(status) = shell.unwind.fatal {
                 return Err(status);
             }
             if shell.unwind.discard {
@@ -3289,7 +3289,7 @@ fn resolve(
             Ok(v) => v,
             Err(()) => return Err(1),
         };
-        if let Some(status) = shell.pending_fatal_status {
+        if let Some(status) = shell.unwind.fatal {
             return Err(status);
         }
         // v312 (#3/#49): a `$(( ))` arith error while expanding an argument word
@@ -7706,7 +7706,7 @@ fn expand_array_elements(
                 };
                 map.insert(idx, value);
                 implicit = idx + 1;
-                if shell.pending_fatal_status.is_some() || shell.unwind.discard {
+                if shell.fatal_pending() || shell.unwind.discard {
                     return Err(());
                 }
             }
@@ -7715,7 +7715,7 @@ fn expand_array_elements(
                     map.insert(implicit, field);
                     implicit += 1;
                 }
-                if shell.pending_fatal_status.is_some() || shell.unwind.discard {
+                if shell.fatal_pending() || shell.unwind.discard {
                     return Err(());
                 }
             }
