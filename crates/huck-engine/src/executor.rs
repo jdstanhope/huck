@@ -432,7 +432,7 @@ fn finish_command(
         return Some(o);
     }
     if c != 0 && shell.err_suppressed_depth == 0 && is_last && !is_negated_pipeline(cmd) {
-        if err_armed {
+        if err_armed && !body_already_fired_err(cmd) {
             crate::traps::fire_err_trap(shell);
             // #442: the ERR action itself ran `exit N`. Checked here, AFTER the
             // fire and BEFORE errexit, so a trap's exit beats the errexit
@@ -2574,6 +2574,38 @@ fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> ExecOutcome {
 /// True if `cmd` is a `!`-negated pipeline — exempt from `set -e`/ERR (bash).
 fn is_negated_pipeline(cmd: &Command) -> bool {
     matches!(cmd, Command::Pipeline(p) if p.negate)
+}
+
+/// True for a compound whose body runs IN THIS PROCESS through the same
+/// `finish_command` epilogue — so the body has already had its own chance to
+/// fire the ERR trap, and the compound's aggregate status must not fire it a
+/// second time (#445).
+///
+/// bash fires ERR at the innermost failing command: `{ false; }` is ONE fire,
+/// not two, and `{ { false; }; }` is still one. Nesting made huck's extra fire
+/// compound — three for two braces.
+///
+/// Deliberately NOT listed:
+/// - `Subshell` — its body runs in a FORKED child whose trap table was
+///   cleared, so nothing fired inside; the parent's fire is the only one.
+/// - a function call (a `Simple`/`Pipeline` here) — same reasoning via the
+///   entry-unset in #438: the body does not fire, the call does.
+/// - `Pipeline`, `Simple`, `Arith`, `DoubleBracket` — these ARE the innermost
+///   failing command.
+///
+/// errexit is deliberately NOT gated on this: `set -e; { false; }` must still
+/// exit, exactly as it does today.
+fn body_already_fired_err(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::BraceGroup(_)
+            | Command::For(_)
+            | Command::ArithFor(_)
+            | Command::Case(_)
+            | Command::Select(_)
+            | Command::If(_)
+            | Command::While(_)
+    )
 }
 
 // ----- background pipeline --------------------------------------------------
