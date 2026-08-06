@@ -69,5 +69,21 @@ check "function call fires"    'trap "echo E" ERR; f() { false; }; f'
 check "errexit in if body"     'set -e; if true; then false; fi; echo after'
 check "status w/o a trap"      '{ false; } || echo "rc=$?"'
 
+# --- the exemption must survive a FORK (#1's subshell third) ---------------
+# A subshell inherits the entire option set (measured: `$-` is byte-identical
+# parent to child, including -e/-u/-x/-m). The caller's "this failure does not
+# count" travels the same way; the trap-reset path used to discard it.
+check "fork: subshell via ||"   'set -e; ( false; echo x ) || echo or'
+check "fork: subshell via &&"   'set -e; ( false; echo x ) && echo and; echo after'
+check "fork: in a function"     'set -e; f() { ( false; echo x ); }; f || echo or'
+check "fork: if condition"      'set -e; if ( false; echo x ); then :; fi; echo after'
+check "fork: nested subshells"  'set -e; ( ( false; echo x ) ) || echo or'
+check "fork: ERR trap via ||"   'trap "echo E" ERR; ( false; echo x ) || echo or'
+check "fork: ERR trap via &&"   'trap "echo E" ERR; ( false; echo x ) && echo and'
+# NOT exempt — the subshell is the last command of its list, so it still counts:
+check "fork: plain subshell"    'set -e; ( false ); echo after'
+check "fork: plain, body runs"  'set -e; ( false; echo x ); echo after'
+check "fork: ERR trap plain"    'trap "echo E" ERR; ( false )'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 [[ $FAIL -eq 0 ]]

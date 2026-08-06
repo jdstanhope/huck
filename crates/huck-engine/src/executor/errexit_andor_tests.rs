@@ -144,3 +144,34 @@ fn andor_scope_balances_across_a_list() {
     assert!(!s.errexit_suppressed(), "errexit suppression leaked");
     assert!(!s.err_trap_suppressed(), "ERR-trap suppression leaked");
 }
+
+/// v356: `run_list_element` owns the exempt scope end-to-end, so no early
+/// return can leak it. A leak would make `set -e` silently stop working for
+/// the rest of the shell's life — a failure no differential harness would
+/// localise. Characterisation test: passes before the refactor and after.
+#[test]
+fn exempt_scope_never_leaks_out_of_a_list() {
+    for src in [
+        "false || true",
+        "false && true",
+        "true && false || true",
+        "{ false; } || true",
+        "f() { return 3; }; f || true",
+        // NO forking shapes here — `( … )` and multi-stage pipelines fork an
+        // in-process subshell, which `exec_guard` (#184) refuses while another
+        // Engine runs on a sibling thread, and the lib harness is parallel.
+        // The forked cases are covered end-to-end by the `fork:` rows in
+        // tests/scripts/errexit_err_suppression_diff_check.sh.
+    ] {
+        let mut s = Shell::new();
+        let _ = crate::shell::process_line(src, &mut s, false);
+        assert!(
+            !s.errexit_suppressed(),
+            "errexit suppression leaked after `{src}`"
+        );
+        assert!(
+            !s.err_trap_suppressed(),
+            "ERR-trap suppression leaked after `{src}`"
+        );
+    }
+}

@@ -377,16 +377,16 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
 /// Returns `Some(outcome)` when the caller must return it immediately, `None`
 /// to carry on with the rest of the list.
 ///
-/// `is_last` is bash's and-or rule: only the SYNTACTICALLY last command of the
-/// list fires ERR/errexit — a command followed by `&&` or `||` is "part of a
-/// list being tested", not a standalone failure. `err_armed` is the
-/// PRE-command snapshot of whether the ERR trap was set (#444, bash's
-/// `was_error_trap`), so a command that installs the ERR trap is not itself
-/// caught by it; errexit is deliberately NOT gated on it.
+/// bash's and-or rule — only the SYNTACTICALLY last command of a list fires
+/// ERR/errexit — is no longer a flag here (v356). An exempt element runs
+/// inside a suppression scope raised by `run_list_element`, so this reads that
+/// state instead. `err_armed` is the PRE-command snapshot of whether the ERR
+/// trap was set (#444, bash's `was_error_trap`), so a command that installs
+/// the ERR trap is not itself caught by it; errexit is deliberately NOT gated
+/// on it.
 fn finish_command(
     cmd: &Command,
     c: i32,
-    is_last: bool,
     err_armed: bool,
     shell: &mut Shell,
 ) -> Option<ExecOutcome> {
@@ -431,7 +431,7 @@ fn finish_command(
     if let Some(o) = pending_unwind(shell, UnwindPhase::After) {
         return Some(o);
     }
-    if c != 0 && !shell.err_trap_suppressed() && is_last && !is_negated_pipeline(cmd) {
+    if c != 0 && !shell.err_trap_suppressed() && !is_negated_pipeline(cmd) {
         if err_armed && !body_already_fired_err(cmd) {
             crate::traps::fire_err_trap(shell);
             // #442: the ERR action itself ran `exit N`. Checked here, AFTER the
@@ -461,55 +461,72 @@ fn debug_trap_gate(shell: &mut Shell) -> Result<crate::traps::DebugDecision, Exe
     }
 }
 
+/// Runs ONE element of an and-or list: the exempt scope, the command, the
+/// interrupt checkpoint, control-flow propagation, and the post-command
+/// epilogue. `Err(outcome)` means the caller must return it immediately;
+/// `Ok(status)` means carry on with the list.
+///
+/// `exempt` is bash's ignore-return: an element that is NOT the syntactically
+/// last of its list is "part of a list being tested", so neither it nor
+/// anything it runs counts — not the brace group's statements, not a
+/// function's body, not a forked subshell's. The scope therefore spans the
+/// body AND the epilogue, which is what lets `finish_command` decide from
+/// suppression state instead of carrying a separate `is_last` flag: one
+/// question, one mechanism.
+///
+/// Owning both ends here is also what makes the scope leak-proof. There is a
+/// single exit path, where previously the raise and the lower straddled five
+/// early returns — and a leak would have made `set -e` silently stop working
+/// for the rest of the list.
+fn run_list_element(
+    cmd: &Command,
+    exempt: bool,
+    shell: &mut Shell,
+) -> Result<ExecOutcome, ExecOutcome> {
+    // #444 (bash's `was_error_trap`): snapshot BEFORE the command runs, so a
+    // command that INSTALLS the ERR trap is not itself caught by it.
+    let err_armed = crate::traps::err_trap_armed(shell);
+    if exempt {
+        shell.suppress_both();
+    }
+    let status = run_command(cmd, shell);
+    let out = 'elem: {
+        if let Some(o) = check_interrupt(shell) {
+            break 'elem Err(o);
+        }
+        if matches!(
+            status,
+            ExecOutcome::Exit(_)
+                | ExecOutcome::LoopBreak(_, _)
+                | ExecOutcome::LoopContinue(_)
+                | ExecOutcome::FunctionReturn(_)
+                | ExecOutcome::Interrupted(_)
+        ) {
+            break 'elem Err(status);
+        }
+        if let ExecOutcome::Continue(c) = status
+            && let Some(o) = finish_command(cmd, c, err_armed, shell)
+        {
+            break 'elem Err(o);
+        }
+        Ok(status)
+    };
+    if exempt {
+        shell.unsuppress_both();
+    }
+    out
+}
+
 fn run_andor_group(
     first: &Command,
     rest: &[(Connector, &Command)],
     shell: &mut Shell,
 ) -> ExecOutcome {
-    // #438: bash captures `was_error_trap` BEFORE running a command and fires
-    // the ERR trap on failure only if the trap was armed back then — so a
-    // command that INSTALLS the ERR trap (typically a function trapping for
-    // itself) is not itself caught by it. Captured per command, not per group.
-    let err_armed_first = crate::traps::err_trap_armed(shell);
-    // #480/#468/#470: a command that is NOT the last of its and-or list is
-    // exempt, and bash propagates that exemption INTO whatever the command
-    // runs — a brace group's statements, a function's body, a loop's
-    // iterations. Without this scope, `set -e; f() { false; echo x; }; f || or`
-    // exits the shell inside f, where bash prints x and then runs the handler.
-    //
-    // For a simple command the scope changes nothing observable: its own fire
-    // is already skipped by the `is_last` guard below and it has no body.
-    //
-    // The un-suppress sits IMMEDIATELY after `run_command`, not at the end of
-    // the function: five early returns follow, and leaking the depth past them
-    // would make `set -e` silently stop working after the first `&&`.
-    let first_exempt = !rest.is_empty();
-    if first_exempt {
-        shell.suppress_both();
-    }
-    let mut status = run_command(first, shell);
-    if first_exempt {
-        shell.unsuppress_both();
-    }
-    if let Some(o) = check_interrupt(shell) {
-        return o;
-    }
-    if matches!(
-        status,
-        ExecOutcome::Exit(_)
-            | ExecOutcome::LoopBreak(_, _)
-            | ExecOutcome::LoopContinue(_)
-            | ExecOutcome::FunctionReturn(_)
-            | ExecOutcome::Interrupted(_)
-    ) {
-        return status;
-    }
-    // `first` is the last command of the list iff there is no `rest`.
-    if let ExecOutcome::Continue(c) = status
-        && let Some(out) = finish_command(first, c, rest.is_empty(), err_armed_first, shell)
-    {
-        return out;
-    }
+    // An element is exempt iff it is not the syntactically last of the list.
+    let mut status = match run_list_element(first, !rest.is_empty(), shell) {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
     for i in 0..rest.len() {
         let (connector, command) = &rest[i];
         let should_run = match connector {
@@ -519,36 +536,10 @@ fn run_andor_group(
             Connector::Semi | Connector::Amp => true,
         };
         if should_run {
-            let err_armed = crate::traps::err_trap_armed(shell);
-            // Same rule as `first`: exempt iff this is not the last element,
-            // and the exemption propagates into whatever the command runs.
-            let exempt = i + 1 != rest.len();
-            if exempt {
-                shell.suppress_both();
-            }
-            status = run_command(command, shell);
-            if exempt {
-                shell.unsuppress_both();
-            }
-            if let Some(o) = check_interrupt(shell) {
-                return o;
-            }
-            if matches!(
-                status,
-                ExecOutcome::Exit(_)
-                    | ExecOutcome::LoopBreak(_, _)
-                    | ExecOutcome::LoopContinue(_)
-                    | ExecOutcome::FunctionReturn(_)
-                    | ExecOutcome::Interrupted(_)
-            ) {
-                return status;
-            }
-            // This command is the last of the list iff there is no rest[i+1].
-            if let ExecOutcome::Continue(c) = status
-                && let Some(out) = finish_command(command, c, i + 1 == rest.len(), err_armed, shell)
-            {
-                return out;
-            }
+            status = match run_list_element(command, i + 1 != rest.len(), shell) {
+                Ok(s) => s,
+                Err(o) => return o,
+            };
         }
     }
     status
