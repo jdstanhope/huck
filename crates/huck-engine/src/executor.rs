@@ -2578,8 +2578,24 @@ fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> ExecOutcome {
     // propagates: it returns `ExecOutcome::Exit` directly, never through the
     // errexit gate the counter controls, and the negation below only rewrites
     // `Continue`.
+    // #469: `!` exempts the negated command ITSELF from both — that part is
+    // handled by `is_negated_pipeline` at the fire site. What it does NOT do is
+    // stop a compound BODY firing the ERR trap: bash prints the trap's output
+    // for `! { false; }` with `set +e` and stays silent with `set -e`.
+    // Reproducing a bash quirk, not choosing a rule — the spec's contract table
+    // records the measurement, including that it really is the inner command
+    // firing (`! { (exit 5); }` reports the inner status).
+    //
+    // Read at ENTRY so `set -e` / `set +e` inside the body cannot unbalance the
+    // counters, and so the choice matches errexit's state when the exemption
+    // began — which is what bash's flag propagation does.
+    let negate_suppresses_err_trap = shell.shell_options.errexit;
     if pipeline.negate {
-        shell.suppress_both();
+        if negate_suppresses_err_trap {
+            shell.suppress_both();
+        } else {
+            shell.suppress_errexit_only();
+        }
     }
     let outcome = if pipeline.commands.len() == 1 {
         // Single-stage pipeline: run directly in the parent shell (no fork needed).
@@ -2589,7 +2605,12 @@ fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> ExecOutcome {
         run_multi_stage(&pipeline.commands, shell)
     };
     if pipeline.negate {
-        shell.unsuppress_both();
+        // Undo exactly what was raised — see `negate_suppresses_err_trap`.
+        if negate_suppresses_err_trap {
+            shell.unsuppress_both();
+        } else {
+            shell.unsuppress_errexit_only();
+        }
         // Negate the exit status only; $PIPESTATUS (set by the stage(s) above)
         // stays raw, and control-flow outcomes propagate unchanged.
         if let ExecOutcome::Continue(s) = outcome {
