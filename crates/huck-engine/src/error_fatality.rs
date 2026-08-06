@@ -48,6 +48,10 @@ pub(crate) enum ErrorKind {
     /// A readonly assignment used as a COMMAND PREFIX (`r=2 true`), which bash
     /// treats far more leniently than a standalone `r=2`.
     AssignmentPrefix,
+    /// A readonly variable used as a `for` loop's iteration variable. bash
+    /// CONTINUES outright outside posix — unlike a standalone `r=2`, which
+    /// abandons the list — and exits in posix.
+    ReadonlyForVar,
     /// Any other builtin error. Measured: ALWAYS continues.
     BuiltinError,
     /// `history` with too many arguments — the only builtin error in bash that
@@ -139,6 +143,19 @@ pub(crate) fn fatality(kind: ErrorKind, shell: &Shell) -> Fatality {
         // than as a standalone command. Measured: bash abandons the list in
         // posix and continues outright otherwise — it never exits, where a
         // standalone `r=2` in posix does. The distinction is the prefix.
+        // ⚠️ Outside posix this CONTINUES; it does not abandon the list. The
+        // site previously called `posix_fatal`, which was a NO-OP outside
+        // posix, so classifying it as `Expansion` (which aborts) was a
+        // regression — caught by `posix_exit_on_error_diff_check.sh`, not by
+        // any unit test. Measured: `readonly i=1; for i in a b; do :; done;
+        // echo AFTER` prints AFTER and exits 0.
+        ErrorKind::ReadonlyForVar => {
+            if posix && can_exit {
+                Fatality::ExitShell(driver_code(1, shell))
+            } else {
+                Fatality::Continue
+            }
+        }
         ErrorKind::AssignmentPrefix => {
             if posix {
                 Fatality::AbortList
@@ -332,6 +349,25 @@ mod tests {
                 Fatality::ExitShell(2)
             );
         }
+    }
+
+    #[test]
+    fn readonly_for_var_continues_outside_posix() {
+        // ⚠️ Regression guard. Classifying this as `Expansion` made it abandon
+        // the list outside posix, because the site it replaced (`posix_fatal`)
+        // was a no-op there. bash prints AFTER and exits 0.
+        assert_eq!(
+            fatality(ErrorKind::ReadonlyForVar, &shell_with(false, false)),
+            Fatality::Continue
+        );
+        assert_eq!(
+            fatality(ErrorKind::ReadonlyForVar, &shell_with(true, false)),
+            Fatality::ExitShell(1)
+        );
+        assert_eq!(
+            fatality(ErrorKind::ReadonlyForVar, &shell_with(true, true)),
+            Fatality::ExitShell(127)
+        );
     }
 
     #[test]

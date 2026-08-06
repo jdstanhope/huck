@@ -1539,12 +1539,12 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell) -> ExecOutcome {
                 let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "{}: readonly variable", clause.var);
             }
-            shell.report_error(crate::error_fatality::ErrorKind::Expansion);
+            shell.report_error(crate::error_fatality::ErrorKind::ReadonlyForVar);
             return ExecOutcome::Continue(1);
         }
         if shell.try_set(&clause.var, value).is_err() {
             // Nameref to a readonly target: try_set already reported the error.
-            shell.report_error(crate::error_fatality::ErrorKind::Expansion);
+            shell.report_error(crate::error_fatality::ErrorKind::ReadonlyForVar);
             return ExecOutcome::Continue(1);
         }
         match execute_sequence_body(&clause.body, shell) {
