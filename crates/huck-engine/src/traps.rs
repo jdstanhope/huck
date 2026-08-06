@@ -185,21 +185,20 @@ pub fn fire_debug_trap(shell: &mut Shell) -> DebugDecision {
     // "In a subroutine" means a context where `return` is legal — a function
     // or a sourced script — NOT the main script (whose base "main" frame is
     // always present). Same predicate the `return` builtin uses to reject a
-    // top-level `return`.
+    // top-level `return`. Used ONLY for the return-2 decision below; it is no
+    // longer a firing gate.
     let in_subroutine = shell.call_stack.iter().any(|f| {
         matches!(
             f.kind,
             crate::shell_state::FrameKind::Function | crate::shell_state::FrameKind::Source
         )
     });
-    // functrace (`set -T` / `shopt -s extdebug`): DEBUG is inherited into a
-    // function or sourced script only under functrace; at the top level it
-    // always fires. bash's shopt_set_debug_mode() couples `extdebug` to the
-    // same function_trace_mode flag `-T` sets, so extdebug alone also
-    // inherits the trap (verified against real bash 5.2.21). (bash)
-    if in_subroutine && !(shell.shell_options.functrace || shell.extdebug()) {
-        return DebugDecision::Proceed;
-    }
+    // #439: no functrace gate here. Non-inheritance is implemented at the
+    // ENTRY to a function or sourced script instead (`take_debug_trap_for_call`
+    // / `restore_debug_trap_after_call`), exactly as #434 did for RETURN and
+    // #438 for ERR — so a DEBUG trap still installed when a command runs
+    // always fires. The gate could not distinguish the caller's trap from one
+    // the body installed for itself, and silenced both.
     let action = match shell.traps.get(&TrapSignal::Debug) {
         Some(Some(text)) => text.clone(),
         _ => return DebugDecision::Proceed,
@@ -264,6 +263,25 @@ pub fn take_err_trap_for_call(shell: &mut Shell) -> Option<String> {
     take_trap_for_call(shell, TrapSignal::Err)
 }
 
+/// The same entry treatment for DEBUG, gated on functrace exactly as RETURN
+/// is — bash's `execute_function` runs `restore_default_signal (DEBUG_TRAP)`
+/// in the same block. This is what makes a trap the body installs FOR ITSELF
+/// fire for the body's remaining commands, which no fire-site gate can
+/// express: the gate cannot tell the caller's trap from the body's own.
+///
+/// Applies to a SOURCED script too (`source_in_sink`), unlike RETURN — bash
+/// unsets DEBUG for the file's duration but runs an inherited RETURN trap
+/// there with or without functrace (#440). Measured, not assumed:
+/// `trap 'echo D' DEBUG; . f` fires once for the `.` itself and not for the
+/// file's commands, while a file that traps DEBUG for itself fires for its
+/// own remaining lines and keeps the trap afterwards. #439
+pub fn take_debug_trap_for_call(shell: &mut Shell) -> Option<String> {
+    if shell.shell_options.functrace || shell.extdebug() {
+        return None;
+    }
+    take_trap_for_call(shell, TrapSignal::Debug)
+}
+
 /// Removes `sig`'s action for the duration of a call, returning it for the
 /// matching `restore_*_after_call`. An *ignored* trap (`trap '' SIG`) is left
 /// alone — see the note on `take_return_trap_for_call`.
@@ -299,6 +317,11 @@ pub fn restore_return_trap_after_call(shell: &mut Shell, saved: Option<String>) 
 /// The ERR counterpart, bash's `maybe_set_error_trap`. #438
 pub fn restore_err_trap_after_call(shell: &mut Shell, saved: Option<String>) {
     restore_trap_after_call(shell, TrapSignal::Err, saved);
+}
+
+/// The DEBUG counterpart, bash's `maybe_set_debug_trap`. #439
+pub fn restore_debug_trap_after_call(shell: &mut Shell, saved: Option<String>) {
+    restore_trap_after_call(shell, TrapSignal::Debug, saved);
 }
 
 fn restore_trap_after_call(shell: &mut Shell, sig: TrapSignal, saved: Option<String>) {

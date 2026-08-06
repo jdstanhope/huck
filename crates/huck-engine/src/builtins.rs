@@ -8131,7 +8131,15 @@ pub(crate) fn source_in_sink(args: &[String], invoked: &str, shell: &mut Shell) 
         kind: crate::shell_state::FrameKind::Source,
     });
     shell.sync_call_arrays();
+    // #439: DEBUG is scoped at the sourced file's ENTRY the same way it is at
+    // a function's — unset for the file's duration without functrace, back
+    // afterwards only if the file left DEBUG untrapped. This is where DEBUG
+    // and RETURN part company: bash runs an INHERITED RETURN trap for a
+    // sourced file with or without functrace (see the #440 note below), but
+    // does NOT let the caller's DEBUG fire for the file's commands.
+    let saved_debug_trap = crate::traps::take_debug_trap_for_call(shell);
     let result = run_sourced_contents_in_sinks(&contents, &path, shell);
+    crate::traps::restore_debug_trap_after_call(shell, saved_debug_trap);
     // #440: a sourced script fires the RETURN trap when it finishes, whether it
     // ran off the end or hit `return N`. Unlike a function call there is NO
     // entry-unset: bash runs an INHERITED trap here with or without functrace
