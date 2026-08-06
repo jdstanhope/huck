@@ -348,10 +348,18 @@ fn fire_pseudo_trap(shell: &mut Shell, sig: TrapSignal) {
     let _ = run_trap_action(shell, sig, &action);
 }
 
-/// Resets all trap state in a freshly-forked subshell child. POSIX:
+/// Resets all TRAP state in a freshly-forked subshell child. POSIX:
 /// trapped signals reset to their original values in subshells; we
 /// also clear EXIT so the parent's EXIT fires only when the parent
 /// exits, not when the subshell does.
+///
+/// v356 (#1): trap state ONLY. A subshell inherits the shell's entire option
+/// set — `$-` is byte-identical parent to child, including `-e`/`-u`/`-x`/`-m`
+/// — and `Shell::suppression` (whether a failing command counts) travels with
+/// it, which is why `set -e; ( false; echo x ) || echo or` prints `x` in bash.
+/// This function used to zero those counters, which made every exempt context
+/// correct in-process and wrong across a fork. They now live in `Suppression`
+/// with private slots, so this path cannot reach them even by accident.
 pub fn clear_for_subshell(shell: &mut Shell) {
     // Unregister every installed signal handler before clearing.
     for (_, sigid) in shell.trap_sigids.drain() {
@@ -360,8 +368,6 @@ pub fn clear_for_subshell(shell: &mut Shell) {
     shell.traps.clear();
     shell.trap_pending = Arc::new(AtomicU32::new(0));
     shell.firing_traps.clear();
-    shell.errexit_suppressed_depth = 0;
-    shell.err_trap_suppressed_depth = 0;
     // #442: a request recorded before the fork is the PARENT's business.
     // Targeted, NOT `unwind = Default::default()`: the sibling slots
     // (`discard`, `fatal` — v354) are deliberately NOT cleared here, because
@@ -1138,15 +1144,23 @@ mod tests {
     }
 
     #[test]
-    fn clear_for_subshell_resets_firing_trap_and_err_depth() {
+    fn clear_for_subshell_resets_traps_but_keeps_the_exemption() {
         let mut shell = Shell::new();
         shell.firing_traps = vec![TrapSignal::Err];
-        shell.errexit_suppressed_depth = 5;
-        shell.err_trap_suppressed_depth = 5;
+        // The caller marked this command's failure as not counting; a fork
+        // must not undo that (#1). This test asserted the opposite, which is
+        // the bug it encoded.
+        shell.suppress_both();
         clear_for_subshell(&mut shell);
-        assert!(shell.firing_traps.is_empty());
-        assert_eq!(shell.errexit_suppressed_depth, 0);
-        assert_eq!(shell.err_trap_suppressed_depth, 0);
+        assert!(shell.firing_traps.is_empty(), "trap state IS reset");
+        assert!(
+            shell.errexit_suppressed(),
+            "the caller's exemption survives the fork"
+        );
+        assert!(
+            shell.err_trap_suppressed(),
+            "the caller's exemption survives the fork"
+        );
     }
 
     #[test]
