@@ -749,7 +749,7 @@ pub fn parse(input: &str) -> Result<ArithExpr, ArithError> {
 /// arith write and does NOT additionally wrap it. Every other arith error kind
 /// (division by zero, syntax error, …) IS wrapped by bash. So the expansion
 /// error sites suppress the wrapped emission for `ReadonlyVar` and emit it for
-/// all other kinds. (Fatality — `pending_discard`/`posix_fatal` — is unaffected;
+/// all other kinds. (Fatality — decided by `error_fatality` — is unaffected;
 /// this governs the MESSAGE only.)
 pub fn should_wrap_expansion_error(err: &ArithError) -> bool {
     !matches!(err.kind, ArithErrorKind::ReadonlyVar(_))

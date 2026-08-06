@@ -977,7 +977,7 @@ fn expand_arith_part_division_by_zero_raises_discard() {
 }
 
 #[test]
-fn expand_arith_error_is_posix_fatal() {
+fn expand_arith_error_exits_in_posix() {
     let mut shell = Shell::new();
     shell.shell_options.posix = true;
     shell.is_interactive = false;

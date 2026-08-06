@@ -1,20 +1,28 @@
 use super::*;
 
+/// v358 (#198) replaces `posix_fatal`, which this test used to exercise. The
+/// gating it checked — posix AND non-interactive — now lives in
+/// `error_fatality::fatality`, and `report_error` is the only way to reach it.
 #[test]
-fn posix_fatal_is_gated_on_posix_and_noninteractive() {
+fn report_error_is_gated_on_posix_and_noninteractive() {
     let mut sh = Shell::new();
     sh.is_interactive = false;
-    // default mode → no-op
-    sh.posix_fatal(127);
+    // default mode: an expansion error abandons the list, it does not exit.
+    sh.report_error(crate::error_fatality::ErrorKind::Expansion);
     assert_eq!(sh.fatal_status(), None);
-    // posix + non-interactive → sets
+    assert!(sh.discard_pending());
+    // posix + non-interactive: exits. 1, not the old hardcoded 127 —
+    // `Shell::new()` is the script/stdin driver, where bash exits 1.
+    let mut sh = Shell::new();
+    sh.is_interactive = false;
     sh.shell_options.posix = true;
-    sh.posix_fatal(127);
-    assert_eq!(sh.fatal_status(), Some(127));
-    // posix + interactive → no-op (clear first)
-    sh.clear_fatal();
+    sh.report_error(crate::error_fatality::ErrorKind::Expansion);
+    assert_eq!(sh.fatal_status(), Some(1));
+    // posix + interactive: never killed by an error.
+    let mut sh = Shell::new();
+    sh.shell_options.posix = true;
     sh.is_interactive = true;
-    sh.posix_fatal(2);
+    sh.report_error(crate::error_fatality::ErrorKind::SpecialBuiltinUsage { status: 2 });
     assert_eq!(sh.fatal_status(), None);
 }
 

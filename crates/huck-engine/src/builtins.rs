@@ -7090,7 +7090,9 @@ fn builtin_set_inner(
                             "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]"
                         );
                         shell.builtin_usage_error = Some(2);
-                        shell.report_error(crate::error_fatality::ErrorKind::SpecialBuiltinUsage);
+                        shell.report_error(crate::error_fatality::ErrorKind::SpecialBuiltinUsage {
+                            status: 2,
+                        });
                         return ExecOutcome::Continue(2);
                     }
                 }
@@ -7172,7 +7174,9 @@ fn builtin_set_inner(
                             "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]"
                         );
                         shell.builtin_usage_error = Some(2);
-                        shell.report_error(crate::error_fatality::ErrorKind::SpecialBuiltinUsage);
+                        shell.report_error(crate::error_fatality::ErrorKind::SpecialBuiltinUsage {
+                            status: 2,
+                        });
                         return ExecOutcome::Continue(2);
                     }
                 }
@@ -8099,7 +8103,8 @@ pub(crate) fn source_in_sink(args: &[String], invoked: &str, shell: &mut Shell) 
                 "{invoked}: usage: {invoked} filename [arguments]"
             );
             // POSIX case #1: missing-filename usage error (the not-found case at
-            // resolve_source_path below was Task 2 and stays posix_fatal(1)).
+            // resolve_source_path below is `SpecialBuiltinOperand`: exits 1
+            // in posix under every driver, no `-c` substitution).
             shell.builtin_usage_error = Some(2);
             return ExecOutcome::Continue(2);
         }
@@ -8130,7 +8135,7 @@ pub(crate) fn source_in_sink(args: &[String], invoked: &str, shell: &mut Shell) 
                     "{filename}: No such file or directory"
                 );
             }
-            shell.posix_fatal(1);
+            shell.report_error(crate::error_fatality::ErrorKind::SpecialBuiltinOperand);
             return ExecOutcome::Continue(1);
         }
     };

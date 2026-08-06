@@ -36,7 +36,18 @@ pub(crate) enum ErrorKind {
     /// This is about USAGE rejection, not about every error a special builtin
     /// can raise: bash continues past `shift a b` and `break 1 2` in both
     /// modes, so those are `BuiltinError`.
-    SpecialBuiltinUsage,
+    ///
+    /// `status` is the builtin's OWN usage status — the builtin knows it, the
+    /// classifier only decides whether it is fatal. Flattening it to a
+    /// constant changed `export`'s bad-assignment status from 1 to 2 and was
+    /// caught by a unit test.
+    SpecialBuiltinUsage { status: i32 },
+    /// A POSIX special builtin rejected an OPERAND (`. /nonexistent`).
+    /// Separate from `SpecialBuiltinUsage` because it exits 1, not 2.
+    SpecialBuiltinOperand,
+    /// A readonly assignment used as a COMMAND PREFIX (`r=2 true`), which bash
+    /// treats far more leniently than a standalone `r=2`.
+    AssignmentPrefix,
     /// Any other builtin error. Measured: ALWAYS continues.
     BuiltinError,
     /// `history` with too many arguments — the only builtin error in bash that
@@ -101,9 +112,36 @@ pub(crate) fn fatality(kind: ErrorKind, shell: &Shell) -> Fatality {
                 Fatality::AbortList
             }
         }
-        ErrorKind::SpecialBuiltinUsage => {
+        // ⚠️ NO driver substitution. Measured: `set -o posix; set -Q` and
+        // `export -Q` exit 2 under `-c`, a script AND stdin alike — unlike the
+        // expansion fatals, which become 127 under `-c`. An earlier draft
+        // applied `driver_code` here and the harness still passed, because the
+        // legacy `posix_fatal(2)` path was answering first; the bug was found
+        // by measuring rather than by a red row.
+        ErrorKind::SpecialBuiltinUsage { status } => {
             if posix && can_exit {
-                Fatality::ExitShell(driver_code(2, shell))
+                Fatality::ExitShell(status)
+            } else {
+                Fatality::Continue
+            }
+        }
+        // A special builtin rejecting an OPERAND rather than an option —
+        // `. /nonexistent`. Measured: exits 1 in posix under every driver
+        // (again no substitution), continues otherwise.
+        ErrorKind::SpecialBuiltinOperand => {
+            if posix && can_exit {
+                Fatality::ExitShell(1)
+            } else {
+                Fatality::Continue
+            }
+        }
+        // A readonly assignment used as a COMMAND PREFIX (`r=2 true`) rather
+        // than as a standalone command. Measured: bash abandons the list in
+        // posix and continues outright otherwise — it never exits, where a
+        // standalone `r=2` in posix does. The distinction is the prefix.
+        ErrorKind::AssignmentPrefix => {
+            if posix {
+                Fatality::AbortList
             } else {
                 Fatality::Continue
             }
@@ -193,16 +231,27 @@ mod tests {
     #[test]
     fn special_builtin_usage_is_fatal_only_in_posix() {
         assert_eq!(
-            fatality(ErrorKind::SpecialBuiltinUsage, &shell_with(false, false)),
+            fatality(
+                ErrorKind::SpecialBuiltinUsage { status: 2 },
+                &shell_with(false, false)
+            ),
             Fatality::Continue
         );
         assert_eq!(
-            fatality(ErrorKind::SpecialBuiltinUsage, &shell_with(true, false)),
+            fatality(
+                ErrorKind::SpecialBuiltinUsage { status: 2 },
+                &shell_with(true, false)
+            ),
             Fatality::ExitShell(2)
         );
+        // ⚠️ 2, NOT 127 — this kind takes no driver substitution. Measured:
+        // `bash -c 'set -o posix; set -Q'` exits 2.
         assert_eq!(
-            fatality(ErrorKind::SpecialBuiltinUsage, &shell_with(true, true)),
-            Fatality::ExitShell(127)
+            fatality(
+                ErrorKind::SpecialBuiltinUsage { status: 2 },
+                &shell_with(true, true)
+            ),
+            Fatality::ExitShell(2)
         );
     }
 
@@ -290,7 +339,7 @@ mod tests {
         for kind in [
             ErrorKind::Expansion,
             ErrorKind::UnsetUnderNounset,
-            ErrorKind::SpecialBuiltinUsage,
+            ErrorKind::SpecialBuiltinUsage { status: 2 },
             ErrorKind::ComsubSyntax { backtick: false },
             ErrorKind::Syntax,
         ] {

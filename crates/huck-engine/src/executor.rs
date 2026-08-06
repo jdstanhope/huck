@@ -829,7 +829,9 @@ fn run_command(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
                     let mut err = err_writer();
                     crate::sh_error_to!(shell, &mut *err, None, "{name}: is a special builtin");
                 }
-                shell.posix_fatal(2);
+                shell.report_error(crate::error_fatality::ErrorKind::SpecialBuiltinUsage {
+                    status: 2,
+                });
                 return ExecOutcome::Continue(2);
             }
             shell.define_function(name.clone(), body.clone(), *line);
@@ -1537,12 +1539,12 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell) -> ExecOutcome {
                 let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "{}: readonly variable", clause.var);
             }
-            shell.posix_fatal(127);
+            shell.report_error(crate::error_fatality::ErrorKind::Expansion);
             return ExecOutcome::Continue(1);
         }
         if shell.try_set(&clause.var, value).is_err() {
             // Nameref to a readonly target: try_set already reported the error.
-            shell.posix_fatal(127);
+            shell.report_error(crate::error_fatality::ErrorKind::Expansion);
             return ExecOutcome::Continue(1);
         }
         match execute_sequence_body(&clause.body, shell) {
@@ -4527,7 +4529,7 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
         Err(s) => {
             restore_inline_assignments(s, shell);
             if builtins::is_special_builtin(&resolved.program) {
-                shell.posix_fatal(127);
+                shell.report_error(crate::error_fatality::ErrorKind::Expansion);
             }
             drain_procsubs(shell, procsub_base);
             return ExecOutcome::Continue(1);
@@ -4690,7 +4692,8 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
             && !require_builtin
             && let Some(st) = shell.builtin_usage_error.take()
         {
-            shell.posix_fatal(st);
+            shell
+                .report_error(crate::error_fatality::ErrorKind::SpecialBuiltinUsage { status: st });
         }
         // exec's variable assignments persist, but pop the #28 child-env scalar
         // overlay so it doesn't leak into subsequent commands (redirection-only
@@ -4803,7 +4806,7 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
         && builtins::is_special_builtin(&resolved.program)
         && let Some(st) = shell.builtin_usage_error.take()
     {
-        shell.posix_fatal(st);
+        shell.report_error(crate::error_fatality::ErrorKind::SpecialBuiltinUsage { status: st });
     }
 
     finalize_inline_scope(snap, persistent, shell);
@@ -7419,9 +7422,11 @@ fn apply_inline_assignments(
             // #234/#203: a readonly-variable error in a command PREFIX assignment
             // is reported, but bash still RUNS the command with the OLD value
             // (rc = the command's exit) in default mode — it does NOT abort.
-            // POSIX non-interactive makes it fatal (exit 1) via `posix_fatal`.
+            // v358 (#198): measured — bash ABANDONS THE LIST in posix and
+            // continues outright otherwise. It never exits here, unlike a
+            // STANDALONE `r=2`, which does. The prefix is the distinction.
             if shell.shell_options.posix && !shell.is_interactive {
-                shell.posix_fatal(1);
+                shell.report_error(crate::error_fatality::ErrorKind::AssignmentPrefix);
                 return Err(snap);
             }
             // Skip this failed assignment (leave the old value) and continue —

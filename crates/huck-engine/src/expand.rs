@@ -1996,8 +1996,10 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                         // current top-level command in default mode (status 1,
                         // shell NOT exited) — set `pending_discard`, converted at
                         // the executor's post-expansion check points. POSIX
-                        // non-interactive EXITS (127) via `posix_fatal` (verified
-                        // against bash 5.2.21 --posix). Empty contribution to the
+                        // non-interactive EXITS. v358 (#198): both branches and
+                        // the exit code now come from `ErrorKind::Expansion` —
+                        // the 127 was hardcoded here and wrong for a script or
+                        // stdin, where bash exits 1. Empty contribution to the
                         // value matches bash either way.
                         if crate::arith::should_wrap_expansion_error(&e) {
                             crate::sh_error!(
