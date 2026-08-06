@@ -27,9 +27,8 @@
 | file | responsibility |
 |---|---|
 | `crates/huck-engine/src/error_fatality.rs` | **new.** `ErrorKind`, `Fatality`, `fatality()`. Pure decision + unit tests. The only module allowed to raise fatality. |
-| `crates/huck-engine/src/shell_state.rs` | gains `Invocation` + `Shell::invocation`; `raise_fatal`/`raise_discard` lose `pub`; `posix_fatal` is deleted; gains `report_error`. |
-| `crates/huck-engine/src/engine.rs` | sets `Invocation` at each entry point. |
-| `crates/huck-engine/src/shell.rs` | the piped-stdin reader sets `Invocation::Stdin`; `shell.rs:557` routes its syntax error through the classifier. |
+| `crates/huck-engine/src/shell_state.rs` | `raise_fatal`/`raise_discard` lose `pub`; `posix_fatal` is deleted; gains `report_error`. Reads the EXISTING `is_command_string`. |
+| `crates/huck-engine/src/shell.rs` | `shell.rs:557` routes its syntax error through the classifier. |
 | `crates/huck-engine/src/expand.rs` | 13 raise sites route through `report_error`. |
 | `crates/huck-engine/src/param_expansion.rs` | 1 raise site routes through `report_error`. |
 | `crates/huck-engine/src/executor.rs` | 2 `posix_fatal` sites route through `report_error`. |
@@ -38,102 +37,48 @@
 
 ---
 
-### Task 1: `Invocation` — record how the shell was started
+### Task 1: ~~`Invocation`~~ — WITHDRAWN, the field already exists
 
-huck has **no** representation of `-c` vs script vs stdin. The classifier needs one, because the exit code depends on it and it is not derivable from anything already on `Shell`. This is one new field replacing two hardcoded constants at 15 sites.
+**Do not implement this task.** It was written on a false premise and the
+correction is the point: `Shell` ALREADY records the driver, as
+`pub is_command_string: bool` (`shell_state.rs:840`) — *"True when the shell
+was invoked as `huck -c '<command>'`"*. It defaults to `false` and the CLI sets
+it at `repl.rs:166`; `Engine::set_is_command_string` is the public setter.
 
-**Files:**
-- Modify: `crates/huck-engine/src/shell_state.rs` (near `pub is_interactive: bool`, line ~833)
-- Modify: `crates/huck-engine/src/engine.rs` (`run` ~109, `capture` ~115, `run_script` ~144, `run_file` ~152)
-- Modify: `crates/huck-engine/src/shell.rs` (the piped-stdin / interactive reader path)
+The brainstorm searched for `invocation` / `InvocationMode` / `dash_c` and
+concluded no such field existed. It exists under a name none of those matched.
 
-**Interfaces:**
-- Produces: `pub enum Invocation { DashC, Script, Stdin }` and `pub invocation: Invocation` on `Shell`. Task 2 consumes it.
+It is sufficient. The classifier needs to distinguish `-c` from everything
+else, and nothing more: script and stdin were MEASURED to behave identically
+(both keep the kind's base code; only `-c` substitutes 127). A three-variant
+`Invocation` enum would encode a distinction that carries no behaviour.
 
-- [ ] **Step 1: Write the failing test**
+Proof it is wired, since the classifier depends on it:
 
-In `crates/huck-engine/src/shell_state.rs` tests module:
+```
+$ huck -c 'if'          ->  huck: -c: line 2: syntax error ...
+$ huck script.sh        ->  script.sh: line 2: syntax error ...
+$ printf 'if\n' | huck  ->  huck: line 2: syntax error ...
+```
+
+The `-c:` segment appears under `-c` alone.
+
+**Consequence for Task 2:** `driver_code` reads `shell.is_command_string`
+rather than a new field:
 
 ```rust
-#[test]
-fn invocation_defaults_to_dash_c() {
-    // `Shell::new()` is what the `-c` path builds; the embedding `Engine::run`
-    // has `bash -c` semantics (see docs/architecture.md).
-    let shell = Shell::new();
-    assert_eq!(shell.invocation, Invocation::DashC);
-}
-
-#[test]
-fn invocation_is_settable_per_driver() {
-    let mut shell = Shell::new();
-    shell.invocation = Invocation::Script;
-    assert_eq!(shell.invocation, Invocation::Script);
-    shell.invocation = Invocation::Stdin;
-    assert_eq!(shell.invocation, Invocation::Stdin);
+fn driver_code(base: i32, shell: &Shell) -> i32 {
+    if shell.is_command_string { 127 } else { base }
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+and every `true` / `false` / `false` in
+Task 2's tests becomes `is_command_string = true` / `false`.
 
-Run: `cargo test -p huck-engine --lib invocation -- --test-threads 4`
-Expected: FAIL — `cannot find type Invocation`.
-
-- [ ] **Step 3: Implement**
-
-In `shell_state.rs`:
-
-```rust
-/// How this shell was started. The error-fatality classifier needs it because
-/// bash's fatal-error exit code depends on the driver and on nothing else:
-/// `-c` substitutes 127 for the error kind's own code, while a script or a
-/// piped stdin keeps it (1 for an expansion or assignment fatal, 2 for a
-/// syntax error). Measured against bash 5.2.21; see the v358 spec.
-///
-/// NOT the same thing as `shell.rs`'s `top_level`, which marks the
-/// interactive / piped-stdin READER and says nothing about `-c`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Invocation {
-    /// `huck -c '...'`, and the `Engine::run` / `Engine::capture` embedding
-    /// entry points, which have `bash -c` semantics.
-    DashC,
-    /// A script file or `Engine::run_script` / `Engine::run_file`.
-    Script,
-    /// Commands read from a pipe or terminal.
-    Stdin,
-}
-```
-
-Add to `Shell`: `pub invocation: Invocation,` initialised to `Invocation::DashC` wherever `Shell`'s other scalar defaults are set.
-
-- [ ] **Step 4: Run to verify it passes**
-
-Run: `cargo test -p huck-engine --lib invocation -- --test-threads 4`
-Expected: PASS (2 tests).
-
-- [ ] **Step 5: Wire the entry points**
-
-In `engine.rs`, set `self.shell.invocation = Invocation::Script;` at the start of `run_script` and `run_file`. Leave `run` and `capture` on the `DashC` default.
-
-In `shell.rs`, set `shell.invocation = Invocation::Stdin;` where the piped-stdin / interactive top-level reader starts.
-
-- [ ] **Step 6: Prove the wiring, behaviour unchanged**
-
-Run: `cargo test -p huck-engine --lib -- --test-threads 4` and `cargo test -p huck --test script_mode_integration --jobs 1 -- --test-threads 1`
-Expected: all pass, no expected-value edits. This task changes NO behaviour — nothing reads `invocation` yet.
-
-- [ ] **Step 7: Commit**
-
-```bash
-cargo fmt --all
-git add -A && git commit -m "feat(#198): record how the shell was started
-
-The fatality classifier needs the driver, and huck had no representation of
-it: `top_level` marks the interactive/piped-stdin READER and says nothing
-about `-c`. One field, read by nobody yet, replacing two hardcoded exit-code
-constants at 15 sites in the tasks that follow.
-
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
-```
+**Not** widened to make `Engine::run` (which has `bash -c` semantics) set it:
+`is_command_string` also drives the `-c:` error-prologue segment, so flipping
+its default would change error text for every embedder. Out of scope, and the
+CLI path the harness exercises is already correct.
 
 ---
 
@@ -144,41 +89,42 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - Modify: `crates/huck-engine/src/lib.rs` (add `mod error_fatality;`)
 
 **Interfaces:**
-- Consumes: `Invocation` from Task 1.
+- Consumes: `Shell::is_command_string` (already exists; Task 1 withdrawn).
 - Produces: `ErrorKind`, `Fatality`, `fatality(kind, shell) -> Fatality`. Tasks 4-6 consume these.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
 use super::*;
-use crate::shell_state::{Invocation, Shell};
+use crate::shell_state::Shell;
 
-fn shell_with(posix: bool, inv: Invocation) -> Shell {
+/// `dash_c` is `Shell::is_command_string` — the EXISTING field that records
+/// `huck -c`. Script and stdin both spell it `false`, which is correct: they
+/// were measured to behave identically.
+fn shell_with(posix: bool, dash_c: bool) -> Shell {
     let mut s = Shell::new();
     s.shell_options.posix = posix;
     s.is_interactive = false;
-    s.invocation = inv;
+    s.is_command_string = dash_c;
     s
 }
 
 #[test]
 fn expansion_error_aborts_the_list_outside_posix() {
-    let s = shell_with(false, Invocation::Script);
+    let s = shell_with(false, false);
     assert_eq!(fatality(ErrorKind::Expansion, &s), Fatality::AbortList);
 }
 
 #[test]
 fn expansion_error_exits_in_posix_with_the_drivers_code() {
+    // script and stdin are the same spelling (`is_command_string == false`),
+    // which is the measured truth rather than a simplification.
     assert_eq!(
-        fatality(ErrorKind::Expansion, &shell_with(true, Invocation::Script)),
+        fatality(ErrorKind::Expansion, &shell_with(true, false)),
         Fatality::ExitShell(1)
     );
     assert_eq!(
-        fatality(ErrorKind::Expansion, &shell_with(true, Invocation::Stdin)),
-        Fatality::ExitShell(1)
-    );
-    assert_eq!(
-        fatality(ErrorKind::Expansion, &shell_with(true, Invocation::DashC)),
+        fatality(ErrorKind::Expansion, &shell_with(true, true)),
         Fatality::ExitShell(127)
     );
 }
@@ -186,11 +132,11 @@ fn expansion_error_exits_in_posix_with_the_drivers_code() {
 #[test]
 fn nounset_always_exits_with_the_drivers_code() {
     assert_eq!(
-        fatality(ErrorKind::UnsetUnderNounset, &shell_with(false, Invocation::Script)),
+        fatality(ErrorKind::UnsetUnderNounset, &shell_with(false, false)),
         Fatality::ExitShell(1)
     );
     assert_eq!(
-        fatality(ErrorKind::UnsetUnderNounset, &shell_with(false, Invocation::DashC)),
+        fatality(ErrorKind::UnsetUnderNounset, &shell_with(false, true)),
         Fatality::ExitShell(127)
     );
 }
@@ -198,11 +144,11 @@ fn nounset_always_exits_with_the_drivers_code() {
 #[test]
 fn special_builtin_usage_is_fatal_only_in_posix() {
     assert_eq!(
-        fatality(ErrorKind::SpecialBuiltinUsage, &shell_with(false, Invocation::Script)),
+        fatality(ErrorKind::SpecialBuiltinUsage, &shell_with(false, false)),
         Fatality::Continue
     );
     assert_eq!(
-        fatality(ErrorKind::SpecialBuiltinUsage, &shell_with(true, Invocation::Script)),
+        fatality(ErrorKind::SpecialBuiltinUsage, &shell_with(true, false)),
         Fatality::ExitShell(2)
     );
 }
@@ -211,7 +157,7 @@ fn special_builtin_usage_is_fatal_only_in_posix() {
 fn ordinary_builtin_errors_always_continue() {
     for posix in [false, true] {
         assert_eq!(
-            fatality(ErrorKind::BuiltinError, &shell_with(posix, Invocation::Script)),
+            fatality(ErrorKind::BuiltinError, &shell_with(posix, false)),
             Fatality::Continue
         );
     }
@@ -224,7 +170,7 @@ fn history_too_many_args_aborts_the_list_in_both_modes() {
     // `break 1 2` and the rest all continue.
     for posix in [false, true] {
         assert_eq!(
-            fatality(ErrorKind::HistoryTooManyArgs, &shell_with(posix, Invocation::Script)),
+            fatality(ErrorKind::HistoryTooManyArgs, &shell_with(posix, false)),
             Fatality::AbortList
         );
     }
@@ -232,7 +178,7 @@ fn history_too_many_args_aborts_the_list_in_both_modes() {
 
 #[test]
 fn backtick_comsub_syntax_error_continues_but_dollar_paren_exits() {
-    let s = shell_with(false, Invocation::Script);
+    let s = shell_with(false, false);
     assert_eq!(
         fatality(ErrorKind::ComsubSyntax { backtick: true }, &s),
         Fatality::Continue
@@ -248,7 +194,7 @@ fn dollar_paren_syntax_error_takes_127_under_dash_c() {
     assert_eq!(
         fatality(
             ErrorKind::ComsubSyntax { backtick: false },
-            &shell_with(false, Invocation::DashC)
+            &shell_with(false, true)
         ),
         Fatality::ExitShell(127)
     );
@@ -259,9 +205,9 @@ fn plain_syntax_error_keeps_2_under_every_driver() {
     // THE EXCEPTION, and the reason this is a test rather than a comment:
     // bash rejects a top-level syntax error before execution begins, so the
     // `-c` substitution never applies. `bash -c 'if'` exits 2, not 127.
-    for inv in [Invocation::DashC, Invocation::Script, Invocation::Stdin] {
+    for dash_c in [true, false] {
         assert_eq!(
-            fatality(ErrorKind::Syntax, &shell_with(false, inv)),
+            fatality(ErrorKind::Syntax, &shell_with(false, dash_c)),
             Fatality::ExitShell(2)
         );
     }
@@ -269,7 +215,7 @@ fn plain_syntax_error_keeps_2_under_every_driver() {
 
 #[test]
 fn an_interactive_shell_is_never_killed_by_an_error() {
-    let mut s = shell_with(true, Invocation::Stdin);
+    let mut s = shell_with(true, false);
     s.is_interactive = true;
     assert_ne!(
         fatality(ErrorKind::SpecialBuiltinUsage, &s),
@@ -294,7 +240,7 @@ Expected: FAIL — module does not exist.
 //! aborted, #116). `Shell::raise_fatal` / `raise_discard` are private to this
 //! module so a site cannot decide for itself.
 
-use crate::shell_state::{Invocation, Shell};
+use crate::shell_state::Shell;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -328,8 +274,8 @@ pub enum Fatality {
 /// `-c` substitutes 127 for the kind's own code; a script or stdin keeps it.
 fn driver_code(base: i32, shell: &Shell) -> i32 {
     match shell.invocation {
-        Invocation::DashC => 127,
-        Invocation::Script | Invocation::Stdin => base,
+        true => 127,
+        false | false => base,
     }
 }
 
@@ -850,4 +796,4 @@ Wait for CI to FINISH and pass. **Do not merge** — a `vNN` iteration PR is the
 
 **Placeholders.** None. The one genuinely open question — whether the backtick/`$( )` distinction is available at `shell.rs:557` — is written as an investigation step with an explicit instruction not to guess from source text, because the answer depends on code no measurement can settle.
 
-**Type consistency.** `ErrorKind`, `Fatality`, `fatality(kind, shell)`, `Invocation`, `Shell::invocation`, `Shell::report_error` are spelled identically in Tasks 1, 2, 4, 5, 6, 7.
+**Type consistency.** `ErrorKind`, `Fatality`, `fatality(kind, shell)`, `Shell::report_error` are spelled identically in Tasks 2, 4, 5, 6, 7. The driver axis is the EXISTING `Shell::is_command_string` throughout — Task 1's `Invocation` was withdrawn once the field was found.
