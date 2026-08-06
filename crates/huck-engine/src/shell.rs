@@ -553,8 +553,23 @@ fn process_line_in_sinks_ex(
             // via the pending-fatal-status channel it already drains for fatal
             // parameter-expansion errors. Command contexts (`eval`) never set
             // `top_level`, so their syntax errors stay non-fatal.
+            //
+            // v358 (#25): a BACKTICK body is parsed during EXPANSION, so bash
+            // reports its syntax error and carries on — `echo \`echo a; ; echo b\`;
+            // echo after` prints `after` and exits 0. `$( )` is parsed with the
+            // script and is fatal. `ParseError::InCommandSub` is raised only by
+            // the backtick reparse (v316/#213), so it is exactly that split.
+            //
+            // ⚠️ A `$( )` body error arrives here as a plain `Unexpected`,
+            // indistinguishable from `echo ;;`, so the `-c` 127-vs-2 half of
+            // this cannot be fixed at this site — see #492.
             if top_level && !shell.is_interactive {
-                shell.raise_fatal(2);
+                let kind = if matches!(e, crate::command::ParseError::InCommandSub { .. }) {
+                    crate::error_fatality::ErrorKind::ComsubSyntax { backtick: true }
+                } else {
+                    crate::error_fatality::ErrorKind::Syntax
+                };
+                shell.report_error(kind);
             }
             ExecOutcome::Continue(2)
         }

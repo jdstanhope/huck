@@ -63,7 +63,8 @@ echo NEXT" 2>/dev/null ); c=$? ;;
 for drv in dashc script stdin; do
     # --- expansion ---------------------------------------------------------
     check "arith"              ''  'echo $((1/0))'            "$drv"
-    check "bad substitution"   ''  'echo ${x[}'               "$drv"
+    # `${x[}` lived here and was removed: it is a PARSE-time rejection in huck
+    # (see the note in the syntax section and #493), not a fatality decision.
     check "readonly assign"    'readonly r=1'  'r=2'          "$drv"
     check "nounset"            'set -u'  'echo $undef_zz'     "$drv"
     check "posix arith"        'set -o posix'  'echo $((1/0))' "$drv"
@@ -102,9 +103,17 @@ set -u'  'echo $undef_zz'                                     "$drv"
     check "posix shift bad"    'set -o posix'  'shift a b'    "$drv"
 
     # --- syntax ------------------------------------------------------------
-    check "backtick syntax"    ''  'echo `echo a; ; echo b`'  "$drv"
-    check "dollarparen syntax" ''  'echo $(echo a; ; echo b)' "$drv"
-    check "posix backtick"     'set -o posix'  'echo `echo a; ; echo b`' "$drv"
+    # ⚠️ NO backtick / `${x[}` / `$( )` ROWS HERE, deliberately. Those are NOT
+    # fatality contracts: huck rejects the whole line at PARSE time where bash
+    # defers to EXPANSION time, so no fatality decision is ever reached. The
+    # discriminator is whether the command BEFORE the error runs:
+    #
+    #   echo BEFORE; echo ${x[}; echo AFTER    bash: BEFORE   huck: (nothing)
+    #
+    # Tracked as #493 (front-end), with #25 / #490 / #492 re-rooted onto it.
+    # Adding them back here would pin a divergence this harness cannot fix and
+    # would make a green run mean less than it does.
+    check "plain syntax error" ''  'echo ;;'                  "$drv"
 
     # --- must-not-change ---------------------------------------------------
     check "command not found"  ''  'no_such_cmd_zz'           "$drv"
