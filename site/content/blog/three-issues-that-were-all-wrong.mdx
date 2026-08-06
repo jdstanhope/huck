@@ -1,0 +1,129 @@
+---
+title: "Three bug reports that were all wrong"
+date: 2026-08-06
+summary: "A round of DEBUG-trap fixes where every issue mis-described its own bug — and each real cause turned out to be simpler than the report, and fixed by deleting a check rather than adding one."
+tags: ["traps", "debug", "extdebug", "bugfix"]
+draft: false
+---
+
+huck's `DEBUG` trap runs a snippet before every command. It is how you write a
+tracer, a profiler, or a "what on earth is this script doing" one-liner. Three
+issues were open against it. All three were fixed this week, and all three
+described their own bug incorrectly.
+
+That is not a complaint about whoever filed them — I filed them. It is a note
+about what happens when you write down the symptom you saw instead of the
+mechanism underneath.
+
+## "A trap set inside a function doesn't fire"
+
+This one was accurate about the symptom:
+
+```bash
+# before
+$ huck -c 'f() { trap "echo D" DEBUG; echo a; echo b; }; f'
+a
+b
+
+# after
+$ huck -c 'f() { trap "echo D" DEBUG; echo a; echo b; }; f'
+D
+a
+D
+b
+```
+
+Your trap was installed and simply never ran. The obvious reading is "the
+firing check has a bug — add a condition". The actual reading is that the
+firing check should not exist.
+
+Shells don't decide whether to fire a trap when they reach a command. They
+decide it when they *enter* a function: without `set -T`, the caller's trap is
+unset for the duration of the body and put back on the way out. huck was asking
+the question at the wrong moment, and at that moment the answer is unknowable —
+"we are inside a function" cannot distinguish the caller's trap from one the
+body installed for itself. So it silenced both.
+
+Moving the decision to function entry deleted the check and fixed four
+behaviours at once. Here's one that nobody had noticed:
+
+```bash
+# before — the function's `trap -` destroys the caller's trap
+$ huck -c 'trap "echo C" DEBUG; f() { trap - DEBUG; }; f; echo after'
+C
+after
+
+# after — the caller gets its trap back, so `echo after` fires it
+$ huck -c 'trap "echo C" DEBUG; f() { trap - DEBUG; }; f; echo after'
+C
+C
+after
+```
+
+## "DEBUG fires once instead of twice around `&&`"
+
+This one was wrong. `&&` had nothing to do with it.
+
+```bash
+# before
+$ huck -c 'trap "echo D" DEBUG; [[ -f /etc/passwd ]] && echo found'
+D
+found
+
+# after
+$ huck -c 'trap "echo D" DEBUG; [[ -f /etc/passwd ]] && echo found'
+D
+D
+found
+```
+
+`true && echo x` was already correct. What was broken is that `[[ ]]` and
+`(( ))` never fired the trap *at all* — connector or no connector. The `&&` was
+just the place where a missing fire is easiest to see, because you can count
+the ones next to it.
+
+Had I trusted the title, I'd have spent the day in the and-or list code, which
+was fine.
+
+## "extdebug doesn't preserve the trap across a subshell"
+
+True, and a symptom of something much simpler. huck treated `shopt -s extdebug`
+as *implying* the `-T` and `-E` flags, and re-derived that implication at every
+place it mattered — three of them, one of which had forgotten to. bash doesn't
+imply anything; extdebug's setter plainly assigns both flags.
+
+The difference is visible without any traps at all:
+
+```bash
+# before
+$ huck -c 'shopt -s extdebug; echo "$-"'
+hBc
+
+# after
+$ huck -c 'shopt -s extdebug; echo "$-"'
+hBETc
+```
+
+Once huck writes the flags like bash does, the three re-derived conditions
+disappear and the forgotten one cannot be written again. Two more things
+started working for free: `set +T` after `shopt -s extdebug` now actually turns
+tracing back off, and `shopt -u extdebug` clears both flags — bluntly, even
+ones you set yourself, which is what bash does whether or not you like it.
+
+## The shape
+
+Each fix removed a condition. That wasn't a goal; it's what happens when you
+measure the mechanism instead of patching the symptom. A missing case invites
+you to add the case. Finding out *why* it was missing tends to reveal that the
+whole construct was the wrong shape — and the wrong shape is usually bigger
+than the bug.
+
+The cascade stopped at two related issues that are still open, because
+measuring them turned up something that needs designing rather than fixing: a
+DEBUG-skipped pipeline stage is not just skipped, it vanishes from
+`$PIPESTATUS` entirely, so a two-stage pipeline reports one status. Changing
+the length of that array is not a bug fix. See
+[#268](https://github.com/jdstanhope/huck/issues/268) and
+[#263](https://github.com/jdstanhope/huck/issues/263), plus
+[#486](https://github.com/jdstanhope/huck/issues/486), where trap output is
+traced at the wrong depth under `set -x`.
