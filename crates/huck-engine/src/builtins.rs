@@ -7267,6 +7267,23 @@ fn builtin_shopt(
             if !shell.shopt_options.set(name, set_f) {
                 crate::sh_error_to!(shell, err, None, "shopt: {name}: invalid shell option name");
                 rc = 1;
+            } else if name == "extdebug" {
+                // #264, bash's `shopt_set_debug_mode`:
+                //     function_trace_mode = error_trace_mode = <extdebug value>
+                // A plain ASSIGNMENT, and extdebug's setter is the only place
+                // it happens. That is stronger than "extdebug implies -T/-E",
+                // which is how huck used to model it at each read site:
+                //
+                //   * `$-` and `set -o` REPORT -T and -E afterwards;
+                //   * `set +T` afterwards genuinely turns tracing back off;
+                //   * `shopt -u extdebug` clears BOTH unconditionally — even a
+                //     `-E` the user set explicitly, having never touched
+                //     extdebug. Blunt, and verified against bash 5.2.21.
+                //
+                // The write is ONE-WAY: `set -T` does not turn extdebug on, so
+                // the DEBUG skip / return-2 rules stay keyed on extdebug alone.
+                shell.shell_options.functrace = set_f;
+                shell.shell_options.errtrace = set_f;
             }
         }
         return ExecOutcome::Continue(rc);
