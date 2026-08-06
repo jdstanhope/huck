@@ -108,6 +108,39 @@ The neighbouring resets stay: `traps.clear()`, the pending bitmask,
 `firing_traps`, and `take_exit()` (v353's rule that a pending exit request
 belongs to the parent).
 
+**Measured, so the question does not have to be re-argued.** A bash subshell
+inherits the ENTIRE option set — no `set` flag and no `shopt` is cleared:
+
+| probe | parent | child |
+|---|---|---|
+| `set -m; ( echo "$-" )` | `hmBc` | `hmBc` |
+| `bash -i … ( echo "$-" )` | `hiBHc` | `hiBHc` |
+| `set -e -u -x; ( echo "$-" )` | — | `ehuxBc` |
+| `shopt extglob / nullglob / failglob / login_shell` | on/on/on/off | identical |
+
+What a subshell DOES reset is narrower and is not an option:
+
+- **caught traps → default** — `trap "echo U" USR1; ( kill -USR1 $BASHPID; … )`
+  kills the child with the default action; the handler is gone;
+- **ignored traps stay ignored** — `trap "" USR1` and the child survives (the
+  POSIX asymmetry);
+- the EXIT trap does not fire in the child, `$BASHPID` differs, and the job
+  table is per-shell.
+
+And the disputed value is inherited, even doubly nested: `set -e;
+( ( false; echo x ) ) || echo or` prints `x`.
+
+So there is no clean-slate principle to appeal to. A subshell is a COPY of the
+shell with caught trap dispositions reset, because the child cannot service the
+parent's handlers. Everything else travels — options, functions, variables, and
+the caller's statement that this command's failure does not count.
+
+**How the bug got in:** the counter was named `err_suppressed_depth` and lived
+beside the trap fields, so it was swept into the function that resets *traps*.
+A naming accident rather than a decision — which is an argument for the v355
+names (`errexit_suppressed_depth` / `err_trap_suppressed_depth`) sitting
+somewhere other than next to the trap table.
+
 ### 4. What is deliberately NOT deleted
 
 Two candidates were checked and kept, both because the harness proves they are
