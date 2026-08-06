@@ -245,19 +245,23 @@ pub fn fire_debug_trap(shell: &mut Shell) -> DebugDecision {
 /// `TRAP_STRING()` yields NULL for an ignored trap, so the save-and-unset
 /// block is skipped and the ignore stays visible inside the function.
 /// (bash) #434
+/// Reads `functrace` alone: `shopt -s extdebug` WRITES that flag rather than
+/// implying it (#264, bash's `shopt_set_debug_mode`), so there is nothing to
+/// or-in here — and `set +T` after `shopt -s extdebug` correctly turns the
+/// inheritance back off.
 pub fn take_return_trap_for_call(shell: &mut Shell) -> Option<String> {
-    if shell.shell_options.functrace || shell.extdebug() {
+    if shell.shell_options.functrace {
         return None;
     }
     take_trap_for_call(shell, TrapSignal::Return)
 }
 
-/// The same entry treatment for the ERR trap, gated on `errtrace` (`set -E` /
-/// `shopt -s extdebug`, which turns errtrace on) instead of functrace —
+/// The same entry treatment for the ERR trap, gated on `errtrace` (`set -E`)
+/// instead of functrace —
 /// bash's `execute_function` runs `restore_default_signal (ERROR_TRAP)` under
 /// exactly the same shape. #438
 pub fn take_err_trap_for_call(shell: &mut Shell) -> Option<String> {
-    if shell.shell_options.errtrace || shell.extdebug() {
+    if shell.shell_options.errtrace {
         return None;
     }
     take_trap_for_call(shell, TrapSignal::Err)
@@ -276,7 +280,7 @@ pub fn take_err_trap_for_call(shell: &mut Shell) -> Option<String> {
 /// file's commands, while a file that traps DEBUG for itself fires for its
 /// own remaining lines and keeps the trap afterwards. #439
 pub fn take_debug_trap_for_call(shell: &mut Shell) -> Option<String> {
-    if shell.shell_options.functrace || shell.extdebug() {
+    if shell.shell_options.functrace {
         return None;
     }
     take_trap_for_call(shell, TrapSignal::Debug)
