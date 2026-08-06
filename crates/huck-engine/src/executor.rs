@@ -471,7 +471,26 @@ fn run_andor_group(
     // command that INSTALLS the ERR trap (typically a function trapping for
     // itself) is not itself caught by it. Captured per command, not per group.
     let err_armed_first = crate::traps::err_trap_armed(shell);
+    // #480/#468/#470: a command that is NOT the last of its and-or list is
+    // exempt, and bash propagates that exemption INTO whatever the command
+    // runs — a brace group's statements, a function's body, a loop's
+    // iterations. Without this scope, `set -e; f() { false; echo x; }; f || or`
+    // exits the shell inside f, where bash prints x and then runs the handler.
+    //
+    // For a simple command the scope changes nothing observable: its own fire
+    // is already skipped by the `is_last` guard below and it has no body.
+    //
+    // The un-suppress sits IMMEDIATELY after `run_command`, not at the end of
+    // the function: five early returns follow, and leaking the depth past them
+    // would make `set -e` silently stop working after the first `&&`.
+    let first_exempt = !rest.is_empty();
+    if first_exempt {
+        shell.suppress_both();
+    }
     let mut status = run_command(first, shell);
+    if first_exempt {
+        shell.unsuppress_both();
+    }
     if let Some(o) = check_interrupt(shell) {
         return o;
     }
@@ -501,7 +520,16 @@ fn run_andor_group(
         };
         if should_run {
             let err_armed = crate::traps::err_trap_armed(shell);
+            // Same rule as `first`: exempt iff this is not the last element,
+            // and the exemption propagates into whatever the command runs.
+            let exempt = i + 1 != rest.len();
+            if exempt {
+                shell.suppress_both();
+            }
             status = run_command(command, shell);
+            if exempt {
+                shell.unsuppress_both();
+            }
             if let Some(o) = check_interrupt(shell) {
                 return o;
             }
