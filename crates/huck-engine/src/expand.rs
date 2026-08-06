@@ -445,7 +445,7 @@ fn expand_assoc_param(
             let val = shell.lookup_associative_element(name, &key);
             if val.is_none() && shell.shell_options.nounset {
                 crate::sh_error!(shell, None, "{name}[{key}]: unbound variable");
-                shell.raise_fatal(1);
+                shell.report_error(crate::error_fatality::ErrorKind::UnsetUnderNounset);
                 return ExpansionResult::Fatal { status: 1 };
             }
             ExpansionResult::Value(val.unwrap_or_default())
@@ -491,7 +491,7 @@ fn expand_assoc_param(
                 Ok(v) => v,
                 Err(e) => {
                     crate::sh_error!(shell, None, "{name}: {e}");
-                    shell.raise_fatal(1);
+                    shell.report_error(crate::error_fatality::ErrorKind::Expansion);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
@@ -653,7 +653,7 @@ fn expand_indirect(
     // value-as-name indirection.
     if subscript.is_none() && (name == "$" || name == "!") {
         crate::sh_error!(shell, None, "${{!{name}}}: bad substitution");
-        shell.raise_fatal(1);
+        shell.report_error(crate::error_fatality::ErrorKind::Expansion);
         return ExpansionResult::Fatal { status: 1 };
     }
     // Nameref special case: ${!r} where r is a nameref yields the TARGET NAME
@@ -930,14 +930,14 @@ fn expand_array_param(
                     if !shell.discard_pending() {
                         crate::sh_error!(shell, None, "{e}");
                     }
-                    shell.raise_fatal(1);
+                    shell.report_error(crate::error_fatality::ErrorKind::Expansion);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
             let val = shell.lookup_indexed_element(name, idx);
             if val.is_none() && shell.shell_options.nounset {
                 crate::sh_error!(shell, None, "{name}[{idx}]: unbound variable");
-                shell.raise_fatal(1);
+                shell.report_error(crate::error_fatality::ErrorKind::UnsetUnderNounset);
                 return ExpansionResult::Fatal { status: 1 };
             }
             ExpansionResult::Value(val.unwrap_or_default())
@@ -957,7 +957,7 @@ fn expand_array_param(
                     if !shell.discard_pending() {
                         crate::sh_error!(shell, None, "{e}");
                     }
-                    shell.raise_fatal(1);
+                    shell.report_error(crate::error_fatality::ErrorKind::Expansion);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
@@ -986,7 +986,7 @@ fn expand_array_param(
                 Ok(v) => v,
                 Err(e) => {
                     crate::sh_error!(shell, None, "{name}: {e}");
-                    shell.raise_fatal(1);
+                    shell.report_error(crate::error_fatality::ErrorKind::Expansion);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
@@ -1199,7 +1199,7 @@ fn expand_part(
                 None => {
                     if shell.shell_options.nounset {
                         crate::sh_error!(shell, None, "{name}: unbound variable");
-                        shell.raise_fatal(1);
+                        shell.report_error(crate::error_fatality::ErrorKind::UnsetUnderNounset);
                         return ControlFlow::Break(());
                     }
                 }
@@ -1222,7 +1222,7 @@ fn expand_part(
                 None => {
                     if shell.shell_options.nounset {
                         crate::sh_error!(shell, None, "{name}: unbound variable");
-                        shell.raise_fatal(1);
+                        shell.report_error(crate::error_fatality::ErrorKind::UnsetUnderNounset);
                         return ControlFlow::Break(());
                     }
                     String::new()
@@ -1308,15 +1308,15 @@ fn expand_part(
                     *has_emitted = true;
                 }
                 Err(e) => {
-                    // Print the error, then raise the fatality flavor. v312
-                    // (#3/#49): default mode DISCARDS the current top-level
-                    // command (bash `jump_to_top_level(DISCARD)`, status 1,
-                    // shell NOT exited) — set `pending_discard`, converted to
-                    // `Interrupted(DiscardCommand)` at the executor's
-                    // post-expansion check points. POSIX non-interactive EXITS
-                    // the shell (127) via `posix_fatal` (verified against bash
-                    // 5.2.21 --posix). The empty contribution matches bash's
-                    // empty $((..)) value on error either way.
+                    // Print the error, then let the classifier pick the
+                    // fatality. v312 (#3/#49): default mode DISCARDS the
+                    // current top-level command (bash
+                    // `jump_to_top_level(DISCARD)`, shell NOT exited); POSIX
+                    // non-interactive EXITS. v358 (#198): both branches, and
+                    // the exit code, now come from `ErrorKind::Expansion` —
+                    // the code was hardcoded 127 here and was wrong for a
+                    // script or stdin, where bash exits 1. The empty
+                    // contribution matches bash's empty $((..)) either way.
                     if crate::arith::should_wrap_expansion_error(&e) {
                         crate::sh_error!(
                             shell,
@@ -1325,11 +1325,7 @@ fn expand_part(
                             crate::arith::render_error_body(&src, &e)
                         );
                     }
-                    if shell.shell_options.posix && !shell.is_interactive {
-                        shell.posix_fatal(127);
-                    } else {
-                        shell.raise_discard();
-                    }
+                    shell.report_error(crate::error_fatality::ErrorKind::Expansion);
                     *has_emitted = true;
                 }
             }
@@ -1355,7 +1351,7 @@ fn expand_part(
             {
                 if shell.lookup_var(name).is_none() && shell.shell_options.nounset {
                     crate::sh_error!(shell, None, "{name}: unbound variable");
-                    shell.raise_fatal(1);
+                    shell.report_error(crate::error_fatality::ErrorKind::UnsetUnderNounset);
                     return ControlFlow::Break(());
                 }
             }
@@ -1465,7 +1461,21 @@ fn expand_part(
                     }
                 }
                 crate::param_expansion::ExpansionResult::Fatal { status } => {
-                    shell.raise_fatal(status);
+                    // v358 (#198): the arm that produced this may ALREADY have
+                    // classified the error — the expansion sites in this file
+                    // now call `report_error` themselves. Only fall back to the
+                    // legacy "escalate to fatal" when nothing was raised, so a
+                    // site that decided "abandon the list" is not silently
+                    // promoted to "exit the shell".
+                    //
+                    // ⚠️ Blanket-classifying this passthrough as `Expansion`
+                    // BROKE `${x:?msg}`: its fatality is raised in
+                    // param_expansion, which returns Fatal without classifying,
+                    // so the flattening downgraded a required-variable error
+                    // (bash EXITS) to a list abort. Caught by four unit tests.
+                    if !shell.discard_pending() && !shell.fatal_pending() {
+                        shell.raise_fatal(status);
+                    }
                     return ControlFlow::Break(());
                 }
             }
@@ -1692,7 +1702,7 @@ fn emit_bad_subst(modifier: &crate::lexer::ParamModifier, word: &Word, shell: &m
     if let crate::lexer::ParamModifier::BadSubst { .. } = modifier {
         let src = reconstruct_word_source_inner(word);
         crate::sh_error!(shell, None, "{src}: bad substitution");
-        shell.raise_fatal(1);
+        shell.report_error(crate::error_fatality::ErrorKind::Expansion);
         true
     } else {
         false
@@ -1964,7 +1974,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 None => {
                     if shell.shell_options.nounset {
                         crate::sh_error!(shell, None, "{name}: unbound variable");
-                        shell.raise_fatal(1);
+                        shell.report_error(crate::error_fatality::ErrorKind::UnsetUnderNounset);
                         return result;
                     }
                 }
@@ -1997,11 +2007,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                                 crate::arith::render_error_body(&src, &e)
                             );
                         }
-                        if shell.shell_options.posix && !shell.is_interactive {
-                            shell.posix_fatal(127);
-                        } else {
-                            shell.raise_discard();
-                        }
+                        shell.report_error(crate::error_fatality::ErrorKind::Expansion);
                     }
                 }
             }
@@ -2057,7 +2063,12 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                         result.push_str(&joined);
                     }
                     crate::param_expansion::ExpansionResult::Fatal { status } => {
-                        shell.raise_fatal(status);
+                        // Same bridge as the other passthrough above: defer to
+                        // a classification the producing arm already made, and
+                        // only fall back to escalating when there was none.
+                        if !shell.discard_pending() && !shell.fatal_pending() {
+                            shell.raise_fatal(status);
+                        }
                         return result;
                     }
                 }

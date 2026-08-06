@@ -1566,7 +1566,10 @@ fn default_readonly_for_var_is_not_fatal() {
 fn posix_assignment_no_command_is_fatal() {
     let mut shell = Shell::new();
     exec_script("set -o posix\nreadonly x=1\nx=2\n", &mut shell);
-    assert_eq!(shell.fatal_status(), Some(127));
+    // v358 (#198): 1, not 127 — see the note in
+    // `expand::tests::expand_arith_error_is_posix_fatal`. `Shell::new()` is
+    // the script/stdin driver, where bash exits 1.
+    assert_eq!(shell.fatal_status(), Some(1));
 }
 #[test]
 fn posix_assignment_before_special_is_fatal() {

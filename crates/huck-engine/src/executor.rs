@@ -4188,21 +4188,21 @@ fn run_assignment_list(items: &[crate::command::Assignment], shell: &mut Shell) 
                 let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "{name}: readonly variable");
             }
-            if shell.shell_options.posix && !shell.is_interactive {
-                shell.posix_fatal(127); // EXITPROG (v226): POSIX non-interactive exits 127
-            } else {
-                shell.raise_discard(); // DISCARD (v312/#31): discard the current command, rc 1
-            }
+            // v226/v312 (#31/#3): POSIX non-interactive EXITS, default mode
+            // DISCARDS the current command. v358 (#198): both, and the exit
+            // code, come from the classifier — the 127 here was hardcoded and
+            // wrong for a script or stdin, where bash exits 1.
+            shell.report_error(crate::error_fatality::ErrorKind::Expansion);
             st = 1;
             break;
         }
         shell.set_xtrace_assign_rhs(None);
         if apply_one_assignment(a, shell, &mut *err_writer()).is_err() {
-            if shell.shell_options.posix && !shell.is_interactive {
-                shell.posix_fatal(127); // EXITPROG (v226): POSIX non-interactive exits 127
-            } else {
-                shell.raise_discard(); // DISCARD (v312/#31): discard the current command, rc 1
-            }
+            // v226/v312 (#31/#3): POSIX non-interactive EXITS, default mode
+            // DISCARDS the current command. v358 (#198): both, and the exit
+            // code, come from the classifier — the 127 here was hardcoded and
+            // wrong for a script or stdin, where bash exits 1.
+            shell.report_error(crate::error_fatality::ErrorKind::Expansion);
             st = 1;
             break;
         }

@@ -3331,6 +3331,22 @@ impl Shell {
         self.unwind.discard = true;
     }
 
+    /// Classify an error and raise whatever unwind it deserves.
+    ///
+    /// v358 (#198): the ONLY public way to make an error fatal. Before this,
+    /// two dozen sites each answered "is this fatal, and with what code"
+    /// alone, and the answers were not merely inconsistent — they were
+    /// uncorrelated with bash, wrong in both directions at once. The decision
+    /// itself lives in `error_fatality::fatality`; this method only carries
+    /// out the verdict on the existing v354 unwind.
+    pub fn report_error(&mut self, kind: crate::error_fatality::ErrorKind) {
+        match crate::error_fatality::fatality(kind, self) {
+            crate::error_fatality::Fatality::Continue => {}
+            crate::error_fatality::Fatality::AbortList => self.raise_discard(),
+            crate::error_fatality::Fatality::ExitShell(n) => self.raise_fatal(n),
+        }
+    }
+
     /// True when the current command is marked for discard. Does not consume.
     pub fn discard_pending(&self) -> bool {
         self.unwind.discard

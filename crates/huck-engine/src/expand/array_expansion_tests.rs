@@ -176,7 +176,12 @@ fn length_of_element_at_bad_subscript_errors() {
     // rather than silently using idx 0.
     let mut s = Shell::new();
     let _ = expand_for_test(&mut s, "${#nonexistent[-1]}");
-    assert!(s.fatal_pending());
+    // v358 (#198): the error now ABANDONS THE LIST rather than exiting.
+    // ⚠️ Neither is right. bash prints `0` and raises nothing at all — huck
+    // was wrong here before this change (it exited) and is still wrong, just
+    // closer. Pinned as-is so the remaining gap stays visible: #491.
+    assert!(s.discard_pending());
+    assert!(!s.fatal_pending());
 }
 
 // v73 regression: ${a[i]:-default} on a missing index must substitute
