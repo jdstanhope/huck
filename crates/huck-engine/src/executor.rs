@@ -93,7 +93,7 @@ fn flush_stdout() {
 /// v36's ERR-trap gate), returns the Exit outcome to terminate the shell
 /// with that status. Caller propagates the outcome with an early return.
 fn maybe_errexit(shell: &Shell, status: i32) -> Option<ExecOutcome> {
-    if shell.shell_options.errexit && shell.err_suppressed_depth == 0 && status != 0 {
+    if shell.shell_options.errexit && !shell.errexit_suppressed() && status != 0 {
         Some(ExecOutcome::Exit(status))
     } else {
         None
@@ -431,7 +431,7 @@ fn finish_command(
     if let Some(o) = pending_unwind(shell, UnwindPhase::After) {
         return Some(o);
     }
-    if c != 0 && shell.err_suppressed_depth == 0 && is_last && !is_negated_pipeline(cmd) {
+    if c != 0 && !shell.err_trap_suppressed() && is_last && !is_negated_pipeline(cmd) {
         if err_armed && !body_already_fired_err(cmd) {
             crate::traps::fire_err_trap(shell);
             // #442: the ERR action itself ran `exit N`. Checked here, AFTER the
@@ -1326,9 +1326,9 @@ fn run_while_inner(clause: &WhileClause, shell: &mut Shell) -> ExecOutcome {
         if let Some(o) = check_interrupt(shell) {
             return o;
         }
-        shell.err_suppressed_depth += 1;
+        shell.suppress_both();
         let cond = execute_sequence_body(&clause.condition, shell);
-        shell.err_suppressed_depth -= 1;
+        shell.unsuppress_both();
         let keep_going = match cond {
             ExecOutcome::Exit(_)
             | ExecOutcome::LoopBreak(_, _)
@@ -2104,9 +2104,9 @@ fn run_case_inner(clause: &CaseClause, shell: &mut Shell) -> ExecOutcome {
 /// branch whose condition succeeds (exit 0), or the `else` body, or
 /// nothing (status 0). An `exit` anywhere inside propagates.
 fn run_if(clause: &IfClause, shell: &mut Shell) -> ExecOutcome {
-    shell.err_suppressed_depth += 1;
+    shell.suppress_both();
     let cond = execute_sequence_body(&clause.condition, shell);
-    shell.err_suppressed_depth -= 1;
+    shell.unsuppress_both();
     if matches!(
         cond,
         ExecOutcome::Exit(_)
@@ -2121,9 +2121,9 @@ fn run_if(clause: &IfClause, shell: &mut Shell) -> ExecOutcome {
         return execute_sequence_body(&clause.then_body, shell);
     }
     for elif in &clause.elif_branches {
-        shell.err_suppressed_depth += 1;
+        shell.suppress_both();
         let elif_cond = execute_sequence_body(&elif.condition, shell);
-        shell.err_suppressed_depth -= 1;
+        shell.unsuppress_both();
         if matches!(
             elif_cond,
             ExecOutcome::Exit(_)
@@ -2551,7 +2551,7 @@ fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> ExecOutcome {
     // errexit gate the counter controls, and the negation below only rewrites
     // `Continue`.
     if pipeline.negate {
-        shell.err_suppressed_depth += 1;
+        shell.suppress_both();
     }
     let outcome = if pipeline.commands.len() == 1 {
         // Single-stage pipeline: run directly in the parent shell (no fork needed).
@@ -2561,7 +2561,7 @@ fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> ExecOutcome {
         run_multi_stage(&pipeline.commands, shell)
     };
     if pipeline.negate {
-        shell.err_suppressed_depth -= 1;
+        shell.unsuppress_both();
         // Negate the exit status only; $PIPESTATUS (set by the stage(s) above)
         // stays raw, and control-flow outcomes propagate unchanged.
         if let ExecOutcome::Continue(s) = outcome {

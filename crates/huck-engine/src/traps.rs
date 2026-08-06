@@ -360,7 +360,8 @@ pub fn clear_for_subshell(shell: &mut Shell) {
     shell.traps.clear();
     shell.trap_pending = Arc::new(AtomicU32::new(0));
     shell.firing_traps.clear();
-    shell.err_suppressed_depth = 0;
+    shell.errexit_suppressed_depth = 0;
+    shell.err_trap_suppressed_depth = 0;
     // #442: a request recorded before the fork is the PARENT's business.
     // Targeted, NOT `unwind = Default::default()`: the sibling slots
     // (`discard`, `fatal` — v354) are deliberately NOT cleared here, because
@@ -1140,10 +1141,12 @@ mod tests {
     fn clear_for_subshell_resets_firing_trap_and_err_depth() {
         let mut shell = Shell::new();
         shell.firing_traps = vec![TrapSignal::Err];
-        shell.err_suppressed_depth = 5;
+        shell.errexit_suppressed_depth = 5;
+        shell.err_trap_suppressed_depth = 5;
         clear_for_subshell(&mut shell);
         assert!(shell.firing_traps.is_empty());
-        assert_eq!(shell.err_suppressed_depth, 0);
+        assert_eq!(shell.errexit_suppressed_depth, 0);
+        assert_eq!(shell.err_trap_suppressed_depth, 0);
     }
 
     #[test]

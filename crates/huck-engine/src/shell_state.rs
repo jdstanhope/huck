@@ -885,7 +885,17 @@ pub struct Shell {
 
     /// Depth counter for ERR-suppression contexts (if/elif/while/until
     /// conditions). ERR trap only fires when this is 0.
-    pub err_suppressed_depth: u32,
+    /// v355 (#480): depth of nested contexts where a failing command must NOT
+    /// exit the shell under `set -e` — a negated pipeline, an `if`/`while`
+    /// condition, or a command in a non-last `&&`/`||` position, and
+    /// everything they run.
+    pub errexit_suppressed_depth: u32,
+
+    /// v355 (#469): depth of nested contexts where a failing command must NOT
+    /// fire the ERR trap. Raised with the errexit counter everywhere EXCEPT a
+    /// negated pipeline while errexit is off, where bash still fires the
+    /// body's trap. Two counters exist for that one cell of the contract.
+    pub err_trap_suppressed_depth: u32,
 
     /// Recursive `source`/`.` call depth. Capped at 64 in
     /// `builtin_source` to prevent runaway loops. Increment on
@@ -1199,7 +1209,8 @@ impl Shell {
             trap_sigids: std::collections::HashMap::new(),
             default_sigids: std::collections::HashMap::new(),
             firing_traps: Vec::new(),
-            err_suppressed_depth: 0,
+            errexit_suppressed_depth: 0,
+            err_trap_suppressed_depth: 0,
             source_depth: 0,
             local_scopes: Vec::new(),
             loop_depth: 0,
@@ -3310,6 +3321,39 @@ impl Shell {
     /// True when the current command is marked for discard. Does not consume.
     pub fn discard_pending(&self) -> bool {
         self.unwind.discard
+    }
+
+    /// Enter a context that exempts failures from BOTH `set -e` and the ERR
+    /// trap: an `if`/`while` condition, or a command in a non-last `&&`/`||`
+    /// position. Pair with `unsuppress_both`.
+    pub fn suppress_both(&mut self) {
+        self.errexit_suppressed_depth += 1;
+        self.err_trap_suppressed_depth += 1;
+    }
+
+    pub fn unsuppress_both(&mut self) {
+        self.errexit_suppressed_depth = self.errexit_suppressed_depth.saturating_sub(1);
+        self.err_trap_suppressed_depth = self.err_trap_suppressed_depth.saturating_sub(1);
+    }
+
+    /// Enter a context that exempts failures from `set -e` but leaves the ERR
+    /// trap live — a negated pipeline while errexit is off (#469).
+    pub fn suppress_errexit_only(&mut self) {
+        self.errexit_suppressed_depth += 1;
+    }
+
+    pub fn unsuppress_errexit_only(&mut self) {
+        self.errexit_suppressed_depth = self.errexit_suppressed_depth.saturating_sub(1);
+    }
+
+    /// True when a failing command must not exit the shell under `set -e`.
+    pub fn errexit_suppressed(&self) -> bool {
+        self.errexit_suppressed_depth > 0
+    }
+
+    /// True when a failing command must not fire the ERR trap.
+    pub fn err_trap_suppressed(&self) -> bool {
+        self.err_trap_suppressed_depth > 0
     }
 
     /// Consumes the discard flag. The caller pairs this with
