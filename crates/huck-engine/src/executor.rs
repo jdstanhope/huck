@@ -3887,6 +3887,10 @@ pub(crate) fn call_function(
     let saved_return_trap = crate::traps::take_return_trap_for_call(shell);
     // #438: same story for ERR, gated on `errtrace` (`set -E`) instead.
     let saved_err_trap = crate::traps::take_err_trap_for_call(shell);
+    // #439: and for DEBUG, gated on functrace like RETURN. Taken BEFORE the
+    // entry fire below, which is the whole point — without functrace bash has
+    // no inherited trap left to fire there.
+    let saved_debug_trap = crate::traps::take_debug_trap_for_call(shell);
 
     // v329 (#274): fire the DEBUG trap ONCE on function ENTRY (after the
     // call-site fire, before the first body command), with $LINENO stamped to
@@ -3929,6 +3933,10 @@ pub(crate) fn call_function(
     // saved one comes back only if the body left RETURN untrapped.
     crate::traps::restore_return_trap_after_call(shell, saved_return_trap);
     crate::traps::restore_err_trap_after_call(shell, saved_err_trap);
+    // #439: same rule — the caller's DEBUG comes back only if the body left
+    // DEBUG untrapped, so a trap the body installed for itself survives the
+    // call and replaces the caller's.
+    crate::traps::restore_debug_trap_after_call(shell, saved_debug_trap);
 
     // Pop local scope and restore each snapshotted variable. Runs
     // AFTER the RETURN trap so the trap action still sees the
