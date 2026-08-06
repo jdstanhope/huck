@@ -461,6 +461,39 @@ fn debug_trap_gate(shell: &mut Shell) -> Result<crate::traps::DebugDecision, Exe
     }
 }
 
+/// Stamps `$BASH_COMMAND` and fires the DEBUG trap for a command whose runner
+/// does not do it itself — `[[ ]]` and `(( ))`, whose runners take destructured
+/// parts rather than the `Command`. Called from the dispatch arm, which is
+/// where the `Command` is still in hand and, not coincidentally, BEFORE the
+/// runner emits its own `set -x` line: bash runs the DEBUG action first. #269
+///
+/// `Err(outcome)` is the caller's immediate return value. A DEBUG-skipped
+/// command yields 0 here, the same as `case` and a simple command (measured;
+/// it is NOT the previous command's status).
+fn debug_gate_for_command(cmd: &Command, line: u32, shell: &mut Shell) -> Result<(), ExecOutcome> {
+    // $LINENO is stamped BEFORE the fire, not left to the runner: the action
+    // reads `$LINENO` and bash reports the line of the command about to run,
+    // not the previous one. The runners stamp it again with the same value.
+    if line != 0 {
+        shell.current_lineno = shell.line_base() + line;
+    }
+    // Same freeze rule as `run_single`: while any pseudo-trap action is
+    // running, its own commands must not re-stamp $BASH_COMMAND.
+    //
+    // `command_to_source` is the renderer bash's own text matches — verified
+    // byte-for-byte through `type f` for both shapes, including the asymmetry
+    // that `[[ ]]` normalizes its spacing while `(( ))` keeps the source
+    // verbatim, and that neither expands `$x`.
+    if shell.firing_traps.is_empty() {
+        shell.current_command = crate::generate::command_to_source(cmd, 0);
+    }
+    match debug_trap_gate(shell)? {
+        crate::traps::DebugDecision::Proceed => Ok(()),
+        crate::traps::DebugDecision::SkipCommand => Err(ExecOutcome::Continue(0)),
+        crate::traps::DebugDecision::ReturnFromSub(n) => Err(ExecOutcome::FunctionReturn(n)),
+    }
+}
+
 /// Runs ONE element of an and-or list: the exempt scope, the command, the
 /// interrupt checkpoint, control-flow propagation, and the post-command
 /// epilogue. `Err(outcome)` means the caller must return it immediately;
@@ -806,9 +839,21 @@ fn run_command(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
             expr,
             inline_assignments,
             line,
-        } => run_double_bracket(expr, inline_assignments, *line, shell),
+        } => {
+            // #269: these two runners take destructured parts, so their DEBUG
+            // fire lives here where the `Command` is still available.
+            if let Err(o) = debug_gate_for_command(cmd, *line, shell) {
+                return o;
+            }
+            run_double_bracket(expr, inline_assignments, *line, shell)
+        }
         Command::ArithFor(clause) => run_arith_for(clause, shell),
-        Command::Arith(expr, line) => run_arith(expr, *line, shell),
+        Command::Arith(expr, line) => {
+            if let Err(o) = debug_gate_for_command(cmd, *line, shell) {
+                return o;
+            }
+            run_arith(expr, *line, shell)
+        }
         Command::Select(clause) => run_select(clause, shell),
         Command::Redirected { inner, redirects } => run_redirected(inner, redirects, shell),
         Command::Coproc { name, body } => run_coproc(name, body, shell),

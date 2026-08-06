@@ -59,9 +59,14 @@ check "LINENO [[ ]]"           'trap "echo L=\$LINENO" DEBUG
 check "LINENO (( ))"           'trap "echo L=\$LINENO" DEBUG
 (( 1 ))'
 
-# --- the DEBUG action runs BEFORE the command's own xtrace line ------------
-check "xtrace order [[ ]]"     'set -x; trap "echo D" DEBUG; [[ 1 == 1 ]]'
-check "xtrace order (( ))"     'set -x; trap "echo D" DEBUG; (( 1 ))'
+# --- the DEBUG action runs BEFORE the command ------------------------------
+# Proved by having the action mutate a variable the command then reads, rather
+# than by reading `set -x` output: huck traces a trap action's commands at the
+# SAME `+` depth as the caller where bash uses `++`, for every trap and every
+# command kind (pre-existing and unrelated to this fix — see #486), so an
+# xtrace-based order row would fail for a reason that is not #269.
+check "order: action mutates (( ))" 'y=1; trap "y=99" DEBUG; (( z = y )); echo z=$z'
+check "order: action mutates [[ ]]" 'v=a; trap "v=b" DEBUG; [[ $v == b ]] && echo yes || echo no'
 
 # --- extdebug: a skipped [[ ]] / (( )) returns 0, like every other command --
 check "extdebug skip [[ ]]"    'shopt -s extdebug; false; trap "trap - DEBUG; false" DEBUG; [[ 1 == 1 ]]; echo rc=$?'
