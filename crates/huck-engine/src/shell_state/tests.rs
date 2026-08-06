@@ -841,3 +841,43 @@ fn unwind_fatal_slot_coexists_with_the_others() {
     assert!(!shell.fatal_pending(), "gone after take");
     assert_eq!(shell.exit_pending(), Some(9), "exit unaffected");
 }
+
+// ----- v355 (#480): the two suppression counters ----------------------------
+
+#[test]
+fn suppression_counters_are_independent() {
+    let mut shell = Shell::new();
+    assert!(!shell.errexit_suppressed());
+    assert!(!shell.err_trap_suppressed());
+
+    shell.suppress_both();
+    assert!(shell.errexit_suppressed());
+    assert!(shell.err_trap_suppressed());
+    shell.unsuppress_both();
+    assert!(!shell.errexit_suppressed());
+    assert!(!shell.err_trap_suppressed());
+
+    // #469: the negated-pipeline case raises only one of them.
+    shell.suppress_errexit_only();
+    assert!(shell.errexit_suppressed(), "errexit is suppressed");
+    assert!(
+        !shell.err_trap_suppressed(),
+        "the ERR trap is NOT suppressed"
+    );
+    shell.unsuppress_errexit_only();
+    assert!(!shell.errexit_suppressed());
+}
+
+#[test]
+fn suppression_counters_nest() {
+    let mut shell = Shell::new();
+    shell.suppress_both();
+    shell.suppress_both();
+    shell.unsuppress_both();
+    assert!(
+        shell.errexit_suppressed() && shell.err_trap_suppressed(),
+        "still suppressed at depth 1"
+    );
+    shell.unsuppress_both();
+    assert!(!shell.errexit_suppressed() && !shell.err_trap_suppressed());
+}

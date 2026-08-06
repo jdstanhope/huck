@@ -93,7 +93,7 @@ fn flush_stdout() {
 /// v36's ERR-trap gate), returns the Exit outcome to terminate the shell
 /// with that status. Caller propagates the outcome with an early return.
 fn maybe_errexit(shell: &Shell, status: i32) -> Option<ExecOutcome> {
-    if shell.shell_options.errexit && shell.err_suppressed_depth == 0 && status != 0 {
+    if shell.shell_options.errexit && !shell.errexit_suppressed() && status != 0 {
         Some(ExecOutcome::Exit(status))
     } else {
         None
@@ -431,7 +431,7 @@ fn finish_command(
     if let Some(o) = pending_unwind(shell, UnwindPhase::After) {
         return Some(o);
     }
-    if c != 0 && shell.err_suppressed_depth == 0 && is_last && !is_negated_pipeline(cmd) {
+    if c != 0 && !shell.err_trap_suppressed() && is_last && !is_negated_pipeline(cmd) {
         if err_armed && !body_already_fired_err(cmd) {
             crate::traps::fire_err_trap(shell);
             // #442: the ERR action itself ran `exit N`. Checked here, AFTER the
@@ -471,7 +471,26 @@ fn run_andor_group(
     // command that INSTALLS the ERR trap (typically a function trapping for
     // itself) is not itself caught by it. Captured per command, not per group.
     let err_armed_first = crate::traps::err_trap_armed(shell);
+    // #480/#468/#470: a command that is NOT the last of its and-or list is
+    // exempt, and bash propagates that exemption INTO whatever the command
+    // runs — a brace group's statements, a function's body, a loop's
+    // iterations. Without this scope, `set -e; f() { false; echo x; }; f || or`
+    // exits the shell inside f, where bash prints x and then runs the handler.
+    //
+    // For a simple command the scope changes nothing observable: its own fire
+    // is already skipped by the `is_last` guard below and it has no body.
+    //
+    // The un-suppress sits IMMEDIATELY after `run_command`, not at the end of
+    // the function: five early returns follow, and leaking the depth past them
+    // would make `set -e` silently stop working after the first `&&`.
+    let first_exempt = !rest.is_empty();
+    if first_exempt {
+        shell.suppress_both();
+    }
     let mut status = run_command(first, shell);
+    if first_exempt {
+        shell.unsuppress_both();
+    }
     if let Some(o) = check_interrupt(shell) {
         return o;
     }
@@ -501,7 +520,16 @@ fn run_andor_group(
         };
         if should_run {
             let err_armed = crate::traps::err_trap_armed(shell);
+            // Same rule as `first`: exempt iff this is not the last element,
+            // and the exemption propagates into whatever the command runs.
+            let exempt = i + 1 != rest.len();
+            if exempt {
+                shell.suppress_both();
+            }
             status = run_command(command, shell);
+            if exempt {
+                shell.unsuppress_both();
+            }
             if let Some(o) = check_interrupt(shell) {
                 return o;
             }
@@ -1326,9 +1354,9 @@ fn run_while_inner(clause: &WhileClause, shell: &mut Shell) -> ExecOutcome {
         if let Some(o) = check_interrupt(shell) {
             return o;
         }
-        shell.err_suppressed_depth += 1;
+        shell.suppress_both();
         let cond = execute_sequence_body(&clause.condition, shell);
-        shell.err_suppressed_depth -= 1;
+        shell.unsuppress_both();
         let keep_going = match cond {
             ExecOutcome::Exit(_)
             | ExecOutcome::LoopBreak(_, _)
@@ -2104,9 +2132,9 @@ fn run_case_inner(clause: &CaseClause, shell: &mut Shell) -> ExecOutcome {
 /// branch whose condition succeeds (exit 0), or the `else` body, or
 /// nothing (status 0). An `exit` anywhere inside propagates.
 fn run_if(clause: &IfClause, shell: &mut Shell) -> ExecOutcome {
-    shell.err_suppressed_depth += 1;
+    shell.suppress_both();
     let cond = execute_sequence_body(&clause.condition, shell);
-    shell.err_suppressed_depth -= 1;
+    shell.unsuppress_both();
     if matches!(
         cond,
         ExecOutcome::Exit(_)
@@ -2121,9 +2149,9 @@ fn run_if(clause: &IfClause, shell: &mut Shell) -> ExecOutcome {
         return execute_sequence_body(&clause.then_body, shell);
     }
     for elif in &clause.elif_branches {
-        shell.err_suppressed_depth += 1;
+        shell.suppress_both();
         let elif_cond = execute_sequence_body(&elif.condition, shell);
-        shell.err_suppressed_depth -= 1;
+        shell.unsuppress_both();
         if matches!(
             elif_cond,
             ExecOutcome::Exit(_)
@@ -2550,8 +2578,24 @@ fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> ExecOutcome {
     // propagates: it returns `ExecOutcome::Exit` directly, never through the
     // errexit gate the counter controls, and the negation below only rewrites
     // `Continue`.
+    // #469: `!` exempts the negated command ITSELF from both — that part is
+    // handled by `is_negated_pipeline` at the fire site. What it does NOT do is
+    // stop a compound BODY firing the ERR trap: bash prints the trap's output
+    // for `! { false; }` with `set +e` and stays silent with `set -e`.
+    // Reproducing a bash quirk, not choosing a rule — the spec's contract table
+    // records the measurement, including that it really is the inner command
+    // firing (`! { (exit 5); }` reports the inner status).
+    //
+    // Read at ENTRY so `set -e` / `set +e` inside the body cannot unbalance the
+    // counters, and so the choice matches errexit's state when the exemption
+    // began — which is what bash's flag propagation does.
+    let negate_suppresses_err_trap = shell.shell_options.errexit;
     if pipeline.negate {
-        shell.err_suppressed_depth += 1;
+        if negate_suppresses_err_trap {
+            shell.suppress_both();
+        } else {
+            shell.suppress_errexit_only();
+        }
     }
     let outcome = if pipeline.commands.len() == 1 {
         // Single-stage pipeline: run directly in the parent shell (no fork needed).
@@ -2561,7 +2605,12 @@ fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> ExecOutcome {
         run_multi_stage(&pipeline.commands, shell)
     };
     if pipeline.negate {
-        shell.err_suppressed_depth -= 1;
+        // Undo exactly what was raised — see `negate_suppresses_err_trap`.
+        if negate_suppresses_err_trap {
+            shell.unsuppress_both();
+        } else {
+            shell.unsuppress_errexit_only();
+        }
         // Negate the exit status only; $PIPESTATUS (set by the stage(s) above)
         // stays raw, and control-flow outcomes propagate unchanged.
         if let ExecOutcome::Continue(s) = outcome {

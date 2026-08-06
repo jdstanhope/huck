@@ -114,3 +114,33 @@ fn errexit_fires_without_an_err_trap_installed() {
         "a non-last failure stays exempt"
     );
 }
+
+/// v355 (#469): the negate arm chooses which counters to raise from errexit's
+/// state at ENTRY, and must undo exactly those — a `set -e` inside the body
+/// would otherwise unbalance them and leave the shell permanently suppressed.
+/// Invisible to the differential harness, so it is pinned here.
+#[test]
+fn negation_scope_balances_when_errexit_changes_inside() {
+    let mut s = Shell::new();
+    assert!(!s.errexit_suppressed() && !s.err_trap_suppressed());
+    let _ = crate::shell::process_line("! { set -e; false; }", &mut s, false);
+    assert!(
+        !s.errexit_suppressed(),
+        "errexit suppression leaked out of the negated body"
+    );
+    assert!(
+        !s.err_trap_suppressed(),
+        "ERR-trap suppression leaked out of the negated body"
+    );
+}
+
+/// The and-or scope has the same obligation: five early returns sit between
+/// the raise and the lower, so a leak would make `set -e` silently stop
+/// working after the first `&&`.
+#[test]
+fn andor_scope_balances_across_a_list() {
+    let mut s = Shell::new();
+    let _ = crate::shell::process_line("false || true && true", &mut s, false);
+    assert!(!s.errexit_suppressed(), "errexit suppression leaked");
+    assert!(!s.err_trap_suppressed(), "ERR-trap suppression leaked");
+}

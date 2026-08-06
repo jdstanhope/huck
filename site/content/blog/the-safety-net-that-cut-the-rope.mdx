@@ -1,0 +1,100 @@
+---
+title: "The safety net that cut the rope"
+date: 2026-08-06
+summary: "A script that guarded a failing step with `|| handler` died instead of running the handler. huck had one switch controlling two different ideas about when a failure should be ignored — and it was missing from the case people write most."
+tags: ["errexit", "traps", "bugfix"]
+version: "v355"
+draft: false
+---
+
+`set -e` means "stop if anything fails". `something || handler` means "if this
+fails, do that instead". Together they are the two halves of careful shell:
+
+```bash
+set -e
+deploy() { rsync ... ; echo "deployed"; }
+deploy || rollback
+```
+
+In huck, that script died. Not at `rollback` — before it. The `rsync` failure
+inside `deploy` tripped `set -e` and killed the shell, so the handler that
+existed precisely for that case never ran.
+
+```bash
+# before
+$ huck -c 'set -e; f() { false; echo x; }; f || echo or'
+                       # nothing at all — the shell exited inside f
+
+# after (and bash)
+$ huck -c 'set -e; f() { false; echo x; }; f || echo or'
+x
+```
+
+## What `||` actually promises
+
+When you write `cmd || handler`, you are telling the shell that `cmd` failing
+is *expected*. bash takes that seriously and carries it inward: not just the
+call, but everything the call runs is exempt from `set -e` for the duration.
+That's why the function above gets to finish its job.
+
+huck applied the exemption only to the outer command. The call itself didn't
+trip `set -e` — but the `false` *inside* it did, and by then the shell was
+already on its way out.
+
+The same gap showed up in the `ERR` trap, which is the diagnostic version of
+the same idea:
+
+```bash
+# before                                    # after (and bash)
+$ trap 'echo E' ERR; { false; } || echo or  $ trap 'echo E' ERR; { false; } || echo or
+E                                           or
+or
+```
+
+You asked for the failure to be handled, and the shell reported it as an error
+anyway.
+
+## One switch, two ideas
+
+Underneath, huck had a single counter meaning "we're somewhere failures don't
+count". Two different questions read it: *should this exit the shell?* and
+*should this fire the ERR trap?* For most of the shell those answers agree, so
+one switch was fine — until they didn't.
+
+They disagree under `!`. Negating a command exempts it, but bash still reports
+a failure that happens *inside* a negated group — unless `set -e` is on, in
+which case it goes quiet:
+
+```bash
+$ trap 'echo E' ERR; ! { false; }            # E        — bash reports it
+$ set -e; trap 'echo E' ERR; ! { false; }    # (silent) — bash does not
+```
+
+That is genuinely odd, and I spent a while confirming it wasn't a measurement
+mistake before reproducing it: the message carries the inner command's status,
+and it appears even when the group as a whole *succeeds*. It's real, so huck
+now does the same. One switch cannot express a rule like that, so it became
+two, each named for the question it answers.
+
+## Proving a change to `set -e`
+
+Changing when `set -e` fires is not something to do on reasoning alone. The
+contract went in first, as thirty-two fragments run through both shells and
+compared byte for byte, committed **red** — eighteen failing — so the fixes
+had to be measured rather than argued. Six of those rows exist only to catch
+over-correction: they describe behaviour that must *not* change, and they
+passed before and after.
+
+Then the wider nets: 270 differential harnesses, 1,981 unit tests, and bash's
+own 82-category suite compared as a set against the previous build — identical.
+
+One case is still wrong and now has its own issue: `! ! { false; }` reports
+twice. It depends on the *parity* of the negations, which makes it a question
+about parsing rather than about any of this, and it was wrong before this work
+too.
+
+*Issues [#480](https://github.com/jdstanhope/huck/issues/480),
+[#468](https://github.com/jdstanhope/huck/issues/468),
+[#469](https://github.com/jdstanhope/huck/issues/469),
+[#470](https://github.com/jdstanhope/huck/issues/470); the parity case is
+[#481](https://github.com/jdstanhope/huck/issues/481).*
