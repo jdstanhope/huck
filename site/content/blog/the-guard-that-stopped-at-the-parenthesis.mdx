@@ -1,0 +1,113 @@
+---
+title: "The guard that stopped at the parenthesis"
+date: 2026-08-06
+summary: "`cmd || handler` protected a failing command — unless you wrapped it in parentheses, and then huck died anyway. The exemption was reaching the child process correctly and being thrown away on arrival."
+tags: ["errexit", "traps", "subshell", "bugfix"]
+version: "v356"
+draft: false
+---
+
+Last iteration taught huck that `something || handler` means the failure
+inside `something` doesn't count. This one is about the word *inside*, and
+where huck stopped believing it.
+
+```bash
+set -e
+( check_config; apply ) || rollback
+```
+
+Parentheses are how you group a couple of steps without giving them a name.
+bash runs the group, sees it fail, and runs `rollback`. huck ran the first
+step, tripped `set -e`, and killed the shell — no `rollback`, no message,
+exit status 1. Drop the parentheses and the same script worked. That is a
+strange thing to have to know about your shell.
+
+The same crack ran through every shape that tests a command:
+
+```bash
+set -e; ( false; echo x ) || echo or        # bash: x     huck: or
+set -e; if ( false; echo x ); then :; fi    # bash: x     huck: (nothing)
+trap "echo E" ERR; ( false; echo x ) || :   # bash: x     huck: E, then x
+```
+
+Five out of five wrong the moment a subshell was involved; the identical
+shapes without one had all been right since v355.
+
+## Not a propagation bug
+
+The obvious theory is that the exemption fails to reach the child. It
+doesn't. A subshell is a fork, and a fork copies the parent's memory — the
+"this failure doesn't count" flag arrives in the child perfectly intact.
+huck then deleted it, in the first thing the child did:
+
+```rust
+// clear_for_subshell — reset what a forked child cannot service
+shell.traps.clear();
+shell.errexit_suppressed_depth = 0;    // <- these two
+shell.err_trap_suppressed_depth = 0;   // <-
+```
+
+That function exists for a real rule: a child cannot run its parent's signal
+handlers, so caught traps go back to their default. The suppression counters
+were sitting next to the trap table, had a name that read like a trap field,
+and got swept up with them. A naming accident, not a decision.
+
+So the fix is two deleted lines — but only if the answer to "should a
+subshell start clean?" is no. We went and measured rather than argued. A
+bash subshell inherits the *entire* option set: `$-` is byte-identical
+across the fork, every `shopt` is unchanged, `set -e -u -x` all survive.
+What it resets is narrow and is not an option at all — caught traps drop to
+default, while ignored traps stay ignored. There is no clean-slate principle
+to appeal to. A subshell is a copy of the shell that can't service its
+parent's handlers. Everything else travels, including the caller's statement
+that this command's failure doesn't count.
+
+## The part that wasn't a bug
+
+The rest of the iteration was the same question asked in fewer places. huck
+decided "is this failure being ignored?" four different ways — a counter, a
+second counter, an `is_last` flag threaded through the epilogue, and the
+list walker's own idea of position. Two of those were the same fact
+travelling by different routes, so the ERR-trap gate read:
+
+```rust
+if c != 0 && !shell.err_trap_suppressed() && is_last && !is_negated_pipeline(cmd) {
+```
+
+An and-or list now runs each element through one function that owns the
+whole sequence — raise the exemption, run the command, check for interrupts,
+propagate control flow, run the epilogue, lower the exemption. Because the
+scope now covers the epilogue, the epilogue can just ask the shell, and
+`is_last` disappears:
+
+```rust
+if c != 0 && !shell.err_trap_suppressed() && !is_negated_pipeline(cmd) {
+```
+
+There's a safety property hiding in that shape. Previously the raise and the
+lower sat on either side of five early returns, and getting one wrong would
+have silently disabled `set -e` for the rest of the list — a bug that
+produces no error, just a script that keeps going after it should have
+stopped. With a single exit path, that mistake can't be written.
+
+The counters themselves stayed two, which surprised us. They look redundant
+until you meet the shape that separates them: `!` over a brace group fires
+the body's ERR trap with `set +e` and stays silent with `set -e`. One scope
+can't say both things, so the two counts are load-bearing — they just moved
+behind a named type with private fields, which is what stops the next
+refactor from sweeping them into the trap reset all over again.
+
+## After
+
+```bash
+$ huck -c 'set -e; ( false; echo x ) || echo or'
+x
+$ huck -c 'set -e; if ( false; echo x ); then :; fi'
+x
+$ huck -c 'set -e; ( false ); echo after'          # still exits — nothing guards it
+$ huck -c 'trap "echo E" ERR; ( false )'
+E
+```
+
+The two lines that guarded nothing are gone, and the ones that guard
+something still do.
