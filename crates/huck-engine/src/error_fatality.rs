@@ -7,14 +7,17 @@
 //! command list (#116, `history` with too many arguments). A cluster that
 //! errs in both directions is the signature of a decision with no owner.
 //!
-//! Every rule below is measured against bash 5.2.21. Two of them look wrong
-//! and are not; both have a test rather than a comment, because a future
-//! reader WILL want to "fix" them:
+//! Every rule below is measured against bash 5.2.21. Three of them look like
+//! inconsistencies and are not; each has a TEST rather than a comment, because
+//! a future reader WILL want to "fix" them:
 //!
 //!   * a plain top-level syntax error exits 2 under `-c`, while every other
 //!     fatal error substitutes 127 there;
 //!   * of fifteen measured builtin errors, only `history` with too many
-//!     arguments abandons the command list.
+//!     arguments abandons the command list;
+//!   * and that one kind's OUTCOME is driver-dependent, not just its code —
+//!     under `-c` it ends the whole program, while its neighbours abandon the
+//!     list and carry on to the next line.
 //!
 //! `Shell::raise_fatal` / `raise_discard` are `pub(crate)` and reached through
 //! `Shell::report_error`, so a site cannot quietly decide for itself.
@@ -106,7 +109,20 @@ pub(crate) fn fatality(kind: ErrorKind, shell: &Shell) -> Fatality {
             }
         }
         ErrorKind::BuiltinError => Fatality::Continue,
-        ErrorKind::HistoryTooManyArgs => Fatality::AbortList,
+        // ⚠️ Driver-dependent OUTCOME, not just a driver-dependent code, and
+        // the only kind here that is. Under `-c` bash ends the whole program
+        // with status 1 even when a further line follows; from a script or
+        // stdin it abandons only the current list and carries on. Its
+        // neighbours do NOT behave that way — an arithmetic or readonly error
+        // under `-c` continues to the next line — so this cannot be folded
+        // into a general rule. Measured 2026-08-06.
+        ErrorKind::HistoryTooManyArgs => {
+            if shell.is_command_string && !shell.is_interactive {
+                Fatality::ExitShell(1)
+            } else {
+                Fatality::AbortList
+            }
+        }
         ErrorKind::ComsubSyntax { backtick } => {
             if backtick || !can_exit {
                 Fatality::Continue
@@ -213,6 +229,23 @@ mod tests {
                 Fatality::AbortList
             );
         }
+    }
+
+    #[test]
+    fn history_too_many_args_ends_the_whole_program_under_dash_c() {
+        // ⚠️ Driver-dependent OUTCOME, unique to this kind. `bash -c
+        // 'history 1 2 3; echo SAME\necho NEXT'` prints nothing and exits 1,
+        // while the same shape with an arithmetic or readonly error prints
+        // NEXT and exits 0. A test rather than a comment because it looks like
+        // an inconsistency and is not.
+        assert_eq!(
+            fatality(ErrorKind::HistoryTooManyArgs, &shell_with(false, true)),
+            Fatality::ExitShell(1)
+        );
+        assert_eq!(
+            fatality(ErrorKind::Expansion, &shell_with(false, true)),
+            Fatality::AbortList
+        );
     }
 
     #[test]
