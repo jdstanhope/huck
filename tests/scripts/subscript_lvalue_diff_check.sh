@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # Byte-identical bash<->huck harness for v268 T3: subscript_lvalue (D1/D2 fixes).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # checkf: run a script via bash and huck, compare byte-for-byte (uses temp file)
 checkf() {
@@ -13,8 +11,7 @@ checkf() {
     b=$(bash "$tmp" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tmp" 2>&1; echo "EXIT:$?")
     rm -f "$tmp"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # checkd: run a script in a temp directory (for cases where file existence matters, like D1 glob)
@@ -26,8 +23,7 @@ checkd() {
     b=$(cd "$tmpdir" && bash script.sh 2>&1; echo "EXIT:$?")
     h=$(cd "$tmpdir" && "$HUCK_BIN" script.sh 2>&1; echo "EXIT:$?")
     rm -rf "$tmpdir"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # Assignment: basic indexed-array behavior (unchanged)
@@ -60,5 +56,4 @@ checkf "T1: unclosed a[=x" 'echo a[=x'
 checkf "T1: unclosed x[+=y" 'echo x[+=y'
 checkf "T1: unclosed via printf" $'printf \'%s\\n\' a[=1'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

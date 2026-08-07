@@ -5,9 +5,7 @@
 # (no fabricated bindings), (b) core bindings match bash's exact line, (c) user
 # override/unbind behave like bash.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 ok()   { PASS=$((PASS+1)); printf 'PASS: %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf 'FAIL: %s\n' "$1"; shift; printf '%s\n' "$@" | sed 's/^/    /'; }
 
@@ -46,5 +44,4 @@ ub_b=$(bash -c 'bind -r "\C-a"; bind -p' 2>/dev/null | grep -c '"\\C-a"')
 ub_h=$("$HUCK_BIN" -c 'bind -r "\C-a"; bind -p' 2>/dev/null | grep -c '"\\C-a"')
 if [[ "$ub_b" == "$ub_h" && "$ub_h" == 0 ]]; then ok "unbind default C-a"; else bad "unbind default C-a" "bash:$ub_b huck:$ub_h"; fi
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

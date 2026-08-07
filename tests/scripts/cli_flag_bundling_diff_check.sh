@@ -4,9 +4,7 @@
 # error messages carry the program-name prefix (`bash:` vs `huck:`), a known
 # artifact, so those are covered by unit tests, not here.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # Compare stdout only (2>/dev/null) plus exit status.
 check() {
@@ -14,8 +12,7 @@ check() {
     local b h
     b=$(bash "$@" 2>/dev/null; echo "rc=$?")
     h=$("$HUCK_BIN" "$@" 2>/dev/null; echo "rc=$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 check "rc echo"       -rc 'echo hi'
@@ -28,5 +25,4 @@ check "rc restricted enforced" -rc 'PATH=/x; echo after'   # assignment to PATH 
 check "c alone still" -c 'echo plain'
 check "r then c sep"  -r -c 'echo sep'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

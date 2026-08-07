@@ -9,9 +9,7 @@
 #   - set-but-empty source (positional or named) -> ": invalid variable name"
 #   - unset NAMED var -> "name: invalid indirect expansion"
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # Normalize the diverging error-line prefix: bash uses "bash: line N: ",
 # huck uses "huck: " — strip both so the message TEXT is what's compared.
 norm() { sed -E 's#^([^:]*/)?(bash|huck): (line [0-9]+: )?##'; }
@@ -19,8 +17,7 @@ check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1; echo "rc=$?"); b=$(printf '%s\n' "$b" | norm)
     h=$("$HUCK_BIN" -c "$frag" 2>&1; echo "rc=$?"); h=$(printf '%s\n' "$h" | norm)
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 # Message-only check: drops the rc line. Used for the `set -u` cases, where
 # bash exits 127 but huck's nounset-during-expansion convention is exit 1
@@ -29,8 +26,7 @@ check_msg() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1 | norm)
     h=$("$HUCK_BIN" -c "$frag" 2>&1 | norm)
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 # --- unset positional -> empty, rc 0 ---
 check "unset \$1"          'echo "[${!1}]"'
@@ -69,5 +65,4 @@ check_msg "set -u unset \$5"   'set -u; echo "[${!5}]"'
 check "valid via named"    'HOME=x x=HOME; echo "[${!x}]"'
 check "valid via pos"      'set -- HOME; echo "[${!1}]"'
 check "pos to unset named" 'set -- a; echo "[${!1}]"'
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

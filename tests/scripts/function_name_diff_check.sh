@@ -6,16 +6,13 @@
 # differ — bash 1 vs huck 2 — and the error WORDING legitimately differs:
 # `huck:` vs `bash: line N:`; only both-nonzero matters).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 check() {  # label ; fragment — assert byte-identical stdout+stderr+exit
     local label="$1" frag="$2" b h
     b=$(printf '%s\n' "$frag" | bash --norc --noprofile 2>&1; echo "EXIT:$?")
     h=$(printf '%s\n' "$frag" | "$HUCK_BIN" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 both_reject() {  # label ; fragment — assert BOTH shells reject it (nonzero exit when RUN)
@@ -37,5 +34,4 @@ check "plain identifier"  'foo_bar() { echo id; }; foo_bar'
 both_reject "reserved name rejected" 'if() { :; }'
 both_reject "hyphen for-var rejected" 'for a-b in 1; do :; done'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

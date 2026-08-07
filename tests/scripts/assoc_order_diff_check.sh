@@ -4,15 +4,12 @@
 # insertion order; `${m[@]}`/`${!m[@]}`/`${m[@]<op>}`/`${m[@]:o:l}` must
 # enumerate elements in that same bash hash order.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(printf '%s\n' "$frag" | bash --norc --noprofile 2>&1; echo "EXIT:$?")
     h=$(printf '%s\n' "$frag" | "$HUCK_BIN" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 S='declare -A a=([one]=1 [two]=2 [three]=3 [foo]=f [bar]=b [qux]=q)'
 check "assoc values @"   "$S; printf '<%s>' \"\${a[@]}\"; echo"

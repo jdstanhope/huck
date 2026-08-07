@@ -6,16 +6,13 @@
 # them). Matrix + empty-element + surrounding-text + associative cases, each
 # bash-verified against `bash --norc --noprofile` first.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 check() {
     local label="$1" frag="$2" b h
     b=$(bash --norc --noprofile -c "$frag" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" -c "$frag" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # matrix: {${A[@]}, ${A[*]}, "${A[@]}", "${A[*]}"} x {IFS='', ' ', '/', unset}
@@ -53,5 +50,4 @@ check "surrounding text" 'IFS=""; A=(p q); set -- x${A[@]}y; echo "$#|$1|$2"'
 # associative: IFS=''; declare -A m=([x]=bob [y]='t d' [z]=joe); set ${m[*]}; echo $#  -> 3
 check "assoc IFS='' \${m[*]}" 'IFS=""; declare -A m=([x]=bob [y]="t d" [z]=joe); set -- ${m[*]}; echo $#'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

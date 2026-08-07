@@ -8,16 +8,13 @@
 # separate, global message-format divergence — normalized away here so the
 # message TEXT and rc are what we compare.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 norm() { sed -E 's#^([^:]*/)?(bash|huck): (line [0-9]+: )?##'; }
 check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1; echo "rc=$?"); b=$(printf '%s\n' "$b" | norm)
     h=$("$HUCK_BIN" -c "$frag" 2>&1; echo "rc=$?"); h=$(printf '%s\n' "$h" | norm)
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 check "over-range (silent)"   'set -- a b; shift 5; echo done'
 check "over-range no args"    'shift 5; echo done'
@@ -32,5 +29,4 @@ check "plus-prefixed count"   'set -- a b c; shift +2; echo "[$*]"'
 check "leading/trailing ws"   'set -- a b c; n=" 2 "; shift "$n"; echo "[$*]"'
 check "overflow numeric"      'set -- a b; shift 99999999999999999999; echo done'
 check "hex rejected"          'set -- a b c; shift 0x2; echo "[$*] rc=$?"'
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

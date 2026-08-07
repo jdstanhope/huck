@@ -6,9 +6,7 @@
 # readline_direct BufReader), so a child `read`/`cat` saw EOF and the parent
 # then ran the swallowed lines as commands. Compares stdout+stderr+rc.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # Run FRAGMENT through both shells via a PIPE (non-tty stdin); compare all output.
 check() { local l="$1" f="$2" b h

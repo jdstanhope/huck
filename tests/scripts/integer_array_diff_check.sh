@@ -4,9 +4,7 @@
 # arith-evaluated on assignment (keys of associative arrays are NOT coerced).
 # Non-integer arrays must stay literal. (L-49)
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 chk() { local l="$1" f="$2" b h
     b=$(bash --norc --noprofile -c "$f" 2>/dev/null; echo "EXIT:$?")

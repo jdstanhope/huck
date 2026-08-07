@@ -5,9 +5,7 @@
 # than left stale). Compares stdout+rc; fragments run as a script piped on
 # stdin (matches read_u_diff_check.sh) so the fd-0 read path is exercised.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 check() { local l="$1" f="$2" b h
   b=$(printf '%s\n' "$f" | bash --norc --noprofile 2>&1; echo "EXIT:$?")

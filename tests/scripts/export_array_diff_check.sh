@@ -6,16 +6,13 @@
 #         array in the environment); an exported scalar IS. `printenv` is an
 #         ordinary external child, so the same fragment runs under both shells.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 norm() { sed -E 's#^([^:]*/)?(bash|huck): (line [0-9]+: )?##'; }
 check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1; echo "rc=$?"); b=$(printf '%s\n' "$b" | norm)
     h=$("$HUCK_BIN" -c "$frag" 2>&1; echo "rc=$?"); h=$(printf '%s\n' "$h" | norm)
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 check "export array assigns"     'export a=(1 2 3); declare -p a'
 check "export array rc"          'export a=(1 2 3); echo "rc=$?"'
@@ -30,5 +27,4 @@ check "inline nested restore"    'FOO=(a b c); f(){ FOO=in2 printenv FOO; echo "
 # #28: a redirection-only `exec` with an inline scalar over an array must not
 # leak that scalar into the child env of subsequent commands.
 check "inline over array + exec" 'FOO=(a b c); FOO=inner exec 3>/dev/null; printenv FOO; echo "rc=$?"'
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

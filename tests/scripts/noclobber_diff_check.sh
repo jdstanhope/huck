@@ -5,9 +5,7 @@
 # rc + file content; the error text is checked in the Rust integration test.
 # (file-arg execution avoids huck's history-expansion-on-piped-stdin divergence, L-27.)
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # check: capture stdout+stderr (for non-blocking cases where output is identical)
 check() {
     local label="$1" frag="$2" b h tf
@@ -16,8 +14,7 @@ check() {
     b=$(bash --norc --noprofile "$tf" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tf" 2>&1; echo "EXIT:$?")
     rm -f "$tf"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 # check_nostderr: suppress stderr (for blocking cases whose error prefix differs).
 # Compares stdout + exit code only.
@@ -28,8 +25,7 @@ check_nostderr() {
     b=$(bash --norc --noprofile "$tf" 2>/dev/null; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tf" 2>/dev/null; echo "EXIT:$?")
     rm -f "$tf"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 check_nostderr "blocked-overwrite" 'd=$(mktemp -d); echo orig > "$d/f"; set -C; echo new > "$d/f"; echo "rc=$? c=$(cat "$d/f")"'
@@ -42,5 +38,4 @@ check_nostderr "ampredir-blocked"  'd=$(mktemp -d); echo orig > "$d/f"; set -C; 
 check         "toggle-off"        'd=$(mktemp -d); echo orig > "$d/f"; set -C; set +C; echo new > "$d/f"; echo "c=$(cat "$d/f")"'
 check         "off-baseline"      'd=$(mktemp -d); echo orig > "$d/f"; echo new > "$d/f"; echo "c=$(cat "$d/f")"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

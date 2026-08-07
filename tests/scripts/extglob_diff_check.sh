@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 # Byte-identical bash<->huck harness for v90: extglob string matching (M-84).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(printf 'shopt -s extglob\n%s\n' "$frag" | bash 2>&1; echo "EXIT:$?")
     h=$(printf 'shopt -s extglob\n%s\n' "$frag" | "$HUCK_BIN" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 # NOTE: v90 is extglob STRING matching only. Pathname/filesystem globbing with
 # extglob (echo +(a|b)) is deferred to v91 (M-84a) and not exercised here. The
@@ -33,5 +30,4 @@ check "pe # shortest"  'v=aaab; echo "${v#+(a)}"'
 check "quoted | literal" '[[ a == @("a|b") ]] && echo y || echo n'
 check "quoted | match"   '[[ "a|b" == @("a|b") ]] && echo y || echo n'
 check "var in group" 'x="a|b"; [[ ab == +($x) ]] && echo y || echo n'
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

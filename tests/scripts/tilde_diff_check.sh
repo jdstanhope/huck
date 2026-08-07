@@ -7,9 +7,7 @@
 # ~+/~- are driven via cd so PWD/OLDPWD are fixed. ~root reads the passwd DB;
 # both shells consult the same DB so it matches on a box that has a root home.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 checkf() {
     local label="$1" body="$2" tmp b h
     tmp=$(mktemp "${TMPDIR:-/tmp}/huck-tilde.XXXXXX")
@@ -17,8 +15,7 @@ checkf() {
     b=$(bash "$tmp" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tmp" 2>&1; echo "EXIT:$?")
     rm -f "$tmp"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # ~ / ~/path : plain HOME expansion at word start.
@@ -123,5 +120,4 @@ checkf "pat casemod ,~"      'HOME=A; t=ABC; echo "[${t,~}]"'        # [aBC]
 checkf "pat quoted lit"      'HOME=/h; t=/h; echo "[${t#"~"}]"'      # [/h] (literal ~)
 checkf "pat not-word-start"  'HOME=/h; t=a/h; echo "[${t#a~}]"'      # [] (a~ -> a/h prefix)
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

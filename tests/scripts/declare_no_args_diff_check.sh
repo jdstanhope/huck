@@ -3,15 +3,12 @@
 # variable listing format. Each case sets z* vars and greps `declare` to ^z to
 # filter out the inherited environment. `declare -p` is included as a guard.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1; echo "rc=$?")
     h=$("$HUCK_BIN" -c "$frag" 2>&1; echo "rc=$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # scalar quoting battery (bare declare)
@@ -41,5 +38,4 @@ check "lists fn"      'zf(){ echo hi; }; declare 2>/dev/null | grep -c "^zf"'
 # REGRESSION GUARD: declare -p must stay byte-identical (the -p path is unchanged)
 check "declare -p"    'zq="a b"; zi=42; declare -i zi; za=(p "q r"); declare -p zq zi za 2>/dev/null'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

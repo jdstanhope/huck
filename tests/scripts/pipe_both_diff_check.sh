@@ -3,9 +3,7 @@
 # shorthand for `2>&1 |`. Each case EXECUTES and asserts identical stdout+exit
 # (the merged stderr flows through the pipe to the consumer's stdout).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b bo h ho
     bo=$(bash --norc --noprofile -c "$frag" 2>/dev/null); b=$?
@@ -25,5 +23,4 @@ check "no-space form"         'sh -c "echo O;echo E 1>&2"|&cat'
 check "control plain pipe"    'echo hi | tr a-z A-Z'
 check "control logical or"    'false || echo alt'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

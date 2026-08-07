@@ -8,9 +8,7 @@
 # where bash says "Stopped" — both filed separately. Those rows would be
 # testing the missing behavior, not the columns.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # `jobs -l` prints the leader pid, which differs between the two shells (and
 # between runs): replace just that field with a fixed token so the COLUMNS
 # after it still line up byte-for-byte.
@@ -19,8 +17,7 @@ check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1 | norm; echo "rc=${PIPESTATUS[0]}")
     h=$("$HUCK_BIN" -c "$frag" 2>&1 | norm; echo "rc=${PIPESTATUS[0]}")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 K='kill -KILL %1 %2 %3 2>/dev/null; wait 2>/dev/null'
 
@@ -53,5 +50,4 @@ check "jobs -r"            "set -m; sleep 3 & jobs -r; $K"
 # -p prints bare pids, so only its shape is compared (pids differ).
 check "jobs -p count"      "set -m; sleep 3 & jobs -p | wc -l; $K"
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

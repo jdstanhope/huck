@@ -9,9 +9,7 @@
 # enclosing `)` / `` ` `` to close. This exercises the corpus files
 # comsub-eof0/1/4 and the former backtick PANIC (comsub-eof1). timeout-guarded.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # NB: stdout + exit-code parity only. bash emits "here-document ... delimited by
 # end-of-file" / "unterminated here-document" WARNINGS to stderr for the eof-
 # adjacency cases; huck intentionally does not (a known, kept divergence), so
@@ -20,8 +18,7 @@ check() {
     local label="$1" frag="$2" b h
     b=$(timeout 15 bash -c "$frag" 2>/dev/null; echo "EXIT:$?")
     h=$(timeout 15 "$HUCK_BIN" -c "$frag" 2>/dev/null; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # comsub-eof1: heredoc inside a BACKTICK (the former `unreachable!` panic).
@@ -44,5 +41,4 @@ check "proper delim then )"       $'x=$(cat <<EOF\nbody\nEOF\n)\necho "$x"'
 # Backtick with a proper delimiter line then trailing `` ` `` on next line.
 check "backtick proper delim"     $'x=`cat <<EOF\nbody\nEOF\n`\necho "$x"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

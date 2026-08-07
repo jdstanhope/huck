@@ -4,9 +4,7 @@
 # ignores. Deterministic via `kill -INT $$` (no PTY/timing). Each fragment is run
 # as a FILE-ARG (an isolated child); stdout AND exit code are compared.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 TMP=$(mktemp -d)
 check() {
     local label="$1" frag="$2" f="$TMP/frag.sh"
@@ -30,5 +28,4 @@ check "trap handler"     'trap "echo c" INT; echo a; kill -INT $$; echo b'
 check "trap ignore"      'trap "" INT; echo a; kill -INT $$; echo b'
 check "legit 130 no abort" 'f(){ return 130; }; f; echo still-here'
 rm -rf "$TMP"
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

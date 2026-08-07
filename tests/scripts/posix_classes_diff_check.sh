@@ -3,9 +3,7 @@
 # in glob patterns (M-54). Spread across the 12 classes + negation + mixed +
 # pathname. File-arg execution (L-27: huck history-expands piped stdin).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h tf
     tf=$(mktemp)
@@ -13,8 +11,7 @@ check() {
     b=$(bash --norc --noprofile "$tf" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tf" 2>&1; echo "EXIT:$?")
     rm -f "$tf"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 check "subst digit"   's="a1 b2"; echo "${s//[[:digit:]]/_}"'
@@ -37,5 +34,4 @@ check "mixed class"    's="a5_b"; echo "${s//[[:digit:]_]/X}"'
 check "extglob off"    'shopt -u extglob; case "5" in [[:digit:]]) echo D;; *) echo no;; esac'
 check "pathname upper" 'd=$(mktemp -d); touch "$d"/Af "$d"/bf "$d"/Cf; cd "$d"; echo [[:upper:]]*; rm -rf "$d"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

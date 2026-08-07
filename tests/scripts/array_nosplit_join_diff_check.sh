@@ -4,15 +4,12 @@
 # `[[ ]]` operand). `@` joins with a SPACE whatever IFS says; `*` joins with
 # IFS[0]. Quoting does not change either rule.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1; echo "rc=$?")
     h=$("$HUCK_BIN" -c "$frag" 2>&1; echo "rc=$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 A='a=(x y z); '
 
@@ -51,5 +48,4 @@ check "split @ IFS=,"     "${A}IFS=,; set -- \${a[@]}; echo \"\$#:\$1\""
 check "split * IFS=,"     "${A}IFS=,; set -- \${a[*]}; echo \"\$#:\$1\""
 check "quoted @ words"    "${A}IFS=,; set -- \"\${a[@]}\"; echo \"\$#:\$1\""
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

@@ -2,9 +2,7 @@
 # Byte-identical bash<->huck harness for v232: command-position-aware
 # alias expansion (case patterns, reserved words, for-lists, [[ ]]).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 checkf() {
     local label="$1" body="$2" tmp b h
     tmp=$(mktemp "${TMPDIR:-/tmp}/huck-aliascase.XXXXXX")
@@ -12,8 +10,7 @@ checkf() {
     b=$(bash "$tmp" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tmp" 2>&1; echo "EXIT:$?")
     rm -f "$tmp"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # The regression: an aliased name used as a case pattern must not break parsing.
@@ -36,5 +33,4 @@ checkf "double bracket interior" \
 checkf "reserved word slot" \
   'shopt -s expand_aliases; alias then="echo BAD"; if true; then echo OK; fi'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

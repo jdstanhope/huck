@@ -6,9 +6,7 @@
 # meaningful and matches between bash and huck. Uses a temp-file `check`
 # helper, as `lineno_fidelity_diff_check.sh` does.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 CL_TMPDIR=$(mktemp -d)
 cleanup_cl_tmpdir() { rm -rf "$CL_TMPDIR"; }
@@ -74,5 +72,4 @@ a() { trace; }
 b() { a; }
 b'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

@@ -4,15 +4,12 @@
 # EXECUTES the construct (writing to a per-run temp file under our control, then
 # printing its contents) and asserts identical stdout+exit under bash and huck.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(bash --norc --noprofile -c "$frag" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" -c "$frag" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
@@ -27,5 +24,4 @@ check "case stage > file"       "printf 'P\n' | case x in x) cat;; esac > $T/g; 
 check "append on group stage"   "echo one > $T/h; echo two | { cat; } >> $T/h; cat $T/h"
 check "regression no redirect"  "echo keep | ( cat ); echo also"
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

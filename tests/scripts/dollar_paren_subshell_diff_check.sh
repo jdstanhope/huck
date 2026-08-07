@@ -5,15 +5,12 @@
 # expansions must be unaffected. Each case EXECUTES and asserts identical
 # stdout+exit.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(bash --norc --noprofile -c "$frag" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" -c "$frag" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # --- the bug: glued $(( subshell ) ... ) is a command substitution ---
@@ -30,5 +27,4 @@ check "arith double paren"     'echo $(( ((4)) ))'
 check "arith ternary"          'echo $((1>0?2:3))'
 check "spaced subshell form"   'echo $( (echo s) 2>&1 )'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

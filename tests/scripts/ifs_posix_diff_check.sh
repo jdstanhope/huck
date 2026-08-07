@@ -8,16 +8,13 @@
 # Each fragment feeds INPUT on stdin to `bash -c` and `huck -c`; stdout+stderr+
 # exit must match byte-for-byte.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # $1 label, $2 input (fed on stdin), $3 shell fragment
 check() {
     local label="$1" inp="$2" frag="$3" b h
     b=$(printf '%s\n' "$inp" | bash --norc --noprofile -c "$frag" 2>&1; echo "EXIT:$?")
     h=$(printf '%s\n' "$inp" | "$HUCK_BIN" -c "$frag" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 XY='read x y; echo "[$x][$y]"'

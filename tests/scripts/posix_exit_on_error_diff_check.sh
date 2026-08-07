@@ -17,9 +17,7 @@
 #  - `trap -z`, `. -z`, `set -z`/`set -h` single-char: huck lacks bad-option
 #    detection there, so it does not exit where bash does. Documented divergences.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # Compare (stdout, exit-code) of `bash <flag> -c FRAG` vs `huck <flag> -c FRAG`.
 # stderr discarded. $1 label, $2 fragment, $3 extra flag ("" or "--posix").
 cmp_run() {
@@ -69,5 +67,4 @@ check_posix "command-strips-assign"     'command export AA[4]=1; echo AFTER'
 check_posix "exit-trap-fires"   'trap "echo TRAP" EXIT; . /no/such/huck_xyz; echo AFTER'
 check_posix "subshell-isolated" '( . /no/such/huck_xyz; echo INNER ); echo AFTER'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

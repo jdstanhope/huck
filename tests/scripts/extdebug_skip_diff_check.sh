@@ -12,15 +12,12 @@
 # lands on the intended fire. Every check below is expected to PASS
 # (bash == huck) after the fix.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(bash --norc --noprofile -c "$frag" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" -c "$frag" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # --- for-header skip: every header fire skips -> whole loop skipped -----
@@ -87,5 +84,4 @@ check "no-extdebug: non-zero status does not skip" \
 check "case skip \$?"   'shopt -s extdebug; n=0; tr(){ n=$((n+1)); [[ $n == 2 ]] && return 1; return 0; }; trap tr DEBUG; false; case a in a) echo m;; esac; echo "R=$?"'
 check "select skip \$?" 'shopt -s extdebug; n=0; tr(){ n=$((n+1)); [[ $n == 1 ]] && return 1; return 0; }; trap tr DEBUG; false; select x in a; do echo $x; break; done <<< 1; echo "R=$?"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

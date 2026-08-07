@@ -8,9 +8,7 @@
 # `set -m`. Never add a real-signal fragment against pid 0 / -0 / -1 — under a
 # non-job-control `bash -c` those name the HARNESS's own process group.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # Normalize the leading program-name token on error lines (`bash: line N:` vs
 # `/path/to/huck: line N:`) — that prefix is the invoking binary's argv[0], a
 # non-behavioral artifact, not a huck<->bash difference. Everything after
@@ -20,8 +18,7 @@ check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1 | norm; echo "rc=${PIPESTATUS[0]}")
     h=$("$HUCK_BIN" -c "$frag" 2>&1 | norm; echo "rc=${PIPESTATUS[0]}")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # --- negative / zero targets go straight to kill(2) -------------------------
@@ -63,5 +60,4 @@ check "-- hides -s"       'kill -- -s TERM 99999; echo rc=$?'
 check "live pgrp probe+kill" \
     'set -m; sleep 5 & p=$!; kill -0 -$p; echo "neg-rc=$?"; kill -KILL -$p; echo "kill-rc=$?"; wait 2>/dev/null; echo done'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

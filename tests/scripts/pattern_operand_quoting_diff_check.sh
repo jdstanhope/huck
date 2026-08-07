@@ -5,15 +5,12 @@
 # the `${...}`-pattern analogue of `case`/`[[ == ]]` quoting (which already work)
 # and of v199's `=~` regex fix.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1)
     h=$("$HUCK_BIN" -c "$frag" 2>&1)
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 # --- remove-prefix # with quoted metachars (literal) ---
 check "rm# quoted * no-match" 'x=axb; echo "${x#'\''a*'\''}"'   # literal a* -> no match -> axb
@@ -41,5 +38,4 @@ check "case^^ unquoted [ "   'x=cat; echo "${x^^[ac]}"'        # active -> CAt
 # --- extglob: unquoted active, quoted literal ---
 check "extglob unquoted"      'shopt -s extglob; x=abc; echo "${x/@(a|z)/_}"'   # active -> _bc
 check "extglob quoted literal" 'shopt -s extglob; x="@(a)bc"; echo "${x/'\''@(a)'\''/_}"' # literal -> _bc
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

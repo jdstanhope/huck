@@ -5,17 +5,14 @@
 # for a script file. Default-on flags h (hashall) and B (braceexpand) are
 # always present.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # Stdin-fed fragments (both shells read from stdin → trailing `s`).
 check() {
     local label="$1" frag="$2" b h
     b=$(printf '%s\n' "$frag" | bash 2>&1; echo "EXIT:$?")
     h=$(printf '%s\n' "$frag" | "$HUCK_BIN" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # `-c COMMAND` invocations (trailing `c`); pass the shell flags before -c.
@@ -24,8 +21,7 @@ check_c() {
     local b h
     b=$(bash "$@" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$@" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # --- stdin mode (trailing s) ---
@@ -56,5 +52,4 @@ printf 'set -x\necho "[$-]"\n' > "$tf"
 check_c "file xtrace" "$tf"
 rm -f "$tf"
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

@@ -7,9 +7,7 @@
 # WORDING legitimately differs: `huck:` vs bash's text). Each "bad-arith" case is
 # `<bad-arith>; echo SECOND`.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # For bash-identical cases: check byte-identical stdout + rc.
 check_bash_identical() {
@@ -35,5 +33,4 @@ check_bash_identical "valid arith"          'echo $((1+2)); echo SECOND'
 check_bash_identical "valid substring"      'v=hello; echo ${v:1:2}; echo SECOND'
 check_bash_identical "standalone (( )) nonfatal" '(( 1+ )); echo SECOND'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

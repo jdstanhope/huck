@@ -17,9 +17,7 @@
 #
 # Bytes are captured through `od -An -tx1` so sequences compare exactly.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # (A) byte-identical stdout for representable values.
 checkbytes() {  # label ; escape (e.g. '\U0041')
@@ -29,8 +27,7 @@ checkbytes() {  # label ; escape (e.g. '\U0041')
     b=$(bash "$tmp" 2>/dev/null | od -An -tx1; echo "EXIT:${PIPESTATUS[0]}")
     h=$("$HUCK_BIN" "$tmp" 2>/dev/null | od -An -tx1; echo "EXIT:${PIPESTATUS[0]}")
     rm -f "$tmp"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # (B) parse-gap parity: both shells must exit 0 (no syntax error). Bytes are
@@ -71,5 +68,4 @@ checkparse "u surrogate d800"    '\ud800'
 checkparse "U 5-byte range"      '\U00200000'
 checkparse "U 6-byte max"        '\U7fffffff'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

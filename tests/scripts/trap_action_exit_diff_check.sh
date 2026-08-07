@@ -12,9 +12,7 @@
 # real bash dies with `xmalloc: cannot allocate 16 bytes`. Reproducing memory
 # exhaustion is not a compatibility goal (docs/bash-divergences.md).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # Both sides run under `timeout`: several fragments here are only bounded
 # BECAUSE the trap exits, so a shell that ignores the exit (the bug being
 # fixed) would spin forever — `trap "exit 9" ERR; while true; do false; done`
@@ -24,8 +22,7 @@ check() {
     local label="$1" frag="$2" b h
     b=$(timeout 10 bash -c "$frag" 2>&1; echo "rc=$?")
     h=$(timeout 10 "$HUCK_BIN" -c "$frag" 2>&1; echo "rc=$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # --- all five trap kinds honour `exit N` ------------------------------------

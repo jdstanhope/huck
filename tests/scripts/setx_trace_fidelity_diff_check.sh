@@ -2,16 +2,13 @@
 # Byte-identical bash<->huck harness for v130: set -x trace fidelity. Compares
 # STDERR only (set -x writes there), stdout discarded. Default PS4 `+ `.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # Exact-bytes comparison (non-pipeline fragments: deterministic single producer).
 check() {
     local label="$1" frag="$2" b h
     b=$(printf 'set -x\n%s\n' "$frag" | bash 2>&1 >/dev/null)
     h=$(printf 'set -x\n%s\n' "$frag" | "$HUCK_BIN" 2>&1 >/dev/null)
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 # Order-independent (PIPELINE fragments): in-process stages trace from a forked
 # child, external stages from the parent, so left-to-right order is best-effort
@@ -20,8 +17,7 @@ check_sorted() {
     local label="$1" frag="$2" b h
     b=$(printf 'set -x\n%s\n' "$frag" | bash 2>&1 >/dev/null | sort)
     h=$(printf 'set -x\n%s\n' "$frag" | "$HUCK_BIN" 2>&1 >/dev/null | sort)
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 check "arg with space"        'x="a b"; echo "$x" c'
@@ -53,5 +49,4 @@ for c in '#' '%' '+' '-' '.' '/' ':' '=' '@' '^' '_' '~' ',' '*' '?' '[' ']' '{'
     check "punct[$c]" "v=a${c}b"
 done
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

@@ -4,9 +4,7 @@
 # name, unlike ksh/zsh). Also covers `${@:0}` / `${*:0}` (which include $0)
 # and FUNCNAME (which IS the function name — must stay correct).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # Compare a fragment run via a SCRIPT FILE (so $0 = the script path). Both
 # shells get the same temp file, so $0 is identical when correct.
@@ -17,16 +15,14 @@ check_file() {
     b=$(bash "$f" 2>&1; echo "rc=$?")
     h=$("$HUCK_BIN" "$f" 2>&1; echo "rc=$?")
     rm -f "$f"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 # Compare a fragment run via `-c` with an explicit argv0 ("prog"), so $0 = prog.
 check_c() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" prog a b 2>&1; echo "rc=$?")
     h=$("$HUCK_BIN" -c "$frag" prog a b 2>&1; echo "rc=$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # --- $0 inside a function keeps the invocation name ---
@@ -45,5 +41,4 @@ check_c    "FUNCNAME nested"        'g(){ echo "$0:${FUNCNAME[0]}:${FUNCNAME[1]}
 # --- top-level $0 unchanged ---
 check_file "top-level \$0"          'echo "[$0]"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

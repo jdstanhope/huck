@@ -9,9 +9,7 @@
 # Backslashes are fragile through `-c`, so most fragments run from a HERE-DOC
 # script fed to `bash -s` / `huck -s`; stdout+stderr+exit must match byte-for-byte.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # Normalize the leading program-name token on error lines (`bash: line N:` vs
 # `/path/to/huck: line N:`) — a non-behavioral argv[0] artifact of piping the
@@ -23,8 +21,7 @@ check_script() {
     local label="$1" script="$2" b h
     b=$(printf '%s' "$script" | bash --norc --noprofile 2>&1 | norm; echo "EXIT:${PIPESTATUS[1]}")
     h=$(printf '%s' "$script" | "$HUCK_BIN" 2>&1 | norm; echo "EXIT:${PIPESTATUS[1]}")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # --- Root 1: backslash from an unquoted expansion is a pattern escape ---

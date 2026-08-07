@@ -3,9 +3,7 @@
 # File-arg execution (L-27: huck history-expands piped stdin). HISTFILE=/dev/null
 # isolates; history is populated with `history -r <fixture>` (works non-interactively).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 printf 'cmd-one\ncmd-two\ncmd-three\ncmd-four\n' > "$WORK/fix"
 norm() { sed -E 's#^([^:]*/)?(bash|huck): (line [0-9]+: )?##'; }
@@ -14,8 +12,7 @@ check() {
     printf '%s\n' "$frag" > "$WORK/frag.sh"
     b=$(cd "$WORK" && bash ./frag.sh 2>&1; echo "rc=$?"); b=$(printf '%s\n' "$b" | norm)
     h=$(cd "$WORK" && "$HUCK_BIN" ./frag.sh 2>&1; echo "rc=$?"); h=$(printf '%s\n' "$h" | norm)
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 POP='HISTFILE=/dev/null; history -c; history -r fix;'
 check "list all format"   "$POP history"
@@ -42,5 +39,4 @@ check "nonnumeric-first multi"  "$POP history abc def; echo rc=\$?"
 # `echo rc=$?` on its own line so both shells resume at the next top-level
 # command and we verify just the message/rc this fix is responsible for.
 check "too many arguments" "$(printf '%s\nhistory 2 3\necho rc=$?' "$POP")"
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

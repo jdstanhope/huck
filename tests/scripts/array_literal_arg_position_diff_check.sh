@@ -6,9 +6,7 @@
 # unexpected `(` (rc 2); huck must match. Compares exit code AND stderr-presence
 # (an error line was / was not emitted) for each fragment.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # Compare parse outcome (rc + whether stderr is non-empty) between bash and huck.
 check() {
@@ -59,5 +57,4 @@ check "decl after leading"     'x=1 declare a=(1 2)'
 check "quoted =("              'echo "a=(x)"'
 check "quoted arg"             'echo a="(x)"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

@@ -5,9 +5,7 @@
 # `` `NAME': not a valid identifier `` and does NOT start the coprocess (exit 1).
 # A valid name (control) is unaffected. Compares full output + exit status.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # Runtime parity: full stdout+stderr and exit status. huck's error prologue is
 # `huck: …` vs bash's `bash: line N: …`, so strip the tool/line prefix before
@@ -18,8 +16,7 @@ runtime() {
         | sed -E 's/^bash: (line [0-9]+: )?//'; echo "EXIT:${PIPESTATUS[0]}")
     h=$(printf '%s\n' "$frag" | timeout 10 "$HUCK_BIN" 2>&1 \
         | sed -E 's#^[^:]*/?huck: (line [0-9]+: )?##'; echo "EXIT:${PIPESTATUS[0]}")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # Parse parity: `-n` exit status only (a bogus name must PARSE like bash).
@@ -46,5 +43,4 @@ runtime "runtime hyphen"   'coproc a-b { echo hi; }; echo "rc=$?"'
 # Valid-name control: coproc starts, roundtrip works.
 runtime "valid roundtrip"  'coproc MYP { read l; echo "e:$l"; }; echo yo >&"${MYP[1]}"; read r <&"${MYP[0]}"; echo "$r"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

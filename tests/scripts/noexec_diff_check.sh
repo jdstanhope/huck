@@ -7,9 +7,7 @@
 # DIAGNOSTIC text legitimately differs (huck's parser messages never byte-match
 # bash's), so stderr is intentionally not compared here.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # With the -n flag (parse-only).
 chkn() { local l="$1" f="$2" b h

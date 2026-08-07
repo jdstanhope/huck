@@ -3,17 +3,14 @@
 # tasks add them, the packaging scripts' --dry-run output). Proves huck runs the
 # real packaging logic identically to bash.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # Run a shell fragment through bash and huck; assert identical stdout+stderr+exit.
 check() {
     local label="$1" frag="$2" b h
     b=$(printf '%s\n' "$frag" | bash --norc --noprofile 2>&1; echo "EXIT:$?")
     h=$(printf '%s\n' "$frag" | "$HUCK_BIN" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # Run a SCRIPT FILE with args through bash and huck; assert identical output.
@@ -22,8 +19,7 @@ check_script() {
     local b h
     b=$(bash "$@" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$@" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 L='packaging/lib/pack_lib.sh'
@@ -41,5 +37,4 @@ check "latest deb miss"  ". $L; printf '%s\n' 'nothing here' | pack_latest_deb_u
 check_script "build-deb --dry-run" packaging/deb/build-deb.sh --dry-run
 check_script "release --dry-run" scripts/release.sh --dry-run
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

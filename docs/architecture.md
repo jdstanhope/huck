@@ -314,11 +314,17 @@ These appear in many call-site signatures; learn them once.
   POSIX special set (`:`, `.`, `break`, `continue`, `eval`, `exit`,
   `export`, `readonly`, `return`, `set`, `shift`, `source`, `trap`,
   `unset`). These DO mutate parent shell state in pipelines.
-- **Bash-diff harnesses** — ~160 executable `*_diff_check.sh` scripts under
+- **Bash-diff harnesses** — ~275 `*_diff_check.sh` scripts under
   `tests/scripts/` run the same fragments through bash and huck and assert
   byte-identical output (e.g. `arrays_diff_check.sh`, `ifs_diff_check.sh`,
   `error_message_diff_check.sh`). Adding a `<feature>_diff_check.sh` is the
-  gold standard for bash-compat verification. On a memory-constrained box,
+  gold standard for bash-compat verification. Shared scaffolding lives in
+  `tests/scripts/lib/harness.sh` (#498) — `HUCK_BIN` + executable guard,
+  `PASS`/`FAIL`, `compare <label> <bash-out> <huck-out>`, `harness_summary`.
+  It owns the SCAFFOLDING only; the DRIVER (piped stdin vs `-c` vs script
+  file, `--norc --noprofile` or not) stays in each harness because those are
+  distinct top-level readers in huck. `lib/` sits outside the runner's
+  `tests/scripts/*_diff_check.sh` glob, so it is never run as a harness. On a memory-constrained box,
   guard a sweep with `ulimit -v 1500000` + a per-harness `timeout`.
   `tests/scripts/run_diff_checks.sh` runs the whole sweep against each
   harness's default binary (most use `target/debug/huck`; a few need

@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 # Byte-identical bash<->huck harness for v96: ${var@OP} parameter transforms (M-??).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(printf '%s\n' "$frag" | bash 2>&1; echo "EXIT:$?")
     h=$(printf '%s\n' "$frag" | "$HUCK_BIN" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # @U / @L / @u case transforms (ASCII only — non-ASCII inherits a documented
@@ -41,5 +38,4 @@ check "at q   quoteQ"  'set "a b" c;     for w in "${@@Q}";   do printf "<%s>" "
 check "at q   ctrlA"   'e=$'"'"'uv\001\001wx'"'"'; set "$e" "$e"; for w in "${@/$'"'"'\001'"'"'/A}"; do printf "<%s>" "$w"; done; echo'
 check "at empty args"  'set --; for w in "${@/X/-}"; do printf "<%s>" "$w"; done; echo DONE'
 check "star q custom-IFS" 'IFS=-; set aXa bXb cXc; printf "<%s>" "${*/X/_}"; echo'
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary
