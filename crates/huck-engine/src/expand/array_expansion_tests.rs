@@ -5,31 +5,8 @@
 //! `slice_word_list` paths are exercised together.
 
 use super::*;
-use crate::command::{Command, SimpleCommand};
 use crate::shell_state::Shell;
-
-/// Lex the input as `echo <input>` and return the first argument
-/// Word. Avoids constructing `WordPart::ParamExpansion` literals by
-/// hand and keeps the tests aligned with what the lexer actually
-/// produces (matters for the lexer-touching `${!a[@]}` shape).
-fn first_arg_word(input: &str) -> Word {
-    let src = format!("echo {input}");
-    let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
-        &src,
-        &Default::default(),
-        crate::lexer::LexerOptions::default(),
-    ))
-    .expect("parse")
-    .expect("non-empty");
-    let pipeline = match seq.first {
-        Command::Pipeline(p) => p,
-        other => panic!("expected Pipeline, got {other:?}"),
-    };
-    match &pipeline.commands[0] {
-        Command::Simple(SimpleCommand::Exec(e)) => e.args[0].clone(),
-        other => panic!("expected SimpleCommand::Exec, got {other:?}"),
-    }
-}
+use crate::test_support::first_arg_word;
 
 /// Run `expand` on the lexed input and return a single string
 /// formed by joining the resulting fields with a space. Used for
