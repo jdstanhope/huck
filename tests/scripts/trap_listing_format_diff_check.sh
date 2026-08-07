@@ -5,15 +5,12 @@
 # walk — EXIT (signal 0) first, then real signals by NUMBER, then DEBUG, ERR,
 # RETURN.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1; echo "rc=$?")
     h=$("$HUCK_BIN" -c "$frag" 2>&1; echo "rc=$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # --- the SIG prefix ---------------------------------------------------------
@@ -42,5 +39,4 @@ check "quote in action" "trap \"echo it's\" USR1; trap"
 check "empty table"     'trap'
 check "reset one"       'trap "echo x" USR1; trap - USR1; trap'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

@@ -9,9 +9,7 @@
 # HARNESS's own process group. Targets here are signal-0 probes, pid 1 (which
 # the harness may not signal), or the nonexistent group -99999.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # Normalize the leading program-name token on error lines (`bash: line N:` vs
 # `/path/to/huck: line N:`) — argv[0], not behavior. The usage lines carry no
 # such prefix and are compared verbatim.
@@ -20,8 +18,7 @@ check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1 | norm; echo "rc=${PIPESTATUS[0]}")
     h=$("$HUCK_BIN" -c "$frag" 2>&1 | norm; echo "rc=${PIPESTATUS[0]}")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # --- usage text (rc 2), every arm that can reach it -------------------------
@@ -63,5 +60,4 @@ check "trailing garbage"    'kill -0 12abc; echo rc=$?'
 check "whitespace only"     'kill -0 " "; echo rc=$?'
 check "interior space"      'kill -0 "1 2"; echo rc=$?'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

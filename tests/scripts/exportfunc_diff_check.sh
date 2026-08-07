@@ -7,16 +7,13 @@
 # import round-trip is same-shell); stdout+stderr+exit must match byte-for-byte
 # after normalizing the program-name prefix on error lines.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # $2 runs under both shells; `$SH` inside the fragment is the shell under test.
 check() {
     local label="$1" frag="$2" b h
     b=$(SH=bash bash --norc --noprofile -c "$frag" 2>&1 | sed 's#^[^:]*:#SH:#'; echo "EXIT:${PIPESTATUS[0]}")
     h=$(SH="$HUCK_BIN" "$HUCK_BIN" -c "$frag" 2>&1 | sed 's#^[^:]*:#SH:#'; echo "EXIT:${PIPESTATUS[0]}")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # ── R1: import a hyphen-named exported function (round-trip through the env) ──

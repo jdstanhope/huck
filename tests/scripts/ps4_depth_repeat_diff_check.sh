@@ -4,15 +4,12 @@
 # there), stdout discarded. Does NOT test $(...)/$((...))/$LINENO in PS4 — those
 # are the known L-29 residual (huck's expand_prompt does not expand them).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(printf 'set -x\n%s\n' "$frag" | bash 2>&1 >/dev/null)
     h=$(printf 'set -x\n%s\n' "$frag" | "$HUCK_BIN" 2>&1 >/dev/null)
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 check "default depth nested"  'a=$(echo $(echo hi))'
@@ -31,5 +28,4 @@ check "triple nest custom"    'set +x; PS4="# "; set -x; a=$(echo $(echo $(echo 
 check "ps4 var expansion"     'set +x; P=Q; PS4="$P "; set -x; echo z'
 check "default no regression" 'echo hi'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

@@ -5,9 +5,7 @@
 # file then cat it so the result is on stdout. rc 0 in bash → compare full
 # stdout+exit.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     # Each shell runs against a freshly emptied $D so an append (`>>`) from the
@@ -16,8 +14,7 @@ check() {
     b=$(printf '%s\n' "$frag" | bash --norc --noprofile 2>&1; echo "EXIT:$?")
     rm -rf "$D"; mkdir -p "$D"
     h=$(printf '%s\n' "$frag" | "$HUCK_BIN" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 D=$(mktemp -d)
 
@@ -30,5 +27,4 @@ check "redir + arg redir"     "m() { echo M; } >$D/e; m >$D/f; echo \"e:\$(cat $
 check "control no redirect"   'c() { echo plain; }; c'
 
 rm -rf "$D"
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

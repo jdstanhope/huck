@@ -5,9 +5,7 @@
 # strip only the close line, so the stored delim kept its tab and never matched —
 # the body ran to EOF. Compares stdout + exit only.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 T=$'\t'   # a real tab
 
 # checkf LABEL BODY : run BODY (may contain real tabs) as a script file in both shells.

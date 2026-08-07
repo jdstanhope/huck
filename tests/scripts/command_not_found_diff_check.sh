@@ -9,9 +9,7 @@
 # cases ($empty / $empty arg / $empty >redir) are a separate deferred divergence
 # (bash no-ops or promotes; huck errors) and are NOT asserted here.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 checkf() {
     local label="$1" body="$2" tmp b h
     tmp=$(mktemp "${TMPDIR:-/tmp}/huck-cnf.XXXXXX")
@@ -19,8 +17,7 @@ checkf() {
     b=$(bash "$tmp" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tmp" 2>&1; echo "EXIT:$?")
     rm -f "$tmp"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 checkf "missing on line 1"      'nosuch_cmd_xyz'
@@ -32,5 +29,4 @@ echo after'
 checkf "missing with args"      'nosuch_cmd_xyz -a b c'
 checkf "quoted-empty command"   "''"
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

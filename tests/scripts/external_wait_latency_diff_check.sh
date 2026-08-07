@@ -3,15 +3,12 @@
 # observable behavior — output across many external commands and subshells
 # (inherited, redirected, and captured stdio) stays byte-identical to bash.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1; echo "rc=$?")
     h=$("$HUCK_BIN" -c "$frag" 2>&1; echo "rc=$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 # Subshells with inherited stdio (no capture pipe — the fixed path).
 check "subshell loop inherited"   'for i in 1 2 3 4 5; do ( echo "s$i" ); done'
@@ -30,5 +27,4 @@ check "command substitution"      'x=$( ( echo cap ) ); echo "[$x]"'
 check "external in capture"       'x=$(/bin/echo capext); echo "[$x]"'
 # Mixed sequence.
 check "mixed sequence"            '( echo a ); /bin/echo b; echo c; x=$(echo d); echo "$x"'
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

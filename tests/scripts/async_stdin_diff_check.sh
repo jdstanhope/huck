@@ -7,9 +7,7 @@
 # hang.) A final functional guard runs a real `cat` under timeout to assert the
 # #126 hang is gone.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 printf 'alpha\n' > "$WORK/inA"
 printf 'beta\n'  > "$WORK/inB"
@@ -22,8 +20,7 @@ check() {
     b=$(cd "$WORK" && bash        -c "$frag" < "$WORK/inA" 2>&1; echo "rc=$?")
     h=$(cd "$WORK" && "$HUCK_BIN" -c "$frag" < "$WORK/inA" 2>&1; echo "rc=$?")
     b=${b//$WORK/@WORK@}; h=${h//$WORK/@WORK@}
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 R='readlink /proc/self/fd/0'
@@ -48,5 +45,4 @@ else
     printf 'FAIL: cat & wait no-hang guard (bash=[%s] huck=[%s])\n' "$gb" "$gh"; FAIL=$((FAIL+1))
 fi
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

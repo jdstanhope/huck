@@ -9,9 +9,7 @@
 # each shell verbatim — no harness-level double-escaping. Output is captured
 # through `od -An -c` so control/NUL-free byte sequences compare exactly.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 checkf() {  # label ; fragment — assert byte-identical stdout+stderr+exit
     local label="$1" body="$2" tmp b h
     tmp=$(mktemp "${TMPDIR:-/tmp}/huck-ansic.XXXXXX")
@@ -19,8 +17,7 @@ checkf() {  # label ; fragment — assert byte-identical stdout+stderr+exit
     b=$(bash "$tmp" 2>&1 | od -An -c; echo "EXIT:${PIPESTATUS[0]}")
     h=$("$HUCK_BIN" "$tmp" 2>&1 | od -An -c; echo "EXIT:${PIPESTATUS[0]}")
     rm -f "$tmp"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # Octal: \NNN (1-3 octal digits) → byte.
@@ -52,5 +49,4 @@ checkf "mixed hex+octal"   "echo \$'\\x41\\102'"
 # One reinforcing concatenation case: literal text abutting a $'…' escape.
 checkf "concat pre/post"   "echo pre\$'\\tX'post"
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

@@ -4,15 +4,12 @@
 # kill %n / wait / $! must still work. We assert OBSERVABLE behavior (exit codes
 # + stdout) since process-group ids are not byte-stable.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(printf '%s\n' "$frag" | bash --norc --noprofile 2>&1; echo "EXIT:$?")
     h=$(printf '%s\n' "$frag" | "$HUCK_BIN" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 check "bgpid nonempty"     'sleep 0.2 & [ -n "$!" ] && echo "have-pid"; wait; echo done'
@@ -23,5 +20,4 @@ check "two bg wait all"    'sleep 0.2 & sleep 0.2 & wait; echo "all done rc=$?"'
 check "no job notice"      'sleep 0.2 & wait; echo only-this-line'
 check "kill bad spec"      'kill %9 2>/dev/null; echo "rc=$?"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

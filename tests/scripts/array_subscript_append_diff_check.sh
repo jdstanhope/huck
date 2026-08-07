@@ -13,9 +13,7 @@
 #   * associative: `a+=([k]+=v)` concatenates onto the existing key; a fresh
 #     `declare -A a=([k]=x [k]+=y)` replace treats `+=` as a plain set (bash quirk).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 checkf() {  # label ; fragment — assert byte-identical stdout+stderr+exit
     local label="$1" body="$2" tmp b h
     tmp=$(mktemp "${TMPDIR:-/tmp}/huck-aappend.XXXXXX")
@@ -23,8 +21,7 @@ checkf() {  # label ; fragment — assert byte-identical stdout+stderr+exit
     b=$(bash "$tmp" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tmp" 2>&1; echo "EXIT:$?")
     rm -f "$tmp"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # --- indexed: fresh replace ---
@@ -51,5 +48,4 @@ checkf "assoc append fresh key" 'declare -A a=([one]=1); a+=([two]+=2); echo "${
 checkf "arith subscript append" 'i=1; x=([i+1]+=v); echo "${x[2]}"'
 checkf "expansion in += value" 'v=X; x=([0]=a [0]+=$v); echo "${x[0]}"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

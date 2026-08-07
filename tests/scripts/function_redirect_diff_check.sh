@@ -3,9 +3,7 @@
 # function-call command apply to the body. File-arg execution (L-27).
 # stdout-only compare (2>/dev/null both sides).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h tf
     tf=$(mktemp)
@@ -13,8 +11,7 @@ check() {
     b=$(bash --norc --noprofile "$tf" 2>/dev/null; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tf" 2>/dev/null; echo "EXIT:$?")
     rm -f "$tf"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 check "func >file"            'f(){ printf "%s\n" BODY; }; d=$(mktemp -d); f >"$d/x"; cat "$d/x"'
@@ -28,5 +25,4 @@ check "func <herestring"      'r(){ read a; echo "got=$a"; }; r <<< "hi"'
 # redirect into the capture buf. Bash forks for $(), making 2>&1 work there.
 # This case is NOT included until L-25 is resolved.
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

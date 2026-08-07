@@ -7,9 +7,7 @@
 # program messages) and add a functional no-hang check for the `read` repro (whose
 # builtin error WORDING differs from bash for unrelated reasons — out of scope).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 
 # Strip the shell's program-name/line prefix so only command output is compared.
@@ -21,8 +19,7 @@ check() {
     local label="$1" frag="$2" b h
     b=$(cd "$WORK" && timeout 5 bash        -c "$frag" </dev/null 2>&1; echo "rc=$?"); b=$(printf '%s\n' "$b" | norm)
     h=$(cd "$WORK" && timeout 5 "$HUCK_BIN" -c "$frag" </dev/null 2>&1; echo "rc=$?"); h=$(printf '%s\n' "$h" | norm)
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 check "closed fd0: cat | cat"        'exec <&-; cat | cat; echo end'
@@ -41,5 +38,4 @@ nohang() {
 }
 nohang "closed fd0: read | cat no-hang" 'exec <&-; read x | cat; echo end'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

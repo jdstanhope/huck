@@ -3,16 +3,13 @@
 # running (a notice, not an error), the current-job operand default, and the
 # `<spec>: no such job` wording fg/bg/disown use when there is no current job.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 norm() { sed 's|^[^:]*: line |PROG: line |'; }
 check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1 | norm; echo "rc=${PIPESTATUS[0]}")
     h=$("$HUCK_BIN" -c "$frag" 2>&1 | norm; echo "rc=${PIPESTATUS[0]}")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 # Job control on, and every fragment kills and reaps what it started.
 J='set -m; '
@@ -51,5 +48,4 @@ check "same job twice"         "${J}sleep 2 & bg %1 %1; echo rc=\$?${R}"
 # --- usage / option errors are unchanged ------------------------------------
 check "bg -x"            'set -m; bg -x; echo rc=$?'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

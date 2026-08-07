@@ -7,15 +7,12 @@
 # -> SIGABRT. Fixed by tracking the SET of active trap signals and guarding
 # on membership.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(bash --norc --noprofile -c "$frag" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" -c "$frag" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 check "err+debug mutual (crash repro)" 'trap false ERR; trap false DEBUG; echo x'
@@ -25,5 +22,4 @@ check "return+debug under functrace" 'set -T; f(){ echo A; false; }; trap false 
 check "lone debug unchanged" 'n=0; trap '"'"'n=$((n+1))'"'"' DEBUG; :; :; echo "n=$n"'
 check "lone err once per failure" 'e=0; trap '"'"'e=$((e+1))'"'"' ERR; false; true; false; echo "e=$e"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

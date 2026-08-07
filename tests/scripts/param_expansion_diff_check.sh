@@ -2,9 +2,7 @@
 # Byte-identical bash<->huck harness for v233: ${...} parse robustness
 # (M1 prefix, M2 special-param names, M3 @-edges, M4 $'...', bad-subst defer).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 checkf() {
     local label="$1" body="$2" tmp b h
     tmp=$(mktemp "${TMPDIR:-/tmp}/huck-pe.XXXXXX")
@@ -12,8 +10,7 @@ checkf() {
     b=$(bash "$tmp" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tmp" 2>&1; echo "EXIT:$?")
     rm -f "$tmp"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # M1 prefix-name expansion
@@ -45,5 +42,4 @@ checkf "positional invmod" 'set -- a b; echo ${1foo}'
 # P10 ${!*} / ${!@} — DIVERGENCE (reported): on invalid var name huck uses the "huck:"
 #     prefix, bash uses the "file: line N:" script prologue.
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

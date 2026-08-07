@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # Byte-identical bash<->huck harness for v231 C: shopt expand_aliases in file mode.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 checkf() {
     local label="$1" body="$2" tmp b h
     tmp=$(mktemp "${TMPDIR:-/tmp}/huck-aliasx.XXXXXX")
@@ -11,8 +9,7 @@ checkf() {
     b=$(bash "$tmp" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tmp" 2>&1; echo "EXIT:$?")
     rm -f "$tmp"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 checkf "def then use"     'shopt -s expand_aliases; alias foo="echo HELLO"; foo'
@@ -50,8 +47,7 @@ checkstdin() {
     local label="$1" body="$2" b h
     b=$(printf '%s' "$body" | bash 2>&1; echo "EXIT:$?")
     h=$(printf '%s' "$body" | "$HUCK_BIN" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 # Positive cases (clean stdout, byte-comparable). The negative "no shopt = no
 # expand" case is verified by hand to match bash's BEHAVIOR (no expansion) but is
@@ -61,5 +57,4 @@ checkstdin() {
 checkstdin "stdin shopt then def then use" $'shopt -s expand_aliases\nalias now=\'echo 2\'\nnow'
 checkstdin "stdin cmdsub body via shopt"   $'shopt -s expand_aliases\nalias now="echo $(echo 2)"\nnow'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

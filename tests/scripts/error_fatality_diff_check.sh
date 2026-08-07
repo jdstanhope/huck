@@ -21,9 +21,7 @@
 # while a script or piped stdin keeps it. A single-driver harness would have
 # shown agreement on cells that disagree.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
 # $1 label, $2 prelude, $3 error fragment, $4 driver (dashc|script|stdin)

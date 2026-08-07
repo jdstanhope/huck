@@ -3,9 +3,7 @@
 # reveal/pop (M-115). Cases A-H + readonly / unset -f / unset arr[i] guards.
 # File-arg execution (L-27: huck history-expands piped stdin).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h tf
     tf=$(mktemp)
@@ -13,8 +11,7 @@ check() {
     b=$(bash --norc --noprofile "$tf" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tf" 2>&1; echo "EXIT:$?")
     rm -f "$tf"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 check "A promote across local"  'inner(){ unset -v "$1"; eval $1=VAL; }; mid(){ local x=mv; inner x; echo "m:$x"; }; outer(){ local x=orig; mid x; echo "o:$x"; }; outer'
@@ -31,5 +28,4 @@ check "unset -f function"       'f(){ echo hi; }; unset -f f; type f >/dev/null 
 check "unset array element"     'a=(p q r); unset "a[1]"; echo "${a[*]} n=${#a[@]}"'
 check "global unset noreveal"   'g=top; f(){ unset -v g; echo "in:${g-U}"; }; f; echo "out:${g-U}"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

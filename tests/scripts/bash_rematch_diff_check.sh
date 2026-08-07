@@ -2,9 +2,7 @@
 # Byte-identical bash<->huck harness for v122: BASH_REMATCH population after
 # [[ =~ ]] (M-14 sub-feature). File-arg execution (L-27).
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h tf
     tf=$(mktemp)
@@ -12,8 +10,7 @@ check() {
     b=$(bash --norc --noprofile "$tf" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tf" 2>&1; echo "EXIT:$?")
     rm -f "$tf"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 check "whole+groups"    '[[ abcdef =~ b(c)(d) ]]; echo "n=${#BASH_REMATCH[@]} [${BASH_REMATCH[0]}][${BASH_REMATCH[1]}][${BASH_REMATCH[2]}]"'
@@ -26,5 +23,4 @@ check "digits group"    '[[ "v1.2.3" =~ ([0-9]+)\.([0-9]+) ]]; echo "[${BASH_REM
 check "longopt extract"  'for w in --all -x --almost-all; do [[ $w =~ (--[a-z-]+) ]] && printf "%s\n" "${BASH_REMATCH[1]}"; done'
 check "rematch indices"  '[[ abcdef =~ b(c)(d) ]]; echo "${!BASH_REMATCH[@]}"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

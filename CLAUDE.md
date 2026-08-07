@@ -203,7 +203,13 @@ wait, branch from `main` and cherry-pick.
 - **Bash-diff harnesses** under `tests/scripts/*_diff_check.sh` run
   the same fragments through bash and huck and assert byte-identical
   output. Adding a `<feature>_diff_check.sh` is the gold standard
-  for verifying bash compat on a new feature.
+  for verifying bash compat on a new feature. Source the shared
+  scaffolding (#498) rather than re-pasting it —
+  `. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"` gives `HUCK_BIN`,
+  the executable guard, the `PASS`/`FAIL` counters, `compare` and
+  `harness_summary`. Keep your own two DRIVER lines: piped stdin,
+  `-c` and a script file are different top-level readers in huck, so the
+  lib deliberately does not choose for you.
 - **Don't push directly to main.** Everything lands via a pull request.
   A `vNN` **iteration** PR is handed to the user to review and merge —
   push the branch, open the PR (`Closes #N`), leave the merge alone. A

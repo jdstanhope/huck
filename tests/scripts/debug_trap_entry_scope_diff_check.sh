@@ -13,9 +13,7 @@
 # Every fire is a fixed marker (`D`, `C`) rather than $LINENO, so a row failing
 # means the FIRE COUNT diverged, not the line numbering.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # Sourced fixtures live in a per-run dir so a parallel sweep cannot collide.
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -26,8 +24,7 @@ check() {
     # runaway fragment into unbounded output, which has OOM-killed this box.
     b=$( ulimit -v 800000; timeout 10 bash --norc --noprofile -c "$frag" 2>&1 | head -c 2000; echo "EXIT:$?" )
     h=$( ulimit -v 800000; timeout 10 "$HUCK_BIN" -c "$frag" 2>&1 | head -c 2000; echo "EXIT:$?" )
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 printf 'echo s1\necho s2\n'                     > "$TMP/plain.sh"

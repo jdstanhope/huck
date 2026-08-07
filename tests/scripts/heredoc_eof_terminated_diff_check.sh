@@ -9,9 +9,7 @@
 # that huck need not emit, so this harness compares STDOUT + EXIT ONLY (like the
 # other heredoc harnesses' spirit), never stderr.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # checkf LABEL BODY [trailing_nl]
 # Runs BODY as a script FILE through bash and huck, comparing stdout+exit only.
@@ -94,5 +92,4 @@ checkp "P2 piped no-trailing-nl"     $'cat <<EOF\nhi'
 checkp "P3 piped preceding command"  $'echo before\ncat <<EOF\nhi\n'
 checkp "P4 piped closed control"     $'cat <<EOF\nhi\nEOF\necho ok\n'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

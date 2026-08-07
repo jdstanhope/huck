@@ -5,15 +5,12 @@
 # distant `))` (e.g. a later `$(( ))`). Kernel runner.sh hit this. rc 0 in bash
 # → compare full stdout+exit.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(printf '%s\n' "$frag" | bash --norc --noprofile 2>&1; echo "EXIT:$?")
     h=$(printf '%s\n' "$frag" | "$HUCK_BIN" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # L-51: nested-subshell `((` (no `))`) followed by a later $(( )) / (( ).
@@ -29,5 +26,4 @@ check "arith grouped sum"          '(( (a=3) + (b=4) )); echo "sum=$((a+b))"'
 check "arith ternary group"        '((x=(5>3)?1:0)); echo "x=$x"'
 check "arith increment"            '((n=3)); ((n++)); echo "n=$n"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

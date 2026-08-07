@@ -8,9 +8,7 @@
 # the background job gets its own process group, and each fragment reaps its
 # child before exiting.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # Normalize the program-name token on error lines (`bash: line N:` vs
 # `/path/to/huck: line N:`) — argv[0], not behavior.
 norm() { sed 's|^[^:]*: line |PROG: line |'; }
@@ -18,8 +16,7 @@ check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1 | norm; echo "rc=${PIPESTATUS[0]}")
     h=$("$HUCK_BIN" -c "$frag" 2>&1 | norm; echo "rc=${PIPESTATUS[0]}")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # --- bare `%` resolves to the current job -----------------------------------
@@ -72,5 +69,4 @@ check "-l -x -y"         'kill -l -x -y; echo rc=$?'
 check "-l -- -3"         'kill -l -- -3; echo rc=$?'
 check "-l operand then -x" 'kill -l TERM -x; echo rc=$?'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

@@ -3,9 +3,7 @@
 # FILE MODE (heredocs are multi-line): each fragment is written to a temp file and
 # run as `bash "$tmp"` vs `"$HUCK_BIN" "$tmp"`, comparing stdout+stderr+exit.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 checkf() {
     local label="$1" body="$2" tmp b h
     tmp=$(mktemp "${TMPDIR:-/tmp}/huck-hdr.XXXXXX")
@@ -13,8 +11,7 @@ checkf() {
     b=$(bash "$tmp" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tmp" 2>&1; echo "EXIT:$?")
     rm -f "$tmp"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # --- Heredocs -------------------------------------------------------------
@@ -60,5 +57,4 @@ checkf "R4c x2> digit is word"         $'f=${TMPDIR:-/tmp}/huckR4c_$$\necho x2>"
 #   ls MISSING 2>f -> "2" IS the stderr fd; error text lands in file
 checkf "R4d bare 2> is stderr fd"      $'f=${TMPDIR:-/tmp}/huckR4d_$$\nls /no/such/huck_$$ 2>"$f"\necho "err-lines:[$(wc -l < "$f" | tr -d " ")]"\nrm -f "$f"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

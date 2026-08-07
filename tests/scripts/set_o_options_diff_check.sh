@@ -7,9 +7,7 @@
 #   - braceexpand gate (`set +B` / `+o braceexpand` disables `{a,b}`)
 #   - allexport gate (`set -a` auto-exports subsequent assignments)
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # Byte-identical stdout+stderr+exit comparison of a script body.
 checkf() {
@@ -19,8 +17,7 @@ checkf() {
     b=$(bash "$tmp" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tmp" 2>&1; echo "EXIT:$?")
     rm -f "$tmp"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # Like checkf but normalizes the leading program-name/path prologue on error
@@ -35,8 +32,7 @@ checkerr() {
     rm -f "$tmp"
     b=$(printf '%s\n' "$b" | sed 's/^.*\(set: \)/\1/')
     h=$(printf '%s\n' "$h" | sed 's/^.*\(set: \)/\1/')
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # ── every long-form option accepted (rc 0, silent) ──
@@ -73,8 +69,7 @@ checkstdin() {
     local label="$1" body="$2" b h
     b=$(printf '%s' "$body" | bash 2>&1; echo "EXIT:$?")
     h=$(printf '%s' "$body" | "$HUCK_BIN" 2>&1; echo "EXIT:$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 checkstdin "set +B disables braces (stdin)" $'set +B\necho {a,b}\n'
 checkstdin "+o braceexpand disables (stdin)" $'set +o braceexpand\necho {a,b}\n'
@@ -85,5 +80,4 @@ checkf "set -a auto-exports" $'set -a\nX=1\nexport -p | grep -w X'
 checkf "no allexport no export" $'Y=2\nexport -p | grep -w Y'
 checkf "set +a stops exporting" $'set -a\nX=1\nset +a\nZ=3\nexport -p | grep -Ew "X|Z"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

@@ -8,9 +8,7 @@
 # (#135 — in-process whole-command redirect on a freed std fd — was fixed in v291
 # Phase 2; its cases are asserted below.)
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 printf 'FA\n' > "$WORK/inA"
 
@@ -23,8 +21,7 @@ check() {
     b=$(cd "$WORK" && timeout 5 bash        -c "$frag" </dev/null 2>&1; echo "rc=$?"); b=$(printf '%s\n' "$b" | norm)
     h=$(cd "$WORK" && timeout 5 "$HUCK_BIN" -c "$frag" </dev/null 2>&1; echo "rc=$?"); h=$(printf '%s\n' "$h" | norm)
     b=${b//$WORK/@W@}; h=${h//$WORK/@W@}
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 # --- freed std fds x pipelines (post-v288 correct) ---
@@ -136,5 +133,4 @@ hh
 EOF
 echo end'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

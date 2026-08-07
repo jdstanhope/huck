@@ -5,9 +5,7 @@
 # `bash: line N: read:` vs huck's `<huckpath>: line N: read:`) by keeping
 # only the part from `read:` onward.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # Keep everything from `read:` onward on any diagnostic line so the leading
 # program-name/path/line-number prefix doesn't cause a spurious mismatch.

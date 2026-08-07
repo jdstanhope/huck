@@ -2,9 +2,7 @@
 # Byte-identical bash<->huck harness for v116: [^...] bracket negation in glob
 # patterns (M-113) — ${}/case/[[ ]]/pathname. [!...] + literal-^ regressions.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 # Run each fragment as a FILE-ARG script (not piped stdin) for both shells. A
 # `[!...]` fragment contains `!` which huck history-expands on piped stdin (a
 # separate divergence; bash disables histexpand on non-interactive stdin too).
@@ -17,8 +15,7 @@ check() {
     b=$(bash --norc --noprofile "$tf" 2>&1; echo "EXIT:$?")
     h=$("$HUCK_BIN" "$tf" 2>&1; echo "EXIT:$?")
     rm -f "$tf"
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 
 check "subst negated"         'v=abc123; echo "${v//[^0-9]/}"'
@@ -34,5 +31,4 @@ check "caret literal"         'v=a^bc; echo "${v//[a^b]/}"'
 check "non-negated class"     'v=abc123; echo "${v//[0-9]/}"'
 check "pathname negated"      'd=$(mktemp -d); touch "$d"/afile "$d"/bfile "$d"/cfile; cd "$d"; echo [^a]file; rm -rf "$d"'
 
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary

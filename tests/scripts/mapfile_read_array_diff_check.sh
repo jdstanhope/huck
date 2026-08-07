@@ -3,15 +3,12 @@
 # Each fragment runs via `-c` with a here-string (so read/mapfile stay in the
 # main shell — a pipe would subshell both identically). stdout + rc compared.
 set -u
-HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
-[[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
-PASS=0; FAIL=0
+. "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 check() {
     local label="$1" frag="$2" b h
     b=$(bash -c "$frag" 2>&1; echo "rc=$?")
     h=$("$HUCK_BIN" -c "$frag" 2>&1; echo "rc=$?")
-    if [[ "$b" == "$h" ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
-    else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
+    compare "$label" "$b" "$h"
 }
 check "read -a basic"     'read -a arr <<< "a b c"; echo "${arr[*]}|${#arr[@]}"'
 check "read -a IFS"       'IFS=: read -a arr <<< "a:b:c"; echo "${arr[*]}|${#arr[@]}"'
@@ -25,5 +22,4 @@ check "mapfile -d"        'mapfile -d : -t arr <<< "a:b:c"; echo "${#arr[@]}|${a
 check "mapfile -O"        'mapfile -O 2 -t arr <<< $'"'"'x\ny'"'"'; echo "${!arr[*]}|${arr[*]}"'
 check "readarray synonym" 'readarray -t arr <<< $'"'"'p\nq'"'"'; echo "${arr[*]}"'
 check "mapfile default"   'mapfile -t <<< $'"'"'a\nb'"'"'; echo "${MAPFILE[*]}"'
-echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
-exit $(( FAIL > 0 ? 1 : 0 ))
+harness_summary
