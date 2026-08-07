@@ -1,0 +1,146 @@
+---
+title: "Who decides when a shell should die"
+date: 2026-08-06
+summary: "huck had two dozen places each deciding, alone, whether an error should kill the shell. The results weren't inconsistent so much as uncorrelated with bash — wrong in both directions, sometimes in adjacent lines."
+tags: ["errors", "posix", "architecture", "bugfix"]
+version: "v358"
+draft: false
+---
+
+When a shell hits an error it has three choices: carry on, abandon the rest of
+the current command list, or exit. Which one — and with what exit code —
+depends on the error, on POSIX mode, and on how the shell was started.
+
+huck answered that question in about two dozen different places, each deciding
+alone. The interesting thing isn't that they disagreed with bash. It's that
+they disagreed in *both directions*, sometimes a few lines apart:
+
+```bash
+# huck exited where bash carried on
+$ huck -c 'echo `echo a; ; echo b`; echo after'
+(nothing — shell dead)
+
+# huck carried on where bash gave up
+$ huck -c 'history 1 2 3
+echo NEXT'
+NEXT
+```
+
+A bug cluster that errs in only one direction usually means a rule is too
+strict or too loose. One that errs in both means nobody owns the rule.
+
+## The exit code isn't about the error
+
+The clearest evidence came from measuring exit codes, which turned out not to
+depend on the error at all:
+
+```bash
+# before
+$ huck script.sh; echo $?     # set -o posix; echo $((1/0))
+127
+
+# after
+$ huck script.sh; echo $?
+1
+```
+
+bash exits **1** there from a script and **127** under `-c`. The same rule
+applies to `set -u`, to readonly assignments, to every fatal expansion error:
+the *kind* decides a base code, and the `-c` driver replaces it with 127.
+
+huck had this half-right twice, in opposite directions. Four sites hardcoded
+127 and eleven hardcoded 1, so whichever you hit, the other family's answer was
+the one you got. Both constants are now gone; there is one function that
+derives the code, and it reads a field the shell already had.
+
+## Some rules only look wrong
+
+Three measured rules read like bugs and are not, so each got a test rather than
+a comment — a future reader will absolutely want to "fix" them.
+
+A plain syntax error keeps exit code 2 under `-c`, even though every other
+fatal error becomes 127 there, because bash rejects it before execution starts.
+An invalid option to a special builtin exits 2 under *every* driver, taking no
+substitution at all. And `history` with too many arguments — the only builtin
+error in bash that abandons the command list, out of fifteen measured — changes
+its *outcome* by driver, not just its code:
+
+```bash
+# before
+$ huck -c 'history 1 2 3
+echo NEXT'; echo "rc=$?"
+NEXT
+rc=0
+
+# after
+$ huck -c 'history 1 2 3
+echo NEXT'; echo "rc=$?"
+huck: line 1: history: too many arguments
+rc=1
+```
+
+Under `-c` it ends the whole program. From a script, the identical error
+abandons one list and carries on. Its neighbours don't do that. I would not
+have guessed any of this, which is rather the point of measuring.
+
+Two more fell out along the way. `set -Q` used to claim it was "not yet
+supported in this version" — a rejection dressed as a gap:
+
+```bash
+# before
+$ huck -c 'set -o posix
+set -Q
+echo NEXT'; echo "rc=$?"
+huck: line 2: set: -Q: not yet supported in this version
+NEXT
+rc=0
+
+# after
+$ huck -c 'set -o posix
+set -Q
+echo NEXT'; echo "rc=$?"
+huck: line 2: set: -Q: invalid option
+set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]
+rc=2
+```
+
+And a readonly assignment used as a *prefix* turned out to be far less fatal
+than one standing alone — huck killed the shell where bash just skips the line:
+
+```bash
+# before                                    # after
+$ huck script.sh                            $ huck script.sh
+script.sh: line 3: r: readonly variable     script.sh: line 3: r: readonly variable
+(shell dead, rc 1)                          NEXT
+                                            (rc 0)
+```
+
+## The part that makes it stick
+
+The decision now lives in one function, and the two ways of raising it are no
+longer public. A site that wants to decide for itself gets a compiler error
+instead of quietly adding the next divergence. That's the same trick that made
+an earlier fix stick: when the wrong thing can't be written, it stops coming
+back.
+
+It also drew a boundary worth knowing. Two of the issues this was meant to
+close turned out not to be fatality bugs at all. huck rejects `${x[}` and a
+malformed backtick body while *parsing*, where bash discovers them while
+*expanding* — so no fatality decision is ever reached. The test is whether the
+command before the error runs:
+
+```bash
+$ bash -c 'echo BEFORE; echo ${x[}; echo AFTER'
+BEFORE
+bash: line 1: ${x[}: bad substitution
+
+$ huck -c 'echo BEFORE; echo ${x[}; echo AFTER'
+huck: -c: line 1: unexpected EOF while looking for matching `}'
+```
+
+bash got one command in and then complained about a substitution. huck never
+started, and complained about the syntax. That's a front-end issue wearing a
+fatality costume, and it's now tracked as its own thing —
+[#493](https://github.com/jdstanhope/huck/issues/493) — along with
+[#494](https://github.com/jdstanhope/huck/issues/494), the last two sites that
+still raise fatality without going through the front door.

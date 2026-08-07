@@ -1554,7 +1554,10 @@ fn posix_readonly_for_var_is_fatal() {
         "set -o posix\nreadonly i=1\nfor i in a b; do :; done\n",
         &mut shell,
     );
-    assert_eq!(shell.fatal_status(), Some(127));
+    // v358 (#198): 1, not 127. `Shell::new()` is the script/stdin driver;
+    // measured `bash script.sh` with this body exits 1. The 127 came from a
+    // `posix_fatal(127)` constant that was only ever right under `-c`.
+    assert_eq!(shell.fatal_status(), Some(1));
 }
 #[test]
 fn default_readonly_for_var_is_not_fatal() {
@@ -1566,22 +1569,33 @@ fn default_readonly_for_var_is_not_fatal() {
 fn posix_assignment_no_command_is_fatal() {
     let mut shell = Shell::new();
     exec_script("set -o posix\nreadonly x=1\nx=2\n", &mut shell);
-    assert_eq!(shell.fatal_status(), Some(127));
+    // v358 (#198): 1, not 127 — see the note in
+    // `expand::tests::expand_arith_error_is_posix_fatal`. `Shell::new()` is
+    // the script/stdin driver, where bash exits 1.
+    assert_eq!(shell.fatal_status(), Some(1));
 }
 #[test]
 fn posix_assignment_before_special_is_fatal() {
     let mut shell = Shell::new();
     exec_script("set -o posix\nreadonly x=1\nx=2 export y\n", &mut shell);
-    assert_eq!(shell.fatal_status(), Some(127));
+    // v358 (#198): 1, not 127 — same hardcoded constant, same driver reason.
+    assert_eq!(shell.fatal_status(), Some(1));
 }
 #[test]
-fn posix_readonly_prefix_before_regular_is_fatal() {
-    // #234/#203: bash --posix EXITS (non-interactively) on a readonly-variable
-    // prefix assignment error before ANY command — regular ones too, not just
-    // special builtins. Default mode runs the command instead (tested above).
+fn posix_readonly_prefix_before_regular_abandons_the_list() {
+    // ⚠️ RENAMED AND RE-MEASURED in v358 (#198). The old name and assertion
+    // said bash EXITS here. It does not: `set -o posix; readonly r=1;
+    // r=2 true; echo SAME` / `echo NEXT` prints NEXT and exits 0 — the list is
+    // abandoned, the shell survives. A STANDALONE `r=2` in posix does exit,
+    // which is presumably where the original claim came from; the command
+    // PREFIX is the distinction, and it now has its own `ErrorKind`.
     let mut shell = Shell::new();
     exec_script("set -o posix\nreadonly x=1\nx=2 true\n", &mut shell);
-    assert_eq!(shell.fatal_status(), Some(1));
+    // Only the fatal slot is asserted: the discard is CONSUMED during
+    // execution (converted to `Interrupted(DiscardCommand)` at the executor's
+    // checkpoint), so it is already cleared by the time the script returns.
+    // The end-to-end behaviour is pinned by error_fatality_diff_check.sh.
+    assert_eq!(shell.fatal_status(), None);
 }
 #[test]
 fn default_assignment_no_command_is_not_fatal() {

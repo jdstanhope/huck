@@ -826,7 +826,8 @@ pub struct Shell {
     pub unwind: Unwind,
     /// Set by a POSIX special builtin when it hits a usage / bad-option /
     /// bad-assignment error (NOT a runtime error). Consumed by the executor's
-    /// bare special-builtin dispatch to fire `posix_fatal`. Cleared per command.
+    /// bare special-builtin dispatch, which classifies it as
+    /// `ErrorKind::SpecialBuiltinUsage`. Cleared per command.
     pub builtin_usage_error: Option<i32>,
     /// True if stdin was a TTY at startup. Determines whether fatal PE
     /// errors exit the shell or just return to the prompt.
@@ -3298,9 +3299,19 @@ impl Shell {
         self.xtrace_assign_rhs.take()
     }
 
-    /// Returns and clears the pending fatal-PE-error flag.
-    /// Records a fatal expansion error's exit status.
-    pub fn raise_fatal(&mut self, n: i32) {
+    /// Records a fatal error's exit status.
+    ///
+    /// The only non-test callers are `report_error` and the two documented
+    /// `ExpansionResult::Fatal` bridges in `expand.rs`, which defer to a
+    /// classification the producing arm already made. Closing that last gap
+    /// means carrying `ErrorKind` through `ExpansionResult` — tracked as #494.
+    ///
+    /// ⚠️ v358 (#198): NOT `pub`. Fatality is decided in exactly one place —
+    /// `error_fatality::fatality` — and reached through `report_error`. The
+    /// visibility IS the enforcement, the same mechanism that made v356's
+    /// `Suppression` fix stick: a site that wants to decide for itself gets a
+    /// compile error instead of quietly adding the next divergence.
+    pub(crate) fn raise_fatal(&mut self, n: i32) {
         self.unwind.fatal = Some(n);
     }
 
@@ -3324,11 +3335,28 @@ impl Shell {
         self.unwind.fatal = None;
     }
 
-    /// Returns and clears the pending arithmetic-discard flag (v312 #3/#49).
     /// Marks the current command for discard (v312 #3/#31): it unwinds out of
     /// loops and functions with status 1, but the shell does NOT exit.
-    pub fn raise_discard(&mut self) {
+    ///
+    /// ⚠️ v358 (#198): NOT `pub` — see the note on `raise_fatal`.
+    pub(crate) fn raise_discard(&mut self) {
         self.unwind.discard = true;
+    }
+
+    /// Classify an error and raise whatever unwind it deserves.
+    ///
+    /// v358 (#198): the ONLY public way to make an error fatal. Before this,
+    /// two dozen sites each answered "is this fatal, and with what code"
+    /// alone, and the answers were not merely inconsistent — they were
+    /// uncorrelated with bash, wrong in both directions at once. The decision
+    /// itself lives in `error_fatality::fatality`; this method only carries
+    /// out the verdict on the existing v354 unwind.
+    pub fn report_error(&mut self, kind: crate::error_fatality::ErrorKind) {
+        match crate::error_fatality::fatality(kind, self) {
+            crate::error_fatality::Fatality::Continue => {}
+            crate::error_fatality::Fatality::AbortList => self.raise_discard(),
+            crate::error_fatality::Fatality::ExitShell(n) => self.raise_fatal(n),
+        }
     }
 
     /// True when the current command is marked for discard. Does not consume.
@@ -3392,14 +3420,6 @@ impl Shell {
     /// path — AFTER the EXIT trap has had its chance to overwrite it.
     pub fn take_exit(&mut self) -> Option<i32> {
         self.unwind.exit.take()
-    }
-
-    /// Mark a POSIX-mode fatal error: a non-interactive posix shell exits with
-    /// `status`. No-op in default mode or interactively (matches bash).
-    pub fn posix_fatal(&mut self, status: i32) {
-        if self.shell_options.posix && !self.is_interactive {
-            self.raise_fatal(status);
-        }
     }
 
     /// Iterates only the exported variables, suitable for passing to a child

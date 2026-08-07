@@ -26,6 +26,9 @@ pub(crate) mod cwd_scope;
 pub mod engine;
 pub(crate) mod err_thread_local;
 pub mod error_emit;
+/// v358 (#198): the single owner of the "is this error fatal, and with what
+/// code" decision. See the module docs for why two of its rules look wrong.
+pub(crate) mod error_fatality;
 pub mod exec_builder;
 pub(crate) mod exec_guard;
 pub(crate) mod executor;

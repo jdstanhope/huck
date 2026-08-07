@@ -977,13 +977,17 @@ fn expand_arith_part_division_by_zero_raises_discard() {
 }
 
 #[test]
-fn expand_arith_error_is_posix_fatal() {
+fn expand_arith_error_exits_in_posix() {
     let mut shell = Shell::new();
     shell.shell_options.posix = true;
     shell.is_interactive = false;
     let word = Word(vec![arith_part("1 + ")]);
     let _ = expand(&word, &mut shell);
-    assert_eq!(shell.fatal_status(), Some(127));
+    // v358 (#198): 1, not 127. `Shell::new()` leaves `is_command_string`
+    // false — the script/stdin driver, where bash exits 1. The old 127 was a
+    // constant hardcoded at the site and was only ever right under `-c`.
+    // Measured: `bash script.sh` with `set -o posix; echo $((1/0))` exits 1.
+    assert_eq!(shell.fatal_status(), Some(1));
 }
 
 #[test]

@@ -6176,6 +6176,13 @@ fn builtin_history(
             }
             Ok(_) if rest.len() > 1 => {
                 crate::sh_error_to!(shell, err, None, "history: too many arguments");
+                // v358 (#116): the ONLY builtin error in bash that abandons the
+                // rest of the command list. Measured across 15 cases — `cd -Q`,
+                // `kill -Q`, `read -Q`, `getopts`, `umask a b`, `history a`,
+                // `history -Q`, and even the special builtins `shift a b` and
+                // `break 1 2` all continue. Hence its own ErrorKind rather than
+                // a general "builtin usage" rule fitted to one data point.
+                shell.report_error(crate::error_fatality::ErrorKind::HistoryTooManyArgs);
                 ExecOutcome::Continue(1)
             }
             Ok(n) => {
@@ -7064,13 +7071,28 @@ fn builtin_set_inner(
                         }
                     }
                     other => {
+                        // v358 (#68): bash reports an unknown `set` flag as an
+                        // INVALID OPTION with its usage line, not as something
+                        // huck has yet to implement — and, `set` being a POSIX
+                        // special builtin, a usage error is fatal to a
+                        // non-interactive shell in POSIX mode. Both halves were
+                        // wrong: the message claimed a gap that is really a
+                        // rejection, and the shell carried on where bash exits.
                         crate::sh_error_to!(
                             shell,
                             err,
                             None,
-                            "set: -{}: not yet supported in this version",
+                            "set: -{}: invalid option",
                             other as char
                         );
+                        let _ = writeln!(
+                            err,
+                            "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]"
+                        );
+                        shell.builtin_usage_error = Some(2);
+                        shell.report_error(crate::error_fatality::ErrorKind::SpecialBuiltinUsage {
+                            status: 2,
+                        });
                         return ExecOutcome::Continue(2);
                     }
                 }
@@ -7133,13 +7155,28 @@ fn builtin_set_inner(
                         }
                     }
                     other => {
+                        // v358 (#68): bash reports an unknown `set` flag as an
+                        // INVALID OPTION with its usage line, not as something
+                        // huck has yet to implement — and, `set` being a POSIX
+                        // special builtin, a usage error is fatal to a
+                        // non-interactive shell in POSIX mode. Both halves were
+                        // wrong: the message claimed a gap that is really a
+                        // rejection, and the shell carried on where bash exits.
                         crate::sh_error_to!(
                             shell,
                             err,
                             None,
-                            "set: +{}: not yet supported in this version",
+                            "set: +{}: invalid option",
                             other as char
                         );
+                        let _ = writeln!(
+                            err,
+                            "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]"
+                        );
+                        shell.builtin_usage_error = Some(2);
+                        shell.report_error(crate::error_fatality::ErrorKind::SpecialBuiltinUsage {
+                            status: 2,
+                        });
                         return ExecOutcome::Continue(2);
                     }
                 }
@@ -8066,7 +8103,8 @@ pub(crate) fn source_in_sink(args: &[String], invoked: &str, shell: &mut Shell) 
                 "{invoked}: usage: {invoked} filename [arguments]"
             );
             // POSIX case #1: missing-filename usage error (the not-found case at
-            // resolve_source_path below was Task 2 and stays posix_fatal(1)).
+            // resolve_source_path below is `SpecialBuiltinOperand`: exits 1
+            // in posix under every driver, no `-c` substitution).
             shell.builtin_usage_error = Some(2);
             return ExecOutcome::Continue(2);
         }
@@ -8097,7 +8135,7 @@ pub(crate) fn source_in_sink(args: &[String], invoked: &str, shell: &mut Shell) 
                     "{filename}: No such file or directory"
                 );
             }
-            shell.posix_fatal(1);
+            shell.report_error(crate::error_fatality::ErrorKind::SpecialBuiltinOperand);
             return ExecOutcome::Continue(1);
         }
     };
