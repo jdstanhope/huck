@@ -317,7 +317,7 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
             // scan arm) distinguishes this from an ordinary already-accumulated
             // word (`x<(y)`), which keeps the break above.
             Some(TokenKind::ProcSubOpen { .. })
-                if !(parts.is_empty() && acc.is_none()) && !in_assign =>
+                if !(in_assign || parts.is_empty() && acc.is_none()) =>
             {
                 break;
             }
@@ -825,10 +825,10 @@ fn push_lit(acc: &mut Option<(String, bool)>, out: &mut Vec<WordPart>, text: Str
 /// Pushes a single `WordPart::Literal` only if the chunk is non-empty — the
 /// oracle never emits an empty `Literal`, so an empty chunk is dropped.
 fn flush_lit(acc: &mut Option<(String, bool)>, out: &mut Vec<WordPart>) {
-    if let Some((text, quoted)) = acc.take() {
-        if !text.is_empty() {
-            out.push(WordPart::Literal { text, quoted });
-        }
+    if let Some((text, quoted)) = acc.take()
+        && !text.is_empty()
+    {
+        out.push(WordPart::Literal { text, quoted });
     }
 }
 
@@ -4144,10 +4144,10 @@ fn fill_redirects(redirects: &mut [Redirection], bodies: &mut impl Iterator<Item
             RedirOp::Move { source, .. } => fill_word(source, bodies),
             RedirOp::Close => {}
             RedirOp::Heredoc { body, .. } => {
-                if body.0.is_empty() {
-                    if let Some(next) = bodies.next() {
-                        *body = next;
-                    }
+                if body.0.is_empty()
+                    && let Some(next) = bodies.next()
+                {
+                    *body = next;
                 }
             }
             RedirOp::HereString(word) => fill_word(word, bodies),

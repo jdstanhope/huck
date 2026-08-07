@@ -1712,11 +1712,8 @@ mod tests {
         std::env::set_current_dir(prev).unwrap();
     }
 
-    fn map(line: &str) -> Vec<Candidate> {
-        let mut sh = Shell::new();
-        let cur = huck_syntax::parse_recover(line).cursor;
-        cursor_to_completion(&cur, line, line.len(), &mut sh).1
-    }
+    // (`map` — the `cursor_to_completion` helper — went with
+    // `mapper_command_position_yields_commands` when it moved out; see below.)
 
     // `mapper_command_position_yields_commands` lives in
     // `tests/completion_path_scan_serial.rs` (#458): it walks every `$PATH`

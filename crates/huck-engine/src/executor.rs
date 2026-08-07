@@ -3535,10 +3535,10 @@ fn heredoc_body_to_fd(bytes: &[u8], tmpdir: Option<&str>) -> Result<RawFd, io::E
     // safe only where a pipe holds 64KB. On macOS pipes start at 16KB, so that
     // same code has nothing to stop it wedging — we degrade to a temp file
     // instead of inheriting the hang (cf. #97, already a macOS-only hang).
-    if bytes.len() <= HEREDOC_PIPESIZE {
-        if let Some(fd) = heredoc_body_to_pipe(bytes) {
-            return Ok(fd);
-        }
+    if bytes.len() <= HEREDOC_PIPESIZE
+        && let Some(fd) = heredoc_body_to_pipe(bytes)
+    {
+        return Ok(fd);
     }
     heredoc_body_to_file(bytes, tmpdir)
 }
@@ -3596,10 +3596,10 @@ fn heredoc_body_to_pipe(bytes: &[u8]) -> Option<RawFd> {
 /// unusable `TMPDIR`.
 fn heredoc_body_to_file(bytes: &[u8], tmpdir: Option<&str>) -> Result<RawFd, io::Error> {
     let mut candidates: Vec<&str> = Vec::new();
-    if let Some(d) = tmpdir {
-        if !d.is_empty() {
-            candidates.push(d);
-        }
+    if let Some(d) = tmpdir
+        && !d.is_empty()
+    {
+        candidates.push(d);
     }
     if !candidates.contains(&"/tmp") {
         candidates.push("/tmp");
@@ -4122,10 +4122,10 @@ fn array_literal_elements(w: &crate::lexer::Word) -> Option<&[crate::lexer::Arra
 /// since `base`. Drains from the end so nested realizations are handled in reverse.
 fn drain_procsubs(shell: &mut Shell, base: usize) {
     while shell.procsub_pending.len() > base {
-        if let Some(ps) = shell.procsub_pending.pop() {
-            if let Some((pid, code)) = crate::procsub::cleanup(ps) {
-                shell.jobs.record_terminal_status(pid, code);
-            }
+        if let Some(ps) = shell.procsub_pending.pop()
+            && let Some((pid, code)) = crate::procsub::cleanup(ps)
+        {
+            shell.jobs.record_terminal_status(pid, code);
         }
     }
 }
@@ -5563,9 +5563,7 @@ fn lower_one_redirect(
                 // raw source word (`>&$v` -> `$v: Bad file descriptor`); a numeric
                 // literal (`>&9`) reconstructs back to its own number, unchanged.
                 let label = crate::expand::reconstruct_word_source(source);
-                if let Err(code) = validate_source(src, fd_state.as_deref(), shell, &label) {
-                    return Err(code);
-                }
+                validate_source(src, fd_state.as_deref(), shell, &label)?;
                 ops.push(PlanOp::InstallDup {
                     target,
                     source: src,
@@ -5629,7 +5627,7 @@ fn lower_one_redirect(
                         target,
                         source: owned,
                     });
-                    if let Some(st) = fd_state.as_deref_mut() {
+                    if let Some(st) = fd_state {
                         st.insert(target, true);
                     }
                 }
@@ -5668,10 +5666,10 @@ fn lower_redirects(redirects: &[Redirection], shell: &mut Shell) -> Result<Redir
     // (its pre-command value); restore LIFO.
     let mut var_snaps: Vec<(String, Option<crate::shell_state::Variable>)> = Vec::new();
     for redir in redirects {
-        if let RedirFd::Var(name) = &redir.fd {
-            if !var_snaps.iter().any(|(n, _)| n == name) {
-                var_snaps.push((name.clone(), shell.snapshot_var(name)));
-            }
+        if let RedirFd::Var(name) = &redir.fd
+            && !var_snaps.iter().any(|(n, _)| n == name)
+        {
+            var_snaps.push((name.clone(), shell.snapshot_var(name)));
         }
     }
     let restore = |shell: &mut Shell,
@@ -5904,7 +5902,7 @@ fn run_subprocess(
                 pid: pid as libc::pid_t,
             };
 
-            let outcome = if interactive {
+            if interactive {
                 // Race-close: also setpgid in the parent so the child's pgrp
                 // is guaranteed to exist before we call tcsetpgrp.
                 setpgid_self(pid);
@@ -6010,8 +6008,7 @@ fn run_subprocess(
                         ExecOutcome::Continue(1)
                     }
                 }
-            };
-            outcome
+            }
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
             // bash format: `<src>: line N: <name>: command not found` (the name
@@ -6372,9 +6369,7 @@ fn spawn_pipeline(
         // pipeline stage, in stage order — its action's output must reach the
         // terminal, not the pipe, so this must run here (before any fork
         // below), not inside the forked child. Decision ignored (#262).
-        if let Err(o) = debug_trap_gate(shell) {
-            return Err(o);
-        }
+        debug_trap_gate(shell)?;
 
         // ---- Assign-only stages: no-op, just pass stdin through as empty ----
         // Skipped under `is_last && lastpipe`: falling through lets the

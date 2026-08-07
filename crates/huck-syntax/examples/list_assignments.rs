@@ -30,7 +30,7 @@ fn main() {
     }
     for a in assigns {
         let op = if a.append { "+=" } else { "=" };
-        println!("{}{}{}", a.target.name(), op, "…");
+        println!("{}{}…", a.target.name(), op);
     }
 
     // Self-contained-surface check: these types are all nameable from the crate

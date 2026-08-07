@@ -33,6 +33,18 @@ jobs:
       - name: Show bash version (compat target is 5.2.21)
         run: bash --version | head -1
 
+      # PINNED, and installed FIRST so the floating `stable` below wins the
+      # rustup default — build/test keep tracking the newest compiler while the
+      # lint gate stays deterministic. Clippy gains lints on almost every
+      # release, so a floating `-D warnings` reds the build on a schedule
+      # nobody chose (#497 hit exactly this: 1.95 locally vs 1.97 in CI).
+      # Bumping this version is a deliberate one-line PR.
+      - name: Install pinned clippy toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: clippy
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -43,6 +55,11 @@ jobs:
 
       - name: Formatting (cargo fmt --check)
         run: cargo fmt --all --check
+
+      - name: Lint (cargo clippy -D warnings)
+        # --all-targets so test code is gated too: the 79 warnings this step was
+        # added to clear (#497) were split roughly 5:1 between lib and tests.
+        run: cargo +1.97.1 clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build (workspace)
         run: cargo build --workspace --locked --verbose

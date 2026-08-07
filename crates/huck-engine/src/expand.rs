@@ -1151,6 +1151,11 @@ fn expand_array_param(
 /// (`${x:+ ""}`'s operand is the literal " " followed by a quoted-empty
 /// `""` — the space is a real field separator, matching bash even under a
 /// custom non-whitespace `IFS`).
+// Nine parameters because a part expands against the full surrounding state
+// (the in-progress field, the emitted-field list, the quoting/splitting flags).
+// Grouping them into a context struct is a real refactor of the expansion core,
+// not a signature tweak — deliberately out of scope here.
+#[allow(clippy::too_many_arguments)]
 fn expand_part(
     part: &WordPart,
     current: &mut Field,
@@ -1348,12 +1353,12 @@ fn expand_part(
             if matches!(modifier, crate::lexer::ParamModifier::None)
                 && subscript.is_none()
                 && !*indirect
+                && shell.lookup_var(name).is_none()
+                && shell.shell_options.nounset
             {
-                if shell.lookup_var(name).is_none() && shell.shell_options.nounset {
-                    crate::sh_error!(shell, None, "{name}: unbound variable");
-                    shell.report_error(crate::error_fatality::ErrorKind::UnsetUnderNounset);
-                    return ControlFlow::Break(());
-                }
+                crate::sh_error!(shell, None, "{name}: unbound variable");
+                shell.report_error(crate::error_fatality::ErrorKind::UnsetUnderNounset);
+                return ControlFlow::Break(());
             }
             // Substring on `$@` / `$*` is array-shaped (closes v33's
             // `${@:o:l}` deferral) — route through the shared
@@ -2212,10 +2217,10 @@ fn expand_word_with_quote_escape(
         // A BadSubst part errors with bash's whole-word message; intercept here
         // (with the outer `word`) before delegating per-part to expand_assignment,
         // which would otherwise only see the single-part sub-word.
-        if let WordPart::ParamExpansion { modifier, .. } = part {
-            if emit_bad_subst(modifier, word, shell) {
-                return result;
-            }
+        if let WordPart::ParamExpansion { modifier, .. } = part
+            && emit_bad_subst(modifier, word, shell)
+        {
+            return result;
         }
         let text = if matches!(part, WordPart::LastStatus { .. }) {
             snapshot_status.to_string()

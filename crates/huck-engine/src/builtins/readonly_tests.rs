@@ -341,7 +341,7 @@ fn readonly_quoted_scalar_assignment_is_an_assignment() {
     let mut s = Shell::new();
     let outcome = run(&mut s, "readonly 'x=hi'");
     assert!(matches!(outcome, ExecOutcome::Continue(0)));
-    assert_eq!(s.get("x").as_deref(), Some("hi"));
+    assert_eq!(s.get("x"), Some("hi"));
     assert!(s.is_readonly("x"));
 }
 
@@ -356,7 +356,7 @@ fn quoted_name_plus_eq_value_is_append_assignment() {
         run(&mut s, "readonly 'y+=cd'"),
         ExecOutcome::Continue(0)
     ));
-    assert_eq!(s.get("y").as_deref(), Some("abcd"));
+    assert_eq!(s.get("y"), Some("abcd"));
     assert!(s.is_readonly("y"));
     // Unset name: append to empty = the value.
     let mut s2 = Shell::new();
@@ -364,7 +364,7 @@ fn quoted_name_plus_eq_value_is_append_assignment() {
         run(&mut s2, "declare 'z+=q'"),
         ExecOutcome::Continue(0)
     ));
-    assert_eq!(s2.get("z").as_deref(), Some("q"));
+    assert_eq!(s2.get("z"), Some("q"));
     // KEEP: an empty name (`+=v`) is not a valid identifier → error, exit 1.
     let mut s3 = Shell::new();
     assert!(matches!(

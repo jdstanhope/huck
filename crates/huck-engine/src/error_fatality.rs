@@ -53,6 +53,14 @@ pub(crate) enum ErrorKind {
     /// abandons the list — and exits in posix.
     ReadonlyForVar,
     /// Any other builtin error. Measured: ALWAYS continues.
+    ///
+    /// Deliberately unconstructed: `Continue` is the no-op verdict, so the ~360
+    /// emit-only builtin sites reach it by simply not calling `report_error` at
+    /// all. Kept because it names the measured default and
+    /// `ordinary_builtin_errors_always_continue` pins it — a new builtin error
+    /// site that DOES want to route through the classifier has an obvious,
+    /// tested kind to reach for.
+    #[allow(dead_code)]
     BuiltinError,
     /// `history` with too many arguments — the only builtin error in bash that
     /// abandons the command list. It gets its own kind because a general rule

@@ -19,6 +19,9 @@
 //! In non-test builds the whole thing is a set of `#[inline] -> false` no-ops,
 //! so the writer hooks compile out to a direct real-fd write.
 
+// `inner` is a cfg(test) IMPLEMENTATION module, not a module of tests: the
+// `#[cfg(not(test))]` no-ops below are its counterpart and must follow it.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod inner {
     use std::cell::RefCell;

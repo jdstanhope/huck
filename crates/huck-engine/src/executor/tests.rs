@@ -1969,12 +1969,12 @@ fn classify_runnability_bare_executable_later_in_path_wins() {
         let mut f = std::fs::File::create(d1.join("foo")).unwrap();
         writeln!(f, "#x").unwrap();
     }
-    std::fs::set_permissions(&d1.join("foo"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(d1.join("foo"), std::fs::Permissions::from_mode(0o644)).unwrap();
     {
         let mut f = std::fs::File::create(d2.join("foo")).unwrap();
         writeln!(f, "#!/bin/sh\n").unwrap();
     }
-    std::fs::set_permissions(&d2.join("foo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(d2.join("foo"), std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut shell = Shell::new();
     shell.set("PATH", format!("{}:{}", d1.display(), d2.display()));
     assert!(matches!(
