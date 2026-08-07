@@ -187,8 +187,12 @@ wait, branch from `main` and cherry-pick.
   4.7 through v136, 4.8 from v137.)
 - **Formatting**: run `cargo fmt --all` before committing — CI enforces
   `cargo fmt --all --check`, so an unformatted tree fails the build.
-- **CI**: `.github/workflows/ci.yml` runs fmt-check + `cargo build`/`cargo test`
-  (`--workspace --locked`) on every push and every PR to `main`, on
+- **Linting**: CI runs `cargo clippy --workspace --all-targets --locked --
+  -D warnings` (#497), so ONE new warning — in production or test code — fails
+  the build. Run it before pushing. Where a lint is wrong for the code, add a
+  narrow `#[allow(...)]` with a comment saying why, not a crate-level allow.
+- **CI**: `.github/workflows/ci.yml` runs fmt-check + clippy + `cargo build`/
+  `cargo test` (`--workspace --locked`) on every push and every PR to `main`, on
   `ubuntu-24.04` (bash 5.2.21, huck's compat target).
 - **Bash-diff harnesses** under `tests/scripts/*_diff_check.sh` run
   the same fragments through bash and huck and assert byte-identical

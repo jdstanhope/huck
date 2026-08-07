@@ -110,7 +110,7 @@ pub(crate) fn emit_syntax_error_ex(
         let _ = err.write_fmt(body);
         let _ = err.write_all(b"\n");
         if let Some(src) = echo {
-            let _ = write!(err, "{prefix}`{src}'\n");
+            let _ = writeln!(err, "{prefix}`{src}'");
         }
     });
 }

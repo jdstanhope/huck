@@ -1487,13 +1487,14 @@ impl<'a> Lexer<'a> {
 
     /// Byte offset of the leading `$` of the innermost `${` currently open.
     pub(crate) fn param_start_off(&self) -> usize {
-        match self.modes.iter().rev().find_map(|m| match m {
-            Mode::ParamExpansion { start_off, .. } => Some(*start_off),
-            _ => None,
-        }) {
-            Some(off) => off,
-            None => 0,
-        }
+        self.modes
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                Mode::ParamExpansion { start_off, .. } => Some(*start_off),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     /// True when the top-of-stack mode is a `${…}` operand scanner currently
@@ -1739,9 +1740,10 @@ impl<'a> Lexer<'a> {
         // `$HO`/`${HO`) with an empty `word`, rather than reporting the literal
         // `"$"` text as an `Argument` word.
         let trailing_lone_dollar = rightmost_is_unquoted_dollar_lit && pieces.len() == 1;
-        let (mut word, mut word_start) = if trailing_lone_dollar {
-            (String::new(), end)
-        } else if pieces.is_empty() {
+        // `pieces.is_empty()` lands on the same empty-word-at-`end` capture for a
+        // different reason (nothing was accumulated at all), so the two share an
+        // arm rather than spelling the identical result twice.
+        let (mut word, mut word_start) = if trailing_lone_dollar || pieces.is_empty() {
             (String::new(), end)
         } else if last_is_dollar_name {
             // #248 whole-branch review: the rightmost atom is a bare `$name`. Its
@@ -2684,14 +2686,14 @@ impl<'a> Lexer<'a> {
     /// the mode stack.  Called after all cursor borrows are released to avoid
     /// borrow-checker conflicts (mirrors the `seen_name` write-back pattern from T2).
     fn set_operand_in_dquote(&mut self, val: bool) {
-        match self.modes.last_mut() {
-            Some(
-                Mode::ParamWordOperand { in_dquote, .. }
-                | Mode::ParamSubstPatternOperand { in_dquote, .. }
-                | Mode::ParamSubstringOffsetOperand { in_dquote, .. }
-                | Mode::ParamSubscriptOperand { in_dquote, .. },
-            ) => *in_dquote = val,
-            _ => {}
+        if let Some(
+            Mode::ParamWordOperand { in_dquote, .. }
+            | Mode::ParamSubstPatternOperand { in_dquote, .. }
+            | Mode::ParamSubstringOffsetOperand { in_dquote, .. }
+            | Mode::ParamSubscriptOperand { in_dquote, .. },
+        ) = self.modes.last_mut()
+        {
+            *in_dquote = val
         }
     }
 
@@ -2741,14 +2743,14 @@ impl<'a> Lexer<'a> {
         if in_dquote {
             // ── Inside a double-quoted span ───────────────────────────────────
             match self.cursor.peek().copied() {
-                None => return Err(LexError::UnterminatedQuote { double: true }),
+                None => Err(LexError::UnterminatedQuote { double: true }),
 
                 // Closing `"` — flip frame back to unquoted; no token emitted this call.
                 // Returning `Step::Produced` is safe: the cursor advanced, so no spin.
                 Some('"') => {
                     self.cursor.next();
                     self.set_operand_in_dquote(false);
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
 
                 // Backslash: special only before `$`, `` ` ``, `"`, `\` inside `"…"`.
@@ -2796,7 +2798,7 @@ impl<'a> Lexer<'a> {
                             ));
                         }
                     }
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
 
                 // Backtick command substitution — emit BeginBacktick SIGNAL without consuming `` ` ``.
@@ -2807,7 +2809,7 @@ impl<'a> Lexer<'a> {
                 Some('`') => {
                     self.history
                         .push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
 
                 // `$` — nested expansion inside `"…"`.
@@ -2887,7 +2889,7 @@ impl<'a> Lexer<'a> {
                             ));
                         }
                     }
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
 
                 // Literal run inside `"…"`: `}`, `/`, `:`, `]` etc. are NOT terminators.
@@ -2905,14 +2907,14 @@ impl<'a> Lexer<'a> {
                         TokenKind::Lit { text, quoted: true },
                         Span::new(off, l, c),
                     ));
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
             }
         } else {
             // ── Outside double-quoted span ────────────────────────────────────
             match self.cursor.peek().copied() {
                 // EOF inside an operand — the enclosing `${…}` is unterminated.
-                None => return Err(LexError::UnterminatedBrace),
+                None => Err(LexError::UnterminatedBrace),
 
                 // Unquoted `end` char (`}` or `]`) — emit the matching close atom.
                 Some(ch) if ch == end => {
@@ -2923,7 +2925,7 @@ impl<'a> Lexer<'a> {
                         TokenKind::RBracket
                     };
                     self.history.push(Token::new(kind, Span::new(off, l, c)));
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
 
                 // Unquoted separator char (`/` or `:`) — emit ParamSep.
@@ -2931,7 +2933,7 @@ impl<'a> Lexer<'a> {
                     self.cursor.next();
                     self.history
                         .push(Token::new(TokenKind::ParamSep, Span::new(off, l, c)));
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
 
                 // `$` — decide based on the next char.
@@ -2982,7 +2984,7 @@ impl<'a> Lexer<'a> {
                         // a `QuoteRun{AnsiC}` (parse_word wraps it in Quoted{AnsiC}).
                         // Mirrors the command scanner's `$'…'` arm (lexer.rs ~3792)
                         // and the oracle's `scan_dollar_expansion` `Some('\'')` arm.
-                        Some('\'') if !(self.emitting_heredoc.is_some() && !is_pattern) => {
+                        Some('\'') if self.emitting_heredoc.is_none() || is_pattern => {
                             self.cursor.next(); // `$`
                             self.cursor.next(); // `'`
                             let text = scan_ansi_c_quoted(&mut self.cursor)?;
@@ -3058,7 +3060,7 @@ impl<'a> Lexer<'a> {
                             ));
                         }
                     }
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
 
                 // Backtick command-substitution — emit BeginBacktick SIGNAL without consuming `` ` ``.
@@ -3069,7 +3071,7 @@ impl<'a> Lexer<'a> {
                 Some('`') => {
                     self.history
                         .push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
 
                 // Single-quoted span: everything literal (backslash NOT special inside `'…'`).
@@ -3101,7 +3103,7 @@ impl<'a> Lexer<'a> {
                         TokenKind::Lit { text, quoted: true }
                     };
                     self.history.push(Token::new(tok, Span::new(off, l, c)));
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
 
                 // Opening `"` — begin a double-quoted span.
@@ -3129,7 +3131,7 @@ impl<'a> Lexer<'a> {
                     let in_l = self.cursor.line();
                     let in_c = self.cursor.column();
                     match self.cursor.peek().copied() {
-                        None => return Err(LexError::UnterminatedQuote { double: true }),
+                        None => Err(LexError::UnterminatedQuote { double: true }),
 
                         // Empty `""` — emit empty quoted Lit (preserves `""` = empty-string
                         // semantics); in_dquote stays false.
@@ -3142,7 +3144,7 @@ impl<'a> Lexer<'a> {
                                 },
                                 Span::new(in_off, in_l, in_c),
                             ));
-                            return Ok(Step::Produced);
+                            Ok(Step::Produced)
                         }
 
                         // Backslash as the first char inside `"…"`.
@@ -3192,7 +3194,7 @@ impl<'a> Lexer<'a> {
                             // We don't know if we've reached the closing `"` yet;
                             // set in_dquote=true so subsequent calls stay inside the span.
                             self.set_operand_in_dquote(true);
-                            return Ok(Step::Produced);
+                            Ok(Step::Produced)
                         }
 
                         // Backtick as the first char inside `"…"`.
@@ -3207,7 +3209,7 @@ impl<'a> Lexer<'a> {
                                 Span::new(in_off, in_l, in_c),
                             ));
                             self.set_operand_in_dquote(true);
-                            return Ok(Step::Produced);
+                            Ok(Step::Produced)
                         }
 
                         // `$` as the first char inside `"…"`.
@@ -3293,7 +3295,7 @@ impl<'a> Lexer<'a> {
                                     self.set_operand_in_dquote(true);
                                 }
                             }
-                            return Ok(Step::Produced);
+                            Ok(Step::Produced)
                         }
 
                         // Literal run as the first content inside `"…"`.
@@ -3322,7 +3324,7 @@ impl<'a> Lexer<'a> {
                             } else {
                                 self.set_operand_in_dquote(true);
                             }
-                            return Ok(Step::Produced);
+                            Ok(Step::Produced)
                         }
                     }
                 }
@@ -3379,7 +3381,7 @@ impl<'a> Lexer<'a> {
                             ));
                         }
                     }
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
 
                 // Backslash escape outside `"…"`: the next char is always literal
@@ -3400,7 +3402,7 @@ impl<'a> Lexer<'a> {
                         TokenKind::Lit { text, quoted: true },
                         Span::new(off, l, c),
                     ));
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
 
                 // Root B (#294): a WORD-START `~` in an UNQUOTED operand is a tilde-prefix
@@ -3468,7 +3470,7 @@ impl<'a> Lexer<'a> {
                             Span::new(off, l, c),
                         )),
                     }
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
 
                 // Unquoted literal run: accumulate until the next special char or terminator.
@@ -3533,7 +3535,7 @@ impl<'a> Lexer<'a> {
                         },
                         Span::new(off, l, c),
                     ));
-                    return Ok(Step::Produced);
+                    Ok(Step::Produced)
                 }
             }
         }
@@ -3571,10 +3573,10 @@ impl<'a> Lexer<'a> {
         // trigger depth so an ENCLOSING expanding heredoc — whose body merely
         // CONTAINS this cmdsub and which triggered at a shallower depth — does
         // NOT divert here (its cmdsub body is real command text).
-        if let Some(state) = self.emitting_heredoc.as_ref() {
-            if state.trigger_depth == self.modes.len() {
-                return self.scan_step_heredoc_body();
-            }
+        if let Some(state) = self.emitting_heredoc.as_ref()
+            && state.trigger_depth == self.modes.len()
+        {
+            return self.scan_step_heredoc_body();
         }
         self.scan_step_command_atoms_core()
     }
@@ -4474,7 +4476,7 @@ impl<'a> Lexer<'a> {
             }
             let mut line = String::new();
             let mut got_nl = false;
-            while let Some(ch) = self.cursor.next() {
+            for ch in self.cursor.by_ref() {
                 if ch == '\n' {
                     got_nl = true;
                     break;
@@ -5177,10 +5179,8 @@ impl<'a> Lexer<'a> {
         let at_word_start = self.cmd_at_word_start;
         // v247 T4: at word start, try to peel a structured assignment prefix
         // (`name+=`, `name[sub]=`, `name[sub]+=`) or a plain scalar `name=`.
-        if at_word_start {
-            if let Some(step) = self.try_scan_assign_prefix(off, l, c)? {
-                return Ok(step);
-            }
+        if at_word_start && let Some(step) = self.try_scan_assign_prefix(off, l, c)? {
+            return Ok(step);
         }
         // v247 T4: value-position tilde eligibility. `assign_val_tilde_ok` is true
         // when the previous unquoted literal char was `=`/`:` inside an assignment
@@ -5486,20 +5486,18 @@ impl<'a> Lexer<'a> {
     /// Mirrors the oracle's `=`/`+=`/`[…]` arms, which fire only when the word so
     /// far is identifier-shaped and the value has not yet started:
     ///
-    ///   - `name=`         → PLAIN scalar assignment. Emits a single `Lit`
-    ///                        `"name="` (NO `AssignPrefix`); the value flows into
-    ///                        the literal run and `try_split_assignment` splits on
-    ///                        the first unquoted `=` — byte-identical to the oracle.
-    ///   - `name+=`        → `AssignPrefix { Bare(name), append: true }`.
-    ///   - `name[`         → (v268) the lexer no longer decides indexed-lvalue vs.
-    ///                        glob word itself: it emits `Lit name` + a zero-width
-    ///                        `LBracket` and sets `pending_lvalue_subscript`. The
-    ///                        PARSER assembles the subscript under
-    ///                        `Mode::ParamSubscriptOperand` and, once it sees the
-    ///                        closing `]`, the lexer's `pending_lvalue_subscript`
-    ///                        hook (top of `scan_step_command_atoms_core`) emits
-    ///                        `AssignEq` iff `=`/`+=` immediately follows — that is
-    ///                        what the parser uses to decide assignment-vs-glob.
+    /// - `name=` → PLAIN scalar assignment. Emits a single `Lit` `"name="` (NO
+    ///   `AssignPrefix`); the value flows into the literal run and
+    ///   `try_split_assignment` splits on the first unquoted `=` — byte-identical
+    ///   to the oracle.
+    /// - `name+=` → `AssignPrefix { Bare(name), append: true }`.
+    /// - `name[` → (v268) the lexer no longer decides indexed-lvalue vs. glob
+    ///   word itself: it emits `Lit name` + a zero-width `LBracket` and sets
+    ///   `pending_lvalue_subscript`. The PARSER assembles the subscript under
+    ///   `Mode::ParamSubscriptOperand` and, once it sees the closing `]`, the
+    ///   lexer's `pending_lvalue_subscript` hook (top of
+    ///   `scan_step_command_atoms_core`) emits `AssignEq` iff `=`/`+=` immediately
+    ///   follows — that is what the parser uses to decide assignment-vs-glob.
     ///
     /// Sets `in_assignment_value` and seeds `assign_val_tilde_ok` (true only after
     /// the bare `name=`, whose buffer ends in `=`; false after `+=`, whose buffer
@@ -6508,6 +6506,10 @@ impl<'a> Lexer<'a> {
         self.fill_to(self.pos)?;
         Ok(self.history.get(self.pos))
     }
+    /// Not `Iterator::next`: lexing is FALLIBLE, so this yields
+    /// `Result<Option<Token>, LexError>` — a shape `Iterator` cannot express
+    /// without collapsing the error into the item type.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Token>, LexError> {
         self.fill_to(self.pos)?;
         let t = self.history.get(self.pos).cloned();
@@ -9616,7 +9618,7 @@ mod array_parse_tests {
         // from the buffered token's span, not the advanced cursor.
         lx.fill_to(0).unwrap();
         assert_eq!(lx.pos, 0);
-        assert!(lx.history.len() >= 1);
+        assert!(!lx.history.is_empty());
         let m = lx.mark();
         let a = lx.next_token().unwrap().unwrap();
         let b = lx.next_token().unwrap().unwrap();

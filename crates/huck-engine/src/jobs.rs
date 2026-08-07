@@ -463,7 +463,7 @@ pub fn reap_owned_once(shell: &mut crate::shell_state::Shell) -> bool {
     // coproc list) as it reaps. Coproc pids are tracked on the Shell, not the job
     // table, so they are unioned in here.
     let mut targets: Vec<i32> = shell.jobs.owned_pids().to_vec();
-    targets.extend(shell.coprocs.iter().map(|c| c.pid as i32));
+    targets.extend(shell.coprocs.iter().map(|c| c.pid));
     targets.sort_unstable();
     targets.dedup();
 

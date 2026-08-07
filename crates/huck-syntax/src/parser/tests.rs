@@ -2693,8 +2693,9 @@ fn cmd_for_arith_unterminated_edge() {
 // THE PRODUCTION LEXER IS THE ORACLE.  When `new_cs` ≠ `old_cs`, fix
 // the new path to match — never weaken or skip the comparison.
 
-/// Build the expected `WordPart::CommandSub` using the PRODUCTION lexer (oracle).
-/// Wraps `s` in `"…"` when `quoted=true` to simulate a double-quoted context.
+// (`old_cs` — built the expected `WordPart::CommandSub` from the PRODUCTION
+// lexer, wrapping `s` in `"…"` when `quoted=true` — went with the oracle in
+// v266. Kept as a note because the preamble above still names it.)
 
 /// Build the expected `WordPart::CommandSub` using the NEW parser-driven path.
 fn new_cs(s: &str, quoted: bool) -> Result<WordPart, ParseError> {
@@ -3064,7 +3065,8 @@ fn bt_error_parity() {
 // THE PRODUCTION LEXER IS THE ORACLE.  When `new_arith` ≠ `old_arith`, fix
 // the new path to match — never weaken or skip the comparison.
 
-/// Production oracle: the `WordPart::Arith` the batch lexer builds for `s`.
+// (`old_arith` — the production oracle's `WordPart::Arith` for `s` — went with
+// the oracle in v266. Kept as a note because the preamble above still names it.)
 
 /// New parser-driven path.
 fn new_arith(s: &str, quoted: bool) -> Result<WordPart, ParseError> {
@@ -4116,9 +4118,7 @@ fn prune_across_outstanding_arith_mark_does_not_corrupt() {
     // outer construct here IS a `$(`, so the same reclassification applies.
     let empty = std::collections::HashMap::new();
     let prefix: String = (0..2000).map(|i| format!("w{i} ")).collect();
-    let inner: String = std::iter::repeat(":; ")
-        .take(HISTORY_PRUNE_THRESHOLD + 200)
-        .collect();
+    let inner: String = std::iter::repeat_n(":; ", HISTORY_PRUNE_THRESHOLD + 200).collect();
     let src = format!("echo {prefix}$(( $({{ {inner} echo HI; }}) x)");
     let mut lx = Lexer::new(&src, &empty, LexerOptions::default());
     let result = parse_sequence(&mut lx);

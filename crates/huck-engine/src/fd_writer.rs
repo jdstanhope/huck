@@ -133,15 +133,15 @@ impl CaptureStderr {
 
 impl io::Write for CaptureStderr {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if !buf.is_empty() {
-            if let Some(stream) = self.stream {
-                let handled = match stream {
-                    CaptureStream::Out => capture_test_hook::push_out(buf),
-                    CaptureStream::Err => capture_test_hook::push_err(buf),
-                };
-                if handled {
-                    return Ok(buf.len());
-                }
+        if !buf.is_empty()
+            && let Some(stream) = self.stream
+        {
+            let handled = match stream {
+                CaptureStream::Out => capture_test_hook::push_out(buf),
+                CaptureStream::Err => capture_test_hook::push_err(buf),
+            };
+            if handled {
+                return Ok(buf.len());
             }
         }
         io::Write::write(&mut io::stderr(), buf)

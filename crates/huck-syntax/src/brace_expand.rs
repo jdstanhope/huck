@@ -244,10 +244,7 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
                     // step that extreme un-expanded (verified against bash 5.2.21:
                     // `{1..2..-9223372036854775808}` prints literally, rc 0), so
                     // falling back to `None` (literal) matches.
-                    let m = match n.checked_abs() {
-                        Some(m) => m,
-                        None => return None,
-                    };
+                    let m = n.checked_abs()?;
                     if r >= l { m } else { -m }
                 }
                 Err(_) => return None,
@@ -320,10 +317,7 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
                     // step that extreme un-expanded (verified against bash 5.2.21:
                     // `{1..2..-9223372036854775808}` prints literally, rc 0), so
                     // falling back to `None` (literal) matches.
-                    let m = match n.checked_abs() {
-                        Some(m) => m,
-                        None => return None,
-                    };
+                    let m = n.checked_abs()?;
                     if r >= l { m } else { -m }
                 }
                 Err(_) => return None,

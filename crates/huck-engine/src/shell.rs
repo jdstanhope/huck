@@ -482,10 +482,11 @@ pub fn process_line_in_sinks(line: &str, shell: &mut Shell, expand_aliases: bool
 /// Core of [`process_line_in_sinks`]. `top_level` marks the interactive /
 /// piped-stdin top-level reader (see [`process_top_level_line`]), which differs
 /// from command contexts (`eval`, traps) in two bash-matching ways:
-///   - a no-command line (blank/comment) preserves `$?` rather than reporting 0
-///     (#332);
-///   - a syntax error in a NON-interactive session aborts the rest of the input
-///     with status 2, like a script file, rather than continuing (#284).
+/// - a no-command line (blank/comment) preserves `$?` rather than reporting 0
+///   (#332);
+/// - a syntax error in a NON-interactive session aborts the rest of the input
+///   with status 2, like a script file, rather than continuing (#284).
+///
 /// Command contexts pass `false` for both.
 fn process_line_in_sinks_ex(
     line: &str,

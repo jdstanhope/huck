@@ -3351,7 +3351,7 @@ impl Shell {
     /// uncorrelated with bash, wrong in both directions at once. The decision
     /// itself lives in `error_fatality::fatality`; this method only carries
     /// out the verdict on the existing v354 unwind.
-    pub fn report_error(&mut self, kind: crate::error_fatality::ErrorKind) {
+    pub(crate) fn report_error(&mut self, kind: crate::error_fatality::ErrorKind) {
         match crate::error_fatality::fatality(kind, self) {
             crate::error_fatality::Fatality::Continue => {}
             crate::error_fatality::Fatality::AbortList => self.raise_discard(),

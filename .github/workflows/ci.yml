@@ -36,13 +36,18 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
       - name: Formatting (cargo fmt --check)
         run: cargo fmt --all --check
+
+      - name: Lint (cargo clippy -D warnings)
+        # --all-targets so test code is gated too: the 79 warnings this step was
+        # added to clear (#497) were split roughly 5:1 between lib and tests.
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build (workspace)
         run: cargo build --workspace --locked --verbose

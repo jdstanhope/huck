@@ -2803,12 +2803,10 @@ fn read_record<R: std::io::Read>(
                     any,
                 ));
             }
-            if pr < 0 {
-                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                    continue; // EINTR: re-check the deadline and re-poll
-                }
-                // Other poll errors: fall through and attempt the read, as before.
+            if pr < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue; // EINTR: re-check the deadline and re-poll
             }
+            // Other poll errors: fall through and attempt the read, as before.
             // pr > 0: fall through and attempt the read.
         }
         let mut byte = [0u8; 1];
@@ -3001,7 +2999,7 @@ fn split_into_names(line: &str, names: &[String], ifs: &str) -> Vec<(String, Str
 
     while fields.len() < names.len() - 1 && i < bytes.len() {
         // Extract one word + consume its separator run.
-        let (word, next) = next_word(bytes, i, &is_ws, &is_nonws, &is_any_ifs);
+        let (word, next) = next_word(bytes, i, is_ws, is_nonws, is_any_ifs);
         fields.push(word);
         i = next;
     }
@@ -3021,7 +3019,7 @@ fn split_into_names(line: &str, names: &[String], ifs: &str) -> Vec<(String, Str
     let last = if i >= bytes.len() {
         String::new()
     } else {
-        let (word, p) = next_word(bytes, i, &is_ws, &is_nonws, &is_any_ifs);
+        let (word, p) = next_word(bytes, i, is_ws, is_nonws, is_any_ifs);
         if p >= bytes.len() {
             word
         } else {
@@ -3066,7 +3064,7 @@ fn split_read_fields(line: &str, ifs: &str) -> Vec<String> {
         i += 1;
     }
     while i < bytes.len() {
-        let (word, next) = next_word(bytes, i, &is_ws, &is_nonws, &is_any);
+        let (word, next) = next_word(bytes, i, is_ws, is_nonws, is_any);
         fields.push(word);
         i = next;
     }
@@ -3142,6 +3140,10 @@ impl std::io::Read for RawFdReader {
 /// consume the next argument (`-d VALUE`). Advances `*i` only in the
 /// separate-arg case. Returns `Err(2)` (the exit code) if there is no next
 /// arg, after printing the standard diagnostic.
+// The parameters are the flag-cluster cursor state (`args`/`i`/`bytes`/`j`) plus
+// the diagnostic context; bundling them into a struct would only move the same
+// fields behind one more name. Revisit with the shared flag parser (#496).
+#[allow(clippy::too_many_arguments)]
 fn take_opt_value(
     args: &[String],
     i: &mut usize,
@@ -6043,10 +6045,7 @@ fn builtin_history(
                 // `resolve_offset("")` fails and yields the standard
                 // out-of-range error.
                 let split = operand.get(1..).and_then(|s| s.find('-')).map(|i| i + 1);
-                let range = match split {
-                    Some(i) => Some((&operand[..i], &operand[i + 1..])),
-                    None => None,
-                };
+                let range = split.map(|i| (&operand[..i], &operand[i + 1..]));
                 if let Some((sa, sb)) = range {
                     match (resolve_offset(shell, sa), resolve_offset(shell, sb)) {
                         (Some(a), Some(b)) => {
@@ -6908,10 +6907,11 @@ fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetEr
 /// (#159). Wraps the private `option_set` table so the CLI layer (huck-cli)
 /// doesn't duplicate the option list. `Err(())` means the name is not a
 /// recognized `set -o` option (the caller renders `<name>: invalid option name`).
-pub fn set_o_option_by_name(shell: &mut Shell, name: &str, enable: bool) -> Result<(), ()> {
+/// Returns `false` when `name` is not a known `set -o` option name.
+pub fn set_o_option_by_name(shell: &mut Shell, name: &str, enable: bool) -> bool {
     match option_set(shell, name, enable) {
-        Ok(()) => Ok(()),
-        Err(OptSetErr::Unknown) => Err(()),
+        Ok(()) => true,
+        Err(OptSetErr::Unknown) => false,
     }
 }
 
@@ -10220,7 +10220,7 @@ fn ulimit_get(res: &UlimitRes, hard: bool) -> Option<u64> {
     if v == libc::RLIM_INFINITY {
         return Some(u64::MAX);
     } // sentinel for "unlimited"
-    Some((v as u64) / res.mult)
+    Some(v / res.mult)
 }
 
 /// Returns Err(io::Error) if setrlimit fails.
@@ -10314,8 +10314,9 @@ fn builtin_ulimit(
 
     if let Some(val) = value_arg {
         // SET
-        let set_soft = want_soft || (!want_soft && !want_hard);
-        let set_hard = want_hard || (!want_soft && !want_hard);
+        // Neither flag given => set both.
+        let set_soft = want_soft || !want_hard;
+        let set_hard = want_hard || !want_soft;
         for &lt in &letters {
             if lt == 'p' {
                 continue;
