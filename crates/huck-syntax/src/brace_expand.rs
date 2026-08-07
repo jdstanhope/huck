@@ -326,17 +326,14 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
         let mut out = Vec::new();
         let mut cur = l;
         loop {
-            if let Some(c) = char::from_u32(cur as u32) {
-                // bash emits an EMPTY (but quote-protected — see module docs)
-                // element for `\` (0x5C) in a char range (#318); every other
-                // char in the byte span is emitted literally.
-                if c == '\\' {
-                    out.push(EMPTY_QUOTED_SENTINEL.to_string());
-                } else {
-                    out.push(c.to_string());
-                }
+            let c = char::from_u32(cur as u32)?;
+            // bash emits an EMPTY (but quote-protected — see module docs)
+            // element for `\` (0x5C) in a char range (#318); every other
+            // char in the byte span is emitted literally.
+            if c == '\\' {
+                out.push(EMPTY_QUOTED_SENTINEL.to_string());
             } else {
-                return None;
+                out.push(c.to_string());
             }
             if out.len() > MAX_ELEMENTS {
                 return Some(out);

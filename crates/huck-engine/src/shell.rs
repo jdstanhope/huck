@@ -254,10 +254,7 @@ pub fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32>
                 .or_else(|| std::env::var("HUCK_RC").ok())
                 .filter(|s| !s.is_empty())
                 .map(std::path::PathBuf::from);
-            match from_env.or_else(|| default_rc_path(shell)) {
-                Some(p) => (p, false),
-                None => return None,
-            }
+            (from_env.or_else(|| default_rc_path(shell))?, false)
         }
     };
     if !path.exists() {
