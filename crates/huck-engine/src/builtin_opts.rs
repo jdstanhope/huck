@@ -202,9 +202,64 @@ impl<'a> Getopt<'a> {
     }
 }
 
-// TEMPORARY: replaced by the real table in Task 2 (#496)
-fn usage_for(_: &str) -> &'static str {
-    ""
+/// Usage text, keyed on the INVOKED name. Transcribed verbatim from bash
+/// 5.2.21; the differential harness pins every one byte-for-byte, so a typo
+/// here is a red test rather than a silent divergence.
+pub(crate) fn usage_for(name: &str) -> &'static str {
+    match name {
+        "alias" => "alias [-p] [name[=value] ... ]",
+        "builtin" => "builtin [shell-builtin [arg ...]]",
+        "cd" => "cd [-L|[-P [-e]] [-@]] [dir]",
+        "command" => "command [-pVv] command [arg ...]",
+        "compgen" => {
+            "compgen [-abcdefgjksuv] [-o option] [-A action] [-G globpat] [-W wordlist] [-F function] [-C command] [-X filterpat] [-P prefix] [-S suffix] [word]"
+        }
+        "complete" => {
+            "complete [-abcdefgjksuv] [-pr] [-DEI] [-o option] [-A action] [-G globpat] [-W wordlist] [-F function] [-C command] [-X filterpat] [-P prefix] [-S suffix] [name ...]"
+        }
+        "compopt" => "compopt [-o|+o option] [-DEI] [name ...]",
+        "declare" => {
+            "declare [-aAfFgiIlnrtux] [name[=value] ...] or declare -p [-aAfFilnrtux] [name ...]"
+        }
+        "disown" => "disown [-h] [-ar] [jobspec ... | pid ...]",
+        "enable" => "enable [-a] [-dnps] [-f filename] [name ...]",
+        "export" => "export [-fn] [name[=value] ...] or export -p",
+        "getopts" => "getopts optstring name [arg ...]",
+        "hash" => "hash [-lr] [-p pathname] [-dt] [name ...]",
+        "help" => "help [-dms] [pattern ...]",
+        "history" => {
+            "history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]"
+        }
+        "jobs" => "jobs [-lnprs] [jobspec ...] or jobs -x command [args]",
+        "local" => "local [option] name[=value] ...",
+        "mapfile" => {
+            "mapfile [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]"
+        }
+        "printf" => "printf [-v var] format [arguments]",
+        "pwd" => "pwd [-LP]",
+        "read" => {
+            "read [-ers] [-a array] [-d delim] [-i text] [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]"
+        }
+        "readarray" => {
+            "readarray [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]"
+        }
+        "readonly" => "readonly [-aAf] [name[=value] ...] or readonly -p",
+        "shopt" => "shopt [-pqsu] [-o] [optname ...]",
+        "trap" => "trap [-lp] [[arg] signal_spec ...]",
+        "type" => "type [-afptP] name [name ...]",
+        "typeset" => {
+            "typeset [-aAfFgiIlnrtux] name[=value] ... or typeset -p [-aAfFilnrtux] [name ...]"
+        }
+        "ulimit" => "ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]",
+        "umask" => "umask [-p] [-S] [mode]",
+        "unalias" => "unalias [-a] name [name ...]",
+        "unset" => "unset [-f] [-v] [-n] [name ...]",
+        "wait" => "wait [-fn] [-p var] [id ...]",
+        other => {
+            debug_assert!(false, "no usage string for builtin {other}");
+            ""
+        }
+    }
 }
 
 #[cfg(test)]

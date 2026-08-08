@@ -9,7 +9,7 @@ fn scan(spec: &str, argv: &[&str]) -> (Vec<(char, Option<String>)>, usize, Optio
     let args: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     let mut sh = Shell::new();
     let mut err: Vec<u8> = Vec::new();
-    let mut g = Getopt::new("t", ArgView::Plain(&args), spec);
+    let mut g = Getopt::new("alias", ArgView::Plain(&args), spec);
     let mut out = Vec::new();
     loop {
         match g.next_opt(&mut sh, &mut err) {
@@ -63,4 +63,56 @@ fn scanning_stops_at_the_first_non_option() {
 fn unknown_option_reports_two_and_stops() {
     let (_, _, err) = scan("p", &["-Q"]);
     assert_eq!(err, Some(2));
+}
+
+#[test]
+fn usage_is_keyed_on_the_invoked_name_not_the_implementation() {
+    // readarray/mapfile and typeset/declare share an implementation but must
+    // NOT share a usage string — bash names the builtin the user invoked.
+    assert!(usage_for("readarray").starts_with("readarray "));
+    assert!(usage_for("mapfile").starts_with("mapfile "));
+    assert!(usage_for("typeset").starts_with("typeset "));
+    assert!(usage_for("declare").starts_with("declare "));
+    assert_ne!(usage_for("readarray"), usage_for("mapfile"));
+    assert_ne!(usage_for("typeset"), usage_for("declare"));
+}
+
+#[test]
+fn every_builtin_with_a_scanner_has_a_usage_string() {
+    for name in [
+        "unset",
+        "readonly",
+        "read",
+        "type",
+        "hash",
+        "declare",
+        "typeset",
+        "printf",
+        "command",
+        "mapfile",
+        "readarray",
+        "help",
+        "complete",
+        "compgen",
+        "compopt",
+        "jobs",
+        "trap",
+        "alias",
+        "unalias",
+        "builtin",
+        "export",
+        "cd",
+        "wait",
+        "history",
+        "local",
+        "getopts",
+        "shopt",
+        "disown",
+        "umask",
+        "ulimit",
+        "pwd",
+        "enable",
+    ] {
+        assert!(!usage_for(name).is_empty(), "no usage string for {name}");
+    }
 }
