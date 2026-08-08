@@ -416,10 +416,10 @@ pub fn run_declaration_builtin(
     shell: &mut Shell,
 ) -> ExecOutcome {
     match name {
-        "declare" | "typeset" => builtin_declare_decl(decl_args, out, err, shell),
-        "local" => builtin_local_decl(decl_args, err, shell),
-        "readonly" => builtin_readonly_decl(decl_args, out, err, shell),
-        "export" => builtin_export_decl(decl_args, out, err, shell),
+        "declare" | "typeset" => builtin_declare_decl(name, decl_args, out, err, shell),
+        "local" => builtin_local_decl(name, decl_args, err, shell),
+        "readonly" => builtin_readonly_decl(name, decl_args, out, err, shell),
+        "export" => builtin_export_decl(name, decl_args, out, err, shell),
         _ => unreachable!("run_declaration_builtin called with non-declaration: {name}"),
     }
 }
@@ -1418,59 +1418,35 @@ fn emit_function(
 /// (bash `declare -ax`); bare `NAME` flips the export bit without checking
 /// readonly.
 fn builtin_export_decl(
+    name: &str,
     args: &[DeclArg],
     out: &mut dyn Write,
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    // Parse leading flags. `-a` is a huck-specific no-op (mise emits
-    // `export -a chpwd_functions`); `-p` lists (only when no operands);
-    // `-n` unexports; `-f` is function export (DEFERRED).
+    // `-a` is a huck-specific no-op (mise emits `export -a chpwd_functions`);
+    // `-p` lists (only when no operands); `-n` unexports; `-f` is function
+    // export.
     let mut unexport = false;
     let mut func = false;
     let mut saw_p = false;
     let mut saw_a = false;
-    let mut idx = 0;
-    while idx < args.len() {
-        match &args[idx] {
-            DeclArg::Plain(s) => {
-                if s == "--" {
-                    idx += 1;
-                    break;
-                }
-                if s.starts_with('-') && s.len() > 1 {
-                    for c in s[1..].chars() {
-                        match c {
-                            'p' => saw_p = true,
-                            'a' => saw_a = true, // huck-specific no-op (mise `export -a chpwd_functions`)
-                            'n' => unexport = true,
-                            'f' => func = true,
-                            _ => {
-                                crate::sh_error_to!(
-                                    shell,
-                                    err,
-                                    None,
-                                    "export: -{c}: invalid option"
-                                );
-                                e!(
-                                    err,
-                                    "export: usage: export [-fn] [name[=value] ...] or export -p"
-                                );
-                                // POSIX case #1: bad option is a usage error.
-                                shell.builtin_usage_error = Some(2);
-                                return ExecOutcome::Continue(2);
-                            }
-                        }
-                    }
-                    idx += 1;
-                    continue;
-                }
-                break;
-            }
-            DeclArg::Assign(_) => break,
+    let mut g =
+        crate::builtin_opts::Getopt::new(name, crate::builtin_opts::ArgView::Decl(args), "pnfa");
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'p' => saw_p = true,
+                'a' => saw_a = true, // huck-specific no-op (mise `export -a chpwd_functions`)
+                'n' => unexport = true,
+                'f' => func = true,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
     }
-    let operands = &args[idx..];
+    let operands = &args[g.rest_index()..];
 
     if operands.is_empty() {
         if unexport {
@@ -1647,7 +1623,12 @@ fn builtin_export_decl(
 /// declaration; routes compound-RHS through `apply_one_assignment` while
 /// re-using the existing per-frame snapshot machinery for unwind on
 /// function return.
-fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_local_decl(
+    name: &str,
+    args: &[DeclArg],
+    err: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
     if shell.local_scopes.is_empty() {
         crate::sh_error_to!(shell, err, None, "local: can only be used in a function");
         return ExecOutcome::Continue(1);
@@ -1660,42 +1641,31 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
     let mut saw_minus_u = false;
     let mut saw_minus_c = false;
     let mut saw_minus_n = false;
-    let mut idx = 0;
-    // Parse leading flags from Plain args. Letters cluster (`-ri`, `-ir`)
-    // exactly as in `declare`.
-    while idx < args.len() {
-        let DeclArg::Plain(s) = &args[idx] else { break };
-        if s == "--" {
-            idx += 1;
-            break;
+    // `local` takes no `+`-style options (unlike `declare`), so the scanner
+    // owns the whole `-` side here.
+    let mut g = crate::builtin_opts::Getopt::new(
+        name,
+        crate::builtin_opts::ArgView::Decl(args),
+        "aAirlucn",
+    );
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'a' => want_array = true,
+                'A' => want_associative = true,
+                'i' => want_integer = true,
+                'r' => want_readonly = true,
+                'l' => saw_minus_l = true,
+                'u' => saw_minus_u = true,
+                'c' => saw_minus_c = true,
+                'n' => saw_minus_n = true,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
-        if !(s.starts_with('-') && s.len() > 1) {
-            break;
-        }
-        for &c in &s.as_bytes()[1..] {
-            match c {
-                b'a' => want_array = true,
-                b'A' => want_associative = true,
-                b'i' => want_integer = true,
-                b'r' => want_readonly = true,
-                b'l' => saw_minus_l = true,
-                b'u' => saw_minus_u = true,
-                b'c' => saw_minus_c = true,
-                b'n' => saw_minus_n = true,
-                other => {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "local: -{}: invalid option",
-                        other as char
-                    );
-                    return ExecOutcome::Continue(1);
-                }
-            }
-        }
-        idx += 1;
     }
+    let idx = g.rest_index();
     if want_array && want_associative {
         crate::sh_error_to!(shell, err, None, "local: cannot specify both -a and -A");
         return ExecOutcome::Continue(1);
@@ -1948,45 +1918,30 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
 /// `readonly` entry point with DeclArg input. Routes compound-RHS through
 /// `apply_one_assignment`; rejects subscripted-target assignments.
 fn builtin_readonly_decl(
+    name: &str,
     args: &[DeclArg],
     out: &mut dyn Write,
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    // Parse leading flags (-p, -a, -A). `--` terminates option processing.
     let mut want_list = false;
     let mut want_associative = false;
     let mut want_indexed = false;
-    let mut idx = 0;
-    while idx < args.len() {
-        let DeclArg::Plain(s) = &args[idx] else { break };
-        match s.as_str() {
-            "-p" => {
-                want_list = true;
-                idx += 1;
-            }
-            "-a" => {
-                want_indexed = true;
-                idx += 1;
-            }
-            "-A" => {
-                want_associative = true;
-                idx += 1;
-            }
-            "--" => {
-                idx += 1;
-                break;
-            }
-            o if o.starts_with('-') && o.len() > 1 => {
-                crate::sh_error_to!(shell, err, None, "readonly: {o}: invalid option");
-                // POSIX case #1: bad option is a usage error.
-                shell.builtin_usage_error = Some(2);
-                return ExecOutcome::Continue(2);
-            }
-            _ => break,
+    let mut g =
+        crate::builtin_opts::Getopt::new(name, crate::builtin_opts::ArgView::Decl(args), "paA");
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'p' => want_list = true,
+                'a' => want_indexed = true,
+                'A' => want_associative = true,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
     }
-    let rest = &args[idx..];
+    let rest = &args[g.rest_index()..];
 
     if rest.is_empty() || want_list {
         for name in shell.readonly_names() {
@@ -2175,6 +2130,7 @@ fn builtin_readonly_decl(
 
 /// `declare`/`typeset` entry point with DeclArg input.
 fn builtin_declare_decl(
+    name: &str,
     args: &[DeclArg],
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -2200,26 +2156,66 @@ fn builtin_declare_decl(
     let mut saw_minus_n = false;
     let mut saw_plus_n = false;
 
-    // Parse leading flags from Plain args. As soon as we hit a non-flag
-    // Plain or any Assign, switch into the per-name phase.
+    // Parse leading flags from Plain args. The `-` side is scanned by the
+    // shared `Getopt` (bash's own `internal_getopt` does not handle `+`
+    // either — `declare` special-cases it); a `+`-prefixed arg makes
+    // `Getopt` stop immediately (it doesn't start with `-`), so this loop
+    // alternates: run the scanner for a `-` run, then hand-process one `+`
+    // run, then try the scanner again — so `-r +x -i` etc. interleave
+    // exactly as bash allows. `--` terminates BOTH sides: `Getopt` consumes
+    // it internally, so a `+`-looking arg right after `--` must NOT be
+    // treated as an option; detect that by checking whether the run's last
+    // consumed slot was the literal `--` terminator.
     let mut idx = 0;
-    while idx < args.len() {
-        let DeclArg::Plain(arg) = &args[idx] else {
-            break;
-        };
-        if arg == "--" {
-            idx += 1;
+    loop {
+        let pre_idx = idx;
+        let mut g = crate::builtin_opts::Getopt::new(
+            name,
+            crate::builtin_opts::ArgView::Decl(&args[idx..]),
+            "rxiaAlucnfFpg",
+        );
+        loop {
+            match g.next_opt(shell, err) {
+                Ok(Some(o)) => match o.ch {
+                    'r' => want_readonly = true,
+                    'x' => want_export = true,
+                    'i' => want_integer = true,
+                    'a' => want_array = true,
+                    'A' => want_associative = true,
+                    'l' => saw_minus_l = true,
+                    'u' => saw_minus_u = true,
+                    'c' => saw_minus_c = true,
+                    'n' => saw_minus_n = true,
+                    'f' => function_mode = true,
+                    'F' => {
+                        function_mode = true;
+                        function_names_only = true;
+                    }
+                    'p' => print_mode = true,
+                    'g' => global = true,
+                    _ => unreachable!("spec and match must agree"),
+                },
+                Ok(None) => break,
+                Err(code) => return ExecOutcome::Continue(code),
+            }
+        }
+        idx += g.rest_index();
+
+        // `--` terminates option processing entirely, even for a `+`-look
+        // arg that follows it.
+        if idx > pre_idx && matches!(&args[idx - 1], DeclArg::Plain(s) if s == "--") {
             break;
         }
-        let plus = arg.starts_with('+');
-        let minus = arg.starts_with('-');
-        if !(plus || minus) || arg.len() < 2 {
+
+        let Some(DeclArg::Plain(arg)) = args.get(idx) else {
+            break;
+        };
+        if !(arg.starts_with('+') && arg.len() > 1) {
             break;
         }
         for &c in &arg.as_bytes()[1..] {
             match c {
-                b'r' if minus => want_readonly = true,
-                b'r' if plus => {
+                b'r' => {
                     crate::sh_error_to!(
                         shell,
                         err,
@@ -2228,12 +2224,9 @@ fn builtin_declare_decl(
                     );
                     return ExecOutcome::Continue(1);
                 }
-                b'x' if minus => want_export = true,
-                b'x' if plus => want_remove_export = true,
-                b'i' if minus => want_integer = true,
-                b'i' if plus => want_remove_integer = true,
-                b'a' if minus => want_array = true,
-                b'a' if plus => {
+                b'x' => want_remove_export = true,
+                b'i' => want_remove_integer = true,
+                b'a' => {
                     crate::sh_error_to!(
                         shell,
                         err,
@@ -2242,8 +2235,7 @@ fn builtin_declare_decl(
                     );
                     return ExecOutcome::Continue(1);
                 }
-                b'A' if minus => want_associative = true,
-                b'A' if plus => {
+                b'A' => {
                     // TODO: bash compat — bash silently ignores `+A` on
                     // existing associatives (the attribute can't be
                     // removed once set). We mirror `+a`'s conservative
@@ -2257,28 +2249,16 @@ fn builtin_declare_decl(
                     );
                     return ExecOutcome::Continue(1);
                 }
-                b'l' if minus => saw_minus_l = true,
-                b'l' if plus => saw_plus_l = true,
-                b'u' if minus => saw_minus_u = true,
-                b'u' if plus => saw_plus_u = true,
-                b'c' if minus => saw_minus_c = true,
-                b'c' if plus => saw_plus_c = true,
-                b'n' if minus => saw_minus_n = true,
-                b'n' if plus => saw_plus_n = true,
-                b'f' if minus => function_mode = true,
-                b'F' if minus => {
-                    function_mode = true;
-                    function_names_only = true;
-                }
-                b'p' if minus => print_mode = true,
-                b'g' if minus => global = true,
+                b'l' => saw_plus_l = true,
+                b'u' => saw_plus_u = true,
+                b'c' => saw_plus_c = true,
+                b'n' => saw_plus_n = true,
                 other => {
-                    let sign = if plus { '+' } else { '-' };
                     crate::sh_error_to!(
                         shell,
                         err,
                         None,
-                        "declare: {sign}{}: invalid option",
+                        "declare: +{}: invalid option",
                         other as char
                     );
                     return ExecOutcome::Continue(2);

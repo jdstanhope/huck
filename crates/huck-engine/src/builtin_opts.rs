@@ -8,19 +8,9 @@
 //! Each builtin keeps its own `match` on the option character. What it loses is
 //! the scanning, which is where 23 hand-rolled copies drifted apart (#496).
 //!
-//! TEMPORARY: nothing outside this module calls into it yet — Task 1 lands it
-//! standalone per the plan, and Tasks 4-7 (#496) convert the builtins onto it.
-//! Until the first conversion lands, `cargo clippy --all-targets` (which
-//! compiles the non-test `lib` target as well as the `#[cfg(test)]` one)
-//! finds every item in this file unreachable outside tests: both structs, both
-//! enum variants, and all 9 methods/functions — 14 items total, i.e. the
-//! entire module. A per-item `#[allow(dead_code)]` on each would be strictly
-//! worse than this one module-scoped allow (more lines, same coverage, and no
-//! finer-grained removability: nothing here has a partial caller yet, so
-//! Task 4 makes most of the surface live in one commit regardless of how the
-//! suppression is spelled today). Delete this attribute once a builtin calls
-//! `Getopt`.
-#![allow(dead_code)]
+//! Converted so far (#496): the four declaration builtins (`readonly`,
+//! `export`, `declare`/`typeset`, `local`; Task 4). Remaining builtins
+//! (Tasks 5-7) still hand-roll their own scan.
 
 use crate::command::DeclArg;
 use crate::shell_state::Shell;
@@ -28,6 +18,9 @@ use std::io::Write;
 
 pub(crate) struct Opt {
     pub ch: char,
+    // Unused until a Task 5-7 builtin adopts a value-taking (`:`-suffixed)
+    // spec — none of Task 4's four declaration-builtin specs do.
+    #[allow(dead_code)]
     pub value: Option<String>,
 }
 
@@ -35,11 +28,15 @@ pub(crate) struct Opt {
 /// `DeclArg::Assign` can never be an option, so it terminates scanning exactly
 /// like a non-option string does.
 pub(crate) enum ArgView<'a> {
+    // Unused until a Task 5-7 builtin (the non-declaration ones, which take
+    // `&[String]`) converts onto the scanner.
+    #[allow(dead_code)]
     Plain(&'a [String]),
     Decl(&'a [DeclArg]),
 }
 
 impl ArgView<'_> {
+    #[allow(dead_code)] // unused: Getopt itself never calls len(), only at()
     fn len(&self) -> usize {
         match self {
             ArgView::Plain(v) => v.len(),

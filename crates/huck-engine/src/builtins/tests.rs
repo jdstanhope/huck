@@ -577,6 +577,7 @@ fn export_nf_unexports_function() {
     let mut out = Vec::new();
     // export -nf uf  -> remove the export mark
     let oc = builtin_export_decl(
+        "export",
         &[dp("-n"), dp("-f"), dp("uf")],
         &mut out,
         &mut std::io::stderr(),
@@ -609,7 +610,13 @@ fn declare_fx_no_names_lists_via_runtime_path() {
     shell.mark_function_exported("dfn2");
     // capture stdout of `declare -fx`: route through builtin_declare_decl directly.
     let mut out = Vec::new();
-    let oc = builtin_declare_decl(&[dp("-fx")], &mut out, &mut std::io::stderr(), &mut shell);
+    let oc = builtin_declare_decl(
+        "declare",
+        &[dp("-fx")],
+        &mut out,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
     assert!(matches!(oc, ExecOutcome::Continue(0)), "{oc:?}");
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("dfn2 ()"), "{s}");
@@ -622,7 +629,13 @@ fn export_p_lists_in_declare_x_format() {
     shell.export_set("EXP_A", "1".to_string());
     shell.export_set("EXP_B", "two".to_string());
     let mut out = Vec::new();
-    let oc = builtin_export_decl(&[dp("-p")], &mut out, &mut std::io::stderr(), &mut shell);
+    let oc = builtin_export_decl(
+        "export",
+        &[dp("-p")],
+        &mut out,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
     assert!(matches!(oc, ExecOutcome::Continue(0)));
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("declare -x EXP_A=\"1\""), "{s}");
@@ -638,7 +651,7 @@ fn bare_export_uses_declare_x_format() {
     let mut shell = Shell::new();
     shell.export_set("EXP_C", "z".to_string());
     let mut out = Vec::new();
-    let _ = builtin_export_decl(&[], &mut out, &mut std::io::stderr(), &mut shell);
+    let _ = builtin_export_decl("export", &[], &mut out, &mut std::io::stderr(), &mut shell);
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("declare -x EXP_C=\"z\""), "{s}");
 }
@@ -650,6 +663,7 @@ fn export_n_unexports_keeps_value() {
     assert!(shell.is_exported("EXP_D"));
     let mut out = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-n"), dp("EXP_D")],
         &mut out,
         &mut std::io::stderr(),
@@ -666,6 +680,7 @@ fn export_n_with_assignment_sets_then_unexports() {
     shell.export_set("EXP_E", "1".to_string());
     let mut out = Vec::new();
     let _ = builtin_export_decl(
+        "export",
         &[dp("-n"), dp("EXP_E=2")],
         &mut out,
         &mut std::io::stderr(),
@@ -680,6 +695,7 @@ fn export_n_unset_name_is_noop() {
     let mut shell = Shell::new();
     let mut out = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-n"), dp("NOPE_X")],
         &mut out,
         &mut std::io::stderr(),
@@ -693,7 +709,13 @@ fn export_n_unset_name_is_noop() {
 fn export_invalid_flag_rc2() {
     let mut shell = Shell::new();
     let mut out = Vec::new();
-    let oc = builtin_export_decl(&[dp("-z")], &mut out, &mut std::io::stderr(), &mut shell);
+    let oc = builtin_export_decl(
+        "export",
+        &[dp("-z")],
+        &mut out,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
     assert!(matches!(oc, ExecOutcome::Continue(2)), "{oc:?}");
 }
 
@@ -704,6 +726,7 @@ fn export_p_with_operand_exports_it_no_listing() {
     assert!(!shell.is_exported("EXP_F"));
     let mut out = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-p"), dp("EXP_F")],
         &mut out,
         &mut std::io::stderr(),
@@ -726,6 +749,7 @@ fn export_f_does_not_create_variable() {
     let mut out = Vec::new();
     // `export -f somefunc` for a nonexistent function: rc 1, no variable.
     let oc = builtin_export_decl(
+        "export",
         &[dp("-f"), dp("somefunc")],
         &mut out,
         &mut std::io::stderr(),
@@ -745,6 +769,7 @@ fn export_f_marks_existing_function() {
     let _ = crate::shell::process_line("myfn(){ echo hi; }", &mut shell, false);
     let mut out = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-f"), dp("myfn")],
         &mut out,
         &mut std::io::stderr(),
@@ -762,6 +787,7 @@ fn export_f_hyphenated_name_ok() {
     let _ = crate::shell::process_line("foo-a(){ echo hi; }", &mut shell, false);
     let mut out = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-f"), dp("foo-a")],
         &mut out,
         &mut std::io::stderr(),
@@ -790,6 +816,7 @@ fn export_f_unencodable_name_cannot_export_rc1() {
     let mut out = Vec::new();
     let mut errbuf = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-f"), dp("foo=bar")],
         &mut out,
         &mut errbuf,
@@ -825,6 +852,7 @@ fn export_f_slash_name_cannot_export_rc1() {
     let mut out = Vec::new();
     let mut errbuf = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-f"), dp("/bin/echo")],
         &mut out,
         &mut errbuf,
@@ -844,6 +872,7 @@ fn export_f_not_a_function_rc1() {
     let mut shell = Shell::new();
     let mut out = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-f"), dp("nope")],
         &mut out,
         &mut std::io::stderr(),
@@ -859,7 +888,13 @@ fn export_f_no_operands_lists_functions() {
     let _ = crate::shell::process_line("af(){ echo hi; }", &mut shell, false);
     shell.mark_function_exported("af");
     let mut out = Vec::new();
-    let oc = builtin_export_decl(&[dp("-f")], &mut out, &mut std::io::stderr(), &mut shell);
+    let oc = builtin_export_decl(
+        "export",
+        &[dp("-f")],
+        &mut out,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
     assert!(matches!(oc, ExecOutcome::Continue(0)));
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("af ()"), "{s}");
@@ -871,7 +906,13 @@ fn export_a_bare_no_listing() {
     let mut shell = Shell::new();
     shell.export_set("EXP_HIDE", "1".to_string());
     let mut out = Vec::new();
-    let oc = builtin_export_decl(&[dp("-a")], &mut out, &mut std::io::stderr(), &mut shell);
+    let oc = builtin_export_decl(
+        "export",
+        &[dp("-a")],
+        &mut out,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
     assert!(matches!(oc, ExecOutcome::Continue(0)));
     assert!(
         String::from_utf8(out).unwrap().is_empty(),
@@ -884,7 +925,13 @@ fn export_f_bare_no_listing() {
     let mut shell = Shell::new();
     shell.export_set("EXP_HIDE2", "1".to_string());
     let mut out = Vec::new();
-    let oc = builtin_export_decl(&[dp("-f")], &mut out, &mut std::io::stderr(), &mut shell);
+    let oc = builtin_export_decl(
+        "export",
+        &[dp("-f")],
+        &mut out,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
     assert!(matches!(oc, ExecOutcome::Continue(0)));
     assert!(
         String::from_utf8(out).unwrap().is_empty(),
