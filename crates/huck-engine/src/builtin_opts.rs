@@ -8,9 +8,18 @@
 //! Each builtin keeps its own `match` on the option character. What it loses is
 //! the scanning, which is where 23 hand-rolled copies drifted apart (#496).
 //!
-//! TEMPORARY: nothing calls into this module yet — Task 1 lands it standalone
-//! per the plan, and later tasks (#496) convert the builtins onto it. Until
-//! then a non-test build sees the whole surface as unused.
+//! TEMPORARY: nothing outside this module calls into it yet — Task 1 lands it
+//! standalone per the plan, and Tasks 4-7 (#496) convert the builtins onto it.
+//! Until the first conversion lands, `cargo clippy --all-targets` (which
+//! compiles the non-test `lib` target as well as the `#[cfg(test)]` one)
+//! finds every item in this file unreachable outside tests: both structs, both
+//! enum variants, and all 9 methods/functions — 14 items total, i.e. the
+//! entire module. A per-item `#[allow(dead_code)]` on each would be strictly
+//! worse than this one module-scoped allow (more lines, same coverage, and no
+//! finer-grained removability: nothing here has a partial caller yet, so
+//! Task 4 makes most of the surface live in one commit regardless of how the
+//! suppression is spelled today). Delete this attribute once a builtin calls
+//! `Getopt`.
 #![allow(dead_code)]
 
 use crate::command::DeclArg;

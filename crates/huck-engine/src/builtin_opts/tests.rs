@@ -1,6 +1,10 @@
 use super::*;
 use crate::shell_state::Shell;
 
+// The tuple is the scanner's three observable outputs (opts scanned, the
+// rest-index, and the terminal error code); the brief specifies this exact
+// shape, so factor-out is a spec deviation rather than a real simplification.
+#[allow(clippy::type_complexity)]
 fn scan(spec: &str, argv: &[&str]) -> (Vec<(char, Option<String>)>, usize, Option<i32>) {
     let args: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     let mut sh = Shell::new();
