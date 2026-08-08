@@ -1,0 +1,97 @@
+---
+title: "What a duplication audit found: readonly -pa"
+date: 2026-08-08
+summary: "We went looking for copy-pasted code and found a bug you can type. Four builtins reject bundled short options that bash accepts — including one that rejects the exact spelling its own usage message documents."
+tags: ["quality", "builtins", "ci"]
+version: null
+draft: false
+---
+
+Combining short options is something you do without thinking. `ls -la`.
+`grep -rn`. Shell builtins take them too, and bash is happy to bundle:
+
+```bash
+# bash 5.2.21
+$ readonly -pa
+declare -ar BASH_VERSINFO=([0]="5" [1]="2" [2]="21" ...)
+$ wait -fn
+$ history -cd 1
+```
+
+huck was not.
+
+```bash
+# huck, before this pass — and still today
+$ readonly -pa
+huck: line 1: readonly: -pa: invalid option
+$ wait -fn
+huck: line 1: wait: -fn: invalid option
+$ history -cd 1
+huck: line 1: history: -cd: invalid option
+```
+
+The `wait` one is the pick of the bunch. Reject the flags and it prints its
+own usage message, which reads `wait [-fn] [-p var] [id ...]` — it is
+documenting the spelling it just refused.
+
+## Why four, and not all of them
+
+`export -pn` works. `declare -pi` works. `jobs -lp` works. The split is not
+about which builtin is important; it is about which one got written on which
+day. Every builtin in huck parses its own flags, and there are two house
+styles: one walks the characters after the `-` (so bundling falls out for
+free), the other compares the whole argument against a list of known strings
+(so `-pa` matches nothing and is rejected). Twenty-odd hand-written parsers,
+two incompatible habits, and no way to tell from the outside which one you
+are talking to.
+
+That is what a duplication audit is for. Nobody set out to make `readonly`
+behave differently from `export`. It happened because the same small job was
+solved twenty times.
+
+## What actually got fixed
+
+Not that bug — it is a shared-plumbing change touching every builtin, so it
+gets designed rather than patched, and it is filed as
+[#496](https://github.com/jdstanhope/huck/issues/496).
+
+What got fixed is the reason it survived this long. The build now refuses to
+compile code the linter complains about, which it had never done:
+
+```bash
+# before
+$ cargo clippy --workspace --all-targets 2>&1 | grep -c '^warning:'
+91
+```
+
+```bash
+# after
+$ cargo clippy --workspace --all-targets -- -D warnings; echo "exit=$?"
+exit=0
+```
+
+Two of those 91 were a day old, from the previous release. The gate is
+pinned to a fixed linter version on purpose: linters gain new rules on nearly
+every release, and a floating one turns the build red on a schedule nobody
+chose.
+
+The test suite got the same treatment. huck is checked by running fragments
+through both shells and demanding byte-identical output, across 277 scripts —
+and 276 of them had copy-pasted the same scaffolding, which had quietly
+drifted apart. That is now one shared file.
+
+One thing deliberately left alone: each script still spells out how it feeds
+a fragment to the shell. Piping to standard input, passing `-c`, and running
+a file are three genuinely different paths through huck, and several tests
+exist precisely to pin one of them. Folding those together would have made
+the suite tidier and stopped it testing what it was written to test.
+
+## Still open
+
+- [#496](https://github.com/jdstanhope/huck/issues/496) — the bundled-options
+  bug above, and the shared flag parser that fixes the class
+- [#499](https://github.com/jdstanhope/huck/issues/499) — one more
+  consolidation, parked because the two fields it would merge mean different
+  things
+- [#476](https://github.com/jdstanhope/huck/issues/476) — job-control tests
+  fail randomly when the machine is busy; measured this pass, not yet fixed
