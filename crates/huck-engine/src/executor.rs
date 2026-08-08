@@ -1380,8 +1380,21 @@ fn run_redirected(
 /// `continue` jumps to the next condition test; `exit` propagates; a
 /// pending SIGINT (Ctrl-C) ends the loop with status 130.
 fn run_while(clause: &WhileClause, shell: &mut Shell) -> ExecOutcome {
+    with_loop_depth(shell, |sh| run_while_inner(clause, sh))
+}
+
+/// Run `f` one loop level deeper, restoring the depth on the way out.
+///
+/// `loop_depth` is what `break`/`continue` count against, so every construct
+/// they can escape must bump it exactly once around its body. Four constructs
+/// (`while`/`until`, `for`, arithmetic `for`, `select`) spelled that
+/// increment/call/decrement triple out by hand and identically; this is the one
+/// owner. A closure rather than an RAII guard because the guard would have to
+/// hold the `&mut Shell` it needs to hand to the body (cf. `cwd_scope::with_cwd`,
+/// which takes the same shape for the same reason).
+fn with_loop_depth<R>(shell: &mut Shell, f: impl FnOnce(&mut Shell) -> R) -> R {
     shell.loop_depth = shell.loop_depth.saturating_add(1);
-    let result = run_while_inner(clause, shell);
+    let result = f(shell);
     shell.loop_depth = shell.loop_depth.saturating_sub(1);
     result
 }
@@ -1446,10 +1459,7 @@ fn run_while_inner(clause: &WhileClause, shell: &mut Shell) -> ExecOutcome {
 /// `exit` propagates, and a pending SIGINT (Ctrl-C) ends the loop
 /// with status 130.
 fn run_for(clause: &ForClause, shell: &mut Shell) -> ExecOutcome {
-    shell.loop_depth = shell.loop_depth.saturating_add(1);
-    let result = run_for_inner(clause, shell);
-    shell.loop_depth = shell.loop_depth.saturating_sub(1);
-    result
+    with_loop_depth(shell, |sh| run_for_inner(clause, sh))
 }
 
 fn run_for_inner(clause: &ForClause, shell: &mut Shell) -> ExecOutcome {
@@ -1703,10 +1713,7 @@ fn run_arith(body: &crate::lexer::Word, line: u32, shell: &mut Shell) -> ExecOut
 /// (None = always true). Evaluates `step` after each iteration body.
 /// Mirrors `run_for`'s break/continue/return/exit/SIGINT handling.
 fn run_arith_for(clause: &crate::command::ArithForClause, shell: &mut Shell) -> ExecOutcome {
-    shell.loop_depth = shell.loop_depth.saturating_add(1);
-    let result = run_arith_for_inner(clause, shell);
-    shell.loop_depth = shell.loop_depth.saturating_sub(1);
-    result
+    with_loop_depth(shell, |sh| run_arith_for_inner(clause, sh))
 }
 
 fn run_arith_for_inner(clause: &crate::command::ArithForClause, shell: &mut Shell) -> ExecOutcome {
@@ -1874,10 +1881,7 @@ fn read_line_into_reply(shell: &mut Shell) -> ExecOutcome {
 /// runs the body zero times; `break`/`continue N` bubble via the v79
 /// loop infrastructure. Wrapped to keep a single `loop_depth` return path.
 fn run_select(clause: &crate::command::SelectClause, shell: &mut Shell) -> ExecOutcome {
-    shell.loop_depth = shell.loop_depth.saturating_add(1);
-    let result = run_select_inner(clause, shell);
-    shell.loop_depth = shell.loop_depth.saturating_sub(1);
-    result
+    with_loop_depth(shell, |sh| run_select_inner(clause, sh))
 }
 
 fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell) -> ExecOutcome {

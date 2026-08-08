@@ -2,27 +2,8 @@
 //! tests drive the slice helper through the lex→expand pipeline.
 
 use super::*;
-use crate::command::{Command, SimpleCommand};
 use crate::shell_state::Shell;
-
-fn first_arg_word(input: &str) -> Word {
-    let src = format!("echo {input}");
-    let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new(
-        &src,
-        &Default::default(),
-        crate::lexer::LexerOptions::default(),
-    ))
-    .expect("parse")
-    .expect("non-empty");
-    let pipeline = match seq.first {
-        Command::Pipeline(p) => p,
-        other => panic!("expected Pipeline, got {other:?}"),
-    };
-    match &pipeline.commands[0] {
-        Command::Simple(SimpleCommand::Exec(e)) => e.args[0].clone(),
-        other => panic!("expected SimpleCommand::Exec, got {other:?}"),
-    }
-}
+use crate::test_support::first_arg_word;
 
 fn expand_for_test(shell: &mut Shell, input: &str) -> String {
     let w = first_arg_word(input);
