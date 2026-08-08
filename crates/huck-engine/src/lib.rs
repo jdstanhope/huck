@@ -12,6 +12,7 @@ pub(crate) mod arith;
 pub(crate) mod array_transforms;
 pub(crate) mod assoc_map;
 pub(crate) mod assoc_order;
+pub(crate) mod builtin_opts;
 #[doc(hidden)]
 pub mod builtins;
 pub(crate) mod capture_test_hook;
