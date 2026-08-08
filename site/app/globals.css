@@ -16,6 +16,8 @@ html { scroll-behavior: smooth; }
 body { @apply bg-white text-zinc-900 antialiased; }
 .dark body { @apply bg-zinc-950 text-zinc-100; }
 
+/* `components/CodeBlock` calls shiki's `codeToHtml`, which DOES emit a `.shiki`
+   class plus `--shiki-*-bg` custom properties. Marketing pages only. */
 .shiki, .shiki span {
   color: var(--shiki-light) !important;
   background-color: var(--shiki-light-bg) !important;
@@ -23,4 +25,18 @@ body { @apply bg-white text-zinc-900 antialiased; }
 .dark .shiki, .dark .shiki span {
   color: var(--shiki-dark) !important;
   background-color: var(--shiki-dark-bg) !important;
+}
+
+/* Blog posts go through `rehype-pretty-code` instead, which emits the per-token
+   `--shiki-light` / `--shiki-dark` properties but NO `.shiki` class — so the
+   rules above never matched a post, and every fence rendered in the prose body
+   colour with no highlighting at all despite the pipeline computing it.
+   Key off `data-theme`, which rehype-pretty-code does set on the `pre`.
+   No `background-color` here: `keepBackground: false` means it never emits the
+   `--shiki-*-bg` pair, and the terminal frame supplies the background. */
+pre[data-theme] span {
+  color: var(--shiki-light);
+}
+.dark pre[data-theme] span {
+  color: var(--shiki-dark);
 }

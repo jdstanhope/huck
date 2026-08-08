@@ -1,5 +1,6 @@
 import * as runtime from "react/jsx-runtime";
 import { CodeBlock } from "./CodeBlock";
+import { MdxPre } from "./MdxPre";
 
 type MDXComponents = Record<string, React.ComponentType<any>>; // eslint-disable-line @typescript-eslint/no-explicit-any -- MDX passes each component very different prop shapes (e.g. CodeBlock's {code, lang}); a shared map can't be typed more precisely than this.
 
@@ -17,7 +18,9 @@ const useMDX = (code: string) => {
   }>;
 };
 
-const components: MDXComponents = { CodeBlock };
+// `pre` is what `rehype-pretty-code` emits for every fence; overriding it is
+// what puts the terminal frame around a post's code without touching content.
+const components: MDXComponents = { CodeBlock, pre: MdxPre };
 
 export function MDXContent({ code }: { code: string }) {
   const Component = useMDX(code);
