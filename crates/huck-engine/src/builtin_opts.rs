@@ -178,11 +178,18 @@ impl<'a> Getopt<'a> {
         }
     }
 
+    // Neither helper calls `shell.report_error(SpecialBuiltinUsage)` directly —
+    // that would fire unconditionally for every builtin this scanner serves,
+    // including the non-special ones (`declare`/`typeset`/`local`), and exit a
+    // posix shell that bash keeps running (bash only treats `readonly`/`export`
+    // as POSIX special builtins among the declaration builtins). Setting
+    // `builtin_usage_error` and leaving the report to the executor's ALREADY
+    // gated consume site (`is_special_builtin(&resolved.program) && posix`,
+    // executor.rs ~4810) makes the fatality decision in exactly one place.
     fn fail_invalid(&self, c: char, shell: &mut Shell, err: &mut dyn Write) {
         crate::sh_error_to!(shell, err, None, "{}: -{c}: invalid option", self.name);
         let _ = writeln!(err, "{}: usage: {}", self.name, usage_for(self.name));
         shell.builtin_usage_error = Some(2);
-        shell.report_error(crate::error_fatality::ErrorKind::SpecialBuiltinUsage { status: 2 });
     }
 
     fn fail_missing_value(&self, c: char, shell: &mut Shell, err: &mut dyn Write) {
@@ -195,7 +202,6 @@ impl<'a> Getopt<'a> {
         );
         let _ = writeln!(err, "{}: usage: {}", self.name, usage_for(self.name));
         shell.builtin_usage_error = Some(2);
-        shell.report_error(crate::error_fatality::ErrorKind::SpecialBuiltinUsage { status: 2 });
     }
 }
 

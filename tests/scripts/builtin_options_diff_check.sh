@@ -38,7 +38,20 @@ check "attached value"        'read -n3 </dev/null; echo rc=$?'
 check "separate value"        'read -n 3 </dev/null; echo rc=$?'
 
 # ── posix fatality of a special-builtin usage error (v358) ──
+# readonly IS a POSIX special builtin: a bad option exits a posix shell.
 check "posix readonly -Q"     'set -o posix; readonly -Q; echo SURVIVED'
 check "non-posix readonly -Q" 'readonly -Q; echo SURVIVED'
+
+# declare/typeset/local are NOT POSIX special builtins: a bad option must
+# NOT exit a posix shell, even though they share the same Getopt scanner as
+# readonly/export. This axis caught a real regression (#496 Task 4 review)
+# where the scanner called report_error unconditionally instead of leaving
+# the fatality decision to the executor's is_special_builtin-gated consume.
+check "posix declare -Q"      'set -o posix; declare -Q; echo SURVIVED'
+check "non-posix declare -Q"  'declare -Q; echo SURVIVED'
+check "posix typeset -Q"      'set -o posix; typeset -Q; echo SURVIVED'
+check "non-posix typeset -Q"  'typeset -Q; echo SURVIVED'
+check "posix local -Q"        'set -o posix; f() { local -Q; }; f; echo SURVIVED'
+check "non-posix local -Q"    'f() { local -Q; }; f; echo SURVIVED'
 
 harness_summary

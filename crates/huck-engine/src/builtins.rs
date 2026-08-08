@@ -2220,7 +2220,7 @@ fn builtin_declare_decl(
                         shell,
                         err,
                         None,
-                        "declare: +r: readonly attribute cannot be removed"
+                        "{name}: +r: readonly attribute cannot be removed"
                     );
                     return ExecOutcome::Continue(1);
                 }
@@ -2231,7 +2231,7 @@ fn builtin_declare_decl(
                         shell,
                         err,
                         None,
-                        "declare: +a: array attribute cannot be removed"
+                        "{name}: +a: array attribute cannot be removed"
                     );
                     return ExecOutcome::Continue(1);
                 }
@@ -2245,7 +2245,7 @@ fn builtin_declare_decl(
                         shell,
                         err,
                         None,
-                        "declare: +A: associative attribute cannot be removed"
+                        "{name}: +A: associative attribute cannot be removed"
                     );
                     return ExecOutcome::Continue(1);
                 }
@@ -2258,9 +2258,15 @@ fn builtin_declare_decl(
                         shell,
                         err,
                         None,
-                        "declare: +{}: invalid option",
+                        "{name}: +{}: invalid option",
                         other as char
                     );
+                    let _ = writeln!(
+                        err,
+                        "{name}: usage: {}",
+                        crate::builtin_opts::usage_for(name)
+                    );
+                    shell.builtin_usage_error = Some(2);
                     return ExecOutcome::Continue(2);
                 }
             }
