@@ -12,6 +12,13 @@ tools/run_results.tsv
 # Soak-harness per-run output (samples.csv, rollup.log, workload.log, …)
 /tools/soak/runs/
 
+# Coverage profiles. `cargo llvm-cov` keeps its own under /target, but any
+# instrumented binary run WITHOUT `LLVM_PROFILE_FILE` set drops
+# `default_*.profraw` in the cwd — a full-suite coverage run left 72 of them in
+# the repo root, one `git add -A` away from being committed.
+*.profraw
+*.profdata
+
 # huck website (Next.js app)
 site/node_modules
 site/.next
