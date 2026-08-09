@@ -66,6 +66,20 @@ fn unknown_option_reports_two_and_stops() {
 }
 
 #[test]
+fn colon_value_marker_is_never_itself_an_accepted_option() {
+    // The spec's ':' is a VALUE marker, not an option character. A spec
+    // that contains ':' (e.g. because it has a value-taking option) must
+    // still reject a literal `-:` as invalid, not hand back `Opt { ch: ':'
+    // }` — every call site's `match` has no arm for ':' and panics via
+    // `_ => unreachable!("spec and match must agree")` (the bug this test
+    // pins: `accepts(':')` used to return true because ':' appears in the
+    // spec string for an unrelated reason).
+    let (opts, _, err) = scan("lrp:dt", &["-:"]);
+    assert!(opts.is_empty(), "`-:` must not be scanned as an option");
+    assert_eq!(err, Some(2), "`-:` must take the invalid-option path");
+}
+
+#[test]
 fn missing_value_message_is_bashs_shape_not_getopt3s() {
     // bash: `hash: -p: option requires an argument` — NOT the getopt(3)
     // `hash: option requires an argument -- p` shape. A prior version of

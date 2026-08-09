@@ -29,6 +29,18 @@ for b in unset readonly read type hash declare typeset printf command mapfile \
 done
 check "local -Q invalid option" 'f() { local -Q; }; f'
 
+# ── `-:` must not panic (review finding, post-Task-7): the spec string uses
+# ':' as a VALUE marker, but `Getopt::accepts` compared it as if it were a
+# real option character, so `-:` was "accepted", handed to the builtin as
+# `Opt { ch: ':' }`, and every call site's `_ => unreachable!("spec and
+# match must agree")` panicked the process (rc 101, killing the rest of a
+# script). One builtin per spec family: `hash`'s spec ("lrp:dt") DOES
+# contain a value marker (this was the exact crash repro); `unset`'s spec
+# ("fvn") has none, so `-:` was already safe there and this row guards
+# against a regression in the other direction.
+check "hash -: does not panic"  'hash -:'
+check "unset -: does not panic" 'unset -:'
+
 # ── missing-value message: `NAME: -C: option requires an argument`, NOT the
 # getopt(3) `NAME: option requires an argument -- C` shape (#496 Task 5
 # review: the scanner had the wrong shape, caught only because `hash -p` was

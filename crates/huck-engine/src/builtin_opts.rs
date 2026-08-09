@@ -46,13 +46,6 @@ pub(crate) enum ArgView<'a> {
 }
 
 impl ArgView<'_> {
-    #[allow(dead_code)] // unused: Getopt itself never calls len(), only at()
-    fn len(&self) -> usize {
-        match self {
-            ArgView::Plain(v) => v.len(),
-            ArgView::Decl(v) => v.len(),
-        }
-    }
     /// `None` when the slot cannot be an option (a compound assignment).
     fn at(&self, i: usize) -> Option<&str> {
         match self {
@@ -104,7 +97,13 @@ impl<'a> Getopt<'a> {
     }
 
     fn accepts(&self, c: char) -> bool {
-        self.spec.chars().any(|sc| sc == c)
+        // ':' is the spec's VALUE marker, never an option character itself —
+        // a spec like "lrp:dt" must not accept a literal `-:` just because
+        // ':' appears in the string. Rejecting it here sends `-:` down the
+        // normal invalid-option path instead of handing an `Opt { ch: ':' }`
+        // to a builtin whose `match` has no arm for it (a panic: every
+        // `_ => unreachable!("spec and match must agree")` call site).
+        c != ':' && self.spec.chars().any(|sc| sc == c)
     }
 
     pub fn next_opt(&mut self, shell: &mut Shell, err: &mut dyn Write) -> Result<Option<Opt>, i32> {
