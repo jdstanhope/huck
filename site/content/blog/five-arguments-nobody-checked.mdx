@@ -1,0 +1,107 @@
+---
+title: "Five arguments nobody checked"
+date: 2026-08-09
+summary: "A round of small fixes to what builtins do with their arguments. Each one was a rule huck had invented, or a rule of bash's it hadn't noticed — and two of them hid because they were half-right."
+tags: ["builtins", "bash-compat"]
+version: null
+draft: false
+---
+
+Five small divergences, all in the same place: what a builtin does with the
+arguments you give it. None is dramatic on its own. Collectively they're the
+kind of thing that makes a script behave differently and leaves you guessing
+why.
+
+## Rules huck invented
+
+Two of these were errors bash simply doesn't produce.
+
+```bash
+# before
+$ f(){ local +x x=1; echo "rc=$? [$x]"; }; f
+huck: line 1: local: `+x': not a valid identifier
+rc=1 [1]
+```
+
+```bash
+# after
+$ f(){ local +x x=1; echo "rc=$? [$x]"; }; f
+rc=0 [1]
+```
+
+`local` accepts `+`-prefixed flags in bash — they say "don't give this variable
+that attribute". huck had never implemented them, and a comment in the source
+confidently stated that `local` takes no such options. It does.
+
+The other invented rule was `wait -p VAR` insisting on being paired with `-n`:
+
+```bash
+# before                                  # after
+$ wait -p v; echo rc=$?                   $ wait -p v; echo rc=$?
+huck: line 1: wait: -p: option requires -n   rc=0
+rc=2
+```
+
+bash has no such requirement. It takes the option, has no process to report,
+and leaves the variable alone.
+
+## Rules bash has that huck didn't
+
+```bash
+# before                          # after
+$ alias xx=yy                     $ alias xx=yy
+$ alias -p xx                     $ alias -p xx
+alias xx='yy'                     alias xx='yy'
+                                  alias xx='yy'
+```
+
+That looks like a bug until you know what `-p` means: print the whole alias
+table. bash prints the table *and then* handles the names you asked about, so
+the same alias legitimately appears twice. Which also means `alias -p nosuch`
+prints your entire table before telling you `nosuch` doesn't exist.
+
+And `mapfile` names what it couldn't parse, rather than saying "number" for
+everything:
+
+```bash
+# before                                  # after
+$ mapfile -n abc A                        $ mapfile -n abc A
+mapfile: abc: invalid number              mapfile: abc: invalid line count
+```
+
+`-O` says "invalid array origin", `-c` says "invalid callback quantum". The exit
+code was wrong too — 2 where bash uses 1.
+
+## The two that hid
+
+```bash
+# before                          # after
+$ command -v -V ls                $ command -v -V ls
+/usr/bin/ls                       ls is /usr/bin/ls
+```
+
+`-v` prints the path; `-V` describes. bash takes whichever came **last**. huck
+always took `-v` — which is right whenever `-v` is last, so `command -V -v ls`
+and `command -Vv ls` both already matched. Only one of the four orderings was
+wrong, which is exactly why nobody noticed.
+
+The `local` fix hid the same way. `local +x` looks like it should *remove* the
+export attribute, so you'd expect implementing it to require real machinery. It
+doesn't: bash's `local` creates a fresh variable carrying only the attributes
+you asked for, so "don't give it this one" is already what happens. Accepting
+the flag and doing nothing is the correct implementation, not a shortcut.
+
+Checking that, though, turned up something real —
+[#539](https://github.com/jdstanhope/huck/issues/539): huck's `local` inherits
+the integer attribute from the variable it shadows, and the value goes wrong
+with it. `local N=abc` inside a function where `N` was `declare -i` gives you
+`0`, not `abc`.
+
+## Still open
+
+- [#539](https://github.com/jdstanhope/huck/issues/539) — `local` inheriting
+  attributes it shouldn't
+- [#509](https://github.com/jdstanhope/huck/issues/509) — `hash` applies its
+  flags in a different order from bash
+- [#512](https://github.com/jdstanhope/huck/issues/512) — `jobs -x`
+- [#530](https://github.com/jdstanhope/huck/issues/530) — `pushd -n` / `popd -n`
