@@ -153,4 +153,19 @@ check "non-posix typeset -Q"  'typeset -Q; echo SURVIVED'
 check "posix local -Q"        'set -o posix; f() { local -Q; }; f; echo SURVIVED'
 check "non-posix local -Q"    'f() { local -Q; }; f; echo SURVIVED'
 
+# ── `+`-option handling (#521, #515) ──
+# `declare` and `compopt` genuinely take `+` options; the scanner deliberately
+# does not (bash's internal_getopt has no `+` either), so those two keep their
+# own `+` loops — but share ONE emit, or the diagnostics drift apart, which is
+# what these rows pin.
+check "compopt +invalid"        'compopt +z'
+check "compopt +unknown 2"      'compopt +q'
+check "compopt +o is real"      'compopt +o nospace'
+check "declare +invalid"        'declare +z v=1'
+# bash's complete/compgen do NOT parse `+` at all — `+z` is a NAME.
+check "complete + is a name"    'complete +z foo; echo rc=$?'
+check "complete +o is a name"   'complete +o nospace foo; echo rc=$?'
+check "complete empty compspec" 'complete foo; echo rc=$?'
+check "complete -- then -o"     'complete -- -o foo; echo rc=$?'
+
 harness_summary

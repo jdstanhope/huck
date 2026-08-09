@@ -21,12 +21,6 @@ struct ParsedFlags {
     print: bool,
     /// -r: remove mode.
     remove: bool,
-    /// True if `-o`/`+o` was used. Tracked separately from `spec` because
-    /// `+o NAME` may set an option to its default value (false) — leaving
-    /// `spec == CompletionSpec::default()` — yet still represent an
-    /// intentional mutation that should bypass the "nothing to complete"
-    /// guard in register mode.
-    options_touched: bool,
     /// Trailing positional args (command names for `complete`, optional
     /// word arg for `compgen`).
     positional: Vec<String>,
@@ -37,19 +31,15 @@ struct ParsedFlags {
 /// invoked name ("complete" or "compgen"), used both for the shared
 /// scanner's diagnostics and this function's own.
 ///
-/// The `-`-prefixed run is scanned by the shared `Getopt` (#496); on
-/// `Err(code)` it has ALREADY emitted both diagnostic lines, so this just
-/// propagates the code. The `+`-prefixed handling below is NOT converted —
-/// `Getopt` doesn't understand `+` (neither does bash's own
-/// `internal_getopt` for this builtin family), so a `+`-prefixed arg makes
-/// the scanner stop immediately and this function hand-processes ONE such
-/// run itself, then tries the scanner again — the same alternating shape
-/// Task 4 used for `declare`'s `-`/`+` split. The `+`-side logic (including
-/// its pre-existing quirks: `+D`/`+E`/`+p`/`+r` are accepted exactly like
-/// `-D`/`-E`/`-p`/`-r` since bash's own `complete`/`compgen` don't gate them
-/// on `+` either, and an unrecognized `+x` is diagnosed with a literal `-x`
-/// in the message) is copied verbatim from the pre-v359 implementation —
-/// only its indexing changed, to fit the alternating loop.
+/// Scanned entirely by the shared `Getopt` (#496); on `Err(code)` it has
+/// ALREADY emitted both diagnostic lines, so this just propagates the code.
+///
+/// There is no `+` handling, and that is the point: bash's `complete` and
+/// `compgen` do not parse `+` at all (#515). A `+`-prefixed argument is simply
+/// the first non-option, so the scanner stops and it becomes a NAME — which is
+/// exactly what bash does. huck previously ran a hand-rolled `+` loop here,
+/// alternating with the scanner; it rejected `+z` as an invalid option and
+/// swallowed `complete +o nospace foo`'s names.
 fn parse_flags(
     args: &[String],
     allow_d_e: bool,
@@ -75,148 +65,78 @@ fn parse_flags(
     } else {
         "abcdefgjksuvo:A:G:W:F:X:P:S:"
     };
-    let mut idx = 0;
+    // bash's `complete`/`compgen` do NOT parse `+` at all (#515): measured,
+    // `complete +o nospace foo` registers THREE NAMES — `foo`, `nospace` and
+    // `+o` — each with an empty compspec. huck used to run a `+` loop here,
+    // alternating with the `-` scan; that loop is gone, so one pass suffices.
+    // (`compopt` is different: its `+o` really does remove an option.)
+    let mut g =
+        crate::builtin_opts::Getopt::new(name, crate::builtin_opts::ArgView::Plain(args), spec);
     loop {
-        let pre_idx = idx;
-        let mut g = crate::builtin_opts::Getopt::new(
-            name,
-            crate::builtin_opts::ArgView::Plain(&args[idx..]),
-            spec,
-        );
-        loop {
-            match g.next_opt(shell, err) {
-                Ok(Some(o)) => match o.ch {
-                    'F' => out.spec.function = Some(o.value.expect("F takes a value")),
-                    'W' => out.spec.wordlist = Some(o.value.expect("W takes a value")),
-                    'G' => out.spec.glob = Some(o.value.expect("G takes a value")),
-                    'A' => {
-                        let v = o.value.expect("A takes a value");
-                        match Action::parse(&v) {
-                            Some(action) => out.spec.actions.push(action),
-                            None => {
-                                crate::sh_error_to!(
-                                    shell,
-                                    err,
-                                    None,
-                                    "{name}: {v}: invalid action name"
-                                );
-                                return Err(2);
-                            }
-                        }
-                    }
-                    'P' => out.spec.prefix = Some(o.value.expect("P takes a value")),
-                    'S' => out.spec.suffix = Some(o.value.expect("S takes a value")),
-                    'X' => out.spec.filter = Some(o.value.expect("X takes a value")),
-                    'o' => {
-                        let v = o.value.expect("o takes a value");
-                        if apply_option(&mut out.spec.options, &v, false).is_err() {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'F' => out.spec.function = Some(o.value.expect("F takes a value")),
+                'W' => out.spec.wordlist = Some(o.value.expect("W takes a value")),
+                'G' => out.spec.glob = Some(o.value.expect("G takes a value")),
+                'A' => {
+                    let v = o.value.expect("A takes a value");
+                    match Action::parse(&v) {
+                        Some(action) => out.spec.actions.push(action),
+                        None => {
                             crate::sh_error_to!(
                                 shell,
                                 err,
                                 None,
-                                "{name}: {v}: invalid completion option"
+                                "{name}: {v}: invalid action name"
                             );
                             return Err(2);
                         }
-                        out.options_touched = true;
                     }
-                    'D' if allow_d_e => out.is_default = true,
-                    'E' if allow_d_e => out.is_empty = true,
-                    'p' if allow_d_e => out.print = true,
-                    'r' if allow_d_e => out.remove = true,
-                    'a' | 'b' | 'c' | 'd' | 'e' | 'f' | 'g' | 'j' | 'k' | 's' | 'u' | 'v' => {
-                        let action = match o.ch {
-                            'a' => Action::Alias,
-                            'b' => Action::Builtin,
-                            'c' => Action::Command,
-                            'd' => Action::Directory,
-                            'e' => Action::Export,
-                            'f' => Action::File,
-                            'g' => Action::Group,
-                            'j' => Action::Job,
-                            'k' => Action::Keyword,
-                            's' => Action::Service,
-                            'u' => Action::User,
-                            'v' => Action::Variable,
-                            _ => unreachable!(),
-                        };
-                        out.spec.actions.push(action);
-                    }
-                    _ => return Err(g.reject_unhandled(o.ch, shell, err)),
-                },
-                Ok(None) => break,
-                Err(code) => return Err(code),
-            }
-        }
-        idx += g.rest_index();
-
-        // `--` terminates option processing entirely, even for a `+`-look
-        // arg that follows it (mirrors declare's Task 4 handling).
-        if idx > pre_idx && args.get(idx - 1).map(String::as_str) == Some("--") {
-            break;
-        }
-
-        let Some(arg) = args.get(idx) else { break };
-        if !(arg.starts_with('+') && arg.len() > 1) {
-            break;
-        }
-        // ---- verbatim pre-v359 `+`-run handling (see doc comment above) ----
-        let chars: Vec<char> = arg[1..].chars().collect();
-        let mut ci = 0;
-        while ci < chars.len() {
-            let c = chars[ci];
-            match c {
-                'F' | 'W' | 'G' | 'A' | 'P' | 'S' | 'X' | 'o' => {
-                    if c != 'o' {
-                        crate::sh_error_to!(shell, err, None, "{name}: +{c}: not supported");
-                        return Err(2);
-                    }
-                    let arg_value: String = if ci + 1 < chars.len() {
-                        let v: String = chars[ci + 1..].iter().collect();
-                        ci = chars.len();
-                        v
-                    } else if idx + 1 < args.len() {
-                        idx += 1;
-                        ci = chars.len();
-                        args[idx].clone()
-                    } else {
+                }
+                'P' => out.spec.prefix = Some(o.value.expect("P takes a value")),
+                'S' => out.spec.suffix = Some(o.value.expect("S takes a value")),
+                'X' => out.spec.filter = Some(o.value.expect("X takes a value")),
+                'o' => {
+                    let v = o.value.expect("o takes a value");
+                    if apply_option(&mut out.spec.options, &v, false).is_err() {
                         crate::sh_error_to!(
                             shell,
                             err,
                             None,
-                            "{name}: -{c}: option requires an argument"
-                        );
-                        return Err(2);
-                    };
-                    if apply_option(&mut out.spec.options, &arg_value, true).is_err() {
-                        crate::sh_error_to!(
-                            shell,
-                            err,
-                            None,
-                            "{name}: {arg_value}: invalid completion option"
+                            "{name}: {v}: invalid completion option"
                         );
                         return Err(2);
                     }
-                    out.options_touched = true;
                 }
                 'D' if allow_d_e => out.is_default = true,
                 'E' if allow_d_e => out.is_empty = true,
                 'p' if allow_d_e => out.print = true,
                 'r' if allow_d_e => out.remove = true,
                 'a' | 'b' | 'c' | 'd' | 'e' | 'f' | 'g' | 'j' | 'k' | 's' | 'u' | 'v' => {
-                    crate::sh_error_to!(shell, err, None, "{name}: +{c}: not supported");
-                    return Err(2);
+                    let action = match o.ch {
+                        'a' => Action::Alias,
+                        'b' => Action::Builtin,
+                        'c' => Action::Command,
+                        'd' => Action::Directory,
+                        'e' => Action::Export,
+                        'f' => Action::File,
+                        'g' => Action::Group,
+                        'j' => Action::Job,
+                        'k' => Action::Keyword,
+                        's' => Action::Service,
+                        'u' => Action::User,
+                        'v' => Action::Variable,
+                        _ => unreachable!(),
+                    };
+                    out.spec.actions.push(action);
                 }
-                other => {
-                    crate::sh_error_to!(shell, err, None, "{name}: -{other}: invalid option");
-                    return Err(2);
-                }
-            }
-            ci += 1;
+                _ => return Err(g.reject_unhandled(o.ch, shell, err)),
+            },
+            Ok(None) => break,
+            Err(code) => return Err(code),
         }
-        idx += 1;
     }
-    out.positional = args[idx..].to_vec();
+    out.positional = args[g.rest_index()..].to_vec();
     Ok(out)
 }
 
@@ -412,13 +332,11 @@ fn register_complete(parsed: &ParsedFlags, err: &mut dyn Write, shell: &mut Shel
         );
         return ExecOutcome::Continue(2);
     }
-    if !parsed.positional.is_empty()
-        && parsed.spec == CompletionSpec::default()
-        && !parsed.options_touched
-    {
-        crate::sh_error_to!(shell, err, None, "complete: nothing to complete");
-        return ExecOutcome::Continue(1);
-    }
+    // No "nothing to complete" guard: bash registers an EMPTY compspec quite
+    // happily. Measured — `complete foo; complete -p` prints `complete foo`,
+    // rc 0. The guard rejected that outright, and also swallowed the names in
+    // `complete +z foo` and `complete -- -o foo`, both of which bash registers
+    // (#515). Nothing in the tree pinned it.
     let specs = Rc::make_mut(&mut shell.completion_specs);
     if parsed.is_default {
         specs.default_spec = Some(parsed.spec.clone());
@@ -660,7 +578,10 @@ pub fn builtin_compopt(
                 'D' => is_default = true,
                 'E' => is_empty = true,
                 other => {
-                    crate::sh_error_to!(shell, err, None, "compopt: -{other}: invalid option");
+                    // #521: this reported `-{other}` with no usage line while
+                    // `declare`'s sibling loop reported `+{other}` with one.
+                    // Both now go through the shared emit.
+                    crate::builtin_opts::emit_invalid_plus_option("compopt", other, shell, err);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -874,12 +795,16 @@ mod tests {
     }
 
     #[test]
-    fn complete_plus_o_nosort_clears_it() {
+    fn complete_plus_o_nosort_is_a_name_not_an_option() {
+        // Was `complete_plus_o_nosort_clears_it` — same wrong premise as
+        // `complete_does_not_parse_plus_o_at_all` above (#515). `compopt +o`
+        // IS real and still clears; `complete +o` is not.
         let mut sh = Shell::new();
         let (_, c1) = run_complete(&["-o", "nosort", "-W", "x", "--", "foo"], &mut sh);
         assert_eq!(c1, 0);
         let (_, c2) = run_complete(&["+o", "nosort", "--", "foo"], &mut sh);
         assert_eq!(c2, 0);
+        assert!(sh.completion_specs.by_command.contains_key("+o"));
         assert!(!sh.completion_specs.by_command["foo"].options.nosort);
     }
 
@@ -895,10 +820,18 @@ mod tests {
     }
 
     #[test]
-    fn complete_nothing_to_complete_errors() {
+    fn complete_bare_name_registers_an_empty_compspec() {
+        // Was `complete_nothing_to_complete_errors`, asserting `code == 1`.
+        // That encoded a guard huck invented: bash registers an EMPTY compspec
+        // quite happily. Measured on bash 5.2.21 —
+        //   $ complete foo; complete -p
+        //   complete foo            (rc 0)
+        // The guard also swallowed the names in `complete +z foo` and
+        // `complete -- -o foo`, both of which bash registers (#515).
         let mut sh = Shell::new();
         let (_, code) = run_complete(&["foo"], &mut sh);
-        assert_eq!(code, 1);
+        assert_eq!(code, 0, "bash registers an empty compspec, rc 0");
+        assert!(sh.completion_specs.by_command.contains_key("foo"));
     }
 
     #[test]
@@ -1033,15 +966,35 @@ mod tests {
     }
 
     #[test]
-    fn complete_plus_o_clears_option() {
+    fn complete_does_not_parse_plus_o_at_all() {
+        // Was `complete_plus_o_clears_option`, asserting `complete +o nospace`
+        // CLEARS an option. bash does not parse `+` in `complete` at all —
+        // measured on bash 5.2.21:
+        //   $ complete -W x -o nospace -- foo; complete -p foo
+        //   complete -o nospace -W 'x' foo
+        //   $ complete +o nospace -- foo; complete -p
+        //   complete foo / complete nospace / complete +o / complete --
+        // i.e. all four tokens become NAMES and foo's spec is REPLACED by an
+        // empty one. The old test passed for the wrong reason after #515: the
+        // replacement spec has `nospace == false`, satisfying the assertion
+        // without anything having been "cleared".
         let mut sh = Shell::new();
         let (_, code) = run_complete(&["-W", "x", "-o", "nospace", "--", "foo"], &mut sh);
         assert_eq!(code, 0);
         assert!(sh.completion_specs.by_command["foo"].options.nospace);
 
         let (_, code) = run_complete(&["+o", "nospace", "--", "foo"], &mut sh);
-        assert_eq!(code, 0, "complete +o should be accepted");
-        assert!(!sh.completion_specs.by_command["foo"].options.nospace);
+        assert_eq!(code, 0);
+        for name in ["+o", "nospace", "--", "foo"] {
+            assert!(
+                sh.completion_specs.by_command.contains_key(name),
+                "{name} should have been registered as a NAME"
+            );
+        }
+        assert!(
+            !sh.completion_specs.by_command["foo"].options.nospace,
+            "foo's spec is replaced by an empty one, not merely cleared"
+        );
     }
 
     #[test]
