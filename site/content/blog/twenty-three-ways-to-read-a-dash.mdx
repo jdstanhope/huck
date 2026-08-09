@@ -99,15 +99,22 @@ differential suite that runs every fragment through both huck and bash was
 entirely green. None of them thought to type `-:`. It was caught by someone
 reading the code and asking what the colon meant.
 
-It is fixed, with a test. But the general shape — a bad option can abort the
-shell instead of complaining — is filed as
-[#523](https://github.com/jdstanhope/huck/issues/523), because a shell should
-never abort on something you typed.
+It is fixed, with a test. And so is the general shape behind it, in a follow-up
+that landed straight after: there were twenty-six places where a builtin could
+hit that same "this can't happen" and take the shell down with it. All of them
+now print an error and carry on, because a shell should never abort on something
+you typed ([#523](https://github.com/jdstanhope/huck/issues/523)).
+
+That change deliberately does *not* add a debug-only assertion to keep the
+mistake loud for developers. It's already loud somewhere better: if a builtin
+ever gains a flag it doesn't handle, bash accepts it and huck rejects it, so the
+differential suite goes red on its own.
 
 ## Still open
 
 Seventeen issues came out of this ([#507](https://github.com/jdstanhope/huck/issues/507)–[#523](https://github.com/jdstanhope/huck/issues/523)),
-each one measured against real bash before filing. A few you might actually hit:
+each one measured against real bash before filing. One of them (#523, above) is
+already done. A few of the rest you might actually hit:
 
 - [#511](https://github.com/jdstanhope/huck/issues/511) — `mapfile -u` (read from a
   given file descriptor) and its callback options aren't implemented.
