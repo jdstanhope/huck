@@ -897,37 +897,35 @@ fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
     // `-f` => function namespace, `-v` (or no flag) => variable namespace.
     // `-n` => variable namespace but unset the nameref variable ITSELF (no deref).
     let mut mode_fn = false;
+    let mut saw_v = false;
     let mut unset_nameref = false;
-    let mut idx = 0;
-    while idx < args.len() {
-        match args[idx].as_str() {
-            "-f" => {
-                mode_fn = true;
-                idx += 1;
-            }
-            "-v" => {
-                mode_fn = false;
-                idx += 1;
-            }
-            "-n" => {
-                unset_nameref = true;
-                idx += 1;
-            }
-            "--" => {
-                idx += 1;
-                break;
-            }
-            s if s.len() > 1 && s.starts_with('-') => {
-                crate::sh_error_to!(shell, err, None, "unset: {s}: invalid option");
-                // POSIX case #1: bad option is a usage error (the "cannot unset
-                // readonly" path below is runtime and stays unmarked).
-                shell.builtin_usage_error = Some(2);
-                return ExecOutcome::Continue(2);
-            }
-            _ => break,
+    let mut g =
+        crate::builtin_opts::Getopt::new("unset", crate::builtin_opts::ArgView::Plain(args), "fvn");
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'f' => mode_fn = true,
+                'v' => saw_v = true,
+                'n' => unset_nameref = true,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
     }
-    let names = &args[idx..];
+    // bash: `-f` and `-v` together is a runtime semantic error (not a usage
+    // error — the scanner already accepted both flags), status 1, script
+    // continues.
+    if mode_fn && saw_v {
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "unset: cannot simultaneously unset a function and a variable"
+        );
+        return ExecOutcome::Continue(1);
+    }
+    let names = &args[g.rest_index()..];
     let mut any_error = false;
     for arg in names {
         if mode_fn {
@@ -8615,7 +8613,20 @@ fn builtin_alias(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    if args.is_empty() {
+    let mut g =
+        crate::builtin_opts::Getopt::new("alias", crate::builtin_opts::ArgView::Plain(args), "p");
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'p' => {} // `-p` lists in the `alias`-reparseable form; same as no operands.
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
+        }
+    }
+    let operands = &args[g.rest_index()..];
+    if operands.is_empty() {
         let mut names: Vec<&String> = shell.aliases.keys().collect();
         names.sort();
         for name in names {
@@ -8625,7 +8636,7 @@ fn builtin_alias(
         return ExecOutcome::Continue(0);
     }
     let mut any_failed = false;
-    for arg in args {
+    for arg in operands {
         if let Some(eq) = arg.find('=') {
             let name = &arg[..eq];
             let value = &arg[eq + 1..];
@@ -8651,16 +8662,30 @@ fn builtin_alias(
 }
 
 fn builtin_unalias(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
-    if args.is_empty() {
-        e!(err, "unalias: usage: unalias [-a] name [name ...]");
-        return ExecOutcome::Continue(2);
+    let mut all = false;
+    let mut g =
+        crate::builtin_opts::Getopt::new("unalias", crate::builtin_opts::ArgView::Plain(args), "a");
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'a' => all = true,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
+        }
     }
-    if args[0] == "-a" {
+    if all {
         shell.aliases.clear();
         return ExecOutcome::Continue(0);
     }
+    let operands = &args[g.rest_index()..];
+    if operands.is_empty() {
+        e!(err, "unalias: usage: unalias [-a] name [name ...]");
+        return ExecOutcome::Continue(2);
+    }
     let mut any_failed = false;
-    for name in args {
+    for name in operands {
         if shell.aliases.remove(name).is_none() {
             crate::sh_error_to!(shell, err, None, "unalias: {name}: not found");
             any_failed = true;
@@ -8945,41 +8970,29 @@ fn builtin_type(
     let mut path_only = false;
     let mut force_path = false;
     let mut skip_func = false;
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--" {
-            i += 1;
-            break;
-        }
-        if !arg.starts_with('-') || arg.len() < 2 {
-            break;
-        }
-        for &c in &arg.as_bytes()[1..] {
-            match c {
-                b'a' => all = true,
-                b't' => type_only = true,
-                b'p' => path_only = true,
-                b'P' => {
+    let mut g = crate::builtin_opts::Getopt::new(
+        "type",
+        crate::builtin_opts::ArgView::Plain(args),
+        "afptP",
+    );
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'a' => all = true,
+                't' => type_only = true,
+                'p' => path_only = true,
+                'P' => {
                     path_only = true;
                     force_path = true;
                 }
-                b'f' => skip_func = true,
-                other => {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "type: -{}: invalid option",
-                        other as char
-                    );
-                    return ExecOutcome::Continue(2);
-                }
-            }
+                'f' => skip_func = true,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
-        i += 1;
     }
-    let names = &args[i..];
+    let names = &args[g.rest_index()..];
     if names.is_empty() {
         return ExecOutcome::Continue(0);
     }
@@ -9021,7 +9034,9 @@ fn builtin_hash(
     shell: &mut Shell,
 ) -> ExecOutcome {
     // Mode-selector flags. Priority when multiple set:
-    // reset > delete > set_path > list > type_only > default.
+    // reset > delete > set_path > type_only-with-names > list > type_only-bare
+    // > default. (`-t` with operand names wins over `-l`; bare `-t`/`-l`
+    // fall back to the no-names branches below.)
     let mut reset = false;
     let mut delete = false;
     let mut set_path = false;
@@ -9029,58 +9044,29 @@ fn builtin_hash(
     let mut type_only = false;
     let mut explicit_path: Option<String> = None;
 
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--" {
-            i += 1;
-            break;
-        }
-        if !arg.starts_with('-') || arg.len() < 2 {
-            break;
-        }
-        // Walk the cluster. -p takes a value (rest-of-arg OR next arg).
-        let bytes = arg.as_bytes();
-        let mut j = 1;
-        while j < bytes.len() {
-            match bytes[j] {
-                b'r' => reset = true,
-                b'd' => delete = true,
-                b'l' => list = true,
-                b't' => type_only = true,
-                b'p' => {
+    let mut g = crate::builtin_opts::Getopt::new(
+        "hash",
+        crate::builtin_opts::ArgView::Plain(args),
+        "lrp:dt",
+    );
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'r' => reset = true,
+                'd' => delete = true,
+                'l' => list = true,
+                't' => type_only = true,
+                'p' => {
                     set_path = true;
-                    if j + 1 < bytes.len() {
-                        // -p inline: "-pPATH" (matches bash; any
-                        // characters following -p are the value).
-                        explicit_path = Some(String::from_utf8_lossy(&bytes[j + 1..]).into_owned());
-                        break;
-                    } else {
-                        // -p separate: next arg
-                        i += 1;
-                        if i >= args.len() {
-                            crate::sh_error_to!(
-                                shell,
-                                err,
-                                None,
-                                "hash: -p: option requires an argument"
-                            );
-                            return ExecOutcome::Continue(2);
-                        }
-                        explicit_path = Some(args[i].clone());
-                        break;
-                    }
+                    explicit_path = o.value;
                 }
-                c => {
-                    crate::sh_error_to!(shell, err, None, "hash: -{}: invalid option", c as char);
-                    return ExecOutcome::Continue(2);
-                }
-            }
-            j += 1;
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
-        i += 1;
     }
-    let names = &args[i..];
+    let names = &args[g.rest_index()..];
 
     if reset {
         Rc::make_mut(&mut shell.command_hash).clear();
@@ -9126,22 +9112,11 @@ fn builtin_hash(
         return ExecOutcome::Continue(0);
     }
 
-    if list {
-        // re-input form: `builtin hash -p PATH NAME`
-        let mut entries: Vec<(&String, &(std::path::PathBuf, u32))> =
-            shell.command_hash.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-        for (name, (path, _)) in entries {
-            let _ = writeln!(out, "builtin hash -p {} {}", path.display(), name);
-        }
-        return ExecOutcome::Continue(0);
-    }
-
-    if type_only {
-        if names.is_empty() {
-            crate::sh_error_to!(shell, err, None, "hash: -t: at least one name required");
-            return ExecOutcome::Continue(2);
-        }
+    // `-t` (report hashed path per name) takes priority over `-l` when NAMES
+    // are given — bash: `hash -lt ls` (ls not yet hashed) reports `hash: ls:
+    // not found`, not the bare "-l" table listing. `-l` alone still owns the
+    // no-names form below.
+    if type_only && !names.is_empty() {
         let mut exit: i32 = 0;
         for name in names {
             match shell.command_hash.get(name) {
@@ -9159,6 +9134,23 @@ fn builtin_hash(
             }
         }
         return ExecOutcome::Continue(exit);
+    }
+
+    if list {
+        // re-input form: `builtin hash -p PATH NAME`
+        let mut entries: Vec<(&String, &(std::path::PathBuf, u32))> =
+            shell.command_hash.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, (path, _)) in entries {
+            let _ = writeln!(out, "builtin hash -p {} {}", path.display(), name);
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    if type_only {
+        // Reached only with no names (the `!names.is_empty()` case returned above).
+        crate::sh_error_to!(shell, err, None, "hash: -t: at least one name required");
+        return ExecOutcome::Continue(2);
     }
 
     // Default: with names → resolve+add; without → list.
@@ -9205,32 +9197,24 @@ fn builtin_command(
 ) -> ExecOutcome {
     let mut concise = false;
     let mut verbose = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-v" => {
-                concise = true;
-                i += 1;
-            }
-            "-V" => {
-                verbose = true;
-                i += 1;
-            }
-            "-p" => {
-                i += 1;
-            } // accept; introspection uses current $PATH
-            "--" => {
-                i += 1;
-                break;
-            }
-            s if s.starts_with('-') && s.len() > 1 => {
-                crate::sh_error_to!(shell, err, None, "command: {s}: invalid option");
-                return ExecOutcome::Continue(2);
-            }
-            _ => break,
+    let mut g = crate::builtin_opts::Getopt::new(
+        "command",
+        crate::builtin_opts::ArgView::Plain(args),
+        "pVv",
+    );
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'v' => concise = true,
+                'V' => verbose = true,
+                'p' => {} // accept; introspection uses current $PATH
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
     }
-    let names = &args[i..];
+    let names = &args[g.rest_index()..];
 
     if !concise && !verbose {
         // Bare `command cmd args` (run cmd bypassing function/alias

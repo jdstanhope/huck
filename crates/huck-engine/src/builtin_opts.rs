@@ -9,8 +9,10 @@
 //! the scanning, which is where 23 hand-rolled copies drifted apart (#496).
 //!
 //! Converted so far (#496): the four declaration builtins (`readonly`,
-//! `export`, `declare`/`typeset`, `local`; Task 4). Remaining builtins
-//! (Tasks 5-7) still hand-roll their own scan.
+//! `export`, `declare`/`typeset`, `local`; Task 4) and the name/lookup
+//! builtins (`unset`, `type`, `hash`, `command`, `builtin`, `alias`,
+//! `unalias`; Task 5). Remaining builtins (Tasks 6-7) still hand-roll their
+//! own scan.
 
 use crate::command::DeclArg;
 use crate::shell_state::Shell;
@@ -18,9 +20,6 @@ use std::io::Write;
 
 pub(crate) struct Opt {
     pub ch: char,
-    // Unused until a Task 5-7 builtin adopts a value-taking (`:`-suffixed)
-    // spec — none of Task 4's four declaration-builtin specs do.
-    #[allow(dead_code)]
     pub value: Option<String>,
 }
 
@@ -28,9 +27,6 @@ pub(crate) struct Opt {
 /// `DeclArg::Assign` can never be an option, so it terminates scanning exactly
 /// like a non-option string does.
 pub(crate) enum ArgView<'a> {
-    // Unused until a Task 5-7 builtin (the non-declaration ones, which take
-    // `&[String]`) converts onto the scanner.
-    #[allow(dead_code)]
     Plain(&'a [String]),
     Decl(&'a [DeclArg]),
 }
