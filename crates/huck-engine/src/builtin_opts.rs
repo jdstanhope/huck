@@ -292,6 +292,7 @@ pub(crate) fn usage_for(name: &str) -> &'static str {
         "declare" => {
             "declare [-aAfFgiIlnrtux] [name[=value] ...] or declare -p [-aAfFilnrtux] [name ...]"
         }
+        "dirs" => "dirs [-clpv] [+N] [-N]",
         "disown" => "disown [-h] [-ar] [jobspec ... | pid ...]",
         "enable" => "enable [-a] [-dnps] [-f filename] [name ...]",
         "export" => "export [-fn] [name[=value] ...] or export -p",
@@ -306,7 +307,9 @@ pub(crate) fn usage_for(name: &str) -> &'static str {
         "mapfile" => {
             "mapfile [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]"
         }
+        "popd" => "popd [-n] [+N | -N]",
         "printf" => "printf [-v var] format [arguments]",
+        "pushd" => "pushd [-n] [+N | -N | dir]",
         "pwd" => "pwd [-LP]",
         "read" => {
             "read [-ers] [-a array] [-d delim] [-i text] [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]"
