@@ -577,6 +577,7 @@ fn export_nf_unexports_function() {
     let mut out = Vec::new();
     // export -nf uf  -> remove the export mark
     let oc = builtin_export_decl(
+        "export",
         &[dp("-n"), dp("-f"), dp("uf")],
         &mut out,
         &mut std::io::stderr(),
@@ -609,7 +610,13 @@ fn declare_fx_no_names_lists_via_runtime_path() {
     shell.mark_function_exported("dfn2");
     // capture stdout of `declare -fx`: route through builtin_declare_decl directly.
     let mut out = Vec::new();
-    let oc = builtin_declare_decl(&[dp("-fx")], &mut out, &mut std::io::stderr(), &mut shell);
+    let oc = builtin_declare_decl(
+        "declare",
+        &[dp("-fx")],
+        &mut out,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
     assert!(matches!(oc, ExecOutcome::Continue(0)), "{oc:?}");
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("dfn2 ()"), "{s}");
@@ -622,7 +629,13 @@ fn export_p_lists_in_declare_x_format() {
     shell.export_set("EXP_A", "1".to_string());
     shell.export_set("EXP_B", "two".to_string());
     let mut out = Vec::new();
-    let oc = builtin_export_decl(&[dp("-p")], &mut out, &mut std::io::stderr(), &mut shell);
+    let oc = builtin_export_decl(
+        "export",
+        &[dp("-p")],
+        &mut out,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
     assert!(matches!(oc, ExecOutcome::Continue(0)));
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("declare -x EXP_A=\"1\""), "{s}");
@@ -638,7 +651,7 @@ fn bare_export_uses_declare_x_format() {
     let mut shell = Shell::new();
     shell.export_set("EXP_C", "z".to_string());
     let mut out = Vec::new();
-    let _ = builtin_export_decl(&[], &mut out, &mut std::io::stderr(), &mut shell);
+    let _ = builtin_export_decl("export", &[], &mut out, &mut std::io::stderr(), &mut shell);
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("declare -x EXP_C=\"z\""), "{s}");
 }
@@ -650,6 +663,7 @@ fn export_n_unexports_keeps_value() {
     assert!(shell.is_exported("EXP_D"));
     let mut out = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-n"), dp("EXP_D")],
         &mut out,
         &mut std::io::stderr(),
@@ -666,6 +680,7 @@ fn export_n_with_assignment_sets_then_unexports() {
     shell.export_set("EXP_E", "1".to_string());
     let mut out = Vec::new();
     let _ = builtin_export_decl(
+        "export",
         &[dp("-n"), dp("EXP_E=2")],
         &mut out,
         &mut std::io::stderr(),
@@ -680,6 +695,7 @@ fn export_n_unset_name_is_noop() {
     let mut shell = Shell::new();
     let mut out = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-n"), dp("NOPE_X")],
         &mut out,
         &mut std::io::stderr(),
@@ -693,7 +709,13 @@ fn export_n_unset_name_is_noop() {
 fn export_invalid_flag_rc2() {
     let mut shell = Shell::new();
     let mut out = Vec::new();
-    let oc = builtin_export_decl(&[dp("-z")], &mut out, &mut std::io::stderr(), &mut shell);
+    let oc = builtin_export_decl(
+        "export",
+        &[dp("-z")],
+        &mut out,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
     assert!(matches!(oc, ExecOutcome::Continue(2)), "{oc:?}");
 }
 
@@ -704,6 +726,7 @@ fn export_p_with_operand_exports_it_no_listing() {
     assert!(!shell.is_exported("EXP_F"));
     let mut out = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-p"), dp("EXP_F")],
         &mut out,
         &mut std::io::stderr(),
@@ -726,6 +749,7 @@ fn export_f_does_not_create_variable() {
     let mut out = Vec::new();
     // `export -f somefunc` for a nonexistent function: rc 1, no variable.
     let oc = builtin_export_decl(
+        "export",
         &[dp("-f"), dp("somefunc")],
         &mut out,
         &mut std::io::stderr(),
@@ -745,6 +769,7 @@ fn export_f_marks_existing_function() {
     let _ = crate::shell::process_line("myfn(){ echo hi; }", &mut shell, false);
     let mut out = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-f"), dp("myfn")],
         &mut out,
         &mut std::io::stderr(),
@@ -762,6 +787,7 @@ fn export_f_hyphenated_name_ok() {
     let _ = crate::shell::process_line("foo-a(){ echo hi; }", &mut shell, false);
     let mut out = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-f"), dp("foo-a")],
         &mut out,
         &mut std::io::stderr(),
@@ -790,6 +816,7 @@ fn export_f_unencodable_name_cannot_export_rc1() {
     let mut out = Vec::new();
     let mut errbuf = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-f"), dp("foo=bar")],
         &mut out,
         &mut errbuf,
@@ -825,6 +852,7 @@ fn export_f_slash_name_cannot_export_rc1() {
     let mut out = Vec::new();
     let mut errbuf = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-f"), dp("/bin/echo")],
         &mut out,
         &mut errbuf,
@@ -844,6 +872,7 @@ fn export_f_not_a_function_rc1() {
     let mut shell = Shell::new();
     let mut out = Vec::new();
     let oc = builtin_export_decl(
+        "export",
         &[dp("-f"), dp("nope")],
         &mut out,
         &mut std::io::stderr(),
@@ -859,7 +888,13 @@ fn export_f_no_operands_lists_functions() {
     let _ = crate::shell::process_line("af(){ echo hi; }", &mut shell, false);
     shell.mark_function_exported("af");
     let mut out = Vec::new();
-    let oc = builtin_export_decl(&[dp("-f")], &mut out, &mut std::io::stderr(), &mut shell);
+    let oc = builtin_export_decl(
+        "export",
+        &[dp("-f")],
+        &mut out,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
     assert!(matches!(oc, ExecOutcome::Continue(0)));
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("af ()"), "{s}");
@@ -871,7 +906,13 @@ fn export_a_bare_no_listing() {
     let mut shell = Shell::new();
     shell.export_set("EXP_HIDE", "1".to_string());
     let mut out = Vec::new();
-    let oc = builtin_export_decl(&[dp("-a")], &mut out, &mut std::io::stderr(), &mut shell);
+    let oc = builtin_export_decl(
+        "export",
+        &[dp("-a")],
+        &mut out,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
     assert!(matches!(oc, ExecOutcome::Continue(0)));
     assert!(
         String::from_utf8(out).unwrap().is_empty(),
@@ -884,7 +925,13 @@ fn export_f_bare_no_listing() {
     let mut shell = Shell::new();
     shell.export_set("EXP_HIDE2", "1".to_string());
     let mut out = Vec::new();
-    let oc = builtin_export_decl(&[dp("-f")], &mut out, &mut std::io::stderr(), &mut shell);
+    let oc = builtin_export_decl(
+        "export",
+        &[dp("-f")],
+        &mut out,
+        &mut std::io::stderr(),
+        &mut shell,
+    );
     assert!(matches!(oc, ExecOutcome::Continue(0)));
     assert!(
         String::from_utf8(out).unwrap().is_empty(),
@@ -1131,17 +1178,124 @@ fn jobs_positional_spec_filters_to_target() {
 }
 
 #[test]
+fn mapfile_dash_u_with_value_is_rejected_not_silently_ignored() {
+    // Real bash IMPLEMENTS `-u FD` (read from that fd instead of stdin). huck
+    // does not, and implementing it is out of scope for the option-scanner
+    // conversion (#496). Before this task `-u` was rejected outright
+    // (`-u: invalid option`, rc 2) because the old hand-rolled scanner had
+    // no arm for it at all. This task's first cut marked `-u` as a
+    // recognized value-taking option and then silently discarded the
+    // value — which parses clean but produces WRONG DATA with NO error
+    // (the target array came back empty instead of erroring), a severity
+    // increase from loud failure to silent corruption (#496 Task 6 review,
+    // Critical). Pinning the loud rejection so it cannot regress back to
+    // silent-ignore. This is a unit test rather than a bash-diff harness
+    // row because huck's chosen behavior (reject) necessarily diverges
+    // from real bash's (implement) for ANY fragment that actually supplies
+    // a value — there is no fragment where the two byte-match here.
+    let mut shell = Shell::new();
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "mapfile",
+        &["-u".to_string(), "3".to_string(), "A".to_string()],
+        &mut std::io::sink(),
+        &mut err,
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    let err_text = String::from_utf8(err).unwrap();
+    assert!(err_text.contains("-u: invalid option"), "err: {err_text}");
+    assert!(
+        shell.get_var("A").is_none(),
+        "A must not be created/populated by a rejected -u"
+    );
+}
+
+#[test]
+fn mapfile_dash_c_callback_with_value_is_rejected_not_silently_ignored() {
+    // Same reasoning as the `-u` test above, for `-C callback -c quantum`
+    // (real bash invokes CALLBACK every QUANTUM lines read).
+    let mut shell = Shell::new();
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "mapfile",
+        &[
+            "-C".to_string(),
+            "echo cb".to_string(),
+            "-c".to_string(),
+            "1".to_string(),
+            "A".to_string(),
+        ],
+        &mut std::io::sink(),
+        &mut err,
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    let err_text = String::from_utf8(err).unwrap();
+    // The scanner processes `-C`'s value first and errors there — `-c`
+    // never gets scanned. Either char rejecting is a correct outcome; pin
+    // the one the scan order actually produces.
+    assert!(err_text.contains("-C: invalid option"), "err: {err_text}");
+}
+
+#[test]
+fn readarray_dash_u_reports_invoked_name() {
+    // The class-3 name-threading fix (#496 Task 6) must hold for the
+    // rejection path too, not just the ordinary invalid-option path.
+    let mut shell = Shell::new();
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "readarray",
+        &["-u".to_string(), "3".to_string(), "A".to_string()],
+        &mut std::io::sink(),
+        &mut err,
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    let err_text = String::from_utf8(err).unwrap();
+    assert!(
+        err_text.contains("readarray: -u: invalid option"),
+        "err: {err_text}"
+    );
+}
+
+#[test]
 fn jobs_invalid_flag_returns_usage_status_2() {
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
         "jobs",
-        &["-x".to_string()],
+        &["-Q".to_string()],
         &mut buf,
         &mut std::io::stderr(),
         &mut shell,
     );
     assert!(matches!(outcome, ExecOutcome::Continue(2)));
+}
+
+#[test]
+fn jobs_x_is_rejected_as_invalid_option() {
+    // `-x` (real bash: substitutes jobspecs with pids and execs COMMAND in
+    // the shell's place) is unimplemented in huck. This task's first cut
+    // accepted the flag and reported "not supported" (rc 1) — worse than
+    // both the pre-v359 rejection AND real bash (`jobs -x` with no operand
+    // exits 0 silently in real bash; huck went from matching-by-accident to
+    // actively wrong). Restored the loud pre-v359 outcome: `-x` is simply
+    // not in the spec, so it takes the same generic invalid-option path as
+    // any other unrecognized flag (#496 Task 6 review, Important).
+    let mut shell = Shell::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "jobs",
+        &["-x".to_string(), "echo".to_string()],
+        &mut buf,
+        &mut err,
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    let err_text = String::from_utf8(err).unwrap();
+    assert!(err_text.contains("-x: invalid option"), "err: {err_text}");
 }
 
 #[test]
@@ -1484,7 +1638,14 @@ fn trap_kill_signal_accepted_silently() {
 }
 
 #[test]
-fn trap_no_signals_errors_status_1() {
+fn trap_no_signals_errors_status_2() {
+    // bash 5.2.21 verified: `trap "echo bye"` (an action with no signal
+    // operand) is a USAGE error — rc 2, not 1 — and `trap` is a POSIX
+    // special builtin, so this must also be able to exit a posix shell
+    // (`set -o posix; trap "echo bye"; echo SURVIVED` prints no SURVIVED in
+    // real bash). The pre-conversion hand-rolled code returned rc 1 and
+    // never set `builtin_usage_error`, which was itself a divergence this
+    // conversion (#496) fixes, not something to preserve.
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -1494,5 +1655,6 @@ fn trap_no_signals_errors_status_1() {
         &mut std::io::stderr(),
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    assert_eq!(shell.builtin_usage_error, Some(2));
 }

@@ -1,0 +1,120 @@
+---
+title: "Twenty-three ways to read a dash"
+date: 2026-08-09
+summary: "readonly -pa didn't work, but export -pn did. Not because anyone decided that — because every builtin parsed its own options, and half of them were written by someone having a different day."
+tags: ["builtins", "bash-compat", "quality"]
+version: "v359"
+draft: false
+---
+
+Combining short options is muscle memory. `ls -la`. `grep -rn`. Shell builtins
+take them too, and until this week huck was inconsistent about it in a way that
+had no logic to it at all:
+
+```bash
+# before
+$ readonly -pa
+huck: line 1: readonly: -pa: invalid option
+
+$ wait -fn
+huck: line 1: wait: -fn: invalid option
+wait: usage: wait [-fn] [-p var] [id ...]
+
+$ unset -vf x
+huck: line 1: unset: -vf: invalid option
+```
+
+Meanwhile `export -pn` was fine. So was `declare -pi`. So was `jobs -lp`.
+
+The `wait` one is my favourite. It rejects the flags, then prints a usage
+message documenting the exact spelling it just refused.
+
+## Why the line fell where it did
+
+Not by design. Every builtin parsed its own options — about twenty-three
+separate parsers — and there were two house styles. One walks the characters
+after the dash, so bundling falls out for free. The other compares the whole
+argument against a list of known strings, so `-pa` matches nothing and is
+rejected.
+
+Which one you got depended on which builtin you were talking to, which depended
+on who wrote it and when. `export` works today because someone happened to
+write a character loop. `readonly` doesn't because someone happened not to.
+
+There was a second symptom from the same root. Ask a builtin for a bad option
+and bash tells you twice — what was wrong, then how to use it. Roughly half of
+huck's builtins forgot the second line, and two of them gave the wrong name
+entirely:
+
+```bash
+# before
+$ readarray -Q
+huck: line 1: mapfile: -Q: invalid option
+```
+
+`readarray` reporting itself as `mapfile`. They share an implementation, and the
+error message was built from the implementation's name rather than the one you
+typed.
+
+## After
+
+```bash
+# after
+$ readonly -pa
+declare -ar BASH_VERSINFO=([0]="5" [1]="2" [2]="0" [3]="1" [4]="release" ...)
+declare -r EUID="1000"
+
+$ unset -vf x
+huck: line 1: unset: cannot simultaneously unset a function and a variable
+
+$ readarray -Q
+huck: line 1: readarray: -Q: invalid option
+readarray: usage: readarray [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]
+```
+
+That `unset` line is the interesting one. The error didn't go away — it got
+*better*. `-vf` now parses, so you reach the real complaint: you asked to unset a
+function and a variable at once, which bash won't do either.
+
+There is now one option reader. Every builtin that takes options uses it, and it
+owns the whole contract: bundled flags, `--`, a bare `-` as a filename rather
+than a flag, values written either way (`-n3` or `-n 3`), and stopping at the
+first thing that isn't an option. The usage text lives in one table, keyed on
+the name you typed.
+
+## The part that didn't go smoothly
+
+Replacing twenty-three parsers with one means every bug is now everyone's bug.
+We found four during review that the test suite did not.
+
+The worst was a crash. A colon is how the new parser marks "this option takes a
+value" — and it was also, accidentally, accepted as an option itself. So
+`hash -:` handed a builtin a flag it had never heard of, and the shell aborted.
+Nine builtins, exit code 101, everything after it in your script silently
+skipped.
+
+What is worth saying plainly: at the moment that bug was live, the linter was
+clean, 2,490 unit tests passed, 27 integration suites passed, and a 275-case
+differential suite that runs every fragment through both huck and bash was
+entirely green. None of them thought to type `-:`. It was caught by someone
+reading the code and asking what the colon meant.
+
+It is fixed, with a test. But the general shape — a bad option can abort the
+shell instead of complaining — is filed as
+[#523](https://github.com/jdstanhope/huck/issues/523), because a shell should
+never abort on something you typed.
+
+## Still open
+
+Seventeen issues came out of this ([#507](https://github.com/jdstanhope/huck/issues/507)–[#523](https://github.com/jdstanhope/huck/issues/523)),
+each one measured against real bash before filing. A few you might actually hit:
+
+- [#511](https://github.com/jdstanhope/huck/issues/511) — `mapfile -u` (read from a
+  given file descriptor) and its callback options aren't implemented.
+- [#519](https://github.com/jdstanhope/huck/issues/519) — `pushd -Q` reports itself
+  as `cd` and prints `cd`'s usage.
+- [#516](https://github.com/jdstanhope/huck/issues/516) — `exec` still has its own
+  option parser. It was missed because the audit searched the wrong two files.
+- [#521](https://github.com/jdstanhope/huck/issues/521) — the handful of builtins
+  taking `+x`-style options still hand-roll *that* half, and those copies have
+  already drifted apart. Which is this whole post happening again, one floor up.

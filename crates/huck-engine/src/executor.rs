@@ -4416,32 +4416,58 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
     let mut bypass_functions = false;
     let mut command_prefix: Vec<String> = Vec::new();
     while resolved.program == "command" {
-        // Scan leading flags in resolved.args.
-        let mut idx = 0;
+        // Scan leading flags via the shared scanner (spec "pVv", same as
+        // `builtin_command`'s own scan for the introspect path below) so
+        // bundling and the invalid-option diagnostic match bash exactly.
+        // bash's internal_getopt scans the WHOLE leading cluster before
+        // deciding anything — `command -v -Z ls` still reports `-Z` invalid,
+        // so this does not stop at the first `-v`/`-V`.
+        let mut diag: Vec<u8> = Vec::new();
+        let mut g = crate::builtin_opts::Getopt::new(
+            "command",
+            crate::builtin_opts::ArgView::Plain(&resolved.args),
+            "pVv",
+        );
         let mut introspect = false;
+        let mut scan_err = None;
         loop {
-            match resolved.args.get(idx).map(String::as_str) {
-                Some("-v") | Some("-V") => {
-                    introspect = true;
+            match g.next_opt(shell, &mut diag) {
+                Ok(Some(o)) => {
+                    if matches!(o.ch, 'v' | 'V') {
+                        introspect = true;
+                    } // 'p' — accept; v99 uses current $PATH
+                }
+                Ok(None) => break,
+                Err(code) => {
+                    scan_err = Some(code);
                     break;
                 }
-                Some("-p") => idx += 1, // accept; v99 uses current $PATH
-                Some("--") => {
-                    idx += 1;
-                    break;
-                }
-                Some(s) if s.starts_with('-') && s.len() > 1 => {
-                    let msg = format!("command: {s}: invalid option");
-                    emit_wrapper_error(cmd, shell, &msg);
-                    drain_procsubs(shell, procsub_base);
-                    return ExecOutcome::Continue(2);
-                }
-                _ => break, // first operand (or end)
             }
+        }
+        if let Some(code) = scan_err {
+            // The scanner already wrote bash's two-line diagnostic into `diag`
+            // (unscoped); replay it under the command's own redirect scope —
+            // #77: `$(command -Z 2>&1)` must capture the error, not leak it
+            // to the real stderr.
+            //
+            // Note: `g.next_opt` already set `shell.builtin_usage_error =
+            // Some(2)` as a side effect of the scan; nothing here consumes
+            // it (we return the code directly). Harmless today — it's
+            // unconditionally cleared at the top of the next
+            // `run_exec_single_inner` — but a latent trap if a future
+            // posix-fatality check ever reads it before that clear runs.
+            with_redirect_scope(&cmd.redirects, shell, |_shell| {
+                let mut err = err_writer();
+                let _ = err.write_all(&diag);
+                ExecOutcome::Continue(code)
+            });
+            drain_procsubs(shell, procsub_base);
+            return ExecOutcome::Continue(code);
         }
         if introspect {
             break; // leave program=="command" -> dispatch runs builtin_command (-v/-V)
         }
+        let idx = g.rest_index();
         // Bare form: the operand at `idx` (if any) becomes the new program.
         match resolved.args.get(idx) {
             None => {
@@ -4470,14 +4496,44 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
     // (A declaration target is intercepted pre-resolve and never reaches here.)
     let mut require_builtin = false;
     while resolved.program == "builtin" {
-        match resolved.args.first() {
+        // `builtin` accepts no options at all (spec ""); only `--` terminates.
+        // Scanning via the shared scanner (rather than special-casing `-Q` as
+        // a bogus target name) makes an invalid option a proper usage error,
+        // matching bash.
+        let mut diag: Vec<u8> = Vec::new();
+        let mut g = crate::builtin_opts::Getopt::new(
+            "builtin",
+            crate::builtin_opts::ArgView::Plain(&resolved.args),
+            "",
+        );
+        let scan_err = match g.next_opt(shell, &mut diag) {
+            Ok(Some(_)) => unreachable!("empty spec never yields an option"),
+            Ok(None) => None,
+            Err(code) => Some(code),
+        };
+        if let Some(code) = scan_err {
+            // #77: replay the diagnostic under the command's own redirect
+            // scope so `$(builtin -Q 2>&1)` captures it instead of leaking
+            // to the real stderr. (`shell.builtin_usage_error` is left
+            // unconsumed here too — see the matching comment in the
+            // `command` loop above.)
+            with_redirect_scope(&cmd.redirects, shell, |_shell| {
+                let mut err = err_writer();
+                let _ = err.write_all(&diag);
+                ExecOutcome::Continue(code)
+            });
+            drain_procsubs(shell, procsub_base);
+            return ExecOutcome::Continue(code);
+        }
+        let idx = g.rest_index();
+        match resolved.args.get(idx) {
             None => {
                 drain_procsubs(shell, procsub_base);
                 return ExecOutcome::Continue(0);
-            } // `builtin` alone
+            } // `builtin` (or `builtin --`) alone
             Some(_) => {
-                let new_program = resolved.args[0].clone();
-                let new_args = resolved.args[1..].to_vec();
+                let new_program = resolved.args[idx].clone();
+                let new_args = resolved.args[idx + 1..].to_vec();
                 resolved.program = new_program;
                 resolved.args = new_args;
                 resolved.decl_args = None;
