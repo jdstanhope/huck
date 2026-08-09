@@ -4902,9 +4902,28 @@ struct ExecFlags {
     operand_start: usize,
 }
 
+/// Why `exec`'s flag parse failed. A structured error, not a rendered message,
+/// because this parser must stay PURE: it is called twice — once at the
+/// restricted-policy check purely to ask whether a command word is present
+/// (errors deliberately swallowed there), and once for real. Emitting inside it
+/// would report the diagnostic twice. The caller that reports renders it via
+/// the shared emitters, so `exec` says exactly what every scanner-based builtin
+/// says, usage line included (#516).
+#[derive(Debug)]
+enum ExecFlagErr {
+    Invalid(char),
+    MissingValue(char),
+}
+
 /// Parses leading `-c`/`-l`/`-a NAME` flags from `exec`'s arguments. Stops at
-/// the first non-flag word or `--`. Returns an error message on a bad flag.
-fn parse_exec_flags(args: &[String]) -> Result<ExecFlags, String> {
+/// the first non-flag word or `--`.
+///
+/// Deliberately NOT on the shared `builtin_opts` scanner: its scanning is
+/// already bash-correct (bundling, `--`, a lone `-` as an operand, `-aNAME`
+/// attached or separate, stop-at-first-non-option all measured identical), and
+/// the scanner emits as it goes, which this function must not do. What #516 was
+/// really about — the missing usage line — is fixed by sharing the EMIT, above.
+fn parse_exec_flags(args: &[String]) -> Result<ExecFlags, ExecFlagErr> {
     let mut f = ExecFlags {
         clear_env: false,
         login: false,
@@ -4939,7 +4958,7 @@ fn parse_exec_flags(args: &[String]) -> Result<ExecFlags, String> {
                     if rest.is_empty() {
                         i += 1;
                         if i >= args.len() {
-                            return Err("exec: -a: option requires an argument".to_string());
+                            return Err(ExecFlagErr::MissingValue('a'));
                         }
                         f.argv0 = Some(args[i].clone());
                     } else {
@@ -4948,7 +4967,7 @@ fn parse_exec_flags(args: &[String]) -> Result<ExecFlags, String> {
                     i += 1;
                     continue 'outer;
                 }
-                other => return Err(format!("exec: -{other}: invalid option")),
+                other => return Err(ExecFlagErr::Invalid(other)),
             }
             j += 1;
         }
@@ -5050,14 +5069,22 @@ fn run_exec_builtin(
 ) -> ExecOutcome {
     let flags = match parse_exec_flags(&resolved.args) {
         Ok(f) => f,
-        Err(msg) => {
+        Err(e) => {
             {
                 let mut err = err_writer();
-                crate::sh_error_to!(shell, &mut *err, None, "{msg}");
+                // Shared emitters (#516): same two-line shape, and the usage
+                // line comes from the same `usage_for` table as every other
+                // builtin's. They also set `builtin_usage_error`, which the
+                // exec interception consumes for a bare invocation.
+                match e {
+                    ExecFlagErr::Invalid(c) => {
+                        crate::builtin_opts::emit_invalid_option("exec", c, shell, &mut *err)
+                    }
+                    ExecFlagErr::MissingValue(c) => {
+                        crate::builtin_opts::emit_missing_value("exec", c, shell, &mut *err)
+                    }
+                }
             }
-            // POSIX case #1: bad option is a usage error (the exec interception
-            // consumes this for a bare invocation).
-            shell.builtin_usage_error = Some(2);
             return ExecOutcome::Continue(2);
         }
     };

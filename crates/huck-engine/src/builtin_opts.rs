@@ -226,19 +226,7 @@ impl<'a> Getopt<'a> {
     }
 
     fn fail_missing_value(&self, c: char, shell: &mut Shell, err: &mut dyn Write) {
-        // bash's form is `NAME: -C: option requires an argument` — NOT the
-        // getopt(3) `NAME: option requires an argument -- C` shape. Verified
-        // against bash 5.2.21 (`hash -p`, `printf -v`, `read -n`, `mapfile
-        // -d` all use this exact wording).
-        crate::sh_error_to!(
-            shell,
-            err,
-            None,
-            "{}: -{c}: option requires an argument",
-            self.name
-        );
-        let _ = writeln!(err, "{}: usage: {}", self.name, usage_for(self.name));
-        shell.builtin_usage_error = Some(2);
+        emit_missing_value(self.name, c, shell, err);
     }
 }
 
@@ -267,7 +255,27 @@ pub(crate) fn emit_invalid_plus_option(
 ///
 /// Shared so the scanner's own failure path and `reject_unhandled` cannot drift
 /// apart — the same drift, one layer up, is what #496 existed to remove.
-fn emit_invalid_option(name: &str, c: char, shell: &mut Shell, err: &mut dyn Write) {
+/// Emit bash's two-line "option requires an argument" diagnostic.
+///
+/// bash's form is `NAME: -C: option requires an argument` — NOT the getopt(3)
+/// `NAME: option requires an argument -- C` shape. Verified against bash 5.2.21
+/// (`hash -p`, `printf -v`, `read -n`, `mapfile -d` all use this exact wording).
+///
+/// Shared as a free function so a builtin that scans its own options — `exec`,
+/// whose parser is deliberately PURE and called twice (#516) — reports
+/// identically to everything on the scanner.
+pub(crate) fn emit_missing_value(name: &str, c: char, shell: &mut Shell, err: &mut dyn Write) {
+    crate::sh_error_to!(
+        shell,
+        err,
+        None,
+        "{name}: -{c}: option requires an argument"
+    );
+    let _ = writeln!(err, "{name}: usage: {}", usage_for(name));
+    shell.builtin_usage_error = Some(2);
+}
+
+pub(crate) fn emit_invalid_option(name: &str, c: char, shell: &mut Shell, err: &mut dyn Write) {
     crate::sh_error_to!(shell, err, None, "{name}: -{c}: invalid option");
     let _ = writeln!(err, "{name}: usage: {}", usage_for(name));
     shell.builtin_usage_error = Some(2);
@@ -295,6 +303,7 @@ pub(crate) fn usage_for(name: &str) -> &'static str {
         "dirs" => "dirs [-clpv] [+N] [-N]",
         "disown" => "disown [-h] [-ar] [jobspec ... | pid ...]",
         "enable" => "enable [-a] [-dnps] [-f filename] [name ...]",
+        "exec" => "exec [-cl] [-a name] [command [argument ...]] [redirection ...]",
         "export" => "export [-fn] [name[=value] ...] or export -p",
         "getopts" => "getopts optstring name [arg ...]",
         "hash" => "hash [-lr] [-p pathname] [-dt] [name ...]",
