@@ -2284,19 +2284,7 @@ fn builtin_declare_decl(
                 b'c' => saw_plus_c = true,
                 b'n' => saw_plus_n = true,
                 other => {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "{name}: +{}: invalid option",
-                        other as char
-                    );
-                    let _ = writeln!(
-                        err,
-                        "{name}: usage: {}",
-                        crate::builtin_opts::usage_for(name)
-                    );
-                    shell.builtin_usage_error = Some(2);
+                    crate::builtin_opts::emit_invalid_plus_option(name, other as char, shell, err);
                     return ExecOutcome::Continue(2);
                 }
             }

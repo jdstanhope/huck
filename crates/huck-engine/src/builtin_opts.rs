@@ -242,6 +242,27 @@ impl<'a> Getopt<'a> {
     }
 }
 
+/// Emit bash's two-line invalid-option diagnostic for a `+`-prefixed option,
+/// and record the usage error.
+///
+/// `+`-style options are NOT the scanner's business — bash's own
+/// `internal_getopt` does not handle `+` either, so the builtins that take them
+/// (`declare`, `compopt`) keep their own `+` loops. But the *diagnostic* is the
+/// same diagnostic, and when each loop spelled it out by hand the copies drifted:
+/// `declare` reported `+z` with a usage line, `compopt` reported `-z` with none
+/// (#521). That is #496's own failure mode one layer up, so the emit lives here
+/// even though the parsing does not.
+pub(crate) fn emit_invalid_plus_option(
+    name: &str,
+    c: char,
+    shell: &mut Shell,
+    err: &mut dyn Write,
+) {
+    crate::sh_error_to!(shell, err, None, "{name}: +{c}: invalid option");
+    let _ = writeln!(err, "{name}: usage: {}", usage_for(name));
+    shell.builtin_usage_error = Some(2);
+}
+
 /// Emit bash's two-line invalid-option diagnostic and record the usage error.
 ///
 /// Shared so the scanner's own failure path and `reject_unhandled` cannot drift
