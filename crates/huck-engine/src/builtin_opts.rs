@@ -13,15 +13,20 @@
 //! builtins (`unset`, `type`, `hash`, `command`, `builtin`, `alias`,
 //! `unalias`; Task 5), the I/O and job builtins (`read`,
 //! `mapfile`/`readarray`, `printf`, `jobs`, `trap`, `help`, `wait`,
-//! `history`; Task 6), and the completion and remaining builtins
-//! (`complete`, `compgen`, `compopt`, `cd`, `getopts`, `shopt`, `disown`,
-//! `umask`, `ulimit`, `pwd`, `enable`; Task 7 — the last batch). Every
-//! builtin with a real getopt-shaped option grammar is now on this
-//! scanner; `set` is not converted (it isn't a getopt builtin in bash —
-//! its long-option forms and `+`/`-` symmetry don't fit this contract),
-//! and `bg`/`bind`/`dirs`/`fg` were deliberately left out of scope (their
-//! divergences are check-ordering and `+N` numeric parsing, filed
-//! separately, not scanning).
+//! `history`; Task 6), and the completion and remaining `builtins.rs`/
+//! `completion_builtins.rs` builtins (`complete`, `compgen`, `compopt`,
+//! `cd`, `getopts`, `shopt`, `disown`, `umask`, `ulimit`, `pwd`, `enable`;
+//! Task 7 — the last batch of THAT plan). `set` is not converted (it
+//! isn't a getopt builtin in bash — its long-option forms and `+`/`-`
+//! symmetry don't fit this contract), and `bg`/`bind`/`dirs`/`fg` were
+//! deliberately left out of scope (their divergences are check-ordering
+//! and `+N` numeric parsing, filed separately, not scanning).
+//!
+//! One known builtin with a real getopt-shaped grammar remains OFF this
+//! scanner: `exec` (`-c`/`-l`/`-a name`), which still hand-rolls its own
+//! scan at `executor.rs` (its own `invalid option` emit) — outside
+//! `builtins.rs`/`completion_builtins.rs`, so outside this plan's audit
+//! scope. Its conversion is tracked separately.
 
 use crate::command::DeclArg;
 use crate::shell_state::Shell;

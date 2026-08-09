@@ -538,10 +538,25 @@ fn builtin_cd_as(
 
     let prev_pwd = shell.get("PWD").map(str::to_string);
 
-    // Set when a `-P` chdir succeeds but the follow-up `current_dir()` (the
-    // getcwd bash does to re-derive $PWD) fails — the one case `-e` names:
-    // "if the -P option is supplied, and the current working directory
-    // cannot be determined successfully, exit with a non-zero status."
+    // Set when a `-P` chdir succeeds but bash's own working-directory
+    // re-derivation can't confirm it — the case `-e` names: "if the -P
+    // option is supplied, and the current working directory cannot be
+    // determined successfully, exit with a non-zero status." That covers
+    // TWO distinct failure shapes, both bash-verified:
+    //
+    //  1. `env::current_dir()` (the getcwd(2) syscall) itself fails.
+    //
+    //  2. `getcwd(2)` SUCCEEDS (it walks the kernel's dentry tree, which
+    //     bypasses directory search-permission checks) but a plain
+    //     NAME-based lookup of that same path does not — e.g. an ancestor
+    //     directory loses search (`x`) permission after huck is already
+    //     resident inside it. Reproduced: `mkdir -p /tmp/t9/sub; cd
+    //     /tmp/t9/sub; chmod 000 /tmp/t9; cd -P -e .` exits 1 in bash even
+    //     though `pwd -P` (bash's own builtin, same getcwd() call) still
+    //     succeeds there — bash's `-e` is checking name-based
+    //     reachability, not raw getcwd() success. A `stat` of the
+    //     getcwd()-reported path fails identically under the same setup,
+    //     which is what shape 2 below probes for.
     let mut pwd_undetermined = false;
 
     let new_pwd: String = if physical {
@@ -557,7 +572,16 @@ fn builtin_cd_as(
             return ExecOutcome::Continue(1);
         }
         match env::current_dir() {
-            Ok(p) => p.to_string_lossy().into_owned(),
+            Ok(p) => {
+                let p = p.to_string_lossy().into_owned();
+                // Shape 2 above. Only probed when `-e` is set — an extra
+                // stat() per `cd -P` would be needless overhead for every
+                // caller who never asked for `-e`'s stronger guarantee.
+                if want_e && std::fs::metadata(&p).is_err() {
+                    pwd_undetermined = true;
+                }
+                p
+            }
             Err(e) => {
                 crate::sh_error_to!(
                     shell,

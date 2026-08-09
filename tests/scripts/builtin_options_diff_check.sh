@@ -93,6 +93,29 @@ check "mapfile -C missing value" 'mapfile -C'
 # together, byte-matches once implemented.
 check "history -aw mutual exclusion" 'history -aw /tmp/nonexistent_hist_xyz_496'
 
+# ── cd -e: implemented for Task 7 (#496 Task 7 review) — "if -P is given
+# and the current working directory cannot be determined successfully,
+# exit with a non-zero status." Two DISTINCT bash-verified failure shapes
+# feed the same exit code; the review caught that only shape 1 was wired,
+# because shape 2 was dismissed in the original report as "not
+# exercisable in a byte-diff fragment" — it is, in three lines, below.
+# Shape 1 (getcwd(2) itself fails, e.g. a since-deleted cwd) is real but
+# its diagnostic TEXT is a pre-existing, unrelated wording divergence
+# ("cd: warning: could not read current dir: ..." vs bash's "cd: error
+# retrieving current directory: getcwd: ...") — not byte-matchable, and
+# not part of this fix, so no harness row for it (would need a separate
+# issue to normalize the wording).
+check "cd -Pe normal (no failure)" 'cd -Pe /tmp; echo rc=$?'
+check "cd -e without -P is ignored" 'cd -e /tmp; echo rc=$?'
+# Shape 2: getcwd(2) SUCCEEDS (it walks the kernel's dentry tree, which
+# bypasses directory search-permission checks) but a plain NAME-based
+# lookup of that same path does not, because an ancestor directory loses
+# search (x) permission after the shell is already resident inside it.
+# `chmod 755` at the end restores permissions so this row is idempotent
+# across repeated runs (bash then huck, same real filesystem).
+check "cd -P -e ancestor search-permission failure" \
+  'rm -rf /tmp/t9_cdE; mkdir -p /tmp/t9_cdE/sub; cd /tmp/t9_cdE/sub; chmod 000 /tmp/t9_cdE; cd -P -e .; echo rc=$?; chmod 755 /tmp/t9_cdE; rm -rf /tmp/t9_cdE'
+
 # ── the contract rows (huck already matches these; they must STAY matching) ──
 check "bundle order -ap"      'readonly -ap >/dev/null'
 check "-- terminates"         'readonly -- x=1; echo $x'
