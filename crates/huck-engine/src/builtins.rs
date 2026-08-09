@@ -9034,10 +9034,11 @@ fn builtin_hash(
     shell: &mut Shell,
 ) -> ExecOutcome {
     // Mode-selector flags. Priority when multiple set:
-    // reset > delete > set_path > (list-or-type)-with-names > list-bare >
-    // type-bare > default. (With operand names, `-l`/`-t` share one path —
-    // see the per-name block below for the exact precedence; bare `-t`/`-l`
-    // fall back to the no-names branches below.)
+    // reset > delete > set_path > type-with-names > list-bare > type-bare >
+    // default. `-l` has NO effect of its own when operand names are
+    // present UNLESS `-t` is also set (see the per-name block below) — a
+    // bare `-l NAME` falls through to the same default resolve+add path as
+    // no flags at all.
     let mut reset = false;
     let mut delete = false;
     let mut set_path = false;
@@ -9113,30 +9114,34 @@ fn builtin_hash(
         return ExecOutcome::Continue(0);
     }
 
-    // With operand NAMEs, `-l` and `-t` share one per-name path (bash
-    // 5.2.21, verified): a name ABSENT from the table is `not found`
-    // regardless of which flag(s) fired. A name PRESENT prints in `-l`'s
-    // reusable form when `-l` is set (even together with `-t` — `-l` wins
-    // the FORMAT), `-t`'s bare-path form when only `-t` is set, or nothing
-    // at all when only `-l` is set (a pure existence check):
+    // `-t` (with or without `-l`) and operand NAMEs present: report from
+    // the hash TABLE (not a fresh $PATH search). A name ABSENT from the
+    // table is `not found`. `-l`, if also set, wins the PRINT FORMAT for a
+    // name that IS hashed (the reusable `-p` form); `-t` alone uses its
+    // own bare-path / tab form. Verified against bash 5.2.21:
     //   hash -p /bin/ls ls; hash -lt ls   -> `builtin hash -p /bin/ls ls`
     //   hash -lt ls        (unhashed)     -> `hash: ls: not found`
-    //   hash -l ls         (hashed)       -> (nothing)
-    if (list || type_only) && !names.is_empty() {
+    //
+    // `-l` ALONE (no `-t`) with names is NOT a table lookup at all — bash
+    // treats it exactly like the DEFAULT (no-flag) path below: a fresh
+    // `$PATH` search that (re)hashes the name, silent on success, `not
+    // found` on failure — even if the name is ALREADY hashed to something
+    // else (a stale `-p`-set entry gets overwritten, not just confirmed).
+    // Verified: `hash -p /bin/ls ls; hash -l ls` -> silent, rc=0; `hash -l
+    // ls` (never hashed) -> also silent, rc=0 (real $PATH resolves it).
+    // So `-l` alone falls straight through this block and the next.
+    if type_only && !names.is_empty() {
         let mut exit: i32 = 0;
         for name in names {
             match shell.command_hash.get(name) {
                 Some((path, _)) => {
-                    if list && type_only {
+                    if list {
                         let _ = writeln!(out, "builtin hash -p {} {}", path.display(), name);
-                    } else if type_only {
-                        if names.len() == 1 {
-                            let _ = writeln!(out, "{}", path.display());
-                        } else {
-                            let _ = writeln!(out, "{}\t{}", name, path.display());
-                        }
+                    } else if names.len() == 1 {
+                        let _ = writeln!(out, "{}", path.display());
+                    } else {
+                        let _ = writeln!(out, "{}\t{}", name, path.display());
                     }
-                    // `-l` alone (no `-t`): silent existence check.
                 }
                 None => {
                     crate::sh_error_to!(shell, err, None, "hash: {name}: not found");
@@ -9147,7 +9152,7 @@ fn builtin_hash(
         return ExecOutcome::Continue(exit);
     }
 
-    if list {
+    if list && names.is_empty() {
         // re-input form: `builtin hash -p PATH NAME`
         let mut entries: Vec<(&String, &(std::path::PathBuf, u32))> =
             shell.command_hash.iter().collect();

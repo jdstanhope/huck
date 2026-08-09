@@ -34,21 +34,31 @@ check "local -Q invalid option" 'f() { local -Q; }; f'
 # review: the scanner had the wrong shape, caught only because `hash -p` was
 # the first `:`-spec builtin converted). `hash -p` is ON the scanner and
 # pins the fixed shape (must PASS). `printf -v` still hand-rolls its own
-# scan (Task 6/7 territory) and its FIRST line already matches bash today —
-# it's EXPECTED RED here only because its hand-rolled code is missing the
-# second (usage) line entirely, a pre-existing gap unrelated to this fix.
-# Once printf converts onto the scanner this row must go green with BOTH
-# lines; if it goes green with the wrong shape on line one, that's the
-# regression this row exists to catch.
+# scan — Task 6 is the one that converts it onto this scanner — and its
+# FIRST line already matches bash today; it's DELIBERATELY, EXPECTEDLY RED
+# here only because its hand-rolled code is missing the second (usage) line
+# entirely, a pre-existing gap unrelated to this fix. Task 6 turns this row
+# green (both lines). If it goes green with the WRONG shape on line one
+# instead, that's the regression this row exists to catch — leave it red
+# until then, it is not a bug in this branch.
 check "hash -p missing value"    'hash -p'
 check "printf -v missing value"  'printf -v'
 
-# ── hash -l/-t precedence with operand names (#496 Task 5 review) ──
-# `-t` wins over bare `-l` for reporting an UNHASHED name ("not found"), but
-# `-l` wins the PRINT FORMAT for a HASHED name when both are given (the
-# reusable `-p` form, not `-t`'s bare-path form). Both cases must hold.
-check "hash -lt hashed name"   'hash -p /bin/ls ls; hash -lt ls'
-check "hash -lt unhashed name" 'hash -lt ls'
+# ── hash -l/-t precedence with operand names (#496 Task 5 review, 2 rounds) ──
+# `-t` (with or without `-l`) wins over a bare `-l` for reporting an
+# UNHASHED name as `not found`, but when BOTH are given and the name IS
+# hashed, `-l` wins the PRINT FORMAT (the reusable `-p` form, not `-t`'s
+# bare-path form). A bare `-l NAME` (no `-t`) is a DIFFERENT thing again —
+# not a table lookup at all, but the same fresh-$PATH-search-and-hash side
+# effect as no flags at all, silent on success even when the name was
+# already hashed to something else. All four shapes must hold together;
+# the second review round caught the fourth only after the first round's
+# fix broke it (a `hash -l ls` regression, rc 0 -> "not found").
+check "hash -lt hashed name"        'hash -p /bin/ls ls; hash -lt ls'
+check "hash -lt unhashed name"      'hash -lt ls'
+check "hash -l unhashed resolvable" 'hash -l ls'
+check "hash -l already hashed"      'hash -p /bin/ls ls; hash -l ls'
+check "hash -l unresolvable"        'hash -l __hash_no_such_cmd_xyzzy__'
 
 # ── the contract rows (huck already matches these; they must STAY matching) ──
 check "bundle order -ap"      'readonly -ap >/dev/null'
