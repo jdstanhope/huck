@@ -165,4 +165,17 @@ check "complete +o is a name"   'complete +o nospace foo; echo rc=$?'
 check "complete empty compspec" 'complete foo; echo rc=$?'
 check "complete -- then -o"     'complete -- -o foo; echo rc=$?'
 
+# ── exec (#516). Its scanner is hand-rolled ON PURPOSE — the parse must stay
+# pure because it runs twice (once at the restricted-policy check purely to ask
+# whether a command word is present, with errors swallowed). Its scanning was
+# already bash-correct; what was missing was the usage line, now emitted through
+# the same shared helpers and the same `usage_for` table as every other builtin.
+check "exec -Q"              'exec -Q'
+check "exec -Q with command" 'exec -Q true'
+check "exec -a missing value" 'exec -a'
+check "exec -cl bundles"     'exec -cl'
+check "exec -- terminator"   'exec --'
+check "exec lone dash"       'exec -'
+check "exec -a attached"     'exec -anm true; echo after'
+
 harness_summary
