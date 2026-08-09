@@ -3137,17 +3137,10 @@ fn builtin_mapfile(
     let mut origin: Option<usize> = None;
 
     // Parse a numeric option value.
-    fn num_val(
-        opt: char,
-        s: &str,
-        err: &mut dyn Write,
-        shell: &Shell,
-        name: &str,
-    ) -> Result<usize, ()> {
+    fn num_val(s: &str, err: &mut dyn Write, shell: &Shell, name: &str) -> Result<usize, ()> {
         match s.trim().parse::<usize>() {
             Ok(n) => Ok(n),
             Err(_) => {
-                let _ = opt; // kept for a potential future bash-shaped message
                 crate::sh_error_to!(shell, err, None, "{name}: {s}: invalid number");
                 Err(())
             }
@@ -3169,30 +3162,40 @@ fn builtin_mapfile(
                 }
                 'n' => {
                     let v = o.value.expect("spec requires a value for -n");
-                    match num_val('n', &v, err, shell, name) {
+                    match num_val(&v, err, shell, name) {
                         Ok(n) => count = n,
                         Err(()) => return ExecOutcome::Continue(2),
                     }
                 }
                 's' => {
                     let v = o.value.expect("spec requires a value for -s");
-                    match num_val('s', &v, err, shell, name) {
+                    match num_val(&v, err, shell, name) {
                         Ok(n) => skip = n,
                         Err(()) => return ExecOutcome::Continue(2),
                     }
                 }
                 'O' => {
                     let v = o.value.expect("spec requires a value for -O");
-                    match num_val('O', &v, err, shell, name) {
+                    match num_val(&v, err, shell, name) {
                         Ok(n) => origin = Some(n),
                         Err(()) => return ExecOutcome::Continue(2),
                     }
                 }
-                // `-u FD`, `-C callback`, `-c quantum` — accepted (in the real
-                // getopt spec) but not implemented; same pre-existing gap as
-                // before this conversion (doc comment above).
+                // `-u FD`, `-C callback`, `-c quantum` are real, implemented
+                // bash options (they take a getopt value, hence the colons in
+                // the spec above — a missing value already errors via the
+                // scanner's own `fail_missing_value`, matching bash exactly).
+                // huck has no read-from-fd / per-line-callback support, so
+                // rather than silently accepting-and-ignoring a supplied
+                // value (#496 Task 6 review, Critical: that turned a loud
+                // pre-v359 "-u: invalid option" rejection into SILENT DATA
+                // CORRUPTION — the array came back empty/wrong with no
+                // error), explicitly reject them, same status/shape as any
+                // other unrecognized option.
                 'u' | 'C' | 'c' => {
                     let _ = o.value;
+                    crate::sh_error_to!(shell, err, None, "{name}: -{}: invalid option", o.ch);
+                    return ExecOutcome::Continue(2);
                 }
                 _ => unreachable!("spec and match must agree"),
             },
@@ -4365,12 +4368,23 @@ fn parse_jobs_args(
     let mut only_new = false;
     let mut only_running = false;
     let mut only_stopped = false;
-    let mut exec_mode = false;
 
+    // `-x` is deliberately NOT in this spec, even though it's a real bash
+    // option (`jobs -x command [args]`: substitutes jobspecs with pids and
+    // execs COMMAND in the shell's place). huck has no exec-replace path
+    // reachable from a builtin body, and pre-v359 huck already rejected it
+    // outright (`-x: invalid option`, rc 2) since the old hand-rolled
+    // scanner had no arm for it. This task's first cut accepted it and
+    // reported "not supported" (rc 1) instead — worse than either the old
+    // behavior OR real bash: bare `jobs -x` exits 0 silently in real bash,
+    // so huck went from matching-by-accident to actively wrong (#496 Task 6
+    // review, Important). Leaving `x` out of the spec restores the loud
+    // rejection via the scanner's own generic invalid-option path — same
+    // status/shape as any other unrecognized flag, no bespoke message.
     let mut g = crate::builtin_opts::Getopt::new(
         "jobs",
         crate::builtin_opts::ArgView::Plain(args),
-        "lnprsx",
+        "lnprs",
     );
     loop {
         match g.next_opt(shell, err) {
@@ -4380,12 +4394,6 @@ fn parse_jobs_args(
                 'n' => only_new = true,
                 'r' => only_running = true,
                 's' => only_stopped = true,
-                // `-x command [args]`: substitutes jobspecs with pids and
-                // execs COMMAND in the shell's place. Not implemented (no
-                // exec-replace path is reachable from a builtin body); accepted
-                // syntactically per bash's option spec, reported as unsupported
-                // rather than silently mis-parsing the command as jobspecs.
-                'x' => exec_mode = true,
                 _ => unreachable!("spec and match must agree"),
             },
             Ok(None) => break,
@@ -4393,11 +4401,6 @@ fn parse_jobs_args(
         }
     }
     let idx = g.rest_index();
-
-    if exec_mode {
-        crate::sh_error_to!(shell, err, None, "jobs: -x: not supported in this context");
-        return Err(ExecOutcome::Continue(1));
-    }
 
     let mut targets = Vec::new();
     for arg in &args[idx..] {
@@ -5855,10 +5858,19 @@ fn builtin_history(
     // order-independent — `-cd 1` and `-d1 -c` behave identically; see the
     // comment at the dispatch site).
     let mut delete_op: Option<String> = None;
-    // `-w`/`-r`/`-a` don't take a getopt value (spec has no `:` on any of
-    // them) — bash's own syntax (`history -anrw [filename]`) shares ONE
-    // optional trailing filename operand across however many of them were
-    // requested. Recorded in encounter order; applied after the scan.
+    // `-a`/`-n`/`-r`/`-w` are mutually exclusive in bash (verified 5.2.21:
+    // ANY two of them together — `-aw`, `-wa`, `-rw`, `-ar`, `-an`, `-nr`,
+    // ... — error `"cannot use more than one of -anrw"`, rc 1, checked
+    // BEFORE any of them runs; `-an` does NOT fall through to -n's "not yet
+    // implemented" placeholder). None of them take a getopt value (spec has
+    // no `:` on any of the four), so this can only be settled once the
+    // whole flag set is known — recorded in encounter order, checked right
+    // after the scan.
+    let mut anrw_flags: Vec<char> = Vec::new();
+    // Populated from `anrw_flags` below once the at-most-one invariant
+    // holds. Bash's own syntax (`history -anrw [filename]`) gives whichever
+    // ONE of `-a`/`-r`/`-w` was requested the same shared optional trailing
+    // filename operand.
     let mut file_ops: Vec<char> = Vec::new();
     // ---- options ----
     let mut g = crate::builtin_opts::Getopt::new(
@@ -5871,8 +5883,8 @@ fn builtin_history(
             Ok(Some(o)) => match o.ch {
                 'c' => did_clear = true,
                 'd' => delete_op = Some(o.value.expect("spec requires a value for -d")),
-                'w' | 'r' | 'a' => file_ops.push(o.ch),
-                'n' | 'p' | 's' => {
+                'a' | 'n' | 'r' | 'w' => anrw_flags.push(o.ch),
+                'p' | 's' => {
                     crate::sh_error_to!(
                         shell,
                         err,
@@ -5887,6 +5899,25 @@ fn builtin_history(
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
         }
+    }
+
+    if anrw_flags.len() > 1 {
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "history: cannot use more than one of -anrw"
+        );
+        return ExecOutcome::Continue(1);
+    }
+    if let Some(&flag) = anrw_flags.first() {
+        if flag == 'n' {
+            // `-n` (read new lines from the history file, not yet consumed
+            // by this session) is unimplemented, same placeholder as -p/-s.
+            crate::sh_error_to!(shell, err, None, "history: -n: not yet implemented");
+            return ExecOutcome::Continue(1);
+        }
+        file_ops.push(flag);
     }
 
     // Fixed dispatch order (verified against bash 5.2.21, NOT the order the

@@ -60,6 +60,39 @@ check "hash -l unhashed resolvable" 'hash -l ls'
 check "hash -l already hashed"      'hash -p /bin/ls ls; hash -l ls'
 check "hash -l unresolvable"        'hash -l __hash_no_such_cmd_xyzzy__'
 
+# ── mapfile -u/-C/-c: real, bash-IMPLEMENTED options huck deliberately does
+# NOT implement (#496 Task 6 review, Critical). huck rejects them outright
+# rather than silently accepting-and-ignoring a supplied value (which
+# produced wrong data with no error — a severity increase from a loud
+# pre-v359 failure to silent corruption). That rejection necessarily
+# diverges from real bash whenever a VALUE is actually supplied (bash then
+# runs the feature), so there is no byte-matching fragment for that shape —
+# it's pinned instead by unit tests in builtins/tests.rs
+# (mapfile_dash_u_with_value_is_rejected_not_silently_ignored,
+# mapfile_dash_c_callback_with_value_is_rejected_not_silently_ignored,
+# readarray_dash_u_reports_invoked_name). What CAN byte-match bash here is
+# the missing-value shape: real bash's own getopt ALSO requires an argument
+# for `-u`/`-C` (they're `:`-spec too), so `mapfile -u`/`-C` with nothing
+# after them errors identically in both shells before either one would ever
+# try to use/ignore a value.
+check "mapfile -u missing value" 'mapfile -u'
+check "mapfile -C missing value" 'mapfile -C'
+
+# ── jobs -x: real, bash-IMPLEMENTED option (substitutes jobspecs with pids
+# and execs COMMAND in the shell's place) huck deliberately does not
+# implement — same reasoning as mapfile -u/-C/-c above. Unlike those two,
+# `-x` takes no getopt value at all, so there is no missing-value shape to
+# exploit for a byte-matching row either: EVERY fragment that exercises `-x`
+# as a real flag diverges (bare `jobs -x` exits 0 silently in real bash;
+# `jobs -x echo hi` prints "hi" rc 0). Pinned instead by a unit test in
+# builtins/tests.rs (jobs_x_is_rejected_as_invalid_option) — no harness row
+# is possible here without huck actually implementing the feature.
+
+# ── history -anrw: real mutual exclusion, fixed IN this task, not reverted
+# (#496 Task 6 review, Important) — bash rejects ANY two of -a/-n/-r/-w
+# together, byte-matches once implemented.
+check "history -aw mutual exclusion" 'history -aw /tmp/nonexistent_hist_xyz_496'
+
 # ── the contract rows (huck already matches these; they must STAY matching) ──
 check "bundle order -ap"      'readonly -ap >/dev/null'
 check "-- terminates"         'readonly -- x=1; echo $x'

@@ -1178,12 +1178,89 @@ fn jobs_positional_spec_filters_to_target() {
 }
 
 #[test]
+fn mapfile_dash_u_with_value_is_rejected_not_silently_ignored() {
+    // Real bash IMPLEMENTS `-u FD` (read from that fd instead of stdin). huck
+    // does not, and implementing it is out of scope for the option-scanner
+    // conversion (#496). Before this task `-u` was rejected outright
+    // (`-u: invalid option`, rc 2) because the old hand-rolled scanner had
+    // no arm for it at all. This task's first cut marked `-u` as a
+    // recognized value-taking option and then silently discarded the
+    // value — which parses clean but produces WRONG DATA with NO error
+    // (the target array came back empty instead of erroring), a severity
+    // increase from loud failure to silent corruption (#496 Task 6 review,
+    // Critical). Pinning the loud rejection so it cannot regress back to
+    // silent-ignore. This is a unit test rather than a bash-diff harness
+    // row because huck's chosen behavior (reject) necessarily diverges
+    // from real bash's (implement) for ANY fragment that actually supplies
+    // a value — there is no fragment where the two byte-match here.
+    let mut shell = Shell::new();
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "mapfile",
+        &["-u".to_string(), "3".to_string(), "A".to_string()],
+        &mut std::io::sink(),
+        &mut err,
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    let err_text = String::from_utf8(err).unwrap();
+    assert!(err_text.contains("-u: invalid option"), "err: {err_text}");
+    assert!(
+        shell.get_var("A").is_none(),
+        "A must not be created/populated by a rejected -u"
+    );
+}
+
+#[test]
+fn mapfile_dash_c_callback_with_value_is_rejected_not_silently_ignored() {
+    // Same reasoning as the `-u` test above, for `-C callback -c quantum`
+    // (real bash invokes CALLBACK every QUANTUM lines read).
+    let mut shell = Shell::new();
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "mapfile",
+        &[
+            "-C".to_string(),
+            "echo cb".to_string(),
+            "-c".to_string(),
+            "1".to_string(),
+            "A".to_string(),
+        ],
+        &mut std::io::sink(),
+        &mut err,
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    let err_text = String::from_utf8(err).unwrap();
+    // The scanner processes `-C`'s value first and errors there — `-c`
+    // never gets scanned. Either char rejecting is a correct outcome; pin
+    // the one the scan order actually produces.
+    assert!(err_text.contains("-C: invalid option"), "err: {err_text}");
+}
+
+#[test]
+fn readarray_dash_u_reports_invoked_name() {
+    // The class-3 name-threading fix (#496 Task 6) must hold for the
+    // rejection path too, not just the ordinary invalid-option path.
+    let mut shell = Shell::new();
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "readarray",
+        &["-u".to_string(), "3".to_string(), "A".to_string()],
+        &mut std::io::sink(),
+        &mut err,
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    let err_text = String::from_utf8(err).unwrap();
+    assert!(
+        err_text.contains("readarray: -u: invalid option"),
+        "err: {err_text}"
+    );
+}
+
+#[test]
 fn jobs_invalid_flag_returns_usage_status_2() {
-    // `-x` used to be this test's "invalid flag" — it no longer is: `jobs
-    // -x command [args]` is a real bash option (spec `"lnprsx"`, #496), it
-    // was simply unimplemented in huck's hand-rolled scanner (which lacked
-    // an `x` arm at all, so it fell into the catch-all). `-Q` is not in the
-    // spec either way and stays a genuine invalid option.
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -1197,11 +1274,15 @@ fn jobs_invalid_flag_returns_usage_status_2() {
 }
 
 #[test]
-fn jobs_x_is_accepted_but_unsupported() {
-    // `-x` parses (it's in the real getopt spec) but huck has no exec-
-    // replace path reachable from a builtin body to implement its
-    // substitute-jobspecs-and-exec semantics; it reports unsupported rather
-    // than silently mis-parsing the trailing command as jobspecs.
+fn jobs_x_is_rejected_as_invalid_option() {
+    // `-x` (real bash: substitutes jobspecs with pids and execs COMMAND in
+    // the shell's place) is unimplemented in huck. This task's first cut
+    // accepted the flag and reported "not supported" (rc 1) — worse than
+    // both the pre-v359 rejection AND real bash (`jobs -x` with no operand
+    // exits 0 silently in real bash; huck went from matching-by-accident to
+    // actively wrong). Restored the loud pre-v359 outcome: `-x` is simply
+    // not in the spec, so it takes the same generic invalid-option path as
+    // any other unrecognized flag (#496 Task 6 review, Important).
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -1212,9 +1293,9 @@ fn jobs_x_is_accepted_but_unsupported() {
         &mut err,
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    assert!(matches!(outcome, ExecOutcome::Continue(2)));
     let err_text = String::from_utf8(err).unwrap();
-    assert!(err_text.contains("not supported"), "err: {err_text}");
+    assert!(err_text.contains("-x: invalid option"), "err: {err_text}");
 }
 
 #[test]
