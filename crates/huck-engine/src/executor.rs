@@ -4449,6 +4449,13 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
             // (unscoped); replay it under the command's own redirect scope —
             // #77: `$(command -Z 2>&1)` must capture the error, not leak it
             // to the real stderr.
+            //
+            // Note: `g.next_opt` already set `shell.builtin_usage_error =
+            // Some(2)` as a side effect of the scan; nothing here consumes
+            // it (we return the code directly). Harmless today — it's
+            // unconditionally cleared at the top of the next
+            // `run_exec_single_inner` — but a latent trap if a future
+            // posix-fatality check ever reads it before that clear runs.
             with_redirect_scope(&cmd.redirects, shell, |_shell| {
                 let mut err = err_writer();
                 let _ = err.write_all(&diag);
@@ -4507,7 +4514,9 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
         if let Some(code) = scan_err {
             // #77: replay the diagnostic under the command's own redirect
             // scope so `$(builtin -Q 2>&1)` captures it instead of leaking
-            // to the real stderr.
+            // to the real stderr. (`shell.builtin_usage_error` is left
+            // unconsumed here too — see the matching comment in the
+            // `command` loop above.)
             with_redirect_scope(&cmd.redirects, shell, |_shell| {
                 let mut err = err_writer();
                 let _ = err.write_all(&diag);

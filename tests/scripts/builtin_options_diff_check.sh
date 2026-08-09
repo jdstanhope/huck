@@ -29,6 +29,27 @@ for b in unset readonly read type hash declare typeset printf command mapfile \
 done
 check "local -Q invalid option" 'f() { local -Q; }; f'
 
+# ── missing-value message: `NAME: -C: option requires an argument`, NOT the
+# getopt(3) `NAME: option requires an argument -- C` shape (#496 Task 5
+# review: the scanner had the wrong shape, caught only because `hash -p` was
+# the first `:`-spec builtin converted). `hash -p` is ON the scanner and
+# pins the fixed shape (must PASS). `printf -v` still hand-rolls its own
+# scan (Task 6/7 territory) and its FIRST line already matches bash today —
+# it's EXPECTED RED here only because its hand-rolled code is missing the
+# second (usage) line entirely, a pre-existing gap unrelated to this fix.
+# Once printf converts onto the scanner this row must go green with BOTH
+# lines; if it goes green with the wrong shape on line one, that's the
+# regression this row exists to catch.
+check "hash -p missing value"    'hash -p'
+check "printf -v missing value"  'printf -v'
+
+# ── hash -l/-t precedence with operand names (#496 Task 5 review) ──
+# `-t` wins over bare `-l` for reporting an UNHASHED name ("not found"), but
+# `-l` wins the PRINT FORMAT for a HASHED name when both are given (the
+# reusable `-p` form, not `-t`'s bare-path form). Both cases must hold.
+check "hash -lt hashed name"   'hash -p /bin/ls ls; hash -lt ls'
+check "hash -lt unhashed name" 'hash -lt ls'
+
 # ── the contract rows (huck already matches these; they must STAY matching) ──
 check "bundle order -ap"      'readonly -ap >/dev/null'
 check "-- terminates"         'readonly -- x=1; echo $x'

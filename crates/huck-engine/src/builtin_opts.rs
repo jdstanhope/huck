@@ -189,11 +189,15 @@ impl<'a> Getopt<'a> {
     }
 
     fn fail_missing_value(&self, c: char, shell: &mut Shell, err: &mut dyn Write) {
+        // bash's form is `NAME: -C: option requires an argument` — NOT the
+        // getopt(3) `NAME: option requires an argument -- C` shape. Verified
+        // against bash 5.2.21 (`hash -p`, `printf -v`, `read -n`, `mapfile
+        // -d` all use this exact wording).
         crate::sh_error_to!(
             shell,
             err,
             None,
-            "{}: option requires an argument -- {c}",
+            "{}: -{c}: option requires an argument",
             self.name
         );
         let _ = writeln!(err, "{}: usage: {}", self.name, usage_for(self.name));

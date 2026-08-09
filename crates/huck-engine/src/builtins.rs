@@ -9034,8 +9034,9 @@ fn builtin_hash(
     shell: &mut Shell,
 ) -> ExecOutcome {
     // Mode-selector flags. Priority when multiple set:
-    // reset > delete > set_path > type_only-with-names > list > type_only-bare
-    // > default. (`-t` with operand names wins over `-l`; bare `-t`/`-l`
+    // reset > delete > set_path > (list-or-type)-with-names > list-bare >
+    // type-bare > default. (With operand names, `-l`/`-t` share one path —
+    // see the per-name block below for the exact precedence; bare `-t`/`-l`
     // fall back to the no-names branches below.)
     let mut reset = false;
     let mut delete = false;
@@ -9112,20 +9113,30 @@ fn builtin_hash(
         return ExecOutcome::Continue(0);
     }
 
-    // `-t` (report hashed path per name) takes priority over `-l` when NAMES
-    // are given — bash: `hash -lt ls` (ls not yet hashed) reports `hash: ls:
-    // not found`, not the bare "-l" table listing. `-l` alone still owns the
-    // no-names form below.
-    if type_only && !names.is_empty() {
+    // With operand NAMEs, `-l` and `-t` share one per-name path (bash
+    // 5.2.21, verified): a name ABSENT from the table is `not found`
+    // regardless of which flag(s) fired. A name PRESENT prints in `-l`'s
+    // reusable form when `-l` is set (even together with `-t` — `-l` wins
+    // the FORMAT), `-t`'s bare-path form when only `-t` is set, or nothing
+    // at all when only `-l` is set (a pure existence check):
+    //   hash -p /bin/ls ls; hash -lt ls   -> `builtin hash -p /bin/ls ls`
+    //   hash -lt ls        (unhashed)     -> `hash: ls: not found`
+    //   hash -l ls         (hashed)       -> (nothing)
+    if (list || type_only) && !names.is_empty() {
         let mut exit: i32 = 0;
         for name in names {
             match shell.command_hash.get(name) {
                 Some((path, _)) => {
-                    if names.len() == 1 {
-                        let _ = writeln!(out, "{}", path.display());
-                    } else {
-                        let _ = writeln!(out, "{}\t{}", name, path.display());
+                    if list && type_only {
+                        let _ = writeln!(out, "builtin hash -p {} {}", path.display(), name);
+                    } else if type_only {
+                        if names.len() == 1 {
+                            let _ = writeln!(out, "{}", path.display());
+                        } else {
+                            let _ = writeln!(out, "{}\t{}", name, path.display());
+                        }
                     }
+                    // `-l` alone (no `-t`): silent existence check.
                 }
                 None => {
                     crate::sh_error_to!(shell, err, None, "hash: {name}: not found");

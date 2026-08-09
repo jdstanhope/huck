@@ -66,6 +66,34 @@ fn unknown_option_reports_two_and_stops() {
 }
 
 #[test]
+fn missing_value_message_is_bashs_shape_not_getopt3s() {
+    // bash: `hash: -p: option requires an argument` — NOT the getopt(3)
+    // `hash: option requires an argument -- p` shape. A prior version of
+    // this scanner emitted the getopt(3) shape; `hash -p` (the first
+    // `:`-spec builtin converted, #496 Task 5) caught it.
+    let args: Vec<String> = vec!["-p".to_string()];
+    let mut sh = Shell::new();
+    let mut err: Vec<u8> = Vec::new();
+    let mut g = Getopt::new("hash", ArgView::Plain(&args), "p:");
+    match g.next_opt(&mut sh, &mut err) {
+        Err(2) => {}
+        other => panic!(
+            "expected Err(2), got a value that isn't Debug-comparable here: {}",
+            other.is_err()
+        ),
+    }
+    let text = String::from_utf8(err).unwrap();
+    assert!(
+        text.contains("hash: -p: option requires an argument"),
+        "got: {text:?}"
+    );
+    assert!(
+        !text.contains("-- p"),
+        "must not use the getopt(3) shape: {text:?}"
+    );
+}
+
+#[test]
 fn usage_is_keyed_on_the_invoked_name_not_the_implementation() {
     // readarray/mapfile and typeset/declare share an implementation but must
     // NOT share a usage string — bash names the builtin the user invoked.
