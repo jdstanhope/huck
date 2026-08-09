@@ -72,27 +72,24 @@ check "hash -l unhashed resolvable" 'hash -l ls'
 check "hash -l already hashed"      'hash -p /bin/ls ls; hash -l ls'
 check "hash -l unresolvable"        'hash -l __hash_no_such_cmd_xyzzy__'
 
-# ── mapfile -u/-C/-c: real, bash-IMPLEMENTED options huck deliberately does
-# NOT implement (#496 Task 6 review, Critical). huck rejects them outright
-# rather than silently accepting-and-ignoring a supplied value (which
-# produced wrong data with no error — a severity increase from a loud
-# pre-v359 failure to silent corruption). That rejection necessarily
-# diverges from real bash whenever a VALUE is actually supplied (bash then
-# runs the feature), so there is no byte-matching fragment for that shape —
-# it's pinned instead by unit tests in builtins/tests.rs
-# (mapfile_dash_u_with_value_is_rejected_not_silently_ignored,
-# mapfile_dash_c_callback_with_value_is_rejected_not_silently_ignored,
-# readarray_dash_u_reports_invoked_name). What CAN byte-match bash here is
-# the missing-value shape: real bash's own getopt ALSO requires an argument
-# for `-u`/`-C` (they're `:`-spec too), so `mapfile -u`/`-C` with nothing
-# after them errors identically in both shells before either one would ever
-# try to use/ignore a value.
-check "mapfile -u missing value" 'mapfile -u'
-check "mapfile -C missing value" 'mapfile -C'
+# ── mapfile -u/-C/-c are now IMPLEMENTED (#511). They were rejected outright
+# while unimplemented, because parsing-and-ignoring them produced wrong data
+# with no error (#496 Task 6 review, Critical). Now they byte-match bash, so
+# the behaviour itself is pinned here rather than the rejection.
+check "mapfile -u missing value"  'mapfile -u'
+check "mapfile -C missing value"  'mapfile -C'
+check "mapfile -u bad fd"         'mapfile -t -u 9 A; echo rc=$?'
+check "mapfile -u non-numeric"    'mapfile -t -u abc A; echo rc=$?'
+check "mapfile -u reads that fd"  'printf "a\nb\n" > /tmp/hk511.$$; exec 3</tmp/hk511.$$; mapfile -t -u 3 A; printf "%s|" "${A[@]}"; echo "n=${#A[@]}"; rm -f /tmp/hk511.$$'
+check "mapfile -C -c fires"       'printf "a\nb\nc\nd\ne\n" > /tmp/hk511b.$$; mapfile -t -C "echo CB:" -c 2 A < /tmp/hk511b.$$; echo "n=${#A[@]}"; rm -f /tmp/hk511b.$$'
+check "mapfile -C default quantum" 'printf "a\nb\nc\n" > /tmp/hk511c.$$; mapfile -t -C "echo CB:" A < /tmp/hk511c.$$; echo "n=${#A[@]}"; rm -f /tmp/hk511c.$$'
+check "mapfile -C sees partial"   'printf "a\nb\nc\nd\ne\n" > /tmp/hk511d.$$; mapfile -t -C "echo have=\${#A[@]}" -c 2 A < /tmp/hk511d.$$; rm -f /tmp/hk511d.$$'
+check "mapfile clears on empty"   'A=(x y z); mapfile -t A < /dev/null; echo "n=${#A[@]}"'
 
 # ── jobs -x: real, bash-IMPLEMENTED option (substitutes jobspecs with pids
 # and execs COMMAND in the shell's place) huck deliberately does not
-# implement — same reasoning as mapfile -u/-C/-c above. Unlike those two,
+# implement. (mapfile -u/-C/-c were in this position until #511
+# implemented them; the reasoning below is now jobs -x's alone.) Unlike them,
 # `-x` takes no getopt value at all, so there is no missing-value shape to
 # exploit for a byte-matching row either: EVERY fragment that exercises `-x`
 # as a real flag diverges (bare `jobs -x` exits 0 silently in real bash;
