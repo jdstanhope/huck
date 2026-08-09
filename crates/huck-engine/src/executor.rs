@@ -795,23 +795,11 @@ fn run_command(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
                 ExecOutcome::Continue(outcome)
             } else {
                 // Non-interactive (script), nested subshell, or completion:
-                // poll-based wait via stream_loop::external_capture_loop (no
-                // capture pipes — it falls to a plain blocking wait, but stays
-                // timeout-aware). Runs on the embedder's thread.
-                let sinks = crate::stream_loop::CaptureSinks {
-                    stdout: None,
-                    stderr: None,
-                };
+                // block until the child exits, on the embedder's thread.
                 // #418: about to BLOCK on a foreground child — bash reaps (and so may
                 // announce a background job's death) exactly at such a point.
                 note_blocked_on_child(shell);
-                let loop_result = crate::stream_loop::external_capture_loop(
-                    pid as libc::pid_t,
-                    -1,
-                    -1,
-                    sinks,
-                    || None,
-                );
+                let loop_result = crate::stream_loop::wait_for_child(pid as libc::pid_t);
                 let raw_status = match loop_result {
                     Ok(s) => s,
                     Err(_) => return ExecOutcome::Continue(1),
@@ -6053,24 +6041,13 @@ fn run_subprocess(
                     }
                 }
             } else {
-                // Non-interactive path: wait on the child via
-                // stream_loop::external_capture_loop. Stage 3 (#197): stdout/stderr
-                // inherit the real fd 1/2 (no capture pipes), so this is a
-                // timeout-aware blocking wait. Runs on the embedder's thread.
-                let sinks = crate::stream_loop::CaptureSinks {
-                    stdout: None,
-                    stderr: None,
-                };
+                // Non-interactive path: stdout/stderr inherit the real fd 1/2
+                // since #197 Stage 3 (no capture pipes), so this is simply a
+                // blocking wait on the embedder's thread.
                 // #418: about to BLOCK on a foreground child — bash reaps (and so may
                 // announce a background job's death) exactly at such a point.
                 note_blocked_on_child(shell);
-                let loop_result = crate::stream_loop::external_capture_loop(
-                    pid as libc::pid_t,
-                    -1,
-                    -1,
-                    sinks,
-                    || None,
-                );
+                let loop_result = crate::stream_loop::wait_for_child(pid as libc::pid_t);
                 // We have already reaped the child via waitpid(WNOHANG) inside
                 // the loop. Tell `Child` not to reap (or wait on) again — the
                 // pid has been collected and would otherwise be -ECHILD.
