@@ -192,4 +192,28 @@ check "readarray -n names self" 'readarray -n abc A'
 check "wait -p alone"           'wait -p v; echo "[${v-unset}]"'
 check "wait -n -p"              'wait -n -p v'
 
+# ── declare/local `+attr` (#507). bash ACCEPTS `+r` and does nothing — it
+# cannot remove readonly, but that is silent. The only error in
+# `declare -r w=1; declare +r w=2` is the ASSIGNMENT to a readonly variable.
+# And `local` DOES take `+` options; huck reported them as invalid identifiers.
+check "declare +r no-op"      'v=1; declare +r v=2; echo "rc=$? [$v]"'
+check "declare +r on readonly" 'declare -r w=1; declare +r w=2; echo "rc=$? [$w]"'
+check "local +r accepted"     'f(){ local +r x=1; echo "rc=$? [$x]"; }; f'
+check "local +x accepted"     'f(){ local +x x=1; echo "rc=$? [$x]"; }; f'
+check "local +unknown"        'f(){ local +z x=1; }; f'
+check "local - and + interleave" 'f(){ local -r +x y=2; echo "rc=$? [$y]"; }; f'
+
+# ── alias -p with operands (#510): bash prints the WHOLE table, then handles
+# the operands normally — so `-p nosuch` prints the table and THEN errors.
+check "alias -p with operand" 'alias xx=yy; alias -p xx'
+check "alias -p two aliases"  'alias xx=yy zz=ww; alias -p xx'
+check "alias -p missing name" 'alias xx=yy; alias -p nosuch'
+
+# ── command -v/-V (#508): the LAST one wins, bundled or separate. huck always
+# took -v, which agreed only when -v happened to come last.
+check "command -v -V"         'command -v -V ls'
+check "command -V -v"         'command -V -v ls'
+check "command -vV bundled"   'command -vV ls'
+check "command -Vv bundled"   'command -Vv ls'
+
 harness_summary

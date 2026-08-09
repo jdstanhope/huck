@@ -73,10 +73,21 @@ fn declare_plus_x_unexports() {
 }
 
 #[test]
-fn declare_plus_r_errors() {
+fn declare_plus_r_is_accepted_and_does_nothing() {
+    // WAS `declare_plus_r_errors`, asserting rc 1 with
+    // `+r: readonly attribute cannot be removed`. bash emits no such message
+    // (#507): it ACCEPTS `+r` and silently does nothing, because it cannot
+    // remove readonly. Measured on bash 5.2.21 —
+    //
+    //   v=1; declare +r v=2   ->  rc 0, v becomes 2
+    //   declare -r w=1; declare +r w=2
+    //                         ->  `declare: w: readonly variable`, rc 1
+    //
+    // i.e. the only failure comes from ASSIGNING to a readonly variable, which
+    // is the assignment path's error, not the `+r` flag's.
     let mut shell = Shell::new();
     let (oc, _) = run(&["+r", "X_FOO"], &mut shell);
-    assert!(matches!(oc, ExecOutcome::Continue(1)));
+    assert!(matches!(oc, ExecOutcome::Continue(0)));
 }
 
 #[test]

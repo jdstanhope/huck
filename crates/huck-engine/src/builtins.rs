@@ -1671,31 +1671,68 @@ fn builtin_local_decl(
     let mut saw_minus_u = false;
     let mut saw_minus_c = false;
     let mut saw_minus_n = false;
-    // `local` takes no `+`-style options (unlike `declare`), so the scanner
-    // owns the whole `-` side here.
-    let mut g = crate::builtin_opts::Getopt::new(
-        name,
-        crate::builtin_opts::ArgView::Decl(args),
-        "aAirlucn",
-    );
+    // `local` DOES take `+`-style options — the comment here used to claim it
+    // did not, and every `+anything` fell through to be reported as an invalid
+    // identifier (#507). Measured on bash 5.2.21:
+    //
+    //   local +r x=1   -> rc 0, x=1        (accepted)
+    //   local +x x=1   -> rc 0, x=1        (accepted)
+    //   local +z x=1   -> `local: +z: invalid option` + usage, rc 2
+    //
+    // The `-` and `+` runs interleave, so scan them alternately, as `declare`
+    // does. `+FLAG` means "do not give the new local this attribute", which is
+    // already the default: bash's `local` creates a FRESH variable carrying
+    // only the attributes its `-` flags ask for. So the accepted letters are
+    // no-ops rather than removals, and that is faithful, not a shortcut.
+    let mut idx = 0usize;
     loop {
-        match g.next_opt(shell, err) {
-            Ok(Some(o)) => match o.ch {
-                'a' => want_array = true,
-                'A' => want_associative = true,
-                'i' => want_integer = true,
-                'r' => want_readonly = true,
-                'l' => saw_minus_l = true,
-                'u' => saw_minus_u = true,
-                'c' => saw_minus_c = true,
-                'n' => saw_minus_n = true,
-                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
-            },
-            Ok(None) => break,
-            Err(code) => return ExecOutcome::Continue(code),
+        let pre_idx = idx;
+        let mut g = crate::builtin_opts::Getopt::new(
+            name,
+            crate::builtin_opts::ArgView::Decl(&args[idx..]),
+            "aAirlucn",
+        );
+        loop {
+            match g.next_opt(shell, err) {
+                Ok(Some(o)) => match o.ch {
+                    'a' => want_array = true,
+                    'A' => want_associative = true,
+                    'i' => want_integer = true,
+                    'r' => want_readonly = true,
+                    'l' => saw_minus_l = true,
+                    'u' => saw_minus_u = true,
+                    'c' => saw_minus_c = true,
+                    'n' => saw_minus_n = true,
+                    _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
+                },
+                Ok(None) => break,
+                Err(code) => return ExecOutcome::Continue(code),
+            }
         }
+        idx += g.rest_index();
+
+        // `--` ends option processing for the `+` side too.
+        if idx > pre_idx && matches!(&args[idx - 1], DeclArg::Plain(s) if s == "--") {
+            break;
+        }
+        let Some(DeclArg::Plain(arg)) = args.get(idx) else {
+            break;
+        };
+        if !(arg.starts_with('+') && arg.len() > 1) {
+            break;
+        }
+        for &c in &arg.as_bytes()[1..] {
+            match c {
+                // Accepted, and a no-op: see the note above.
+                b'a' | b'A' | b'i' | b'r' | b'l' | b'u' | b'c' | b'n' | b'x' => {}
+                other => {
+                    crate::builtin_opts::emit_invalid_plus_option(name, other as char, shell, err);
+                    return ExecOutcome::Continue(2);
+                }
+            }
+        }
+        idx += 1;
     }
-    let idx = g.rest_index();
     if want_array && want_associative {
         crate::sh_error_to!(shell, err, None, "local: cannot specify both -a and -A");
         return ExecOutcome::Continue(1);
@@ -2245,15 +2282,13 @@ fn builtin_declare_decl(
         }
         for &c in &arg.as_bytes()[1..] {
             match c {
-                b'r' => {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "{name}: +r: readonly attribute cannot be removed"
-                    );
-                    return ExecOutcome::Continue(1);
-                }
+                // #507: bash ACCEPTS `+r` and does nothing — it cannot remove
+                // readonly, but that is silent, not an error. The only failure
+                // in `declare -r w=1; declare +r w=2` is the ASSIGNMENT to a
+                // readonly variable (`declare: w: readonly variable`), which
+                // the assignment path already reports. Measured: on a
+                // non-readonly variable `declare +r v=2` succeeds and assigns.
+                b'r' => {}
                 b'x' => want_remove_export = true,
                 b'i' => want_remove_integer = true,
                 b'a' => {
@@ -8600,12 +8635,17 @@ fn builtin_alias(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
+    let mut want_list = false;
     let mut g =
         crate::builtin_opts::Getopt::new("alias", crate::builtin_opts::ArgView::Plain(args), "p");
     loop {
         match g.next_opt(shell, err) {
             Ok(Some(o)) => match o.ch {
-                'p' => {} // `-p` lists in the `alias`-reparseable form; same as no operands.
+                // #510: `-p` prints the whole table, and does NOT replace the
+                // operands — bash does both. `alias -p xx` prints the table and
+                // then `xx` again; `alias -p nosuch` prints the table and THEN
+                // reports the missing name.
+                'p' => want_list = true,
                 _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
@@ -8613,6 +8653,14 @@ fn builtin_alias(
         }
     }
     let operands = &args[g.rest_index()..];
+    if want_list && !operands.is_empty() {
+        let mut names: Vec<&String> = shell.aliases.keys().collect();
+        names.sort();
+        for name in names {
+            let value = &shell.aliases[name];
+            let _ = writeln!(out, "alias {}='{}'", name, escape_alias_value(value));
+        }
+    }
     if operands.is_empty() {
         let mut names: Vec<&String> = shell.aliases.keys().collect();
         names.sort();
@@ -9208,8 +9256,17 @@ fn builtin_command(
     loop {
         match g.next_opt(shell, err) {
             Ok(Some(o)) => match o.ch {
-                'v' => concise = true,
-                'V' => verbose = true,
+                // #508: bash takes the LAST of `-v`/`-V`, bundled or separate
+                // (`command -v -V ls` and `command -vV ls` both describe).
+                // huck always took `-v`, which agreed only when `-v` came last.
+                'v' => {
+                    concise = true;
+                    verbose = false;
+                }
+                'V' => {
+                    verbose = true;
+                    concise = false;
+                }
                 'p' => {} // accept; introspection uses current $PATH
                 _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
