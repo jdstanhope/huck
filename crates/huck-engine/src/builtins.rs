@@ -476,34 +476,35 @@ fn builtin_cd_as(
         crate::sh_error_to!(shell, err, None, "{msg}");
         return ExecOutcome::Continue(1);
     }
-    // 1. Parse leading -L/-P flags (last wins) and `--`. `-` is NOT a flag (it
-    //    is the OLDPWD shortcut / target).
+    // 1. Parse leading -L/-P/-e flags (last of -L/-P wins) and `--`. `-` is NOT
+    //    a flag (it is the OLDPWD shortcut / target).
+    //
+    //    `@` is in bash's own usage string (`cd [-L|[-P [-e]] [-@]] [dir]`)
+    //    but it's gated on HAVE_XATTR at bash's compile time — the ubuntu-24.04
+    //    bash 5.2.21 this project targets does NOT have it built in and
+    //    rejects `-@` itself (verified: `bash -c 'cd -@ /tmp'` ->
+    //    `cd: -@: invalid option`). Leaving `@` out of the spec so huck
+    //    rejects it too is therefore a byte-for-byte MATCH with the target
+    //    bash, not a gap.
     let mut physical_flag: Option<bool> = None;
-    let mut idx = 0;
-    while idx < args.len() {
-        match args[idx].as_str() {
-            "-L" => {
-                physical_flag = Some(false);
-                idx += 1;
-            }
-            "-P" => {
-                physical_flag = Some(true);
-                idx += 1;
-            }
-            "--" => {
-                idx += 1;
-                break;
-            }
-            "-" => break, // OLDPWD shortcut, handled as the target below
-            s if s.starts_with('-') && s.len() > 1 => {
-                crate::sh_error_to!(shell, err, None, "cd: {s}: invalid option");
-                e!(err, "cd: usage: cd [-L|[-P [-e]] [-@]] [dir]");
-                return ExecOutcome::Continue(2);
-            }
-            _ => break, // a target
+    let mut want_e = false;
+    let mut g =
+        crate::builtin_opts::Getopt::new("cd", crate::builtin_opts::ArgView::Plain(args), "LPe");
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'L' => physical_flag = Some(false),
+                'P' => physical_flag = Some(true),
+                // -e: only takes effect below, in the -P branch, when
+                // `env::current_dir()` fails after a successful chdir.
+                'e' => want_e = true,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
     }
-    let rest = &args[idx..];
+    let rest = &args[g.rest_index()..];
     if rest.len() > 1 {
         crate::sh_error_to!(shell, err, None, "cd: too many arguments");
         return ExecOutcome::Continue(1);
@@ -537,6 +538,12 @@ fn builtin_cd_as(
 
     let prev_pwd = shell.get("PWD").map(str::to_string);
 
+    // Set when a `-P` chdir succeeds but the follow-up `current_dir()` (the
+    // getcwd bash does to re-derive $PWD) fails — the one case `-e` names:
+    // "if the -P option is supplied, and the current working directory
+    // cannot be determined successfully, exit with a non-zero status."
+    let mut pwd_undetermined = false;
+
     let new_pwd: String = if physical {
         // Physical: chdir to the target, store the canonical cwd.
         if let Err(e) = env::set_current_dir(Path::new(&target)) {
@@ -559,6 +566,7 @@ fn builtin_cd_as(
                     "cd: warning: could not read current dir: {}",
                     crate::bash_io_error(&e)
                 );
+                pwd_undetermined = true;
                 prev_pwd.clone().unwrap_or_default()
             }
         }
@@ -603,7 +611,7 @@ fn builtin_cd_as(
         // v308: reported once by the run_builtin_with_redirects epilogue.
         return ExecOutcome::Continue(1);
     }
-    ExecOutcome::Continue(0)
+    ExecOutcome::Continue(if want_e && pwd_undetermined { 1 } else { 0 })
 }
 
 fn builtin_pwd(
@@ -615,17 +623,17 @@ fn builtin_pwd(
     // Parse -L/-P (last wins); `--` ends flags; non-flag args are ignored
     // (bash prints pwd anyway). Unknown flag → invalid option, rc 2.
     let mut physical_flag: Option<bool> = None;
-    for a in args {
-        match a.as_str() {
-            "-L" => physical_flag = Some(false),
-            "-P" => physical_flag = Some(true),
-            "--" => break,
-            s if s.starts_with('-') && s.len() > 1 => {
-                crate::sh_error_to!(shell, err, None, "pwd: {s}: invalid option");
-                e!(err, "pwd: usage: pwd [-LP]");
-                return ExecOutcome::Continue(2);
-            }
-            _ => {} // ignore non-flag args
+    let mut g =
+        crate::builtin_opts::Getopt::new("pwd", crate::builtin_opts::ArgView::Plain(args), "LP");
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'L' => physical_flag = Some(false),
+                'P' => physical_flag = Some(true),
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
     }
     let physical = physical_flag.unwrap_or_else(|| option_get(shell, "physical").unwrap_or(false));
@@ -5470,39 +5478,25 @@ fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Ex
     let mut all = false;
     let mut running_only = false;
     let mut mark_nohup = false;
-    let mut idx = 0;
-    while idx < args.len() {
-        let a = &args[idx];
-        if a == "--" {
-            idx += 1;
-            break;
-        }
-        if let Some(rest) = a.strip_prefix('-') {
-            if rest.is_empty() {
-                break;
-            }
-            for c in rest.chars() {
-                match c {
-                    'a' => all = true,
-                    'r' => running_only = true,
-                    'h' => mark_nohup = true,
-                    _ => {
-                        crate::sh_error_to!(shell, err, None, "disown: -{c}: invalid option");
-                        e!(
-                            err,
-                            "disown: usage: disown [-h] [-ar] [jobspec ... | pid ...]"
-                        );
-                        return ExecOutcome::Continue(2);
-                    }
-                }
-            }
-            idx += 1;
-        } else {
-            break;
+    let mut g = crate::builtin_opts::Getopt::new(
+        "disown",
+        crate::builtin_opts::ArgView::Plain(args),
+        "har",
+    );
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'a' => all = true,
+                'r' => running_only = true,
+                'h' => mark_nohup = true,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
     }
 
-    let positional = &args[idx..];
+    let positional = &args[g.rest_index()..];
 
     let mut target_ids: Vec<u32> = if all {
         shell.jobs.iter().map(|j| j.id).collect()
@@ -6469,22 +6463,17 @@ fn optstring_takes_arg(optstring: &str, c: char) -> bool {
 fn builtin_getopts(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     const USAGE: &str = "getopts: usage: getopts optstring name [arg ...]";
 
-    // getopts accepts no options of its own. A leading operand starting with
-    // '-' (other than "-" or "--") is an invalid option, reported with the
-    // builtin-error prologue plus a usage line (bash: internal_getopt("")).
-    // A leading "--" is consumed as the option terminator.
-    let mut args = args;
-    if let Some(first) = args.first() {
-        if first.starts_with('-') && first != "-" && first != "--" {
-            let c = first.chars().nth(1).unwrap();
-            crate::sh_error_to!(shell, err, Some("getopts"), "-{c}: invalid option");
-            e!(err, "{USAGE}");
-            return ExecOutcome::Continue(2);
-        }
-        if first == "--" {
-            args = &args[1..];
-        }
+    // getopts accepts no options of its own (bash: internal_getopt("")). A
+    // leading operand starting with '-' (other than "-" or "--") is an
+    // invalid option; a leading "--" is consumed as the option terminator.
+    let mut g =
+        crate::builtin_opts::Getopt::new("getopts", crate::builtin_opts::ArgView::Plain(args), "");
+    match g.next_opt(shell, err) {
+        Ok(Some(_)) => unreachable!("empty spec accepts nothing"),
+        Ok(None) => {}
+        Err(code) => return ExecOutcome::Continue(code),
     }
+    let args = &args[g.rest_index()..];
 
     if args.len() < 2 {
         e!(err, "{USAGE}");
@@ -7137,33 +7126,26 @@ fn builtin_shopt(
 ) -> ExecOutcome {
     let (mut set_f, mut unset_f, mut quiet, mut print_f, mut o_bridge) =
         (false, false, false, false, false);
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        if a == "--" {
-            i += 1;
-            break;
-        }
-        if a.len() >= 2 && a.starts_with('-') {
-            for c in a[1..].chars() {
-                match c {
-                    's' => set_f = true,
-                    'u' => unset_f = true,
-                    'q' => quiet = true,
-                    'p' => print_f = true,
-                    'o' => o_bridge = true,
-                    _ => {
-                        crate::sh_error_to!(shell, err, None, "shopt: -{c}: invalid option");
-                        e!(err, "shopt: usage: shopt [-pqsu] [-o] [optname ...]");
-                        return ExecOutcome::Continue(2);
-                    }
-                }
-            }
-            i += 1;
-        } else {
-            break;
+    let mut g = crate::builtin_opts::Getopt::new(
+        "shopt",
+        crate::builtin_opts::ArgView::Plain(args),
+        "pqsuo",
+    );
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                's' => set_f = true,
+                'u' => unset_f = true,
+                'q' => quiet = true,
+                'p' => print_f = true,
+                'o' => o_bridge = true,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
     }
+    let i = g.rest_index();
     if set_f && unset_f {
         crate::sh_error_to!(
             shell,
@@ -9881,30 +9863,20 @@ fn builtin_umask(
 ) -> ExecOutcome {
     let mut symbolic = false;
     let mut posix = false;
-    let mut idx = 0;
-    while idx < args.len() {
-        let a = &args[idx];
-        if a == "--" {
-            idx += 1;
-            break;
-        }
-        if a.len() > 1 && a.starts_with('-') {
-            for c in a[1..].chars() {
-                match c {
-                    'S' => symbolic = true,
-                    'p' => posix = true,
-                    other => {
-                        crate::sh_error_to!(shell, err, Some("umask"), "-{other}: invalid option");
-                        e!(err, "umask: usage: umask [-p] [-S] [mode]");
-                        return ExecOutcome::Continue(2);
-                    }
-                }
-            }
-            idx += 1;
-        } else {
-            break;
+    let mut g =
+        crate::builtin_opts::Getopt::new("umask", crate::builtin_opts::ArgView::Plain(args), "pS");
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'S' => symbolic = true,
+                'p' => posix = true,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
     }
+    let idx = g.rest_index();
     // read current mask without disturbing it
     let cur = (unsafe {
         let m = libc::umask(0);
@@ -10151,39 +10123,50 @@ fn builtin_ulimit(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    const USAGE: &str = "ulimit: usage: ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]";
     let mut want_soft = false;
     let mut want_hard = false;
     let mut show_all = false;
     let mut letters: Vec<char> = Vec::new();
-    let mut idx = 0;
-    while idx < args.len() {
-        let a = &args[idx];
-        if a == "--" {
-            idx += 1;
-            break;
-        }
-        if a.len() > 1 && a.starts_with('-') {
-            for c in a[1..].chars() {
-                match c {
-                    'S' => want_soft = true,
-                    'H' => want_hard = true,
-                    'a' => show_all = true,
-                    'p' => letters.push('p'),
-                    other if ulimit_lookup(other).is_some() => letters.push(other),
-                    other => {
-                        crate::sh_error_to!(shell, err, Some("ulimit"), "-{other}: invalid option");
-                        e!(err, "{USAGE}");
-                        return ExecOutcome::Continue(2);
-                    }
+    // Built from ULIMIT_TABLE rather than bash's full "SHabcdefiklmnpqrstuvxPRT"
+    // literal: `b`/`k`/`P`/`T` name resource limits bash itself only accepts
+    // on platforms it was built with support for, and this project's bash
+    // target (ubuntu-24.04, bash 5.2.21) rejects all four itself (verified:
+    // `bash -c 'ulimit -b'` -> `invalid option`, same for -k/-P/-T) — so
+    // excluding them here is a MATCH with the target bash, not a gap. `R`
+    // (RLIMIT_RTTIME) is the one real, bash-accepted-on-Linux letter huck
+    // does not implement (no ULIMIT_TABLE entry); pre-v359 huck already
+    // rejected it too, so this keeps that pending divergence rather than
+    // widening into an unimplemented resource (#496 Task 6's mapfile
+    // lesson: don't parse what isn't backed by real behavior).
+    let spec: String = format!(
+        "SHap{}",
+        ULIMIT_TABLE.iter().map(|r| r.letter).collect::<String>()
+    );
+    let mut g = crate::builtin_opts::Getopt::new(
+        "ulimit",
+        crate::builtin_opts::ArgView::Plain(args),
+        &spec,
+    );
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'S' => want_soft = true,
+                'H' => want_hard = true,
+                'a' => show_all = true,
+                'p' => letters.push('p'),
+                other => {
+                    debug_assert!(
+                        ulimit_lookup(other).is_some(),
+                        "spec is built from ULIMIT_TABLE, so every non-fixed char resolves"
+                    );
+                    letters.push(other);
                 }
-            }
-            idx += 1;
-        } else {
-            break;
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
     }
-    let value_arg: Option<&String> = args.get(idx);
+    let value_arg: Option<&String> = args.get(g.rest_index());
 
     if show_all {
         let hard = want_hard && !want_soft;
@@ -10300,37 +10283,37 @@ fn builtin_enable(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    const USAGE: &str = "enable: usage: enable [-a] [-dnps] [-f filename] [name ...]";
     let mut disable = false; // -n
     let mut all = false; // -a
     let mut special = false; // -s
-    let mut idx = 0;
-    while idx < args.len() {
-        let a = &args[idx];
-        if a == "--" {
-            idx += 1;
-            break;
-        }
-        if a.len() > 1 && a.starts_with('-') {
-            for c in a[1..].chars() {
-                match c {
-                    'n' => disable = true,
-                    'a' => all = true,
-                    's' => special = true,
-                    'p' => {} // print format — the listing default
-                    other => {
-                        crate::sh_error_to!(shell, err, Some("enable"), "-{other}: invalid option");
-                        e!(err, "{USAGE}");
-                        return ExecOutcome::Continue(2);
-                    }
-                }
-            }
-            idx += 1;
-        } else {
-            break;
+    // `-d`/`-f filename` (bash's "dynamic loading" pair: load/unload a
+    // builtin from a shared object) are deliberately NOT in this spec.
+    // huck has no dlopen-based builtin-loading mechanism at all, so
+    // accepting `-f` would silently swallow a filename argument and do
+    // nothing — the same "parses, does nothing, wrong result with no
+    // error" shape #496 Task 6 flagged as strictly worse than rejecting.
+    // Pre-v359 huck already rejected both outright; this keeps that
+    // (`enable -d`/`enable -f x` -> `invalid option`, rc 2). Filed as a
+    // follow-up divergence, not implemented here.
+    let mut g = crate::builtin_opts::Getopt::new(
+        "enable",
+        crate::builtin_opts::ArgView::Plain(args),
+        "anps",
+    );
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'n' => disable = true,
+                'a' => all = true,
+                's' => special = true,
+                'p' => {} // print format — the listing default
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
     }
-    let names = &args[idx..];
+    let names = &args[g.rest_index()..];
 
     if names.is_empty() {
         let mut cands: Vec<&str> = BUILTIN_NAMES

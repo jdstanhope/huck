@@ -11,10 +11,17 @@
 //! Converted so far (#496): the four declaration builtins (`readonly`,
 //! `export`, `declare`/`typeset`, `local`; Task 4), the name/lookup
 //! builtins (`unset`, `type`, `hash`, `command`, `builtin`, `alias`,
-//! `unalias`; Task 5), and the I/O and job builtins (`read`,
+//! `unalias`; Task 5), the I/O and job builtins (`read`,
 //! `mapfile`/`readarray`, `printf`, `jobs`, `trap`, `help`, `wait`,
-//! `history`; Task 6). Remaining builtins (Task 7) still hand-roll their
-//! own scan.
+//! `history`; Task 6), and the completion and remaining builtins
+//! (`complete`, `compgen`, `compopt`, `cd`, `getopts`, `shopt`, `disown`,
+//! `umask`, `ulimit`, `pwd`, `enable`; Task 7 — the last batch). Every
+//! builtin with a real getopt-shaped option grammar is now on this
+//! scanner; `set` is not converted (it isn't a getopt builtin in bash —
+//! its long-option forms and `+`/`-` symmetry don't fit this contract),
+//! and `bg`/`bind`/`dirs`/`fg` were deliberately left out of scope (their
+//! divergences are check-ordering and `+N` numeric parsing, filed
+//! separately, not scanning).
 
 use crate::command::DeclArg;
 use crate::shell_state::Shell;

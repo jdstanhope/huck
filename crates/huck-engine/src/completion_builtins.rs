@@ -32,139 +32,195 @@ struct ParsedFlags {
     positional: Vec<String>,
 }
 
-#[derive(Debug)]
-enum FlagError {
-    Usage(String),
-    InvalidAction(String),
-    InvalidOption(String),
-    MissingArg(char),
-}
-
-impl FlagError {
-    fn diag(&self, cmd: &str) -> String {
-        match self {
-            FlagError::Usage(msg) => format!("{cmd}: {msg}"),
-            FlagError::InvalidAction(name) => {
-                format!("{cmd}: {name}: invalid action name")
-            }
-            FlagError::InvalidOption(name) => {
-                format!("{cmd}: {name}: invalid completion option")
-            }
-            FlagError::MissingArg(c) => {
-                format!("{cmd}: -{c}: option requires an argument")
-            }
-        }
-    }
-
-    fn status(&self) -> i32 {
-        match self {
-            FlagError::Usage(_) => 2,
-            _ => 2,
-        }
-    }
-}
-
 /// Parses the flags. `allow_d_e` controls whether `-D`/`-E`/`-p`/`-r`
-/// are accepted (true for `complete`, false for `compgen`).
-fn parse_flags(args: &[String], allow_d_e: bool) -> Result<ParsedFlags, FlagError> {
+/// are accepted (true for `complete`, false for `compgen`). `name` is the
+/// invoked name ("complete" or "compgen"), used both for the shared
+/// scanner's diagnostics and this function's own.
+///
+/// The `-`-prefixed run is scanned by the shared `Getopt` (#496); on
+/// `Err(code)` it has ALREADY emitted both diagnostic lines, so this just
+/// propagates the code. The `+`-prefixed handling below is NOT converted —
+/// `Getopt` doesn't understand `+` (neither does bash's own
+/// `internal_getopt` for this builtin family), so a `+`-prefixed arg makes
+/// the scanner stop immediately and this function hand-processes ONE such
+/// run itself, then tries the scanner again — the same alternating shape
+/// Task 4 used for `declare`'s `-`/`+` split. The `+`-side logic (including
+/// its pre-existing quirks: `+D`/`+E`/`+p`/`+r` are accepted exactly like
+/// `-D`/`-E`/`-p`/`-r` since bash's own `complete`/`compgen` don't gate them
+/// on `+` either, and an unrecognized `+x` is diagnosed with a literal `-x`
+/// in the message) is copied verbatim from the pre-v359 implementation —
+/// only its indexing changed, to fit the alternating loop.
+fn parse_flags(
+    args: &[String],
+    allow_d_e: bool,
+    name: &str,
+    shell: &mut Shell,
+    err: &mut dyn Write,
+) -> Result<ParsedFlags, i32> {
     let mut out = ParsedFlags::default();
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--" {
-            i += 1;
+    // `I` (bash: `-I`/`+I`, "completion on the initial word") and `C`
+    // (bash: `-C command`, generate completions by running a shell command)
+    // are real, bash-implemented options — NOT in this spec, even though
+    // bash's own usage string lists both. huck has no initial-word spec
+    // slot (`CompletionSpecs` has only `by_command`/`default_spec`/
+    // `empty_spec`) and no command-runner completion generator
+    // (`CompletionSpec` has no field for it). Accepting either would parse
+    // successfully and then either panic (no match arm to route it to) or
+    // require inventing throwaway storage nothing reads — the #496 Task 6
+    // mapfile lesson (silently-wrong beats loudly-rejected only when it's
+    // actually implemented). Pre-v359 huck already rejected both
+    // (`-C: invalid option`, `-I: invalid option`); this keeps that.
+    let spec: &str = if allow_d_e {
+        "abcdefgjksuvprDEo:A:G:W:F:X:P:S:"
+    } else {
+        "abcdefgjksuvo:A:G:W:F:X:P:S:"
+    };
+    let mut idx = 0;
+    loop {
+        let pre_idx = idx;
+        let mut g = crate::builtin_opts::Getopt::new(
+            name,
+            crate::builtin_opts::ArgView::Plain(&args[idx..]),
+            spec,
+        );
+        loop {
+            match g.next_opt(shell, err) {
+                Ok(Some(o)) => match o.ch {
+                    'F' => out.spec.function = Some(o.value.expect("F takes a value")),
+                    'W' => out.spec.wordlist = Some(o.value.expect("W takes a value")),
+                    'G' => out.spec.glob = Some(o.value.expect("G takes a value")),
+                    'A' => {
+                        let v = o.value.expect("A takes a value");
+                        match Action::parse(&v) {
+                            Some(action) => out.spec.actions.push(action),
+                            None => {
+                                crate::sh_error_to!(
+                                    shell,
+                                    err,
+                                    None,
+                                    "{name}: {v}: invalid action name"
+                                );
+                                return Err(2);
+                            }
+                        }
+                    }
+                    'P' => out.spec.prefix = Some(o.value.expect("P takes a value")),
+                    'S' => out.spec.suffix = Some(o.value.expect("S takes a value")),
+                    'X' => out.spec.filter = Some(o.value.expect("X takes a value")),
+                    'o' => {
+                        let v = o.value.expect("o takes a value");
+                        if apply_option(&mut out.spec.options, &v, false).is_err() {
+                            crate::sh_error_to!(
+                                shell,
+                                err,
+                                None,
+                                "{name}: {v}: invalid completion option"
+                            );
+                            return Err(2);
+                        }
+                        out.options_touched = true;
+                    }
+                    'D' if allow_d_e => out.is_default = true,
+                    'E' if allow_d_e => out.is_empty = true,
+                    'p' if allow_d_e => out.print = true,
+                    'r' if allow_d_e => out.remove = true,
+                    'a' | 'b' | 'c' | 'd' | 'e' | 'f' | 'g' | 'j' | 'k' | 's' | 'u' | 'v' => {
+                        let action = match o.ch {
+                            'a' => Action::Alias,
+                            'b' => Action::Builtin,
+                            'c' => Action::Command,
+                            'd' => Action::Directory,
+                            'e' => Action::Export,
+                            'f' => Action::File,
+                            'g' => Action::Group,
+                            'j' => Action::Job,
+                            'k' => Action::Keyword,
+                            's' => Action::Service,
+                            'u' => Action::User,
+                            'v' => Action::Variable,
+                            _ => unreachable!(),
+                        };
+                        out.spec.actions.push(action);
+                    }
+                    _ => unreachable!("spec and match must agree"),
+                },
+                Ok(None) => break,
+                Err(code) => return Err(code),
+            }
+        }
+        idx += g.rest_index();
+
+        // `--` terminates option processing entirely, even for a `+`-look
+        // arg that follows it (mirrors declare's Task 4 handling).
+        if idx > pre_idx && args.get(idx - 1).map(String::as_str) == Some("--") {
             break;
         }
-        if !arg.starts_with('-') && !arg.starts_with('+') {
+
+        let Some(arg) = args.get(idx) else { break };
+        if !(arg.starts_with('+') && arg.len() > 1) {
             break;
         }
-        if arg == "-" || arg == "+" {
-            return Err(FlagError::Usage(format!("bad option: {arg}")));
-        }
-        // Cluster: each character after the leading -/+ is a flag.
-        // Flags that take an arg consume the remainder of the current
-        // word (inline) OR the next word.
-        let leading = arg.chars().next().unwrap(); // - or +
+        // ---- verbatim pre-v359 `+`-run handling (see doc comment above) ----
         let chars: Vec<char> = arg[1..].chars().collect();
         let mut ci = 0;
         while ci < chars.len() {
             let c = chars[ci];
             match c {
                 'F' | 'W' | 'G' | 'A' | 'P' | 'S' | 'X' | 'o' => {
-                    // Only F/W/G/A/P/S/X reject `+`. `'o'` accepts `+` so
-                    // `complete +o NAME` can clear a previously-set option.
-                    if leading == '+' && c != 'o' {
-                        return Err(FlagError::Usage(format!("+{c}: not supported")));
+                    if c != 'o' {
+                        crate::sh_error_to!(shell, err, None, "{name}: +{c}: not supported");
+                        return Err(2);
                     }
-                    // Argument is either the rest of this word or the next word.
                     let arg_value: String = if ci + 1 < chars.len() {
                         let v: String = chars[ci + 1..].iter().collect();
-                        ci = chars.len(); // consume rest of this word
-                        v
-                    } else if i + 1 < args.len() {
-                        i += 1;
                         ci = chars.len();
-                        args[i].clone()
+                        v
+                    } else if idx + 1 < args.len() {
+                        idx += 1;
+                        ci = chars.len();
+                        args[idx].clone()
                     } else {
-                        return Err(FlagError::MissingArg(c));
+                        crate::sh_error_to!(
+                            shell,
+                            err,
+                            None,
+                            "{name}: -{c}: option requires an argument"
+                        );
+                        return Err(2);
                     };
-                    match c {
-                        'F' => out.spec.function = Some(arg_value),
-                        'W' => out.spec.wordlist = Some(arg_value),
-                        'G' => out.spec.glob = Some(arg_value),
-                        'A' => {
-                            let action = Action::parse(&arg_value)
-                                .ok_or_else(|| FlagError::InvalidAction(arg_value.clone()))?;
-                            out.spec.actions.push(action);
-                        }
-                        'P' => out.spec.prefix = Some(arg_value),
-                        'S' => out.spec.suffix = Some(arg_value),
-                        'X' => out.spec.filter = Some(arg_value),
-                        'o' => {
-                            apply_option(&mut out.spec.options, &arg_value, leading == '+')?;
-                            out.options_touched = true;
-                        }
-                        _ => unreachable!(),
+                    if apply_option(&mut out.spec.options, &arg_value, true).is_err() {
+                        crate::sh_error_to!(
+                            shell,
+                            err,
+                            None,
+                            "{name}: {arg_value}: invalid completion option"
+                        );
+                        return Err(2);
                     }
+                    out.options_touched = true;
                 }
                 'D' if allow_d_e => out.is_default = true,
                 'E' if allow_d_e => out.is_empty = true,
                 'p' if allow_d_e => out.print = true,
                 'r' if allow_d_e => out.remove = true,
                 'a' | 'b' | 'c' | 'd' | 'e' | 'f' | 'g' | 'j' | 'k' | 's' | 'u' | 'v' => {
-                    if leading == '+' {
-                        return Err(FlagError::Usage(format!("+{c}: not supported")));
-                    }
-                    let action = match c {
-                        'a' => Action::Alias,
-                        'b' => Action::Builtin,
-                        'c' => Action::Command,
-                        'd' => Action::Directory,
-                        'e' => Action::Export,
-                        'f' => Action::File,
-                        'g' => Action::Group,
-                        'j' => Action::Job,
-                        'k' => Action::Keyword,
-                        's' => Action::Service,
-                        'u' => Action::User,
-                        'v' => Action::Variable,
-                        _ => unreachable!(),
-                    };
-                    out.spec.actions.push(action);
+                    crate::sh_error_to!(shell, err, None, "{name}: +{c}: not supported");
+                    return Err(2);
                 }
                 other => {
-                    return Err(FlagError::Usage(format!("-{other}: invalid option")));
+                    crate::sh_error_to!(shell, err, None, "{name}: -{other}: invalid option");
+                    return Err(2);
                 }
             }
             ci += 1;
         }
-        i += 1;
+        idx += 1;
     }
-    out.positional = args[i..].to_vec();
+    out.positional = args[idx..].to_vec();
     Ok(out)
 }
 
-fn apply_option(opts: &mut CompOptions, name: &str, off: bool) -> Result<(), FlagError> {
+fn apply_option(opts: &mut CompOptions, name: &str, off: bool) -> Result<(), ()> {
     let value = !off;
     match name {
         "default" => opts.default = value,
@@ -175,7 +231,7 @@ fn apply_option(opts: &mut CompOptions, name: &str, off: bool) -> Result<(), Fla
         "nosort" => opts.nosort = value,
         "noquote" => opts.noquote = value,
         "plusdirs" => opts.plusdirs = value,
-        _ => return Err(FlagError::InvalidOption(name.to_string())),
+        _ => return Err(()),
     }
     Ok(())
 }
@@ -187,12 +243,9 @@ pub fn builtin_complete(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    let parsed = match parse_flags(args, true) {
+    let parsed = match parse_flags(args, true, "complete", shell, err) {
         Ok(p) => p,
-        Err(pe) => {
-            crate::sh_error_to!(shell, err, None, "{}", pe.diag("complete"));
-            return ExecOutcome::Continue(pe.status());
-        }
+        Err(code) => return ExecOutcome::Continue(code),
     };
 
     // Mode: print
@@ -454,12 +507,9 @@ pub fn builtin_compgen(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    let parsed = match parse_flags(args, false) {
+    let parsed = match parse_flags(args, false, "compgen", shell, err) {
         Ok(p) => p,
-        Err(pe) => {
-            crate::sh_error_to!(shell, err, None, "{}", pe.diag("compgen"));
-            return ExecOutcome::Continue(pe.status());
-        }
+        Err(code) => return ExecOutcome::Continue(code),
     };
 
     let word = parsed.positional.first().cloned().unwrap_or_default();
@@ -512,25 +562,65 @@ pub fn builtin_compopt(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    let mut i = 0;
     let mut option_set: Vec<(String, bool)> = Vec::new();
     let mut is_default = false;
     let mut is_empty = false;
 
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--" {
-            i += 1;
+    // `I` (bash: "change options for completion on the initial word") is a
+    // real, bash-implemented option NOT in this spec: huck has no
+    // initial-word compspec slot to route it to (same reasoning as
+    // `complete`/`compgen`'s `parse_flags` above). Pre-v359 huck already
+    // rejected it (`-I: invalid option`); this keeps that.
+    //
+    // The `-`-side is the shared scanner (#496); `+o` is NOT — `Getopt`
+    // doesn't understand `+` (neither does bash's own `internal_getopt`
+    // here), so this alternates scanner-run / one-`+`-arg exactly like
+    // `declare` (Task 4) and `complete`/`compgen` (`parse_flags` above).
+    let mut idx = 0;
+    loop {
+        let pre_idx = idx;
+        let mut g = crate::builtin_opts::Getopt::new(
+            "compopt",
+            crate::builtin_opts::ArgView::Plain(&args[idx..]),
+            "DEo:",
+        );
+        loop {
+            match g.next_opt(shell, err) {
+                Ok(Some(o)) => match o.ch {
+                    'o' => {
+                        let v = o.value.expect("o takes a value");
+                        if !["default", "nospace", "filenames", "bashdefault", "dirnames"]
+                            .contains(&v.as_str())
+                        {
+                            crate::sh_error_to!(
+                                shell,
+                                err,
+                                None,
+                                "compopt: {v}: invalid completion option"
+                            );
+                            return ExecOutcome::Continue(2);
+                        }
+                        option_set.push((v, false));
+                    }
+                    'D' => is_default = true,
+                    'E' => is_empty = true,
+                    _ => unreachable!("spec and match must agree"),
+                },
+                Ok(None) => break,
+                Err(code) => return ExecOutcome::Continue(code),
+            }
+        }
+        idx += g.rest_index();
+
+        if idx > pre_idx && args.get(idx - 1).map(String::as_str) == Some("--") {
             break;
         }
-        if !arg.starts_with('-') && !arg.starts_with('+') {
+
+        let Some(arg) = args.get(idx) else { break };
+        if !(arg.starts_with('+') && arg.len() > 1) {
             break;
         }
-        if arg == "-" || arg == "+" {
-            crate::sh_error_to!(shell, err, None, "compopt: bad option: {arg}");
-            return ExecOutcome::Continue(2);
-        }
-        let leading = arg.chars().next().unwrap();
+        // ---- verbatim pre-v359 `+`-run handling ----
         let chars: Vec<char> = arg[1..].chars().collect();
         let mut ci = 0;
         while ci < chars.len() {
@@ -541,10 +631,10 @@ pub fn builtin_compopt(
                         let v: String = chars[ci + 1..].iter().collect();
                         ci = chars.len();
                         v
-                    } else if i + 1 < args.len() {
-                        i += 1;
+                    } else if idx + 1 < args.len() {
+                        idx += 1;
                         ci = chars.len();
-                        args[i].clone()
+                        args[idx].clone()
                     } else {
                         crate::sh_error_to!(
                             shell,
@@ -554,7 +644,6 @@ pub fn builtin_compopt(
                         );
                         return ExecOutcome::Continue(2);
                     };
-                    let off = leading == '+';
                     if !["default", "nospace", "filenames", "bashdefault", "dirnames"]
                         .contains(&arg_value.as_str())
                     {
@@ -566,14 +655,10 @@ pub fn builtin_compopt(
                         );
                         return ExecOutcome::Continue(2);
                     }
-                    option_set.push((arg_value, off));
+                    option_set.push((arg_value, true));
                 }
-                'D' => {
-                    is_default = true;
-                }
-                'E' => {
-                    is_empty = true;
-                }
+                'D' => is_default = true,
+                'E' => is_empty = true,
                 other => {
                     crate::sh_error_to!(shell, err, None, "compopt: -{other}: invalid option");
                     return ExecOutcome::Continue(2);
@@ -581,9 +666,9 @@ pub fn builtin_compopt(
             }
             ci += 1;
         }
-        i += 1;
+        idx += 1;
     }
-    let names: Vec<String> = args[i..].to_vec();
+    let names: Vec<String> = args[idx..].to_vec();
 
     if is_default || is_empty {
         crate::sh_error_to!(shell, err, None, "compopt: -D/-E not yet supported");
@@ -878,7 +963,9 @@ mod tests {
         let tokens = tokenize_posix_line(out.trim_end());
         assert_eq!(tokens[0], "complete");
 
-        let parsed = super::parse_flags(&tokens[1..], true).expect("re-parse");
+        let mut reparse_err = Vec::<u8>::new();
+        let parsed = super::parse_flags(&tokens[1..], true, "complete", &mut sh, &mut reparse_err)
+            .expect("re-parse");
         let original = &sh.completion_specs.by_command["myc"];
         assert_eq!(&parsed.spec, original, "round-trip mismatch");
         assert_eq!(parsed.positional, vec!["myc".to_string()]);
