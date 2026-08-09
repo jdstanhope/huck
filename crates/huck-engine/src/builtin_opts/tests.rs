@@ -158,3 +158,61 @@ fn every_builtin_with_a_scanner_has_a_usage_string() {
         assert!(!usage_for(name).is_empty(), "no usage string for {name}");
     }
 }
+
+#[test]
+fn an_unhandled_spec_character_is_reported_not_panicked() {
+    // #523: a spec that gains an option character without a matching arm used
+    // to hit `unreachable!()` and ABORT the shell. v359 shipped exactly that
+    // crash (`hash -:`, rc 101, nine builtins). It must now degrade to bash's
+    // ordinary invalid-option diagnostic instead.
+    let args = vec!["-p".to_string()];
+    let mut sh = Shell::new();
+    let mut err: Vec<u8> = Vec::new();
+    let g = Getopt::new("alias", ArgView::Plain(&args), "p");
+
+    let code = g.reject_unhandled('p', &mut sh, &mut err);
+
+    assert_eq!(
+        code, 2,
+        "an unhandled option is a usage error, like any other"
+    );
+    assert_eq!(
+        sh.builtin_usage_error,
+        Some(2),
+        "must set the usage-error state the executor's posix gate reads"
+    );
+    let msg = String::from_utf8_lossy(&err);
+    assert!(
+        msg.contains("alias: -p: invalid option"),
+        "should report the option, got: {msg}"
+    );
+    assert!(
+        msg.contains("alias: usage: "),
+        "should carry bash's second (usage) line, got: {msg}"
+    );
+}
+
+#[test]
+fn reject_unhandled_matches_the_normal_invalid_option_path() {
+    // The fallback must not become a second, drifting emit site — that is the
+    // duplication #496 existed to remove, and #521 shows it recurring.
+    let args = vec!["-Q".to_string()];
+    let mut sh_a = Shell::new();
+    let mut err_a: Vec<u8> = Vec::new();
+    let mut g_a = Getopt::new("alias", ArgView::Plain(&args), "p");
+    let normal = g_a.next_opt(&mut sh_a, &mut err_a); // real invalid option
+    assert!(matches!(normal, Err(2)));
+
+    let mut sh_b = Shell::new();
+    let mut err_b: Vec<u8> = Vec::new();
+    let g_b = Getopt::new("alias", ArgView::Plain(&args), "p");
+    let code = g_b.reject_unhandled('Q', &mut sh_b, &mut err_b);
+
+    assert_eq!(code, 2);
+    assert_eq!(
+        String::from_utf8_lossy(&err_a),
+        String::from_utf8_lossy(&err_b),
+        "the fallback must emit byte-identically to the scanner's own path"
+    );
+    assert_eq!(sh_a.builtin_usage_error, sh_b.builtin_usage_error);
+}

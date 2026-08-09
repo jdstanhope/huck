@@ -498,7 +498,7 @@ fn builtin_cd_as(
                 // -e: only takes effect below, in the -P branch, when
                 // `env::current_dir()` fails after a successful chdir.
                 'e' => want_e = true,
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -654,7 +654,7 @@ fn builtin_pwd(
             Ok(Some(o)) => match o.ch {
                 'L' => physical_flag = Some(false),
                 'P' => physical_flag = Some(true),
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -939,7 +939,7 @@ fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
                 'f' => mode_fn = true,
                 'v' => saw_v = true,
                 'n' => unset_nameref = true,
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -1470,7 +1470,7 @@ fn builtin_export_decl(
                 'a' => saw_a = true, // huck-specific no-op (mise `export -a chpwd_functions`)
                 'n' => unexport = true,
                 'f' => func = true,
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -1689,7 +1689,7 @@ fn builtin_local_decl(
                 'u' => saw_minus_u = true,
                 'c' => saw_minus_c = true,
                 'n' => saw_minus_n = true,
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -1965,7 +1965,7 @@ fn builtin_readonly_decl(
                 'p' => want_list = true,
                 'a' => want_indexed = true,
                 'A' => want_associative = true,
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -2223,7 +2223,7 @@ fn builtin_declare_decl(
                     }
                     'p' => print_mode = true,
                     'g' => global = true,
-                    _ => unreachable!("spec and match must agree"),
+                    _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
                 },
                 Ok(None) => break,
                 Err(code) => return ExecOutcome::Continue(code),
@@ -3229,7 +3229,7 @@ fn builtin_mapfile(
                     crate::sh_error_to!(shell, err, None, "{name}: -{}: invalid option", o.ch);
                     return ExecOutcome::Continue(2);
                 }
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -3401,7 +3401,7 @@ fn builtin_read(
                         }
                     }
                 }
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -4232,7 +4232,7 @@ fn builtin_printf(
                     }
                     v_var = Some(target);
                 }
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -4426,7 +4426,7 @@ fn parse_jobs_args(
                 'n' => only_new = true,
                 'r' => only_running = true,
                 's' => only_stopped = true,
-                _ => unreachable!("spec and match must agree"),
+                _ => return Err(ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err))),
             },
             Ok(None) => break,
             Err(code) => return Err(ExecOutcome::Continue(code)),
@@ -4581,7 +4581,7 @@ fn parse_wait_args(
                 // termination), so accept-and-conform: no state to record.
                 'f' => {}
                 'p' => pid_var = o.value,
-                _ => unreachable!("spec and match must agree"),
+                _ => return Err(ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err))),
             },
             Ok(None) => break,
             Err(code) => return Err(ExecOutcome::Continue(code)),
@@ -5513,7 +5513,7 @@ fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Ex
                 'a' => all = true,
                 'r' => running_only = true,
                 'h' => mark_nohup = true,
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -5912,7 +5912,7 @@ fn builtin_history(
                     );
                     return ExecOutcome::Continue(1);
                 }
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -6111,7 +6111,7 @@ fn builtin_trap(
             Ok(Some(o)) => match o.ch {
                 'l' => list_signals = true,
                 'p' => print_mode = true,
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -6493,7 +6493,11 @@ fn builtin_getopts(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
     let mut g =
         crate::builtin_opts::Getopt::new("getopts", crate::builtin_opts::ArgView::Plain(args), "");
     match g.next_opt(shell, err) {
-        Ok(Some(_)) => unreachable!("empty spec accepts nothing"),
+        // Empty spec => `accepts` yields nothing, so this is unreached. Routed
+        // through the same fallback as every other builtin (#523) rather than
+        // `unreachable!`: if the spec ever gains a character, that must be a
+        // diagnostic, not a dead shell.
+        Ok(Some(o)) => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
         Ok(None) => {}
         Err(code) => return ExecOutcome::Continue(code),
     }
@@ -7163,7 +7167,7 @@ fn builtin_shopt(
                 'q' => quiet = true,
                 'p' => print_f = true,
                 'o' => o_bridge = true,
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -7942,7 +7946,7 @@ fn builtin_help(
                 's' => want_synopsis = true,
                 'd' => want_description = true,
                 'm' => want_man = true,
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -8535,7 +8539,7 @@ fn builtin_alias(
         match g.next_opt(shell, err) {
             Ok(Some(o)) => match o.ch {
                 'p' => {} // `-p` lists in the `alias`-reparseable form; same as no operands.
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -8585,7 +8589,7 @@ fn builtin_unalias(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
         match g.next_opt(shell, err) {
             Ok(Some(o)) => match o.ch {
                 'a' => all = true,
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -8902,7 +8906,7 @@ fn builtin_type(
                     force_path = true;
                 }
                 'f' => skip_func = true,
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -8978,7 +8982,7 @@ fn builtin_hash(
                     set_path = true;
                     explicit_path = o.value;
                 }
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -9140,7 +9144,7 @@ fn builtin_command(
                 'v' => concise = true,
                 'V' => verbose = true,
                 'p' => {} // accept; introspection uses current $PATH
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -9894,7 +9898,7 @@ fn builtin_umask(
             Ok(Some(o)) => match o.ch {
                 'S' => symbolic = true,
                 'p' => posix = true,
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),
@@ -10331,7 +10335,7 @@ fn builtin_enable(
                 'a' => all = true,
                 's' => special = true,
                 'p' => {} // print format — the listing default
-                _ => unreachable!("spec and match must agree"),
+                _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
             Err(code) => return ExecOutcome::Continue(code),

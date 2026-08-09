@@ -101,8 +101,9 @@ impl<'a> Getopt<'a> {
         // a spec like "lrp:dt" must not accept a literal `-:` just because
         // ':' appears in the string. Rejecting it here sends `-:` down the
         // normal invalid-option path instead of handing an `Opt { ch: ':' }`
-        // to a builtin whose `match` has no arm for it (a panic: every
-        // `_ => unreachable!("spec and match must agree")` call site).
+        // to a builtin whose `match` has no arm for it. That used to be a
+        // PANIC; since #523 the call sites fall back to `reject_unhandled`,
+        // so this check is now correctness rather than crash-avoidance.
         c != ':' && self.spec.chars().any(|sc| sc == c)
     }
 
@@ -196,9 +197,32 @@ impl<'a> Getopt<'a> {
     // gated consume site (`is_special_builtin(&resolved.program) && posix`,
     // executor.rs ~4810) makes the fatality decision in exactly one place.
     fn fail_invalid(&self, c: char, shell: &mut Shell, err: &mut dyn Write) {
-        crate::sh_error_to!(shell, err, None, "{}: -{c}: invalid option", self.name);
-        let _ = writeln!(err, "{}: usage: {}", self.name, usage_for(self.name));
-        shell.builtin_usage_error = Some(2);
+        emit_invalid_option(self.name, c, shell, err);
+    }
+
+    /// The fallback for an option character the builtin's `match` has no arm
+    /// for. Emits the ordinary invalid-option diagnostic and returns the status
+    /// to propagate (2, as for any usage error).
+    ///
+    /// Replaces a `_ => unreachable!("spec and match must agree")` that stood at
+    /// 26 call sites (#523). `unreachable!` PANICS — a process abort — and a
+    /// shell must not die on something the user typed. v359 shipped exactly that
+    /// crash: `-:` was accepted as an option because `:` is the spec's value
+    /// marker, reached the `unreachable!`, and killed the shell (rc 101) for
+    /// nine builtins while clippy, 2490 unit tests, 27 integration binaries and
+    /// a 275-case differential sweep all stayed green.
+    ///
+    /// Reaching this is still a programming error — `accepts()` only yields
+    /// characters from the builtin's own spec, so arriving here means a spec
+    /// gained a character without a matching arm. That mistake stays loud
+    /// WITHOUT a `debug_assert`: the differential harness catches it directly,
+    /// because bash accepts the flag and huck would now reject it, turning the
+    /// row red. The developer signal survives; the user gets a diagnostic
+    /// instead of a dead shell. A `debug_assert` here would also make the
+    /// graceful path untestable, since tests build with assertions on.
+    pub(crate) fn reject_unhandled(&self, c: char, shell: &mut Shell, err: &mut dyn Write) -> i32 {
+        emit_invalid_option(self.name, c, shell, err);
+        2
     }
 
     fn fail_missing_value(&self, c: char, shell: &mut Shell, err: &mut dyn Write) {
@@ -216,6 +240,16 @@ impl<'a> Getopt<'a> {
         let _ = writeln!(err, "{}: usage: {}", self.name, usage_for(self.name));
         shell.builtin_usage_error = Some(2);
     }
+}
+
+/// Emit bash's two-line invalid-option diagnostic and record the usage error.
+///
+/// Shared so the scanner's own failure path and `reject_unhandled` cannot drift
+/// apart — the same drift, one layer up, is what #496 existed to remove.
+fn emit_invalid_option(name: &str, c: char, shell: &mut Shell, err: &mut dyn Write) {
+    crate::sh_error_to!(shell, err, None, "{name}: -{c}: invalid option");
+    let _ = writeln!(err, "{name}: usage: {}", usage_for(name));
+    shell.builtin_usage_error = Some(2);
 }
 
 /// Usage text, keyed on the INVOKED name. Transcribed verbatim from bash
