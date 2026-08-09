@@ -142,7 +142,7 @@ fn parse_flags(
                         };
                         out.spec.actions.push(action);
                     }
-                    _ => unreachable!("spec and match must agree"),
+                    _ => return Err(g.reject_unhandled(o.ch, shell, err)),
                 },
                 Ok(None) => break,
                 Err(code) => return Err(code),
@@ -604,7 +604,7 @@ pub fn builtin_compopt(
                     }
                     'D' => is_default = true,
                     'E' => is_empty = true,
-                    _ => unreachable!("spec and match must agree"),
+                    _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
                 },
                 Ok(None) => break,
                 Err(code) => return ExecOutcome::Continue(code),
