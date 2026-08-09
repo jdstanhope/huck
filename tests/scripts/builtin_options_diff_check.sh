@@ -178,4 +178,18 @@ check "exec -- terminator"   'exec --'
 check "exec lone dash"       'exec -'
 check "exec -a attached"     'exec -anm true; echo after'
 
+# ── mapfile numeric-option validation (#513). bash uses a DIFFERENT message
+# per option, not one generic string, and exits 1 not 2.
+check "mapfile -n non-numeric"  'mapfile -n abc A'
+check "mapfile -s non-numeric"  'mapfile -s abc A'
+check "mapfile -O non-numeric"  'mapfile -O abc A'
+check "mapfile -c non-numeric"  'mapfile -c abc A'
+check "mapfile -n negative"     'mapfile -n -1 A'
+check "readarray -n names self" 'readarray -n abc A'
+
+# ── wait -p without -n (#514). bash has no "requires -n" rule: it accepts the
+# option silently and simply leaves the variable unset.
+check "wait -p alone"           'wait -p v; echo "[${v-unset}]"'
+check "wait -n -p"              'wait -n -p v'
+
 harness_summary
