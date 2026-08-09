@@ -9338,6 +9338,26 @@ fn is_signed_index_arg(s: &str) -> bool {
     (s.starts_with('+') || s.starts_with('-')) && s.len() > 1 && s.as_bytes()[1].is_ascii_digit()
 }
 
+/// bash reports an unrecognized `pushd`/`popd`/`dirs` argument as a bad NUMBER,
+/// not a bad option, and echoes the WHOLE token — `dirs -cl` reports `-cl`, not
+/// `-c` (#519).
+///
+/// These three are deliberately NOT on the shared `builtin_opts` scanner and
+/// must not be: they take `+N`/`-N` rotation arguments, so bash does not bundle
+/// their flags at all. Each argument is matched whole — a known option, `--`,
+/// a signed number, or a malformed number. Forcing them through a getopt
+/// contract would make them wrong in a new way.
+fn invalid_number(name: &str, tok: &str, shell: &mut Shell, err: &mut dyn Write) -> ExecOutcome {
+    crate::sh_error_to!(shell, err, None, "{name}: {tok}: invalid number");
+    let _ = writeln!(
+        err,
+        "{name}: usage: {}",
+        crate::builtin_opts::usage_for(name)
+    );
+    shell.builtin_usage_error = Some(2);
+    ExecOutcome::Continue(2)
+}
+
 fn builtin_pushd(
     args: &[String],
     out: &mut dyn Write,
@@ -9345,6 +9365,12 @@ fn builtin_pushd(
     shell: &mut Shell,
 ) -> ExecOutcome {
     sync_stack_top(shell);
+
+    // `--` ends option processing. Strip it FIRST so `pushd --` is bare
+    // `pushd` (bash swaps the top two, or reports "no other directory") rather
+    // than a no-op stack print.
+    let after_ddash = args.first().map(String::as_str) == Some("--");
+    let args: &[String] = if after_ddash { &args[1..] } else { args };
 
     if args.is_empty() {
         // Swap top two.
@@ -9363,6 +9389,25 @@ fn builtin_pushd(
             return ExecOutcome::Continue(c);
         }
         return print_stack(out, shell, true, false, false);
+    }
+
+    // Classify the first argument the way bash does, BEFORE anything reaches
+    // `cd`. Without this, `pushd -Q` fell through to the DIR path and reported
+    // itself as `cd: -Q: invalid option`, complete with cd's usage string
+    // (#519) — a dispatch bug, not a parsing one.
+    // `-n` is a REAL bash option here and huck does not implement it (measured:
+    // bash inserts the directory BELOW the top and does not chdir, and bare
+    // `pushd -n` prints without swapping). It is deliberately NOT accepted:
+    // parsing it and then doing the ordinary push-and-chdir would silently do
+    // the wrong thing, which is strictly worse than a loud rejection. Filed
+    // separately; this round only stops it misrouting to `cd`.
+    if let Some(a) = args.first()
+        && !after_ddash
+        && a.starts_with('-')
+        && a.len() > 1
+        && !is_signed_index_arg(a)
+    {
+        return invalid_number("pushd", a, shell, err);
     }
 
     let arg = &args[0];
@@ -9413,6 +9458,26 @@ fn builtin_popd(
     shell: &mut Shell,
 ) -> ExecOutcome {
     sync_stack_top(shell);
+
+    // Argument validity is decided BEFORE the stack-empty check: bash reports
+    // `popd -Q` as an invalid number even on an empty stack, where huck used to
+    // report "directory stack empty" and never look at the argument (#519).
+    // `-n` deliberately NOT accepted here either — see `builtin_pushd`.
+    // `--` is a terminator, NOT a malformed number: `popd --` is bare `popd`.
+    let rest: &[String] = if args.first().map(String::as_str) == Some("--") {
+        &args[1..]
+    } else {
+        args
+    };
+    if let Some(a) = rest.first()
+        && a.starts_with('-')
+        && a.len() > 1
+        && !is_signed_index_arg(a)
+    {
+        return invalid_number("popd", a, shell, err);
+    }
+    let args = rest;
+
     if shell.dir_stack.len() <= 1 {
         crate::sh_error_to!(shell, err, None, "popd: directory stack empty");
         return ExecOutcome::Continue(1);
@@ -9501,9 +9566,11 @@ fn builtin_dirs(
                 }
                 i += 1;
             }
+            // `--` ends option processing; `dirs` takes no operands after it,
+            // so nothing reads `i` again and it is simply dropped.
+            "--" => break,
             s if s.starts_with('-') && s.len() > 1 => {
-                crate::sh_error_to!(shell, err, None, "dirs: {s}: invalid option");
-                return ExecOutcome::Continue(2);
+                return invalid_number("dirs", s, shell, err);
             }
             _ => break,
         }
