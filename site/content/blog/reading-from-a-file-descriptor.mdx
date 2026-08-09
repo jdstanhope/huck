@@ -1,0 +1,88 @@
+---
+title: "Reading from a file descriptor"
+date: 2026-08-09
+summary: "mapfile -u now works, and so does its callback option. Getting the callback right meant three separate wrong guesses about how bash calls it — none of which the documentation settles."
+tags: ["builtins", "bash-compat"]
+version: null
+draft: false
+---
+
+`mapfile` reads lines into an array. Usually from standard input — but bash lets
+you point it at any open file descriptor, which is how you read from one file
+while a loop is already consuming another. huck didn't support that:
+
+```bash
+# before
+$ exec 3< data.txt
+$ mapfile -t -u 3 A; echo "n=${#A[@]}"
+huck: line 1: mapfile: -u: invalid option
+n=0
+```
+
+```bash
+# after
+$ exec 3< data.txt
+$ mapfile -t -u 3 A; echo "n=${#A[@]}"
+n=3
+```
+
+That option had been *deliberately* rejected rather than ignored. A while back it
+briefly parsed and then did nothing, which meant you got an empty array and no
+error — worse than the rejection, so the rejection went back in until someone
+implemented it. That's now done, along with its two companions.
+
+## The callback, and three wrong guesses
+
+`mapfile -C CALLBACK -c N` runs a command every N lines while it reads — useful
+for progress on a big file:
+
+```bash
+# after
+$ mapfile -t -C "echo read so far:" -c 2 A < data.txt
+read so far: 1 beta
+```
+
+Simple enough to describe. I got it wrong three times before measuring, and each
+mistake is the kind that would have shipped looking fine:
+
+**It's a command line, not arguments.** bash appends the line number and the
+line to your callback text and runs the whole thing. So `$1` inside your callback
+is *not* the index — it's empty, and the index arrives glued onto the end of
+whatever your command prints. That's why the output above reads
+`read so far: 1 beta`.
+
+**It fires before the line is stored, not after.** With `-c 2` over five lines
+it fires at lines 1 and 3 — so if your callback looks at the array, it's one
+element short of what you'd expect.
+
+**The default matters more than it looks.** bash's default interval is 5000
+lines, so `-C` with no `-c` fires nothing at all on ordinary files. My first
+version fired on the very first line, which looks harmless until you realise it
+means every single `-C` user gets a spurious callback.
+
+The third one is the one I'd have shipped. It only shows up if you test `-C`
+*without* `-c`, and there's no reason to think of that unless you've read what
+the default is.
+
+## While we were nearby
+
+`exec` was missing half its error message:
+
+```bash
+# before                          # after
+$ exec -Q                         $ exec -Q
+exec: -Q: invalid option          exec: -Q: invalid option
+                                  exec: usage: exec [-cl] [-a name] [command [argument ...]] [redirection ...]
+```
+
+Everything else about `exec`'s option handling was already right — it was only
+the second line, the one that tells you what the valid options actually are.
+
+## Still open
+
+- [#512](https://github.com/jdstanhope/huck/issues/512) — `jobs -x`
+- [#530](https://github.com/jdstanhope/huck/issues/530) — `pushd -n` / `popd -n`
+- [#527](https://github.com/jdstanhope/huck/issues/527) — `complete -p` output
+  doesn't round-trip
+- [#509](https://github.com/jdstanhope/huck/issues/509) — `hash` applies its
+  flags in a different order from bash
