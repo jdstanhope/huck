@@ -9,9 +9,11 @@
 //! the scanning, which is where 23 hand-rolled copies drifted apart (#496).
 //!
 //! Converted so far (#496): the four declaration builtins (`readonly`,
-//! `export`, `declare`/`typeset`, `local`; Task 4) and the name/lookup
+//! `export`, `declare`/`typeset`, `local`; Task 4), the name/lookup
 //! builtins (`unset`, `type`, `hash`, `command`, `builtin`, `alias`,
-//! `unalias`; Task 5). Remaining builtins (Tasks 6-7) still hand-roll their
+//! `unalias`; Task 5), and the I/O and job builtins (`read`,
+//! `mapfile`/`readarray`, `printf`, `jobs`, `trap`, `help`, `wait`,
+//! `history`; Task 6). Remaining builtins (Task 7) still hand-roll their
 //! own scan.
 
 use crate::command::DeclArg;

@@ -231,7 +231,7 @@ pub fn run_builtin(
         "popd" => builtin_popd(args, out, err, shell),
         "dirs" => builtin_dirs(args, out, err, shell),
         "read" => builtin_read(args, out, err, shell),
-        "mapfile" | "readarray" => builtin_mapfile(args, err, shell),
+        "mapfile" | "readarray" => builtin_mapfile(name, args, err, shell),
         "printf" => builtin_printf(args, out, err, shell),
         "test" | "[" => builtin_test(name, args, err, shell),
         "break" => builtin_break(args, err, shell),
@@ -3120,153 +3120,89 @@ impl std::io::Read for RawFdReader {
     }
 }
 
-/// Extract an option's value from the rest of a flag cluster (`-dVALUE`) or
-/// consume the next argument (`-d VALUE`). Advances `*i` only in the
-/// separate-arg case. Returns `Err(2)` (the exit code) if there is no next
-/// arg, after printing the standard diagnostic.
-// The parameters are the flag-cluster cursor state (`args`/`i`/`bytes`/`j`) plus
-// the diagnostic context; bundling them into a struct would only move the same
-// fields behind one more name. Revisit with the shared flag parser (#496).
-#[allow(clippy::too_many_arguments)]
-fn take_opt_value(
-    args: &[String],
-    i: &mut usize,
-    bytes: &[u8],
-    j: usize,
-    cmd: &str,
-    opt: char,
-    err: &mut dyn Write,
-    shell: &Shell,
-) -> Result<String, i32> {
-    if j + 1 < bytes.len() {
-        Ok(String::from_utf8_lossy(&bytes[j + 1..]).into_owned())
-    } else {
-        *i += 1;
-        if *i >= args.len() {
-            crate::sh_error_to!(
-                shell,
-                err,
-                None,
-                "{cmd}: -{opt}: option requires an argument"
-            );
-            return Err(2);
-        }
-        Ok(args[*i].clone())
-    }
-}
-
 /// `mapfile [-d DELIM] [-n COUNT] [-O ORIGIN] [-s SKIP] [-t] [ARRAY]`
 /// (alias `readarray`). Reads delimiter-separated records from stdin into the
 /// indexed array ARRAY (default MAPFILE). Core option set (v140); `-u`/`-C`/`-c`
 /// are not implemented.
-fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_mapfile(
+    name: &str,
+    args: &[String],
+    err: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
     let mut delim: u8 = b'\n';
     let mut strip_t = false;
     let mut count: usize = 0; // 0 = unlimited
     let mut skip: usize = 0;
     let mut origin: Option<usize> = None;
-    let mut i = 0;
 
-    // Parse a numeric option value (rest-of-arg or next arg).
+    // Parse a numeric option value.
     fn num_val(
-        args: &[String],
-        i: &mut usize,
-        j: usize,
-        bytes: &[u8],
         opt: char,
+        s: &str,
         err: &mut dyn Write,
         shell: &Shell,
+        name: &str,
     ) -> Result<usize, ()> {
-        let s = if j + 1 < bytes.len() {
-            String::from_utf8_lossy(&bytes[j + 1..]).into_owned()
-        } else {
-            *i += 1;
-            if *i >= args.len() {
-                crate::sh_error_to!(
-                    shell,
-                    err,
-                    None,
-                    "mapfile: -{opt}: option requires an argument"
-                );
-                return Err(());
-            }
-            args[*i].clone()
-        };
         match s.trim().parse::<usize>() {
             Ok(n) => Ok(n),
             Err(_) => {
-                crate::sh_error_to!(shell, err, None, "mapfile: {s}: invalid number");
+                let _ = opt; // kept for a potential future bash-shaped message
+                crate::sh_error_to!(shell, err, None, "{name}: {s}: invalid number");
                 Err(())
             }
         }
     }
 
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--" {
-            i += 1;
-            break;
-        }
-        if !arg.starts_with('-') || arg.len() < 2 {
-            break;
-        }
-        let bytes = arg.as_bytes();
-        let mut j = 1;
-        let mut consumed_rest = false;
-        while j < bytes.len() {
-            match bytes[j] {
-                b't' => strip_t = true,
-                b'd' => {
-                    let s = match take_opt_value(args, &mut i, bytes, j, "mapfile", 'd', err, shell)
-                    {
-                        Ok(v) => v,
-                        Err(rc) => return ExecOutcome::Continue(rc),
-                    };
+    let mut g = crate::builtin_opts::Getopt::new(
+        name,
+        crate::builtin_opts::ArgView::Plain(args),
+        "d:n:O:s:tu:C:c:",
+    );
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                't' => strip_t = true,
+                'd' => {
+                    let s = o.value.expect("spec requires a value for -d");
                     delim = s.bytes().next().unwrap_or(0u8); // empty -> NUL
-                    consumed_rest = true;
                 }
-                b'n' => match num_val(args, &mut i, j, bytes, 'n', err, shell) {
-                    Ok(n) => {
-                        count = n;
-                        consumed_rest = true;
+                'n' => {
+                    let v = o.value.expect("spec requires a value for -n");
+                    match num_val('n', &v, err, shell, name) {
+                        Ok(n) => count = n,
+                        Err(()) => return ExecOutcome::Continue(2),
                     }
-                    Err(()) => return ExecOutcome::Continue(2),
-                },
-                b's' => match num_val(args, &mut i, j, bytes, 's', err, shell) {
-                    Ok(n) => {
-                        skip = n;
-                        consumed_rest = true;
-                    }
-                    Err(()) => return ExecOutcome::Continue(2),
-                },
-                b'O' => match num_val(args, &mut i, j, bytes, 'O', err, shell) {
-                    Ok(n) => {
-                        origin = Some(n);
-                        consumed_rest = true;
-                    }
-                    Err(()) => return ExecOutcome::Continue(2),
-                },
-                c => {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "mapfile: -{}: invalid option",
-                        c as char
-                    );
-                    return ExecOutcome::Continue(2);
                 }
-            }
-            if consumed_rest {
-                break;
-            }
-            j += 1;
+                's' => {
+                    let v = o.value.expect("spec requires a value for -s");
+                    match num_val('s', &v, err, shell, name) {
+                        Ok(n) => skip = n,
+                        Err(()) => return ExecOutcome::Continue(2),
+                    }
+                }
+                'O' => {
+                    let v = o.value.expect("spec requires a value for -O");
+                    match num_val('O', &v, err, shell, name) {
+                        Ok(n) => origin = Some(n),
+                        Err(()) => return ExecOutcome::Continue(2),
+                    }
+                }
+                // `-u FD`, `-C callback`, `-c quantum` — accepted (in the real
+                // getopt spec) but not implemented; same pre-existing gap as
+                // before this conversion (doc comment above).
+                'u' | 'C' | 'c' => {
+                    let _ = o.value;
+                }
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
-        i += 1;
     }
 
     let array_name = args
-        .get(i)
+        .get(g.rest_index())
         .cloned()
         .unwrap_or_else(|| "MAPFILE".to_string());
     if !is_valid_name(&array_name) {
@@ -3274,7 +3210,7 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
             shell,
             err,
             None,
-            "mapfile: `{array_name}': not a valid array name"
+            "{name}: `{array_name}': not a valid array name"
         );
         return ExecOutcome::Continue(1);
     }
@@ -3286,7 +3222,7 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
             Ok(Some(_)) => {}
             Ok(None) => break,
             Err(e) => {
-                crate::sh_error_to!(shell, err, None, "mapfile: {}", crate::bash_io_error(&e));
+                crate::sh_error_to!(shell, err, None, "{name}: {}", crate::bash_io_error(&e));
                 return ExecOutcome::Continue(1);
             }
         }
@@ -3307,7 +3243,7 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
             }
             Ok(None) => break,
             Err(e) => {
-                crate::sh_error_to!(shell, err, None, "mapfile: {}", crate::bash_io_error(&e));
+                crate::sh_error_to!(shell, err, None, "{name}: {}", crate::bash_io_error(&e));
                 return ExecOutcome::Continue(1);
             }
         }
@@ -3357,64 +3293,35 @@ fn builtin_read(
     let mut max_chars: Option<usize> = None;
     let mut nchars_active_delim = true;
     let mut timeout: Option<f64> = None;
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--" {
-            i += 1;
-            break;
-        }
-        if !arg.starts_with('-') || arg.len() < 2 {
-            break;
-        }
-        let bytes = arg.as_bytes();
-        let mut j = 1;
-        while j < bytes.len() {
-            match bytes[j] {
-                b'r' => raw = true,
-                b's' => silent = true,
-                b'p' => {
-                    // -p PROMPT — value is rest-of-arg OR next arg.
-                    if j + 1 < bytes.len() {
-                        prompt = Some(String::from_utf8_lossy(&bytes[j + 1..]).into_owned());
-                    } else {
-                        i += 1;
-                        if i >= args.len() {
-                            crate::sh_error_to!(
-                                shell,
-                                err,
-                                None,
-                                "read: -p: option requires an argument"
-                            );
-                            return ExecOutcome::Continue(2);
-                        }
-                        prompt = Some(args[i].clone());
-                    }
-                    break;
+
+    let mut g = crate::builtin_opts::Getopt::new(
+        "read",
+        crate::builtin_opts::ArgView::Plain(args),
+        "ersa:d:i:n:N:p:t:u:",
+    );
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'e' => {
+                    // Readline editing — huck's `read` has no readline-editing
+                    // mode; accepted (matches bash's option spec) and ignored.
                 }
-                b'd' => {
-                    let d_val =
-                        match take_opt_value(args, &mut i, bytes, j, "read", 'd', err, shell) {
-                            Ok(v) => v,
-                            Err(rc) => return ExecOutcome::Continue(rc),
-                        };
+                'r' => raw = true,
+                's' => silent = true,
+                'i' => {
+                    // Readline initial text — only meaningful together with
+                    // `-e`, itself a no-op here; accepted and ignored.
+                    let _ = o.value;
+                }
+                'p' => prompt = o.value,
+                'd' => {
+                    let d_val = o.value.expect("spec requires a value for -d");
                     // Empty DELIM means NUL byte.
                     delim = d_val.bytes().next().unwrap_or(0u8);
-                    break;
                 }
-                b'a' => {
-                    let v = match take_opt_value(args, &mut i, bytes, j, "read", 'a', err, shell) {
-                        Ok(v) => v,
-                        Err(rc) => return ExecOutcome::Continue(rc),
-                    };
-                    array_name = Some(v);
-                    break;
-                }
-                b'u' => {
-                    let v = match take_opt_value(args, &mut i, bytes, j, "read", 'u', err, shell) {
-                        Ok(v) => v,
-                        Err(rc) => return ExecOutcome::Continue(rc),
-                    };
+                'a' => array_name = o.value,
+                'u' => {
+                    let v = o.value.expect("spec requires a value for -u");
                     // A non-numeric fd spec is rejected up front (bash:
                     // "read: <val>: invalid file descriptor specification").
                     match v.trim().parse::<std::os::unix::io::RawFd>() {
@@ -3429,23 +3336,10 @@ fn builtin_read(
                             return ExecOutcome::Continue(1);
                         }
                     }
-                    break;
                 }
-                b'n' | b'N' => {
-                    let upper = bytes[j] == b'N';
-                    let v = match take_opt_value(
-                        args,
-                        &mut i,
-                        bytes,
-                        j,
-                        "read",
-                        bytes[j] as char,
-                        err,
-                        shell,
-                    ) {
-                        Ok(v) => v,
-                        Err(rc) => return ExecOutcome::Continue(rc),
-                    };
+                'n' | 'N' => {
+                    let upper = o.ch == 'N';
+                    let v = o.value.expect("spec requires a value for -n/-N");
                     match v.trim().parse::<usize>() {
                         Ok(k) => {
                             max_chars = Some(k);
@@ -3456,13 +3350,9 @@ fn builtin_read(
                             return ExecOutcome::Continue(1);
                         }
                     }
-                    break;
                 }
-                b't' => {
-                    let v = match take_opt_value(args, &mut i, bytes, j, "read", 't', err, shell) {
-                        Ok(v) => v,
-                        Err(rc) => return ExecOutcome::Continue(rc),
-                    };
+                't' => {
+                    let v = o.value.expect("spec requires a value for -t");
                     match v.trim().parse::<f64>() {
                         Ok(t) if t >= 0.0 && t.is_finite() => timeout = Some(t),
                         _ => {
@@ -3475,18 +3365,14 @@ fn builtin_read(
                             return ExecOutcome::Continue(1);
                         }
                     }
-                    break;
                 }
-                c => {
-                    crate::sh_error_to!(shell, err, None, "read: -{}: invalid option", c as char);
-                    return ExecOutcome::Continue(2);
-                }
-            }
-            j += 1;
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
-        i += 1;
     }
-    let names: Vec<String> = args[i..].to_vec();
+    let names: Vec<String> = args[g.rest_index()..].to_vec();
 
     // Validate names BEFORE reading (POSIX ordering).
     for name in &names {
@@ -4287,52 +4173,37 @@ fn builtin_printf(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    // Parse leading flags: -v VAR, -- end-of-flags.
+    // Parse leading flags: -v VAR.
     let mut v_var: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-v" => {
-                i += 1;
-                if i >= args.len() {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "printf: -v: option requires an argument"
-                    );
-                    return ExecOutcome::Continue(2);
+    let mut g =
+        crate::builtin_opts::Getopt::new("printf", crate::builtin_opts::ArgView::Plain(args), "v:");
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'v' => {
+                    let target = o.value.expect("spec requires a value for -v");
+                    let valid = is_valid_name(&target)
+                        || crate::expand::split_name_subscript(&target)
+                            .map(|(name, sub)| is_valid_name(&name) && !sub.is_empty())
+                            .unwrap_or(false);
+                    if !valid {
+                        crate::sh_error_to!(
+                            shell,
+                            err,
+                            None,
+                            "printf: `{target}': not a valid identifier"
+                        );
+                        return ExecOutcome::Continue(1);
+                    }
+                    v_var = Some(target);
                 }
-                let target = &args[i];
-                let valid = is_valid_name(target)
-                    || crate::expand::split_name_subscript(target)
-                        .map(|(name, sub)| is_valid_name(&name) && !sub.is_empty())
-                        .unwrap_or(false);
-                if !valid {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "printf: `{target}': not a valid identifier"
-                    );
-                    return ExecOutcome::Continue(1);
-                }
-                v_var = Some(target.clone());
-                i += 1;
-            }
-            "--" => {
-                i += 1;
-                break;
-            }
-            s if s.starts_with('-') && s.len() > 1 && s != "-" => {
-                // Bash's printf rejects unknown flags but accepts a
-                // lone "-" as a format. We do the same.
-                crate::sh_error_to!(shell, err, None, "printf: {s}: invalid option");
-                return ExecOutcome::Continue(2);
-            }
-            _ => break,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
     }
+    let i = g.rest_index();
 
     if i >= args.len() {
         e!(err, "printf: usage: printf [-v var] format [arguments]");
@@ -4487,43 +4358,45 @@ struct JobsArgs {
 fn parse_jobs_args(
     args: &[String],
     err: &mut dyn Write,
-    shell: &Shell,
+    shell: &mut Shell,
 ) -> Result<JobsArgs, ExecOutcome> {
     let mut long = false;
     let mut pids_only = false;
     let mut only_new = false;
     let mut only_running = false;
     let mut only_stopped = false;
-    let mut idx = 0;
+    let mut exec_mode = false;
 
-    while idx < args.len() {
-        let a = &args[idx];
-        if a == "--" {
-            idx += 1;
-            break;
+    let mut g = crate::builtin_opts::Getopt::new(
+        "jobs",
+        crate::builtin_opts::ArgView::Plain(args),
+        "lnprsx",
+    );
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'l' => long = true,
+                'p' => pids_only = true,
+                'n' => only_new = true,
+                'r' => only_running = true,
+                's' => only_stopped = true,
+                // `-x command [args]`: substitutes jobspecs with pids and
+                // execs COMMAND in the shell's place. Not implemented (no
+                // exec-replace path is reachable from a builtin body); accepted
+                // syntactically per bash's option spec, reported as unsupported
+                // rather than silently mis-parsing the command as jobspecs.
+                'x' => exec_mode = true,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return Err(ExecOutcome::Continue(code)),
         }
-        if let Some(rest) = a.strip_prefix('-') {
-            if rest.is_empty() {
-                break;
-            }
-            for c in rest.chars() {
-                match c {
-                    'l' => long = true,
-                    'p' => pids_only = true,
-                    'n' => only_new = true,
-                    'r' => only_running = true,
-                    's' => only_stopped = true,
-                    _ => {
-                        crate::sh_error_to!(shell, err, None, "jobs: -{c}: invalid option");
-                        e!(err, "jobs: usage: jobs [-lpnrs] [%spec ...]");
-                        return Err(ExecOutcome::Continue(2));
-                    }
-                }
-            }
-            idx += 1;
-        } else {
-            break;
-        }
+    }
+    let idx = g.rest_index();
+
+    if exec_mode {
+        crate::sh_error_to!(shell, err, None, "jobs: -x: not supported in this context");
+        return Err(ExecOutcome::Continue(1));
     }
 
     let mut targets = Vec::new();
@@ -4657,50 +4530,29 @@ struct WaitArgs {
 fn parse_wait_args(
     args: &[String],
     err: &mut dyn Write,
-    shell: &Shell,
+    shell: &mut Shell,
 ) -> Result<WaitArgs, ExecOutcome> {
     let mut wait_any = false;
     let mut pid_var: Option<String> = None;
-    let mut idx = 0;
 
-    while idx < args.len() {
-        let a = &args[idx];
-        match a.as_str() {
-            "-n" => {
-                wait_any = true;
-                idx += 1;
-            }
-            "-f" => {
+    let mut g =
+        crate::builtin_opts::Getopt::new("wait", crate::builtin_opts::ArgView::Plain(args), "fnp:");
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'n' => wait_any = true,
                 // #160: "wait for full termination rather than a status change".
                 // huck's wait has no return-on-stop path (it already blocks to
                 // termination), so accept-and-conform: no state to record.
-                idx += 1;
-            }
-            "-p" => {
-                if idx + 1 >= args.len() {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "wait: -p: option requires a variable name"
-                    );
-                    return Err(ExecOutcome::Continue(2));
-                }
-                pid_var = Some(args[idx + 1].clone());
-                idx += 2;
-            }
-            "--" => {
-                idx += 1;
-                break;
-            }
-            s if s.starts_with('-') && s.len() > 1 => {
-                crate::sh_error_to!(shell, err, None, "wait: {s}: invalid option");
-                e!(err, "wait: usage: wait [-fn] [-p var] [id ...]");
-                return Err(ExecOutcome::Continue(2));
-            }
-            _ => break,
+                'f' => {}
+                'p' => pid_var = o.value,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return Err(ExecOutcome::Continue(code)),
         }
     }
+    let mut idx = g.rest_index();
 
     if pid_var.is_some() && !wait_any {
         crate::sh_error_to!(shell, err, None, "wait: -p: option requires -n");
@@ -5991,137 +5843,150 @@ fn builtin_history(
         }
     }
 
-    let mut idx = 0;
     // Set true only when -c/-d/-w/-r/-a actually ran (NOT for `--` or an
     // unknown option), so the trailing "list all" block can distinguish
     // "no operand, no action" (list all) from "no operand, action already
     // performed" (nothing more to do).
     let mut did_action = false;
+    let mut did_clear = false;
+    // Deferred rather than acted on immediately (unlike -c/-w/-r/-a below):
+    // whether a failure here is reported depends on `did_clear`, which is
+    // only known once the WHOLE flag set has been scanned (bash's rule is
+    // order-independent — `-cd 1` and `-d1 -c` behave identically; see the
+    // comment at the dispatch site).
+    let mut delete_op: Option<String> = None;
+    // `-w`/`-r`/`-a` don't take a getopt value (spec has no `:` on any of
+    // them) — bash's own syntax (`history -anrw [filename]`) shares ONE
+    // optional trailing filename operand across however many of them were
+    // requested. Recorded in encounter order; applied after the scan.
+    let mut file_ops: Vec<char> = Vec::new();
     // ---- options ----
-    while idx < args.len() {
-        let a = &args[idx];
-        if a == "--" {
-            idx += 1;
-            break;
+    let mut g = crate::builtin_opts::Getopt::new(
+        "history",
+        crate::builtin_opts::ArgView::Plain(args),
+        "cd:anrwps",
+    );
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'c' => did_clear = true,
+                'd' => delete_op = Some(o.value.expect("spec requires a value for -d")),
+                'w' | 'r' | 'a' => file_ops.push(o.ch),
+                'n' | 'p' | 's' => {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "history: -{}: not yet implemented",
+                        o.ch
+                    );
+                    return ExecOutcome::Continue(1);
+                }
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
-        match a.as_str() {
-            "-c" => {
-                Rc::make_mut(&mut shell.history).clear();
-                did_action = true;
-                idx += 1;
-            }
-            "-d" => {
-                let Some(operand) = args.get(idx + 1) else {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "history: -d: option requires an argument"
-                    );
-                    return ExecOutcome::Continue(1);
-                };
-                // Range iff a '-' appears AFTER the first char (so a leading
-                // negative sign on a single offset isn't mistaken for a
-                // range). `operand.get(1..)` (rather than `operand[1..]`)
-                // avoids panicking when `operand` is empty or the byte at
-                // index 1 isn't a char boundary; an empty operand simply
-                // falls through to the single-offset path below, where
-                // `resolve_offset("")` fails and yields the standard
-                // out-of-range error.
-                let split = operand.get(1..).and_then(|s| s.find('-')).map(|i| i + 1);
-                let range = split.map(|i| (&operand[..i], &operand[i + 1..]));
-                if let Some((sa, sb)) = range {
-                    match (resolve_offset(shell, sa), resolve_offset(shell, sb)) {
-                        (Some(a), Some(b)) => {
-                            Rc::make_mut(&mut shell.history).delete_range(a, b);
-                            did_action = true;
-                        }
-                        _ => {
-                            crate::sh_error_to!(
-                                shell,
-                                err,
-                                None,
-                                "history: {operand}: history position out of range"
-                            );
-                            return ExecOutcome::Continue(1);
-                        }
-                    }
-                } else {
-                    match resolve_offset(shell, operand) {
-                        Some(n) if Rc::make_mut(&mut shell.history).delete(n) => {
-                            did_action = true;
-                        }
-                        _ => {
-                            crate::sh_error_to!(
-                                shell,
-                                err,
-                                None,
-                                "history: {operand}: history position out of range"
-                            );
-                            return ExecOutcome::Continue(1);
-                        }
-                    }
+    }
+
+    // Fixed dispatch order (verified against bash 5.2.21, NOT the order the
+    // flags were typed in): -c always runs first. `history -c -w FILE`
+    // writes an EMPTY file even when the list was non-empty beforehand, so
+    // -w sees the already-cleared list; by the same evidence -d does too.
+    if did_clear {
+        Rc::make_mut(&mut shell.history).clear();
+        did_action = true;
+    }
+    if let Some(operand) = delete_op {
+        did_action = true;
+        // Range iff a '-' appears AFTER the first char (so a leading
+        // negative sign on a single offset isn't mistaken for a
+        // range). `operand.get(1..)` (rather than `operand[1..]`)
+        // avoids panicking when `operand` is empty or the byte at
+        // index 1 isn't a char boundary; an empty operand simply
+        // falls through to the single-offset path below, where
+        // `resolve_offset("")` fails and yields the standard
+        // out-of-range error.
+        let split = operand.get(1..).and_then(|s| s.find('-')).map(|i| i + 1);
+        let range = split.map(|i| (&operand[..i], &operand[i + 1..]));
+        let ok = if let Some((sa, sb)) = range {
+            match (resolve_offset(shell, sa), resolve_offset(shell, sb)) {
+                (Some(a), Some(b)) => {
+                    Rc::make_mut(&mut shell.history).delete_range(a, b);
+                    true
                 }
-                idx += 2;
+                _ => false,
             }
-            "-w" | "-r" | "-a" => {
-                let flag = a.clone();
-                // Optional filename operand; else the default histfile.
-                let file: std::path::PathBuf = match args.get(idx + 1) {
-                    Some(f) if !f.starts_with('-') => {
-                        idx += 1;
-                        std::path::PathBuf::from(f)
-                    }
-                    // #226: resolve the default from the LIVE $HISTFILE shell
-                    // variable, not the startup-cached value.
-                    _ => match shell.resolve_histfile_path() {
-                        Some(p) => p,
-                        None => {
-                            crate::sh_error_to!(
-                                shell,
-                                err,
-                                None,
-                                "history: cannot use the history file"
-                            );
-                            return ExecOutcome::Continue(1);
-                        }
-                    },
-                };
-                let h = Rc::make_mut(&mut shell.history);
-                let res = match flag.as_str() {
-                    "-w" => h.write_all_to(&file),
-                    "-a" => h.append_new_to(&file),
-                    _ => h.read_append_from(&file),
-                };
-                if let Err(e) = res {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "history: {}: {}",
-                        file.display(),
-                        crate::bash_io_error(&e)
-                    );
-                    return ExecOutcome::Continue(1);
-                }
-                did_action = true;
-                idx += 1;
+        } else {
+            match resolve_offset(shell, &operand) {
+                Some(n) => Rc::make_mut(&mut shell.history).delete(n),
+                None => false,
             }
-            "-p" | "-s" | "-n" => {
-                crate::sh_error_to!(shell, err, None, "history: {a}: not yet implemented");
+        };
+        if !ok {
+            // bash 5.2.21, verified: `history -cd 1`, `-cd abc`, `-cd 1-3`,
+            // and `-cd 5` against a 2-entry PRELOADED history (offset 5 was
+            // out of range even BEFORE the clear) all exit 0 with no
+            // output — `-c`'s presence anywhere in the same invocation
+            // silently swallows ANY `-d` failure (bad number or out of
+            // range alike), order-independent. Standalone `-d 1` against an
+            // equally empty history (no `-c`) DOES error, so this is not a
+            // general "empty history" exemption — it is specific to the
+            // -c-and-d combination.
+            if !did_clear {
+                crate::sh_error_to!(
+                    shell,
+                    err,
+                    None,
+                    "history: {operand}: history position out of range"
+                );
                 return ExecOutcome::Continue(1);
             }
-            other if other.starts_with('-') && other.len() > 1 => {
-                crate::sh_error_to!(shell, err, None, "history: {other}: invalid option");
-                e!(
-                    err,
-                    "history: usage: history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]"
-                );
-                shell.builtin_usage_error = Some(2);
-                return ExecOutcome::Continue(2);
-            }
-            _ => break, // a non-option operand (the N count)
         }
+    }
+
+    let rest_after_opts = g.rest_index();
+    let mut idx = rest_after_opts;
+    if !file_ops.is_empty() {
+        // Optional trailing filename operand; else the default histfile.
+        // Consuming it here (rather than leaving it for the general
+        // trailing-operand handling below) matches bash: once a file op is
+        // requested, the operand names ITS file, not a listing count.
+        let file: std::path::PathBuf = match args.get(rest_after_opts) {
+            Some(f) => {
+                idx += 1;
+                std::path::PathBuf::from(f)
+            }
+            // #226: resolve the default from the LIVE $HISTFILE shell
+            // variable, not the startup-cached value.
+            None => match shell.resolve_histfile_path() {
+                Some(p) => p,
+                None => {
+                    crate::sh_error_to!(shell, err, None, "history: cannot use the history file");
+                    return ExecOutcome::Continue(1);
+                }
+            },
+        };
+        for op in &file_ops {
+            let h = Rc::make_mut(&mut shell.history);
+            let res = match op {
+                'w' => h.write_all_to(&file),
+                'a' => h.append_new_to(&file),
+                _ => h.read_append_from(&file),
+            };
+            if let Err(e) = res {
+                crate::sh_error_to!(
+                    shell,
+                    err,
+                    None,
+                    "history: {}: {}",
+                    file.display(),
+                    crate::bash_io_error(&e)
+                );
+                return ExecOutcome::Continue(1);
+            }
+        }
+        did_action = true;
     }
 
     // ---- trailing operand: the listing count N (only when no option consumed it) ----
@@ -6188,30 +6053,50 @@ fn builtin_trap(
 ) -> ExecOutcome {
     use crate::traps::{TrapSignal, install, parse_trap_signal, reset};
 
-    // No args: same as `trap -p`.
-    if args.is_empty() {
+    let mut list_signals = false;
+    let mut print_mode = false;
+    let mut g =
+        crate::builtin_opts::Getopt::new("trap", crate::builtin_opts::ArgView::Plain(args), "lp");
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                'l' => list_signals = true,
+                'p' => print_mode = true,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
+        }
+    }
+    let rest = &args[g.rest_index()..];
+
+    // No operands and no -l: same as `trap -p` (covers bare `trap`, and
+    // `trap --`/`trap -p` alone — bash 5.2.21 verified: `trap --` is a
+    // silent no-op, not a usage error).
+    if rest.is_empty() && !list_signals {
         print_active_traps(out, shell, None);
         return ExecOutcome::Continue(0);
     }
 
-    // -l: list signal name/number pairs.
-    if args[0] == "-l" {
-        if args.len() != 1 {
-            crate::sh_error_to!(shell, err, None, "trap: -l takes no arguments");
-            return ExecOutcome::Continue(1);
-        }
+    // -l: list signal name/number pairs. Wins over -p when both are given
+    // (bash: `trap -lp`/`trap -pl` both list signals, not active traps).
+    // Extra operands are accepted and silently ignored — verified against
+    // bash 5.2.21 (`trap -l foo` neither errors nor filters); huck used to
+    // reject them ("trap: -l takes no arguments"), which was itself a
+    // divergence, not something this conversion needs to preserve.
+    if list_signals {
         print_signal_table(out);
         return ExecOutcome::Continue(0);
     }
 
     // -p [SIGNAL...]: list active traps (optionally filtered).
-    if args[0] == "-p" {
-        if args.len() == 1 {
+    if print_mode {
+        if rest.is_empty() {
             print_active_traps(out, shell, None);
             return ExecOutcome::Continue(0);
         }
         let mut filter: Vec<TrapSignal> = Vec::new();
-        for name in &args[1..] {
+        for name in rest {
             match parse_trap_signal(name) {
                 Ok(sig) => filter.push(sig),
                 Err(msg) => {
@@ -6224,13 +6109,20 @@ fn builtin_trap(
         return ExecOutcome::Continue(0);
     }
 
-    // `trap - SIGNAL...`: reset each signal.
-    if args[0] == "-" {
-        if args.len() < 2 {
+    // `trap - SIGNAL...`: reset each signal. A lone "-" is never an option
+    // to the scanner (it's the standard "operand, not a flag cluster" rule),
+    // so it always surfaces here as rest[0].
+    if rest.first().map(|s| s.as_str()) == Some("-") {
+        if rest.len() < 2 {
+            // bash: rc 2 (a usage error), not 1 — and `trap` is a POSIX
+            // special builtin, so this must be able to exit a posix shell
+            // like the scanner's own invalid-option errors do (verified:
+            // `set -o posix; trap -; echo SURVIVED` does not print SURVIVED).
             e!(err, "trap: usage: trap [-lp] [[arg] signal_spec ...]");
-            return ExecOutcome::Continue(1);
+            shell.builtin_usage_error = Some(2);
+            return ExecOutcome::Continue(2);
         }
-        for name in &args[1..] {
+        for name in &rest[1..] {
             let sig = match parse_trap_signal(name) {
                 Ok(s) => s,
                 Err(msg) => {
@@ -6247,17 +6139,19 @@ fn builtin_trap(
     }
 
     // `trap ACTION SIGNAL...`: install action for each signal.
-    if args.len() < 2 {
+    if rest.len() < 2 {
+        // Same rc-2/posix-fatal correction as the reset-usage error above.
         e!(err, "trap: usage: trap [-lp] [[arg] signal_spec ...]");
-        return ExecOutcome::Continue(1);
+        shell.builtin_usage_error = Some(2);
+        return ExecOutcome::Continue(2);
     }
-    let action_text = args[0].clone();
+    let action_text = rest[0].clone();
     let action = if action_text.is_empty() {
         None // empty string → ignore
     } else {
         Some(action_text)
     };
-    for name in &args[1..] {
+    for name in &rest[1..] {
         let sig = match parse_trap_signal(name) {
             Ok(s) => s,
             Err(msg) => {
@@ -8003,36 +7897,21 @@ fn builtin_help(
     let mut want_synopsis = false;
     let mut want_description = false;
     let mut want_man = false;
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--" {
-            i += 1;
-            break;
+    let mut g =
+        crate::builtin_opts::Getopt::new("help", crate::builtin_opts::ArgView::Plain(args), "dms");
+    loop {
+        match g.next_opt(shell, err) {
+            Ok(Some(o)) => match o.ch {
+                's' => want_synopsis = true,
+                'd' => want_description = true,
+                'm' => want_man = true,
+                _ => unreachable!("spec and match must agree"),
+            },
+            Ok(None) => break,
+            Err(code) => return ExecOutcome::Continue(code),
         }
-        if !arg.starts_with('-') || arg.len() < 2 {
-            break;
-        }
-        for &c in &arg.as_bytes()[1..] {
-            match c {
-                b's' => want_synopsis = true,
-                b'd' => want_description = true,
-                b'm' => want_man = true,
-                other => {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "help: -{}: invalid option",
-                        other as char
-                    );
-                    return ExecOutcome::Continue(2);
-                }
-            }
-        }
-        i += 1;
     }
-    let names = &args[i..];
+    let names = &args[g.rest_index()..];
 
     if names.is_empty() {
         for entry in HELP_ENTRIES {

@@ -47,10 +47,14 @@ fn history_invalid_option_errors() {
     // usage line on stderr, and sets the special-builtin usage-error status.
     assert!(matches!(outcome, ExecOutcome::Continue(2)));
     let err_text = String::from_utf8(err).unwrap();
-    assert!(
-        err_text.contains("--bogus: invalid option"),
-        "err: {err_text}"
-    );
+    // bash 5.2.21 verified: `history --bogus` reports `--: invalid option`,
+    // not the whole `--bogus` token — its getopt scans `--bogus` as a short-
+    // option CLUSTER (only an EXACT `--` token is the end-of-options
+    // terminator), so the second `-` is the first (and only) char it looks
+    // at. The shared scanner (#496) matches this; the old hand-rolled
+    // history parser reported the whole token instead, which was itself a
+    // divergence this conversion fixes.
+    assert!(err_text.contains("--: invalid option"), "err: {err_text}");
     assert!(err_text.contains("history: usage:"), "err: {err_text}");
 }
 

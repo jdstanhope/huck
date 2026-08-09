@@ -1179,16 +1179,42 @@ fn jobs_positional_spec_filters_to_target() {
 
 #[test]
 fn jobs_invalid_flag_returns_usage_status_2() {
+    // `-x` used to be this test's "invalid flag" — it no longer is: `jobs
+    // -x command [args]` is a real bash option (spec `"lnprsx"`, #496), it
+    // was simply unimplemented in huck's hand-rolled scanner (which lacked
+    // an `x` arm at all, so it fell into the catch-all). `-Q` is not in the
+    // spec either way and stays a genuine invalid option.
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
         "jobs",
-        &["-x".to_string()],
+        &["-Q".to_string()],
         &mut buf,
         &mut std::io::stderr(),
         &mut shell,
     );
     assert!(matches!(outcome, ExecOutcome::Continue(2)));
+}
+
+#[test]
+fn jobs_x_is_accepted_but_unsupported() {
+    // `-x` parses (it's in the real getopt spec) but huck has no exec-
+    // replace path reachable from a builtin body to implement its
+    // substitute-jobspecs-and-exec semantics; it reports unsupported rather
+    // than silently mis-parsing the trailing command as jobspecs.
+    let mut shell = Shell::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "jobs",
+        &["-x".to_string(), "echo".to_string()],
+        &mut buf,
+        &mut err,
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    let err_text = String::from_utf8(err).unwrap();
+    assert!(err_text.contains("not supported"), "err: {err_text}");
 }
 
 #[test]
@@ -1531,7 +1557,14 @@ fn trap_kill_signal_accepted_silently() {
 }
 
 #[test]
-fn trap_no_signals_errors_status_1() {
+fn trap_no_signals_errors_status_2() {
+    // bash 5.2.21 verified: `trap "echo bye"` (an action with no signal
+    // operand) is a USAGE error — rc 2, not 1 — and `trap` is a POSIX
+    // special builtin, so this must also be able to exit a posix shell
+    // (`set -o posix; trap "echo bye"; echo SURVIVED` prints no SURVIVED in
+    // real bash). The pre-conversion hand-rolled code returned rc 1 and
+    // never set `builtin_usage_error`, which was itself a divergence this
+    // conversion (#496) fixes, not something to preserve.
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -1541,5 +1574,6 @@ fn trap_no_signals_errors_status_1() {
         &mut std::io::stderr(),
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    assert_eq!(shell.builtin_usage_error, Some(2));
 }
