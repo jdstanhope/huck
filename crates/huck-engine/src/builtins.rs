@@ -3162,11 +3162,26 @@ fn builtin_mapfile(
     let mut quantum: usize = 5000;
 
     // Parse a numeric option value.
-    fn num_val(s: &str, err: &mut dyn Write, shell: &Shell, name: &str) -> Result<usize, ()> {
+    /// `what` names the thing bash could not parse — it uses a DIFFERENT
+    /// message per option, not one generic string (#513), measured on
+    /// bash 5.2.21:
+    ///
+    ///   -n, -s  ->  "invalid line count"
+    ///   -O      ->  "invalid array origin"
+    ///   -c      ->  "invalid callback quantum"
+    ///
+    /// and exits 1, not the 2 huck used for all four.
+    fn num_val(
+        s: &str,
+        what: &str,
+        err: &mut dyn Write,
+        shell: &Shell,
+        name: &str,
+    ) -> Result<usize, ()> {
         match s.trim().parse::<usize>() {
             Ok(n) => Ok(n),
             Err(_) => {
-                crate::sh_error_to!(shell, err, None, "{name}: {s}: invalid number");
+                crate::sh_error_to!(shell, err, None, "{name}: {s}: invalid {what}");
                 Err(())
             }
         }
@@ -3187,23 +3202,23 @@ fn builtin_mapfile(
                 }
                 'n' => {
                     let v = o.value.expect("spec requires a value for -n");
-                    match num_val(&v, err, shell, name) {
+                    match num_val(&v, "line count", err, shell, name) {
                         Ok(n) => count = n,
-                        Err(()) => return ExecOutcome::Continue(2),
+                        Err(()) => return ExecOutcome::Continue(1),
                     }
                 }
                 's' => {
                     let v = o.value.expect("spec requires a value for -s");
-                    match num_val(&v, err, shell, name) {
+                    match num_val(&v, "line count", err, shell, name) {
                         Ok(n) => skip = n,
-                        Err(()) => return ExecOutcome::Continue(2),
+                        Err(()) => return ExecOutcome::Continue(1),
                     }
                 }
                 'O' => {
                     let v = o.value.expect("spec requires a value for -O");
-                    match num_val(&v, err, shell, name) {
+                    match num_val(&v, "array origin", err, shell, name) {
                         Ok(n) => origin = Some(n),
-                        Err(()) => return ExecOutcome::Continue(2),
+                        Err(()) => return ExecOutcome::Continue(1),
                     }
                 }
                 // `-u FD` (#511). Same validation and wording as `read -u`:
@@ -3228,9 +3243,9 @@ fn builtin_mapfile(
                 'C' => callback = o.value,
                 'c' => {
                     let v = o.value.expect("spec requires a value for -c");
-                    match num_val(&v, err, shell, name) {
+                    match num_val(&v, "callback quantum", err, shell, name) {
                         Ok(n) => quantum = n,
-                        Err(()) => return ExecOutcome::Continue(2),
+                        Err(()) => return ExecOutcome::Continue(1),
                     }
                 }
                 _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
@@ -4642,10 +4657,9 @@ fn parse_wait_args(
     }
     let mut idx = g.rest_index();
 
-    if pid_var.is_some() && !wait_any {
-        crate::sh_error_to!(shell, err, None, "wait: -p: option requires -n");
-        return Err(ExecOutcome::Continue(2));
-    }
+    // No "-p requires -n" rule: bash has none (#514). `wait -p v` on its own is
+    // accepted silently, rc 0, and simply leaves `v` unset — measured, there is
+    // no pid to record. huck rejected it with a message bash never emits.
 
     let mut targets = Vec::with_capacity(args.len() - idx);
     while idx < args.len() {

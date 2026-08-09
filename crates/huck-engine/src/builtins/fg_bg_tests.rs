@@ -434,7 +434,12 @@ fn wait_n_p_var_captures_pgid_via_explicit_target() {
 }
 
 #[test]
-fn wait_p_without_n_is_usage_error() {
+fn wait_p_without_n_is_accepted_and_leaves_the_var_unset() {
+    // WAS `wait_p_without_n_is_usage_error`, asserting rc 2. bash has no
+    // "-p requires -n" rule (#514): `wait -p PID` on its own is accepted
+    // silently, rc 0, and simply leaves the variable unset — there is no pid
+    // to record. huck emitted `wait: -p: option requires -n`, a message bash
+    // never produces.
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -444,7 +449,11 @@ fn wait_p_without_n_is_usage_error() {
         &mut std::io::stderr(),
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    assert!(
+        shell.lookup_var("PID").is_none(),
+        "no pid was waited for, so the variable must stay unset"
+    );
 }
 
 #[test]

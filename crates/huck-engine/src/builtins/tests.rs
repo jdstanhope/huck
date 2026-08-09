@@ -1215,6 +1215,11 @@ fn mapfile_dash_c_quantum_rejects_a_non_numeric_value() {
     // BEFORE that element is assigned) is pinned by
     // `builtin_options_diff_check.sh` against real bash. What is pinned here is
     // that `-c` still validates its value.
+    //
+    // The expected status changed from 2 to 1 in #513: I wrote the `2` here
+    // during #511, pinning huck's then-current behaviour rather than bash's.
+    // bash exits 1 for a bad numeric option value, with a per-option message
+    // ("invalid callback quantum" for `-c`).
     let mut shell = Shell::new();
     let mut err: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -1230,7 +1235,12 @@ fn mapfile_dash_c_quantum_rejects_a_non_numeric_value() {
         &mut err,
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    let err_text = String::from_utf8(err).unwrap();
+    assert!(
+        err_text.contains("mapfile: abc: invalid callback quantum"),
+        "got: {err_text}"
+    );
 }
 
 #[test]
