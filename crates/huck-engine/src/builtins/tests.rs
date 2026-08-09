@@ -1178,43 +1178,43 @@ fn jobs_positional_spec_filters_to_target() {
 }
 
 #[test]
-fn mapfile_dash_u_with_value_is_rejected_not_silently_ignored() {
-    // Real bash IMPLEMENTS `-u FD` (read from that fd instead of stdin). huck
-    // does not, and implementing it is out of scope for the option-scanner
-    // conversion (#496). Before this task `-u` was rejected outright
-    // (`-u: invalid option`, rc 2) because the old hand-rolled scanner had
-    // no arm for it at all. This task's first cut marked `-u` as a
-    // recognized value-taking option and then silently discarded the
-    // value — which parses clean but produces WRONG DATA with NO error
-    // (the target array came back empty instead of erroring), a severity
-    // increase from loud failure to silent corruption (#496 Task 6 review,
-    // Critical). Pinning the loud rejection so it cannot regress back to
-    // silent-ignore. This is a unit test rather than a bash-diff harness
-    // row because huck's chosen behavior (reject) necessarily diverges
-    // from real bash's (implement) for ANY fragment that actually supplies
-    // a value — there is no fragment where the two byte-match here.
+fn mapfile_dash_u_reads_from_the_given_fd() {
+    // WAS `mapfile_dash_u_with_value_is_rejected_not_silently_ignored`, which
+    // pinned a deliberate rejection: `-u` was a real bash option huck did not
+    // implement, and #496 Task 6 had briefly made it parse-and-ignore, turning
+    // a loud failure into silent wrong data. #511 implements it, so the
+    // rejection is no longer the correct behaviour to pin.
+    //
+    // The end-to-end read-from-fd path is covered by
+    // `builtin_options_diff_check.sh` (it needs a real open fd, which this
+    // in-process harness cannot set up). What is pinned here is the argument
+    // VALIDATION, which byte-matches `read -u`: a non-numeric spec is a
+    // "specification" error, rc 1.
     let mut shell = Shell::new();
     let mut err: Vec<u8> = Vec::new();
     let outcome = run_builtin(
         "mapfile",
-        &["-u".to_string(), "3".to_string(), "A".to_string()],
+        &["-u".to_string(), "abc".to_string(), "A".to_string()],
         &mut std::io::sink(),
         &mut err,
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
     let err_text = String::from_utf8(err).unwrap();
-    assert!(err_text.contains("-u: invalid option"), "err: {err_text}");
     assert!(
-        shell.get_var("A").is_none(),
-        "A must not be created/populated by a rejected -u"
+        err_text.contains("mapfile: abc: invalid file descriptor specification"),
+        "got: {err_text}"
     );
 }
 
 #[test]
-fn mapfile_dash_c_callback_with_value_is_rejected_not_silently_ignored() {
-    // Same reasoning as the `-u` test above, for `-C callback -c quantum`
-    // (real bash invokes CALLBACK every QUANTUM lines read).
+fn mapfile_dash_c_quantum_rejects_a_non_numeric_value() {
+    // WAS `mapfile_dash_c_callback_with_value_is_rejected_not_silently_ignored`
+    // — see the `-u` test above; #511 implements `-C`/`-c`, so the rejection is
+    // no longer correct. The callback firing schedule (every QUANTUM records,
+    // BEFORE that element is assigned) is pinned by
+    // `builtin_options_diff_check.sh` against real bash. What is pinned here is
+    // that `-c` still validates its value.
     let mut shell = Shell::new();
     let mut err: Vec<u8> = Vec::new();
     let outcome = run_builtin(
@@ -1223,7 +1223,7 @@ fn mapfile_dash_c_callback_with_value_is_rejected_not_silently_ignored() {
             "-C".to_string(),
             "echo cb".to_string(),
             "-c".to_string(),
-            "1".to_string(),
+            "abc".to_string(),
             "A".to_string(),
         ],
         &mut std::io::sink(),
@@ -1231,30 +1231,31 @@ fn mapfile_dash_c_callback_with_value_is_rejected_not_silently_ignored() {
         &mut shell,
     );
     assert!(matches!(outcome, ExecOutcome::Continue(2)));
-    let err_text = String::from_utf8(err).unwrap();
-    // The scanner processes `-C`'s value first and errors there — `-c`
-    // never gets scanned. Either char rejecting is a correct outcome; pin
-    // the one the scan order actually produces.
-    assert!(err_text.contains("-C: invalid option"), "err: {err_text}");
 }
 
 #[test]
 fn readarray_dash_u_reports_invoked_name() {
-    // The class-3 name-threading fix (#496 Task 6) must hold for the
-    // rejection path too, not just the ordinary invalid-option path.
+    // The class-3 name-threading fix (#496 Task 6) must hold on `-u`'s own
+    // error path, not just the ordinary invalid-option path — `readarray` and
+    // `mapfile` share an implementation and must still name themselves.
+    //
+    // The vehicle changed with #511: `-u 3` used to be REJECTED outright
+    // (`readarray: -u: invalid option`) because `-u` was unimplemented. It is
+    // implemented now, so the assertion moves to the argument-validation error,
+    // which still exercises the same name threading.
     let mut shell = Shell::new();
     let mut err: Vec<u8> = Vec::new();
     let outcome = run_builtin(
         "readarray",
-        &["-u".to_string(), "3".to_string(), "A".to_string()],
+        &["-u".to_string(), "abc".to_string(), "A".to_string()],
         &mut std::io::sink(),
         &mut err,
         &mut shell,
     );
-    assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    assert!(matches!(outcome, ExecOutcome::Continue(1)));
     let err_text = String::from_utf8(err).unwrap();
     assert!(
-        err_text.contains("readarray: -u: invalid option"),
+        err_text.contains("readarray: abc: invalid file descriptor specification"),
         "err: {err_text}"
     );
 }

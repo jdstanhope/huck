@@ -3155,6 +3155,11 @@ fn builtin_mapfile(
     let mut count: usize = 0; // 0 = unlimited
     let mut skip: usize = 0;
     let mut origin: Option<usize> = None;
+    let mut read_fd: Option<std::os::unix::io::RawFd> = None;
+    let mut callback: Option<String> = None;
+    // bash's default quantum is 5000, so `-C` with no `-c` fires only on very
+    // large inputs — measured: `-C cb` over 3 lines fires nothing.
+    let mut quantum: usize = 5000;
 
     // Parse a numeric option value.
     fn num_val(s: &str, err: &mut dyn Write, shell: &Shell, name: &str) -> Result<usize, ()> {
@@ -3201,21 +3206,32 @@ fn builtin_mapfile(
                         Err(()) => return ExecOutcome::Continue(2),
                     }
                 }
-                // `-u FD`, `-C callback`, `-c quantum` are real, implemented
-                // bash options (they take a getopt value, hence the colons in
-                // the spec above — a missing value already errors via the
-                // scanner's own `fail_missing_value`, matching bash exactly).
-                // huck has no read-from-fd / per-line-callback support, so
-                // rather than silently accepting-and-ignoring a supplied
-                // value (#496 Task 6 review, Critical: that turned a loud
-                // pre-v359 "-u: invalid option" rejection into SILENT DATA
-                // CORRUPTION — the array came back empty/wrong with no
-                // error), explicitly reject them, same status/shape as any
-                // other unrecognized option.
-                'u' | 'C' | 'c' => {
-                    let _ = o.value;
-                    crate::sh_error_to!(shell, err, None, "{name}: -{}: invalid option", o.ch);
-                    return ExecOutcome::Continue(2);
+                // `-u FD` (#511). Same validation and wording as `read -u`:
+                // a non-numeric spec is a "specification" error, an unopened
+                // one is "Bad file descriptor" — both rc 1, both measured
+                // against bash 5.2.21.
+                'u' => {
+                    let v = o.value.expect("spec requires a value for -u");
+                    match v.trim().parse::<std::os::unix::io::RawFd>() {
+                        Ok(fd) if fd >= 0 => read_fd = Some(fd),
+                        _ => {
+                            crate::sh_error_to!(
+                                shell,
+                                err,
+                                None,
+                                "{name}: {v}: invalid file descriptor specification"
+                            );
+                            return ExecOutcome::Continue(1);
+                        }
+                    }
+                }
+                'C' => callback = o.value,
+                'c' => {
+                    let v = o.value.expect("spec requires a value for -c");
+                    match num_val(&v, err, shell, name) {
+                        Ok(n) => quantum = n,
+                        Err(()) => return ExecOutcome::Continue(2),
+                    }
                 }
                 _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
@@ -3238,7 +3254,25 @@ fn builtin_mapfile(
         return ExecOutcome::Continue(1);
     }
 
-    let mut handle = RawFdReader::new();
+    // `-u FD`: validate the fd is open BEFORE reading, exactly as `read -u`
+    // does (bash checks via fcntl(fd, F_GETFD) == -1), so an unopened fd errors
+    // without consuming input.
+    if let Some(fd) = read_fd
+        && unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1
+    {
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "{name}: {fd}: invalid file descriptor: Bad file descriptor"
+        );
+        return ExecOutcome::Continue(1);
+    }
+
+    let mut handle = match read_fd {
+        Some(fd) => RawFdReader::from_fd(fd),
+        None => RawFdReader::new(),
+    };
     // Skip the first `skip` records.
     for _ in 0..skip {
         match read_one_record(&mut handle, delim) {
@@ -3250,10 +3284,23 @@ fn builtin_mapfile(
             }
         }
     }
+    // Without `-O`, mapfile REPLACES the array — and does so even when it goes
+    // on to read nothing (measured: `A=(x y z); mapfile A </dev/null` leaves
+    // A empty). Clearing up front is also what lets a `-C` callback observe the
+    // elements assigned so far, which bash's does.
+    let base = origin.unwrap_or(0);
+    if origin.is_none()
+        && shell
+            .replace_indexed(&array_name, std::collections::BTreeMap::new())
+            .is_err()
+    {
+        return ExecOutcome::Continue(1);
+    }
+
     // Collect up to `count` (0 = unlimited) records.
-    let mut elements: Vec<String> = Vec::new();
+    let mut n_read: usize = 0;
     loop {
-        if count != 0 && elements.len() >= count {
+        if count != 0 && n_read >= count {
             break;
         }
         match read_one_record(&mut handle, delim) {
@@ -3262,7 +3309,40 @@ fn builtin_mapfile(
                 if had_delim && !strip_t {
                     val.push(delim as char);
                 }
-                elements.push(val);
+                // `-C CALLBACK -c QUANTUM` (#511). bash evaluates the STRING
+                // `CALLBACK INDEX LINE` — the index and line are appended to
+                // the callback text and the whole thing is run as a command
+                // line, NOT passed as positional parameters (measured: with
+                // `-C 'echo idx=$1'` the `$1` is EMPTY and `1 b` is appended
+                // to the output).
+                //
+                // It fires after every QUANTUM-th record and BEFORE that
+                // element is assigned, so the array is one short at that
+                // moment — measured with `-c 2` over five lines, the callback
+                // saw `${#A[@]}` as 1 then 3, and fired at indices 1 and 3.
+                // Hence `(n_read + 1) % quantum`, not `n_read % quantum`:
+                // the latter fires at 0, 2, 4 and makes bash's default quantum
+                // of 5000 fire immediately on the first record.
+                if let Some(cb) = &callback
+                    && quantum != 0
+                    && (n_read + 1).is_multiple_of(quantum)
+                {
+                    let idx = base + n_read;
+                    let line = val.trim_end_matches(delim as char);
+                    let script = format!("{cb} {idx} {line}");
+                    let _ = run_sourced_contents_in_sinks(
+                        &script,
+                        std::path::Path::new("mapfile"),
+                        shell,
+                    );
+                }
+                if shell
+                    .set_indexed_element(&array_name, base + n_read, val)
+                    .is_err()
+                {
+                    return ExecOutcome::Continue(1);
+                }
+                n_read += 1;
             }
             Ok(None) => break,
             Err(e) => {
@@ -3272,22 +3352,7 @@ fn builtin_mapfile(
         }
     }
 
-    match origin {
-        None => {
-            let map: std::collections::BTreeMap<usize, String> =
-                elements.into_iter().enumerate().collect();
-            if shell.replace_indexed(&array_name, map).is_err() {
-                return ExecOutcome::Continue(1);
-            }
-        }
-        Some(o) => {
-            for (k, val) in elements.into_iter().enumerate() {
-                if shell.set_indexed_element(&array_name, o + k, val).is_err() {
-                    return ExecOutcome::Continue(1);
-                }
-            }
-        }
-    }
+    // Elements were assigned incrementally above.
     ExecOutcome::Continue(0)
 }
 
