@@ -1,0 +1,123 @@
+---
+title: "The builtins that don't take options"
+date: 2026-08-09
+summary: "After giving every builtin one option parser, the interesting cases were the ones that couldn't use it. pushd -Q was reporting itself as cd, complete was rejecting arguments bash accepts, and a typo could take the shell down."
+tags: ["builtins", "bash-compat"]
+version: null
+draft: false
+---
+
+Last week every builtin got a single shared option parser. The follow-ups were
+more interesting than the main event, because they were all about builtins that
+*can't* use it.
+
+## pushd was answering to the wrong name
+
+```bash
+# before
+$ pushd -Q
+huck: line 1: cd: -Q: invalid option
+cd: usage: cd [-L|[-P [-e]] [-@]] [dir]
+```
+
+You typed `pushd`. It complained as `cd`, and printed `cd`'s usage. What
+happened: `pushd` checks whether its argument is a directory-stack index like
+`+1`, and if not, hands it to the code that changes directory — which is `cd`
+wearing a different hat. A typo'd flag sailed straight through and got answered
+by the wrong builtin.
+
+`popd` had a different version of the same confusion: it checked whether the
+directory stack was empty *before* looking at what you typed, so a bad flag got
+reported as an empty stack.
+
+```bash
+# after
+$ pushd -Q
+huck: line 1: pushd: -Q: invalid number
+pushd: usage: pushd [-n] [+N | -N | dir]
+
+$ popd -Q
+huck: line 1: popd: -Q: invalid number
+popd: usage: popd [-n] [+N | -N]
+```
+
+"Invalid number", not "invalid option" — because that's what bash says, and the
+reason is the interesting part. `pushd`, `popd` and `dirs` take arguments like
+`+1` and `-2` to rotate the stack. So `-Q` isn't a bad flag to them; it's a
+malformed number.
+
+That also means they can't use the shared parser at all, and the proof is a
+detail I'd never have guessed:
+
+```bash
+# after
+$ dirs -cl
+huck: line 1: dirs: -cl: invalid number
+dirs: usage: dirs [-clpv] [+N] [-N]
+```
+
+`-c` and `-l` are both real `dirs` options. Combine them and bash rejects the
+whole thing — it reports `-cl`, not `-c`. These builtins don't combine flags at
+all, because `-1` has to stay a number. Any parser that helpfully bundled them
+would be wrong.
+
+## complete was rejecting things bash accepts
+
+```bash
+# before
+$ complete foo
+huck: line 1: complete: nothing to complete
+```
+
+bash accepts that quite happily — it registers `foo` with an empty completion
+spec. huck had invented a rule that you must specify *something*, which also
+swallowed a couple of stranger forms bash accepts.
+
+The neighbouring bug: huck treated `+o` as an option to `complete`. bash
+doesn't. `complete +o nospace foo` registers three completions, named `foo`,
+`nospace` and `+o`. Odd, but that's the behaviour, and scripts that do it were
+getting an error instead.
+
+Meanwhile `compopt`, which *does* take `+o`, was reporting a bad one with the
+wrong sign and no usage line:
+
+```bash
+# before                                  # after
+$ compopt +z                              $ compopt +z
+compopt: -z: invalid option               compopt: +z: invalid option
+                                          compopt: usage: compopt [-o|+o option] [-DEI] [name ...]
+```
+
+Four builtins hand-wrote that same error message, and the copies had drifted
+apart. Which is precisely the problem the shared parser was built to fix,
+reappearing one floor up in the code the parser doesn't cover.
+
+## And a crash
+
+The option parser had a "this can't happen" branch at twenty-six places. It
+could happen. A colon marks "this option takes a value", and was also being
+accepted as an option itself, so `hash -:` reached the impossible branch and
+took the whole shell down — exit code 101, everything after it in your script
+skipped.
+
+Fixed, but the general shape was the real bug: a shell should never abort on
+something you typed. All twenty-six now print an error and carry on.
+
+## The recurring lesson
+
+Twice in these rounds a fix started by making a flag *parse* that huck doesn't
+actually implement. Both times that's worse than rejecting it: the flag is
+accepted, quietly ignored, and you get wrong results with no error. `pushd -n`
+is the current example — bash inserts the directory below the top without
+changing directory, huck doesn't implement that, and so it says so out loud
+rather than pretending.
+
+## Still open
+
+- [#530](https://github.com/jdstanhope/huck/issues/530) — `pushd -n` / `popd -n`
+- [#527](https://github.com/jdstanhope/huck/issues/527) — `complete -p` prints a
+  stray `--`, so its output doesn't round-trip
+- [#511](https://github.com/jdstanhope/huck/issues/511) — `mapfile -u`, reading
+  from a given file descriptor
+- [#516](https://github.com/jdstanhope/huck/issues/516) — `exec` still has its
+  own option parser, missed because the audit searched the wrong files
