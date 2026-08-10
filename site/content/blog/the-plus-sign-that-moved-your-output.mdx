@@ -1,0 +1,120 @@
+---
+title: "The plus sign that moved your output"
+date: 2026-08-10
+summary: "A flaky test turned out to be two real bugs. The interesting one sent a command's output to a completely different place than bash would — same exit status, no error message, nothing to notice."
+tags: ["redirection", "bash-compat", "flaky-tests"]
+version: null
+draft: false
+---
+
+This started as a flaky test. One harness in the suite failed a full run, passed
+on its own, and had been written off twice as "load flakiness" on a slow
+machine. It wasn't. Underneath were two separate bugs, and the one nobody was
+looking for is the kind you cannot see happening.
+
+## Writing to somewhere else entirely
+
+In bash, `>&WORD` only means "duplicate a file descriptor" when the word is
+made purely of digits. `>&2` is a descriptor. `>&report.txt` is a *file* — it's
+the same thing as `&>report.txt`, sending both stdout and stderr there.
+
+So what is `>&+7`? Not digits — there's a `+`. bash makes a file called `+7`.
+
+huck was deciding "is this a descriptor?" with a numeric parse that happily
+accepts a leading sign. It read `+7` as descriptor 7. If descriptor 7 happened
+to be open, the output went there:
+
+```bash
+# before
+$ exec 7>fd7.out; x=+7; echo PAYLOAD >&"$x"; echo "rc=$?"
+rc=0
+   FILE fd7.out=[PAYLOAD]
+```
+
+```bash
+# after (and what bash does)
+$ exec 7>fd7.out; x=+7; echo PAYLOAD >&"$x"; echo "rc=$?"
+rc=0
+   FILE +7=[PAYLOAD]
+   FILE fd7.out=[]
+```
+
+Note what is *not* different: the exit status is 0 both times, and neither run
+prints a warning. The only evidence you were given is which file your text
+ended up in. A script that logs somewhere unexpected, with no error and a
+successful return, is about the least fun thing to debug.
+
+## The empty descriptor
+
+The second bug is what the flaky test was actually tripping over. When a
+descriptor word expands to nothing, bash calls it a bad descriptor. huck had
+two different wrong answers depending on which way the arrow pointed — one of
+them tried to open a file with an empty name, and the other used a message
+bash has never printed for a redirection:
+
+```bash
+# before
+$ x=; echo hi >&"$x"; echo "rc=$?"
+line 1: : No such file or directory
+rc=1
+$ x=; read r <&"$x"; echo "rc=$?"
+line 1: bad fd: "$x"
+rc=1
+```
+
+```bash
+# after (matching bash)
+$ x=; echo hi >&"$x"; echo "rc=$?"
+"$x": Bad file descriptor
+rc=1
+$ x=; read r <&"$x"; echo "rc=$?"
+"$x": Bad file descriptor
+rc=1
+```
+
+An empty word isn't a contrived case. It's exactly what you get from
+`${MYP[0]}` after a coprocess has finished and the shell has cleared the array
+out from under you — which is precisely the state the flaky harness kept
+landing in. Since huck's message differed from bash's, the comparison failed.
+
+Related, a non-numeric word going the *input* direction has no filename
+meaning at all, so bash calls it ambiguous:
+
+```bash
+# before
+$ x=abc; read r <&"$x"
+line 1: bad fd: "$x"
+```
+
+```bash
+# after
+$ x=abc; read r <&"$x"
+abc: ambiguous redirect
+```
+
+## The rule is fussier than it looks
+
+Getting the error text right meant working out which thing bash names when it
+complains, and the answer took several attempts. A first version of this fix
+looked correct against a dozen hand-picked cases and still broke `4>&77`,
+because bash has three behaviours here, not one: a literal number names itself
+whatever descriptor you aimed at (`4>&77` says `77`, and `4>&007` says `7`),
+quoting that same number changes the answer to `4`, and a redirection on its
+own default descriptor names the word you wrote rather than the number.
+
+That is not something worth reasoning about from first principles. It's
+something to measure, which is what the new harness does — 47 cases, run
+through both shells, compared byte for byte, including *which files ended up on
+disk*. That last part matters: the `+7` bug produces identical text and
+identical exit codes in both shells, so any harness comparing only output would
+have called it a pass.
+
+## Still open
+
+Fixing this changes the flaky harness's symptom without removing it. The
+underlying race is [#185](https://github.com/jdstanhope/huck/issues/185): huck
+tears a finished coprocess down sooner than bash does, so `${MYP[0]}` goes
+empty earlier. Measured on an idle machine, bash lost that race 0 times in 150
+runs and huck lost it 5 — so it was never really about load, and it reproduces
+standalone if you run it enough times. The descriptor cleanup itself is
+unchanged here.
