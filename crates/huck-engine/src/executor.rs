@@ -3155,18 +3155,43 @@ fn resolve_fd_target(source: &crate::lexer::Word, shell: &mut Shell) -> Result<i
         .map_err(|_| io::Error::other(format!("bad fd: {expanded}")))
 }
 
+/// bash's fd-word test (#542): a dup/move redirect word names an fd only when
+/// the expanded field is entirely ASCII digits. `7` and `007` are fds; a sign
+/// (`+7`, `-5`), surrounding space (`" 7"`) or trailing text (`7abc`) is NOT —
+/// bash falls through to the filename / ambiguous-redirect branches, so
+/// `parse::<i32>()` (which accepts a sign) silently dup'd where bash opened a
+/// file. An all-digits word that overflows is still an fd to bash: it reports
+/// `Bad file descriptor` rather than creating a file, so saturate instead of
+/// failing the parse.
+fn fd_word_number(field: &str) -> Option<RawFd> {
+    if field.is_empty() || !field.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(field.parse::<RawFd>().unwrap_or(RawFd::MAX))
+}
+
 /// Resolve a `>&w` / `<&w` / move (`>&w-`) source word to an fd, writing bash's
 /// error to the redirect-aware writer on failure. Shared by every dup/move
 /// redirect-lowering site (`lower_redirects` for the in-process path and the
-/// child-plan builders). Does NOT check the fd is currently open — the in-process sites
-/// add that via `validate_fd_open` (they perform the `dup2` in the parent);
-/// the child-plan sites defer the check to child replay. Returns `Err(())`
-/// after emitting the error.
-fn resolve_dup_source(source: &crate::lexer::Word, shell: &mut Shell) -> Result<RawFd, ()> {
-    // bash: a dup source that word-splits to 0 or >1 fields (e.g. `$v` unset,
-    // `>&` empty) is an *ambiguous redirect* naming the raw word; a single
-    // non-numeric field is `bad fd`. The error names the UN-expanded source
-    // word (`$v`), not the expansion result.
+/// child-plan builders). Does NOT check the fd is currently open — the
+/// in-process sites add that via `validate_fd_open` (they perform the `dup2`
+/// in the parent); the child-plan sites defer the check to child replay.
+/// Returns `Err(())` after emitting the error.
+///
+/// `bad_fd_label` is what bash names in a `Bad file descriptor` message — the
+/// source word when the redirect targets its directional default fd, else the
+/// target number (see the call site). Note the asymmetry, which is bash's:
+/// `Bad file descriptor` names that label, `ambiguous redirect` names the
+/// EXPANSION for a single non-numeric field but the SOURCE WORD when the word
+/// produced a field count other than one.
+///
+/// The `&>file` filename fallback for an output dup on fd 1 is handled by the
+/// caller before this point, so a non-numeric field here is always ambiguous.
+fn resolve_dup_source(
+    source: &crate::lexer::Word,
+    shell: &mut Shell,
+    bad_fd_label: &str,
+) -> Result<RawFd, ()> {
     let fields = expand(source, shell);
     let word_src = crate::expand::reconstruct_word_source(source);
     if fields.len() != 1 {
@@ -3174,14 +3199,24 @@ fn resolve_dup_source(source: &crate::lexer::Word, shell: &mut Shell) -> Result<
         crate::sh_error_to!(shell, &mut *err, None, "{word_src}: ambiguous redirect");
         return Err(());
     }
-    match fields.into_iter().next().unwrap().chars.parse::<i32>() {
-        Ok(fd) => Ok(fd),
-        Err(_) => {
-            let mut err = err_writer();
-            crate::sh_error_to!(shell, &mut *err, None, "bad fd: {word_src}");
-            Err(())
-        }
+    let field = fields.into_iter().next().unwrap().chars;
+    if let Some(fd) = fd_word_number(&field) {
+        return Ok(fd);
     }
+    let mut err = err_writer();
+    if field.is_empty() {
+        // `<&""`, or `${ARR[0]}` after the array was unset — a bad fd, not a
+        // filename and not huck's invented `bad fd:` wording.
+        crate::sh_error_to!(
+            shell,
+            &mut *err,
+            None,
+            "{bad_fd_label}: Bad file descriptor"
+        );
+    } else {
+        crate::sh_error_to!(shell, &mut *err, None, "{field}: ambiguous redirect");
+    }
+    Err(())
 }
 
 /// Check that `src` is currently an open fd; on failure write bash's
@@ -5560,6 +5595,26 @@ fn lower_one_redirect(
         RedirOp::Dup { source, .. } | RedirOp::Move { source, .. } => {
             let is_move = matches!(&redir.op, RedirOp::Move { .. });
             let is_output_dup = matches!(&redir.op, RedirOp::Dup { output: true, .. });
+            // #542: what bash names in `Bad file descriptor`, measured. Three
+            // cases, in this order:
+            //   * the word is a LITERAL fd number (bash's `[n]>&NUMBER`
+            //     production) -> its NUMERIC VALUE, whatever the target:
+            //     `4>&77` says `77` and `4>&007` says `7` (not `007`).
+            //     Quoting defeats the production, so `4>&'77'` says `4`.
+            //   * else the redirect targets its DIRECTIONAL DEFAULT fd
+            //     (`>&`/`1>&` -> 1, `<&`/`0<&` -> 0) -> the SOURCE WORD,
+            //     e.g. `>&"$x"` says `"$x"`.
+            //   * else -> the TARGET fd: `4>&"$z"` says `4`.
+            // Explicitness of the prefix is NOT the discriminator — `1>&""`
+            // names the word while `2>&""` names `2`, though both spell an fd.
+            let word_src = crate::expand::reconstruct_word_source(source);
+            let literal_fd = (!word_src.is_empty() && word_src.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| word_src.parse::<RawFd>().unwrap_or(RawFd::MAX));
+            let bad_fd_label = match literal_fd {
+                Some(n) => n.to_string(),
+                None if target == RawFd::from(redir.op.default_fd()) => word_src,
+                None => target.to_string(),
+            };
             // #223: `>&word` / `1>&word` (an OUTPUT dup on fd 1) whose word is a
             // single NON-NUMERIC, non-`-` field is a synonym for `&>word` —
             // redirect BOTH stdout and stderr to that file. Resolve from ONE
@@ -5584,9 +5639,23 @@ fn lower_one_redirect(
                     }
                     return Ok(ops);
                 }
-                match field.parse::<RawFd>() {
-                    Ok(fd) => fd, // `>&2` etc. — a normal dup; fall through below.
-                    Err(_) => {
+                if field.is_empty() {
+                    // #542: an empty expansion is a BAD FD, not a filename.
+                    // Falling into the `&>file` branch made `>&"${ARR[0]}"`
+                    // (array unset, e.g. a reaped coproc) try to open "" and
+                    // report `: No such file or directory`.
+                    let mut err = err_writer();
+                    crate::sh_error_to!(
+                        shell,
+                        &mut *err,
+                        None,
+                        "{bad_fd_label}: Bad file descriptor"
+                    );
+                    return Err(1);
+                }
+                match fd_word_number(&field) {
+                    Some(fd) => fd, // `>&2` etc. — a normal dup; fall through below.
+                    None => {
                         // `&>file` fallback: open the file on fd 1, then fd 2 <- fd 1.
                         use crate::command::FileMode;
                         if check_restricted_redirect(&FileMode::Truncate, &field, &field, shell)
@@ -5624,7 +5693,7 @@ fn lower_one_redirect(
                     }
                 }
             } else {
-                match resolve_dup_source(source, shell) {
+                match resolve_dup_source(source, shell, &bad_fd_label) {
                     Ok(n) => n,
                     Err(()) => return Err(1),
                 }
@@ -5634,11 +5703,11 @@ fn lower_one_redirect(
             if !(is_move && src == target) {
                 // Validate the source NOW (before any later file opens) so an invalid
                 // dup errors without truncating a later `>file`. Same-plan targets are
-                // recorded open in fd_state, so `3>g 4>&3` still passes. bash names the
-                // raw source word (`>&$v` -> `$v: Bad file descriptor`); a numeric
-                // literal (`>&9`) reconstructs back to its own number, unchanged.
-                let label = crate::expand::reconstruct_word_source(source);
-                validate_source(src, fd_state.as_deref(), shell, &label)?;
+                // recorded open in fd_state, so `3>g 4>&3` still passes. `bad_fd_label`
+                // carries bash's naming rule (source word on the directional default
+                // fd, target number otherwise — #542); a numeric literal (`>&9`)
+                // reconstructs back to its own number, unchanged.
+                validate_source(src, fd_state.as_deref(), shell, &bad_fd_label)?;
                 ops.push(PlanOp::InstallDup {
                     target,
                     source: src,

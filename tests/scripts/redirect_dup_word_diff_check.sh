@@ -90,6 +90,22 @@ check "closed fd implicit"   'x=7; echo hi >&"$x"; echo "rc=$?"'
 check "closed fd explicit"   'x=7; echo hi 9>&"$x"; echo "rc=$?"'
 check "closed fd expl in"    'x=7; read r 9<&"$x"; echo "rc=$?"'
 check "octal-looking closed" 'x=007; echo hi >&"$x"; echo "rc=$?"'
+# A LITERAL fd number is bash's `[n]>&NUMBER` production: it names its own
+# NUMERIC value whatever the target, and quoting defeats the production. These
+# rows are the ones a target-only rule gets wrong.
+check "literal fd nondefault" 'echo hi 4>&77; echo "rc=$?"'
+check "literal fd default"    'echo hi >&77; echo "rc=$?"'
+check "literal fd input dflt" 'read r 0<&77; echo "rc=$?"'
+check "literal octal nondflt" 'echo hi 4>&007; echo "rc=$?"'
+check "quoted num nondefault" "echo hi 4>&'77'; echo \"rc=\$?\""
+check "dquoted num nondflt"   'echo hi 4>&"77"; echo "rc=$?"'
+check "arith num nondefault"  'echo hi 4>&$((70+7)); echo "rc=$?"'
+check "expand num nondefault" 'x=77; echo hi 4>&"$x"; echo "rc=$?"'
+check "expand num in nondflt" 'x=77; read r 4<&"$x"; echo "rc=$?"'
+check "empty expand nondflt"  'x=; echo hi 4>&"$x"; echo "rc=$?"'
+check "empty literal nondflt" 'echo hi 4>&""; echo "rc=$?"'
+check "compound literal fd"   '{ :; } 4>&77; echo "rc=$?"'
+check "subshell literal fd"   '( : ) 4>&77; echo "rc=$?"'
 check "huge fd"              'x=99999; echo hi >&"$x"; echo "rc=$?"'
 check "overflow fd"          'x=99999999999999999999; echo hi >&"$x"; echo "rc=$?"'
 
