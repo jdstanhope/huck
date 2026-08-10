@@ -2,6 +2,32 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: dfe1c78 (v313: readonly-assignment error discards the current command #31).
+
+**Re-swept at 063a5c4b (2026-08-10 UTC) — TABLE CORRECTION, no behaviour change.**
+A full 82-category run reports **PASS 39 / FAIL 43 / TIMEOUT 0 / ERROR 0**. The
+per-category table below said **35** PASS, disagreeing with this file's own
+prose counts: the rows for **`parser` (v331)**, **`dynvar` (v332)**,
+**`nquote` (v333)** and **`array2` (v334)** were never flipped from FAIL when
+those iterations landed, even though v335 onward were. All four are corrected
+here, so the table now sums to 39/43 and matches a live run.
+
+⚠️ **This mattered, not just tidiness:** a regression check that diffs a run
+against this table reported those four as *new improvements*, which is exactly
+how a real regression elsewhere could be waved through. When an iteration flips
+a category, update the ROW, not only the prose.
+
+Also verified at this commit: #542 (dup-redirect word classification) changed
+**nothing** in this suite. Runs at `a504f747` (pre-#542) and `063a5c4b` are
+identical — same PASS/FAIL sets and the same **7110** total diff lines. Of 82
+per-category diff files 68 were byte-identical, and after normalising
+environment noise (PPID, OLDPWD, the helper `PATH` temp dir, maxresident,
+CPU%, pagefaults, epoch timestamps, the binary's own path) exactly **two**
+behavioural lines differ, both the same pre-existing bug now filed as **#544**
+(a dup word expanding to `-` must close the fd; huck errors and leaves it
+open): `redir` lines 25/37 and `coproc` line 70 moved from `bad fd: …` to
+`-: ambiguous redirect`. Neither diff got smaller. Fixing #544 should shrink
+`redir` by 2 lines and `coproc` by 1.
+
 **Updated by v351 (#350, 2026-07-31 UTC):** `case` flipped to PASS (0-diff) —
 two roots. **Root 1:** a backslash from an UNQUOTED expansion is a pattern escape
 (`\x`→`x`, `\*`→literal `*`, `\\`→literal `\`), spanning `case` / `[[ == ]]` /
@@ -402,7 +428,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | arith | FAIL | The `set -o posix` cascade was resolved in v215 (test now runs end-to-end). v216 aligns arith error-message format with bash: the source-file + line-number prologue, leading-trimmed expression echo, and `(error token is "...")` suffix now match byte-for-byte for the both-error cases verified by `arith_error_diff_check.sh` (10/10 PASS). Remaining failures are the behavioral divergences catalogued in L-56: signed-integer overflow wrapping (literals ≥ 2^63 wrap to min-int in bash; huck rejects as out-of-range); `++`/`--` applied to non-lvalue literals (bash treats as repeated unary `+`/`-` and yields the number; huck errors); lazy dead-branch evaluation in ternary expressions (dead branch must not be evaluated even if it contains an unset variable); array-element lvalue expressions inside arith (`a[n]=n++`); substring offset/length with arith ternary colons; standalone `(( ))` command line-number attribution (off vs bash because `Command::Arith` carries no source line); and minor error-kind wording for malformed base-N numbers. |
 | arith-for | FAIL | The `declare -f` trailing-space format divergence is resolved by v218. Remaining divergences: huck leaves empty `for ((` sections empty (`for ((; i<3; i++))`), whereas bash normalizes a missing section to `1` (`for ((1; i<3; i++))`) — an arith-for reconstruction-fidelity gap (L-59); and error-message wording for malformed `for ((` headers (wrong section count or a quoted string as a section value) still differs between huck and bash. |
 | array | FAIL | `set +a` (all-export off) not supported, misconfiguring the test environment. Also an array literal whose element contains a background `&` operator is parsed differently than bash expects. |
-| array2 | FAIL | With helpers provisioned, the real divergence is in how certain array subscript/expansion forms pass word counts to commands: huck collapses some `${a[@]}`-style expansions into fewer arguments than bash produces, treating them more like `${a[*]}` in specific subscript contexts. |
+| array2 | PASS | v334 (#291): 0-diff PASS. Single root — unquoted `${arr[@]}`/`${arr[*]}` under an EMPTY IFS. bash expands each element to a separate word and then word-splits each; with an empty IFS there is no splitting but the elements STAY separate, where huck joined them into one word. Fixed in the unquoted `WordList` field-split branch (`expand.rs`). |
 | assoc | FAIL | `BASH_ALIASES` and `BASH_CMDS` built-in assoc arrays are not present in huck. Also L-46 (bare attribute-only `declare -A` prints an empty-string assignment in `declare -p`) and L-44 (assoc-array iteration order). |
 | attr | PASS | v349 (#343): `readonly -a` (Root A), conditional readonly-var error prefix (Root C), quoted `name=value` arg as assignment (Root D), `-a`/`-A` `(...)`-scalar array coercion (Root B). |
 | braces | PASS | v341 (#44/#318): 0-diff PASS. Four roots fixed — negative step (sign ignored, `{10..1..-2}`→`10 8 6 4 2`); nested/unmatched outer brace still expands a balanced inner one (`a-{b{d,e}}-c`, `a-{bdef-{g,i}-c`); char range emits an empty element for `\`; and bare `$var{x,y}`→`$varx $vary` name-merge (new `braced` flag on `WordPart::Var`, since modifier-less `${var}` demotes to `Var`). #44 stays open for the broader brace-before-param ordering. |
@@ -420,7 +446,7 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | dbg-support2 | PASS | v322 (#255): DEBUG trap fires before bare assignments; the action's `$LINENO` tracks the pending command's line without leaking into a function the action calls; extdebug non-zero DEBUG-action status skips the pending command (status 2 in a function/sourced script simulates `return 2`). 0-diff PASS. |
 | dirstack | FAIL | `pushd -m` / `popd -m` / `dirs -m` argument is treated as an invalid option rather than a numeric argument (huck and bash differ on which flags these commands accept). Error-message prefix and format differences throughout. |
 | dollars | FAIL | No longer TIMEOUTs (the v220-recorded hang — a blocking read/process-wait around `${!*}`/`${!@}` indirect expansion — is resolved): the category now runs to completion with output divergences across the `$@`/`$*`/`${!*}` dollar-special tests (error-message wording and expansion-count differences). |
-| dynvar | FAIL | `BASH_ARGV0` is not updated to reflect the running script's `$0` — tests that check `BASH_ARGV0` report a mismatch. `EPOCHREALTIME` not implemented (L-41 computed-dynamics gap). |
+| dynvar | PASS | v332 (#286): 0-diff PASS. Three missing computed variables — `BASH_ARGV0` (read/write against `$0`, write via the RANDOM/SECONDS `reseed_special_on_assign` hook so nothing is stored), `EPOCHREALTIME` (exact `secs.micros` 6-digit format — the test does integer arithmetic on the micros field), and `BASH_COMMAND` (new `Shell.current_command`, stamped in `run_single` from the existing `render_job_simple` renderer). |
 | errors | FAIL | Multiple `set -o <option>: not yet supported` rejections misconfigure the test environment (posix, allexport, etc.). Also `alias -x` / `unalias -x` flags not recognized. Cascading from missing set options. |
 | execscript | FAIL | Error-message format differences — huck uses its own name as prefix rather than the script-file-and-line-number form bash uses. Executing a binary file produces a UTF-8 decoding error instead of bash's "cannot execute binary file" message. |
 | exp-tests | FAIL | Several real divergences now visible: `$'...'` strings containing control characters are displayed in `$'...'` escape notation by huck rather than as raw bytes; certain `${a[@]}` expansions collapse to fewer arguments than bash produces; `${!}` and similar empty-name parameter-expansion forms cause a huck syntax error while bash returns a value; high-byte characters in variable keys and values are formatted differently (huck uses a plain-string representation while bash uses `$'...'` notation in `declare -p` output); and word-splitting with non-standard IFS diverges for some adjacent-field cases. |
@@ -448,13 +474,13 @@ remaining TIMEOUTs; a TIMEOUT anywhere now signals a genuine hang/regression.
 | more-exp | FAIL | Several remaining divergences: `${a[@]}` in contexts where IFS-splitting interacts with leading-space preservation produces fewer fields than bash; tilde in certain variable assignment contexts is not expanded when it should be (or expands to an unrelated value); a backslash at the end of a word in `"$@"` contexts splits incorrectly; an unterminated command substitution causes an abort where bash would produce output; and word-splitting with embedded bracket characters diverges. |
 | nameref | FAIL | L-47 (nameref follow-on gaps). A `declare -p` call on a nameref variable dumps the entire variable table instead of just the named variable — new bug in the nameref plus `declare -p` interaction path. |
 | new-exp | FAIL | A parse or expansion error early in the test file (involving `}` as an unexpected token in an arith/expansion context) causes huck to abort the script, losing nearly all expected output. Error-message format also differs (huck says `unexpected character: '}'` while bash says `syntax error: operand expected (error token is "}")`). The `set: posix: not yet supported` issue is gone but the early-abort prevents the remainder from running. |
-| nquote | FAIL | Several divergences: `$'\t'` and similar `$'...'` escape sequences produce the literal escape notation rather than the actual character in some contexts; `set: history` and `set: -H` are not supported, causing format divergences; an unterminated `${...}` inside a multi-line quoted string errors in huck while bash produces output; byte-level differences in high-byte character sequences passed through quoting operations; and a helper glue-file source operation fails in huck. |
+| nquote | PASS | v333 (#289): 0-diff PASS. Two `$'…'` (ANSI-C) quoting roots — Root A a `\c\\` off-by-one (the escaped-backslash form must consume BOTH backslashes; huck left a stray `\` that corrupted the next escape), and Root B `$'…'` inside a heredoc body, which bash leaves literal in a VALUE operand (`${x-word}`) but still expands in a PATTERN operand. |
 | nquote1 | PASS | v298 re-sweep: 0-diff PASS (the v268 embedded-Ctrl-A word-count/empty-field divergence is resolved). |
 | nquote2 | PASS | v340 (#314): 0-diff PASS. Root was positional `${@/pat/rep}`/`${@//pat/rep}` applying the substitution to only the first positional param (quoted form joined into one word); fixed by mapping the transform over each param via the array per-element path (`expand_positional_transform`). The Ctrl-A bytes were incidental test data, not the cause. |
 | nquote3 | PASS | v340 (#314): 0-diff PASS. Same root as nquote2 — positional `${@%pat}`/`${@#pat}`/`${@##pat}` pattern-removal transforms now apply per-param. Flipped by the same one-branch fix (double flip). |
 | nquote4 | FAIL | The braced hex-escape form `\x{NN}` inside `$'...'` strings is not implemented in huck: the sequence is passed through literally while bash expands it to the corresponding byte. Unbraced `\xNN` and other escape forms may have separate issues. |
 | nquote5 | PASS | |
-| parser | FAIL | v314 (#211) shrank the diff to 13 lines: the `for`/`case`-in-`for` syntax-error TEXT now matches bash's near-token/unexpected-EOF shapes byte-for-byte. Remaining: an unrelated `not a valid identifier` diagnostic wrongly carries a `line N:` prefix (not a top-level parse error, outside `render_syntax_diag`'s scope), plus a line-alignment artifact downstream of it. |
+| parser | PASS | v331 (#27/#283): 0-diff PASS. Four independent divergences behind a 13-line near-miss — three cosmetic error-SHAPE mismatches (a missing `line N:` prefix on the `for <bad-name>` runtime error; a concrete wrong token where a keyword was required giving the unexpected-EOF shape instead of bash's near-token `unexpected token` form; plus a downstream alignment artifact) and one real driver-semantics root hiding behind them. |
 | posix2 | PASS | v315 (#209): the `eval:` marker + eval line base resolved the diagnostic-prefix diff v314 (#211) had narrowed this to — huck now prints `eval: line 199:` with the correct outer line number, matching bash exactly. 0-diff PASS. |
 | posixexp | FAIL | Multiple real divergences: quoting-aware pattern removal (`${var//pattern}`) strips more content than bash; an unterminated `${...}` form that bash accepts causes a syntax error in huck; `$*` with a non-whitespace IFS joins with a space instead of the IFS character (producing `1 2` where bash produces `12`); IFS-splitting at word boundaries diverges (huck splits where bash keeps tokens joined); and the test-case label printed for IFS diagnostic output shows `(null)` in huck versus the actual IFS value in bash for some edge cases. |
 | posixexp2 | PASS | v347 (#337): 0-diff PASS. Two `${...}` operand backslash rules in `scan_step_param_operand` — Root A `\}` escapes the `}` delimiter (drop backslash) in a double-quoted operand; Root B `\<newline>` line-continuation removed in the operand sub-scanners. Localized (not the deferred param-expansion-lexer refactor). |
