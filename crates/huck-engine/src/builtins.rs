@@ -7064,6 +7064,17 @@ pub fn set_o_option_by_name(shell: &mut Shell, name: &str, enable: bool) -> bool
     }
 }
 
+/// The `set -o` listing, for the CLI's argument-less `-o` / `+o` (#164).
+/// `table` picks the two forms the builtin already has: the `name<TAB>on|off`
+/// table (`-o`) or the `set -o name` reinput form (`+o`).
+pub fn print_set_o_options(out: &mut dyn Write, shell: &Shell, table: bool) {
+    let _ = if table {
+        print_options_table(out, shell)
+    } else {
+        print_options_reinput(out, shell)
+    };
+}
+
 fn print_options_table(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     for opt in SETO_TABLE {
         let val = option_get(shell, opt.name).unwrap_or(opt.default);
