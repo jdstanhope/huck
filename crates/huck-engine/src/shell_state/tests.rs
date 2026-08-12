@@ -394,9 +394,10 @@ fn shell_clone_shares_command_hash_history_completion_specs() {
     assert_eq!(Rc::strong_count(&a.history), 2);
     assert_eq!(Rc::strong_count(&a.completion_specs), 2);
 
-    // COW: a mutation on `a` must not affect `b`.
-    Rc::make_mut(&mut a.command_hash)
-        .insert("myls".to_string(), (std::path::PathBuf::from("/bin/ls"), 0));
+    // COW: a mutation on `a` must not affect `b`. Goes through `hash_insert`
+    // (which `Rc::make_mut`s the same way) so the map and the registration
+    // order it is printed from cannot drift apart — #555.
+    a.hash_insert("myls", std::path::PathBuf::from("/bin/ls"));
     assert!(a.command_hash.contains_key("myls"), "a should have myls");
     assert!(
         !b.command_hash.contains_key("myls"),
