@@ -21,4 +21,30 @@ check "register -u rc"         'complete -u cmd; echo rc=$?'
 check "register -A stopped rc" 'complete -A stopped cmd; echo rc=$?'
 check "register -ev rc"        'complete -ev cmd; echo rc=$?'
 check "register -A setopt rc"  'complete -A setopt cmd; echo rc=$?'
+
+# --- #528: compgen's exit status. bash's `build_actions` FAILS when its getopt
+#     loop consumed no option at all, and `compgen_builtin` maps that failure
+#     back to SUCCESS without generating anything — so "no options" is rc 0
+#     whatever words follow, while "options but no matches" is the ordinary
+#     rc 1. A bare `--` is not an option, and `+z` is a plain word (#515).
+check "compgen bare rc"        'compgen; echo rc=$?'
+check "compgen word only rc"   'compgen zzzzznope; echo rc=$?'
+check "compgen empty word rc"  'compgen ""; echo rc=$?'
+check "compgen plus word rc"   'compgen +z; echo rc=$?'
+check "compgen plus-o word rc" 'compgen +o zzzzznope; echo rc=$?'
+check "compgen many words rc"  'compgen a b c; echo rc=$?'
+check "compgen ddash word rc"  'compgen -- zzzzznope; echo rc=$?'
+check "compgen ddash opt rc"   'compgen -- -W abc; echo rc=$?'
+check "compgen ddash ddash rc" 'compgen -- --; echo rc=$?'
+# Options present: unchanged, and still rc 1 when nothing matches.
+check "compgen -W no match rc" 'compgen -W "a b" zzzzznope; echo rc=$?'
+check "compgen -W match rc"    'compgen -W "a b" a; echo rc=$?'
+check "compgen -o only rc"     'compgen -o nospace zzzzznope; echo rc=$?'
+check "compgen -P only rc"     'compgen -P pre; echo rc=$?'
+check "compgen -A fn none rc"  'compgen -A function zzzzznope; echo rc=$?'
+check "compgen -X filtered rc" 'compgen -X "*" -W a a; echo rc=$?'
+# `compgen -q` (invalid option, rc 2) is deliberately NOT a row here: this
+# harness does not normalize the program-name prefix, so the diagnostic line
+# would differ on the `bash:` vs `<path>/huck:` prefix alone. The status
+# itself was verified equal (2) by hand.
 harness_summary

@@ -24,6 +24,12 @@ struct ParsedFlags {
     /// Trailing positional args (command names for `complete`, optional
     /// word arg for `compgen`).
     positional: Vec<String>,
+    /// Whether the scanner consumed at least one OPTION (`-x`, `-W list`, …).
+    /// A bare `--` does not count, and neither does a `+`-prefixed word (which
+    /// is a positional here — #515). `compgen` needs this: bash's
+    /// `build_actions` fails when no option was given and `compgen_builtin`
+    /// turns that failure into success WITHOUT generating anything (#528).
+    saw_option: bool,
 }
 
 /// Parses the flags. `allow_d_e` controls whether `-D`/`-E`/`-p`/`-r`
@@ -74,64 +80,67 @@ fn parse_flags(
         crate::builtin_opts::Getopt::new(name, crate::builtin_opts::ArgView::Plain(args), spec);
     loop {
         match g.next_opt(shell, err) {
-            Ok(Some(o)) => match o.ch {
-                'F' => out.spec.function = Some(o.value.expect("F takes a value")),
-                'W' => out.spec.wordlist = Some(o.value.expect("W takes a value")),
-                'G' => out.spec.glob = Some(o.value.expect("G takes a value")),
-                'A' => {
-                    let v = o.value.expect("A takes a value");
-                    match Action::parse(&v) {
-                        Some(action) => out.spec.actions.push(action),
-                        None => {
+            Ok(Some(o)) => {
+                out.saw_option = true;
+                match o.ch {
+                    'F' => out.spec.function = Some(o.value.expect("F takes a value")),
+                    'W' => out.spec.wordlist = Some(o.value.expect("W takes a value")),
+                    'G' => out.spec.glob = Some(o.value.expect("G takes a value")),
+                    'A' => {
+                        let v = o.value.expect("A takes a value");
+                        match Action::parse(&v) {
+                            Some(action) => out.spec.actions.push(action),
+                            None => {
+                                crate::sh_error_to!(
+                                    shell,
+                                    err,
+                                    None,
+                                    "{name}: {v}: invalid action name"
+                                );
+                                return Err(2);
+                            }
+                        }
+                    }
+                    'P' => out.spec.prefix = Some(o.value.expect("P takes a value")),
+                    'S' => out.spec.suffix = Some(o.value.expect("S takes a value")),
+                    'X' => out.spec.filter = Some(o.value.expect("X takes a value")),
+                    'o' => {
+                        let v = o.value.expect("o takes a value");
+                        if apply_option(&mut out.spec.options, &v, false).is_err() {
                             crate::sh_error_to!(
                                 shell,
                                 err,
                                 None,
-                                "{name}: {v}: invalid action name"
+                                "{name}: {v}: invalid completion option"
                             );
                             return Err(2);
                         }
                     }
-                }
-                'P' => out.spec.prefix = Some(o.value.expect("P takes a value")),
-                'S' => out.spec.suffix = Some(o.value.expect("S takes a value")),
-                'X' => out.spec.filter = Some(o.value.expect("X takes a value")),
-                'o' => {
-                    let v = o.value.expect("o takes a value");
-                    if apply_option(&mut out.spec.options, &v, false).is_err() {
-                        crate::sh_error_to!(
-                            shell,
-                            err,
-                            None,
-                            "{name}: {v}: invalid completion option"
-                        );
-                        return Err(2);
+                    'D' if allow_d_e => out.is_default = true,
+                    'E' if allow_d_e => out.is_empty = true,
+                    'p' if allow_d_e => out.print = true,
+                    'r' if allow_d_e => out.remove = true,
+                    'a' | 'b' | 'c' | 'd' | 'e' | 'f' | 'g' | 'j' | 'k' | 's' | 'u' | 'v' => {
+                        let action = match o.ch {
+                            'a' => Action::Alias,
+                            'b' => Action::Builtin,
+                            'c' => Action::Command,
+                            'd' => Action::Directory,
+                            'e' => Action::Export,
+                            'f' => Action::File,
+                            'g' => Action::Group,
+                            'j' => Action::Job,
+                            'k' => Action::Keyword,
+                            's' => Action::Service,
+                            'u' => Action::User,
+                            'v' => Action::Variable,
+                            _ => unreachable!(),
+                        };
+                        out.spec.actions.push(action);
                     }
+                    _ => return Err(g.reject_unhandled(o.ch, shell, err)),
                 }
-                'D' if allow_d_e => out.is_default = true,
-                'E' if allow_d_e => out.is_empty = true,
-                'p' if allow_d_e => out.print = true,
-                'r' if allow_d_e => out.remove = true,
-                'a' | 'b' | 'c' | 'd' | 'e' | 'f' | 'g' | 'j' | 'k' | 's' | 'u' | 'v' => {
-                    let action = match o.ch {
-                        'a' => Action::Alias,
-                        'b' => Action::Builtin,
-                        'c' => Action::Command,
-                        'd' => Action::Directory,
-                        'e' => Action::Export,
-                        'f' => Action::File,
-                        'g' => Action::Group,
-                        'j' => Action::Job,
-                        'k' => Action::Keyword,
-                        's' => Action::Service,
-                        'u' => Action::User,
-                        'v' => Action::Variable,
-                        _ => unreachable!(),
-                    };
-                    out.spec.actions.push(action);
-                }
-                _ => return Err(g.reject_unhandled(o.ch, shell, err)),
-            },
+            }
             Ok(None) => break,
             Err(code) => return Err(code),
         }
@@ -429,6 +438,17 @@ pub fn builtin_compgen(
         Ok(p) => p,
         Err(code) => return ExecOutcome::Continue(code),
     };
+
+    // #528: `compgen` with NO options generates nothing and exits 0, whatever
+    // words follow. bash's `build_actions` returns EXECUTION_FAILURE when its
+    // getopt loop consumed no option, and `compgen_builtin` maps exactly that
+    // failure back to EXECUTION_SUCCESS — so `compgen zzz`, `compgen +z` (`+z`
+    // is a plain word, #515), `compgen -- -W abc` and bare `compgen` are all
+    // silent successes, while `compgen -o nospace zzz` (an option, no matches)
+    // is the ordinary status 1. A `--` alone is not an option.
+    if !parsed.saw_option {
+        return ExecOutcome::Continue(0);
+    }
 
     let word = parsed.positional.first().cloned().unwrap_or_default();
     let ctx = CompletionCtx {
