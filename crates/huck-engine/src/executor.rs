@@ -5562,6 +5562,26 @@ fn lower_one_redirect(
         };
         // Close the owned source now that it's been duped to `high`.
         drop(owned_src);
+        // #224: a READONLY `{var}` is bash's two-line refusal, and the redirect
+        // FAILS — the command does not run. Checked after the source is in
+        // hand so the diagnostics come in bash's order, and before `$name` is
+        // written by either path.
+        if shell.is_readonly(name) {
+            {
+                let mut err = err_writer();
+                crate::sh_error_to!(shell, &mut *err, None, "{name}: readonly variable");
+                crate::sh_error_to!(
+                    shell,
+                    &mut *err,
+                    None,
+                    "{name}: cannot assign fd to variable"
+                );
+            }
+            unsafe {
+                libc::close(high);
+            }
+            return Err(1);
+        }
         // Child (batch, `fd_state = Some`) path: allocate a VIRTUAL destination fd
         // — the lowest number >= 10 that is not already used as a target by an
         // earlier plan op and not an earlier `{var}`'s virtual number (both are
@@ -6424,7 +6444,14 @@ fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
     elems.insert(0, read_fd.to_string());
     elems.insert(1, write_fd.to_string());
     let _ = shell.replace_indexed(name, elems);
-    shell.set(format!("{name}_PID").as_str(), pid.to_string());
+    // #224: a readonly `NAME_PID` is reported and left alone — the coprocess
+    // still starts and the status stays 0 (measured against bash).
+    let pid_var = format!("{name}_PID");
+    if shell.is_readonly(&pid_var) {
+        crate::sh_error!(shell, None, "{pid_var}: readonly variable");
+    } else {
+        shell.set(pid_var.as_str(), pid.to_string());
+    }
     shell.last_bg_pid = Some(pid);
     shell.jobs.add(pid, vec![pid], format!("coproc {name}"));
     shell.coprocs.push(crate::shell_state::Coproc {
