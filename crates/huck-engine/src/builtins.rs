@@ -9084,15 +9084,23 @@ fn builtin_hash(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    // Mode-selector flags. Priority when multiple set:
-    // reset > delete > set_path > type-with-names > list-bare > type-bare >
-    // default. `-l` has NO effect of its own when operand names are
-    // present UNLESS `-t` is also set (see the per-name block below) — a
-    // bare `-l NAME` falls through to the same default resolve+add path as
-    // no flags at all.
+    // bash's `hash_builtin` (builtins/hash.def), whose shape this follows
+    // exactly (#509). The flags are NOT a priority ladder over the whole
+    // command — they are read in a fixed ORDER at three different places:
+    //
+    //   1. `-d`/`-t` with no NAMEs is a usage error, checked FIRST — so
+    //      `hash -rt` errors and the `-r` flush does NOT happen;
+    //   2. `-r` flushes the table, before anything is listed or added;
+    //   3. with no NAMEs left, the whole table is listed (`-l` picks the
+    //      re-input form) — `-p` and `-l` do not suppress that;
+    //   4. per NAME: `-t` (report) wins over `-p` (set) wins over `-d`
+    //      (delete) wins over the default PATH search.
+    //
+    // huck used to run reset > delete > set_path > list, so `hash -dt ls`
+    // deleted where bash reports, and `hash -p X -t ls` set where bash
+    // reports the OLD entry.
     let mut reset = false;
     let mut delete = false;
-    let mut set_path = false;
     let mut list = false;
     let mut type_only = false;
     let mut explicit_path: Option<String> = None;
@@ -9109,10 +9117,7 @@ fn builtin_hash(
                 'd' => delete = true,
                 'l' => list = true,
                 't' => type_only = true,
-                'p' => {
-                    set_path = true;
-                    explicit_path = o.value;
-                }
+                'p' => explicit_path = o.value,
                 _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
             },
             Ok(None) => break,
@@ -9121,77 +9126,69 @@ fn builtin_hash(
     }
     let names = &args[g.rest_index()..];
 
+    // (1) bash's `sh_needarg`, status 1 — not huck's invented "at least one
+    // name required" at status 2. `-d` names itself when both are set.
+    if names.is_empty() && (delete || type_only) {
+        let which = if delete { "-d" } else { "-t" };
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "hash: {which}: option requires an argument"
+        );
+        return ExecOutcome::Continue(1);
+    }
+
+    // (2) The flush. It empties the table but does NOT un-create it, so a
+    // later `hash -d nosuch` still reports `not found`.
     if reset {
         Rc::make_mut(&mut shell.command_hash).clear();
-        return ExecOutcome::Continue(0);
+        // bash keeps `hash -r` SILENT: with no NAMEs left it returns here
+        // rather than falling into the listing below, so it does not print
+        // `hash: hash table empty` at the table it just emptied.
+        if names.is_empty() {
+            return ExecOutcome::Continue(0);
+        }
     }
 
-    if delete {
-        if names.is_empty() {
-            crate::sh_error_to!(shell, err, None, "hash: -d: at least one name required");
-            return ExecOutcome::Continue(2);
-        }
-        let mut exit: i32 = 0;
-        let mut not_found: Vec<&String> = Vec::new();
-        {
-            let h = Rc::make_mut(&mut shell.command_hash);
-            for name in names {
-                if h.remove(name).is_none() {
-                    not_found.push(name);
-                    exit = 1;
-                }
+    // (3) No NAMEs: list the table. Reached with `-p` and `-l` too — bash's
+    // `hash -p /bin/ls` (no name) prints the table rather than erroring.
+    if names.is_empty() {
+        let mut entries: Vec<(&String, &(std::path::PathBuf, u32))> =
+            shell.command_hash.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        if list {
+            // Re-input form. An empty table prints NOTHING under `-l`.
+            for (name, (path, _)) in entries {
+                let _ = writeln!(out, "builtin hash -p {} {}", path.display(), name);
+            }
+        } else if entries.is_empty() {
+            let _ = writeln!(out, "hash: hash table empty");
+        } else {
+            let _ = writeln!(out, "hits\tcommand");
+            for (_name, (path, hits)) in entries {
+                let _ = writeln!(out, "{hits:>4}\t{}", path.display());
             }
         }
-        for name in not_found {
-            crate::sh_error_to!(shell, err, None, "hash: {name}: not found");
-        }
-        return ExecOutcome::Continue(exit);
-    }
-
-    if set_path {
-        // Exactly one name required.
-        if names.len() != 1 {
-            crate::sh_error_to!(shell, err, None, "hash: -p: exactly one name required");
-            return ExecOutcome::Continue(2);
-        }
-        let name = &names[0];
-        if name.contains('/') {
-            crate::sh_error_to!(shell, err, None, "hash: {name}: must not contain `/'");
-            return ExecOutcome::Continue(1);
-        }
-        let path = explicit_path.unwrap(); // safe: set_path implies Some
-        Rc::make_mut(&mut shell.command_hash)
-            .insert(name.clone(), (std::path::PathBuf::from(path), 0u32));
         return ExecOutcome::Continue(0);
     }
 
-    // `-t` (with or without `-l`) and operand NAMEs present: report from
-    // the hash TABLE (not a fresh $PATH search). A name ABSENT from the
-    // table is `not found`. `-l`, if also set, wins the PRINT FORMAT for a
-    // name that IS hashed (the reusable `-p` form); `-t` alone uses its
-    // own bare-path / tab form. Verified against bash 5.2.21:
-    //   hash -p /bin/ls ls; hash -lt ls   -> `builtin hash -p /bin/ls ls`
-    //   hash -lt ls        (unhashed)     -> `hash: ls: not found`
-    //
-    // `-l` ALONE (no `-t`) with names is NOT a table lookup at all — bash
-    // treats it exactly like the DEFAULT (no-flag) path below: a fresh
-    // `$PATH` search that (re)hashes the name, silent on success, `not
-    // found` on failure — even if the name is ALREADY hashed to something
-    // else (a stale `-p`-set entry gets overwritten, not just confirmed).
-    // Verified: `hash -p /bin/ls ls; hash -l ls` -> silent, rc=0; `hash -l
-    // ls` (never hashed) -> also silent, rc=0 (real $PATH resolves it).
-    // So `-l` alone falls straight through this block and the next.
-    if type_only && !names.is_empty() {
-        let mut exit: i32 = 0;
-        for name in names {
+    // (4) The per-name loop, in bash's branch order.
+    let mut exit: i32 = 0;
+    let multi = names.len() > 1;
+    for name in names {
+        // `-t` reports from the TABLE, and is the one branch bash runs
+        // BEFORE its absolute-program skip: `hash -t /bin/ls` really does
+        // report `/bin/ls: not found`.
+        if type_only {
             match shell.command_hash.get(name) {
                 Some((path, _)) => {
                     if list {
                         let _ = writeln!(out, "builtin hash -p {} {}", path.display(), name);
-                    } else if names.len() == 1 {
-                        let _ = writeln!(out, "{}", path.display());
+                    } else if multi {
+                        let _ = writeln!(out, "{name}\t{}", path.display());
                     } else {
-                        let _ = writeln!(out, "{}\t{}", name, path.display());
+                        let _ = writeln!(out, "{}", path.display());
                     }
                 }
                 None => {
@@ -9199,57 +9196,37 @@ fn builtin_hash(
                     exit = 1;
                 }
             }
-        }
-        return ExecOutcome::Continue(exit);
-    }
-
-    if list && names.is_empty() {
-        // re-input form: `builtin hash -p PATH NAME`
-        let mut entries: Vec<(&String, &(std::path::PathBuf, u32))> =
-            shell.command_hash.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-        for (name, (path, _)) in entries {
-            let _ = writeln!(out, "builtin hash -p {} {}", path.display(), name);
-        }
-        return ExecOutcome::Continue(0);
-    }
-
-    if type_only {
-        // Reached only with no names (the `!names.is_empty()` case returned above).
-        crate::sh_error_to!(shell, err, None, "hash: -t: at least one name required");
-        return ExecOutcome::Continue(2);
-    }
-
-    // Default: with names → resolve+add; without → list.
-    if names.is_empty() {
-        if shell.command_hash.is_empty() {
-            let _ = writeln!(out, "hash: hash table empty");
-            return ExecOutcome::Continue(0);
-        }
-        let mut entries: Vec<(&String, &(std::path::PathBuf, u32))> =
-            shell.command_hash.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-        let _ = writeln!(out, "hits\tcommand");
-        for (_name, (path, hits)) in entries {
-            let _ = writeln!(out, "{:>4}\t{}", hits, path.display());
-        }
-        return ExecOutcome::Continue(0);
-    }
-
-    let mut exit: i32 = 0;
-    for name in names {
-        if name.contains('/') {
-            crate::sh_error_to!(shell, err, None, "hash: {name}: must not contain `/'");
-            exit = 1;
             continue;
         }
-        match search_path_for(name, shell) {
-            Some(path) => {
-                Rc::make_mut(&mut shell.command_hash).insert(name.clone(), (path, 0u32));
-            }
-            None => {
+        // bash's `absolute_program()` is "contains a slash", and such a name
+        // is SILENTLY skipped — there is nothing to hash. huck used to reject
+        // it with an invented `must not contain \`/'` diagnostic.
+        if name.contains('/') {
+            continue;
+        }
+        if let Some(path) = &explicit_path {
+            Rc::make_mut(&mut shell.command_hash)
+                .insert(name.clone(), (std::path::PathBuf::from(path), 0u32));
+            shell.command_hash_created = true;
+        } else if delete {
+            // A table that has never held anything reports nothing: bash's
+            // `phash_remove` returns success when `hashed_filenames` is null.
+            if shell.command_hash_created
+                && Rc::make_mut(&mut shell.command_hash).remove(name).is_none()
+            {
                 crate::sh_error_to!(shell, err, None, "hash: {name}: not found");
                 exit = 1;
+            }
+        } else {
+            match search_path_for(name, shell) {
+                Some(path) => {
+                    Rc::make_mut(&mut shell.command_hash).insert(name.clone(), (path, 0u32));
+                    shell.command_hash_created = true;
+                }
+                None => {
+                    crate::sh_error_to!(shell, err, None, "hash: {name}: not found");
+                    exit = 1;
+                }
             }
         }
     }

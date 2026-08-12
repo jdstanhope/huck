@@ -47,8 +47,20 @@ fn hash_d_removes() {
 }
 
 #[test]
-fn hash_d_missing_errors() {
+fn hash_d_missing_on_fresh_shell_is_silent_success() {
+    // #509: bash's `phash_remove` returns success when the hash table has
+    // never been created, so deleting an unhashed name in a fresh shell is
+    // rc 0 with no diagnostic. This test asserted rc 1 — it pinned the
+    // divergence the issue was opened for.
     let mut shell = Shell::new();
+    let (oc, _) = run(&["-d", "mycmd"], &mut shell);
+    assert!(matches!(oc, ExecOutcome::Continue(0)));
+}
+
+#[test]
+fn hash_d_missing_errors_once_table_exists() {
+    let mut shell = Shell::new();
+    run(&["-p", "/custom", "other"], &mut shell);
     let (oc, _) = run(&["-d", "mycmd"], &mut shell);
     assert!(matches!(oc, ExecOutcome::Continue(1)));
 }
@@ -90,10 +102,13 @@ fn hash_t_missing_errors_status_1() {
 }
 
 #[test]
-fn hash_path_like_name_rejected() {
+fn hash_path_like_name_skipped_silently() {
+    // #509: bash's `absolute_program()` (a name CONTAINING a slash) is
+    // skipped without a word — there is nothing to hash. This asserted the
+    // rc 1 of huck's invented "must not contain `/'" diagnostic.
     let mut shell = Shell::new();
     let (oc, _) = run(&["a/b"], &mut shell);
-    assert!(matches!(oc, ExecOutcome::Continue(1)));
+    assert!(matches!(oc, ExecOutcome::Continue(0)));
     assert!(shell.command_hash.is_empty());
 }
 
