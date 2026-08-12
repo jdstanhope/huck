@@ -872,12 +872,18 @@ fn run_command(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
 /// `RedirectScope`'s save/restore (#197 Class-A).
 fn own_dup(fd: RawFd) -> Option<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
-    let d = unsafe { libc::dup(fd) };
-    if d < 0 {
-        None
-    } else {
-        Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(d) })
-    }
+    // #398: park the saved copy at a HIGH fd. A plain `dup(2)` takes the LOWEST
+    // free descriptor, so once a redirect list has CLOSED one — `echo hi >&-
+    // 2>/dev/null` frees fd 1 — the very next redirect's save-dup lands ON the
+    // fd that was just closed. fd 1 came back open (pointing at fd 2's original
+    // target), the builtin's write succeeded, and the close the user asked for
+    // had silently evaporated. bash keeps its saved fds out of the user-visible
+    // range for exactly this reason.
+    //
+    // CLOEXEC too: the saved copy is the shell's own bookkeeping and has no
+    // business surviving into an exec'd program.
+    let d = crate::child_fd::dup_to_high_fd(fd, 10, true).ok()?;
+    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(d) })
 }
 
 struct RedirectScope {
