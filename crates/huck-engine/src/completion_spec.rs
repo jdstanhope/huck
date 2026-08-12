@@ -16,6 +16,15 @@ pub struct CompletionSpecs {
     pub by_command: HashMap<String, CompletionSpec>,
     pub default_spec: Option<CompletionSpec>,
     pub empty_spec: Option<CompletionSpec>,
+    /// Whether this table has ever held a compspec. bash creates its
+    /// prog-completion hash lazily and `progcomp_remove` reports success for a
+    /// table that does not exist yet, so `complete -r nosuch` is SILENT in a
+    /// fresh shell and reports `no completion specification` once anything has
+    /// been registered — even after everything was removed again (#568). The
+    /// same rule as `Shell::command_hash_created` (#509); an empty map cannot
+    /// tell the two apart.
+    pub created: bool,
+
     /// Registration order of every live entry, oldest first — the key to
     /// `complete -p`'s output order (#527). See [`CompletionSpecs::register`].
     /// Holds the `-D`/`-E` slots alongside command names, because bash keeps
@@ -99,6 +108,7 @@ impl CompletionSpecs {
         if self.by_command.insert(name.to_string(), spec).is_none() {
             self.reg_order.push(CompKey::Command(name.to_string()));
         }
+        self.created = true;
     }
 
     /// Install the `-D` (default) or `-E` (empty-line) spec, tracking its
@@ -113,6 +123,7 @@ impl CompletionSpecs {
         if !was_set {
             self.reg_order.push(key);
         }
+        self.created = true;
     }
 
     /// Remove `name`'s spec. Returns whether it was registered.

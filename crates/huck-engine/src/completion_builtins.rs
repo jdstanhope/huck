@@ -143,7 +143,7 @@ fn parse_flags(
                                 shell,
                                 err,
                                 None,
-                                "{name}: {v}: invalid completion option"
+                                "{name}: {v}: invalid option name"
                             );
                             return Err(2);
                         }
@@ -367,6 +367,7 @@ fn remove_complete(
     shell: &mut Shell,
 ) -> ExecOutcome {
     let mut status = 0;
+    let created = shell.completion_specs.created;
     let specs = Rc::make_mut(&mut shell.completion_specs);
     if parsed.is_default {
         specs.unregister_slot(CompKey::Default);
@@ -403,7 +404,10 @@ fn remove_complete(
                     had
                 }
             };
-            if !removed && !parsed.is_default && !parsed.is_empty {
+            // #568: nothing can be missing from a table that was never
+            // created — bash's `progcomp_remove` reports success there, so the
+            // FIRST `complete -r` in a fresh shell cannot fail.
+            if !removed && created && !parsed.is_default && !parsed.is_empty {
                 missing.push(n);
                 status = 1;
             }
@@ -718,7 +722,7 @@ pub fn builtin_compopt(
                                 shell,
                                 err,
                                 None,
-                                "compopt: {v}: invalid completion option"
+                                "compopt: {v}: invalid option name"
                             );
                             return ExecOutcome::Continue(2);
                         }
@@ -773,7 +777,7 @@ pub fn builtin_compopt(
                             shell,
                             err,
                             None,
-                            "compopt: {arg_value}: invalid completion option"
+                            "compopt: {arg_value}: invalid option name"
                         );
                         return ExecOutcome::Continue(2);
                     }
@@ -942,8 +946,19 @@ mod tests {
     }
 
     #[test]
-    fn complete_r_missing_name_returns_1() {
+    fn complete_r_missing_name_on_fresh_shell_is_silent_success() {
+        // #568: bash's `progcomp_remove` reports success while the table has
+        // never been created, so the FIRST `complete -r` in a fresh shell
+        // cannot fail. This asserted rc 1 — it pinned the divergence.
         let mut sh = Shell::new();
+        let (_, code) = run_complete(&["-r", "ghost"], &mut sh);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn complete_r_missing_name_returns_1_once_created() {
+        let mut sh = Shell::new();
+        let _ = run_complete(&["-W", "x", "--", "other"], &mut sh);
         let (_, code) = run_complete(&["-r", "ghost"], &mut sh);
         assert_eq!(code, 1);
     }
