@@ -2681,6 +2681,18 @@ fn is_negated_pipeline(cmd: &Command) -> bool {
 /// errexit is deliberately NOT gated on this: `set -e; { false; }` must still
 /// exit, exactly as it does today.
 fn body_already_fired_err(cmd: &Command) -> bool {
+    // #481: look THROUGH a single-stage pipeline wrapper. An EVEN number of
+    // `!` in front of a compound cancels to `negate: false`, which leaves the
+    // compound wrapped in a `Pipeline` that `is_negated_pipeline` no longer
+    // exempts — so `! ! { false; }` fired twice where `{ false; }` and
+    // `! ! ! { false; }` each fire once. The wrapper does not change WHO the
+    // innermost failing command is, so unwrap it before deciding. Only a
+    // single-command pipeline: a real `{ false; } | cat` is a different shape
+    // whose stages run in forked children.
+    let cmd = match cmd {
+        Command::Pipeline(p) if p.commands.len() == 1 => &p.commands[0],
+        other => other,
+    };
     matches!(
         cmd,
         Command::BraceGroup(_)
