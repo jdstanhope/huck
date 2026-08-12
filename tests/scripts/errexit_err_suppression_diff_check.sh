@@ -44,13 +44,32 @@ check "! silent with -e"       'set -e; trap "echo E" ERR; ! { false; }; echo af
 check "! carries the status"   'trap "echo E:\$?" ERR; ! { (exit 5); }'
 check "! group succeeds"       'trap "echo E" ERR; ! { false; true; }'
 check "! nested"               'trap "echo E" ERR; ! { { false; }; }'
-# NOT covered: `! ! { false; }` fires ERR twice in huck, once in bash — an EVEN
-# number of `!` directly before a compound. Pre-existing (reproduces on main),
-# parity-dependent, and about the parse shape rather than the suppression
-# rules: `! ! ! { false; }` and `! { ! { false; }; }` are both correct. See the
-# issue filed alongside this harness.
 check "! simple command"       'trap "echo E" ERR; ! false'
 check "! subshell"             'trap "echo E" ERR; ! ( false )'
+
+# --- #481: the count must not depend on the PARITY of the negations. An EVEN
+#     number of `!` cancels to a non-negated pipeline, which used to leave the
+#     compound wrapped in a `Pipeline` that no longer looked like a body — so
+#     the aggregate status fired a SECOND time on top of the inner command's.
+check "!! brace group"         'trap "echo E:\$?" ERR; ! ! { false; }'
+check "!!! brace group"        'trap "echo E:\$?" ERR; ! ! ! { false; }'
+check "!!!! brace group"       'trap "echo E:\$?" ERR; ! ! ! ! { false; }'
+check "!! nested in braces"    'trap "echo E:\$?" ERR; ! { ! { false; }; }'
+check "!! if"                  'trap "echo E:\$?" ERR; ! ! if true; then false; fi'
+check "!! for"                 'trap "echo E:\$?" ERR; ! ! for i in 1; do false; done'
+check "!! case"                'trap "echo E:\$?" ERR; ! ! case x in x) false;; esac'
+check "!! while"               'trap "echo E:\$?" ERR; ! ! while true; do false; break; done'
+check "!! simple"              'trap "echo E:\$?" ERR; ! ! false'
+check "!! subshell"            'trap "echo E:\$?" ERR; ! ! ( false )'
+check "!! function"            'trap "echo E:\$?" ERR; f(){ false; }; ! ! f; echo "rc=$?"'
+check "!! carries the status"  'trap "echo E:\$?" ERR; ! ! { (exit 5); }; echo "rc=$?"'
+check "!! group succeeds"      'trap "echo E:\$?" ERR; ! ! { false; true; }; echo "rc=$?"'
+check "!! pipeline stage"      'trap "echo E:\$?" ERR; ! ! { false; } | cat'
+check "!! then status"         'trap "echo E:\$?" ERR; ! ! { false; }; echo "rc=$?"'
+# errexit's side of the same shapes must not move.
+check "!! with -e"             'set -e; trap "echo E" ERR; ! ! { false; }; echo after'
+check "!! with -e simple"      'set -e; ! ! false; echo after'
+check "! with -e still runs on" 'set -e; ! { false; }; echo after'
 
 # --- the inherited path under set -E (#470) --------------------------------
 check "-E func via ||"         'set -E; trap "echo E" ERR; f() { false; }; f || echo or'
