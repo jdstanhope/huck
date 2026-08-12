@@ -132,33 +132,101 @@ pub(crate) fn eval_arith_word(
     eval_arith_word_src(body, shell).1
 }
 
+/// Why an array subscript could not be turned into an index (#572).
+///
+/// The two are reported differently by bash, so they cannot share a message:
+/// an ARITHMETIC failure gets the ordinary arith diagnostic and is fatal in
+/// every form, while a negative subscript that cannot WRAP is
+/// `bad array subscript` — named after the variable in the value form, after
+/// the raw subscript text in the length form, and fatal only in the latter.
+pub(crate) enum SubscriptErr {
+    /// The subscript's arithmetic failed to parse or evaluate. Carries bash's
+    /// rendered body (`1+: syntax error: operand expected …`), or `None` when
+    /// the arith layer already reported it (a nested `$(( ))` failure).
+    Arith(Option<String>),
+    /// It evaluated to a negative index with no maximum to count back from.
+    OutOfRange,
+}
+
 /// Arith-evaluates an array subscript `Word` to a `usize`, honouring
 /// bash's bash-4.3+ rule that a negative result counts from the end:
-/// `${a[-1]}` is the highest-subscript element. Returns `Err(msg)` if
-/// the subscript fails to parse/eval, or if the wrap-around still
-/// yields a negative index. The caller decides whether to print the
-/// diagnostic and set `pending_fatal_status`.
+/// `${a[-1]}` is the highest-subscript element. The caller decides what to
+/// print and whether it is fatal — the two `Err` kinds differ in both.
 pub(crate) fn eval_subscript(
     subscript: &Word,
     shell: &mut Shell,
     name: &str,
-) -> Result<usize, String> {
+) -> Result<usize, SubscriptErr> {
     let s = crate::param_expansion::expand_word_to_string(subscript, shell);
-    let expr = crate::arith::parse(&s).map_err(|_| format!("{name}: bad array subscript"))?;
-    let n = crate::arith::eval(&expr, shell).map_err(|_| format!("{name}: bad array subscript"))?;
+    let arith_err = |e: &crate::arith::ArithError| {
+        // A nested `$(( ))` inside the subscript reports its own failure and
+        // raises the discard; saying anything more would double-report (#201).
+        if crate::arith::should_wrap_expansion_error(e) {
+            SubscriptErr::Arith(Some(crate::arith::render_error_body(&s, e)))
+        } else {
+            SubscriptErr::Arith(None)
+        }
+    };
+    let expr = crate::arith::parse(&s).map_err(|e| arith_err(&e))?;
+    let n = crate::arith::eval(&expr, shell).map_err(|e| arith_err(&e))?;
     if n >= 0 {
         Ok(n as usize)
     } else {
         let max = shell
             .array_max_index(name)
-            .ok_or_else(|| format!("{name}: bad array subscript"))?;
+            .ok_or(SubscriptErr::OutOfRange)?;
         let wrapped = max as i64 + 1 + n;
         if wrapped < 0 {
-            Err(format!("{name}: bad array subscript"))
+            Err(SubscriptErr::OutOfRange)
         } else {
             Ok(wrapped as usize)
         }
     }
+}
+
+impl SubscriptErr {
+    /// The diagnostic body for this failure, given the label THIS caller's
+    /// form uses for an out-of-range subscript — bash uses four different ones
+    /// for the same underlying mistake (#572):
+    ///
+    /// | form | label |
+    /// | --- | --- |
+    /// | `${a[-3]}` (value) | `a` |
+    /// | `${#a[-3]}` (length) | `-3]` |
+    /// | `a[-3]=z` (assignment) | `a[-3]` |
+    /// | `unset 'a[-3]'` | `[-3]` |
+    ///
+    /// An ARITHMETIC failure ignores the label entirely: every form reports
+    /// the arith diagnostic. `None` means it was already reported.
+    pub(crate) fn message(&self, out_of_range_label: &str) -> Option<String> {
+        match self {
+            SubscriptErr::Arith(msg) => msg.clone(),
+            SubscriptErr::OutOfRange => Some(format!("{out_of_range_label}: bad array subscript")),
+        }
+    }
+
+    /// True when this failure is fatal in the VALUE form. An out-of-range
+    /// subscript is not — bash reports it and treats the element as unset.
+    pub(crate) fn is_arith(&self) -> bool {
+        matches!(self, SubscriptErr::Arith(_))
+    }
+}
+
+/// Report a subscript failure in the VALUE form (`${a[i]}`, with or without a
+/// modifier). bash names the VARIABLE and, for an out-of-range wrap, CARRIES
+/// ON with the element treated as unset — only an arithmetic failure is fatal
+/// (#572). Returns whether the caller should stop.
+fn report_value_subscript_err(e: &SubscriptErr, name: &str, shell: &mut Shell) -> bool {
+    if !shell.discard_pending()
+        && let Some(m) = e.message(name)
+    {
+        crate::sh_error!(shell, None, "{m}");
+    }
+    if e.is_arith() {
+        shell.report_error(crate::error_fatality::ErrorKind::Expansion);
+        return true;
+    }
+    false
 }
 
 /// Slices a word list per `${a[@]:off:len}` semantics. Negative offset
@@ -921,22 +989,27 @@ fn expand_array_param(
         }
         // ${a[i]} — read a specific element.
         (PM::None, SK::Index(w)) => {
-            let idx = match eval_subscript(w, shell, name) {
-                Ok(i) => i,
+            // #572: an out-of-range subscript is reported and the element is
+            // then treated as UNSET — bash carries on. Only an arithmetic
+            // failure in the subscript is fatal.
+            let (idx, bad) = match eval_subscript(w, shell, name) {
+                Ok(i) => (Some(i), false),
                 Err(e) => {
-                    // #201: if the subscript's own `$(( ))` expansion already
-                    // failed (arith error, `pending_discard` set + reported),
-                    // suppress the redundant secondary "bad array subscript".
-                    if !shell.discard_pending() {
-                        crate::sh_error!(shell, None, "{e}");
+                    if report_value_subscript_err(&e, name, shell) {
+                        return ExpansionResult::Fatal { status: 1 };
                     }
-                    shell.report_error(crate::error_fatality::ErrorKind::Expansion);
-                    return ExpansionResult::Fatal { status: 1 };
+                    (None, true)
                 }
             };
-            let val = shell.lookup_indexed_element(name, idx);
+            let val = idx.and_then(|i| shell.lookup_indexed_element(name, i));
             if val.is_none() && shell.shell_options.nounset {
-                crate::sh_error!(shell, None, "{name}[{idx}]: unbound variable");
+                // bash names the SUBSCRIPT AS WRITTEN when there is no index to
+                // name (`nonexistent[-1]: unbound variable`).
+                let label = match idx {
+                    Some(i) if !bad => format!("{name}[{i}]"),
+                    _ => format!("{name}[{}]", reconstruct_word_source(w)),
+                };
+                crate::sh_error!(shell, None, "{label}: unbound variable");
                 shell.report_error(crate::error_fatality::ErrorKind::UnsetUnderNounset);
                 return ExpansionResult::Fatal { status: 1 };
             }
@@ -955,16 +1028,34 @@ fn expand_array_param(
             // `a=(x y); echo ${#a[-3]}` really is a bad subscript in bash too,
             // and aborts the list on both sides.
             if shell.get_indexed(name).is_none() && shell.get(name).is_none() {
+                // #572: `set -u` beats the length-of-a-missing-element rule —
+                // an unset VARIABLE is unbound before its subscript is even
+                // considered, and bash names the variable alone (no `[0]`).
+                if shell.shell_options.nounset {
+                    crate::sh_error!(shell, None, "{name}: unbound variable");
+                    shell.report_error(crate::error_fatality::ErrorKind::UnsetUnderNounsetLength);
+                    return ExpansionResult::Fatal { status: 1 };
+                }
                 return ExpansionResult::Value("0".to_string());
             }
             let idx = match eval_subscript(w, shell, name) {
                 Ok(i) => i,
                 Err(e) => {
-                    // #201: if the subscript's own `$(( ))` expansion already
-                    // failed (arith error, `pending_discard` set + reported),
-                    // suppress the redundant secondary "bad array subscript".
+                    // #572: the LENGTH form names the raw subscript text with
+                    // its closing bracket — `${#a[-3]}` is `-3]: bad array
+                    // subscript`, not `a: …` — and is fatal either way.
+                    // (#201: a nested `$(( ))` reported its own failure.)
                     if !shell.discard_pending() {
-                        crate::sh_error!(shell, None, "{e}");
+                        match &e {
+                            SubscriptErr::Arith(Some(m)) => crate::sh_error!(shell, None, "{m}"),
+                            SubscriptErr::Arith(None) => {}
+                            SubscriptErr::OutOfRange => crate::sh_error!(
+                                shell,
+                                None,
+                                "{}]: bad array subscript",
+                                reconstruct_word_source(w)
+                            ),
+                        }
                     }
                     shell.report_error(crate::error_fatality::ErrorKind::Expansion);
                     return ExpansionResult::Fatal { status: 1 };
@@ -1012,11 +1103,20 @@ fn expand_array_param(
         // correctly trigger default/error modifiers instead of falling
         // through to the array's scalar view.
         (modif, SK::Index(w)) => {
+            // #572: same rule as the plain value form — report, then let the
+            // modifier see an UNSET element, so `${a[-3]:-D}` reports and
+            // still substitutes `D`. huck used to swallow the error and skip
+            // the modifier entirely.
             let idx = match eval_subscript(w, shell, name) {
-                Ok(i) => i,
-                Err(_) => return ExpansionResult::Value(String::new()),
+                Ok(i) => Some(i),
+                Err(e) => {
+                    if report_value_subscript_err(&e, name, shell) {
+                        return ExpansionResult::Fatal { status: 1 };
+                    }
+                    None
+                }
             };
-            let val = shell.lookup_indexed_element(name, idx);
+            let val = idx.and_then(|i| shell.lookup_indexed_element(name, i));
             crate::param_expansion::expand_modifier_with_value(
                 name,
                 modif,

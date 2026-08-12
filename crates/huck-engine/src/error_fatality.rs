@@ -77,6 +77,18 @@ pub(crate) enum ErrorKind {
     ComsubSyntax { backtick: bool },
     /// A syntax error in the script itself.
     Syntax,
+    /// `set -u` on an unset variable, reported from the LENGTH form with a
+    /// SUBSCRIPT — `${#nope[0]}`. The same error as `UnsetUnderNounset`
+    /// except that bash's `-c` 127 substitution does NOT reach it. Measured:
+    ///
+    /// ```text
+    /// bash -c 'set -u; echo $nope'          -> 127
+    /// bash -c 'set -u; echo ${nope[0]}'     -> 127
+    /// bash -c 'set -u; echo ${#nope[0]}'    ->   1   <- this one
+    /// ```
+    ///
+    /// A script file gives 1 for all three, so the split is `-c`-only (#572).
+    UnsetUnderNounsetLength,
     /// The here-document limit (bash's `HEREDOC_MAX`) exceeded in a NESTED
     /// parse — a sourced file, an `eval`, or a function calling either.
     ///
@@ -212,6 +224,13 @@ pub(crate) fn fatality(kind: ErrorKind, shell: &Shell) -> Fatality {
                 Fatality::ExitShell(2)
             } else {
                 Fatality::Continue
+            }
+        }
+        ErrorKind::UnsetUnderNounsetLength => {
+            if can_exit {
+                Fatality::ExitShell(1)
+            } else {
+                Fatality::AbortList
             }
         }
         ErrorKind::HeredocLimit => {
