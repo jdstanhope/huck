@@ -10744,9 +10744,19 @@ fn builtin_caller(
     let n = shell.call_stack.len();
     match args.first() {
         None => {
-            if n >= 2 {
+            // The no-expr form reports the line the CURRENT frame was called
+            // from plus the caller's source file. bash prints the literal
+            // `NULL` when that source does not exist — a function called from
+            // a `-c` string, or the top level of a sourced file — rather than
+            // failing, which is what huck did by demanding two frames (#559).
+            if n >= 1 {
                 let line = shell.call_stack[n - 1].call_line;
-                let file = shell.call_stack[n - 2].source.clone();
+                let file = if n >= 2 {
+                    shell.call_stack[n - 2].source.clone()
+                } else {
+                    String::new()
+                };
+                let file = if file.is_empty() { "NULL" } else { &file };
                 let _ = writeln!(out, "{line} {file}");
                 ExecOutcome::Continue(0)
             } else {

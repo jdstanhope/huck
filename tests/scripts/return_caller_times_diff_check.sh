@@ -26,8 +26,7 @@
 #
 # Both shells run with an EXPLICIT $0 ("huck5") so the error prologue matches.
 #
-# NOT covered: a bare `caller` inside a function (bash prints `1 NULL`, huck
-# prints nothing and returns 1 — #559), and a top-level `return` (bash reports
+# NOT covered: a top-level `return` (bash reports
 # ``can only `return' from a function or sourced script`` and CONTINUES; huck
 # stops the script silently — #560).
 set -u
@@ -91,6 +90,14 @@ check "caller -1 in fn"    'f(){ caller -1; }; f; echo "in=$?"'
 check "caller bad num"     'f(){ caller abc; }; f; echo "in=$?"'
 check "caller 0 in fn"     'f(){ caller 0; }; f; echo "in=$?"'
 check "caller 9 in fn"     'f(){ caller 9; }; f; echo "in=$?"'
+
+# --- caller with NO expr: the caller's line, plus its source or the literal
+#     `NULL` when there is none (a `-c` string, or the top of a sourced file) ---
+check "caller bare in fn"  'f(){ caller; echo "in=$?"; }; f'
+check "caller ddash in fn" 'f(){ caller --; echo "in=$?"; }; f'
+check "caller bare nested" 'f(){ caller; }; g(){ f; }; g'
+check "caller bare sourced" 'printf "caller; echo in=\$?\n" > /tmp/huck-cal-$$.sh; . /tmp/huck-cal-$$.sh; rm -f /tmp/huck-cal-$$.sh'
+check "caller bare src fn"  'printf "f(){ caller; }\nf\n" > /tmp/huck-cal2-$$.sh; . /tmp/huck-cal2-$$.sh | sed "s#/tmp/huck-cal2-[0-9]*#SRC#"; rm -f /tmp/huck-cal2-$$.sh'
 
 # --- times: no options, operands ignored ---
 check "times bad option"   'times -Q; echo "in=$?"'
