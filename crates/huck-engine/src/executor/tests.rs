@@ -23,22 +23,18 @@ fn render_test_leaf_forms() {
         crate::command::Command::DoubleBracket { expr, .. } => *expr,
         other => panic!("expected [[ ]], got {other:?}"),
     };
-    assert_eq!(
-        render_test_leaf(&parse_expr("[[ -n $v ]]"), &mut shell),
-        "-n hi"
-    );
-    assert_eq!(
-        render_test_leaf(&parse_expr("[[ -z \"\" ]]"), &mut shell),
-        "-z ''"
-    );
-    assert_eq!(
-        render_test_leaf(&parse_expr("[[ $v == h* ]]"), &mut shell),
-        "hi == h*"
-    );
-    assert_eq!(
-        render_test_leaf(&parse_expr("[[ 5 -gt 3 ]]"), &mut shell),
-        "5 -gt 3"
-    );
+    // #220: rendering now goes through the SINGLE expansion the evaluation
+    // uses, so the trace body is built from an already-expanded leaf.
+    let render = |src: &str, shell: &mut Shell| {
+        let expr = parse_expr(src);
+        render_test_leaf(&expand_test_leaf(&expr, shell).expect("leaf"))
+    };
+    assert_eq!(render("[[ -n $v ]]", &mut shell), "-n hi");
+    assert_eq!(render("[[ -z \"\" ]]", &mut shell), "-z ''");
+    assert_eq!(render("[[ $v == h* ]]", &mut shell), "hi == h*");
+    assert_eq!(render("[[ 5 -gt 3 ]]", &mut shell), "5 -gt 3");
+    // A connective has no operands of its own.
+    assert!(expand_test_leaf(&parse_expr("[[ -n $v && -n $v ]]"), &mut shell).is_none());
 }
 
 #[test]
