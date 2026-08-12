@@ -51,6 +51,11 @@ fn bg_with_percent_spec_arg_and_no_job_errors_status_1() {
 #[test]
 fn bg_on_running_job_reports_already_in_background() {
     let mut shell = Shell::new();
+    // #518: `fg`/`bg` refuse with `no job control` before parsing or
+    // resolving anything unless the shell has job control, which a bare
+    // `Shell::new()` does not. `set -m` is what this test has always
+    // implicitly assumed.
+    shell.shell_options.monitor = true;
     shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
     let mut buf: Vec<u8> = Vec::new();
     let mut errbuf: Vec<u8> = Vec::new();
@@ -67,6 +72,11 @@ fn fg_on_terminal_job_reports_no_such_job_and_drops_it() {
     // back to Running (which leaked a phantom entry and returned 1 via a
     // waitpid(-pgid) ECHILD race).
     let mut shell = Shell::new();
+    // #518: `fg`/`bg` refuse with `no job control` before parsing or
+    // resolving anything unless the shell has job control, which a bare
+    // `Shell::new()` does not. `set -m` is what this test has always
+    // implicitly assumed.
+    shell.shell_options.monitor = true;
     shell.jobs.add_synthetic_done("sleep 0.05".to_string(), 0);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -87,6 +97,11 @@ fn fg_on_terminal_job_reports_no_such_job_and_drops_it() {
 fn fg_on_signaled_job_reports_no_such_job_and_drops_it() {
     // Same as above for a Signaled terminal state.
     let mut shell = Shell::new();
+    // #518: `fg`/`bg` refuse with `no job control` before parsing or
+    // resolving anything unless the shell has job control, which a bare
+    // `Shell::new()` does not. `set -m` is what this test has always
+    // implicitly assumed.
+    shell.shell_options.monitor = true;
     shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
     shell.jobs.jobs_mut()[0].state = crate::jobs::JobState::Signaled(libc::SIGKILL);
     let mut out: Vec<u8> = Vec::new();
@@ -106,6 +121,11 @@ fn bg_on_terminal_job_reports_no_such_job_and_drops_it() {
     // #162: bg on a job the entry-reap completed must report "no such job" +
     // remove it, not misreport "already running" (the pre-fix behavior).
     let mut shell = Shell::new();
+    // #518: `fg`/`bg` refuse with `no job control` before parsing or
+    // resolving anything unless the shell has job control, which a bare
+    // `Shell::new()` does not. `set -m` is what this test has always
+    // implicitly assumed.
+    shell.shell_options.monitor = true;
     shell.jobs.add_synthetic_done("sleep 0.05".to_string(), 0);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -173,6 +193,11 @@ fn fg_with_non_percent_arg_is_a_job_spec() {
 #[test]
 fn fg_with_multiple_args_returns_usage_status_2() {
     let mut shell = Shell::new();
+    // #518: `fg`/`bg` refuse with `no job control` before parsing or
+    // resolving anything unless the shell has job control, which a bare
+    // `Shell::new()` does not. `set -m` is what this test has always
+    // implicitly assumed.
+    shell.shell_options.monitor = true;
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(
         "fg",
@@ -215,6 +240,11 @@ fn bg_with_no_such_job_spec_errors_status_1() {
 #[test]
 fn bg_with_running_spec_reports_already_in_background() {
     let mut shell = Shell::new();
+    // #518: `fg`/`bg` refuse with `no job control` before parsing or
+    // resolving anything unless the shell has job control, which a bare
+    // `Shell::new()` does not. `set -m` is what this test has always
+    // implicitly assumed.
+    shell.shell_options.monitor = true;
     shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
     let mut buf: Vec<u8> = Vec::new();
     let outcome = run_builtin(

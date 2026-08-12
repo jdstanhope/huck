@@ -5727,6 +5727,18 @@ fn builtin_fg(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
+    // #518/#416: bash's `fg_bg` refuses OUTRIGHT when the shell has no job
+    // control, before it parses options or resolves a job spec — so every
+    // form (`%1`, a bad option, no argument at all) reports the same single
+    // line. huck used to parse first, reporting `-Q: invalid option` (rc 2)
+    // or `%1: no such job` where bash reports this. `job_control_active()`
+    // is false in a non-interactive shell without `set -m` AND inside a
+    // subshell, which is the other half of #416: one stage of a pipeline
+    // has no job control even when the parent does.
+    if !shell.job_control_active() {
+        crate::sh_error_to!(shell, err, None, "fg: no job control");
+        return ExecOutcome::Continue(1);
+    }
     // #158: drain pending STOP/CONT before resolving/acting on the job.
     crate::jobs::reap_completed(shell);
     // #161: fg takes no options; a leading-dash argument (other than `--`) is
@@ -5861,6 +5873,18 @@ fn builtin_bg(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
+    // #518/#416: bash's `fg_bg` refuses OUTRIGHT when the shell has no job
+    // control, before it parses options or resolves a job spec — so every
+    // form (`%1`, a bad option, no argument at all) reports the same single
+    // line. huck used to parse first, reporting `-Q: invalid option` (rc 2)
+    // or `%1: no such job` where bash reports this. `job_control_active()`
+    // is false in a non-interactive shell without `set -m` AND inside a
+    // subshell, which is the other half of #416: one stage of a pipeline
+    // has no job control even when the parent does.
+    if !shell.job_control_active() {
+        crate::sh_error_to!(shell, err, None, "bg: no job control");
+        return ExecOutcome::Continue(1);
+    }
     // #158: drain pending STOP/CONT so `bg` finds a newly-stopped job.
     crate::jobs::reap_completed(shell);
     // #161: bg takes no options; a leading-dash argument (other than `--`) is
