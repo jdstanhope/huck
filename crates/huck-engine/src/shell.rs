@@ -567,6 +567,19 @@ fn process_line_in_sinks_ex(
             // `InDollarCommandSub`, so the two are finally distinguishable
             // here — bash exits 127 for the substitution and 2 for an
             // ordinary top-level syntax error, under `-c`.
+            // #340: the here-document limit is fatal to the whole shell even
+            // from `eval`, which is NOT `top_level` and whose ordinary syntax
+            // errors really are non-fatal. Only the nested case is taken here:
+            // at the top level (piped stdin) the ordinary `Syntax` handling
+            // below already gives bash's 2, and `HeredocLimit`'s 1 would be
+            // wrong there.
+            if !top_level
+                && matches!(&e, crate::command::ParseError::Lex(le)
+                    if matches!(**le, crate::lexer::LexError::HeredocMaxExceeded))
+            {
+                shell.report_error(crate::error_fatality::ErrorKind::HeredocLimit);
+                return ExecOutcome::Continue(2);
+            }
             if top_level && !shell.is_interactive {
                 let kind = match &e {
                     crate::command::ParseError::InCommandSub { .. } => {

@@ -8741,6 +8741,15 @@ fn run_sourced_contents_in_sinks_inner(
                         prev_end = start;
                         continue 'outer;
                     }
+                    // #340: the here-document limit is bash's one lex error
+                    // that is fatal to the WHOLE shell, not just to the parse
+                    // context that raised it. At the top level the `return`
+                    // below already ends everything with 2, which is what bash
+                    // gives there; NESTED (a sourced file) it has to unwind
+                    // past the caller, with a plain 1.
+                    if is_lex && shell.source_depth > 0 {
+                        shell.report_error(crate::error_fatality::ErrorKind::HeredocLimit);
+                    }
                     // bash aborts the whole parse-context on a regular syntax
                     // error — it does NOT skip the offending line and resume.
                     // This driver runs only `-c` strings, script files, and

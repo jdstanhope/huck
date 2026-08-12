@@ -77,6 +77,16 @@ pub(crate) enum ErrorKind {
     ComsubSyntax { backtick: bool },
     /// A syntax error in the script itself.
     Syntax,
+    /// The here-document limit (bash's `HEREDOC_MAX`) exceeded in a NESTED
+    /// parse — a sourced file, an `eval`, or a function calling either.
+    ///
+    /// Its own kind because it is the one lex error bash treats as fatal to
+    /// the WHOLE shell rather than to the parse context that raised it:
+    /// `source bad; echo OUTER` prints nothing and exits 1, where an ordinary
+    /// syntax error in the same file lets the caller carry on (#340). The
+    /// status is a plain 1 with no `-c` substitution — measured under `-c`,
+    /// a script file and a function.
+    HeredocLimit,
 }
 
 /// The three outcomes bash actually has. `AbortList` is the one an outcome
@@ -200,6 +210,13 @@ pub(crate) fn fatality(kind: ErrorKind, shell: &Shell) -> Fatality {
         ErrorKind::Syntax => {
             if can_exit {
                 Fatality::ExitShell(2)
+            } else {
+                Fatality::Continue
+            }
+        }
+        ErrorKind::HeredocLimit => {
+            if can_exit {
+                Fatality::ExitShell(1)
             } else {
                 Fatality::Continue
             }
