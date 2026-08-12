@@ -216,6 +216,28 @@ fn render_diag_inner(
         }) if is_matching_delim(*d) => {
             emit_matching(shell, *d, source, local_line, marker, line_base);
         }
+        // #313: a malformed `for (( … ))` header is TWO lines — the
+        // malformation, then the header as typed, and unlike the near-token
+        // shape the echo line repeats the `syntax error: ` wrapper:
+        //
+        //     huck: -c: line 1: syntax error: arithmetic expression required
+        //     huck: -c: line 1: syntax error: `((i=0; i<3))'
+        ParseError::ArithForHeader { header, .. } => {
+            emit_syntax_error_ex(
+                shell,
+                display_line,
+                format_args!("syntax error: {err}"),
+                None,
+                marker,
+            );
+            emit_syntax_error_ex(
+                shell,
+                display_line,
+                format_args!("syntax error: `(({header}))'"),
+                None,
+                marker,
+            );
+        }
         // v348 (#339, R3): bash's HEREDOC_MAX message has no `syntax error:`
         // wrapper — it's bare `maximum here-document count exceeded` after
         // the usual `<name>: [-c: ]line N: ` prologue.

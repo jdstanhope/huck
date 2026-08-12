@@ -1760,7 +1760,11 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
                     // bash reports as one or the other (`$(()` is huck's "empty
                     // subshell" but bash's unexpected-EOF), so marking those
                     // would turn an agreeing status into a divergent one.
-                    other @ ParseError::Unexpected(_) => {
+                    // #313 adds `ArithForHeader` to the marked set: bash
+                    // reports a bad `for (( … ))` header inside `$( )` with
+                    // its own two-line shape and STILL exits 127 under `-c`
+                    // (measured), so the marker is right for it too.
+                    other @ (ParseError::Unexpected(_) | ParseError::ArithForHeader { .. }) => {
                         ParseError::InDollarCommandSub(Box::new(other))
                     }
                     other => other,
@@ -1879,7 +1883,11 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
                     // bash reports as one or the other (`$(()` is huck's "empty
                     // subshell" but bash's unexpected-EOF), so marking those
                     // would turn an agreeing status into a divergent one.
-                    other @ ParseError::Unexpected(_) => {
+                    // #313 adds `ArithForHeader` to the marked set: bash
+                    // reports a bad `for (( … ))` header inside `$( )` with
+                    // its own two-line shape and STILL exits 127 under `-c`
+                    // (measured), so the marker is right for it too.
+                    other @ (ParseError::Unexpected(_) | ParseError::ArithForHeader { .. }) => {
                         ParseError::InDollarCommandSub(Box::new(other))
                     }
                     other => other,
@@ -4828,15 +4836,19 @@ fn trim_section(word: &Word) -> Option<Word> {
 /// `ArithSemi`. Mirrors `parse_arith_body`'s part arms (all `quoted:true`). Returns the
 /// section `Word`s (≥1). `ArithBail` (a depth-0 `)` not followed by `)`) ⇒ the header
 /// never closed ⇒ `UnterminatedLoop` (matching the oracle's `for ((` fallback).
-fn parse_arith_for_body(iter: &mut Lexer) -> Result<Vec<Word>, ParseError> {
+fn parse_arith_for_body(iter: &mut Lexer) -> Result<(Vec<Word>, usize), ParseError> {
     let mut sections: Vec<Word> = Vec::new();
     let mut cur: Vec<WordPart> = Vec::new();
     loop {
         match iter.peek_kind()? {
             Some(TokenKind::ArithClose) => {
+                // The offset of the closing `))` — with the one just past the
+                // opening `((` it delimits the header text a bad-header
+                // diagnostic echoes (#313).
+                let close_at = iter.peek_span()?.map(|s| s.offset).unwrap_or(0);
                 iter.next_kind()?;
                 sections.push(Word(cur));
-                return Ok(sections);
+                return Ok((sections, close_at));
             }
             Some(TokenKind::ArithSemi) => {
                 iter.next_kind()?;
@@ -4904,6 +4916,8 @@ fn parse_arith_for_body(iter: &mut Lexer) -> Result<Vec<Word>, ParseError> {
 fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
     let line = iter.current_line()?;
     iter.next_kind()?; // first `(`
+    // The second `(` starts one byte before the header text itself.
+    let open_at = iter.peek_span()?.map(|s| s.offset + 1).unwrap_or(0);
     iter.next_kind()?; // second `(`
     iter.push_mode(Mode::Arith {
         paren_depth: 0,
@@ -4914,18 +4928,33 @@ fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
         delim: ArithDelim::Paren,
     });
     let result = parse_arith_for_body(iter);
-    iter.pop_mode();
-    let sections = match result {
+    let (sections, close_at) = match result {
         Ok(s) => s,
-        Err(ParseError::Lex(_)) => return Err(ParseError::UnterminatedLoop),
-        Err(e) => return Err(e),
+        Err(ParseError::Lex(_)) => {
+            iter.pop_mode();
+            return Err(ParseError::UnterminatedLoop);
+        }
+        Err(e) => {
+            iter.pop_mode();
+            return Err(e);
+        }
     };
     if sections.len() != 3 {
-        return Err(ParseError::ArithForHeader(format!(
-            "expected 3 sections separated by `;`, got {}",
-            sections.len()
-        )));
+        // Slice the header out of the source rather than rebuilding it from
+        // the sections: bash echoes what was typed, keeping the original
+        // spacing, quotes and embedded newlines, none of which survive
+        // tokenizing (#313).
+        let header = iter
+            .source_between(open_at, close_at)
+            .unwrap_or_default()
+            .to_string();
+        iter.pop_mode();
+        return Err(ParseError::ArithForHeader {
+            extra_semi: sections.len() > 3,
+            header,
+        });
     }
+    iter.pop_mode();
     let init = trim_section(&sections[0]);
     let cond = trim_section(&sections[1]);
     let step = trim_section(&sections[2]);

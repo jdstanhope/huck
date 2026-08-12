@@ -44,8 +44,16 @@ pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
         ParseError::ArithBlock(msg) => {
             format!("arithmetic '((...))': {msg}")
         }
-        ParseError::ArithForHeader(msg) => {
-            format!("'for ((...))' header: {msg}")
+        // bash names the malformation, not the section count: a header with
+        // FEWER than three sections is missing an expression, one with more
+        // has a `;` too many (#313). The header echo is a second line, emitted
+        // by the diagnostic renderer.
+        ParseError::ArithForHeader { extra_semi, .. } => {
+            if *extra_semi {
+                "`;' unexpected".to_string()
+            } else {
+                "arithmetic expression required".to_string()
+            }
         }
         ParseError::Lex(e) => {
             let s = lex_error_message_impl(e);

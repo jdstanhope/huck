@@ -841,7 +841,15 @@ pub enum ParseError {
     ArithBlock(String),
     /// NEW (v78): `for ((header))` header did not split into exactly 3
     /// `;`-separated sections.
-    ArithForHeader(String),
+    ArithForHeader {
+        /// True when the header had MORE than three `;`-separated sections,
+        /// which bash reports as an unexpected `;` rather than as a missing
+        /// expression.
+        extra_semi: bool,
+        /// The header text exactly as written between `((` and `))` — bash
+        /// echoes it verbatim on a second line, spacing and newlines included.
+        header: String,
+    },
     /// NEW (v239): a lex error surfaced while the parser pulled tokens live
     Lex(Box<crate::lexer::LexError>),
     /// A nested expansion the parser-driven path does not handle yet

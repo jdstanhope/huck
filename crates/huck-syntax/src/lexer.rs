@@ -203,6 +203,12 @@ impl<'a> CharCursor<'a> {
     /// once all injected frames are drained it reports the base position again
     /// (all nested frames share the same anchor, so the topmost-with-content
     /// frame's anchor is the outermost alias-name span).
+    /// The whole input this cursor walks. Diagnostics that echo source text
+    /// verbatim slice it by byte offset (#313).
+    pub fn source(&self) -> &'a str {
+        self.s
+    }
+
     pub fn offset(&self) -> usize {
         for f in self.injected.iter().rev() {
             if !f.exhausted() {
@@ -6654,6 +6660,18 @@ impl<'a> Lexer<'a> {
     /// slice. After a lex error from `parse_one_unit`, this is the position
     /// where the scanner gave up — used by the source loop to compute the
     /// restart line (`next_line_start(start + iter.cursor_pos())`).
+    /// The raw source between two byte offsets, or `None` when the range is
+    /// not a valid slice of this lexer's input. Used for diagnostics that echo
+    /// the text as written (the `for ((…))` header, #313) rather than a
+    /// reconstruction — bash preserves the original spacing and newlines
+    /// there, which parsed tokens cannot recover.
+    pub fn source_between(&self, start: usize, end: usize) -> Option<&'a str> {
+        if start > end {
+            return None;
+        }
+        self.cursor.source().get(start..end)
+    }
+
     pub fn cursor_pos(&self) -> usize {
         self.cursor.offset()
     }
