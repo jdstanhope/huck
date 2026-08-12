@@ -8687,6 +8687,18 @@ fn run_sourced_contents_in_sinks_inner(
                     let line = line_of(start + foff) as u32;
                     crate::render_syntax_diag(shell, &e, contents, line);
                     last_status = 2;
+                    // #492: a syntax error inside a `$( )` body is bash's one
+                    // exception to "a syntax error is status 2" — it exits 127
+                    // under `-c`, and it is FATAL to the whole shell even from
+                    // a sourced file, where an ordinary syntax error only ends
+                    // that file. The classifier already knows both rules; what
+                    // was missing was telling the two errors apart, which the
+                    // parser now marks (`InDollarCommandSub`).
+                    if matches!(e, crate::command::ParseError::InDollarCommandSub(_)) {
+                        shell.report_error(crate::error_fatality::ErrorKind::ComsubSyntax {
+                            backtick: false,
+                        });
+                    }
                     // v348 (#339, R3): a HEREDOC_MAX overflow is a lex error
                     // but, unlike other recoverable lex errors here, is FATAL
                     // (see `lex_error_is_fatal`) — falls through to the
