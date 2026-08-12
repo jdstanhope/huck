@@ -122,4 +122,27 @@ check "valid dup literal"    'echo hi >&2; echo "rc=$?"'
 check "dash closes"          'x=-; echo hi >&"$x"; echo "rc=$?"'
 check "dash literal closes"  'exec 9>&-; echo "rc=$?"'
 
+# --- #544: a word that EXPANDS to `-` closes the redirector on EVERY target and
+#     in BOTH directions, not just the fd-1 output dup that already worked. The
+#     bug was silent on the failing side: huck reported `-: ambiguous redirect`
+#     and left the fd OPEN, so the follow-on write went through into whatever
+#     the fd still pointed at. Each row therefore WRITES through the fd after
+#     the close and lets the on-disk file settle it. ---
+check "dash exec out fd3"    'exec 3>f3; x=-; exec 3>&"$x"; echo PAYLOAD >&3; echo "rc=$?"'
+check "dash exec out unq"    'exec 3>f3; x=-; exec 3>&$x; echo PAYLOAD >&3; echo "rc=$?"'
+check "dash exec in fd3"     'printf "L\n" >f3; exec 3<f3; x=-; exec 3<&"$x"; read r <&3; echo "rc=$? r=$r"'
+check "dash cmd fd2"         'x=-; echo hi 2>&"$x"; echo "rc=$?"'
+check "dash cmd fd2 stderr"  'x=-; { echo O; echo E >&2; } 2>&"$x" 2>>err.txt; echo "rc=$?"'
+check "dash cmd closed fd9"  'x=-; echo hi 9>&"$x"; echo "rc=$?"'
+check "dash cmd open fd4"    'exec 4>f4; x=-; { echo hi; echo P >&4; } 4>&"$x"; echo "rc=$?"'
+check "dash compound fd3"    'exec 3>f3; x=-; { echo hi; echo P >&3; } 3>&"$x"; echo "rc=$?"'
+check "dash subshell fd3"    'exec 3>f3; x=-; ( echo hi; echo P >&3 ) 3>&"$x"; echo "rc=$?"'
+check "dash external fd3"    'exec 3>f3; x=-; /bin/echo hi 3>&"$x"; echo "rc=$?"'
+check "dash pipeline fd3"    'exec 3>f3; x=-; echo hi | cat 3>&"$x"; echo "rc=$?"'
+check "dash outer preserved" 'exec 3>f3; x=-; { echo P >&3; } 3>&"$x"; echo Q >&3; echo "rc=$?"'
+check "dash split word"      'exec 3>f3; x=" -"; exec 3>&$x; echo PAYLOAD >&3; echo "rc=$?"'
+check "dash cmdsub"          'exec 3>f3; exec 3>&$(echo -); echo PAYLOAD >&3; echo "rc=$?"'
+check "double dash ambig"    'exec 3>f3; x=--; exec 3>&"$x"; echo PAYLOAD >&3; echo "rc=$?"'
+check "dash in dup fd0"      'exec 3>f3; x=-; { echo hi; } 3<&"$x"; echo "rc=$?"'
+
 harness_summary

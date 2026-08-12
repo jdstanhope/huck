@@ -3170,6 +3170,15 @@ fn fd_word_number(field: &str) -> Option<RawFd> {
     Some(field.parse::<RawFd>().unwrap_or(RawFd::MAX))
 }
 
+/// What a dup/move source word resolved to: an fd, or bash's "close the
+/// redirector" outcome for a word that expanded to exactly `-` (#544).
+enum DupSource {
+    Fd(RawFd),
+    /// The word expanded to `-`: close the TARGET fd, exactly like a literal
+    /// `>&-` / `<&-` (which the parser routes to `RedirOp::Close`).
+    CloseTarget,
+}
+
 /// Resolve a `>&w` / `<&w` / move (`>&w-`) source word to an fd, writing bash's
 /// error to the redirect-aware writer on failure. Shared by every dup/move
 /// redirect-lowering site (`lower_redirects` for the in-process path and the
@@ -3191,7 +3200,7 @@ fn resolve_dup_source(
     source: &crate::lexer::Word,
     shell: &mut Shell,
     bad_fd_label: &str,
-) -> Result<RawFd, ()> {
+) -> Result<DupSource, ()> {
     let fields = expand(source, shell);
     let word_src = crate::expand::reconstruct_word_source(source);
     if fields.len() != 1 {
@@ -3200,8 +3209,15 @@ fn resolve_dup_source(
         return Err(());
     }
     let field = fields.into_iter().next().unwrap().chars;
+    // #544: bash tests the EXPANDED word for `-` before the all-digits test and
+    // before the `&>file` fallback (redir.c), so `m=-; exec 3>&$m` closes fd 3
+    // just as `exec 3>&-` does. huck used to report `-: ambiguous redirect` and
+    // leave the fd OPEN, so the follow-on write silently succeeded.
+    if field == "-" {
+        return Ok(DupSource::CloseTarget);
+    }
     if let Some(fd) = fd_word_number(&field) {
-        return Ok(fd);
+        return Ok(DupSource::Fd(fd));
     }
     let mut err = err_writer();
     if field.is_empty() {
@@ -5694,7 +5710,15 @@ fn lower_one_redirect(
                 }
             } else {
                 match resolve_dup_source(source, shell, &bad_fd_label) {
-                    Ok(n) => n,
+                    Ok(DupSource::Fd(n)) => n,
+                    Ok(DupSource::CloseTarget) => {
+                        // `m=-; exec 3>&$m` — close the redirector, like `3>&-`.
+                        ops.push(PlanOp::Close { target });
+                        if let Some(st) = fd_state.as_deref_mut() {
+                            st.insert(target, false);
+                        }
+                        return Ok(ops);
+                    }
                     Err(()) => return Err(1),
                 }
             };
