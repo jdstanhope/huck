@@ -13,8 +13,9 @@
 #   * actions print in `compacts[]` table order, TWICE over the table: the
 #     one-letter forms first (`-u -v`), then the long ones (`-A hostname`).
 #     They are a bitmask in bash, so `-u -u` collapses.
-#   * every option VALUE is single-quoted; `-F` is NOT (bash requires a valid
-#     identifier there, so there is nothing to quote).
+#   * every option VALUE is single-quoted EXCEPT `-F`, which is quoted only
+#     when the name needs it — the same `sh_contains_shell_metas` test the
+#     command name gets, but an empty `-F` value stays bare.
 #   * `-D`/`-E` sit where the name would be, at the END of the line.
 #   * the NAME is single-quoted only when `sh_contains_shell_metas` says so,
 #     and there is never a `--` in front of it.
@@ -29,11 +30,12 @@
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
-# DRIVER: `-c`, since every fragment is a one-liner with no stdin.
+# DRIVER: `-c` with an EXPLICIT $0 ("huck5"), so the error prologue of the
+# `-F` validation rows matches byte for byte without normalisation.
 check() {
     local label="$1" frag="$2" b h
-    b=$(timeout 10 bash --norc --noprofile -c "$frag" 2>&1)
-    h=$(timeout 10 "$HUCK_BIN" -c "$frag" 2>&1)
+    b=$(timeout 10 bash --norc --noprofile -c "$frag" huck5 2>&1)
+    h=$(timeout 10 "$HUCK_BIN" -c "$frag" huck5 2>&1)
     compare "$label" "$b" "$h"
 }
 
@@ -48,6 +50,8 @@ check "action dedupe"      'complete -u -u -v foo; complete -p foo'
 check "short before long"  'complete -A hostname -u foo; complete -p foo'
 check "generators order"   'complete -o nospace -o default -u -v -A hostname -G "*.c" -W "a b" -F _f -X "!*.o" -P pre -S suf foo; complete -p foo'
 check "-F unquoted"        'complete -F _f foo; complete -p foo'
+check "-F quoted when meta" 'complete -F "a\$b" foo; complete -p foo'
+check "-F empty stays bare" 'complete -F "" foo; complete -p foo'
 check "-W quoted"          'complete -W "a b" foo; complete -p foo'
 check "-W empty quoted"    'complete -W "" foo; complete -p foo'
 check "-W with quote"      "complete -W \"a'b\" foo; complete -p foo"
@@ -68,6 +72,22 @@ check "-D name -E"         'complete -D -o nospace; complete zz; complete -E -o 
 check "-D with -W -F"      'complete -D -W "a b" -F _f; complete -p'
 check "-p -D"              'complete -D -o nospace; complete -p -D'
 check "-p -E"              'complete -E -o nospace; complete -p -E'
+
+# --- #550: the `-F` NAME is validated at registration, which is what lets
+#     `complete -p` print it unquoted. The rule is not "identifier" despite the
+#     wording: bash accepts `1abc`, `a-b`, `a.b`, `a/b`, `a$b` and even the
+#     empty string, and rejects only a name holding a shell BREAK character. ---
+check "-F odd but legal"   'complete -F 1abc a; complete -F a-b b; complete -F a.b c; complete -F a/b d; complete -F "a\$b" e; complete -F "" f; complete -p'
+check "-F with space"      'complete -F "a b" foo; echo "rc=$?"; complete -p foo; echo "rc=$?"'
+check "-F with semicolon"  'complete -F "a;b" foo; echo "rc=$?"'
+check "-F with pipe"       'complete -F "a|b" foo; echo "rc=$?"'
+check "-F with amp"        'complete -F "a&b" foo; echo "rc=$?"'
+check "-F with parens"     'complete -F "a(b" foo; echo "rc=$?"'
+check "-F with redirect"   'complete -F "a<b" foo; echo "rc=$?"'
+check "-F with tab"        'complete -F "$(printf "a\tb")" foo; echo "rc=$?"'
+check "-F bad with -W"     'complete -W x -F "a b" foo; echo "rc=$?"'
+check "-F bad two names"   'complete -F "a b" foo bar; echo "rc=$?"; complete -p'
+check "compgen -F bad"     'compgen -F "a b" x; echo "rc=$?"'
 
 # --- print-all ORDER: bash's hash walk, not sorted and not insertion order ---
 check "order abc"          'complete a; complete b; complete c; complete -p'

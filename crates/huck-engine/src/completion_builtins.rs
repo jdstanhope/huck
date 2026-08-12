@@ -83,7 +83,27 @@ fn parse_flags(
             Ok(Some(o)) => {
                 out.saw_option = true;
                 match o.ch {
-                    'F' => out.spec.function = Some(o.value.expect("F takes a value")),
+                    'F' => {
+                        let v = o.value.expect("F takes a value");
+                        // #550: bash validates the function name at
+                        // REGISTRATION and refuses the whole command. The rule
+                        // is not "identifier" despite the wording — `1abc`,
+                        // `a-b`, `a.b`, `a/b`, `a$b` and the empty string are
+                        // all accepted. Measured, what it rejects is a name
+                        // containing a shell BREAK character (`shellbreak()` in
+                        // bash: ` \t\n;|&()<>`), which is also why `-F` can be
+                        // printed unquoted by `complete -p` (#527).
+                        if v.contains([' ', '\t', '\n', ';', '|', '&', '(', ')', '<', '>']) {
+                            crate::sh_error_to!(
+                                shell,
+                                err,
+                                None,
+                                "{name}: `{v}': not a valid identifier"
+                            );
+                            return Err(2);
+                        }
+                        out.spec.function = Some(v);
+                    }
                     'W' => out.spec.wordlist = Some(o.value.expect("W takes a value")),
                     'G' => out.spec.glob = Some(o.value.expect("G takes a value")),
                     'A' => {
@@ -418,14 +438,20 @@ fn contains_shell_metas(s: &str) -> bool {
     false
 }
 
-/// The command name as `complete -p` writes it: bare when it needs no quoting,
-/// single-quoted (bash's `sh_single_quote`) when it does. An EMPTY name is
-/// quoted too — `complete ""` prints `complete ''`.
-fn print_quote_name(name: &str) -> String {
-    if name.is_empty() || contains_shell_metas(name) {
-        format!("'{}'", crate::builtins::escape_alias_value(name))
+/// A word as `complete -p` writes it: bare when it needs no quoting,
+/// single-quoted (bash's `sh_single_quote`) when it does.
+///
+/// `quote_empty` is the one difference between the two words that get this
+/// treatment: an empty command NAME prints as `''` (so `complete ""` round
+/// trips) while an empty `-F` value prints BARE, leaving `complete -F  e`
+/// with two spaces — measured, and bash's own output does not re-input there.
+/// Every OTHER option value (`-W`, `-P`, `-S`, `-X`, `-G`) is quoted
+/// unconditionally, so it does not come through here.
+fn print_quote_word(word: &str, quote_empty: bool) -> String {
+    if (word.is_empty() && quote_empty) || contains_shell_metas(word) {
+        format!("'{}'", crate::builtins::escape_alias_value(word))
     } else {
-        name.to_string()
+        word.to_string()
     }
 }
 
@@ -490,17 +516,17 @@ fn format_spec_for_print(spec: &CompletionSpec, name: Option<&str>, mode: Option
     if let Some(x) = &spec.filter {
         parts.push(format!("-X '{}'", crate::builtins::escape_alias_value(x)));
     }
-    // `-F` is printed RAW: bash rejects a function name that is not a valid
-    // identifier at registration, so there is never anything to quote.
+    // `-F` is quoted only when the name needs it — the same test as the command
+    // name, but an EMPTY value stays bare (#550).
     if let Some(f) = &spec.function {
-        parts.push(format!("-F {f}"));
+        parts.push(format!("-F {}", print_quote_word(f, false)));
     }
     // `-D` / `-E` sit at the END of the line, where the command name would be.
     if let Some(m) = mode {
         parts.push(m.to_string());
     }
     if let Some(n) = name {
-        parts.push(print_quote_name(n));
+        parts.push(print_quote_word(n, true));
     }
     parts.join(" ")
 }
