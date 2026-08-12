@@ -976,6 +976,7 @@ pub(crate) fn parse_param_expansion(
     iter.push_mode(Mode::ParamExpansion {
         seen_name: false,
         indirect: false,
+        length: false,
         start_off: 0,
     });
 

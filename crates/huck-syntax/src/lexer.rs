@@ -1124,6 +1124,10 @@ pub(crate) enum Mode {
     ParamExpansion {
         seen_name: bool,
         indirect: bool,
+        /// `${#name…}` — the LENGTH prefix was emitted. A length form takes a
+        /// subscript and nothing else, so any operator after the name is a bad
+        /// substitution in bash (#605).
+        length: bool,
         start_off: usize,
     }, // ${ … }
     // `enclosing_dquote` — the OUTER `"…"` context the `${…}` itself sits in
@@ -2316,6 +2320,9 @@ impl<'a> Lexer<'a> {
                     } else {
                         // `${#name}` — emit length prefix; name comes next call.
                         self.cursor.next();
+                        if let Some(Mode::ParamExpansion { length, .. }) = self.modes.last_mut() {
+                            *length = true;
+                        }
                         self.history.push(Token::new(
                             TokenKind::ParamLengthPrefix,
                             Span::new(off, l, c),
@@ -2419,6 +2426,36 @@ impl<'a> Lexer<'a> {
             self.modes.last(),
             Some(Mode::ParamExpansion { indirect: true, .. })
         );
+
+        // #605: `${#name}` accepts a subscript and then the closing brace, and
+        // NOTHING else — bash rejects `${#v:-D}`, `${#v#a}`, `${#v/a/z}`,
+        // `${#v:1:1}` and every other operator as a bad substitution rather
+        // than applying it to the length. Marking it here reuses the same
+        // deferred-marker machinery every other bad substitution uses, so the
+        // parser drives the tail and the raw `${…}` is echoed verbatim.
+        let length_form = matches!(
+            self.modes.last(),
+            Some(Mode::ParamExpansion { length: true, .. })
+        );
+        if length_form && !matches!(self.cursor.peek().copied(), Some('}') | Some('[')) {
+            emit_bad_subst!();
+        }
+        // ...and a SUBSCRIPT is only legal on a name that could name an array:
+        // `${#a[0]}` is a length, `${#@[0]}`, `${#*[0]}` and `${#1[0]}` are bad
+        // substitutions. The name is `history.last()` here — this runs directly
+        // after Phase 1 emitted it, before any subscript token exists — so a
+        // second `[` AFTER a subscript is left alone (it is its own divergence,
+        // #609).
+        if length_form && self.cursor.peek() == Some(&'[') {
+            let bad_name = matches!(
+                self.history.last().map(|t| &t.kind),
+                Some(TokenKind::ParamName(n))
+                    if n == "@" || n == "*" || n.chars().all(|c| c.is_ascii_digit())
+            );
+            if bad_name {
+                emit_bad_subst!();
+            }
+        }
 
         match self.cursor.peek().copied() {
             // Closing brace → ParamClose (bare name or after subscript/op).
@@ -7830,12 +7867,14 @@ mod tests {
         lx.push_mode(Mode::ParamExpansion {
             seen_name: false,
             indirect: false,
+            length: false,
             start_off: 7,
         });
         assert_eq!(lx.param_start_off(), 7);
         lx.push_mode(Mode::ParamExpansion {
             seen_name: false,
             indirect: false,
+            length: false,
             start_off: 12,
         });
         assert_eq!(lx.param_start_off(), 12, "innermost frame wins when nested");
@@ -8329,6 +8368,7 @@ mod tests {
         lx.push_mode(Mode::ParamExpansion {
             seen_name: false,
             indirect: false,
+            length: false,
             start_off: 0,
         });
         let mut out = Vec::new();
@@ -8349,6 +8389,7 @@ mod tests {
         lx.push_mode(Mode::ParamExpansion {
             seen_name: false,
             indirect: false,
+            length: false,
             start_off: 0,
         });
         let mut out = Vec::new();
@@ -8433,6 +8474,7 @@ mod tests {
         lx.push_mode(Mode::ParamExpansion {
             seen_name: false,
             indirect: false,
+            length: false,
             start_off: 0,
         });
         assert!(matches!(
@@ -8465,6 +8507,7 @@ mod tests {
         lx.push_mode(Mode::ParamExpansion {
             seen_name: false,
             indirect: false,
+            length: false,
             start_off: 0,
         });
 
@@ -8493,6 +8536,7 @@ mod tests {
         lx.push_mode(Mode::ParamExpansion {
             seen_name: false,
             indirect: false,
+            length: false,
             start_off: 0,
         });
         // Inner frame: pull ParamOpen (the ${ of ${b}).
