@@ -1118,7 +1118,25 @@ fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
                             }
                         }
                         Err(e) => {
-                            crate::sh_error_to!(shell, err, None, "unset: {e}");
+                            // #572: `unset` names the SUBSCRIPT in brackets and
+                            // nothing else — `unset 'a[-3]'` is
+                            // `unset: [-3]: bad array subscript`, status 1, and
+                            // the shell carries on. An ARITHMETIC failure in
+                            // the subscript is a different animal: it is an
+                            // expansion error, reported BARE (no `unset:`
+                            // prefix) and fatal to the command list.
+                            if e.is_arith() {
+                                if !shell.discard_pending()
+                                    && let Some(m) = e.message("")
+                                {
+                                    crate::sh_error_to!(shell, err, None, "{m}");
+                                }
+                                shell.report_error(crate::error_fatality::ErrorKind::Expansion);
+                                return ExecOutcome::Continue(1);
+                            }
+                            if let Some(m) = e.message(&format!("[{sub_text}]")) {
+                                crate::sh_error_to!(shell, err, None, "unset: {m}");
+                            }
                             any_error = true;
                         }
                     }

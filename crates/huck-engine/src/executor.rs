@@ -8018,13 +8018,20 @@ pub(crate) fn apply_one_assignment(
         (AssignTarget::Indexed { name, subscript }, None) => {
             let idx = match crate::expand::eval_subscript(subscript, shell, name) {
                 Ok(i) => i,
-                Err(msg) => {
+                Err(e) => {
                     // v312 (#3/#49): if a `$(( ))` arith error in the subscript
                     // already raised the discard, the command is being unwound —
-                    // suppress the secondary "bad array subscript" diagnostic
-                    // (bash prints only the arith error, then discards).
+                    // suppress the secondary diagnostic (bash prints only the
+                    // arith error, then discards).
+                    // #572: an ASSIGNMENT names `name[subscript]`.
                     if !shell.discard_pending() {
-                        crate::sh_error_to!(shell, err, None, "{msg}");
+                        let label = format!(
+                            "{name}[{}]",
+                            crate::expand::reconstruct_word_source(subscript)
+                        );
+                        if let Some(m) = e.message(&label) {
+                            crate::sh_error_to!(shell, err, None, "{m}");
+                        }
                     }
                     return Err(());
                 }
@@ -8129,9 +8136,26 @@ fn expand_array_elements(
             Some(sw) => {
                 let idx = match crate::expand::eval_subscript(sw, shell, name) {
                     Ok(i) => i,
-                    Err(msg) => {
-                        crate::sh_error_to!(shell, err, None, "{msg}");
-                        return Err(());
+                    Err(e) => {
+                        // #572: an ELEMENT of an array literal names the whole
+                        // element text — `a=([-3]=z)` is `[-3]=z: bad array
+                        // subscript` — and an out-of-range one is SKIPPED
+                        // rather than failing the assignment (bash: rc 0, the
+                        // rest of the literal still applies). An arithmetic
+                        // failure is fatal, as everywhere.
+                        let label = format!(
+                            "[{}]{}={}",
+                            crate::expand::reconstruct_word_source(sw),
+                            if elem.append { "+" } else { "" },
+                            crate::expand::reconstruct_word_source(&elem.value)
+                        );
+                        if let Some(m) = e.message(&label) {
+                            crate::sh_error_to!(shell, err, None, "{m}");
+                        }
+                        if e.is_arith() {
+                            return Err(());
+                        }
+                        continue;
                     }
                 };
                 let add = expand_assignment(&elem.value, shell);
