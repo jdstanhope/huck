@@ -7848,12 +7848,17 @@ pub(crate) fn apply_one_assignment(
                         .map_err(|_| ());
                 }
             }
-            (AssignTarget::Indexed { name, .. }, Some(_)) => {
+            (AssignTarget::Indexed { name, subscript }, Some(_)) => {
+                // #76: bash names the lvalue as WRITTEN, subscript included and
+                // unexpanded (`a[i]`, `a[2+3]`, `a[$((1+1))]`), and says
+                // `cannot assign list to array member` — the same wording for
+                // an associative element as for an indexed one.
+                let sub = crate::expand::reconstruct_word_source(subscript);
                 crate::sh_error_to!(
                     shell,
                     err,
                     None,
-                    "{name}: cannot assign array literal to associative array element"
+                    "{name}[{sub}]: cannot assign list to array member"
                 );
                 return Err(());
             }
@@ -7969,12 +7974,13 @@ pub(crate) fn apply_one_assignment(
             }
         }
         // Subscripted lvalue + compound array RHS: bash rejects this.
-        (AssignTarget::Indexed { name, .. }, Some(_)) => {
+        (AssignTarget::Indexed { name, subscript }, Some(_)) => {
+            let sub = crate::expand::reconstruct_word_source(subscript);
             crate::sh_error_to!(
                 shell,
                 err,
                 None,
-                "{name}: cannot assign array literal to array element"
+                "{name}[{sub}]: cannot assign list to array member"
             );
             Err(())
         }
