@@ -142,11 +142,18 @@ impl<'a> Getopt<'a> {
                 self.ch = 0;
                 continue;
             }
-            let c = bytes[self.ch] as char;
+            // The BYTE the user typed, kept as a byte for the diagnostic:
+            // `bytes[i] as char` is a Latin-1 decode, so re-encoding a
+            // non-ASCII byte for output would print the two UTF-8 bytes of
+            // U+00XX where bash prints the one raw byte (#522). `accepts()`
+            // only ever matches ASCII (spec strings are ASCII), so the `char`
+            // that flows on from here is ASCII whenever it is used at all.
+            let b = bytes[self.ch];
+            let c = b as char;
             self.ch += 1;
 
             if !self.accepts(c) {
-                self.fail_invalid(c, shell, err);
+                self.fail_invalid(b, shell, err);
                 return Err(2);
             }
 
@@ -196,8 +203,8 @@ impl<'a> Getopt<'a> {
     // `builtin_usage_error` and leaving the report to the executor's ALREADY
     // gated consume site (`is_special_builtin(&resolved.program) && posix`,
     // executor.rs ~4810) makes the fatality decision in exactly one place.
-    fn fail_invalid(&self, c: char, shell: &mut Shell, err: &mut dyn Write) {
-        emit_invalid_option(self.name, c, shell, err);
+    fn fail_invalid(&self, b: u8, shell: &mut Shell, err: &mut dyn Write) {
+        emit_invalid_option(self.name, b, shell, err);
     }
 
     /// The fallback for an option character the builtin's `match` has no arm
@@ -221,7 +228,9 @@ impl<'a> Getopt<'a> {
     /// instead of a dead shell. A `debug_assert` here would also make the
     /// graceful path untestable, since tests build with assertions on.
     pub(crate) fn reject_unhandled(&self, c: char, shell: &mut Shell, err: &mut dyn Write) -> i32 {
-        emit_invalid_option(self.name, c, shell, err);
+        // ASCII by construction: `c` came from `accepts()`, i.e. from this
+        // builtin's own (ASCII) spec string.
+        emit_invalid_option(self.name, c as u8, shell, err);
         2
     }
 
@@ -240,13 +249,8 @@ impl<'a> Getopt<'a> {
 /// `declare` reported `+z` with a usage line, `compopt` reported `-z` with none
 /// (#521). That is #496's own failure mode one layer up, so the emit lives here
 /// even though the parsing does not.
-pub(crate) fn emit_invalid_plus_option(
-    name: &str,
-    c: char,
-    shell: &mut Shell,
-    err: &mut dyn Write,
-) {
-    crate::sh_error_to!(shell, err, None, "{name}: +{c}: invalid option");
+pub(crate) fn emit_invalid_plus_option(name: &str, b: u8, shell: &mut Shell, err: &mut dyn Write) {
+    crate::emit_error_bytes_to(shell, err, None, &invalid_option_body(name, b'+', b));
     let _ = writeln!(err, "{name}: usage: {}", usage_for(name));
     shell.builtin_usage_error = Some(2);
 }
@@ -275,8 +279,30 @@ pub(crate) fn emit_missing_value(name: &str, c: char, shell: &mut Shell, err: &m
     shell.builtin_usage_error = Some(2);
 }
 
-pub(crate) fn emit_invalid_option(name: &str, c: char, shell: &mut Shell, err: &mut dyn Write) {
-    crate::sh_error_to!(shell, err, None, "{name}: -{c}: invalid option");
+/// The first BYTE of `c`'s UTF-8 encoding. bash scans an option cluster byte
+/// by byte, so a non-ASCII option character is reported as that single leading
+/// byte (`+é` -> `+\xC3`), never as the whole code point (#522). For an ASCII
+/// `c` this is `c` itself. Used by the two hand-rolled `+`-run loops that scan
+/// `char`s rather than bytes.
+pub(crate) fn opt_first_byte(c: char) -> u8 {
+    let mut buf = [0u8; 4];
+    c.encode_utf8(&mut buf).as_bytes()[0]
+}
+
+/// `<name>: <sign><byte>: invalid option`, built as BYTES so a non-ASCII
+/// option character reaches stderr as the single raw byte bash reports (#522).
+pub(crate) fn invalid_option_body(name: &str, sign: u8, b: u8) -> Vec<u8> {
+    let mut body = Vec::with_capacity(name.len() + 20);
+    body.extend_from_slice(name.as_bytes());
+    body.extend_from_slice(b": ");
+    body.push(sign);
+    body.push(b);
+    body.extend_from_slice(b": invalid option");
+    body
+}
+
+pub(crate) fn emit_invalid_option(name: &str, b: u8, shell: &mut Shell, err: &mut dyn Write) {
+    crate::emit_error_bytes_to(shell, err, None, &invalid_option_body(name, b'-', b));
     let _ = writeln!(err, "{name}: usage: {}", usage_for(name));
     shell.builtin_usage_error = Some(2);
 }

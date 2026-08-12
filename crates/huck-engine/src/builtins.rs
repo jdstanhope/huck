@@ -1726,7 +1726,7 @@ fn builtin_local_decl(
                 // Accepted, and a no-op: see the note above.
                 b'a' | b'A' | b'i' | b'r' | b'l' | b'u' | b'c' | b'n' | b'x' => {}
                 other => {
-                    crate::builtin_opts::emit_invalid_plus_option(name, other as char, shell, err);
+                    crate::builtin_opts::emit_invalid_plus_option(name, other, shell, err);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -2319,7 +2319,7 @@ fn builtin_declare_decl(
                 b'c' => saw_plus_c = true,
                 b'n' => saw_plus_n = true,
                 other => {
-                    crate::builtin_opts::emit_invalid_plus_option(name, other as char, shell, err);
+                    crate::builtin_opts::emit_invalid_plus_option(name, other, shell, err);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -5697,13 +5697,15 @@ fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Ex
 /// option character if the first argument is a `-`-prefixed token other than
 /// `-` or `--`. bash's getopt reports the first such character (`fg -sx` →
 /// `-s`), so callers format it as `-{c}: invalid option`.
-fn leading_invalid_option(args: &[String]) -> Option<char> {
+fn leading_invalid_option(args: &[String]) -> Option<u8> {
     let first = args.first()?;
     if first == "--" {
         return None;
     }
     let rest = first.strip_prefix('-')?;
-    rest.chars().next()
+    // The first BYTE — bash's option scan is byte-wise, so a non-ASCII flag
+    // name is reported as its leading byte alone (#522).
+    rest.as_bytes().first().copied()
 }
 
 /// #162: true if the resolved job has already completed (Done/Signaled) — the
@@ -5730,7 +5732,12 @@ fn builtin_fg(
     // #161: fg takes no options; a leading-dash argument (other than `--`) is
     // reported as an invalid option before the usage line, matching bash.
     if let Some(c) = leading_invalid_option(args) {
-        crate::sh_error_to!(shell, err, None, "fg: -{c}: invalid option");
+        crate::emit_error_bytes_to(
+            shell,
+            err,
+            None,
+            &crate::builtin_opts::invalid_option_body("fg", b'-', c),
+        );
         e!(err, "fg: usage: fg [job_spec]");
         return ExecOutcome::Continue(2);
     }
@@ -5859,7 +5866,12 @@ fn builtin_bg(
     // #161: bg takes no options; a leading-dash argument (other than `--`) is
     // reported as an invalid option before the usage line, matching bash.
     if let Some(c) = leading_invalid_option(args) {
-        crate::sh_error_to!(shell, err, None, "bg: -{c}: invalid option");
+        crate::emit_error_bytes_to(
+            shell,
+            err,
+            None,
+            &crate::builtin_opts::invalid_option_body("bg", b'-', c),
+        );
         e!(err, "bg: usage: bg [job_spec ...]");
         return ExecOutcome::Continue(2);
     }
@@ -7106,12 +7118,14 @@ fn builtin_set_inner(
                         // non-interactive shell in POSIX mode. Both halves were
                         // wrong: the message claimed a gap that is really a
                         // rejection, and the shell carried on where bash exits.
-                        crate::sh_error_to!(
+                        // Raw byte, not `other as char`: bash scans the flag
+                        // word byte-wise, so `set -\xC3\xA9` names only the
+                        // first byte (#522).
+                        crate::emit_error_bytes_to(
                             shell,
                             err,
                             None,
-                            "set: -{}: invalid option",
-                            other as char
+                            &crate::builtin_opts::invalid_option_body("set", b'-', other),
                         );
                         let _ = writeln!(
                             err,
@@ -7190,12 +7204,14 @@ fn builtin_set_inner(
                         // non-interactive shell in POSIX mode. Both halves were
                         // wrong: the message claimed a gap that is really a
                         // rejection, and the shell carried on where bash exits.
-                        crate::sh_error_to!(
+                        // Raw byte, not `other as char`: bash scans the flag
+                        // word byte-wise, so `set -\xC3\xA9` names only the
+                        // first byte (#522).
+                        crate::emit_error_bytes_to(
                             shell,
                             err,
                             None,
-                            "set: +{}: invalid option",
-                            other as char
+                            &crate::builtin_opts::invalid_option_body("set", b'+', other),
                         );
                         let _ = writeln!(
                             err,

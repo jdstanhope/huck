@@ -441,6 +441,22 @@ pub fn emit_error_to(
     let _ = w.write_all(b"\n");
 }
 
+/// [`emit_error_to`] for a body that is NOT valid UTF-8. A Rust `String`
+/// cannot hold a lone `0xC3`, but bash's diagnostics can and do — an invalid
+/// option is reported as the RAW BYTE the user typed, so `readonly -é` names
+/// only the first byte of the two `é` occupies (#522). Callers with such a
+/// body build it as bytes and hand it over whole; the prologue is the same.
+pub fn emit_error_bytes_to(
+    shell: &Shell,
+    w: &mut dyn std::io::Write,
+    cmd: Option<&str>,
+    body: &[u8],
+) {
+    let _ = write!(w, "{}", shell.error_prefix(Diag::Runtime(cmd)));
+    let _ = w.write_all(body);
+    let _ = w.write_all(b"\n");
+}
+
 /// `eprintln!`-shaped wrapper around [`emit_error_to`]: `sh_error_to!(shell,
 /// w, cmd, "fmt", args...)`. Use at any builtin site that holds an `out`/`err`
 /// writer descending from `run_builtin` — see [`emit_error_to`].
