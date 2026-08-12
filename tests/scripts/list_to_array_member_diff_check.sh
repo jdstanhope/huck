@@ -17,10 +17,11 @@
 # run) and non-fatal from a script file, which is why the rows below carry no
 # `echo rc=$?` — the marker is whether anything follows the diagnostic.
 #
-# NOT covered, and filed as #585: the DECLARATION-BUILTIN forms.
-# `declare a[0]=(x y)` gets the right message now but is non-fatal in huck where
-# bash aborts, and `readonly` / `export` reject the subscripted lvalue with
-# their own earlier diagnostics before ever reaching this one.
+# The DECLARATION-BUILTIN forms behave the same way (#585): all five report this
+# same message and abandon the list. `readonly` and `export` reach it only
+# because the LIST rule is checked BEFORE their own rejection of a subscripted
+# lvalue — `readonly a[0]=x` is `` `a[0]': not a valid identifier `` while
+# `readonly a[0]=(x y)` is this error.
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
@@ -68,6 +69,25 @@ check "single element"      'a[0]=(x); echo NOTREACHED'
 # --- from a script file it reports and CARRIES ON ---
 check_script "script keeps going"   'a[0]=(x y)'
 check_script "script assoc"         'declare -A m; m[k]=(x y)'
+
+# --- the declaration builtins: same message, same abandonment (#585) ---
+check "declare"             'declare a[0]=(x y); echo NOTREACHED'
+check "typeset"             'typeset a[0]=(x y); echo NOTREACHED'
+check "declare -a"          'declare -a a[0]=(x y); echo NOTREACHED'
+check "readonly"            'readonly a[0]=(x y); echo NOTREACHED'
+check "export"              'export a[0]=(x y); echo NOTREACHED'
+check "local in a function" 'f(){ local a[0]=(x y); echo NOTREACHED; }; f; echo ALSONOT'
+check "readonly name sub"   'readonly a[i]=(x); echo NOTREACHED'
+check "export expr sub"     'export a[2+3]=(x); echo NOTREACHED'
+check_script "declare in a script" 'declare a[0]=(x y)'
+# The list rule is checked BEFORE the subscripted-lvalue rejection those two
+# builtins have of their own, so a SCALAR RHS still gets the identifier error.
+check "readonly scalar rhs" 'readonly a[0]=x; echo "rc=$?"'
+check "export scalar rhs"   'export a[0]=x; echo "rc=$?"'
+check "readonly on element" 'a=(p q); readonly a[1]=x; echo "rc=$?"; declare -p a'
+# A declaration builtin with a NON-list failure still reports and carries on.
+check "declare readonly var" 'readonly r=1; declare r=2; echo AFTER'
+check "declare scalar sub"  'declare a[0]=x; echo "rc=$?"; declare -p a'
 
 # --- controls: the valid forms are untouched ---
 check "whole array"         'a=(x y); echo "${a[@]}"'
