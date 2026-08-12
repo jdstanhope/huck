@@ -116,6 +116,27 @@ check "-E ignores names"      'complete -E -o nospace foo bar; complete -p; echo
 check "-p -D -E prints -D"    'complete -D -o nospace; complete -p -D -E; echo "rc=$?"'
 check "-D with -r removes"    'complete -D -r; complete -p; echo "rc=$?"'
 
+# --- #567: a bad `-o` NAME is `invalid option name`, in all three builtins
+#     (and on compopt's `+o` side too) — not "invalid completion option". ---
+check "complete -o bad"    'complete -o zzz foo; echo "rc=$?"'
+check "complete -o empty"  'complete -o "" foo; echo "rc=$?"'
+check "compgen -o bad"     'compgen -o zzz; echo "rc=$?"'
+check "compopt -o bad"     'compopt -o zzz; echo "rc=$?"'
+check "compopt +o bad"     'compopt +o zzz; echo "rc=$?"'
+
+# --- #568: nothing can be missing from a table that was never created, so the
+#     FIRST `complete -r` in a fresh shell is a silent success. ---
+check "-r fresh shell"     'complete -r nosuch; echo "rc=$?"'
+check "-r fresh two names" 'complete -r nosuch1 nosuch2; echo "rc=$?"'
+check "-r fresh reserved"  'complete -r _DefaultCmD_; echo "rc=$?"'
+check "-r once created"    'complete foo; complete -r nosuch; echo "rc=$?"'
+check "-r after empty out" 'complete foo; complete -r foo; complete -r nosuch; echo "rc=$?"'
+check "-r after clear all" 'complete foo; complete -r; complete -r nosuch; echo "rc=$?"'
+check "-r after -D only"   'complete -D -o nospace; complete -r nosuch; echo "rc=$?"'
+check "-r after -E only"   'complete -E -o nospace; complete -r nosuch; echo "rc=$?"'
+# `-p` has no such rule: a missing name reports either way.
+check "-p fresh shell"     'complete -p nosuch; echo "rc=$?"'
+
 # --- print-all ORDER: bash's hash walk, not sorted and not insertion order ---
 check "order abc"          'complete a; complete b; complete c; complete -p'
 check "order cba"          'complete c; complete b; complete a; complete -p'
