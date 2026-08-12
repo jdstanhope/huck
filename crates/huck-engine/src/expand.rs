@@ -948,6 +948,15 @@ fn expand_array_param(
         }
         // ${#a[i]} — char count of the element at `i`.
         (PM::Length, SK::Index(w)) => {
+            // #491: on a variable that is entirely UNSET, bash answers 0 and
+            // raises nothing — the length of a missing element. It never
+            // evaluates the negative-subscript wrap, which is what has no
+            // answer without a maximum index. A SET variable is different:
+            // `a=(x y); echo ${#a[-3]}` really is a bad subscript in bash too,
+            // and aborts the list on both sides.
+            if shell.get_indexed(name).is_none() && shell.get(name).is_none() {
+                return ExpansionResult::Value("0".to_string());
+            }
             let idx = match eval_subscript(w, shell, name) {
                 Ok(i) => i,
                 Err(e) => {

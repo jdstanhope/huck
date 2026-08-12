@@ -146,17 +146,27 @@ fn slicing_negative_length_indexes_from_end() {
 }
 
 #[test]
-fn length_of_element_at_bad_subscript_errors() {
-    // ${#nonexistent[-1]} — negative subscript on an unset array
-    // cannot wrap (no max index), so eval_subscript returns Err.
-    // The fix to (PM::Length, SK::Index) must propagate that error
-    // rather than silently using idx 0.
+fn length_of_element_at_bad_subscript_on_unset_is_zero() {
+    // #491: `${#nonexistent[-1]}` is `0` in bash, with nothing raised — the
+    // length of a missing element. It never evaluates the negative-subscript
+    // wrap, which is the part that has no answer without a maximum index.
+    // This test used to pin the abandon-the-list behaviour (and before v358,
+    // an outright exit).
     let mut s = Shell::new();
-    let _ = expand_for_test(&mut s, "${#nonexistent[-1]}");
-    // v358 (#198): the error now ABANDONS THE LIST rather than exiting.
-    // ⚠️ Neither is right. bash prints `0` and raises nothing at all — huck
-    // was wrong here before this change (it exited) and is still wrong, just
-    // closer. Pinned as-is so the remaining gap stays visible: #491.
+    assert_eq!(expand_for_test(&mut s, "${#nonexistent[-1]}"), "0");
+    assert!(!s.discard_pending());
+    assert!(!s.fatal_pending());
+}
+
+#[test]
+fn length_of_element_at_bad_subscript_on_set_array_still_errors() {
+    // The other half of the same rule: on a variable that IS set, a
+    // negative subscript past the start really is a bad subscript in bash
+    // too, and abandons the list on both sides (#572 covers the label).
+    let mut s = Shell::new();
+    s.replace_indexed("a", [(0usize, "x".to_string())].into_iter().collect())
+        .unwrap();
+    let _ = expand_for_test(&mut s, "${#a[-3]}");
     assert!(s.discard_pending());
     assert!(!s.fatal_pending());
 }
