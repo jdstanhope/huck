@@ -2440,18 +2440,31 @@ impl<'a> Lexer<'a> {
         if length_form && !matches!(self.cursor.peek().copied(), Some('}') | Some('[')) {
             emit_bad_subst!();
         }
-        // ...and a SUBSCRIPT is only legal on a name that could name an array:
-        // `${#a[0]}` is a length, `${#@[0]}`, `${#*[0]}` and `${#1[0]}` are bad
-        // substitutions. The name is `history.last()` here — this runs directly
-        // after Phase 1 emitted it, before any subscript token exists — so a
-        // second `[` AFTER a subscript is left alone (it is its own divergence,
-        // #609).
-        if length_form && self.cursor.peek() == Some(&'[') {
-            let bad_name = matches!(
-                self.history.last().map(|t| &t.kind),
-                Some(TokenKind::ParamName(n))
-                    if n == "@" || n == "*" || n.chars().all(|c| c.is_ascii_digit())
-            );
+        // ...and a SUBSCRIPT is only legal on a name that could name an ARRAY.
+        // `${a[0]}` and `${#a[0]}` are references; `${@[0]}`, `${*[0]}`,
+        // `${1[0]}`, `${-[0]}` and a SECOND subscript (`${a[0][1]}`) are all bad
+        // substitutions in bash (#605, #609) — huck used to answer empty for the
+        // first four and reject the last at parse time.
+        //
+        // `history.last()` is the name here when the `[` follows it directly,
+        // and something else (the subscript's `]`) when a subscript has already
+        // closed — which is exactly the two cases to reject.
+        //
+        // The LENGTH form keeps a narrower rule: `${#?[0]}` answers `0` in bash,
+        // part of the `${#?…}` oddity in #608, so only `@`, `*` and a positional
+        // are rejected there.
+        if self.cursor.peek() == Some(&'[') {
+            let bad_name = match self.history.last().map(|t| &t.kind) {
+                Some(TokenKind::ParamName(n)) => {
+                    if length_form {
+                        n == "@" || n == "*" || n.chars().all(|c| c.is_ascii_digit())
+                    } else {
+                        !is_valid_param_name(n)
+                    }
+                }
+                // A `[` that does not follow a name follows a closed subscript.
+                _ => true,
+            };
             if bad_name {
                 emit_bad_subst!();
             }

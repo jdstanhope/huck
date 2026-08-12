@@ -26,9 +26,9 @@
 #
 # NOT here: `${#?:-D}` and `${#-:-D}`, which bash answers `0` for (it stops
 # reading the name at the special and treats the rest as an operator on `$#`)
-# where huck calls both a bad substitution — #608; and a DOUBLE subscript
-# (`${a[0][1]}`), which bash calls a bad substitution and huck rejects at parse
-# time with its own message — #609.
+# where huck calls both a bad substitution — #608. The subscript forms WITHOUT
+# a length prefix (`${@[0]}`, `${a[0][1]}`) live in
+# `subscript_badsubst_diff_check.sh` (#609).
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
