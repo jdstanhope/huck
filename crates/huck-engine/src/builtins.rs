@@ -250,7 +250,7 @@ pub fn run_builtin(
             if !in_fn_or_source {
                 shell.builtin_usage_error = Some(2);
             }
-            builtin_return(args, shell)
+            builtin_return(args, err, shell)
         }
         "bind" => builtin_bind(args, out, err, shell),
         "umask" => builtin_umask(args, out, err, shell),
@@ -340,14 +340,54 @@ fn builtin_continue(args: &[String], err: &mut dyn Write, shell: &Shell) -> Exec
     }
 }
 
-/// `return [N]` builtin. Sets the exit status to N (or `$?` if N is
-/// omitted or unparseable) and returns `FunctionReturn(code)` so the
-/// enclosing function unwinds. Behavior preserved from the v0 inline
-/// implementation — extracted to a named helper for symmetry with
-/// builtin_break and builtin_continue.
-fn builtin_return(args: &[String], shell: &Shell) -> ExecOutcome {
+/// bash's `legal_number()` (lib/sh/shquote.c's neighbour in general.c): a
+/// base-10 integer with optional surrounding whitespace and sign. NOT
+/// `parse::<i32>()`: bash accepts `" 3 "` and rejects `0x10` and the empty
+/// string, and an out-of-range value is a failure rather than a saturation.
+fn legal_number(s: &str) -> Option<i64> {
+    let t = s.trim_matches(|c: char| c == ' ' || c == '\t' || c == '\n');
+    if t.is_empty() {
+        return None;
+    }
+    let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse::<i64>().ok()
+}
+
+/// `return [N]` builtin. bash's `return_builtin` + `get_exitstat`:
+///
+///   * more than one argument is `return: too many arguments` and a HARD
+///     abort of the shell with status 1 — not catchable by `||` or `if`
+///     (measured; a `( return 3 4 )` kills only the subshell);
+///   * a leading `--` is skipped, so `return -- 3` returns 3;
+///   * the argument must be a `legal_number`, else
+///     `return: <arg>: numeric argument required` and the function returns
+///     with status 2 (the rest of its body is skipped);
+///   * the value is masked to `& 255`, so `return -1` is 255 and
+///     `return 300` is 44. huck returned the raw `i32`, so `$?` could hold
+///     -1 or 300.
+///
+/// With no argument at all the status is `$?`, unchanged.
+fn builtin_return(args: &[String], err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
+    // `--` first: bash's `get_exitstat` skips it before counting.
+    let args = match args.first() {
+        Some(a) if a == "--" => &args[1..],
+        _ => args,
+    };
+    if args.len() > 1 {
+        crate::sh_error_to!(shell, err, None, "return: too many arguments");
+        return ExecOutcome::Exit(1);
+    }
     let code = match args.first() {
-        Some(s) => s.parse::<i32>().unwrap_or_else(|_| shell.last_status()),
+        Some(a) => match legal_number(a) {
+            Some(n) => (n & 255) as i32,
+            None => {
+                crate::sh_error_to!(shell, err, None, "return: {a}: numeric argument required");
+                2
+            }
+        },
         None => shell.last_status(),
     };
     ExecOutcome::FunctionReturn(code)
@@ -10490,12 +10530,42 @@ fn builtin_ulimit(
     ExecOutcome::Continue(status)
 }
 
+/// bash's `no_options()` (builtins/common.c): a builtin that takes NO options
+/// still runs the option scanner, so a leading `-x` is rejected with the
+/// standard two-line diagnostic at status 2 and a `--` is consumed. Returns
+/// the index of the first operand, or `Err(2)` once the diagnostic is out.
+///
+/// Used by `times` (which then IGNORES its operands — `times x` runs) and by
+/// `caller` (whose leading-dash argument is an INVALID OPTION, not an invalid
+/// number) — #520.
+fn no_options(
+    name: &'static str,
+    args: &[String],
+    shell: &mut Shell,
+    err: &mut dyn Write,
+) -> Result<usize, i32> {
+    let mut g =
+        crate::builtin_opts::Getopt::new(name, crate::builtin_opts::ArgView::Plain(args), "");
+    match g.next_opt(shell, err) {
+        // An empty spec accepts nothing, so a leading `-x` always fails here.
+        Ok(Some(o)) => Err(g.reject_unhandled(o.ch, shell, err)),
+        Ok(None) => Ok(g.rest_index()),
+        Err(code) => Err(code),
+    }
+}
+
 fn builtin_times(
-    _args: &[String],
+    args: &[String],
     out: &mut dyn Write,
-    _err: &mut dyn Write,
-    _shell: &mut Shell,
+    err: &mut dyn Write,
+    shell: &mut Shell,
 ) -> ExecOutcome {
+    // bash's `times` takes no options — and ignores any operands, so
+    // `times x` prints the times while `times -Q` is a usage error. huck ran
+    // regardless, which made a bad option silently do the work.
+    if let Err(code) = no_options("times", args, shell, err) {
+        return ExecOutcome::Continue(code);
+    }
     let mut t: libc::tms = unsafe { std::mem::zeroed() };
     unsafe {
         libc::times(&mut t);
@@ -10606,6 +10676,26 @@ fn builtin_caller(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
+    // bash returns 1 SILENTLY when there is no call frame at all — its
+    // `caller_builtin` bails on a missing FUNCNAME/BASH_SOURCE/BASH_LINENO
+    // before it looks at the arguments, so `caller -Q` at the top level is
+    // rc 1 with no diagnostic, not an option error (#520).
+    let in_fn_or_source = shell.call_stack.iter().any(|f| {
+        matches!(
+            f.kind,
+            crate::shell_state::FrameKind::Function | crate::shell_state::FrameKind::Source
+        )
+    });
+    if !in_fn_or_source {
+        return ExecOutcome::Continue(1);
+    }
+    // Then bash's `no_options`: a leading dash is an INVALID OPTION (`-1` and
+    // `-Q` alike), and `--` is consumed so `caller --` is the no-expr form.
+    let rest = match no_options("caller", args, shell, err) {
+        Ok(i) => i,
+        Err(code) => return ExecOutcome::Continue(code),
+    };
+    let args = &args[rest..];
     let n = shell.call_stack.len();
     match args.first() {
         None => {

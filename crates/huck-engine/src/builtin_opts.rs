@@ -314,6 +314,7 @@ pub(crate) fn usage_for(name: &str) -> &'static str {
     match name {
         "alias" => "alias [-p] [name[=value] ... ]",
         "builtin" => "builtin [shell-builtin [arg ...]]",
+        "caller" => "caller [expr]",
         "cd" => "cd [-L|[-P [-e]] [-@]] [dir]",
         "command" => "command [-pVv] command [arg ...]",
         "compgen" => {
@@ -359,6 +360,9 @@ pub(crate) fn usage_for(name: &str) -> &'static str {
         "typeset" => {
             "typeset [-aAfFgiIlnrtux] name[=value] ... or typeset -p [-aAfFilnrtux] [name ...]"
         }
+        // `times` and `caller` take NO options, but they still run the
+        // scanner (bash's `no_options`) and so still need a usage line (#520).
+        "times" => "times",
         "ulimit" => "ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]",
         "umask" => "umask [-p] [-S] [mode]",
         "unalias" => "unalias [-a] name [name ...]",
