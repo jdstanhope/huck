@@ -46,4 +46,39 @@ check "trace array quoted elt" $'set -x; a=(\'a b\' c)'
 check "trace array subscripts" 'set -x; a=([2]=x [5]=y)'
 check "trace assoc assign"     'declare -A m; set -x; m=([k]=v [j]=w)'
 
+# --- #372: a DECLARATION BUILTIN with a compound array value traces as TWO
+#     lines — the value on its own, RE-QUOTED (every element single-quoted, an
+#     explicit subscript quoted too), then the builtin with the operand reduced
+#     to the bare NAME. Note the contrast with the bare assignment rows above,
+#     which bash traces as their literal source: `a=(1 2 3)` but
+#     `declare -a a=('1' '2' '3')`.
+check "declare -a two lines"   'set -x; declare -a a=(x y)'
+check "declare -A two lines"   'set -x; declare -A m=([k]=v [j]=w)'
+check "declare -a quoted elt"  $'set -x; declare -a a=(\'x y\' z)'
+check "declare -a squote elt"  $'set -x; declare -a a=("a\'b")'
+check "declare -a empty"       'set -x; declare -a a=()'
+check "declare -A empty"       'set -x; declare -A m=()'
+check "declare -a subscripts"  'set -x; declare -a a=([3]=x [1]=y)'
+check "declare -a append elt"  'set -x; declare -a a=([0]+=x)'
+check "declare -A empty value" 'set -x; declare -A m=([k]="")'
+check "declare -A spaced key"  'set -x; declare -A m=([a b]="c d")'
+check "declare -a plus scalar" 'set -x; declare -a a=(1 2) x=5'
+check "declare -a plus bare"   'set -x; declare -a a=(1 2) b'
+check "declare -ax flags"      'set -x; declare -ax e=(1)'
+check "readonly -a two lines"  'set -x; readonly -a r=(1 2)'
+check "export -a two lines"    'set -x; export -a e=(1 2)'
+check "typeset -a two lines"   'set -x; typeset -a t=(1 2)'
+check "local -a in a function" 'set -x; f(){ local -a a=(1 2); }; f'
+check "declare -a then cmd"    'set -x; declare -a a=(1); echo done'
+check "declare -a expanded"    'v=1; set -x; declare -a a=($v 2)'
+check "declare -A expanded key" 'k=K; set -x; declare -A m=([$k]=v)'
+# Untouched: a scalar declare stays on ONE line.
+check "declare scalar one line" 'set -x; declare x=1'
+check "declare -i one line"    'set -x; declare -i n=5'
+#
+# NOT covered — the elements are traced BEFORE the assignment's own expansion,
+# so an element that word-SPLITS (`declare -a a=($v)` with `v="1 2"`), GLOBS
+# (`a=(*.md)`) or holds a command substitution is rendered pre-split and the
+# substitution RUNS TWICE. Different root, filed as #581.
+
 harness_summary

@@ -1642,6 +1642,38 @@ fn render_elem_value(v: &crate::lexer::Word, shell: &mut Shell) -> String {
     }
 }
 
+/// bash's `set -x` rendering of a declaration builtin's compound array value
+/// (#372). Every element is SINGLE-QUOTED, and an explicit subscript is quoted
+/// too: `declare -a a=(x "y z")` traces as `a=('x' 'y z')` and
+/// `declare -A m=([k]=v)` as `m=(['k']='v')`. An empty literal is `()`.
+///
+/// Deliberately not `reconstruct_array_literal`: that one produces re-parseable
+/// source for `declare -p`/`eval`, which is a different (double-quoted, and
+/// bare for a subscript) shape.
+pub(crate) fn xtrace_array_literal(
+    elems: &[crate::lexer::ArrayLiteralElement],
+    shell: &mut Shell,
+) -> String {
+    fn sq(s: &str) -> String {
+        format!("'{}'", crate::builtins::escape_alias_value(s))
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(elems.len());
+    for e in elems {
+        let value = sq(&render_elem_value(&e.value, shell));
+        match &e.subscript {
+            Some(sub) => {
+                let key = sq(&expand_assignment(sub, shell));
+                parts.push(format!(
+                    "[{key}]{}={value}",
+                    if e.append { "+" } else { "" }
+                ));
+            }
+            None => parts.push(value),
+        }
+    }
+    format!("({})", parts.join(" "))
+}
+
 /// Reconstruct an array literal to re-parseable `(e1 e2 [k]=v …)` text.
 pub(crate) fn reconstruct_array_literal(
     elems: &[crate::lexer::ArrayLiteralElement],
