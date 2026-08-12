@@ -1,0 +1,96 @@
+---
+title: "The file descriptor that came back"
+date: 2026-08-12
+summary: "Ten more fixes, led by a closed file descriptor that reopened itself because the shell saved another one on top of it — and a trap that fired twice depending on how many exclamation marks you typed."
+tags: ["bash-compat", "redirection", "traps", "xtrace"]
+version: null
+draft: false
+---
+
+A shell has to be boringly predictable about file descriptors. This round began
+with one that came back from the dead.
+
+## A close that got undone
+
+`>&-` closes a descriptor. huck did that correctly — and then, if the same
+command had *any other* redirection after it, the descriptor quietly reopened:
+
+```bash
+# before
+echo hi >&- 2>/dev/null; echo "rc=$?"
+hi
+rc=0
+
+# after
+echo hi >&- 2>/dev/null; echo "rc=$?"
+rc=1
+```
+
+The mechanism is almost funny. Before replacing a descriptor, the shell saves
+the old one by duplicating it — and `dup()` hands back the *lowest free* number.
+Once `>&-` had freed fd 1, the very next redirection's save-copy landed on fd 1
+itself, pointing at wherever fd 2 used to go. The write then succeeded and the
+close the script asked for had evaporated. Saved descriptors now go somewhere
+high, out of the way, which is what bash has always done.
+
+## A trap that counted your exclamation marks
+
+`!` negates a command. Two of them cancel out. huck agreed — except that the
+ERR trap fired twice for an even number of them:
+
+```bash
+# before
+trap "echo E:$?" ERR; ! ! { false; }
+E:0
+E:0
+
+# after
+trap "echo E:$?" ERR; ! ! { false; }
+E:0
+```
+
+One `!` was fine. Three were fine. Two, or four, fired twice. The parity is the
+tell: an even number of negations cancels to "not negated", which left the
+compound wrapped in a shape the trap logic no longer recognised as a body, so
+the group's own failure was reported on top of the failure inside it.
+
+## Watching something changed it
+
+This one is the reason `set -x` exists at all, and the reason it should never
+matter:
+
+```bash
+# before — with set -x, the command inside <( ) ran TWICE
+set -x; [[ -e <(echo M >>counter) ]]
+inner command ran 2 times
+
+# after
+inner command ran 1 time
+```
+
+huck expanded the operands once to build the trace line and once to actually
+evaluate the test. Expanding is what *runs* a `<(cmd)` or `$(cmd)`, so turning on
+tracing doubled every side effect inside a `[[ … ]]`. Now the operands are
+expanded once and both the trace and the test are built from that — which, as a
+bonus, made the trace itself more accurate, because each operand is now shown in
+the form its operator actually uses.
+
+## The rest
+
+Seven more: `wait -n -p VAR`, `{VAR}>file` and a coprocess's `NAME_PID` all
+silently overwrote a **readonly** variable, and now refuse the way bash does;
+`declare -a a=("x y" z)` traces as `a=('x y' 'z')` instead of losing the quotes
+and claiming three elements; `huck -o` with no option name prints the options
+table instead of erroring; assigning a list to one array member names the member
+(`a[i]: cannot assign list to array member`) instead of just the array; exceeding
+the here-document limit inside a sourced file now stops the shell as it does in
+bash; and the process-substitution fallback reads `TMPDIR` from the shell rather
+than from the environment the shell was started with.
+
+Ten issues closed, seven new ones opened along the way. Two are worth knowing
+about: huck
+[runs the valid part of a line that has a syntax error later on](https://github.com/jdstanhope/huck/issues/575),
+so `rm -rf important;;` deletes where bash does nothing, and it
+[has no `-s`, `-i` or `-l` flag](https://github.com/jdstanhope/huck/issues/591),
+which means there is currently no way to pass positional parameters to a script
+read from standard input.
