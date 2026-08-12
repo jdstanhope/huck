@@ -1020,6 +1020,19 @@ fn expand_array_param(
         }
         // ${#a[@]} / ${#a[*]} — element count (NOT max index).
         (PM::Length, SK::All) | (PM::Length, SK::Star) => {
+            // #595: a variable that does not exist AT ALL is unbound under
+            // `set -u` before its element count is asked for — and bash's
+            // status for this shape is 1, not the 127 a bare `${#nope}`
+            // gives under `-c`. An EMPTY indexed array is set, so `a=();
+            // echo ${#a[@]}` still answers 0.
+            if shell.shell_options.nounset
+                && shell.get_indexed(name).is_none()
+                && shell.get(name).is_none()
+            {
+                crate::sh_error!(shell, None, "{name}: unbound variable");
+                shell.report_error(crate::error_fatality::ErrorKind::UnsetUnderNounsetLength);
+                return ExpansionResult::Fatal { status: 1 };
+            }
             ExpansionResult::Value(collect_keys(shell).len().to_string())
         }
         // ${#a[i]} — char count of the element at `i`.
@@ -1476,6 +1489,9 @@ fn expand_part(
             {
                 crate::sh_error!(shell, None, "{name}: unbound variable");
                 shell.report_error(crate::error_fatality::ErrorKind::UnsetUnderNounset);
+                return ControlFlow::Break(());
+            }
+            if report_unbound_length(name, modifier, subscript.as_ref(), *indirect, shell) {
                 return ControlFlow::Break(());
             }
             // Substring on `$@` / `$*` is array-shaped (closes v33's
@@ -2107,6 +2123,41 @@ fn reconstruct_command_source(cmd: &crate::command::Command) -> String {
 /// the result is one string. Each `Var`/`LastStatus`/`CommandSub` part
 /// contributes its value verbatim regardless of the `quoted` flag — matching
 /// bash, which disables splitting on the right-hand side of `NAME=...`.
+/// #595: `${#name}` is subject to `set -u` exactly as `${name}` is — bash
+/// reports `name: unbound variable` rather than answering `0`. Reports and
+/// returns true when the caller must abort.
+///
+/// `$@`/`$*` are exempt: `${#@}` is the positional COUNT, which is `0` for an
+/// empty list whether or not anything is set. So are the special parameters
+/// that always have a value (`$?`, `$-`, `$$`, `$_`, `$!`, `$0`) — they resolve
+/// through `lookup_var`, so the `is_none()` test excludes them by itself. A
+/// POSITIONAL (`${#1}`) is NOT exempt: bash reports it like a name.
+///
+/// Called from every dispatch site that expands a `${…}`: the word path, the
+/// no-split path (assignment RHS, `case` subject, `[[ ]]` operand) and the
+/// arithmetic path, since a rule wired into only one of them is the #315
+/// shape of bug.
+pub(crate) fn report_unbound_length(
+    name: &str,
+    modifier: &crate::lexer::ParamModifier,
+    subscript: Option<&crate::lexer::SubscriptKind>,
+    indirect: bool,
+    shell: &mut Shell,
+) -> bool {
+    if matches!(modifier, crate::lexer::ParamModifier::Length)
+        && subscript.is_none()
+        && !indirect
+        && !matches!(name, "@" | "*")
+        && shell.shell_options.nounset
+        && shell.lookup_var(name).is_none()
+    {
+        crate::sh_error!(shell, None, "{name}: unbound variable");
+        shell.report_error(crate::error_fatality::ErrorKind::UnsetUnderNounset);
+        return true;
+    }
+    false
+}
+
 pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
     // Snapshot $? so `LastStatus` parts read the value at the start of
     // expansion, not whatever a preceding `$(cmd)` mutated it to. Same
@@ -2176,6 +2227,9 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 indirect,
             } => {
                 if emit_bad_subst(modifier, word, shell) {
+                    return result;
+                }
+                if report_unbound_length(name, modifier, subscript.as_ref(), *indirect, shell) {
                     return result;
                 }
                 let result_pe = if *indirect {
