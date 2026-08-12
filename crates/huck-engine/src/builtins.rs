@@ -9251,7 +9251,7 @@ fn builtin_hash(
     // (2) The flush. It empties the table but does NOT un-create it, so a
     // later `hash -d nosuch` still reports `not found`.
     if reset {
-        Rc::make_mut(&mut shell.command_hash).clear();
+        shell.hash_clear();
         // bash keeps `hash -r` SILENT: with no NAMEs left it returns here
         // rather than falling into the listing below, so it does not print
         // `hash: hash table empty` at the table it just emptied.
@@ -9263,20 +9263,25 @@ fn builtin_hash(
     // (3) No NAMEs: list the table. Reached with `-p` and `-l` too — bash's
     // `hash -p /bin/ls` (no name) prints the table rather than erroring.
     if names.is_empty() {
-        let mut entries: Vec<(&String, &(std::path::PathBuf, u32))> =
-            shell.command_hash.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
+        // #555: bash WALKS its hash table to print, so the order is neither
+        // sorted nor insertion order — bucket ascending, newest first within
+        // a bucket. `hash_names_in_bash_order` reproduces it.
+        let names_ordered = shell.hash_names_in_bash_order();
         if list {
             // Re-input form. An empty table prints NOTHING under `-l`.
-            for (name, (path, _)) in entries {
-                let _ = writeln!(out, "builtin hash -p {} {}", path.display(), name);
+            for name in &names_ordered {
+                if let Some((path, _)) = shell.command_hash.get(*name) {
+                    let _ = writeln!(out, "builtin hash -p {} {name}", path.display());
+                }
             }
-        } else if entries.is_empty() {
+        } else if names_ordered.is_empty() {
             let _ = writeln!(out, "hash: hash table empty");
         } else {
             let _ = writeln!(out, "hits\tcommand");
-            for (_name, (path, hits)) in entries {
-                let _ = writeln!(out, "{hits:>4}\t{}", path.display());
+            for name in &names_ordered {
+                if let Some((path, hits)) = shell.command_hash.get(*name) {
+                    let _ = writeln!(out, "{hits:>4}\t{}", path.display());
+                }
             }
         }
         return ExecOutcome::Continue(0);
@@ -9314,24 +9319,17 @@ fn builtin_hash(
             continue;
         }
         if let Some(path) = &explicit_path {
-            Rc::make_mut(&mut shell.command_hash)
-                .insert(name.clone(), (std::path::PathBuf::from(path), 0u32));
-            shell.command_hash_created = true;
+            shell.hash_insert(name, std::path::PathBuf::from(path));
         } else if delete {
             // A table that has never held anything reports nothing: bash's
             // `phash_remove` returns success when `hashed_filenames` is null.
-            if shell.command_hash_created
-                && Rc::make_mut(&mut shell.command_hash).remove(name).is_none()
-            {
+            if shell.command_hash_created && !shell.hash_remove(name) {
                 crate::sh_error_to!(shell, err, None, "hash: {name}: not found");
                 exit = 1;
             }
         } else {
             match search_path_for(name, shell) {
-                Some(path) => {
-                    Rc::make_mut(&mut shell.command_hash).insert(name.clone(), (path, 0u32));
-                    shell.command_hash_created = true;
-                }
+                Some(path) => shell.hash_insert(name, path),
                 None => {
                     crate::sh_error_to!(shell, err, None, "hash: {name}: not found");
                     exit = 1;
