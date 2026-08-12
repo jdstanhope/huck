@@ -4,10 +4,10 @@
 #   - `disown -Z`      usage string `[-h] [-ar] [jobspec ... | pid ...]`
 #   - `fg -s` / `bg -s` report `-<opt>: invalid option` before the usage line,
 #     with usage `fg [job_spec]` / `bg [job_spec ...]`
-# fg/bg cases run under `set -m`: without job control bash short-circuits to
-# `fg: no job control` before parsing options, so `set -m` is what exercises the
-# option/usage wording this issue is about (a wording-only fix — huck models no
-# job-control-disabled state). Compares stdout+stderr+rc byte-identically.
+# fg/bg cases run under `set -m`: without job control BOTH shells short-circuit
+# to `fg: no job control` before parsing options (#518), so `set -m` is what
+# exercises the option/usage wording this issue is about. Compares
+# stdout+stderr+rc byte-identically.
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 HUCK=target/debug/huck

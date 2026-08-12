@@ -24,8 +24,9 @@ check "bg % running"     "${J}sleep 2 & bg %; echo rc=\$?${R}"
 check "bg %2 of two"     "${J}sleep 2 & sleep 2 & bg %2; echo rc=\$?; kill -KILL %1 %2 2>/dev/null; wait 2>/dev/null"
 
 # --- no current job ---------------------------------------------------------
-# (All of these enable job control: without `set -m` bash answers "no job
-# control" before it ever looks at the operand — a separate, filed divergence.)
+# (All of these enable job control: without `set -m` BOTH shells answer "no job
+# control" before ever looking at the operand — that path is fg_bg_no_jobcontrol
+# _diff_check.sh's, #518/#416.)
 check "bg bare no jobs"     'set -m; bg; echo rc=$?'
 check "fg bare no jobs"     'set -m; fg; echo rc=$?'
 check "disown bare no jobs" 'disown; echo rc=$?'  # disown needs no job control
@@ -34,9 +35,9 @@ check "fg %1 no jobs"       'set -m; fg %1; echo rc=$?'
 
 # (Resuming a genuinely STOPPED job is covered by job_stop_cont_diff_check.sh.
 # It cannot be re-checked here: bash prints an asynchronous `[1]+  Stopped`
-# notice huck does not, and filtering it needs a pipe — which puts bash's `bg`
-# in a subshell, where it reports "no job control" instead. Both of those are
-# separate, pre-existing divergences, filed.)
+# notice huck does not, and filtering it needs a pipe — which puts `bg` in a
+# subshell, where BOTH shells now report "no job control" (#416). The missing
+# async notice is a separate, filed divergence.)
 
 # --- #417: bg takes a LIST of specs; status 1 if any operand failed ---------
 check "two specs, none exist"  "${J}bg %1 %2; echo rc=\$?"
