@@ -938,6 +938,14 @@ pub struct Shell {
     /// M-34 in docs/bash-divergences.md).
     pub command_hash: Rc<std::collections::HashMap<String, (std::path::PathBuf, u32)>>,
 
+    /// Whether the command hash table has ever held an entry. bash creates
+    /// `hashed_filenames` lazily on the first insert and never frees it, and
+    /// `phash_remove` returns "removed" for a table that does not exist yet —
+    /// so `hash -d nosuch` is a SILENT success in a fresh shell but reports
+    /// `not found` once anything has been hashed, even after `hash -r`
+    /// emptied it again (#509). An empty map cannot tell those apart.
+    pub command_hash_created: bool,
+
     /// Directory stack maintained by the `pushd`/`popd`/`dirs`
     /// builtins. Top is index 0 — always synced with `$PWD` at
     /// the top of each pushd/popd/dirs call.
@@ -1229,6 +1237,7 @@ impl Shell {
             local_scopes: Vec::new(),
             loop_depth: 0,
             command_hash: Rc::new(std::collections::HashMap::new()),
+            command_hash_created: false,
             dir_stack: Vec::new(),
             completion_specs: Rc::new(CompletionSpecs::default()),
             current_completion_spec: None,
