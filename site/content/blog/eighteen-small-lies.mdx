@@ -1,0 +1,119 @@
+---
+title: "Eighteen small lies"
+date: 2026-08-12
+summary: "A cascade of eighteen bug-fix rounds, starting from a redirection that reported an error and then quietly wrote your data into the file it was supposed to close."
+tags: ["bash-compat", "redirection", "builtins", "completion"]
+version: null
+draft: false
+---
+
+The worst kind of shell bug is the one that tells you it failed and then does
+the thing anyway. This round started with one of those.
+
+## A close that didn't close
+
+`>&-` closes a file descriptor. So does a variable that expands to `-` — that
+is how you write "close whichever fd this variable names":
+
+```bash
+# before
+m=-; exec 3>/dev/null; exec 3>&$m; echo LEAKED >&3; echo rc=$?
+huck: line 1: -: ambiguous redirect
+rc=0
+```
+
+Read that twice. huck complained that the redirection was ambiguous, refused to
+perform it — and then the write to fd 3 **succeeded**, because the descriptor
+was still open. Anything a script sent through that fd went somewhere it was
+never meant to go, with no second complaint.
+
+```bash
+# after
+m=-; exec 3>/dev/null; exec 3>&$m; echo LEAKED >&3; echo rc=$?
+huck: line 1: 3: Bad file descriptor
+rc=1
+```
+
+That is what bash does: the fd is gone, so the write fails and says so. The
+harness for it compares the *files on disk* afterwards, because the difference
+between "duplicated an fd" and "created a file" is invisible in the output —
+that lesson cost a whole round the last time round.
+
+## A typo that did the work anyway
+
+`times` takes no options. Give it one and bash tells you so. huck ignored the
+option and ran:
+
+```bash
+# before
+times -Q; echo rc=$?
+0m0.000s 0m0.000s
+0m0.000s 0m0.000s
+rc=0
+
+# after
+times -Q; echo rc=$?
+huck: line 1: times: -Q: invalid option
+times: usage: times
+rc=2
+```
+
+`return` had the same flavour of problem in a more interesting place. Its
+argument is masked to a byte, so `return -1` is 255 — a real exit status.
+huck stored the number it was given:
+
+```bash
+# before
+f(){ return -1; }; f; echo rc=$?
+rc=-1
+
+# after
+f(){ return -1; }; f; echo rc=$?
+rc=255
+```
+
+A negative `$?` is not a number any other program will ever hand you.
+
+## The directory you are already standing in
+
+If a directory above you loses its search permission while you are inside it,
+you can still `cd .` — you are already there, nothing has to be looked up. bash
+knows this: when the canonical path cannot be walked it retries the path you
+actually typed.
+
+```bash
+mkdir -p /tmp/t9/sub; cd /tmp/t9/sub; chmod 000 /tmp/t9
+
+# before
+cd .; echo rc=$?
+huck: line 1: cd: .: Permission denied
+rc=1
+
+# after
+cd .; echo rc=$?
+rc=0
+```
+
+The same retry fixes a second case nobody had noticed: a logical path through a
+symlink whose canonical form does not exist (`cd ../q` from a symlinked
+directory) now lands where bash lands.
+
+## The rest
+
+Fifteen more rounds went the same way, each one small: `fg` and `bg` now say
+`no job control` in a script instead of hunting for a job that could never be
+resumed; `complete -p` prints lines that can actually be pasted back in, in
+bash's order (a hash walk, not alphabetical — the same trick the shell uses for
+associative arrays); `hash -dt ls` reports the entry instead of deleting it;
+an invalid option spelled with a non-ASCII character is reported as the raw
+byte you typed; `${#unset[-1]}` is `0`; and a syntax error inside `$( )` exits
+127 under `-c`, as it does in bash, including when it happens inside a sourced
+file — where it kills the whole shell.
+
+Eighteen issues closed. Thirteen new ones opened along the way, which is the
+usual ratio: every fix is a measurement, and measurements find things. The two
+worth knowing about if you use huck today are that it
+[panics on a non-UTF-8 argument or environment variable](https://github.com/jdstanhope/huck/issues/553)
+— one odd byte in your environment and the shell will not start — and that it
+[runs the valid part of a line that has a syntax error later on](https://github.com/jdstanhope/huck/issues/575),
+so `rm -rf important;;` deletes in huck and does nothing in bash.
