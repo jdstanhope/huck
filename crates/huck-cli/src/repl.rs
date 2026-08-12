@@ -198,6 +198,15 @@ pub fn run(args: &[String], version: &str) -> i32 {
     // ----- interactive / piped-stdin REPL (unchanged below this line) -----
     // This path reads commands from stdin — drives the trailing `s` in `$-` (#231).
     shell_cell.borrow_mut().reads_stdin = true;
+    // #583: a PIPED stdin session is non-interactive, so `emacs` goes off here
+    // the way it does for `-c` and a script file. An interactive session keeps
+    // the startup default ON, as bash does.
+    {
+        let mut sh = shell_cell.borrow_mut();
+        if !sh.is_interactive {
+            sh.shell_options.emacs = false;
+        }
+    }
     let config = Config::builder()
         .completion_type(CompletionType::List)
         .build();

@@ -294,7 +294,12 @@ impl Default for ShellOptions {
             onecmd: false,
             functrace: false,
             errtrace: false,
-            emacs: false,
+            // #583: bash's `emacs` starts ON — readline's default editing
+            // mode — and is turned OFF once the shell commits to being
+            // non-interactive. That transient is observable: `bash -o` lists
+            // the options DURING option parsing and shows `emacs on` even
+            // with stdin at /dev/null, while `bash -c 'set -o'` shows it off.
+            emacs: true,
             vi: false,
             nolog: false,
             privileged: false,

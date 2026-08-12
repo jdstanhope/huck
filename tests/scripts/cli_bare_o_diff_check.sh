@@ -12,10 +12,10 @@
 # ordinary `invalid option name` error. The list also prints at its own POSITION
 # in the sequence, so `-o xtrace -o` shows `xtrace on`.
 #
-# The `emacs` row is normalised away: bash prints its listing DURING option
-# parsing, before a non-interactive shell turns emacs off, so bash says `on` and
-# huck says `off` for that one line — a timing divergence of its own (#583), not
-# this flag's. Every other row already matches byte for byte.
+# The `emacs` row used to be normalised away here: bash prints its listing
+# DURING option parsing, before a non-interactive shell turns emacs off, so it
+# says `on` even with stdin at /dev/null while `set -o` later says `off`. huck
+# now models that transient (#583), so the row is compared like every other.
 #
 # stdout only: the two shells buffer stdout and stderr differently, so a merged
 # capture would order the xtrace line and the table by buffering rather than by
@@ -25,14 +25,12 @@ set -u
 
 BASH_BIN="${BASH_BIN:-bash}"
 
-norm_emacs() { sed -E -e 's/^emacs( +)\t(on|off)$/emacs\1\tEMACS/' -e 's/^set [-+]o emacs$/set ?o emacs/'; }
-
 # stdout + status; stdin is /dev/null so nothing is read.
 check_out() {
     local label="$1" b h
     shift
-    b=$(timeout 10 "$BASH_BIN" --norc --noprofile "$@" </dev/null 2>/dev/null | norm_emacs; echo "EXIT:$?")
-    h=$(timeout 10 "$HUCK_BIN" "$@" </dev/null 2>/dev/null | norm_emacs; echo "EXIT:$?")
+    b=$(timeout 10 "$BASH_BIN" --norc --noprofile "$@" </dev/null 2>/dev/null; echo "EXIT:$?")
+    h=$(timeout 10 "$HUCK_BIN" "$@" </dev/null 2>/dev/null; echo "EXIT:$?")
     compare "$label" "$b" "$h"
 }
 
@@ -40,8 +38,8 @@ check_out() {
 check_stdin() {
     local label="$1" prog="$2" b h
     shift 2
-    b=$(printf '%s\n' "$prog" | timeout 10 "$BASH_BIN" --norc --noprofile "$@" 2>/dev/null | norm_emacs; echo "EXIT:$?")
-    h=$(printf '%s\n' "$prog" | timeout 10 "$HUCK_BIN" "$@" 2>/dev/null | norm_emacs; echo "EXIT:$?")
+    b=$(printf '%s\n' "$prog" | timeout 10 "$BASH_BIN" --norc --noprofile "$@" 2>/dev/null; echo "EXIT:$?")
+    h=$(printf '%s\n' "$prog" | timeout 10 "$HUCK_BIN" "$@" 2>/dev/null; echo "EXIT:$?")
     compare "$label" "$b" "$h"
 }
 
@@ -64,5 +62,11 @@ check_out "+o with a name"       +o allexport
 check_out "-o then -o is a name" -o -o
 check_out "-o empty name"        -o ""
 check_out "-o unknown name"      -o nosuchoption
+
+# --- #583: the `emacs` row itself. On in the CLI listing (printed before the
+#     shell commits to being non-interactive), off in every `set -o` that runs
+#     after that commitment. ---
+check_out   "emacs on in the listing" -o
+check_stdin "emacs off once running"  'set -o' -o
 
 harness_summary

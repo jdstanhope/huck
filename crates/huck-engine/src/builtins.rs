@@ -6934,7 +6934,9 @@ const SETO_TABLE: &[OptionInfo] = &[
     },
     OptionInfo {
         name: "emacs",
-        default: false,
+        // #583: on at startup, cleared when the shell commits to being
+        // non-interactive — see `ShellOptions`'s initialiser.
+        default: true,
     },
     OptionInfo {
         name: "errexit",
