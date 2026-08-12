@@ -1870,10 +1870,18 @@ pub(crate) fn reconstruct_word_source_inner(word: &Word) -> String {
 /// (The token-only fallback in `param_expansion.rs` remains for any caller that
 /// expands a modifier without a surrounding word, e.g. arithmetic operands.)
 fn emit_bad_subst(modifier: &crate::lexer::ParamModifier, word: &Word, shell: &mut Shell) -> bool {
-    if let crate::lexer::ParamModifier::BadSubst { .. } = modifier {
+    if let crate::lexer::ParamModifier::BadSubst { raw } = modifier {
         let src = reconstruct_word_source_inner(word);
         crate::sh_error!(shell, None, "{src}: bad substitution");
-        shell.report_error(crate::error_fatality::ErrorKind::Expansion);
+        // #605: `${#@…}` is the one bad substitution bash treats as fatal —
+        // the script stops there, where `${#v:-D}` or `${#*:-D}` reports and
+        // carries on. The whole WORD is named in the message either way, which
+        // is why the shape is read off the expansion's own raw text.
+        shell.report_error(if raw.starts_with("${#@") {
+            crate::error_fatality::ErrorKind::BadSubstAllArgsLength
+        } else {
+            crate::error_fatality::ErrorKind::Expansion
+        });
         true
     } else {
         false

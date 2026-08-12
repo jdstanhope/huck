@@ -89,6 +89,21 @@ pub(crate) enum ErrorKind {
     ///
     /// A script file gives 1 for all three, so the split is `-c`-only (#572).
     UnsetUnderNounsetLength,
+    /// A bad substitution whose parameter is `$@` under the LENGTH prefix —
+    /// `${#@:-D}`, `${#@#a}`, `${#@[0]}`. bash makes this one FATAL where every
+    /// other bad substitution lets the script carry on. Measured:
+    ///
+    /// ```text
+    /// script:  echo ${#@:-D}; echo SAME   -> message, rc 1, no SAME
+    ///          echo ${#v:-D}; echo SAME   -> message, rc 0, SAME
+    /// bash -c: echo ${#@:-D}              -> 127
+    ///          echo ${#v:-D}              ->   1
+    /// ```
+    ///
+    /// `$*` is NOT included (`${#*:-D}` is the ordinary non-fatal kind), nor is
+    /// `$@` without the length prefix (`${@!}`) — the fatality is specific to
+    /// the pair (#605).
+    BadSubstAllArgsLength,
     /// The here-document limit (bash's `HEREDOC_MAX`) exceeded in a NESTED
     /// parse — a sourced file, an `eval`, or a function calling either.
     ///
@@ -224,6 +239,13 @@ pub(crate) fn fatality(kind: ErrorKind, shell: &Shell) -> Fatality {
                 Fatality::ExitShell(2)
             } else {
                 Fatality::Continue
+            }
+        }
+        ErrorKind::BadSubstAllArgsLength => {
+            if can_exit {
+                Fatality::ExitShell(driver_code(1, shell))
+            } else {
+                Fatality::AbortList
             }
         }
         ErrorKind::UnsetUnderNounsetLength => {
