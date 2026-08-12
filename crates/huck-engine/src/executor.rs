@@ -4217,13 +4217,43 @@ fn xtrace_compound(shell: &mut Shell, body: &str) {
 
 /// If `w` is an array-literal RHS (`(a b c)`), return its elements for
 /// best-effort xtrace rendering. `None` for ordinary scalar RHS words.
-fn array_literal_elements(w: &crate::lexer::Word) -> Option<&[crate::lexer::ArrayLiteralElement]> {
+pub(crate) fn array_literal_elements(
+    w: &crate::lexer::Word,
+) -> Option<&[crate::lexer::ArrayLiteralElement]> {
     for part in &w.0 {
         if let crate::lexer::WordPart::ArrayLiteral(elems) = part {
             return Some(elems);
         }
     }
     None
+}
+
+/// A compound `(…)` RHS on a SUBSCRIPTED lvalue, rejected the way bash does
+/// (#76/#585): `name[subscript]: cannot assign list to array member`, and the
+/// command list is abandoned. Returns true when it fired.
+///
+/// `readonly` and `export` need this BEFORE their own "not a valid identifier"
+/// rejection of a subscripted lvalue, because bash checks the list rule first:
+/// `readonly a[0]=x` is the identifier error, `readonly a[0]=(x y)` is this one.
+pub(crate) fn reject_list_to_array_member(
+    name: &str,
+    subscript: &crate::lexer::Word,
+    value: &crate::lexer::Word,
+    shell: &mut Shell,
+    err: &mut dyn std::io::Write,
+) -> bool {
+    if array_literal_elements(value).is_none() {
+        return false;
+    }
+    let sub = crate::expand::reconstruct_word_source(subscript);
+    crate::sh_error_to!(
+        shell,
+        err,
+        None,
+        "{name}[{sub}]: cannot assign list to array member"
+    );
+    shell.report_error(crate::error_fatality::ErrorKind::Expansion);
+    true
 }
 
 /// Clean up (close fd + unlink FIFO + reap) every process substitution recorded
@@ -7934,6 +7964,11 @@ pub(crate) fn apply_one_assignment(
                     None,
                     "{name}[{sub}]: cannot assign list to array member"
                 );
+                // #585: this failure abandons the command list, in a
+                // DECLARATION command as much as in a plain assignment — the
+                // plain path reports the same kind at its caller, and the
+                // declaration builtins only set a status.
+                shell.report_error(crate::error_fatality::ErrorKind::Expansion);
                 return Err(());
             }
         }
@@ -8063,6 +8098,8 @@ pub(crate) fn apply_one_assignment(
                 None,
                 "{name}[{sub}]: cannot assign list to array member"
             );
+            // #585: abandons the command list — see the associative arm above.
+            shell.report_error(crate::error_fatality::ErrorKind::Expansion);
             Err(())
         }
     }

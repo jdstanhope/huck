@@ -1681,6 +1681,15 @@ fn builtin_export_decl(
             },
             DeclArg::Assign(a) => {
                 if let crate::command::AssignTarget::Indexed { name, subscript } = &a.target {
+                    // #585: the LIST rule comes first — `export a[0]=(x y)` is
+                    // `a[0]: cannot assign list to array member`, not the
+                    // identifier rejection below.
+                    if crate::executor::reject_list_to_array_member(
+                        name, subscript, &a.value, shell, err,
+                    ) {
+                        any_error = true;
+                        continue;
+                    }
                     // #114: name the FULL `name[subscript]` source, not the bare
                     // name. bash shows the subscript after word expansion but
                     // NOT arithmetic eval (`AA[$x]`→`AA[9]`, `AA[2+2]` stays).
@@ -2267,12 +2276,31 @@ fn builtin_readonly_decl(
                     }
                     shell.mark_readonly(name);
                 }
-                crate::command::AssignTarget::Indexed { name, .. } => {
+                crate::command::AssignTarget::Indexed { name, subscript } => {
+                    // #585: the LIST rule comes first, as for `export`.
+                    if crate::executor::reject_list_to_array_member(
+                        name, subscript, &a.value, shell, err,
+                    ) {
+                        exit = 1;
+                        continue;
+                    }
+                    // #585: bash rejects a subscripted lvalue here exactly as
+                    // `export` does — `` `a[0]': not a valid identifier ``,
+                    // naming the whole lvalue as written. huck had its own
+                    // wording, naming only the variable.
+                    //
+                    // The LIST case never reaches this: a compound `(…)` RHS on
+                    // an element is caught first, by the same check that serves
+                    // a plain `a[0]=(x y)` (#76).
+                    let lvalue = format!(
+                        "{name}[{}]",
+                        crate::expand::reconstruct_word_source(subscript)
+                    );
                     crate::sh_error_to!(
                         shell,
                         err,
                         None,
-                        "readonly: `{name}': cannot make subscripted-assignment target readonly"
+                        "readonly: `{lvalue}': not a valid identifier"
                     );
                     // POSIX case #1: invalid-identifier ASSIGNMENT (`AA[4]=1`) →
                     // bad-assignment usage error, exit status 1. A bad name without
