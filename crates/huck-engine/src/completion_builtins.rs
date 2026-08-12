@@ -6,7 +6,7 @@ use std::io::Write;
 use std::rc::Rc;
 
 use crate::builtins::ExecOutcome;
-use crate::completion_spec::{Action, CompOptions, CompletionCtx, CompletionSpec};
+use crate::completion_spec::{Action, CompKey, CompOptions, CompletionCtx, CompletionSpec};
 use crate::shell_state::Shell;
 
 /// Output of parsing a `complete` / `compgen` flag string.
@@ -254,21 +254,23 @@ fn print_complete(
     }
 
     if names.is_empty() {
-        // Print all in sorted order: by_command first, then -D, then -E.
-        let mut keys: Vec<&String> = specs.by_command.keys().collect();
-        keys.sort();
-        for k in keys {
-            let _ = writeln!(
-                out,
-                "{}",
-                format_spec_for_print(&specs.by_command[k], Some(k.as_str()), None)
-            );
-        }
-        if let Some(d) = &specs.default_spec {
-            let _ = writeln!(out, "{}", format_spec_for_print(d, None, Some("-D")));
-        }
-        if let Some(es) = &specs.empty_spec {
-            let _ = writeln!(out, "{}", format_spec_for_print(es, None, Some("-E")));
+        // #527: bash keeps every compspec — command names AND the `-D`/`-E`
+        // slots — in ONE hash table and `complete -p` walks it, so the output
+        // order is neither sorted nor insertion order, and the `-D` line is
+        // NOT pinned to the end: it lands wherever `_DefaultCmD_` hashes.
+        for key in specs.keys_in_bash_order() {
+            let line = match key {
+                CompKey::Command(n) => {
+                    format_spec_for_print(&specs.by_command[n], Some(n.as_str()), None)
+                }
+                CompKey::Default => {
+                    format_spec_for_print(specs.default_spec.as_ref().unwrap(), None, Some("-D"))
+                }
+                CompKey::Empty => {
+                    format_spec_for_print(specs.empty_spec.as_ref().unwrap(), None, Some("-E"))
+                }
+            };
+            let _ = writeln!(out, "{line}");
         }
     } else {
         for n in names {
@@ -300,13 +302,13 @@ fn remove_complete(
     let mut status = 0;
     let specs = Rc::make_mut(&mut shell.completion_specs);
     if parsed.is_default {
-        specs.default_spec = None;
+        specs.unregister_slot(CompKey::Default);
     }
     if parsed.is_empty {
-        specs.empty_spec = None;
+        specs.unregister_slot(CompKey::Empty);
     }
     if names.is_empty() && !parsed.is_default && !parsed.is_empty {
-        specs.by_command.clear();
+        specs.clear_commands();
     } else {
         // Collect misses first: `specs` borrows `shell.completion_specs`
         // mutably for the whole loop, so the diagnostic (which needs
@@ -314,7 +316,7 @@ fn remove_complete(
         // the loop, once that borrow has ended.
         let mut missing: Vec<&String> = Vec::new();
         for n in names {
-            if specs.by_command.remove(n).is_none() && !parsed.is_default && !parsed.is_empty {
+            if !specs.unregister(n) && !parsed.is_default && !parsed.is_empty {
                 missing.push(n);
                 status = 1;
             }
@@ -348,44 +350,91 @@ fn register_complete(parsed: &ParsedFlags, err: &mut dyn Write, shell: &mut Shel
     // (#515). Nothing in the tree pinned it.
     let specs = Rc::make_mut(&mut shell.completion_specs);
     if parsed.is_default {
-        specs.default_spec = Some(parsed.spec.clone());
+        specs.register_slot(CompKey::Default, parsed.spec.clone());
     }
     if parsed.is_empty {
-        specs.empty_spec = Some(parsed.spec.clone());
+        specs.register_slot(CompKey::Empty, parsed.spec.clone());
     }
     for n in &parsed.positional {
-        specs.by_command.insert(n.clone(), parsed.spec.clone());
+        specs.register(n, parsed.spec.clone());
     }
     ExecOutcome::Continue(0)
 }
 
-/// Renders a spec for `complete -p` in deterministic re-input form.
+/// bash's `compacts[]` table (pcomplete.c): every `-A` action name in the
+/// order `complete -p` prints them, paired with its one-letter option where
+/// bash has one. Printing walks the table TWICE — the short flags first, then
+/// the `-A name` forms — which is why `complete -u -v -A hostname` comes out
+/// in that order however the flags were typed.
+const COMPACTS: &[(Action, Option<char>)] = &[
+    (Action::Alias, Some('a')),
+    (Action::Arrayvar, None),
+    (Action::Binding, None),
+    (Action::Builtin, Some('b')),
+    (Action::Command, Some('c')),
+    (Action::Directory, Some('d')),
+    (Action::Disabled, None),
+    (Action::Enabled, None),
+    (Action::Export, Some('e')),
+    (Action::File, Some('f')),
+    (Action::Function, None),
+    (Action::Group, Some('g')),
+    (Action::Helptopic, None),
+    (Action::Hostname, None),
+    (Action::Job, Some('j')),
+    (Action::Keyword, Some('k')),
+    (Action::Running, None),
+    (Action::Service, Some('s')),
+    (Action::Setopt, None),
+    (Action::Shopt, None),
+    (Action::Signal, None),
+    (Action::Stopped, None),
+    (Action::User, Some('u')),
+    (Action::Variable, Some('v')),
+];
+
+/// bash's `sh_contains_shell_metas` (lib/sh/shquote.c): whether a word has to
+/// be quoted to survive re-input. `complete -p` runs the COMMAND NAME through
+/// this and single-quotes only when it says yes — which is why bash prints
+/// `complete a~b` but `complete 'a^b'`. Option VALUES are unconditionally
+/// quoted instead, so this is not used for them.
+fn contains_shell_metas(s: &str) -> bool {
+    let b = s.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b' ' | b'\t' | b'\n' => return true,
+            b'\'' | b'"' | b'\\' => return true,
+            b'|' | b'&' | b';' | b'(' | b')' | b'<' | b'>' => return true,
+            b'!' | b'{' | b'}' => return true,
+            b'*' | b'[' | b'?' | b']' | b'^' => return true,
+            b'$' | b'`' => return true,
+            // Tilde expansion only triggers at the start of the word or right
+            // after `=` / `:`, and `#` only starts a comment at the start.
+            b'~' if i == 0 || b[i - 1] == b'=' || b[i - 1] == b':' => return true,
+            b'#' if i == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The command name as `complete -p` writes it: bare when it needs no quoting,
+/// single-quoted (bash's `sh_single_quote`) when it does. An EMPTY name is
+/// quoted too — `complete ""` prints `complete ''`.
+fn print_quote_name(name: &str) -> String {
+    if name.is_empty() || contains_shell_metas(name) {
+        format!("'{}'", crate::builtins::escape_alias_value(name))
+    } else {
+        name.to_string()
+    }
+}
+
+/// Renders a spec for `complete -p` in bash's re-input form: options, then
+/// actions, then the generators, then `-D`/`-E`, then the name.
 fn format_spec_for_print(spec: &CompletionSpec, name: Option<&str>, mode: Option<&str>) -> String {
     let mut parts: Vec<String> = vec!["complete".to_string()];
-    if let Some(m) = mode {
-        parts.push(m.to_string());
-    }
-    if let Some(f) = &spec.function {
-        parts.push(format!("-F '{}'", crate::builtins::escape_alias_value(f)));
-    }
-    if let Some(w) = &spec.wordlist {
-        parts.push(format!("-W '{}'", crate::builtins::escape_alias_value(w)));
-    }
-    if let Some(g) = &spec.glob {
-        parts.push(format!("-G '{}'", crate::builtins::escape_alias_value(g)));
-    }
-    for a in &spec.actions {
-        parts.push(format!("-A {}", a.as_str()));
-    }
-    if let Some(p) = &spec.prefix {
-        parts.push(format!("-P '{}'", crate::builtins::escape_alias_value(p)));
-    }
-    if let Some(s) = &spec.suffix {
-        parts.push(format!("-S '{}'", crate::builtins::escape_alias_value(s)));
-    }
-    if let Some(x) = &spec.filter {
-        parts.push(format!("-X '{}'", crate::builtins::escape_alias_value(x)));
-    }
+    // `-o` options come first, in bash's `compopts[]` table order (which is
+    // alphabetical) — NOT the order they were given on the command line.
     let CompOptions {
         default,
         nospace,
@@ -396,33 +445,62 @@ fn format_spec_for_print(spec: &CompletionSpec, name: Option<&str>, mode: Option
         noquote,
         plusdirs,
     } = spec.options;
-    if default {
-        parts.push("-o default".to_string());
+    for (on, opt) in [
+        (bashdefault, "bashdefault"),
+        (default, "default"),
+        (dirnames, "dirnames"),
+        (filenames, "filenames"),
+        (noquote, "noquote"),
+        (nosort, "nosort"),
+        (nospace, "nospace"),
+        (plusdirs, "plusdirs"),
+    ] {
+        if on {
+            parts.push(format!("-o {opt}"));
+        }
     }
-    if nospace {
-        parts.push("-o nospace".to_string());
+    // Actions: short flags first, then the long `-A` forms, each in table
+    // order. bash stores actions as a BITMASK, so a repeated `-u -u` collapses
+    // and the order the user typed is not recoverable — matching that means
+    // walking the table rather than `spec.actions`.
+    for (act, ch) in COMPACTS {
+        if let Some(c) = ch
+            && spec.actions.contains(act)
+        {
+            parts.push(format!("-{c}"));
+        }
     }
-    if filenames {
-        parts.push("-o filenames".to_string());
+    for (act, ch) in COMPACTS {
+        if ch.is_none() && spec.actions.contains(act) {
+            parts.push(format!("-A {}", act.as_str()));
+        }
     }
-    if bashdefault {
-        parts.push("-o bashdefault".to_string());
+    if let Some(g) = &spec.glob {
+        parts.push(format!("-G '{}'", crate::builtins::escape_alias_value(g)));
     }
-    if dirnames {
-        parts.push("-o dirnames".to_string());
+    if let Some(w) = &spec.wordlist {
+        parts.push(format!("-W '{}'", crate::builtins::escape_alias_value(w)));
     }
-    if noquote {
-        parts.push("-o noquote".to_string());
+    if let Some(p) = &spec.prefix {
+        parts.push(format!("-P '{}'", crate::builtins::escape_alias_value(p)));
     }
-    if nosort {
-        parts.push("-o nosort".to_string());
+    if let Some(s) = &spec.suffix {
+        parts.push(format!("-S '{}'", crate::builtins::escape_alias_value(s)));
     }
-    if plusdirs {
-        parts.push("-o plusdirs".to_string());
+    if let Some(x) = &spec.filter {
+        parts.push(format!("-X '{}'", crate::builtins::escape_alias_value(x)));
+    }
+    // `-F` is printed RAW: bash rejects a function name that is not a valid
+    // identifier at registration, so there is never anything to quote.
+    if let Some(f) = &spec.function {
+        parts.push(format!("-F {f}"));
+    }
+    // `-D` / `-E` sit at the END of the line, where the command name would be.
+    if let Some(m) = mode {
+        parts.push(m.to_string());
     }
     if let Some(n) = name {
-        parts.push("--".to_string());
-        parts.push(n.to_string());
+        parts.push(print_quote_name(n));
     }
     parts.join(" ")
 }

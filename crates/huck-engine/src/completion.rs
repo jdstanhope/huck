@@ -1278,8 +1278,8 @@ mod tests {
         // Register a spec for some command — it should NOT fire on $var.
         {
             let mut s = shell.borrow_mut();
-            Rc::make_mut(&mut s.completion_specs).by_command.insert(
-                "echo".to_string(),
+            Rc::make_mut(&mut s.completion_specs).register(
+                "echo",
                 crate::completion_spec::CompletionSpec {
                     wordlist: Some("should_not_appear".to_string()),
                     ..Default::default()
@@ -1349,8 +1349,8 @@ mod tests {
         let wb = format!("{}:", shell.get("COMP_WORDBREAKS").unwrap());
         shell.export_set("COMP_WORDBREAKS", wb);
         // A `-o default` spec for cd (so it routes through run_spec_with_empty_fallback).
-        Rc::make_mut(&mut shell.completion_specs).by_command.insert(
-            "cd".to_string(),
+        Rc::make_mut(&mut shell.completion_specs).register(
+            "cd",
             crate::completion_spec::CompletionSpec {
                 options: crate::completion_spec::CompOptions {
                     default: true,
@@ -1386,8 +1386,8 @@ mod tests {
     #[test]
     fn dispatch_arg_position_uses_spec() {
         let mut shell = Shell::new();
-        Rc::make_mut(&mut shell.completion_specs).by_command.insert(
-            "myc".to_string(),
+        Rc::make_mut(&mut shell.completion_specs).register(
+            "myc",
             crate::completion_spec::CompletionSpec {
                 wordlist: Some("alpha alpine beta".to_string()),
                 ..Default::default()
@@ -1493,8 +1493,8 @@ mod tests {
         let prior = std::env::current_dir().unwrap();
         std::env::set_current_dir(tempdir.path()).unwrap();
 
-        Rc::make_mut(&mut shell.completion_specs).by_command.insert(
-            "mycmd".to_string(),
+        Rc::make_mut(&mut shell.completion_specs).register(
+            "mycmd",
             crate::completion_spec::CompletionSpec {
                 wordlist: Some("subd".to_string()),
                 options: crate::completion_spec::CompOptions {
@@ -1531,8 +1531,8 @@ mod tests {
         // Quoted command name like "git" or 'git' should reach its
         // registered spec — the registry is keyed by the unquoted name.
         let mut shell = Shell::new();
-        Rc::make_mut(&mut shell.completion_specs).by_command.insert(
-            "mycmd".to_string(),
+        Rc::make_mut(&mut shell.completion_specs).register(
+            "mycmd",
             crate::completion_spec::CompletionSpec {
                 wordlist: Some("alpha".to_string()),
                 ..Default::default()

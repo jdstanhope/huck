@@ -16,6 +16,129 @@ pub struct CompletionSpecs {
     pub by_command: HashMap<String, CompletionSpec>,
     pub default_spec: Option<CompletionSpec>,
     pub empty_spec: Option<CompletionSpec>,
+    /// Registration order of every live entry, oldest first — the key to
+    /// `complete -p`'s output order (#527). See [`CompletionSpecs::register`].
+    /// Holds the `-D`/`-E` slots alongside command names, because bash keeps
+    /// all three in ONE hash table.
+    reg_order: Vec<CompKey>,
+}
+
+/// An entry in the completion registry, as `complete -p` prints it: a command
+/// name, or one of the two option-named slots. Kept apart from the command
+/// names (rather than folded into them under bash's reserved strings) because
+/// huck stores the two slots in their own fields — see [`DEFAULT_SPEC_KEY`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompKey {
+    Command(String),
+    Default,
+    Empty,
+}
+
+impl CompKey {
+    /// The string bash hashes for this entry.
+    fn hash_name(&self) -> &str {
+        match self {
+            CompKey::Command(n) => n,
+            CompKey::Default => DEFAULT_SPEC_KEY,
+            CompKey::Empty => EMPTY_SPEC_KEY,
+        }
+    }
+}
+
+/// bash stores the `-D` and `-E` compspecs in the same prog-completion hash
+/// table as ordinary command names, under these reserved names — measured:
+/// `complete _DefaultCmD_` sets the DEFAULT spec, and `complete -p -D` on an
+/// unset slot reports `_DefaultCmD_: no completion specification`. huck keeps
+/// them in their own fields, so these strings exist only to place the two
+/// slots in the hash walk that `complete -p` prints (see `keys_in_bash_order`).
+pub const DEFAULT_SPEC_KEY: &str = "_DefaultCmD_";
+pub const EMPTY_SPEC_KEY: &str = "_EmptycmD_";
+
+/// bash's prog-completion hash table has 512 buckets (`hash_string` is the
+/// FNV-1 in [`crate::assoc_order`]). Reproducing `complete -p`'s order is
+/// therefore the same trick as the associative-array order (#32): bucket
+/// ascending, newest-registered first WITHIN a bucket, since bash's
+/// `hash_insert` pushes onto the head of the bucket's list.
+///
+/// Validated against bash 5.2.21 over randomized name sets of 50/200/400/
+/// 600/900/1023 entries plus re-registration and remove-then-re-add rounds:
+/// 0 mismatches. bash rehashes the table to 2048 buckets once it holds more
+/// than `nbuckets * 2` = 1024 entries and the order changes there; that
+/// growth is NOT modelled (#551).
+const COMPLETE_NBUCKETS: u32 = 512;
+
+impl CompletionSpecs {
+    /// Register (or replace) the spec for `name`. Replacing an EXISTING name
+    /// keeps its registration slot: bash's `hash_search(…, HASH_CREATE)` finds
+    /// the item and updates it in place, so `complete -p` order does not move
+    /// (measured). A remove-then-re-add does move it, which falls out of
+    /// [`CompletionSpecs::unregister`] dropping the entry.
+    pub fn register(&mut self, name: &str, spec: CompletionSpec) {
+        if self.by_command.insert(name.to_string(), spec).is_none() {
+            self.reg_order.push(CompKey::Command(name.to_string()));
+        }
+    }
+
+    /// Install the `-D` (default) or `-E` (empty-line) spec, tracking its
+    /// place in the same registration order as command names.
+    pub fn register_slot(&mut self, key: CompKey, spec: CompletionSpec) {
+        let slot = match key {
+            CompKey::Default => &mut self.default_spec,
+            _ => &mut self.empty_spec,
+        };
+        let was_set = slot.is_some();
+        *slot = Some(spec);
+        if !was_set {
+            self.reg_order.push(key);
+        }
+    }
+
+    /// Remove `name`'s spec. Returns whether it was registered.
+    pub fn unregister(&mut self, name: &str) -> bool {
+        let had = self.by_command.remove(name).is_some();
+        if had {
+            self.reg_order
+                .retain(|k| !matches!(k, CompKey::Command(n) if n == name));
+        }
+        had
+    }
+
+    /// Clear the `-D` or `-E` slot.
+    pub fn unregister_slot(&mut self, key: CompKey) {
+        match key {
+            CompKey::Default => self.default_spec = None,
+            _ => self.empty_spec = None,
+        }
+        self.reg_order.retain(|k| *k != key);
+    }
+
+    /// Drop every per-command spec (bare `complete -r`).
+    pub fn clear_commands(&mut self) {
+        self.by_command.clear();
+        self.reg_order.retain(|k| !matches!(k, CompKey::Command(_)));
+    }
+
+    /// Every live entry — command names plus the `-D`/`-E` slots — in the
+    /// order bash's `complete -p` walks its hash table.
+    pub fn keys_in_bash_order(&self) -> Vec<&CompKey> {
+        let mut live: Vec<(usize, &CompKey)> = self
+            .reg_order
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| match k {
+                CompKey::Default => self.default_spec.is_some(),
+                CompKey::Empty => self.empty_spec.is_some(),
+                CompKey::Command(n) => self.by_command.contains_key(n),
+            })
+            .collect();
+        live.sort_by_key(|&(i, k)| {
+            (
+                crate::assoc_order::assoc_hash(k.hash_name()) % COMPLETE_NBUCKETS,
+                usize::MAX - i,
+            )
+        });
+        live.into_iter().map(|(_, k)| k).collect()
+    }
 }
 
 /// A single completion spec. Multiple content generators (`-F`, `-W`,
