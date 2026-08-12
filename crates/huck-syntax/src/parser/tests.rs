@@ -2316,7 +2316,9 @@ fn atoms_arith_for() {
     diff_cmd("for ((i=$x; i<${n}; i++)); do :; done"); // embedded expansions
     diff_cmd("for ((i=(1+2); i<9; i++)); do :; done"); // inner grouping parens
     diff_cmd("for ((;;)); do break; done");
-    // Section-count errors (both paths ArithForHeader with identical message).
+    // Section-count errors (both paths ArithForHeader; #313 turned the message
+    // into bash's — "arithmetic expression required" under three sections,
+    // "`;' unexpected" over — plus the header echoed as typed).
     diff_err("for ((a;b;c;d)); do :; done"); // got 4
     diff_err("for ((a)); do :; done"); // got 1
     diff_err("for ((a; b)); do :; done"); // got 2
@@ -2362,7 +2364,7 @@ fn atoms_arith_for_edges() {
 /// finding header-section separators — it has no idea backticks or
 /// `${…}` exist, so a `;` inside `` `a;b` `` or `${x;y}` is just another
 /// depth-0 separator and the header splits into 4 sections →
-/// `ArithForHeader` ("got 4"). The atom path tokenizes the header via
+/// `ArithForHeader` (four sections). The atom path tokenizes the header via
 /// `Mode::Arith`, where a backtick opener hands off to the
 /// `BeginBacktick` sub-parse and `${` hands off to the `ParamOpen`
 /// sub-parse — so the `;` inside either sub-expansion is consumed by
@@ -2627,7 +2629,8 @@ fn atoms_arith_for_header_quote() {
     // Probed edge (v261 T2 Step 6): a quoted for-header section. Both paths
     // agree byte-for-byte — a quoted `;` inside a for-header section still
     // counts as a section separator (quote-blind, like the paren-delim bail),
-    // so `"a;b"` splits into 4 sections → ArithForHeader error on both sides;
+    // so `"a;b"` splits into 4 sections → ArithForHeader error on both sides
+    // (bash disagrees and takes the quoted `;` literally — #602);
     // a fully-quoted section (`"1"`/`"2"`) parses identically with the quotes
     // stripped from the resulting Word.
     diff_err("for (( \"a;b\" ; ; )); do :; done");
