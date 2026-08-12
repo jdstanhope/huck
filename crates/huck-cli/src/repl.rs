@@ -143,6 +143,14 @@ pub fn run(args: &[String], version: &str) -> i32 {
     // through the engine's `set -o` table, before any program/interactive
     // dispatch, so they govern the whole session.
     for (name, enable) in &opts.o_options {
+        let Some(name) = name else {
+            // #164: the ARGUMENT-LESS form lists, exactly as the `set` builtin
+            // does with no name — and at its own position in the sequence, so
+            // `huck -o xtrace -o` shows xtrace ON.
+            let mut out = std::io::stdout();
+            huck_engine::builtins::print_set_o_options(&mut out, &shell_cell.borrow(), *enable);
+            continue;
+        };
         if !huck_engine::builtins::set_o_option_by_name(&mut shell_cell.borrow_mut(), name, *enable)
         {
             emit_cli_error(&prog, format_args!("{name}: invalid option name"));

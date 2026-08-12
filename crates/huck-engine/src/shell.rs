@@ -41,7 +41,13 @@ pub struct CliOptions {
     pub posix: bool,
     /// `-o <name>` / `+o <name>` command-line options, in argv order. `bool` is
     /// enable (`-o` = true, `+o` = false). Applied at startup like `set -o`.
-    pub o_options: Vec<(String, bool)>,
+    /// `-o NAME` / `+o NAME` in argv order. A `None` name is the ARGUMENT-LESS
+    /// form (`huck -o` as the last option), which bash answers by printing the
+    /// options table (`-o`) or its `set -o …` reinput form (`+o`) at that point
+    /// in the sequence — so `huck -o xtrace -o` prints a table with xtrace ON
+    /// (#164). Only the last option can be name-less: anything following `-o`
+    /// is taken as the NAME, even another `-o` or a script path.
+    pub o_options: Vec<(Option<String>, bool)>,
     /// `-r`: start the shell restricted (also set for invocation as `rbash`;
     /// see `startup_restricted`).
     pub restricted: bool,
@@ -67,7 +73,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
     let mut norc = false;
     let mut noexec = false;
     let mut posix = false;
-    let mut o_options: Vec<(String, bool)> = Vec::new();
+    let mut o_options: Vec<(Option<String>, bool)> = Vec::new();
     let mut restricted = false;
     let mut command: Option<String> = None;
     let mut i = 0;
@@ -95,12 +101,11 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                 let enable = args[i] == "-o";
                 i += 1;
                 if i >= args.len() {
-                    return Err(format!(
-                        "{}: option requires an argument",
-                        if enable { "-o" } else { "+o" }
-                    ));
+                    // #164: bare `-o` / `+o` LISTS, it is not an error.
+                    o_options.push((None, enable));
+                    break;
                 }
-                o_options.push((args[i].clone(), enable));
+                o_options.push((Some(args[i].clone()), enable));
                 i += 1;
             }
             "--rcfile" => {
@@ -781,13 +786,38 @@ mod rc_tests {
         .unwrap();
         assert_eq!(
             o.o_options,
-            vec![("errexit".to_string(), true), ("posix".to_string(), false)]
+            vec![
+                (Some("errexit".to_string()), true),
+                (Some("posix".to_string()), false)
+            ]
         );
     }
 
     #[test]
-    fn parse_cli_o_missing_arg_errors() {
-        assert!(parse_cli(&["-o".into()]).is_err());
+    fn parse_cli_bare_o_is_a_list_request() {
+        // #164: bare `-o` / `+o` LISTS the options in bash — it is not the
+        // usage error this test used to assert.
+        let o = parse_cli(&["-o".into()]).unwrap();
+        assert_eq!(o.o_options, vec![(None, true)]);
+        let o = parse_cli(&["+o".into()]).unwrap();
+        assert_eq!(o.o_options, vec![(None, false)]);
+    }
+
+    #[test]
+    fn parse_cli_o_takes_the_next_word_as_the_name() {
+        // Only the LAST option can be name-less: anything after `-o` is the
+        // NAME, even another `-o`.
+        let o = parse_cli(&["-o".into(), "-o".into()]).unwrap();
+        assert_eq!(o.o_options, vec![(Some("-o".to_string()), true)]);
+    }
+
+    #[test]
+    fn parse_cli_o_list_keeps_its_place_in_the_sequence() {
+        let o = parse_cli(&["-o".into(), "xtrace".into(), "-o".into()]).unwrap();
+        assert_eq!(
+            o.o_options,
+            vec![(Some("xtrace".to_string()), true), (None, true)]
+        );
     }
 
     #[test]
