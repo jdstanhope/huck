@@ -92,13 +92,24 @@ fn inline_assignment_separate_lines() {
 }
 
 #[test]
-fn array_literal_decl_does_not_crash() {
+fn array_literal_decl_traces_as_two_lines() {
+    // #372: bash traces a declaration builtin's compound value on its OWN
+    // line, re-quoted, then the builtin with the operand reduced to the bare
+    // NAME. This asserted the single `+ local arr=(a b c)` line huck used to
+    // emit — the divergence itself. (The original point of the test, "must not
+    // panic", is kept.)
     let (_o, e, c) = run("set -x\nf() { local arr=(a b c); }; f\n");
     assert_ne!(c, 101, "must not panic; stderr: {e}"); // 101 = Rust panic abort
-    assert!(
-        trace_lines(&e).iter().any(|l| l == "+ local arr=(a b c)"),
-        "stderr: {e}"
-    );
+    let t = trace_lines(&e);
+    let i = t
+        .iter()
+        .position(|l| l == "+ arr=('a' 'b' 'c')")
+        .unwrap_or_else(|| panic!("value line; stderr: {e}"));
+    let j = t
+        .iter()
+        .position(|l| l == "+ local arr")
+        .unwrap_or_else(|| panic!("builtin line; stderr: {e}"));
+    assert!(i < j, "value line before the builtin line; stderr: {e}");
 }
 
 #[test]
