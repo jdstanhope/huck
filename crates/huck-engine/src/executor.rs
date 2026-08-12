@@ -4950,7 +4950,10 @@ struct ExecFlags {
 /// says, usage line included (#516).
 #[derive(Debug)]
 enum ExecFlagErr {
-    Invalid(char),
+    /// The raw BYTE of the rejected option — bash scans the flag word byte by
+    /// byte, so `exec -é` names only the first of the two bytes `é` occupies
+    /// (#522). A `char` here would name the whole code point.
+    Invalid(u8),
     MissingValue(char),
 }
 
@@ -4985,15 +4988,19 @@ fn parse_exec_flags(args: &[String]) -> Result<ExecFlags, ExecFlagErr> {
             f.operand_start = i;
             return Ok(f);
         }
-        let chars: Vec<char> = body.chars().collect();
+        // Bytes, not chars: bash's scan is byte-wise, which is what makes the
+        // diagnostic for a non-ASCII flag name one raw byte (#522). Slicing
+        // `body` at `j + 1` stays on a char boundary because every byte before
+        // it matched an ASCII flag letter.
+        let bytes = body.as_bytes();
         let mut j = 0;
-        while j < chars.len() {
-            match chars[j] {
-                'c' => f.clear_env = true,
-                'l' => f.login = true,
-                'a' => {
+        while j < bytes.len() {
+            match bytes[j] {
+                b'c' => f.clear_env = true,
+                b'l' => f.login = true,
+                b'a' => {
                     // `-a NAME`: the rest of this word, else the next word.
-                    let rest: String = chars[j + 1..].iter().collect();
+                    let rest: String = body[j + 1..].to_string();
                     if rest.is_empty() {
                         i += 1;
                         if i >= args.len() {

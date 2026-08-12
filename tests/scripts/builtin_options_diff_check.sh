@@ -216,4 +216,29 @@ check "command -V -v"         'command -V -v ls'
 check "command -vV bundled"   'command -vV ls'
 check "command -Vv bundled"   'command -Vv ls'
 
+# ── #522: the reported option character is a RAW BYTE. bash scans the flag
+# word byte by byte, so a two-byte `é` (0xC3 0xA9) is reported as the single
+# leading byte 0xC3 — huck decoded that byte as Latin-1 U+00C3 and re-encoded
+# it, printing TWO bytes (`-Ã`). These rows only compare equal byte-for-byte,
+# which is the whole point; `$(...)` keeps the invalid UTF-8 intact.
+for b in unset readonly read type hash declare typeset printf command mapfile \
+         readarray help complete compgen compopt jobs trap alias unalias builtin \
+         export cd wait history getopts shopt disown umask ulimit pwd enable; do
+    check "$b -<utf8> raw byte" "$b -é"
+done
+check "local -<utf8> raw byte"  'f() { local -é; }; f'
+check "set -<utf8> raw byte"    'set -é'
+check "set +<utf8> raw byte"    'set +é'
+check "exec -<utf8> raw byte"   'exec -é'
+check "declare +<utf8> raw"     'declare +é'
+check "compopt +<utf8> raw"     'compopt +é'
+# NOT covered here: a byte that is not valid UTF-8 at all (`readonly -\xe9`).
+# huck PANICS on such an argument long before the option scanner sees it —
+# `std::env::args()` unwraps — and lossily replaces it with U+FFFD when it
+# arrives through the stdin reader. That is #553, a different root; adding the
+# row now would just pin a crash.
+# Bundled: the byte is reported wherever it sits in the cluster.
+check "utf8 after valid flag"   'readonly -pé'
+check "utf8 before valid flag"  'readonly -ép'
+
 harness_summary

@@ -679,7 +679,12 @@ pub fn builtin_compopt(
                     // #521: this reported `-{other}` with no usage line while
                     // `declare`'s sibling loop reported `+{other}` with one.
                     // Both now go through the shared emit.
-                    crate::builtin_opts::emit_invalid_plus_option("compopt", other, shell, err);
+                    crate::builtin_opts::emit_invalid_plus_option(
+                        "compopt",
+                        crate::builtin_opts::opt_first_byte(other),
+                        shell,
+                        err,
+                    );
                     return ExecOutcome::Continue(2);
                 }
             }
