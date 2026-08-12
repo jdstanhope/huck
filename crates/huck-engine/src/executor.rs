@@ -3198,13 +3198,19 @@ fn expand_single(
     if fields.len() == 1 {
         Ok(fields.into_iter().next().unwrap().chars)
     } else {
-        crate::sh_error_to!(
-            shell,
-            err,
-            None,
-            "{}: ambiguous redirect",
-            crate::expand::reconstruct_word_source(word)
-        );
+        // #606: when the expansion ITSELF failed and reported — `set -u` on an
+        // unset name is the case that reaches here — bash prints that message
+        // and stops. huck used to add `$nope: ambiguous redirect` on top,
+        // naming a word that never got the chance to be ambiguous.
+        if !(shell.fatal_pending() || shell.discard_pending()) {
+            crate::sh_error_to!(
+                shell,
+                err,
+                None,
+                "{}: ambiguous redirect",
+                crate::expand::reconstruct_word_source(word)
+            );
+        }
         Err(())
     }
 }
@@ -3269,8 +3275,12 @@ fn resolve_dup_source(
     let fields = expand(source, shell);
     let word_src = crate::expand::reconstruct_word_source(source);
     if fields.len() != 1 {
-        let mut err = err_writer();
-        crate::sh_error_to!(shell, &mut *err, None, "{word_src}: ambiguous redirect");
+        // #606: the expansion's own failure has already been reported; do not
+        // add a second diagnostic bash does not print.
+        if !(shell.fatal_pending() || shell.discard_pending()) {
+            let mut err = err_writer();
+            crate::sh_error_to!(shell, &mut *err, None, "{word_src}: ambiguous redirect");
+        }
         return Err(());
     }
     let field = fields.into_iter().next().unwrap().chars;
