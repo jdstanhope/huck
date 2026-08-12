@@ -9691,6 +9691,88 @@ fn invalid_number(name: &str, tok: &str, shell: &mut Shell, err: &mut dyn Write)
     ExecOutcome::Continue(2)
 }
 
+/// What bash's `pushd`/`popd` argument loop found.
+struct DirStackArgs<'a> {
+    /// `-n`: do the stack manipulation, skip the `cd`.
+    nflag: bool,
+    /// The LAST `+N`/`-N` seen — `pushd +1 +2` rotates by 2, not by 1 and
+    /// then 2.
+    spec: Option<&'a str>,
+    /// Everything from the first token that was neither an option nor a
+    /// spec onwards.
+    operands: &'a [String],
+    /// True when a `--` ended the loop, so a leading `-` in the operand is
+    /// part of the directory NAME and must not be re-parsed by `cd`.
+    after_ddash: bool,
+}
+
+/// bash consumes options and `+N`/`-N` specs from the FRONT in a single loop,
+/// in either order, and stops at the first token that is neither — which is why
+/// `pushd +1 -n` honours the `-n` but `pushd /var -n` reports "too many
+/// arguments" (the loop stopped at `/var`, leaving two operands). `--` ends the
+/// loop too, so `pushd -- -n` means the directory named `-n`.
+fn scan_dirstack_args<'a>(
+    name: &str,
+    args: &'a [String],
+    shell: &mut Shell,
+    err: &mut dyn Write,
+) -> Result<DirStackArgs<'a>, ExecOutcome> {
+    let mut nflag = false;
+    let mut spec: Option<&str> = None;
+    let mut after_ddash = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            after_ddash = true;
+            i += 1;
+            break;
+        }
+        if a == "-n" {
+            nflag = true;
+        } else if is_signed_index_arg(a) {
+            spec = Some(a);
+        } else if a.starts_with('-') && a.len() > 1 {
+            // `-Q`, `-nn`: a bad NUMBER in bash's telling, not a bad option,
+            // and it must not reach `cd` (#519).
+            return Err(invalid_number(name, a, shell, err));
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    Ok(DirStackArgs {
+        nflag,
+        spec,
+        operands: &args[i..],
+        after_ddash,
+    })
+}
+
+/// Resolve a `+N`/`-N` spec against the stack, with bash's one wrinkle: when
+/// there is nothing on the stack but the current directory, an out-of-range
+/// index is reported as an EMPTY stack rather than as a bad index
+/// (`pushd +9` with nothing pushed says "directory stack empty", but `+0`
+/// there is fine).
+fn resolve_dirstack_index(
+    name: &str,
+    spec: &str,
+    shell: &mut Shell,
+    err: &mut dyn Write,
+) -> Result<usize, ExecOutcome> {
+    match parse_signed_index(spec, shell.dir_stack.len()) {
+        Ok(i) => Ok(i),
+        Err(e) => {
+            if shell.dir_stack.len() <= 1 && e.ends_with("directory stack index out of range") {
+                crate::sh_error_to!(shell, err, None, "{name}: directory stack empty");
+            } else {
+                crate::sh_error_to!(shell, err, None, "{name}: {e}");
+            }
+            Err(ExecOutcome::Continue(1))
+        }
+    }
+}
+
 fn builtin_pushd(
     args: &[String],
     out: &mut dyn Write,
@@ -9699,13 +9781,50 @@ fn builtin_pushd(
 ) -> ExecOutcome {
     sync_stack_top(shell);
 
-    // `--` ends option processing. Strip it FIRST so `pushd --` is bare
-    // `pushd` (bash swaps the top two, or reports "no other directory") rather
-    // than a no-op stack print.
-    let after_ddash = args.first().map(String::as_str) == Some("--");
-    let args: &[String] = if after_ddash { &args[1..] } else { args };
+    let scan = match scan_dirstack_args("pushd", args, shell, err) {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
 
-    if args.is_empty() {
+    if let Some(spec) = scan.spec {
+        // A rotation. `-n` keeps the rotated list but leaves the current
+        // directory where it is, so the entry that would have become $PWD is
+        // simply dropped off the top — `dirs` then shows $PWD above the
+        // rotated remainder, duplicating an entry, exactly as bash does.
+        let idx = match resolve_dirstack_index("pushd", spec, shell, err) {
+            Ok(i) => i,
+            Err(o) => return o,
+        };
+        if idx != 0 {
+            shell.dir_stack.rotate_left(idx);
+            if scan.nflag {
+                sync_stack_top(shell);
+            } else {
+                let target = shell.dir_stack[0].clone();
+                let cd_args = vec![target.display().to_string()];
+                if let ExecOutcome::Continue(c) = builtin_cd_as("pushd", &cd_args, out, err, shell)
+                    && c != 0
+                {
+                    // Undo rotation on cd failure.
+                    shell.dir_stack.rotate_right(idx);
+                    return ExecOutcome::Continue(c);
+                }
+            }
+        }
+        // A rotation under `-n` prints NOTHING — the one `pushd` form that is
+        // silent on success.
+        if scan.nflag {
+            return ExecOutcome::Continue(0);
+        }
+        return print_stack(out, shell, true, false, false);
+    }
+
+    let Some(dir) = scan.operands.first() else {
+        // No directory and no spec. `-n` makes this a silent no-op — not even
+        // the "no other directory" complaint on an empty stack.
+        if scan.nflag {
+            return ExecOutcome::Continue(0);
+        }
         // Swap top two.
         if shell.dir_stack.len() < 2 {
             crate::sh_error_to!(shell, err, None, "pushd: no other directory");
@@ -9722,54 +9841,31 @@ fn builtin_pushd(
             return ExecOutcome::Continue(c);
         }
         return print_stack(out, shell, true, false, false);
-    }
+    };
 
-    // Classify the first argument the way bash does, BEFORE anything reaches
-    // `cd`. Without this, `pushd -Q` fell through to the DIR path and reported
-    // itself as `cd: -Q: invalid option`, complete with cd's usage string
-    // (#519) — a dispatch bug, not a parsing one.
-    // `-n` is a REAL bash option here and huck does not implement it (measured:
-    // bash inserts the directory BELOW the top and does not chdir, and bare
-    // `pushd -n` prints without swapping). It is deliberately NOT accepted:
-    // parsing it and then doing the ordinary push-and-chdir would silently do
-    // the wrong thing, which is strictly worse than a loud rejection. Filed
-    // separately; this round only stops it misrouting to `cd`.
-    if let Some(a) = args.first()
-        && !after_ddash
-        && a.starts_with('-')
-        && a.len() > 1
-        && !is_signed_index_arg(a)
-    {
-        return invalid_number("pushd", a, shell, err);
-    }
-
-    let arg = &args[0];
-    if is_signed_index_arg(arg) {
-        let idx = match parse_signed_index(arg, shell.dir_stack.len()) {
-            Ok(i) => i,
-            Err(e) => {
-                crate::sh_error_to!(shell, err, None, "pushd: {e}");
-                return ExecOutcome::Continue(1);
-            }
-        };
-        if idx == 0 {
-            return print_stack(out, shell, true, false, false);
-        }
-        shell.dir_stack.rotate_left(idx);
-        let target = shell.dir_stack[0].clone();
-        let cd_args = vec![target.display().to_string()];
-        if let ExecOutcome::Continue(c) = builtin_cd_as("pushd", &cd_args, out, err, shell)
-            && c != 0
-        {
-            // Undo rotation on cd failure.
-            shell.dir_stack.rotate_right(idx);
-            return ExecOutcome::Continue(c);
-        }
+    if scan.nflag {
+        // The directory goes in BELOW the current one, unresolved and
+        // unvalidated: with no `cd` there is nothing to fail, so
+        // `pushd -n /nonexistent` succeeds and a relative path is stored as
+        // typed. Trailing operands are ignored here, where the chdir form
+        // rejects them.
+        shell.dir_stack.insert(1, std::path::PathBuf::from(dir));
         return print_stack(out, shell, true, false, false);
     }
 
-    // pushd DIR
-    let cd_args = vec![arg.clone()];
+    if scan.operands.len() > 1 {
+        crate::sh_error_to!(shell, err, None, "pushd: too many arguments");
+        return ExecOutcome::Continue(1);
+    }
+
+    // pushd DIR. After a `--` the name is handed to `cd` behind its own `--`,
+    // so `pushd -- -n` reports `pushd: -n: No such file or directory` instead
+    // of letting `cd` read it as an option.
+    let cd_args = if scan.after_ddash {
+        vec!["--".to_string(), dir.clone()]
+    } else {
+        vec![dir.clone()]
+    };
     if let ExecOutcome::Continue(c) = builtin_cd_as("pushd", &cd_args, out, err, shell)
         && c != 0
     {
@@ -9779,7 +9875,7 @@ fn builtin_pushd(
         .lookup_var("PWD")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| std::path::PathBuf::from(arg));
+        .unwrap_or_else(|| std::path::PathBuf::from(dir));
     shell.dir_stack.insert(0, new_cwd);
     print_stack(out, shell, true, false, false)
 }
@@ -9793,45 +9889,46 @@ fn builtin_popd(
     sync_stack_top(shell);
 
     // Argument validity is decided BEFORE the stack-empty check: bash reports
-    // `popd -Q` as an invalid number even on an empty stack, where huck used to
-    // report "directory stack empty" and never look at the argument (#519).
-    // `-n` deliberately NOT accepted here either — see `builtin_pushd`.
-    // `--` is a terminator, NOT a malformed number: `popd --` is bare `popd`.
-    let rest: &[String] = if args.first().map(String::as_str) == Some("--") {
-        &args[1..]
-    } else {
-        args
+    // `popd -Q` as an invalid number, and `popd /usr` as an invalid ARGUMENT
+    // (with the usage line and status 2), even on an empty stack, where huck
+    // used to report "directory stack empty" and never look at the argument
+    // (#519, #530).
+    let scan = match scan_dirstack_args("popd", args, shell, err) {
+        Ok(s) => s,
+        Err(o) => return o,
     };
-    if let Some(a) = rest.first()
-        && a.starts_with('-')
-        && a.len() > 1
-        && !is_signed_index_arg(a)
-    {
-        return invalid_number("popd", a, shell, err);
+    if let Some(bad) = scan.operands.first() {
+        crate::sh_error_to!(shell, err, None, "popd: {bad}: invalid argument");
+        let _ = writeln!(
+            err,
+            "popd: usage: {}",
+            crate::builtin_opts::usage_for("popd")
+        );
+        shell.builtin_usage_error = Some(2);
+        return ExecOutcome::Continue(2);
     }
-    let args = rest;
 
     if shell.dir_stack.len() <= 1 {
         crate::sh_error_to!(shell, err, None, "popd: directory stack empty");
         return ExecOutcome::Continue(1);
     }
 
-    let idx = if args.is_empty() {
-        0
-    } else {
-        let arg = &args[0];
-        if !is_signed_index_arg(arg) {
-            crate::sh_error_to!(shell, err, None, "popd: {arg}: invalid argument");
-            return ExecOutcome::Continue(1);
-        }
-        match parse_signed_index(arg, shell.dir_stack.len()) {
+    let mut idx = match scan.spec {
+        None => 0,
+        Some(spec) => match resolve_dirstack_index("popd", spec, shell, err) {
             Ok(i) => i,
-            Err(e) => {
-                crate::sh_error_to!(shell, err, None, "popd: {e}");
-                return ExecOutcome::Continue(1);
-            }
-        }
+            Err(o) => return o,
+        },
     };
+
+    if scan.nflag {
+        // Without a chdir the current directory cannot be popped, so the top
+        // of the LIST — the entry below $PWD — goes instead. That is why
+        // `popd -n`, `popd -n +0` and `popd -n +1` all remove the same entry.
+        idx = idx.max(1);
+        shell.dir_stack.remove(idx);
+        return print_stack(out, shell, true, false, false);
+    }
 
     // Save the entry being removed so we can restore on cd failure
     // (only matters when idx == 0, where popd does a cd to the new
