@@ -1460,19 +1460,73 @@ fn builtin_return_no_arg_returns_last_status() {
 }
 
 #[test]
-fn builtin_return_invalid_arg_falls_back_to_last_status() {
+fn builtin_return_invalid_arg_is_status_2() {
+    // #520: bash's `get_exitstat` reports `return: <arg>: numeric argument
+    // required` and returns with status 2 — it does NOT fall back to `$?`.
+    // This test asserted the fallback, i.e. it pinned the divergence.
     let mut shell = Shell::new();
     shell.set_last_status(13);
     let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
     assert_eq!(
         run_builtin(
             "return",
             &["not-a-num".to_string()],
             &mut out,
-            &mut std::io::stderr(),
+            &mut err,
             &mut shell
         ),
-        ExecOutcome::FunctionReturn(13)
+        ExecOutcome::FunctionReturn(2)
+    );
+    let msg = String::from_utf8(err).unwrap();
+    assert!(
+        msg.contains("return: not-a-num: numeric argument required"),
+        "{msg:?}"
+    );
+}
+
+#[test]
+fn builtin_return_masks_to_255() {
+    // bash masks the status with `& 255`: `return -1` is 255, `return 300` is 44.
+    let mut shell = Shell::new();
+    let mut out: Vec<u8> = Vec::new();
+    for (arg, want) in [("-1", 255), ("300", 44), ("256", 0), ("-- 3", 3)] {
+        let args: Vec<String> = arg.split(' ').map(str::to_string).collect();
+        assert_eq!(
+            run_builtin(
+                "return",
+                &args,
+                &mut out,
+                &mut std::io::stderr(),
+                &mut shell
+            ),
+            ExecOutcome::FunctionReturn(want),
+            "return {arg}"
+        );
+    }
+}
+
+#[test]
+fn builtin_return_too_many_args_aborts() {
+    // bash: `return: too many arguments` and a hard abort at status 1.
+    let mut shell = Shell::new();
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    assert_eq!(
+        run_builtin(
+            "return",
+            &["3".to_string(), "4".to_string()],
+            &mut out,
+            &mut err,
+            &mut shell
+        ),
+        ExecOutcome::Exit(1)
+    );
+    assert!(
+        String::from_utf8(err)
+            .unwrap()
+            .contains("return: too many arguments"),
+        "expected the too-many-arguments diagnostic"
     );
 }
 
