@@ -109,6 +109,23 @@ fn realize_via_devfd(
     ))
 }
 
+/// Where the FIFO fallback puts its temp file: the shell's `TMPDIR`, else
+/// `/tmp` (#189).
+///
+/// NOT `std::env::var("TMPDIR")`. huck never pushes shell variables into its own
+/// process environment — a child's environment is BUILT from the variable table
+/// — so `env::var` here sees only what huck was launched with and misses
+/// `TMPDIR=/x`, exported or not. That is backwards from what this call site
+/// wants: a user who points `TMPDIR` at a writable directory precisely because
+/// `/tmp` is unwritable or noexec would still get `/tmp`. The six heredoc
+/// delivery sites already read the shell variable; this is the same rule.
+fn procsub_tmpdir(shell: &Shell) -> String {
+    shell
+        .lookup_var("TMPDIR")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/tmp".to_string())
+}
+
 /// FIFO fallback (used only when /dev/fd is absent — unreachable on Linux/macOS).
 ///
 /// Correct rendezvous: the parent does NOT pre-open the FIFO. Instead the inner
@@ -125,7 +142,7 @@ fn realize_via_fifo(
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+    let tmpdir = procsub_tmpdir(shell);
     let pid = unsafe { libc::getpid() };
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     let fifo_path = PathBuf::from(format!("{tmpdir}/huck-procsub-{pid}-{counter}"));
@@ -228,4 +245,31 @@ pub fn cleanup(ps: ProcSub) -> Option<(i32, i32)> {
         0
     };
     Some((ps.pid, code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #189: the FIFO fallback's temp directory comes from the SHELL's
+    /// `TMPDIR`, not from the process environment huck was launched with.
+    /// The fallback itself is unreachable on Linux (`/dev/fd` exists), so this
+    /// tests the source rule directly rather than through a realized procsub.
+    #[test]
+    fn tmpdir_comes_from_the_shell_variable() {
+        let mut shell = Shell::new();
+        assert_eq!(procsub_tmpdir(&shell), "/tmp");
+
+        // A plain (unexported) assignment counts — bash honours it too.
+        shell.set("TMPDIR", "/huck-shellvar".to_string());
+        assert_eq!(procsub_tmpdir(&shell), "/huck-shellvar");
+
+        // Exported is the same variable as far as this is concerned.
+        shell.export_set("TMPDIR", "/huck-exported".to_string());
+        assert_eq!(procsub_tmpdir(&shell), "/huck-exported");
+
+        // Empty falls back rather than producing a path starting with `/`.
+        shell.set("TMPDIR", String::new());
+        assert_eq!(procsub_tmpdir(&shell), "/tmp");
+    }
 }
