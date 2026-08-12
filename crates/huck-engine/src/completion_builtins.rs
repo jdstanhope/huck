@@ -17,6 +17,12 @@ struct ParsedFlags {
     is_default: bool,
     /// -E: apply when completing on empty command line.
     is_empty: bool,
+    /// -I was given. bash's `-D`/`-E`/`-I` are MUTUALLY EXCLUSIVE with
+    /// precedence D > E > I (measured: `complete -E -D …` and `complete -D -E …`
+    /// both land on -D, `complete -I -E …` on -E), so this is recorded and then
+    /// resolved rather than acted on directly — huck has no initial-word spec
+    /// slot, so an `-I` that SURVIVES the precedence is still rejected (#549).
+    is_initial: bool,
     /// -p: print mode.
     print: bool,
     /// -r: remove mode.
@@ -67,7 +73,13 @@ fn parse_flags(
     // actually implemented). Pre-v359 huck already rejected both
     // (`-C: invalid option`, `-I: invalid option`); this keeps that.
     let spec: &str = if allow_d_e {
-        "abcdefgjksuvprDEo:A:G:W:F:X:P:S:"
+        // `I` is SCANNED (#549) so bash's D > E > I precedence can be applied —
+        // `complete -D -I …` is a plain `-D` registration in bash, not an
+        // error. An `-I` that survives that precedence is rejected in
+        // `register_complete`, because huck has no initial-word spec slot to
+        // put it in; the two diagnostic lines are the same ones the scanner
+        // used to print, so a lone `complete -I` is unchanged.
+        "abcdefgjksuvprDEIo:A:G:W:F:X:P:S:"
     } else {
         "abcdefgjksuvo:A:G:W:F:X:P:S:"
     };
@@ -138,6 +150,7 @@ fn parse_flags(
                     }
                     'D' if allow_d_e => out.is_default = true,
                     'E' if allow_d_e => out.is_empty = true,
+                    'I' if allow_d_e => out.is_initial = true,
                     'p' if allow_d_e => out.print = true,
                     'r' if allow_d_e => out.remove = true,
                     'a' | 'b' | 'c' | 'd' | 'e' | 'f' | 'g' | 'j' | 'k' | 's' | 'u' | 'v' => {
@@ -166,6 +179,14 @@ fn parse_flags(
         }
     }
     out.positional = args[g.rest_index()..].to_vec();
+    // bash keeps ONE of -D/-E/-I: `complete_builtin` tests them in the order
+    // D, E, I and the first hit wins, whatever order they were typed in.
+    if out.is_default {
+        out.is_empty = false;
+        out.is_initial = false;
+    } else if out.is_empty {
+        out.is_initial = false;
+    }
     Ok(out)
 }
 
@@ -203,6 +224,7 @@ pub fn builtin_complete(
             &parsed.positional,
             parsed.is_default,
             parsed.is_empty,
+            parsed.is_initial,
             out,
             err,
             shell,
@@ -221,6 +243,7 @@ fn is_bare(parsed: &ParsedFlags) -> bool {
     spec_empty
         && !parsed.is_default
         && !parsed.is_empty
+        && !parsed.is_initial
         && !parsed.remove
         && parsed.positional.is_empty()
 }
@@ -229,6 +252,7 @@ fn print_complete(
     names: &[String],
     is_default: bool,
     is_empty: bool,
+    is_initial: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
     shell: &Shell,
@@ -243,11 +267,14 @@ fn print_complete(
                 let _ = writeln!(out, "{}", format_spec_for_print(d, None, Some("-D")));
             }
             None => {
+                // bash names the reserved pseudo-command, not the flag: the
+                // slot IS a hash entry called `_DefaultCmD_` (#549).
                 crate::sh_error_to!(
                     shell,
                     err,
                     None,
-                    "complete: no completion specification for -D"
+                    "complete: {}: no completion specification",
+                    crate::completion_spec::DEFAULT_SPEC_KEY
                 );
                 status = 1;
             }
@@ -263,13 +290,26 @@ fn print_complete(
                     shell,
                     err,
                     None,
-                    "complete: no completion specification for -E"
+                    "complete: {}: no completion specification",
+                    crate::completion_spec::EMPTY_SPEC_KEY
                 );
                 status = 1;
             }
         }
     }
-    if is_default || is_empty {
+    if is_initial {
+        // huck has no initial-word slot, so there is never a spec here — which
+        // is exactly what bash reports when none has been registered (#549).
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "complete: {}: no completion specification",
+            crate::completion_spec::INITIAL_SPEC_KEY
+        );
+        status = 1;
+    }
+    if is_default || is_empty || is_initial {
         return ExecOutcome::Continue(status);
     }
 
@@ -294,9 +334,16 @@ fn print_complete(
         }
     } else {
         for n in names {
-            match specs.by_command.get(n) {
+            // A NAME may address one of the reserved slots: `complete -p
+            // _DefaultCmD_` prints the default spec, in its `-D` form (#549).
+            let (spec, mode, printed_name) = match CompKey::from_name(n) {
+                CompKey::Default => (specs.default_spec.as_ref(), Some("-D"), None),
+                CompKey::Empty => (specs.empty_spec.as_ref(), Some("-E"), None),
+                CompKey::Command(_) => (specs.by_command.get(n), None, Some(n.as_str())),
+            };
+            match spec {
                 Some(s) => {
-                    let _ = writeln!(out, "{}", format_spec_for_print(s, Some(n.as_str()), None));
+                    let _ = writeln!(out, "{}", format_spec_for_print(s, printed_name, mode));
                 }
                 None => {
                     crate::sh_error_to!(
@@ -327,8 +374,17 @@ fn remove_complete(
     if parsed.is_empty {
         specs.unregister_slot(CompKey::Empty);
     }
+    if parsed.is_initial {
+        // Nothing can be registered under the initial-word slot, so removing
+        // it is the no-op success bash gives for an absent one.
+        return ExecOutcome::Continue(status);
+    }
     if names.is_empty() && !parsed.is_default && !parsed.is_empty {
+        // A bare `complete -r` empties the WHOLE table, `-D`/`-E` slots
+        // included — they are entries in it (#549).
         specs.clear_commands();
+        specs.unregister_slot(CompKey::Default);
+        specs.unregister_slot(CompKey::Empty);
     } else {
         // Collect misses first: `specs` borrows `shell.completion_specs`
         // mutably for the whole loop, so the diagnostic (which needs
@@ -336,7 +392,18 @@ fn remove_complete(
         // the loop, once that borrow has ended.
         let mut missing: Vec<&String> = Vec::new();
         for n in names {
-            if !specs.unregister(n) && !parsed.is_default && !parsed.is_empty {
+            let removed = match CompKey::from_name(n) {
+                CompKey::Command(_) => specs.unregister(n),
+                key => {
+                    let had = match key {
+                        CompKey::Default => specs.default_spec.is_some(),
+                        _ => specs.empty_spec.is_some(),
+                    };
+                    specs.unregister_slot(key);
+                    had
+                }
+            };
+            if !removed && !parsed.is_default && !parsed.is_empty {
                 missing.push(n);
                 status = 1;
             }
@@ -354,13 +421,16 @@ fn remove_complete(
 }
 
 fn register_complete(parsed: &ParsedFlags, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
-    if (parsed.is_default || parsed.is_empty) && !parsed.positional.is_empty() {
-        crate::sh_error_to!(
-            shell,
+    // `-I` survived the D>E>I precedence: huck has no initial-word spec slot,
+    // so reject rather than register something nothing reads (#549).
+    if parsed.is_initial {
+        crate::sh_error_to!(shell, err, None, "complete: -I: invalid option");
+        let _ = writeln!(
             err,
-            None,
-            "complete: cannot use -D or -E with command names"
+            "complete: usage: {}",
+            crate::builtin_opts::usage_for("complete")
         );
+        shell.builtin_usage_error = Some(2);
         return ExecOutcome::Continue(2);
     }
     // No "nothing to complete" guard: bash registers an EMPTY compspec quite
@@ -375,8 +445,18 @@ fn register_complete(parsed: &ParsedFlags, err: &mut dyn Write, shell: &mut Shel
     if parsed.is_empty {
         specs.register_slot(CompKey::Empty, parsed.spec.clone());
     }
-    for n in &parsed.positional {
-        specs.register(n, parsed.spec.clone());
+    // With `-D`/`-E` bash IGNORES any command names given alongside — it
+    // registers the slot and nothing else, silently (#549). huck used to
+    // reject the whole command.
+    if !parsed.is_default && !parsed.is_empty {
+        for n in &parsed.positional {
+            // `complete _DefaultCmD_` addresses the default slot: same table,
+            // same entry.
+            match CompKey::from_name(n) {
+                CompKey::Command(_) => specs.register(n, parsed.spec.clone()),
+                key => specs.register_slot(key, parsed.spec.clone()),
+            }
+        }
     }
     ExecOutcome::Continue(0)
 }
@@ -887,10 +967,40 @@ mod tests {
     }
 
     #[test]
-    fn complete_D_with_names_errors() {
+    fn complete_D_ignores_command_names() {
+        // #549: bash registers the DEFAULT spec and silently ignores any names
+        // given alongside `-D`. This asserted huck's invented status-2
+        // rejection, i.e. it pinned the divergence.
         let mut sh = Shell::new();
         let (_, code) = run_complete(&["-D", "-W", "x", "--", "foo"], &mut sh);
-        assert_eq!(code, 2);
+        assert_eq!(code, 0);
+        assert!(sh.completion_specs.default_spec.is_some());
+        assert!(!sh.completion_specs.by_command.contains_key("foo"));
+    }
+
+    #[test]
+    fn complete_reserved_name_addresses_the_slot() {
+        // `complete _DefaultCmD_` IS `complete -D` — same table entry (#549).
+        let mut sh = Shell::new();
+        let (_, code) = run_complete(&["-W", "x", "--", "_DefaultCmD_"], &mut sh);
+        assert_eq!(code, 0);
+        assert!(sh.completion_specs.default_spec.is_some());
+        assert!(!sh.completion_specs.by_command.contains_key("_DefaultCmD_"));
+    }
+
+    #[test]
+    fn complete_D_beats_E_whatever_the_order() {
+        // bash keeps ONE of -D/-E/-I, tested in that order (#549).
+        for args in [
+            vec!["-D", "-E", "-o", "nospace"],
+            vec!["-E", "-D", "-o", "nospace"],
+        ] {
+            let mut sh = Shell::new();
+            let (_, code) = run_complete(&args, &mut sh);
+            assert_eq!(code, 0, "{args:?}");
+            assert!(sh.completion_specs.default_spec.is_some(), "{args:?}");
+            assert!(sh.completion_specs.empty_spec.is_none(), "{args:?}");
+        }
     }
 
     #[test]

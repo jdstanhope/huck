@@ -35,6 +35,24 @@ pub enum CompKey {
 }
 
 impl CompKey {
+    /// Map a command NAME to the entry it really addresses. bash keeps the
+    /// `-D`/`-E` compspecs in the same table as command names, under reserved
+    /// strings, so `complete _DefaultCmD_` sets the DEFAULT spec and
+    /// `complete -p _DefaultCmD_` prints it as `complete … -D` (#549).
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            DEFAULT_SPEC_KEY => CompKey::Default,
+            EMPTY_SPEC_KEY => CompKey::Empty,
+            _ => CompKey::Command(name.to_string()),
+        }
+    }
+
+    /// The string bash hashes for this entry — also what bash NAMES in
+    /// `<name>: no completion specification`.
+    pub fn display_name(&self) -> &str {
+        self.hash_name()
+    }
+
     /// The string bash hashes for this entry.
     fn hash_name(&self) -> &str {
         match self {
@@ -53,6 +71,10 @@ impl CompKey {
 /// slots in the hash walk that `complete -p` prints (see `keys_in_bash_order`).
 pub const DEFAULT_SPEC_KEY: &str = "_DefaultCmD_";
 pub const EMPTY_SPEC_KEY: &str = "_EmptycmD_";
+/// bash's third reserved name, for `-I` (completion on the initial word).
+/// huck has no slot for it — the constant exists only so the diagnostics can
+/// name what bash names.
+pub const INITIAL_SPEC_KEY: &str = "_InitialWorD_";
 
 /// bash's prog-completion hash table has 512 buckets (`hash_string` is the
 /// FNV-1 in [`crate::assoc_order`]). Reproducing `complete -p`'s order is

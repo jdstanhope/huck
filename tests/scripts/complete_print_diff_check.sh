@@ -89,6 +89,33 @@ check "-F bad with -W"     'complete -W x -F "a b" foo; echo "rc=$?"'
 check "-F bad two names"   'complete -F "a b" foo bar; echo "rc=$?"; complete -p'
 check "compgen -F bad"     'compgen -F "a b" x; echo "rc=$?"'
 
+# --- #549: the `-D`/`-E` slots ARE entries in the same table, under bash's
+#     reserved names. So the diagnostics name `_DefaultCmD_` / `_EmptycmD_` /
+#     `_InitialWorD_`, a NAME can address a slot, the three flags are mutually
+#     exclusive with precedence D > E > I, and a bare `complete -r` clears them
+#     along with everything else. ---
+check "-p -D unset names it"  'complete -p -D; echo "rc=$?"'
+check "-p -E unset names it"  'complete -p -E; echo "rc=$?"'
+check "-p -I unset names it"  'complete -p -I; echo "rc=$?"'
+check "-p by reserved name"   'complete -D -o nospace; complete -p _DefaultCmD_; echo "rc=$?"'
+check "reserved name sets -D" 'complete _DefaultCmD_; complete -p; complete -p -D; echo "rc=$?"'
+check "reserved name sets -E" 'complete _EmptycmD_; complete -p -E; echo "rc=$?"'
+check "-D wins over -E"       'complete -D -E -o nospace; complete -p; echo "rc=$?"'
+check "-D wins whatever order" 'complete -E -D -o nospace; complete -p; echo "rc=$?"'
+check "-E wins over -I"       'complete -E -I -o nospace; complete -p; echo "rc=$?"'
+check "-E wins whatever order" 'complete -I -E -o nospace; complete -p; echo "rc=$?"'
+check "-D wins over -I"       'complete -D -I -o nospace; complete -p; echo "rc=$?"'
+check "bare -r clears -D"     'complete -D -o nospace; complete -r; complete -p -D; echo "rc=$?"'
+check "bare -r clears both"   'complete -D -o nospace; complete -E -o dirnames; complete -r; complete -p; echo "rc=$?"'
+check "-r by reserved name"   'complete -D -o nospace; complete -r _DefaultCmD_; complete -p -D; echo "rc=$?"'
+check "-r -D unset is quiet"  'complete -r -D; echo "rc=$?"'
+check "-r -E unset is quiet"  'complete -r -E; echo "rc=$?"'
+check "-r -I unset is quiet"  'complete -r -I; echo "rc=$?"'
+check "-D ignores names"      'complete -D -o nospace foo; complete -p; echo "rc=$?"'
+check "-E ignores names"      'complete -E -o nospace foo bar; complete -p; echo "rc=$?"'
+check "-p -D -E prints -D"    'complete -D -o nospace; complete -p -D -E; echo "rc=$?"'
+check "-D with -r removes"    'complete -D -r; complete -p; echo "rc=$?"'
+
 # --- print-all ORDER: bash's hash walk, not sorted and not insertion order ---
 check "order abc"          'complete a; complete b; complete c; complete -p'
 check "order cba"          'complete c; complete b; complete a; complete -p'
