@@ -4820,6 +4820,23 @@ fn builtin_wait(
         Err(outcome) => return outcome,
     };
 
+    // #224: `-p VAR` on a READONLY variable is refused UP FRONT — bash checks
+    // before it waits (measured: the error is instant, not after the child
+    // finishes) and returns 1 without reaping anything. The wording is its
+    // own: `wait` unsets the variable before assigning, so what it reports is
+    // the failed UNSET.
+    if let Some(name) = &parsed.pid_var
+        && shell.is_readonly(name)
+    {
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "wait: {name}: cannot unset: readonly variable"
+        );
+        return ExecOutcome::Continue(1);
+    }
+
     let outcome = match (parsed.wait_any, parsed.targets.len()) {
         (false, 0) => wait_all(shell),
         (false, _) => wait_for_all(parsed.targets, err, shell),
