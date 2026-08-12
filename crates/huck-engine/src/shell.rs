@@ -312,6 +312,8 @@ pub fn run_program_in_sinks(
 ) -> i32 {
     let mut shell = shell_cell.borrow_mut();
     shell.is_interactive = false;
+    // #583: committing to non-interactive is what clears `emacs` in bash.
+    shell.shell_options.emacs = false;
     if let Some(a0) = argv0 {
         shell.shell_argv0 = a0;
     }
