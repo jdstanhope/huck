@@ -1,0 +1,160 @@
+---
+title: "Answers to questions nobody asked"
+date: 2026-08-12
+summary: "Eleven fixes about a shell that was too willing to answer. set -u stopped catching typos the moment you asked for a length, a nonsense expansion returned a plausible value, and a transform quietly applied to only the first argument."
+tags: ["bash-compat", "parameter-expansion", "set -u", "diagnostics"]
+version: null
+draft: false
+---
+
+A shell that answers a malformed question is worse than one that refuses. The
+answer looks right, so nobody checks it. This run of fixes was mostly about
+teaching huck to refuse.
+
+## The hole in `set -u`
+
+`set -u` exists so a typo becomes an error instead of an empty string. It did —
+right up until you asked for a length:
+
+```bash
+# before
+set -u; echo "count=${#missing}"; echo "still running"
+count=0
+still running
+
+# after
+set -u; echo "count=${#missing}"; echo "still running"
+huck: line 1: missing: unbound variable
+```
+
+`0` is the worst possible answer here: it is exactly what you would get from a
+variable that legitimately holds an empty value, so a misspelled name reads as
+"nothing to do" and the script marches on. Both array forms had the same hole
+(`${#missing[@]}`, `${#missing[*]}`).
+
+The fix had to be wired into four separate places — a bare word, an assignment
+right-hand side, a `case` subject, an arithmetic body — because each expands
+`${…}` by its own route. The first version only fixed the first one, which is
+how `echo ${#missing}` started reporting while `x=${#missing}` still answered `0`.
+
+## A length that wasn't a length
+
+`${#name}` takes a length. It does not take anything else — bash rejects the
+whole word. huck read the `#`, then cheerfully applied whatever followed:
+
+```bash
+# before
+v=hello; echo ${#v:-default}
+hello
+
+# after
+v=hello; echo ${#v:-default}
+huck: line 1: ${#v:-default}: bad substitution
+```
+
+Every modifier behaved this way: `${#v#a}` trimmed, `${#v:1:1}` sliced,
+`${#v@Q}` quoted. Each answered a question that was never asked, and none of
+them was the length.
+
+The same rule turned out to govern subscripts, which are legal on an array name
+and nothing else:
+
+```bash
+# before
+echo ${@[0]}; echo "still running"
+
+still running
+
+# after
+echo ${@[0]}; echo "still running"
+huck: line 1: ${@[0]}: bad substitution
+```
+
+## Refusing without giving up
+
+Refusing is not the same as stopping. A bad array subscript is reported by bash
+and then the element is simply treated as unset, so a default still fills in and
+the script continues:
+
+```bash
+# before
+a=(x y); echo ${a[-3]:-fallback}; echo "still running"
+
+still running
+
+# after
+a=(x y); echo ${a[-3]:-fallback}; echo "still running"
+huck: line 1: a: bad array subscript
+fallback
+still running
+```
+
+huck was silent and dropped the default on the floor. bash has five different
+messages for the same mistake depending on where it appears, and two different
+answers to "does the script survive this" — all five now match.
+
+## A transform that only reached the first argument
+
+Not everything this round was about refusing. One was a plain wrong answer:
+
+```bash
+# before
+set aXa bXb cXc; x=${@/X/-}; echo "$x"
+a-a bXb cXc
+
+# after
+set aXa bXb cXc; x=${@/X/-}; echo "$x"
+a-a b-b c-c
+```
+
+The substitution applied to every argument in `echo ${@/X/-}` and to only the
+first in `x=${@/X/-}`. Same expansion, different context, different route
+through the code — and only one of the two routes had been taught the rule.
+
+## The rest
+
+`pushd -n` and `popd -n` now work — and they are not "skip the directory
+change", they are a different stack operation:
+
+```bash
+# before
+cd /tmp; pushd -n /usr; dirs; pwd
+huck: line 1: pushd: -n: invalid number
+pushd: usage: pushd [-n] [+N | -N | dir]
+/tmp
+/tmp
+
+# after
+cd /tmp; pushd -n /usr; dirs; pwd
+/tmp /usr
+/tmp /usr
+/tmp
+```
+
+A malformed C-style `for` header now says what is wrong with it and shows you
+the header as you typed it, instead of reporting a section count bash never
+mentions:
+
+```bash
+# before
+for ((i=0; i<3)); do echo $i; done
+huck: -c: line 1: syntax error: 'for ((...))' header: expected 3 sections separated by `;`, got 2
+
+# after
+for ((i=0; i<3)); do echo $i; done
+huck: -c: line 1: syntax error: arithmetic expression required
+huck: -c: line 1: syntax error: `((i=0; i<3))'
+```
+
+And three smaller ones: `declare -f` prints an empty `for` section as `1`, the
+way bash normalises it; `huck -o` reports line editing as on, because a shell
+starts with it on and only turns it off once it knows it is not interactive; and
+assigning a list to one array member names the member rather than the array.
+
+Eleven issues closed, and ten opened along the way — three of which this run
+then closed as well. Two of the rest are worth knowing about: bash keeps
+["declared" and "assigned" as different states](https://github.com/jdstanhope/huck/issues/600)
+— `declare -A x` leaves `x` unset, where huck creates an empty one — and an
+unbound variable in
+[a redirection on an external command](https://github.com/jdstanhope/huck/issues/606)
+ends the whole shell in huck where bash only loses the command.
