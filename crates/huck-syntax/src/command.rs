@@ -862,6 +862,17 @@ pub enum ParseError {
         body: String,
         err_pos: usize,
     },
+    /// #492: a syntax error inside a `$( … )` body, at a TOKEN rather than at
+    /// EOF. Purely a MARKER — it renders exactly as `inner` does, against the
+    /// outer line, because that is what bash prints. What it carries is the
+    /// fact that the error came from a command substitution, which is the only
+    /// thing separating `bash -c 'echo $(echo a; ; echo b)'` (exit 127) from
+    /// `bash -c 'echo ;;'` (exit 2).
+    ///
+    /// An UNTERMINATED `$(` is deliberately NOT wrapped: bash exits 2 there,
+    /// like any other unexpected-EOF error, and the REPL's
+    /// keep-reading-more-input check keys on those variants.
+    InDollarCommandSub(Box<ParseError>),
 }
 
 impl std::fmt::Display for ParseError {

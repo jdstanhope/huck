@@ -55,6 +55,8 @@ pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
         ParseError::UnsupportedCommand => "unsupported command".to_string(),
         ParseError::Unexpected(_) => "syntax error near unexpected token".to_string(),
         ParseError::InCommandSub { inner, .. } => parse_error_message_impl(inner),
+        // #492: a transparent marker — the message is the inner one.
+        ParseError::InDollarCommandSub(inner) => parse_error_message_impl(inner),
     }
 }
 

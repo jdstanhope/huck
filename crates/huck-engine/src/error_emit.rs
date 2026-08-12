@@ -285,6 +285,13 @@ fn render_diag_inner(
                 comsub_base,
             );
         }
+        // #492: a `$( )` body error is rendered exactly as if unwrapped —
+        // against the OUTER line, with the outer marker — which is what bash
+        // prints. The wrapper exists only to carry the fatality (exit 127
+        // under `-c`), not to change a byte of the diagnostic.
+        ParseError::InDollarCommandSub(inner) => {
+            render_diag_inner(shell, inner, source, local_line, marker, line_base);
+        }
         // Fallback: keep the descriptive message (unmigrated / non-top-level).
         other => {
             emit_syntax_error_ex(

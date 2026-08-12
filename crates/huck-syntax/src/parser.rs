@@ -1748,6 +1748,21 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
                 let mapped = match e {
                     ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
                     ParseError::UnterminatedSubshell => unterminated_cmdsub(pos),
+                    // #492: mark a body error so the engine can tell it from an
+                    // ordinary top-level one — `bash -c` exits 127 for the
+                    // first and 2 for the second. The marker is transparent to
+                    // rendering.
+                    //
+                    // ONLY `Unexpected` is marked, and that is deliberate.
+                    // bash's 127 cases are exactly its "syntax error near
+                    // unexpected token" ones; its unexpected-EOF errors stay 2.
+                    // huck raises its OWN descriptive variants for some bodies
+                    // bash reports as one or the other (`$(()` is huck's "empty
+                    // subshell" but bash's unexpected-EOF), so marking those
+                    // would turn an agreeing status into a divergent one.
+                    other @ ParseError::Unexpected(_) => {
+                        ParseError::InDollarCommandSub(Box::new(other))
+                    }
                     other => other,
                 };
                 return Err(mapped);
@@ -1852,6 +1867,21 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
                 let mapped = match e {
                     ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
                     ParseError::UnterminatedSubshell => unterminated_cmdsub(pos),
+                    // #492: mark a body error so the engine can tell it from an
+                    // ordinary top-level one — `bash -c` exits 127 for the
+                    // first and 2 for the second. The marker is transparent to
+                    // rendering.
+                    //
+                    // ONLY `Unexpected` is marked, and that is deliberate.
+                    // bash's 127 cases are exactly its "syntax error near
+                    // unexpected token" ones; its unexpected-EOF errors stay 2.
+                    // huck raises its OWN descriptive variants for some bodies
+                    // bash reports as one or the other (`$(()` is huck's "empty
+                    // subshell" but bash's unexpected-EOF), so marking those
+                    // would turn an agreeing status into a divergent one.
+                    other @ ParseError::Unexpected(_) => {
+                        ParseError::InDollarCommandSub(Box::new(other))
+                    }
                     other => other,
                 };
                 return Err(mapped);

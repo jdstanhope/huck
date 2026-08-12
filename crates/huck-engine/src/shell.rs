@@ -558,14 +558,19 @@ fn process_line_in_sinks_ex(
             // script and is fatal. `ParseError::InCommandSub` is raised only by
             // the backtick reparse (v316/#213), so it is exactly that split.
             //
-            // ⚠️ A `$( )` body error arrives here as a plain `Unexpected`,
-            // indistinguishable from `echo ;;`, so the `-c` 127-vs-2 half of
-            // this cannot be fixed at this site — see #492.
+            // v360 (#492): a `$( )` body error now arrives wrapped in
+            // `InDollarCommandSub`, so the two are finally distinguishable
+            // here — bash exits 127 for the substitution and 2 for an
+            // ordinary top-level syntax error, under `-c`.
             if top_level && !shell.is_interactive {
-                let kind = if matches!(e, crate::command::ParseError::InCommandSub { .. }) {
-                    crate::error_fatality::ErrorKind::ComsubSyntax { backtick: true }
-                } else {
-                    crate::error_fatality::ErrorKind::Syntax
+                let kind = match &e {
+                    crate::command::ParseError::InCommandSub { .. } => {
+                        crate::error_fatality::ErrorKind::ComsubSyntax { backtick: true }
+                    }
+                    crate::command::ParseError::InDollarCommandSub(_) => {
+                        crate::error_fatality::ErrorKind::ComsubSyntax { backtick: false }
+                    }
+                    _ => crate::error_fatality::ErrorKind::Syntax,
                 };
                 shell.report_error(kind);
             }
