@@ -2312,79 +2312,101 @@ fn xtrace_operand(s: &str) -> String {
     }
 }
 
-/// Render the `[[ … ]]` body for a single leaf (operands EXPANDED), for `set -x`.
-fn render_test_leaf(expr: &TestExpr, shell: &mut Shell) -> String {
+/// A `[[ … ]]` leaf whose operands have been EXPANDED — exactly once (#220).
+///
+/// The expansion is what runs a `<(cmd)` or `$(cmd)` in an operand, so doing it
+/// separately for the `set -x` line and for the evaluation ran the inner
+/// command TWICE, with its side effects. Expanding into this and driving both
+/// from it is what makes the count one.
+///
+/// Each operand is expanded in the form ITS OPERATOR needs, which is also the
+/// form bash traces: `==`/`!=` take a PATTERN (so `[[ abc == "a*" ]]` traces as
+/// `abc == \a\*`) and `=~` a REGEX (`[[ a.b =~ "a.b" ]]` traces as
+/// `a.b =~ a\.b`). Rendering from a plain word expansion, as huck used to,
+/// dropped that escaping.
+enum TestLeaf {
+    Unary {
+        op: TestUnaryOp,
+        s: String,
+    },
+    Binary {
+        op: TestBinaryOp,
+        l: String,
+        r: String,
+    },
+    Regex {
+        l: String,
+        p: String,
+    },
+}
+
+/// The RHS of a binary op, expanded ONCE in the form that operator needs.
+fn expand_test_rhs(op: TestBinaryOp, rhs: &crate::lexer::Word, shell: &mut Shell) -> String {
+    match op {
+        TestBinaryOp::StringEq | TestBinaryOp::StringNe => expand_pattern(rhs, shell),
+        _ => expand_assignment(rhs, shell),
+    }
+}
+
+/// Expand a LEAF's operands once. `None` for the connectives, which have no
+/// operands of their own.
+fn expand_test_leaf(expr: &TestExpr, shell: &mut Shell) -> Option<TestLeaf> {
     match expr {
-        TestExpr::Unary { op, operand } => {
-            let s = expand_assignment(operand, shell);
-            format!("{} {}", test_unary_op_str(*op), xtrace_operand(&s))
-        }
+        TestExpr::Unary { op, operand } => Some(TestLeaf::Unary {
+            op: *op,
+            s: expand_assignment(operand, shell),
+        }),
         TestExpr::Binary { op, lhs, rhs } => {
             let l = expand_assignment(lhs, shell);
-            let r = expand_assignment(rhs, shell);
-            format!(
-                "{} {} {}",
-                xtrace_operand(&l),
-                test_binary_op_str(*op),
-                xtrace_operand(&r)
-            )
+            let r = expand_test_rhs(*op, rhs, shell);
+            Some(TestLeaf::Binary { op: *op, l, r })
         }
         TestExpr::Regex { lhs, pattern } => {
             let l = expand_assignment(lhs, shell);
-            let p = expand_assignment(pattern, shell);
-            format!("{} =~ {}", xtrace_operand(&l), xtrace_operand(&p))
+            // A QUOTED span matches literally (regex metachars escaped); an
+            // unquoted span stays an active regex (bash 3.2+, L-23).
+            let p = crate::expand::expand_regex_operand(pattern, shell);
+            Some(TestLeaf::Regex { l, p })
         }
-        TestExpr::Not(_) | TestExpr::And(_, _) | TestExpr::Or(_, _) => String::new(),
+        TestExpr::Not(_) | TestExpr::And(_, _) | TestExpr::Or(_, _) => None,
     }
 }
 
-fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
-    eval_test_expr_traced(expr, shell, false)
+/// Render an already-expanded leaf for `set -x`.
+fn render_test_leaf(leaf: &TestLeaf) -> String {
+    match leaf {
+        TestLeaf::Unary { op, s } => format!("{} {}", test_unary_op_str(*op), xtrace_operand(s)),
+        TestLeaf::Binary { op, l, r } => format!(
+            "{} {} {}",
+            xtrace_operand(l),
+            test_binary_op_str(*op),
+            xtrace_operand(r)
+        ),
+        TestLeaf::Regex { l, p } => format!("{} =~ {}", xtrace_operand(l), xtrace_operand(p)),
+    }
 }
 
-fn eval_test_expr_traced(
-    expr: &TestExpr,
-    shell: &mut Shell,
-    suppress: bool,
-) -> Result<bool, String> {
-    if !suppress
-        && shell.shell_options.xtrace
-        && matches!(
-            expr,
-            TestExpr::Unary { .. } | TestExpr::Binary { .. } | TestExpr::Regex { .. }
-        )
-    {
-        let body = render_test_leaf(expr, shell);
-        let p4 = ps4(shell);
-        xtrace_emit(xtrace_target_fd(shell), &format!("{p4}[[ {body} ]]"));
-    }
-    match expr {
-        TestExpr::Unary { op, operand } => {
-            let s = expand_assignment(operand, shell);
+/// Evaluate an already-expanded leaf. Nothing here expands again.
+fn eval_test_leaf(leaf: &TestLeaf, shell: &mut Shell) -> Result<bool, String> {
+    match leaf {
+        TestLeaf::Unary { op, s } => {
             if matches!(op, TestUnaryOp::VarSet) {
-                return Ok(shell.element_or_var_is_set(&s));
+                return Ok(shell.element_or_var_is_set(s));
             }
             if matches!(op, TestUnaryOp::OptEnabled) {
-                return Ok(crate::builtins::option_get(shell, &s).unwrap_or(false));
+                return Ok(crate::builtins::option_get(shell, s).unwrap_or(false));
             }
-            Ok(eval_unary(*op, &s))
+            Ok(eval_unary(*op, s))
         }
-        TestExpr::Binary { op, lhs, rhs } => {
-            let l = expand_assignment(lhs, shell);
-            eval_binary(*op, &l, rhs, shell)
-        }
-        TestExpr::Regex { lhs, pattern } => {
-            let l = expand_assignment(lhs, shell);
-            // A QUOTED span of the operand matches literally (regex metachars
-            // escaped); an unquoted span stays an active regex (bash 3.2+, L-23).
-            let p = crate::expand::expand_regex_operand(pattern, shell);
+        TestLeaf::Binary { op, l, r } => eval_binary(*op, l, r, shell),
+        TestLeaf::Regex { l, p } => {
             let p = if shell.nocasematch() {
                 format!("(?i){p}")
             } else {
-                p
+                p.clone()
             };
             let re = regex::Regex::new(&p).map_err(|e| format!("regex error: {e}"))?;
-            match re.captures(&l) {
+            match re.captures(l) {
                 Some(caps) => {
                     // BASH_REMATCH[0] = whole matched substring; [1..] = capture
                     // groups (a non-participating group is "" but still indexed).
@@ -2409,18 +2431,45 @@ fn eval_test_expr_traced(
                 }
             }
         }
+    }
+}
+
+fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
+    eval_test_expr_traced(expr, shell, false)
+}
+
+fn eval_test_expr_traced(
+    expr: &TestExpr,
+    shell: &mut Shell,
+    suppress: bool,
+) -> Result<bool, String> {
+    // #220: expand the leaf's operands ONCE, then drive BOTH the `set -x` line
+    // and the evaluation from that. Expanding separately for each ran a
+    // `<(cmd)` / `$(cmd)` operand twice — under `set -x` only, so the inner
+    // command's side effects doubled exactly when someone was watching.
+    if let Some(leaf) = expand_test_leaf(expr, shell) {
+        if !suppress && shell.shell_options.xtrace {
+            let p4 = ps4(shell);
+            xtrace_emit(
+                xtrace_target_fd(shell),
+                &format!("{p4}[[ {} ]]", render_test_leaf(&leaf)),
+            );
+        }
+        return eval_test_leaf(&leaf, shell);
+    }
+    match expr {
         TestExpr::Not(inner) => {
-            if !suppress
-                && shell.shell_options.xtrace
-                && matches!(
-                    **inner,
-                    TestExpr::Unary { .. } | TestExpr::Binary { .. } | TestExpr::Regex { .. }
-                )
-            {
-                let body = render_test_leaf(inner, shell);
-                let p4 = ps4(shell);
-                xtrace_emit(xtrace_target_fd(shell), &format!("{p4}[[ ! {body} ]]"));
-                return eval_test_expr_traced(inner, shell, true).map(|b| !b);
+            // The negation is part of the traced body (`[[ ! -e x ]]`), so the
+            // inner leaf is expanded here and evaluated from that expansion.
+            if let Some(leaf) = expand_test_leaf(inner, shell) {
+                if !suppress && shell.shell_options.xtrace {
+                    let p4 = ps4(shell);
+                    xtrace_emit(
+                        xtrace_target_fd(shell),
+                        &format!("{p4}[[ ! {} ]]", render_test_leaf(&leaf)),
+                    );
+                }
+                return eval_test_leaf(&leaf, shell).map(|b| !b);
             }
             eval_test_expr_traced(inner, shell, suppress).map(|b| !b)
         }
@@ -2437,6 +2486,10 @@ fn eval_test_expr_traced(
             } else {
                 eval_test_expr_traced(b, shell, false)
             }
+        }
+        // Every leaf returned above.
+        TestExpr::Unary { .. } | TestExpr::Binary { .. } | TestExpr::Regex { .. } => {
+            unreachable!("leaves are handled by expand_test_leaf")
         }
     }
 }
@@ -2522,15 +2575,14 @@ fn arith_eval_operand(s: &str, shell: &mut Shell) -> Result<i64, String> {
         .map_err(|e| format!("{e}"))
 }
 
-fn eval_binary(
-    op: TestBinaryOp,
-    lhs: &str,
-    rhs_word: &crate::lexer::Word,
-    shell: &mut Shell,
-) -> Result<bool, String> {
+/// `rhs` arrives ALREADY EXPANDED, in the form this operator needs
+/// (`expand_test_rhs`) — a pattern for `==`/`!=`, a plain word otherwise. It
+/// used to expand the RHS word itself, which is half of why a `$(cmd)` operand
+/// ran twice under `set -x` (#220).
+fn eval_binary(op: TestBinaryOp, lhs: &str, rhs: &str, shell: &mut Shell) -> Result<bool, String> {
     match op {
         TestBinaryOp::StringEq | TestBinaryOp::StringNe => {
-            let pattern_str = expand_pattern(rhs_word, shell);
+            let pattern_str = rhs.to_string();
             let nocase = shell.nocasematch();
             // G3: the `==`/`!=` RHS inside `[[ … ]]` is ALWAYS an extended
             // pattern in bash — an `@(a|b)`/`!(x)`-shaped group matches as extglob
@@ -2561,26 +2613,22 @@ fn eval_binary(
                 !matched
             })
         }
-        TestBinaryOp::StringLt | TestBinaryOp::StringGt => {
-            let rhs = expand_assignment(rhs_word, shell);
-            Ok(match op {
-                TestBinaryOp::StringLt => lhs < rhs.as_str(),
-                TestBinaryOp::StringGt => lhs > rhs.as_str(),
-                _ => unreachable!(),
-            })
-        }
+        TestBinaryOp::StringLt | TestBinaryOp::StringGt => Ok(match op {
+            TestBinaryOp::StringLt => lhs < rhs,
+            TestBinaryOp::StringGt => lhs > rhs,
+            _ => unreachable!(),
+        }),
         TestBinaryOp::IntEq
         | TestBinaryOp::IntNe
         | TestBinaryOp::IntLt
         | TestBinaryOp::IntGt
         | TestBinaryOp::IntLe
         | TestBinaryOp::IntGe => {
-            let rhs = expand_assignment(rhs_word, shell);
             // In `[[ ]]`, the arithmetic comparison ops evaluate BOTH operands
             // as arithmetic expressions: a bare variable name resolves to its
             // value, `2+3` -> 5, and an unset/empty operand -> 0.
             let l: i64 = arith_eval_operand(lhs, shell)?;
-            let r: i64 = arith_eval_operand(&rhs, shell)?;
+            let r: i64 = arith_eval_operand(rhs, shell)?;
             Ok(match op {
                 TestBinaryOp::IntEq => l == r,
                 TestBinaryOp::IntNe => l != r,
@@ -2592,14 +2640,13 @@ fn eval_binary(
             })
         }
         TestBinaryOp::NewerThan | TestBinaryOp::OlderThan | TestBinaryOp::SameFile => {
-            let rhs = expand_assignment(rhs_word, shell);
             let op_str = match op {
                 TestBinaryOp::NewerThan => "-nt",
                 TestBinaryOp::OlderThan => "-ot",
                 TestBinaryOp::SameFile => "-ef",
                 _ => unreachable!(),
             };
-            Ok(crate::test_builtin::compare_files(op_str, lhs, &rhs))
+            Ok(crate::test_builtin::compare_files(op_str, lhs, rhs))
         }
     }
 }
