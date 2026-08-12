@@ -651,17 +651,50 @@ fn builtin_cd_as(
             format!("{base}/{target}")
         };
         let normalized = normalize_logical(&curpath);
-        if let Err(e) = env::set_current_dir(Path::new(&normalized)) {
-            crate::sh_error_to!(
-                shell,
-                err,
-                Some(caller),
-                "{target}: {}",
-                crate::bash_io_error(&e)
-            );
-            return ExecOutcome::Continue(1);
+        match env::set_current_dir(Path::new(&normalized)) {
+            Ok(()) => normalized,
+            Err(e) => {
+                // #517: bash's `change_to_directory` does NOT give up here. When
+                // the canonicalized path cannot be entered it retries the
+                // argument AS WRITTEN, and on success takes the resulting
+                // directory from getcwd() instead of the canonical name. Two
+                // measured cases need it:
+                //
+                //   * an ancestor that has lost search permission since the
+                //     shell moved inside it — `chdir("/a/b/c")` is EACCES while
+                //     `chdir(".")` succeeds, so bash's `cd .` is a no-op success
+                //     where huck reported `Permission denied`;
+                //   * a logical path through a symlink whose canonical form does
+                //     not exist — from a symlinked `lnk -> p/q`, bash's
+                //     `cd ../q` lands in `p/q` (PWD becomes the PHYSICAL path)
+                //     while huck reported `No such file or directory`.
+                //
+                // On a second failure the FIRST error is the one bash reports:
+                // `cd ./nosuch` under the revoked-ancestor setup says
+                // `Permission denied` (the canonical attempt) and not the
+                // `No such file or directory` the literal attempt would give.
+                if env::set_current_dir(Path::new(&target)).is_err() {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        Some(caller),
+                        "{target}: {}",
+                        crate::bash_io_error(&e)
+                    );
+                    return ExecOutcome::Continue(1);
+                }
+                match env::current_dir() {
+                    Ok(p) => p.to_string_lossy().into_owned(),
+                    // getcwd() failed after a successful chdir: bash forgets the
+                    // working directory here and `-e` calls that "cannot be
+                    // determined". Keep the canonical name as the best guess.
+                    Err(_) => {
+                        pwd_undetermined = true;
+                        normalized
+                    }
+                }
+            }
         }
-        normalized
     };
 
     // 4. Maintain OLDPWD / PWD.
