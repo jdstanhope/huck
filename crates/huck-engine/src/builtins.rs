@@ -3679,7 +3679,19 @@ fn builtin_read(
     let (line, stop, _any_read) = match read_record(&mut handle, &cfg, poll_fd) {
         Ok(t) => t,
         Err(e) => {
-            crate::sh_error_to!(shell, err, None, "read: {}", crate::bash_io_error(&e));
+            // #546: bash's `read_builtin` reports a failed read(2) as
+            // `read error: <fd>: <strerror>`, naming the descriptor it was
+            // reading from — 0 by default, or the `-u` fd. huck printed the
+            // strerror alone, which loses the only clue to WHICH fd failed
+            // when a script reads from several.
+            let fd = handle.raw_fd();
+            crate::sh_error_to!(
+                shell,
+                err,
+                None,
+                "read: read error: {fd}: {}",
+                crate::bash_io_error(&e)
+            );
             #[cfg(unix)]
             if let Some(s) = saved_term {
                 unsafe {
