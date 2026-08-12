@@ -33,5 +33,20 @@ check     "no over-consume"        'f=$(mktemp); printf "first\nsecond\nthird\n"
 check_err "non-numeric fd"         'read -u xyz v'
 check_err "unopened fd 9"          'read -u 9 v'
 
+# --- #546: a failed read(2) is reported as `read error: <fd>: <strerror>`,
+#     naming the descriptor read from. huck printed the strerror alone, so a
+#     script reading from several fds could not tell which one failed. `-u`
+#     validates the fd first, so reaching this needs an fd that IS open but
+#     cannot be read: a write-only one, or a directory.
+check_err "closed stdin"           'exec 0<&-; read v'
+# NOT a row: `exec 0>/dev/null; read v`. This harness pipes the script into the
+# shell on stdin, so REPLACING fd 0 breaks the script reader itself — bash
+# reports `error reading input file` and exits 2 before `read` ever runs. Under
+# `-c` both shells agree (`read: read error: 0: Bad file descriptor`).
+check_err "write-only -u fd"       'exec 4>/dev/null; read -u 4 v'
+check_err "directory on stdin"     'read v < /'
+check_err "directory on -u fd"     'exec 5</etc; read -u 5 v'
+check_err "closed stdin in pipe"   'echo x | { exec 0<&-; read v; }'
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
