@@ -33,6 +33,19 @@ fragments=(
   'f(){ for x in 1 2; do echo $x; done; }; declare -f f'
   'f(){ for x; do echo $x; done; }; declare -f f'
   'f(){ for ((i=0; i<3; i++)); do echo $i; done; }; declare -f f'
+  # #64: a MISSING header section reconstructs as `1`, not as empty — the
+  # normalisation is bash's, and it applies to each of the three
+  # independently. Only the printed form changes; an empty init and step
+  # still do nothing and an empty condition is still true, which the
+  # re-run rows below check.
+  'f(){ for ((;;)); do break; done; }; declare -f f'
+  'f(){ for ((; i<3; i++)); do :; done; }; declare -f f'
+  'f(){ for ((i=0;; i++)); do break; done; }; declare -f f'
+  'f(){ for ((i=0; i<3;)); do break; done; }; declare -f f'
+  'f(){ for ((   ;  ; )); do break; done; }; declare -f f'
+  'f(){ for ((;;)); do break; done; }; type f'
+  'f(){ for ((; i<3; i++)); do :; done; }; eval "$(declare -f f)"; declare -f f'
+  'i=0; f(){ for ((;i<2;)); do echo $i; i=$((i+1)); done; }; f; declare -f f'
   'f(){ select x in a b; do echo $x; done; }; declare -f f'
   'f(){ case $x in a) echo A;; b|c) echo BC;; esac; }; declare -f f'
   'f(){ (( i < 3 )); }; declare -f f'

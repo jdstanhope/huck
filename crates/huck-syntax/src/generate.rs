@@ -283,8 +283,18 @@ fn for_to_source(c: &ForClause, indent: usize) -> String {
 }
 
 fn arith_for_to_source(c: &crate::command::ArithForClause, indent: usize) -> String {
-    let sec =
-        |w: &Option<crate::lexer::Word>| w.as_ref().map(arith_body_to_source).unwrap_or_default();
+    // bash normalises a MISSING header section to `1` when it reconstructs the
+    // loop for `declare -f`/`type`, so `for ((;;))` comes back as
+    // `for ((1; 1; 1))` (#64). The `1` is only in the printed form — an empty
+    // init and step still do nothing, and an empty condition is still true.
+    let sec = |w: &Option<crate::lexer::Word>| {
+        let text = w.as_ref().map(arith_body_to_source).unwrap_or_default();
+        if text.is_empty() {
+            "1".to_string()
+        } else {
+            text
+        }
+    };
     let mut s = format!(
         "for (({}; {}; {}))\n{}do\n",
         sec(&c.init),
