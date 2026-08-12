@@ -455,11 +455,14 @@ fn expand_positional_transform(
         .iter()
         .map(|a| scalar_apply_per_element(name, modifier, a, quoted, shell))
         .collect();
-    if name == "@" && quoted {
-        ExpansionResult::WordList(transformed)
-    } else {
+    // #316: same shape rule as the array arm — only a QUOTED `*` joins here;
+    // every other case is a WordList so the render arm can keep the elements
+    // separate under an empty IFS.
+    if name == "*" && quoted {
         let sep = ifs_join_sep(&shell.ifs());
         ExpansionResult::Value(transformed.join(&sep))
+    } else {
+        ExpansionResult::WordList(transformed)
     }
 }
 
@@ -1183,12 +1186,18 @@ fn expand_array_param(
                 .iter()
                 .map(|v| scalar_apply_per_element(name, modif, v, quoted, shell))
                 .collect();
-            if matches!(subscript, SK::All) && quoted {
-                ExpansionResult::WordList(transformed)
-            } else {
+            // #316: only a QUOTED `*` joins here. Everything else hands the
+            // elements to the render arm as a WordList, which is the one that
+            // knows an unquoted `@`/`*` keeps each element a SEPARATE WORD
+            // even when IFS is empty — joining first collapsed
+            // `IFS=; ${arr[@]/X/-}` into one field, where the untransformed
+            // `${arr[@]}` was already right.
+            if matches!(subscript, SK::Star) && quoted {
                 let ifs = shell.ifs();
                 let sep = ifs_join_sep(&ifs);
                 ExpansionResult::Value(transformed.join(&sep))
+            } else {
+                ExpansionResult::WordList(transformed)
             }
         }
         (crate::lexer::ParamModifier::Transform { op }, sub)
@@ -2178,6 +2187,17 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                     ("@" | "*", crate::lexer::ParamModifier::Substring { .. })
                 ) {
                     expand_positional_substring(name, modifier, *quoted, shell)
+                } else if matches!(name.as_str(), "@" | "*") && is_per_element_modifier(modifier) {
+                    // #315: the per-element transform applies to EVERY
+                    // positional parameter here too. This dispatch (assignment
+                    // RHS, `case` subject, `[[ ]]` operand — word-splitting
+                    // suppressed) was left unwired by v340, so `x=${@/X/-}`
+                    // transformed only `$1`. Asking for the WordList shape
+                    // (`quoted = true` for `@`) hands the join to the arm
+                    // below, which is the one that knows a `@` joins with a
+                    // SPACE in a no-split context whatever IFS says (#292).
+                    let want_list = name == "@";
+                    expand_positional_transform(name, modifier, *quoted || want_list, shell)
                 } else {
                     crate::param_expansion::expand_modifier_quoted(name, modifier, *quoted, shell)
                 };
