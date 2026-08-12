@@ -4673,6 +4673,17 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
             );
         }
         if !resolved.program.is_empty() {
+            // #372: a declaration builtin's COMPOUND array operands are traced
+            // by bash on their own preceding lines, re-quoted, with the operand
+            // itself reduced to the bare NAME on the command line:
+            //
+            //     declare -A m=([k]=v [j]=w)
+            //     + m=(['k']='v' ['j']='w')
+            //     + declare -A m
+            //
+            // huck emitted the raw source as one line. Collected here and
+            // emitted below, after any inline-assignment prefix lines.
+            let mut compound_lines: Vec<String> = Vec::new();
             let body = if let Some(dargs) = &resolved.decl_args {
                 let mut parts: Vec<String> = command_prefix
                     .iter()
@@ -4687,14 +4698,9 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
                         crate::command::DeclArg::Assign(a) => {
                             let name = a.target.name();
                             if let Some(elems) = array_literal_elements(&a.value) {
-                                // Array-literal RHS: best-effort `name=(e1 e2 ...)`
-                                // (spec: arrays best-effort, must not crash;
-                                // expand_assignment would panic on the literal).
-                                // Route through the shared reconstructor so the
-                                // render matches the eval/declare re-parse path.
-                                let rendered =
-                                    crate::expand::reconstruct_array_literal(elems, shell);
-                                parts.push(format!("{name}={rendered}"));
+                                let rendered = crate::expand::xtrace_array_literal(elems, shell);
+                                compound_lines.push(format!("{name}={rendered}"));
+                                parts.push(name.to_string());
                             } else {
                                 let rhs = match crate::command::word_literal_text(&a.value) {
                                     Some(t) => t.to_string(),
@@ -4712,6 +4718,9 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
             } else {
                 xtrace_command_line(&command_prefix, &resolved.program, &resolved.args)
             };
+            for line in compound_lines {
+                xtrace_emit(xtrace_target_fd(shell), &format!("{p4}{line}"));
+            }
             xtrace_emit(xtrace_target_fd(shell), &format!("{p4}{body}"));
         }
     }
