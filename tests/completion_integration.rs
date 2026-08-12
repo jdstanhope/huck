@@ -76,10 +76,10 @@ complete -p myc
 "#;
     let (out, _, code) = run_huck(script);
     assert_eq!(code, 0);
-    assert!(out.contains("complete"));
-    assert!(out.contains("-W"));
-    assert!(out.contains("alpha apple banana"));
-    assert!(out.contains("-- myc"));
+    // bash's print form, byte for byte: the value is single-quoted, the name
+    // is bare, and there is NO `--` in front of it (#527 — this assertion used
+    // to demand `-- myc`, pinning the divergence).
+    assert_eq!(out.trim_end(), "complete -W 'alpha apple banana' myc");
 }
 
 #[test]
