@@ -8763,6 +8763,26 @@ fn run_sourced_contents_in_sinks_inner(
                     // scan-stop position, which is what bash names for them.
                     let opens_delim = matches!(&e, crate::command::ParseError::Lex(le)
                         if crate::error_emit::lex_error_opens_delim(le));
+                    // #617: a NEAR-TOKEN error is reported at the offending
+                    // token's own line — bash names `;;` on line 4 of an `if`
+                    // that started on line 2, and echoes line 4. huck used the
+                    // UNIT's start for every non-lex parse error, which agreed
+                    // only while the token sat on the compound's first line.
+                    // The failure carries the token's offset already.
+                    // Only a failure that FOUND A TOKEN takes this path: an
+                    // `Unexpected` whose `found` is Eof is one of the
+                    // unexpected-EOF shapes, whose line the renderer derives
+                    // itself (the delimiter's opening line, or the EOF line) —
+                    // its `pos` is where the scan stopped, which would drag an
+                    // unterminated backtick back to the last line.
+                    let near_token_off = match &e {
+                        crate::command::ParseError::Unexpected(f)
+                            if !matches!(f.found, crate::command::Found::Eof) =>
+                        {
+                            Some(f.pos)
+                        }
+                        _ => None,
+                    };
                     let foff = if is_lex {
                         iter.cursor_pos()
                     } else {
@@ -8770,7 +8790,9 @@ fn run_sourced_contents_in_sinks_inner(
                     };
                     // The RESTART position stays where the scan stopped; only
                     // the reported LINE moves back to the delimiter.
-                    let line_off = if opens_delim {
+                    let line_off = if let Some(off) = near_token_off {
+                        off
+                    } else if opens_delim {
                         // The innermost OPEN frame's offset when there is one
                         // (`"…"`, `${…}`, `$((…))`), else where the failing scan
                         // step began (a single-quoted run or a backtick, which
