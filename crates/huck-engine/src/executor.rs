@@ -218,6 +218,26 @@ pub fn execute_with_sink(seq: &Sequence, shell: &mut Shell, source: &str) -> Exe
 }
 
 fn execute_with_sink_inner(seq: &Sequence, shell: &mut Shell, _source: &str) -> ExecOutcome {
+    // `set -n` / `-o noexec` / the `-n` CLI flag: parse but run NOTHING. The
+    // per-command gate in `run_command` is not enough, because two paths reach a
+    // background launch without going through it (#636):
+    //
+    //   * the trailing-`&` fast path just below, which called
+    //     `run_background_sequence` directly — so `huck -n f.sh` on a file whose
+    //     last command is `cmd &` RAN it. That is how a `parse_sweep` run over
+    //     every script on the machine started a `usbipd` daemon.
+    //   * `execute_sequence_body`'s backgrounded-group arm, which forks a child
+    //     that then skips its own body — no visible side effect, but a process
+    //     bash never creates.
+    //
+    // Gating at the sequence entry closes both, and is where "noexec means
+    // nothing runs" is actually true. Non-interactive only, matching
+    // `run_command` (bash ignores `-n` interactively). Status is 0: a skipped
+    // list is what bash reports, and it is what `run_command` already returned
+    // for every command it gated.
+    if shell.shell_options.noexec && !shell.is_interactive {
+        return ExecOutcome::Continue(0);
+    }
     // Fast path: a trailing-`&` that backgrounds a SINGLE and-or group (no
     // `&`-separators inside the list). This preserves the real source-derived
     // job-display label for the common `cmd &` / `a && b &` / `a | b &` forms.
