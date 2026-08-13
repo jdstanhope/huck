@@ -1,0 +1,171 @@
+---
+title: "The shell that pointed at the wrong line"
+date: 2026-08-13
+summary: "Seven fixes about a shell that spotted your mistake and then sent you somewhere else to find it. A syntax error blamed the line a block started on, an unterminated quote blamed the end of the file, and set -x invented quotes you never typed."
+tags: ["bash-compat", "diagnostics", "syntax-errors", "set -x"]
+version: null
+draft: false
+---
+
+A syntax error has two jobs. Say what is wrong, and say where. huck was doing
+the first one well and the second one badly — every fix in this run is about
+the second half of the message: the line number, the echoed source line, or
+which delimiter it names.
+
+## The line a mistake was reported on
+
+Put a stray `;;` inside an `if` block and huck told you the truth about the
+token and lied about where it was:
+
+```bash
+# before
+echo hello
+if true
+then
+;;
+fi
+
+hello
+f.sh: line 2: syntax error near unexpected token `;;'
+f.sh: line 2: `if true'
+```
+
+Line 2 is where the `if` started. The mistake is on line 4, and the echoed
+source line — the thing you actually scan for the problem — showed you a line
+that is perfectly fine. In a long script, that sends you to the wrong place
+twice.
+
+```bash
+# after
+hello
+f.sh: line 4: syntax error near unexpected token `;;'
+f.sh: line 4: `;;'
+```
+
+It was filed as a bug about `case`. It turned out every multi-line compound had
+it: `if`, `while`, `until`, `for`, `case`, brace groups, subshells and function
+bodies all named their own first line.
+
+## The delimiter that ran out
+
+When input ends in the middle of something, bash tells you which delimiter it
+was still looking for. huck named the wrong one whenever arithmetic was
+involved:
+
+```bash
+# before
+echo hello
+total=$((1 +
+2 +
+"3
+
+hello
+b.sh: line 5: unexpected EOF while looking for matching `)'
+```
+
+There are two errors in one line of output. The unclosed thing is the quote, not
+the arithmetic — and it opened on line 4, not line 5. Both halves now match
+bash:
+
+```bash
+# after
+hello
+b.sh: line 4: unexpected EOF while looking for matching `"'
+```
+
+The same family of fixes taught huck that `$[ 1+2` — bash's deprecated spelling
+of `$(( ))` — is closed by `]` rather than `)`, and that an unterminated C-style
+`for (( ))` header should name its delimiter at the header's line instead of
+falling back to a generic "unexpected end of file" pointing at the bottom of the
+file.
+
+Reading a script from a pipe had a wording problem too. huck used a phrase bash
+never says:
+
+```bash
+# before
+$ printf 'echo hello\necho "oops\n' | huck
+hello
+huck: line 2: syntax error: unexpected end of input
+
+# after
+hello
+huck: line 2: unexpected EOF while looking for matching `"'
+```
+
+## Quotes nobody typed
+
+Away from syntax errors, `set -x` had its own version of the same problem —
+showing you something other than what you wrote. An empty assignment came back
+wearing quotes:
+
+```bash
+# before
+set -x
+x=
+y=""
+
++ x=''
++ y=''
+```
+
+```bash
+# after
++ x=
++ y=
+```
+
+bash prints the bare `x=` for both. When you are reading a trace to find out
+what a script actually did, an invented `''` is a detail you have to stop and
+distrust.
+
+Trap actions had a related problem. The `+` marks in a trace count nesting
+depth, so a handler's commands should stand out from the code they interrupted —
+but huck traced them flat, at the depth of whatever was running:
+
+```bash
+# before
+set -x
+trap "echo a; echo b" USR1
+kill -USR1 $$
+
++ trap 'echo a; echo b' USR1
++ kill -USR1 12345
++ echo a
++ echo b
+```
+
+```bash
+# after
++ trap 'echo a; echo b' USR1
++ kill -USR1 12345
+++ echo a
+++ echo b
+```
+
+Nothing in the "before" trace tells you that `echo a` came from a signal
+handler rather than from the next line of your script.
+
+## What is still open
+
+Measuring these turned up six more. One — the `for (( ))` header above — was
+fixed in the same run; the other five are filed and open, and they are all the
+same question: when input runs out inside something nested, which delimiter gets
+named?
+
+An [unterminated `${…}`](https://github.com/jdstanhope/huck/issues/627) inside
+arithmetic names `}` where bash names the arithmetic delimiter. A
+[single quote inside a `${…}`](https://github.com/jdstanhope/huck/issues/631)
+in a double-quoted context is skipped for the same reason it is skipped when
+expanding — except bash still names it. A
+[backslash-escaped quote](https://github.com/jdstanhope/huck/issues/624) is
+treated as a real one, which also changes the expression bash would have
+evaluated. A `$((` that turns out to be
+[a command substitution](https://github.com/jdstanhope/huck/issues/629) loses
+the line it opened on. And a `for (( … )` header closed by
+[a single paren](https://github.com/jdstanhope/huck/issues/628) still gets the
+generic message.
+
+They interlock — fixing the `${…}` one moves the answer for the single-quote one
+without making it right — so the next pass here is probably one deliberate model
+of what names what, rather than five more small fixes.
