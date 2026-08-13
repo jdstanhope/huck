@@ -4935,9 +4935,18 @@ fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
     let result = parse_arith_for_body(iter);
     let (sections, close_at) = match result {
         Ok(s) => s,
-        Err(ParseError::Lex(_)) => {
+        // #625: a lex error means the HEADER ran out of input, and it already
+        // knows which delimiter it was looking for and where that opened — the
+        // same `scan_step_arith` answer `$((`/`$[`/`((` report. Collapsing it to
+        // `UnterminatedLoop` threw both away for huck's generic `syntax error:
+        // unexpected end of file` at the input's LAST line, where bash says
+        // `unexpected EOF while looking for matching X` at the header's line.
+        // The `ArithBail` path (a depth-0 `)` not followed by `)`) is NOT a lex
+        // error and still maps to `UnterminatedLoop`, which is the shape bash
+        // reports for a header that closes wrong rather than running out.
+        Err(e @ ParseError::Lex(_)) => {
             iter.pop_mode();
-            return Err(ParseError::UnterminatedLoop);
+            return Err(e);
         }
         Err(e) => {
             iter.pop_mode();

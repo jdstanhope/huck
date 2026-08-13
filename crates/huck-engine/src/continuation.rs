@@ -330,14 +330,21 @@ mod tests {
 
     #[test]
     fn unterminated_arith_for_header_requests_more_input() {
-        // `for ((;;` — the arith-for header isn't closed yet. As of v184 an
-        // unterminated `((` no longer lex-errors; it falls back to two LParens,
-        // so the parser sees `for ( (` and reports an unclosed arith-for header
-        // as UnterminatedLoop → Incomplete(Compound). Still Incomplete (the REPL
-        // prompts for continuation), matching bash which prompts `>` here.
+        // `for ((;;` — the arith-for header isn't closed yet. The REPL must
+        // prompt for continuation, matching bash's `>` here; that is what this
+        // test is for, and it holds either way.
+        //
+        // The REASON is now OpenQuote rather than Compound: #625 stopped
+        // `parse_arith_for_clause` collapsing the header's lex error into
+        // `UnterminatedLoop`, so an unterminated header arrives as the same
+        // open-delimiter lex error `echo $[ 1 +` does just above — and takes the
+        // same classification branch. `joiner_for` returns "; " for both here
+        // (the Compound branch only differs when the last line ends in a control
+        // keyword, which an unterminated header never does), so the multi-line
+        // history join is unchanged.
         assert_eq!(
             classify("for ((;;", false),
-            Completeness::Incomplete(ContinuationReason::Compound)
+            Completeness::Incomplete(ContinuationReason::OpenQuote)
         );
     }
 
