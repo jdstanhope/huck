@@ -52,15 +52,17 @@ fn lex_error_reports_line() {
 }
 
 #[test]
-fn multiline_construct_points_at_first_line() {
-    // A 3-line function whose body has a stray `done`; documented limitation:
-    // the reported line is the construct's FIRST line (function def, line 2).
+fn multiline_construct_points_at_the_token() {
+    // A 3-line function whose body has a stray `done`. This asserted the
+    // construct's FIRST line (line 2) as a "documented limitation"; #617 makes
+    // it bash's answer instead — the token's OWN line, with that line echoed.
+    // Verified against bash 5.2.21 for the same script.
     let (_o, se, _c) = run_script("echo a\nf() {\n  done\n}\n");
-    assert!(se.contains("syntax error"), "stderr: {se:?}");
     assert!(
-        se.contains("line 2:"),
-        "expected first-line 'line 2:', got: {se:?}"
+        se.contains("line 3: syntax error near unexpected token `done'"),
+        "stderr: {se:?}"
     );
+    assert!(se.contains("line 3: `  done'"), "stderr: {se:?}");
 }
 
 // --- v239 regression guards: a lex error that begins a unit in the live source
