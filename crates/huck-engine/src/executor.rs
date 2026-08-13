@@ -4376,7 +4376,7 @@ fn run_assignment_list(items: &[crate::command::Assignment], shell: &mut Shell) 
                     Some(rhs) => rhs,
                     None => shell.lookup_var(name).unwrap_or_default(),
                 };
-                crate::param_expansion::xtrace_quote(&val)
+                crate::param_expansion::xtrace_quote_value(&val)
             };
             let p4 = ps4(shell);
             xtrace_emit(
@@ -4756,7 +4756,10 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
             let val = shell.lookup_var(name).unwrap_or_default();
             xtrace_emit(
                 xtrace_target_fd(shell),
-                &format!("{p4}{name}={}", crate::param_expansion::xtrace_quote(&val)),
+                &format!(
+                    "{p4}{name}={}",
+                    crate::param_expansion::xtrace_quote_value(&val)
+                ),
             );
         }
         if !resolved.program.is_empty() {
@@ -4795,7 +4798,7 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
                                 };
                                 parts.push(format!(
                                     "{name}={}",
-                                    crate::param_expansion::xtrace_quote(&rhs)
+                                    crate::param_expansion::xtrace_quote_value(&rhs)
                                 ));
                             }
                         }

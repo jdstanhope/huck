@@ -397,6 +397,18 @@ pub(crate) fn xtrace_quote(s: &str) -> String {
     s.to_string()
 }
 
+/// Quote an ASSIGNMENT's value for xtrace. Identical to `xtrace_quote` except
+/// for the empty string: bash prints `x=` where a command ARGUMENT would be
+/// `''`, so the empty case is bare here (#614). Measured across every
+/// assignment path — a bare `x=`, an inline prefix (`x= cmd`), `declare`,
+/// `local`, `export`, `readonly` and `+=`.
+pub(crate) fn xtrace_quote_value(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    xtrace_quote(s)
+}
+
 /// bash `sh_contains_shell_metas`: does `s` contain a character that requires
 /// quoting to re-read as a single literal word?
 pub(crate) fn contains_shell_metas(s: &str) -> bool {
