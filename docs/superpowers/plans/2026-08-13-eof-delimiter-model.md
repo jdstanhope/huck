@@ -40,7 +40,7 @@ If a gate does not come out as this plan says it will, **stop and report it** ra
 | `crates/huck-syntax/src/spell.rs` | spells the new variant. |
 | `crates/huck-engine/src/error_emit.rs` | renders from the reported pair; `lex_is_shape3`'s variant→`Delim` mapping is deleted; the `$(`-uses-EOF-line special case becomes the pair's `LineRule`. |
 | `tools/eof_matrix.sh` *(new)* | the measuring instrument: generates the 813 cells, compares bash vs huck, prints a TSV. |
-| `tools/eof_matrix_baseline.tsv` *(new)* | today's divergent rows, committed so each task can show exactly which ones it fixed. |
+| `tools/eof_matrix.sh`'s `EXPECTED_DIFF` list | today's 78 divergent coordinates, embedded IN the tool (`/tools/*.tsv` is gitignored by design), so each task's edit to it is visible in review. `--check` diffs a live run against it. |
 | `tests/scripts/eof_delimiter_matrix_diff_check.sh` *(new, Task 9)* | the generated harness, once green. |
 | `tests/scripts/eof_pair_lines_diff_check.sh` *(new, Task 9)* | hand-written rows for what the matrix cannot reach: multi-line line rules, `$((1+2)`, piped stdin, escaped quotes. |
 
@@ -140,7 +140,7 @@ The message must record the inertness evidence: parse sweep identical over N row
 Every later task proves itself against this. It touches no production code.
 
 **Files:**
-- Create: `tools/eof_matrix.sh`, `tools/eof_matrix_baseline.tsv`
+- Create: `tools/eof_matrix.sh` (carrying its own `EXPECTED_DIFF` baseline)
 
 **Interfaces:**
 - Produces: `tools/eof_matrix.sh [--tsv]` → one row per cell, tab-separated: `DEPTH CONTEXT MIDDLE INNER FRAGMENT BASH HUCK VERDICT`, where `BASH`/`HUCK` are `"<line> <delimiter>"` for a Shape 3 message or `"<line> ~<message prefix>"` otherwise, and `VERDICT` is `OK` or `DIFF`. Honours `HUCK_BIN`. Later tasks call it and diff against the baseline.
@@ -167,9 +167,15 @@ Expected: `echo $((1+${x` → bash `3 )`, huck `3 }`, DIFF. `echo $((1+"` → `3
 - [ ] **Step 3: Record the baseline**
 
 ```bash
-tools/eof_matrix.sh --tsv > tools/eof_matrix_baseline.tsv
-awk -F'\t' 'NR>1{c[$8]++} END{for(k in c) print k, c[k]}' tools/eof_matrix_baseline.tsv
+tools/eof_matrix.sh --tsv > /tmp/mx.tsv
+awk -F'\t' 'NR>1{c[$8]++} END{for(k in c) print k, c[k]}' /tmp/mx.tsv
 ```
+
+Then embed those 78 divergent coordinates in the tool as `EXPECTED_DIFF` and add
+`--check`, which reports what LEFT the set (a fix) and what JOINED it (a
+regression) and exits nonzero only on the latter. Negative-test the gate in both
+directions before trusting it: a mutated copy with one real coordinate removed
+and one bogus one added must report exactly one REGRESSED and one FIXED.
 
 Expected: `OK 735`, `DIFF 78` (16 divergent of 165 at depth 1, 62 of 648 at depth 2).
 
@@ -178,8 +184,8 @@ If the counts differ from this plan, **stop and report** — either the instrume
 - [ ] **Step 4: Commit**
 
 ```bash
-git add tools/eof_matrix.sh tools/eof_matrix_baseline.tsv
-git commit -m "tools(#635): the EOF-delimiter matrix and today's baseline"
+git add tools/eof_matrix.sh
+git commit -m "tools(#635): the EOF-delimiter matrix and its expected DIFF set"
 ```
 
 ---
@@ -253,7 +259,7 @@ Map each pair-bearing `Mode` to its `Delim` and `LineRule` (`$(` → `Eof`; ever
 ```bash
 cargo build --locked --bin huck
 tools/eof_matrix.sh --tsv > /tmp/m.tsv
-diff tools/eof_matrix_baseline.tsv /tmp/m.tsv && echo "MATRIX UNCHANGED (813 cells)"
+tools/eof_matrix.sh --check     # expect: 0 FIXED, 0 REGRESSED
 ```
 
 Expected: identical. This task is a refactor; a changed cell means the mode→pair mapping is wrong somewhere, and you should find out which cell and why before continuing.
@@ -307,7 +313,7 @@ Push a quote pair when an arith body opens a quote span (replacing `Mode::Arith:
 
 ```bash
 tools/eof_matrix.sh --tsv > /tmp/m.tsv
-diff <(awk -F'\t' '$8=="DIFF"' tools/eof_matrix_baseline.tsv) <(awk -F'\t' '$8=="DIFF"' /tmp/m.tsv)
+tools/eof_matrix.sh --check
 ```
 
 Expected: the 6 `'`-in-`${}` rows leave the DIFF set; **nothing joins it**. A new DIFF row is a regression — investigate before continuing.
@@ -480,7 +486,7 @@ Controls that already agree: `echo $( (1+2)` and `echo $(cmd` both report the EO
 
 **Files:**
 - Create: `tests/scripts/eof_delimiter_matrix_diff_check.sh`
-- Modify: `tests/scripts/eof_pair_lines_diff_check.sh` (final rows), `tools/eof_matrix_baseline.tsv` (now all-OK)
+- Modify: `tests/scripts/eof_pair_lines_diff_check.sh` (final rows), `tools/eof_matrix.sh` (`EXPECTED_DIFF` down to the 6 out-of-scope cells)
 
 - [ ] **Step 1: Confirm every in-scope cell is green**
 
@@ -515,8 +521,8 @@ Build `main` in a worktree and run both harnesses against it. Expected: the matr
 - [ ] **Step 5: Refresh the baseline and commit**
 
 ```bash
-tools/eof_matrix.sh --tsv > tools/eof_matrix_baseline.tsv    # 807 OK, the 6 excluded cells still DIFF
-git add tests/scripts/eof_delimiter_matrix_diff_check.sh tests/scripts/eof_pair_lines_diff_check.sh tools/eof_matrix_baseline.tsv
+tools/eof_matrix.sh --check    # 0 REGRESSED; EXPECTED_DIFF now lists only the 6 out-of-scope cells
+git add tests/scripts/eof_delimiter_matrix_diff_check.sh tests/scripts/eof_pair_lines_diff_check.sh tools/eof_matrix.sh
 git commit -m "test(#635): the generated EOF-delimiter matrix joins the sweep"
 ```
 
