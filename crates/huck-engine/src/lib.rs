@@ -67,7 +67,7 @@ pub use completion::{Candidate, CandidateKind};
 pub use engine::{Completion, Engine, EngineBuilder, Output};
 pub use error_emit::{
     Diag, emit_cli_error, emit_error, emit_error_bytes_to, emit_error_noline_to, emit_error_to,
-    emit_syntax_error, render_syntax_diag,
+    emit_syntax_error, render_incomplete_input_diag, render_syntax_diag,
 };
 pub use exec_builder::ExecBuilder;
 

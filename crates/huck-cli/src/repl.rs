@@ -360,16 +360,25 @@ pub fn run(args: &[String], version: &str) -> i32 {
                 return shell_exit(&mut shell, code);
             }
             ReadResult::EofMidCommand(buffer) => {
-                // bash's line count for an EOF-truncated command is the line
-                // the next (never-arriving) physical line would have been:
-                // 1 (first line) + newlines already read + 1 (the missing one).
-                let line = buffer.matches('\n').count() as u32 + 2;
                 let mut shell = shell_cell.borrow_mut();
-                emit_syntax_error(
-                    &shell,
-                    line,
-                    format_args!("syntax error: unexpected end of input"),
-                );
+                // #385: the buffer is re-parsed so this reader reports the same
+                // shape every other driver does — `unexpected EOF while looking
+                // for matching `"'` at the line the quote opened on, or
+                // `unexpected end of file` for an open compound. huck used to
+                // print its own "unexpected end of input", which bash never
+                // says. The fallback stays for a buffer that parses cleanly
+                // (the reader and the parser disagreeing about completeness).
+                if !huck_engine::render_incomplete_input_diag(&shell, &buffer) {
+                    // bash's line count for an EOF-truncated command is the line
+                    // the next (never-arriving) physical line would have been:
+                    // 1 (first line) + newlines already read + 1 (the missing one).
+                    let line = buffer.matches('\n').count() as u32 + 2;
+                    emit_syntax_error(
+                        &shell,
+                        line,
+                        format_args!("syntax error: unexpected end of input"),
+                    );
+                }
                 return shell_exit(&mut shell, 2);
             }
             ReadResult::ReadError(msg) => {
