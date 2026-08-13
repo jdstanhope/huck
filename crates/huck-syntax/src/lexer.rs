@@ -1215,6 +1215,8 @@ pub(crate) struct Mark {
     opts: LexerOptions,
     alias_trailing_eligible: bool,
     modes: Vec<Mode>,
+    /// Parallel to `modes` — see `Lexer::mode_open_offs` (#385).
+    mode_open_offs: Vec<usize>,
     retokenize_arith_as_cmdsub: bool,
     cmd_at_word_start: bool,
     assign_val_tilde_ok: bool,
@@ -1312,6 +1314,16 @@ pub struct Lexer<'a> {
     current: String,
     has_token: bool,
     token_start: usize,
+    /// Byte offset the most recent scan step began at (#385) — see
+    /// `last_step_start()`.
+    last_step_start: usize,
+    /// Parallel to `modes`: the cursor offset each frame was pushed at, so an
+    /// EOF inside an open delimiter can name the line the delimiter OPENED on
+    /// (#385). The floor entry is 0.
+    mode_open_offs: Vec<usize>,
+    /// Where the delimiter that was open when the last lex error was raised
+    /// started — recorded at raise time, before the parser unwinds its frames.
+    err_open_off: Option<usize>,
     token_start_line: u32,
     token_start_col: u32,
     in_assignment_value: bool,
@@ -1453,6 +1465,7 @@ impl<'a> Lexer<'a> {
             current: String::new(),
             has_token: false,
             token_start: 0,
+            last_step_start: 0,
             token_start_line: 1,
             token_start_col: 1,
             in_assignment_value: false,
@@ -1465,6 +1478,8 @@ impl<'a> Lexer<'a> {
             aliases: std::collections::HashMap::new(),
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
+            mode_open_offs: vec![0],
+            err_open_off: None,
             retokenize_arith_as_cmdsub: false,
             cmd_at_word_start: true,
             assign_val_tilde_ok: false,
@@ -1832,6 +1847,7 @@ impl<'a> Lexer<'a> {
         if matches!(m, Mode::BacktickRaw) {
             self.backtick_raw_started = false;
         }
+        self.mode_open_offs.push(self.cursor.offset());
         self.modes.push(m);
     }
 
@@ -1844,6 +1860,7 @@ impl<'a> Lexer<'a> {
             "Command is the floor and must never be popped"
         );
         let popped_depth = self.modes.len();
+        self.mode_open_offs.pop();
         let popped = self.modes.pop().expect("pop_mode on an empty mode stack");
         // Delayed heredoc across a comsub/backtick boundary: a `cat <<D` opened
         // INSIDE a command substitution whose `)`/`` ` `` closes before D's body
@@ -1938,6 +1955,7 @@ impl<'a> Lexer<'a> {
             opts: self.opts,
             alias_trailing_eligible: self.alias_trailing_eligible,
             modes: self.modes.clone(),
+            mode_open_offs: self.mode_open_offs.clone(),
             retokenize_arith_as_cmdsub: self.retokenize_arith_as_cmdsub,
             cmd_at_word_start: self.cmd_at_word_start,
             assign_val_tilde_ok: self.assign_val_tilde_ok,
@@ -1975,6 +1993,7 @@ impl<'a> Lexer<'a> {
         self.opts = m.opts;
         self.alias_trailing_eligible = m.alias_trailing_eligible;
         self.modes = m.modes.clone();
+        self.mode_open_offs = m.mode_open_offs.clone();
         self.retokenize_arith_as_cmdsub = m.retokenize_arith_as_cmdsub;
         self.cmd_at_word_start = m.cmd_at_word_start;
         self.assign_val_tilde_ok = m.assign_val_tilde_ok;
@@ -2163,8 +2182,24 @@ impl<'a> Lexer<'a> {
     /// parser to consume it (the v266-resume OOM). Any step that consumes input
     /// resets the counter, so normal parser-driven flow never trips it.
     fn scan_step_guarded(&mut self) -> Result<Step, LexError> {
+        self.last_step_start = self.cursor.offset();
         let before = self.cursor.consumed;
-        let step = self.scan_step()?;
+        // #385: capture where the innermost OPEN delimiter frame started while
+        // it is still on the stack — the parser unwinds its frames on the way
+        // out, so by the time a driver sees the error the stack is back to the
+        // `Command` floor. For a construct with no frame (a single-quoted run,
+        // a backtick), the failing step's own start is the delimiter's line.
+        let step = match self.scan_step() {
+            Ok(st) => st,
+            Err(e) => {
+                self.err_open_off = Some(if self.modes.len() > 1 {
+                    self.mode_open_offs.last().copied().unwrap_or(0)
+                } else {
+                    self.last_step_start
+                });
+                return Err(e);
+            }
+        };
         if matches!(step, Step::Produced) {
             if self.cursor.consumed == before {
                 self.stall_steps += 1;
@@ -6720,6 +6755,28 @@ impl<'a> Lexer<'a> {
             return None;
         }
         self.cursor.source().get(start..end)
+    }
+
+    /// Byte offset where the LAST scan step began. After a lex error that is
+    /// the start of the atom that failed — for an unterminated quote, where the
+    /// quoted run started, which is the line bash names in `unexpected EOF
+    /// while looking for matching` (#385). `cursor_pos()` is where the failed
+    /// scan ran to instead, i.e. end of input.
+    pub fn last_step_start(&self) -> usize {
+        self.last_step_start
+    }
+
+    /// Byte offset where the delimiter that was open when the last lex error
+    /// was raised started — a `"`, `${`, `$((`, `$(`, or the failing scan step
+    /// itself for a construct the lexer scans without a frame (a single-quoted
+    /// run, a backtick). `None` if no lex error has been raised.
+    ///
+    /// bash reports an EOF inside an open delimiter at the line the delimiter
+    /// OPENED on, not where the scan gave up (#385), and the parser has already
+    /// unwound its frames by the time a driver renders the error — so this is
+    /// recorded at raise time rather than read from the live stack.
+    pub fn error_open_start(&self) -> Option<usize> {
+        self.err_open_off
     }
 
     pub fn cursor_pos(&self) -> usize {

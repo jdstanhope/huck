@@ -8755,12 +8755,32 @@ fn run_sourced_contents_in_sinks_inner(
                     // line after where the scanner stopped — byte-identical to
                     // the old tokenize_partial foff path.
                     let is_lex = matches!(e, crate::command::ParseError::Lex(_));
+                    // #385: an OPEN-DELIMITER lex error is reported at the line
+                    // the delimiter opened on, which is the failing token's
+                    // start — `cursor_pos()` is where the failed scan ran to,
+                    // i.e. EOF, so `echo "a` on line 3 of a 4-line file was
+                    // reported as line 5. Every other lex error keeps the
+                    // scan-stop position, which is what bash names for them.
+                    let opens_delim = matches!(&e, crate::command::ParseError::Lex(le)
+                        if crate::error_emit::lex_error_opens_delim(le));
                     let foff = if is_lex {
                         iter.cursor_pos()
                     } else {
                         unit_start_off
                     };
-                    let line = line_of(start + foff) as u32;
+                    // The RESTART position stays where the scan stopped; only
+                    // the reported LINE moves back to the delimiter.
+                    let line_off = if opens_delim {
+                        // The innermost OPEN frame's offset when there is one
+                        // (`"…"`, `${…}`, `$((…))`), else where the failing scan
+                        // step began (a single-quoted run or a backtick, which
+                        // are scanned as one atom with no frame).
+                        iter.error_open_start()
+                            .unwrap_or_else(|| iter.last_step_start())
+                    } else {
+                        foff
+                    };
+                    let line = line_of(start + line_off) as u32;
                     crate::render_syntax_diag(shell, &e, contents, line);
                     last_status = 2;
                     // #492: a syntax error inside a `$( )` body is bash's one

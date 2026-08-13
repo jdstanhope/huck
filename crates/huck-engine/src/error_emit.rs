@@ -426,6 +426,52 @@ fn lex_is_shape3(le: &huck_syntax::lexer::LexError) -> Option<Delim> {
     }
 }
 
+/// Render the diagnostic bash prints for input that ended in the middle of a
+/// command — a REPL or piped-stdin session that hit EOF with a quote, `${`,
+/// `$((` or a compound command still open (#385).
+///
+/// The reader detects the incompleteness itself and never runs the buffer, so
+/// this re-parses it to find out WHICH shape bash would report:
+///
+/// ```text
+/// echo "open      ->  line 1: unexpected EOF while looking for matching `"'
+/// if true         ->  line 2: syntax error: unexpected end of file
+/// ```
+///
+/// The quote family is reported at the line the delimiter OPENED on, which is
+/// why the line comes from the lexer's `error_open_start` rather than from the
+/// buffer's length. Returns false when the buffer parses cleanly after all (no
+/// diagnostic emitted) so the caller can fall back.
+pub fn render_incomplete_input_diag(shell: &Shell, buffer: &str) -> bool {
+    let mut lx = huck_syntax::lexer::Lexer::new(
+        buffer,
+        &Default::default(),
+        huck_syntax::lexer::LexerOptions::default(),
+    );
+    let err = match huck_syntax::parser::parse_sequence(&mut lx) {
+        Err(e) => e,
+        Ok(_) => return false,
+    };
+    let off = lx
+        .error_open_start()
+        .unwrap_or_else(|| lx.last_step_start());
+    // `render_syntax_diag` takes an already-based line (it subtracts the base
+    // back out to index `buffer`), and a stdin session's base is how many lines
+    // earlier commands consumed.
+    let line =
+        shell.line_base() + huck_syntax::lexer::line_at_offset(buffer, off.min(buffer.len()));
+    render_syntax_diag(shell, &err, buffer, line);
+    true
+}
+
+/// True for a lex error bash reports as `unexpected EOF while looking for
+/// matching `X'` — an open quote, `${`, `$((`, `$(` or backtick. The line for
+/// those is where the delimiter OPENED, not where the scan gave up, so a driver
+/// has to pass a different line for them (#385).
+pub(crate) fn lex_error_opens_delim(le: &huck_syntax::lexer::LexError) -> bool {
+    lex_is_shape3(le).is_some()
+}
+
 /// Emit a diagnostic with no `Shell` in scope: `<prog>: <msg>` — no line, no
 /// `-c:`. For failures before a `Shell` exists (bad CLI option, line-editor
 /// init). `prog` is the invocation basename (bash's `get_name_for_error` for
