@@ -27,10 +27,10 @@
 #
 # NOT here, both pre-existing and each its own issue: an unterminated `case`,
 # which bash reports at the NEXT line's token where huck reports at the `case`
-# (#617); an open QUOTE inside an unterminated arith (`echo "$((1+"`), where
-# bash names the quote and huck names the arith delimiter (#621); and
-# `echo ;;`, where huck runs the leading `echo` before rejecting the line
-# (#575).
+# (#617); and `echo ;;`, where huck runs the leading `echo` before rejecting the
+# line (#575). An open QUOTE inside an unterminated arith (`echo "$((1+"`) was
+# also excluded here as #621; it is fixed, and its rows live in
+# `arith_eof_quote_diff_check.sh`.
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 

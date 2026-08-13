@@ -1165,10 +1165,17 @@ pub(crate) enum Mode {
     // outer quoted/unquoted branch to select). Both flags start `false` at every
     // push site (a fresh body opens outside any quote span) and are written back
     // to this frame by `sync_quotes!` on every `'`/`"` toggle in `scan_step_arith`.
+    // `quote_open_off` rides along with them: the byte offset of the `'`/`"` that
+    // opened the currently-open span (`None` when no span is open). bash reports an
+    // EOF inside an open quote at the line the QUOTE opened on, which is neither the
+    // line the arith opened on nor the one the scan gave up at (#621), and a span
+    // survives across scan calls (a `$`/backtick sub-parse returns mid-body), so the
+    // offset has to live on the frame exactly like the flags do.
     Arith {
         paren_depth: u32,
         in_squote: bool,
         in_dquote: bool,
+        quote_open_off: Option<usize>,
         body_started: bool,
         for_header: bool,
         delim: ArithDelim,
@@ -1324,6 +1331,13 @@ pub struct Lexer<'a> {
     /// Where the delimiter that was open when the last lex error was raised
     /// started — recorded at raise time, before the parser unwinds its frames.
     err_open_off: Option<usize>,
+    /// A raise site's own answer for `err_open_off`, overriding the innermost
+    /// frame's opening offset. Set immediately before returning `Err` by a
+    /// scanner that tracks an inner delimiter WITHOUT a mode frame of its own —
+    /// a quote span inside an arith body, whose opening line is the one bash
+    /// names (#621) even though the innermost frame is the `$((`. Consumed
+    /// (taken) by `scan_step_guarded` on the way out, so it never goes stale.
+    err_open_hint: Option<usize>,
     token_start_line: u32,
     token_start_col: u32,
     in_assignment_value: bool,
@@ -1480,6 +1494,7 @@ impl<'a> Lexer<'a> {
             modes: vec![Mode::Command],
             mode_open_offs: vec![0],
             err_open_off: None,
+            err_open_hint: None,
             retokenize_arith_as_cmdsub: false,
             cmd_at_word_start: true,
             assign_val_tilde_ok: false,
@@ -2149,6 +2164,7 @@ impl<'a> Lexer<'a> {
                 paren_depth,
                 in_squote,
                 in_dquote,
+                quote_open_off,
                 body_started,
                 for_header,
                 delim,
@@ -2156,6 +2172,7 @@ impl<'a> Lexer<'a> {
                 paren_depth,
                 in_squote,
                 in_dquote,
+                quote_open_off,
                 body_started,
                 for_header,
                 delim,
@@ -2192,11 +2209,15 @@ impl<'a> Lexer<'a> {
         let step = match self.scan_step() {
             Ok(st) => st,
             Err(e) => {
-                self.err_open_off = Some(if self.modes.len() > 1 {
+                // A raise site that tracks a frame-less inner delimiter itself (a
+                // quote span inside an arith body, #621) leaves the offset here;
+                // take it in preference to the frame's, and only fall back to the
+                // frame when it did not.
+                self.err_open_off = self.err_open_hint.take().or(Some(if self.modes.len() > 1 {
                     self.mode_open_offs.last().copied().unwrap_or(0)
                 } else {
                     self.last_step_start
-                });
+                }));
                 return Err(e);
             }
         };
@@ -3821,15 +3842,46 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// `Mode::Arith { paren_depth, in_squote, in_dquote, body_started, for_header, delim }` scanner — v246.
+    /// Offset to record for a quote about to open a span in an arith body, or
+    /// `None` when this scanner should not claim to know where the span opened.
+    ///
+    /// A quote preceded by an ODD run of backslashes is one bash escapes: it
+    /// keeps the `"`/`'` as a literal operand char and never opens a span, so
+    /// `$(( 1+\"` runs out of input inside the ARITH, not inside a quote, and
+    /// bash names `)`. huck's arith scanner does not apply that escape — it
+    /// pushes the `\` literally and re-processes the quote as an opener, which
+    /// diverges in the expression text too (`$(( 1+\"2\" ))` errors on the `\`
+    /// where bash errors on the operand `"2"`) and is tracked as its own
+    /// divergence. Returning `None` here keeps the EOF diagnostic on the
+    /// answer that already matched bash rather than following huck's own
+    /// mis-parity: no recorded opener ⇒ the EOF arm reports the arith delimiter.
+    /// An EVEN run is an escaped BACKSLASH, leaving the quote live (`\\"`).
+    fn span_opener_off(&self, text: &str) -> Option<usize> {
+        let backslashes = text.bytes().rev().take_while(|&b| b == b'\\').count();
+        if backslashes % 2 == 1 {
+            None
+        } else {
+            Some(self.cursor.offset())
+        }
+    }
+
+    /// `Mode::Arith { paren_depth, in_squote, in_dquote, quote_open_off, body_started, for_header, delim }`
+    /// scanner — v246.
     /// Emits `$((` (ArithOpen) on entry, then body atoms, then `))` (ArithClose).
     /// `for_header` (v256) additionally emits `ArithSemi` at a depth-0 `;`.
     /// `delim` (v258) selects `$((`/ArithClose(`))`) vs `$[`/LegacyArithOpen/ArithClose(`]`).
+    // The parameters ARE the `Mode::Arith` frame's fields, destructured by the
+    // `scan_step` dispatch exactly like every other `scan_step_*` — grouping the
+    // three quote fields into a struct would change the frame's shape at all 25
+    // construction and match sites, which is a refactor rather than a signature
+    // tweak (#621 added the eighth).
+    #[allow(clippy::too_many_arguments)]
     fn scan_step_arith(
         &mut self,
         paren_depth: u32,
         in_squote: bool,
         in_dquote: bool,
+        quote_open_off: Option<usize>,
         body_started: bool,
         for_header: bool,
         delim: ArithDelim,
@@ -3885,6 +3937,12 @@ impl<'a> Lexer<'a> {
         }
         let mut squote = in_squote;
         let mut dquote = in_dquote;
+        // Offset of the quote char that opened the span `squote`/`dquote` describe
+        // — the line bash names for an EOF inside it (#621). Set by the toggle
+        // arms, cleared when the span closes. `None` means "no span, or a span
+        // whose opener this scanner does not claim" (see `span_opener_off`), and
+        // the EOF arm treats it as the arith delimiter running out either way.
+        let mut quote_off = quote_open_off;
         // Write the current quote-span state back to the top Arith frame. Called
         // on every `'`/`"` toggle so the flag survives a `$`/backtick sub-parse
         // round-trip WITHOUT adding a sync to every `return` site (mirrors how
@@ -3894,11 +3952,13 @@ impl<'a> Lexer<'a> {
                 if let Some(Mode::Arith {
                     in_squote,
                     in_dquote,
+                    quote_open_off,
                     ..
                 }) = self.modes.last_mut()
                 {
                     *in_squote = squote;
                     *in_dquote = dquote;
+                    *quote_open_off = quote_off;
                 }
             };
         }
@@ -3916,14 +3976,19 @@ impl<'a> Lexer<'a> {
                         ArithDelim::Bracket => LexError::UnterminatedLegacyArith,
                         ArithDelim::Paren => LexError::UnterminatedArith,
                     };
-                    if squote || dquote {
-                        // Unterminated quote span inside the arith body. The oracle
-                        // also errors here (scan_arith_body → UnterminatedArith /
-                        // scan_legacy_arith_body/push_quoted_span → UnterminatedLegacyArith).
-                        // Both paths error, so the input is not byte-comparable
-                        // (`old_seq` panics on lex errors) — same non-diff pattern as
-                        // prior iterations' unterminated cases.
-                        return Err(eof_err);
+                    if (squote || dquote) && quote_off.is_some() {
+                        // #621: a quote span is still open, and bash names the QUOTE,
+                        // not the arith delimiter — `$(( 1+"` is `unexpected EOF while
+                        // looking for matching `"'`, reported at the line the quote
+                        // opened on (which for a multi-line body is neither the `$((`
+                        // line nor the last line). The two flags are mutually exclusive
+                        // within a frame — inside a `"…"` span a `'` is a literal and
+                        // vice versa — but check `squote` first so the innermost span
+                        // wins even for `echo "$(( 1+'`, whose frame starts OUTSIDE the
+                        // word's own `"` (every push site seeds `in_dquote: false`) and
+                        // which bash reports as `'`.
+                        self.err_open_hint = quote_off;
+                        return Err(LexError::UnterminatedQuote { double: !squote });
                     }
                     if !text.is_empty() {
                         sync_depth!();
@@ -3946,6 +4011,7 @@ impl<'a> Lexer<'a> {
                 Some('\'') if squote => {
                     self.cursor.next();
                     squote = false;
+                    quote_off = None;
                     sync_quotes!();
                 }
                 Some('"') if squote => {
@@ -3957,17 +4023,21 @@ impl<'a> Lexer<'a> {
                 // the quote char — bash quote-removal). `"` toggles the double-quote
                 // span (drop the quote char). Both are DROPPED, never pushed.
                 Some('\'') => {
+                    let qoff = self.span_opener_off(&text);
                     self.cursor.next();
                     if dquote {
                         text.push('\'');
                     } else {
                         squote = true;
+                        quote_off = qoff;
                         sync_quotes!();
                     }
                 }
                 Some('"') => {
+                    let qoff = self.span_opener_off(&text);
                     self.cursor.next();
                     dquote = !dquote;
+                    quote_off = if dquote { qoff } else { None };
                     sync_quotes!();
                 }
                 Some(oc)
@@ -8124,6 +8194,7 @@ mod tests {
             paren_depth: 0,
             in_squote: false,
             in_dquote: false,
+            quote_open_off: None,
             body_started: false,
             for_header: false,
             delim: ArithDelim::Paren,
@@ -8134,6 +8205,7 @@ mod tests {
                 paren_depth: 0,
                 in_squote: false,
                 in_dquote: false,
+                quote_open_off: None,
                 body_started: false,
                 for_header: false,
                 delim: ArithDelim::Paren
@@ -8160,6 +8232,7 @@ mod tests {
                 paren_depth: 0,
                 in_squote: false,
                 in_dquote: false,
+                quote_open_off: None,
                 body_started: false,
                 for_header: false,
                 delim: ArithDelim::Paren
@@ -8182,6 +8255,7 @@ mod tests {
             paren_depth: 0,
             in_squote: false,
             in_dquote: false,
+            quote_open_off: None,
             body_started: true,
             for_header: true,
             delim: ArithDelim::Paren,
@@ -8224,6 +8298,7 @@ mod tests {
             paren_depth: 0,
             in_squote: false,
             in_dquote: false,
+            quote_open_off: None,
             body_started: true,
             for_header: true,
             delim: ArithDelim::Paren,
@@ -8260,6 +8335,7 @@ mod tests {
             paren_depth: 0,
             in_squote: false,
             in_dquote: false,
+            quote_open_off: None,
             body_started: false,
             for_header: false,
             delim: ArithDelim::Bracket,
@@ -8283,6 +8359,72 @@ mod tests {
             "expected body Lit \"a[0]+1\", got {kinds:?}"
         );
         assert_eq!(kinds.last(), Some(&TokenKind::ArithClose));
+    }
+
+    /// Drive a whole input through `parse_sequence` and return the lex error it
+    /// failed with plus the lexer's `error_open_start()` — the pair a driver
+    /// renders an `unexpected EOF while looking for matching X` from.
+    fn eof_err_and_open(src: &str) -> (LexError, Option<usize>) {
+        let mut lx = Lexer::new(src, &Default::default(), LexerOptions::default());
+        let err = crate::parser::parse_sequence(&mut lx).expect_err("must not parse");
+        let open = lx.error_open_start();
+        match err {
+            crate::command::ParseError::Lex(e) => (*e, open),
+            other => panic!("expected a lex error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arith_eof_inside_quote_names_the_quote_and_its_offset() {
+        // #621: bash names the innermost open delimiter, so an EOF inside a quote
+        // span in an arith body is the QUOTE — reported at the offset the quote
+        // opened at, not the one the `$((` opened at (verified against bash
+        // 5.2.21). `((`, `$((` and `$[` share the scanner; the quote char picks
+        // `double`, which is what renders `` `"' `` vs `` `'' ``.
+        for (src, double) in [
+            ("echo $((1+\"", true),
+            ("echo $((1+'", false),
+            ("echo $[1+\"", true),
+            ("((1+\"", true),
+            // The frame is seeded OUTSIDE the word's own quote, so a span opened
+            // in the body wins even inside an already-quoted word.
+            ("echo \"$((1+'", false),
+        ] {
+            let (err, open) = eof_err_and_open(src);
+            assert_eq!(
+                err,
+                LexError::UnterminatedQuote { double },
+                "{src}: must name the quote, not the arith delimiter"
+            );
+            assert_eq!(
+                open,
+                Some(src.rfind(if double { '"' } else { '\'' }).unwrap()),
+                "{src}: must report the offset the QUOTE opened at"
+            );
+        }
+    }
+
+    #[test]
+    fn arith_eof_outside_a_quote_names_the_arith() {
+        // The control: a span that CLOSED leaves the arith delimiter as the
+        // innermost open one, reported at the `$((`/`$[` offset. A quote
+        // preceded by an odd backslash run is one bash escapes, so it is not a
+        // span opener either (#624) — both keep the arith error.
+        for (src, want) in [
+            ("echo $((1+", LexError::UnterminatedArith),
+            ("echo $((1+\"x\"", LexError::UnterminatedArith),
+            ("echo $[1+", LexError::UnterminatedLegacyArith),
+            ("echo $((1+\\\"", LexError::UnterminatedArith),
+            ("echo $[1+\\\"", LexError::UnterminatedLegacyArith),
+        ] {
+            let (err, open) = eof_err_and_open(src);
+            assert_eq!(err, want, "{src}: must name the arith delimiter");
+            assert_eq!(
+                open,
+                Some(src.find('$').unwrap()),
+                "{src}: must report the arith opener's offset"
+            );
+        }
     }
 
     #[test]
@@ -9792,6 +9934,7 @@ mod array_parse_tests {
             paren_depth: 0,
             in_squote: false,
             in_dquote: false,
+            quote_open_off: None,
             body_started: false,
             for_header: false,
             delim: ArithDelim::Paren,
@@ -9813,6 +9956,7 @@ mod array_parse_tests {
                 paren_depth: 0,
                 in_squote: false,
                 in_dquote: false,
+                quote_open_off: None,
                 body_started: false,
                 for_header: false,
                 delim: ArithDelim::Paren
@@ -9824,6 +9968,7 @@ mod array_parse_tests {
                 paren_depth: 0,
                 in_squote: false,
                 in_dquote: false,
+                quote_open_off: None,
                 body_started: false,
                 for_header: false,
                 delim: ArithDelim::Paren
