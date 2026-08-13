@@ -97,9 +97,13 @@ fn backslash_newline_joins_lines() {
 
 #[test]
 fn eof_inside_unterminated_if_is_a_syntax_error() {
+    // #385: the wording is bash's — `syntax error: unexpected end of file`,
+    // reported at the line after the last one read. This asserted huck's own
+    // "unexpected end of input", which bash never prints; that string was the
+    // divergence, not the contract.
     let (_, err, code) = run_with_status("if true\nthen\necho hi\n");
     assert!(
-        err.to_lowercase().contains("unexpected end of input"),
+        err.contains("line 4: syntax error: unexpected end of file"),
         "stderr: {err}"
     );
     assert_eq!(code, 2, "exit code");
