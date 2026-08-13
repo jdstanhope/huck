@@ -70,6 +70,7 @@ pub fn spell_delim(d: crate::command::Delim) -> char {
         SQuote => '\'',
         Backtick => '`',
         DBracket => ']', // rendered as `]]` by the caller
+        DollarBracket => ']',
     }
 }
 

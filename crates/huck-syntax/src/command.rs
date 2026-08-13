@@ -789,6 +789,9 @@ pub enum Delim {
     DollarDParen, // $((
     DollarBrace,  // ${
     DBracket,     // [[
+    /// `$[` — bash's deprecated arithmetic form, closed by `]` rather than the
+    /// `))` its `$((` synonym takes (#618).
+    DollarBracket,
 }
 
 /// v314 (#211): captures the context of a parse expectation failure —

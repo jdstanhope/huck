@@ -22,9 +22,13 @@
 # The stdin rows normalise the program NAME only: piped stdin has no argv[0] to
 # set, so each shell names itself.
 #
-# NOT here, all pre-existing and each its own issue: `$[1+`, where bash says
-# matching `]` and huck says `)` (#618); an unterminated `case`, which bash
-# reports at the NEXT line's token where huck reports at the `case` (#617); and
+# `$[…]`, bash's deprecated arithmetic form, is closed by `]` and reports that
+# (#618) — the rows below cover it alongside `$((`.
+#
+# NOT here, both pre-existing and each its own issue: an unterminated `case`,
+# which bash reports at the NEXT line's token where huck reports at the `case`
+# (#617); an open QUOTE inside an unterminated arith (`echo "$((1+"`), where
+# bash names the quote and huck names the arith delimiter (#621); and
 # `echo ;;`, where huck runs the leading `echo` before rejecting the line
 # (#575).
 set -u
@@ -59,6 +63,10 @@ check_file "single quote"   "echo 'open"
 check_file "backtick"       'echo `open'
 check_file "param brace"    'echo ${x'
 check_file "arith"          'echo $((1+'
+check_file "legacy arith"   'echo $[1+'
+check_file "legacy spaced"  'echo $[ 1 '
+check_file "legacy in assign" 'x=$[1'
+check_file "arith command"  '((1+'
 check_file "comsub"         'echo $(open'
 check_file "quote in comsub" 'echo $(echo "'
 check_file "comsub in quote" 'echo "$(echo'
@@ -93,6 +101,7 @@ y'
 # --- controls: complete input, and errors that are not EOF ---
 check_file  "closed quote"  'echo "closed"'
 check_file  "closed compound" 'if true; then echo t; fi'
+check_file  "closed legacy" 'echo $[1+2]'
 check_stdin "stdin complete" 'echo done'
 check_file  "near token"    'if; then'
 

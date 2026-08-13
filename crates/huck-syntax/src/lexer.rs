@@ -3909,6 +3909,13 @@ impl<'a> Lexer<'a> {
         loop {
             match self.cursor.peek().copied() {
                 None => {
+                    // #618: which arith form ran out matters to the diagnostic —
+                    // `$[ 1+` is `unexpected EOF while looking for matching `]'`,
+                    // `$(( 1+` is the same message with `)`.
+                    let eof_err = match delim {
+                        ArithDelim::Bracket => LexError::UnterminatedLegacyArith,
+                        ArithDelim::Paren => LexError::UnterminatedArith,
+                    };
                     if squote || dquote {
                         // Unterminated quote span inside the arith body. The oracle
                         // also errors here (scan_arith_body → UnterminatedArith /
@@ -3916,7 +3923,7 @@ impl<'a> Lexer<'a> {
                         // Both paths error, so the input is not byte-comparable
                         // (`old_seq` panics on lex errors) — same non-diff pattern as
                         // prior iterations' unterminated cases.
-                        return Err(LexError::UnterminatedArith);
+                        return Err(eof_err);
                     }
                     if !text.is_empty() {
                         sync_depth!();
@@ -3926,7 +3933,7 @@ impl<'a> Lexer<'a> {
                         ));
                         return Ok(Step::Produced);
                     }
-                    return Err(LexError::UnterminatedArith);
+                    return Err(eof_err);
                 }
                 // Inside a single-quoted span single-quote is DELIM-AWARE, exactly
                 // like double-quote: it suppresses `$`/backtick/`\`-escaping (those

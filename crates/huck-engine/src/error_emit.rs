@@ -418,9 +418,9 @@ fn lex_is_shape3(le: &huck_syntax::lexer::LexError) -> Option<Delim> {
         LexError::UnterminatedQuote { double: true } => Some(Delim::DQuote),
         LexError::UnterminatedQuote { double: false } => Some(Delim::SQuote),
         LexError::UnterminatedSubstitution => Some(Delim::DollarParen),
-        LexError::UnterminatedArith
-        | LexError::UnterminatedLegacyArith
-        | LexError::UnterminatedArithBlock => Some(Delim::DollarDParen),
+        LexError::UnterminatedArith | LexError::UnterminatedArithBlock => Some(Delim::DollarDParen),
+        // #618: `$[ 1+` is closed by `]`, not `))`.
+        LexError::UnterminatedLegacyArith => Some(Delim::DollarBracket),
         LexError::UnterminatedBrace => Some(Delim::DollarBrace),
         _ => None,
     }
