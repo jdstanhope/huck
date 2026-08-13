@@ -117,7 +117,20 @@ pub(crate) fn run_trap_action(
 ) -> TrapActionResult {
     let saved_status = shell.last_status();
     shell.firing_traps.push(sig);
+    // #486: bash traces a trap action's commands one level deeper than the
+    // command that triggered it — `++ echo D` under `+ true` — the same
+    // indirection bump a command substitution or a function called from one
+    // gets. EXIT is the exception, measured in both shells: its action traces
+    // at the caller's depth, because it runs on the shell's termination path
+    // rather than nested inside anything.
+    let nest_xtrace = sig != TrapSignal::Exit;
+    if nest_xtrace {
+        shell.xtrace_depth += 1;
+    }
     let outcome = crate::shell::process_line(action, shell, false);
+    if nest_xtrace {
+        shell.xtrace_depth = shell.xtrace_depth.saturating_sub(1);
+    }
     shell.firing_traps.pop();
     let status = shell.last_status();
     shell.set_last_status(saved_status);
