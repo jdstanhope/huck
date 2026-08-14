@@ -1,3 +1,5 @@
+pub(crate) mod state;
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[non_exhaustive]
 pub enum LexError {
@@ -1213,16 +1215,16 @@ pub(crate) struct Mark {
     pos: usize,                // self.pos (pull index) at mark time
     resume: (usize, u32, u32), // (offset, line, column) to resume scanning from
     brace_expand: bool,
-    in_assignment_value: bool,
     dbracket_depth: u32,
     opts: LexerOptions,
     alias_trailing_eligible: bool,
+    /// Command-position state — word position and assignment context,
+    /// changed only through `state::CommandPos`'s transitions (#641).
+    cmd_pos: state::CommandPos,
     modes: Vec<Mode>,
     /// Parallel to `modes` — see `Lexer::mode_open_offs` (#385).
     mode_open_offs: Vec<usize>,
     retokenize_arith_as_cmdsub: bool,
-    cmd_at_word_start: bool,
-    assign_val_tilde_ok: bool,
     /// v268: see `Lexer::pending_lvalue_subscript`. Captured/restored so an
     /// arith mark/rewind spanning the flag's brief lifetime cannot desync it.
     pending_lvalue_subscript: bool,
@@ -1333,7 +1335,6 @@ pub struct Lexer<'a> {
     /// (taken) by `scan_step_guarded` on the way out, so it never goes stale.
     err_open_hint: Option<usize>,
     token_start_line: u32,
-    in_assignment_value: bool,
     dbracket_depth: u32,
     /// v250: the atom path's heredoc queue. (It was once one of two — a legacy
     /// queue sat beside it until v361 found it had stopped being written at all.)
@@ -1358,6 +1359,9 @@ pub struct Lexer<'a> {
     /// the floor. Dormant in v240 — only `Command` is pushed in production.
     /// Each `ParamExpansion` frame carries its own `seen_name` phase flag so
     /// nested `${…}` expansions and `mark`/`rewind` are both stack-safe.
+    /// Command-position state — word position and assignment context,
+    /// changed only through `state::CommandPos`'s transitions (#641).
+    cmd_pos: state::CommandPos,
     modes: Vec<Mode>,
     /// One-shot v246 flag: when set, the CommandSub scanner treats a `$((` opener
     /// as `$(` + a subshell `(` (the `$( (…) )` wrinkle) instead of deferring it
@@ -1371,7 +1375,6 @@ pub struct Lexer<'a> {
     /// `!has_token` guard: a `~` is tilde-special only at word start; mid-word
     /// (`a~b`, `$x~`) it is literal. Reset to true after a `Blank`, cleared
     /// after any word-content atom. Only meaningful under `command_atoms`.
-    cmd_at_word_start: bool,
     /// v247 T4: true when a `~` scanned next would be a tilde CONSTRUCT because
     /// we are inside an assignment value AND positioned right after a `=`/`:`
     /// (mirrors the oracle's `tilde_eligible_in_assignment`, which checks that
@@ -1379,7 +1382,6 @@ pub struct Lexer<'a> {
     /// `name=` prefix and after an unquoted `=`/`:` in the value literal run;
     /// cleared whenever a non-literal part is emitted (which flushes the
     /// oracle's buffer). Only meaningful under `command_atoms`.
-    assign_val_tilde_ok: bool,
     /// v268: set when the command scanner emitted a word-start `name[` `LBracket`;
     /// checked once, on the first command scan step after the parser assembles the
     /// subscript and consumes `RBracket`, to emit `AssignEq` (→ indexed assignment)
@@ -1470,7 +1472,6 @@ impl<'a> Lexer<'a> {
             current: String::new(),
             last_step_start: 0,
             token_start_line: 1,
-            in_assignment_value: false,
             dbracket_depth: 0,
             atom_pending_heredocs: std::collections::VecDeque::new(),
             emitting_heredoc: None,
@@ -1482,8 +1483,7 @@ impl<'a> Lexer<'a> {
             err_open_off: None,
             err_open_hint: None,
             retokenize_arith_as_cmdsub: false,
-            cmd_at_word_start: true,
-            assign_val_tilde_ok: false,
+            cmd_pos: state::CommandPos::default(),
             pending_lvalue_subscript: false,
             force_extglob_depth: None,
             stall_steps: 0,
@@ -1582,7 +1582,7 @@ impl<'a> Lexer<'a> {
     /// `#`/`~`. Callers invoke this only on the cmdsub/procsub continuation path,
     /// never for a subshell-close `)`, so `(cmd); next` still arms word-start.
     pub(crate) fn clear_cmd_at_word_start(&mut self) {
-        self.cmd_at_word_start = false;
+        self.cmd_pos = self.cmd_pos.resume_outer_word();
     }
 
     /// v318 (#218): true while scanning an assignment RHS value (`name=…`,
@@ -1592,7 +1592,7 @@ impl<'a> Lexer<'a> {
     /// though a `<(`/`>(` after other already-accumulated word content
     /// otherwise ends the word.
     pub(crate) fn in_assignment_value(&self) -> bool {
-        self.in_assignment_value
+        self.cmd_pos.in_assignment_value()
     }
 
     /// v250 T3: record one assembled heredoc body `Word` (parser-owned
@@ -1949,15 +1949,13 @@ impl<'a> Lexer<'a> {
             pos: self.pos,
             resume,
             brace_expand: self.brace_expand,
-            in_assignment_value: self.in_assignment_value,
             dbracket_depth: self.dbracket_depth,
             opts: self.opts,
             alias_trailing_eligible: self.alias_trailing_eligible,
             modes: self.modes.clone(),
             mode_open_offs: self.mode_open_offs.clone(),
             retokenize_arith_as_cmdsub: self.retokenize_arith_as_cmdsub,
-            cmd_at_word_start: self.cmd_at_word_start,
-            assign_val_tilde_ok: self.assign_val_tilde_ok,
+            cmd_pos: self.cmd_pos,
             pending_lvalue_subscript: self.pending_lvalue_subscript,
             heredoc_gen: self.heredoc_gen,
             recovery_frames: self.recovery_frames.clone(),
@@ -1985,15 +1983,13 @@ impl<'a> Lexer<'a> {
         }
         self.pos = m.pos;
         self.brace_expand = m.brace_expand;
-        self.in_assignment_value = m.in_assignment_value;
         self.dbracket_depth = m.dbracket_depth;
         self.opts = m.opts;
         self.alias_trailing_eligible = m.alias_trailing_eligible;
         self.modes = m.modes.clone();
         self.mode_open_offs = m.mode_open_offs.clone();
         self.retokenize_arith_as_cmdsub = m.retokenize_arith_as_cmdsub;
-        self.cmd_at_word_start = m.cmd_at_word_start;
-        self.assign_val_tilde_ok = m.assign_val_tilde_ok;
+        self.cmd_pos = m.cmd_pos;
         self.pending_lvalue_subscript = m.pending_lvalue_subscript;
         // Transient recovery bookkeeping — a rewind (only ever taken mid-input,
         // before genuine EOF) invalidates any pending EOF-closer state and any
@@ -3731,7 +3727,7 @@ impl<'a> Lexer<'a> {
             // (false), but a `#` at `$(#…` opens a comment (the oracle uses
             // `!has_token`, which is fresh in the isolated body). Set it so the
             // first body atom is treated as word-start (comment / keyword / tilde).
-            self.cmd_at_word_start = true;
+            self.cmd_pos = self.cmd_pos.enter_nested_command();
             self.history
                 .push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
             Ok(Step::Produced)
@@ -4515,7 +4511,7 @@ impl<'a> Lexer<'a> {
             // `'#' if !self.has_token`, i.e. at a word boundary) runs to end of
             // line. `#` mid-word is literal — handled by the word-run arm, which
             // does not treat `#` as a stop char. No token is emitted.
-            Some('#') if self.cmd_at_word_start => {
+            Some('#') if self.cmd_pos.at_word_start() => {
                 skip_line_comment(&mut self.cursor);
                 Ok(Step::Produced)
             }
@@ -5120,9 +5116,7 @@ impl<'a> Lexer<'a> {
     /// is no longer in assignment-value context (mirrors the pre-atom scanner's
     /// whitespace and operator arms clearing word-start / assignment-value state).
     fn boundary_reset(&mut self) {
-        self.cmd_at_word_start = true;
-        self.in_assignment_value = false;
-        self.assign_val_tilde_ok = false;
+        self.cmd_pos = self.cmd_pos.boundary();
     }
 
     /// v247 T5: emit ONE structural operator/redirect token per call. The cursor
@@ -5203,7 +5197,7 @@ impl<'a> Lexer<'a> {
                         TokenKind::ProcSubOpen { dir: ProcDir::In },
                         Span::new(off, l, c),
                     ));
-                    self.cmd_at_word_start = false;
+                    self.cmd_pos = self.cmd_pos.enter_word_content();
                     return Ok(Step::Produced);
                 }
                 Some('<') => {
@@ -5264,7 +5258,7 @@ impl<'a> Lexer<'a> {
                         TokenKind::ProcSubOpen { dir: ProcDir::Out },
                         Span::new(off, l, c),
                     ));
-                    self.cmd_at_word_start = false;
+                    self.cmd_pos = self.cmd_pos.enter_word_content();
                     return Ok(Step::Produced);
                 }
                 Some('>') => {
@@ -5318,12 +5312,14 @@ impl<'a> Lexer<'a> {
     /// with `<`/`>` no longer stop chars, the run never stops with the cursor
     /// sitting on one, so that block would be dead code anyway.
     fn scan_command_word_atom(&mut self, in_array_value: bool) -> Result<Step, LexError> {
+        // v361 Task 2: hypotheses about which flag COMBINATIONS are reachable.
+        // Armed to be measured, not asserted from reading the write sites.
         let off = self.cursor.offset();
         let l = self.cursor.line();
         let c = self.cursor.column();
         // A `~` is tilde-special only at word start (mirrors the oracle's
         // `!has_token` guard); capture the flag before it's cleared below.
-        let at_word_start = self.cmd_at_word_start;
+        let at_word_start = self.cmd_pos.at_word_start();
         // v247 T4: at word start, try to peel a structured assignment prefix
         // (`name+=`, `name[sub]=`, `name[sub]+=`) or a plain scalar `name=`.
         if at_word_start && let Some(step) = self.try_scan_assign_prefix(off, l, c)? {
@@ -5335,14 +5331,14 @@ impl<'a> Lexer<'a> {
         // then DEFAULT-CLEAR: every atom kind resets it EXCEPT the literal-run arm,
         // which re-sets it based on its final char (a non-literal part flushes the
         // oracle's buffer, so a following `~` is no longer value-eligible).
-        let tilde_ok = self.assign_val_tilde_ok;
-        self.assign_val_tilde_ok = false;
+        let tilde_ok = self.cmd_pos.tilde_eligible_in_value();
+        self.cmd_pos = self.cmd_pos.begin_atom();
         match self.cursor.peek().copied() {
             None => self.finish(),
 
             // `'…'` — single-quoted run: fully literal, no escapes recognized.
             Some('\'') => {
-                self.cmd_at_word_start = false;
+                self.cmd_pos = self.cmd_pos.enter_word_content();
                 self.cursor.next(); // consume opening `'`
                 let mut text = String::new();
                 loop {
@@ -5369,7 +5365,7 @@ impl<'a> Lexer<'a> {
             // atom-native — the parser owns recursion into nested `$(…)`/`` `…`
             // ``/`$((…))` — instead of the T2 flat single-shot body scan.
             Some('"') => {
-                self.cmd_at_word_start = false;
+                self.cmd_pos = self.cmd_pos.enter_word_content();
                 self.history
                     .push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
                 Ok(Step::Produced)
@@ -5383,7 +5379,7 @@ impl<'a> Lexer<'a> {
                 self.cursor.next(); // consume `\`
                 match self.cursor.next() {
                     None => {
-                        self.cmd_at_word_start = false;
+                        self.cmd_pos = self.cmd_pos.enter_word_content();
                         self.history.push(Token::new(
                             TokenKind::Lit {
                                 text: "\\".to_string(),
@@ -5395,7 +5391,7 @@ impl<'a> Lexer<'a> {
                     }
                     Some('\n') => Ok(Step::Produced), // deleted — no atom, word-start preserved
                     Some(ch) => {
-                        self.cmd_at_word_start = false;
+                        self.cmd_pos = self.cmd_pos.enter_word_content();
                         self.history.push(Token::new(
                             TokenKind::QuoteRun {
                                 style: QuoteStyle::Backslash,
@@ -5410,7 +5406,7 @@ impl<'a> Lexer<'a> {
 
             // `$'…'` — ANSI-C quoting (must precede the general `$` arm below).
             Some('$') if self.cursor.peek_nth(1) == Some('\'') => {
-                self.cmd_at_word_start = false;
+                self.cmd_pos = self.cmd_pos.enter_word_content();
                 self.cursor.next(); // `$`
                 self.cursor.next(); // `'`
                 let text = scan_ansi_c_quoted(&mut self.cursor)?;
@@ -5430,7 +5426,7 @@ impl<'a> Lexer<'a> {
             // digit/name→DollarName, lone `$`→Lit. Reuses the v246 `$((`-vs-`$(`
             // bounded peek.
             Some('$') => {
-                self.cmd_at_word_start = false;
+                self.cmd_pos = self.cmd_pos.enter_word_content();
                 self.emit_unquoted_dollar_atom(off, l, c);
                 Ok(Step::Produced)
             }
@@ -5439,7 +5435,7 @@ impl<'a> Lexer<'a> {
             // (cursor stays on `` ` ``; the parser's `parse_backtick_sub` pushes
             // `Mode::BacktickRaw`, whose entry scan consumes the opening `` ` ``).
             Some('`') => {
-                self.cmd_at_word_start = false;
+                self.cmd_pos = self.cmd_pos.enter_word_content();
                 self.history
                     .push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
                 Ok(Step::Produced)
@@ -5458,7 +5454,7 @@ impl<'a> Lexer<'a> {
                     && matches!(pc, '?' | '*' | '+' | '@' | '!')
                     && self.cursor.peek_nth(1) == Some('(') =>
             {
-                self.cmd_at_word_start = false;
+                self.cmd_pos = self.cmd_pos.enter_word_content();
                 self.history.push(Token::new(
                     TokenKind::ExtglobOpen { prefix: pc },
                     Span::new(off, l, c),
@@ -5478,10 +5474,10 @@ impl<'a> Lexer<'a> {
             // re-tokenizes that buffer standalone, so a trailing `~` there sees
             // EOF, not `)` — our live-cursor scan sees the real `)` unless told
             // to treat it as a boundary too.
-            Some('~') if at_word_start || (self.in_assignment_value && tilde_ok) => {
-                self.cmd_at_word_start = false;
+            Some('~') if at_word_start || tilde_ok => {
+                self.cmd_pos = self.cmd_pos.enter_word_content();
                 self.cursor.next(); // consume `~`
-                match try_parse_tilde(&mut self.cursor, self.in_assignment_value, None) {
+                match try_parse_tilde(&mut self.cursor, self.cmd_pos.in_assignment_value(), None) {
                     Some(spec) => {
                         // The `~` arm fires for `at_word_start` OR the
                         // assignment-value branch; `!at_word_start` here means it
@@ -5515,11 +5511,11 @@ impl<'a> Lexer<'a> {
             // position right after a `=`/`:`, where it opens a tilde construct
             // (v247 T4): break so the `~` arm fires on the next call.
             Some(_) => {
-                self.cmd_at_word_start = false;
+                self.cmd_pos = self.cmd_pos.enter_word_content();
                 let mut text = String::new();
                 // Track the oracle's tilde eligibility per char: true iff we're in
                 // an assignment value and the last char accumulated is `=`/`:`.
-                let mut boundary = self.in_assignment_value && tilde_ok;
+                let mut boundary = tilde_ok;
                 while let Some(&ch) = self.cursor.peek() {
                     // Stop at whitespace, quote openers, and expansion openers
                     // always. At COMMAND position (v247 T5) also stop at the
@@ -5565,7 +5561,7 @@ impl<'a> Lexer<'a> {
                     // bash tilde-expands the prefix after the ASSIGNING `=` (word start, seeded by
                     // begin_assignment_value) and after each unquoted `:`, but NOT after a second,
                     // embedded `=` (`h=HOME=~` → literal). Only `:` re-enables eligibility. (#294)
-                    boundary = self.in_assignment_value && ch == ':';
+                    boundary = self.cmd_pos.in_assignment_value() && ch == ':';
                 }
                 // v247 T5 fd-prefix: a WHOLE-word pure digit-run or `{ident}` (this
                 // run began at word start) glued directly to a redirect operator
@@ -5603,7 +5599,7 @@ impl<'a> Lexer<'a> {
                         return Ok(Step::Produced);
                     }
                     if let Some(fd) = fd_prefix_of_text(&text) {
-                        self.assign_val_tilde_ok = false;
+                        self.cmd_pos = self.cmd_pos.begin_atom();
                         self.history
                             .push(Token::new(TokenKind::RedirFd(fd), Span::new(off, l, c)));
                         return Ok(Step::Produced);
@@ -5611,7 +5607,7 @@ impl<'a> Lexer<'a> {
                 }
                 // Carry the eligibility to the next atom: true when the run ended on
                 // an unquoted `=`/`:` (or broke right before a value-tilde `~`).
-                self.assign_val_tilde_ok = boundary;
+                self.cmd_pos = self.cmd_pos.end_literal_run(boundary);
                 // `text` is non-empty: none of the break conditions can fire on
                 // the FIRST char of this arm (the outer match already routed
                 // `'`/`"`/`\\`/`$`/`` ` `` away, and metacharacters are handled by
@@ -5686,9 +5682,7 @@ impl<'a> Lexer<'a> {
                 }
                 self.cursor.next(); // `=`
                 name.push('=');
-                self.cmd_at_word_start = false;
-                self.in_assignment_value = true;
-                self.assign_val_tilde_ok = true; // buffer now ends in `=`
+                self.cmd_pos = self.cmd_pos.begin_assignment_value(true);
                 self.history.push(Token::new(
                     TokenKind::Lit {
                         text: name,
@@ -5725,9 +5719,7 @@ impl<'a> Lexer<'a> {
                 }
                 self.cursor.next(); // `+`
                 self.cursor.next(); // `=`
-                self.cmd_at_word_start = false;
-                self.in_assignment_value = true;
-                self.assign_val_tilde_ok = false; // buffer empty after the prefix
+                self.cmd_pos = self.cmd_pos.begin_assignment_value(false);
                 self.history.push(Token::new(
                     TokenKind::AssignPrefix {
                         target: crate::command::AssignTarget::Bare(name),
@@ -5761,7 +5753,7 @@ impl<'a> Lexer<'a> {
                     self.cursor.next();
                 }
                 self.cursor.next(); // consume `[`
-                self.cmd_at_word_start = false;
+                self.cmd_pos = self.cmd_pos.enter_word_content();
                 self.pending_lvalue_subscript = true;
                 self.history.push(Token::new(
                     TokenKind::Lit {
@@ -5789,9 +5781,7 @@ impl<'a> Lexer<'a> {
     /// a leading `~` in `a[i]=~/x` now expands, matching the scalar `name=` arm).
     /// Also runs the compound-array `(` probe so `a[i]=(…)` pushes `Mode::ArrayLiteral`.
     pub(crate) fn begin_assignment_value(&mut self, _append: bool) {
-        self.cmd_at_word_start = false;
-        self.in_assignment_value = true;
-        self.assign_val_tilde_ok = true;
+        self.cmd_pos = self.cmd_pos.begin_assignment_value(true);
         skip_line_continuations(&mut self.cursor);
         if self.cursor.peek() == Some(&'(') {
             let (ao, al, ac) = (
@@ -6402,9 +6392,7 @@ impl<'a> Lexer<'a> {
             // re-tokenizing the collected element text from scratch): reset the
             // word-start/assignment-value state so `try_scan_assign_prefix` and
             // value-tilde eligibility see a clean slate for the first value.
-            self.cmd_at_word_start = true;
-            self.in_assignment_value = false;
-            self.assign_val_tilde_ok = false;
+            self.cmd_pos = self.cmd_pos.boundary();
             // fall through to scan the first atom (at_element_start is already
             // true from the push, so a leading `[` opens a subscript).
         }
@@ -6503,9 +6491,7 @@ impl<'a> Lexer<'a> {
                 // the entry bootstrap above. A separator opens a NEW element, so
                 // the persistent `at_element_start` flips back to true (a `[`
                 // right after this separator is a subscript, not a literal).
-                self.cmd_at_word_start = true;
-                self.in_assignment_value = false;
-                self.assign_val_tilde_ok = false;
+                self.cmd_pos = self.cmd_pos.boundary();
                 if let Some(Mode::ArrayLiteral {
                     at_element_start, ..
                 }) = self.modes.last_mut()
@@ -6936,7 +6922,7 @@ impl<'a> Lexer<'a> {
         // instead of hitting the comment gate (`Some('#') if
         // self.cmd_at_word_start`) the way a literal leading `#` does — bash
         // treats an alias expanding to a leading `#` as starting a comment.
-        self.cmd_at_word_start = true;
+        self.cmd_pos = self.cmd_pos.enter_nested_command();
         // Re-drive: lex the body's first command word so a DIFFERENT leading alias
         // still expands. `name` is now on the stack, so it cannot re-expand itself.
         self.maybe_expand_command_alias()?;
@@ -7824,12 +7810,12 @@ mod tests {
         let empty = std::collections::HashMap::new();
         let mut lx = Lexer::new("x", &empty, LexerOptions::default());
         lx.begin_assignment_value(false);
-        assert!(lx.in_assignment_value);
+        assert!(lx.cmd_pos.in_assignment_value());
         assert!(
-            lx.assign_val_tilde_ok,
+            lx.cmd_pos.tilde_eligible_in_value(),
             "D2: tilde enabled for indexed value"
         );
-        assert!(!lx.cmd_at_word_start);
+        assert!(!lx.cmd_pos.at_word_start());
     }
 
     #[test]
