@@ -1354,13 +1354,19 @@ struct HeredocEmit {
 pub struct Lexer<'a> {
     cursor: CharCursor<'a>,
     opts: LexerOptions,
+    // v361 (#641) sort: an OPTION (`shopt -s braceexpand`), supplied once at
+    // construction and never moved by the automaton. It is NOT in the mode
+    // stack, so it is already outside the state machine. Folding it into
+    // `LexerOptions` is the tidier home but was NOT done: that struct derives
+    // `Default`, 93 sites construct it, and every `new_scanner` caller passes
+    // `true` — a derived default would silently turn brace expansion OFF. It
+    // needs a hand-written `Default`, which is a behaviour risk this inert
+    // refactor declined to take.
     brace_expand: bool,
     /// Tokens produced so far (was the local `tokens` vec); `pos` is the
     /// index of the next token next_token() will hand out (pull + future rewind).
     history: Vec<Token>,
     pos: usize,
-    /// True for a from_tokens() replay lexer: history is pre-filled, never scans.
-    replay: bool,
     parts: Vec<WordPart>,
     current: String,
     /// Byte offset the most recent scan step began at (#385) — see
@@ -1414,6 +1420,12 @@ pub struct Lexer<'a> {
     /// cleared the moment `scan_step_command_sub` consumes the `$(`. Captured in
     /// `Mark`/restored by `rewind` so a rewind that spans setting it stays
     /// consistent.
+    // v361 (#641) sort: a ONE-SHOT INSTRUCTION from parser to lexer, not state
+    // — `$((` was re-read as `$( (`, so the next scan must tokenize it that
+    // way. It is consumed once and cleared. It stays a field because the
+    // instruction has to survive the `rewind` that precedes it (hence its
+    // `Mark` entry); passing it as an argument would mean threading it
+    // through the rewind protocol, which is Task 7's territory.
     retokenize_arith_as_cmdsub: bool,
     /// v247 T3: true when the next command-word atom begins a fresh word (i.e.
     /// the previous atom was a `Blank`/start-of-input). Mirrors the oracle's
@@ -1486,6 +1498,11 @@ pub struct Lexer<'a> {
     /// EOF capture records whether the cursor word is command- or arg-position.
     /// Defaults `true` (a bare/empty line is command position). Only read when a
     /// recovery capture is taken.
+    // v361 (#641) sort: PARSER-SUPPLIED HINTS for EOF recovery, not lexer
+    // state — the parser tells the lexer what it was about to parse so a
+    // synthesized closer lands in the right place. They are transient and
+    // invalidated by a rewind. Left as fields; converting them to arguments
+    // means changing the recovery capture's signature, which is Task 7.
     recovery_cmd_word: bool,
     /// Recovery: the parser sets this to `true` while assembling a bare redirect
     /// operand (`parse_one_redirect`'s target word) and back to `false` once the
@@ -1511,7 +1528,6 @@ impl<'a> Lexer<'a> {
             brace_expand,
             history: Vec::new(),
             pos: 0,
-            replay: false,
             parts: Vec::new(),
             current: String::new(),
             last_step_start: 0,
@@ -2060,8 +2076,7 @@ impl<'a> Lexer<'a> {
 
     /// Restore a `Mark`: discard buffered/produced tokens at/after it, seek the
     /// cursor back, and restore flags + mode stack. The next pull re-lexes from
-    /// the checkpoint under the now-current mode. A replay (`from_tokens`) lexer
-    /// never scans, so history is left intact and only `pos`/flags are reset.
+    /// the checkpoint under the now-current mode.
     pub(crate) fn rewind(&mut self, m: &Mark) {
         debug_assert!(m.pos <= self.history.len(), "rewind target beyond history");
         // Like `mark`, `rewind` is only valid at a pull boundary: it does not
@@ -2071,10 +2086,8 @@ impl<'a> Lexer<'a> {
             self.current.is_empty() && self.parts.is_empty(),
             "rewind() must be called at a pull boundary (no word mid-accumulation)"
         );
-        if !self.replay {
-            self.history.truncate(m.pos);
-            self.cursor.seek(m.resume.0, m.resume.1, m.resume.2);
-        }
+        self.history.truncate(m.pos);
+        self.cursor.seek(m.resume.0, m.resume.1, m.resume.2);
         self.pos = m.pos;
         self.brace_expand = m.brace_expand;
         self.dbracket_depth = m.dbracket_depth;
@@ -2129,11 +2142,10 @@ impl<'a> Lexer<'a> {
     /// such a mark is live, so a later `rewind(&mark)` never sees a stale `pos`.
     /// (A nested `$((… $({compound})…))` reaches `parse_and_or_opts` — hence this
     /// call site — with the arith mark still outstanding; the depth guard is what
-    /// makes that safe.) No-op for a replay lexer, and skipped while any heredoc
+    /// makes that safe.) Skipped while any heredoc
     /// body is pending: a mid-collection body must not have its prefix shifted.
     pub(crate) fn maybe_prune_history(&mut self) {
-        if self.replay
-            || self.mode_depth() > 1
+        if self.mode_depth() > 1
             || self.pos < HISTORY_PRUNE_THRESHOLD
             || !self.atom_pending_heredocs.is_empty()
         {
@@ -6683,9 +6695,6 @@ impl<'a> Lexer<'a> {
     /// Heredoc token is never exposed before its body is collected (v238). On a lex
     /// error, RETURN it (no stash). scan_step appends to history without advancing pos.
     fn fill_to(&mut self, idx: usize) -> Result<(), LexError> {
-        if self.replay {
-            return Ok(());
-        }
         loop {
             if self.history.len() > idx {
                 return Ok(());
