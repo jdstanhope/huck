@@ -1929,6 +1929,14 @@ impl<'a> Lexer<'a> {
     /// the ENCLOSING scanner has consumed the opener — in production the head
     /// scanner's Phase 0 never runs). Used so a deferred bad-substitution can
     /// reconstruct the verbatim `${…}` raw.
+    ///
+    /// v361 (#641): NOT redundant with the frame's `open_off`, though it looks it.
+    /// Both hypotheses were armed and measured. `start_off == open_off` fails on
+    /// the whole corpus; `start_off == open_off - 2` holds there but fails in the
+    /// operand paths (`arith_in_param_operand` and six siblings), where the frame
+    /// is pushed BEFORE the opener is consumed rather than after. The offset
+    /// between the two is not constant, so the frame cannot answer for this and
+    /// the setter stays.
     pub(crate) fn set_param_start_off_from_cursor(&mut self) {
         let off = self.cursor.offset().saturating_sub(2);
         if let Some(Mode::ParamExpansion { start_off, .. }) = self.mode_last_mut() {
@@ -2006,12 +2014,17 @@ impl<'a> Lexer<'a> {
     /// been produced," so `body_started` tracks the oracle's
     /// `!(lit.is_empty() && parts.is_empty())` — an empty `""` leaves it false. A
     /// no-op if the top of the mode stack is not `Mode::Regex` (defensive).
-    pub(crate) fn set_regex_body_started(&mut self, v: bool) {
+    pub(crate) fn set_regex_has_content(&mut self, v: bool) {
         if let Some(Mode::Regex { has_content, .. }) = self.mode_last_mut() {
             *has_content = v;
         }
     }
 
+    /// v361 (#641) sort: a SCOPED INSTRUCTION, and already better than a bool —
+    /// it records the mode depth the force applies to. It is armed and disarmed
+    /// around one parser call rather than at a push, so it is not a push-time
+    /// mode parameter; it stays.
+    ///
     /// G3: arm/disarm force-extglob for the `[[ … ]]` `==`/`!=`/`=` pattern
     /// operand about to be scanned. Called by the parser around
     /// `next_test_word_atom`. When `on`, captures the CURRENT mode depth so the
@@ -6149,7 +6162,7 @@ impl<'a> Lexer<'a> {
 
         // `body_started` is PARSER-MANAGED (v254 T1 fix): the lexer only READS it
         // (for the leading-ws/`\<NL>` skip above) and never self-sets it. The
-        // parser calls `set_regex_body_started(!(parts.is_empty()&&acc.is_none()))`
+        // parser calls `set_regex_has_content(!(parts.is_empty()&&acc.is_none()))`
         // after each atom, so `body_started` reflects the oracle's
         // `!(lit.is_empty() && parts.is_empty())` — an EMPTY `""` produces NO part,
         // leaving the operand "unstarted" so the following space is still treated as

@@ -615,7 +615,7 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
             // `flush_literal` pushes NOTHING for an EMPTY body. Unwrap
             // `parse_dquote`'s wrapper; but DROP the injected empty-`""` marker
             // (`[Literal{"",true}]`) so an empty `""` contributes no part — that is
-            // what leaves the operand "unstarted" (via `set_regex_body_started`
+            // what leaves the operand "unstarted" (via `set_regex_has_content`
             // below) so the pattern becomes the literal `]]` → the `=~` arm guard
             // reproduces the oracle's `Err(TestExprMissingOperand)` for
             // `[[ $x =~ "" ]]`, and drops the middle part in `a""b`.
@@ -670,7 +670,7 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
         // `""` (which added no part) keeps the operand "unstarted" and the lexer's
         // leading-ws skip swallows the trailing space (→ oracle's Err). Skipped on
         // `RegexEnd` (the `break` above), where the lexer has already popped the mode.
-        iter.set_regex_body_started(!(parts.is_empty() && acc.is_none()));
+        iter.set_regex_has_content(!(parts.is_empty() && acc.is_none()));
     }
     flush_lit(&mut acc, &mut parts);
     Ok(Word(parts))
