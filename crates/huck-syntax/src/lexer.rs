@@ -994,14 +994,12 @@ struct PendingHeredoc {
     expand: bool,
     strip_tabs: bool,
     /// Index into `tokens` of the `TokenKind::Heredoc` placeholder to patch.
-    token_idx: usize,
     /// v264 (atom path only): the mode-stack depth (`self.modes.len()`) at which
     /// the `<<` opener was registered. A heredoc introduced inside a cmdsub/
     /// backtick body registers at depth ≥ 2 and its body must be emitted at that
     /// body's own newline — BEFORE a shallower (outer-line) heredoc that was
     /// registered EARLIER in source but belongs to the enclosing line. Selection
-    /// by matching depth (not FIFO front) keeps the two independent. Unused by
-    /// the oracle `pending_heredocs` queue.
+    /// by matching depth (not FIFO front) keeps the two independent.
     reg_depth: usize,
 }
 
@@ -1207,7 +1205,7 @@ pub(crate) enum Mode {
 /// from `resume`. Taken only at a pull boundary (no word mid-accumulation), so
 /// the word-accumulation buffers need not be captured.
 ///
-/// NOTE: `mark`/`rewind` must not span heredoc-body collection — `pending_heredocs`
+/// NOTE: `mark`/`rewind` must not span heredoc-body collection — the heredoc queue
 /// is intentionally not captured; that interaction is designed when heredocs enter
 /// the mode stack.
 #[derive(Debug, Clone)]
@@ -1215,10 +1213,8 @@ pub(crate) struct Mark {
     pos: usize,                // self.pos (pull index) at mark time
     resume: (usize, u32, u32), // (offset, line, column) to resume scanning from
     brace_expand: bool,
-    has_token: bool,
     in_assignment_value: bool,
     dbracket_depth: u32,
-    expect_regex: bool,
     opts: LexerOptions,
     alias_trailing_eligible: bool,
     modes: Vec<Mode>,
@@ -1319,8 +1315,6 @@ pub struct Lexer<'a> {
     replay: bool,
     parts: Vec<WordPart>,
     current: String,
-    has_token: bool,
-    token_start: usize,
     /// Byte offset the most recent scan step began at (#385) — see
     /// `last_step_start()`.
     last_step_start: usize,
@@ -1339,13 +1333,10 @@ pub struct Lexer<'a> {
     /// (taken) by `scan_step_guarded` on the way out, so it never goes stale.
     err_open_hint: Option<usize>,
     token_start_line: u32,
-    token_start_col: u32,
     in_assignment_value: bool,
     dbracket_depth: u32,
-    expect_regex: bool,
-    pending_heredocs: std::collections::VecDeque<PendingHeredoc>,
-    /// v250: atom-path heredoc queue — SEPARATE from `pending_heredocs` so the
-    /// production `fill_to`/`backfill_pending_at` never gate the atom opener.
+    /// v250: the atom path's heredoc queue. (It was once one of two — a legacy
+    /// queue sat beside it until v361 found it had stopped being written at all.)
     atom_pending_heredocs: std::collections::VecDeque<PendingHeredoc>,
     /// v250: Some while emitting heredoc body atoms after a line's newline.
     emitting_heredoc: Option<HeredocEmit>,
@@ -1477,15 +1468,10 @@ impl<'a> Lexer<'a> {
             replay: false,
             parts: Vec::new(),
             current: String::new(),
-            has_token: false,
-            token_start: 0,
             last_step_start: 0,
             token_start_line: 1,
-            token_start_col: 1,
             in_assignment_value: false,
             dbracket_depth: 0,
-            expect_regex: false,
-            pending_heredocs: std::collections::VecDeque::new(),
             atom_pending_heredocs: std::collections::VecDeque::new(),
             emitting_heredoc: None,
             parsed_heredoc_bodies: Vec::new(),
@@ -1628,7 +1614,7 @@ impl<'a> Lexer<'a> {
     /// `HeredocBodyBegin` — avoiding an over-scan into the *next* unit's first
     /// token when no heredoc is pending (issue #86).
     pub(crate) fn has_pending_heredoc_body(&self) -> bool {
-        !self.pending_heredocs.is_empty() || !self.atom_pending_heredocs.is_empty()
+        !self.atom_pending_heredocs.is_empty()
     }
 
     /// v264: set the M-156 extquote double-quote context flag (`opts.in_dquote`),
@@ -1941,12 +1927,12 @@ impl<'a> Lexer<'a> {
     /// pull boundary (no partial word). The resume point is the span of the
     /// next-to-hand-out token when lookahead is buffered, else the live cursor.
     ///
-    /// NOTE: `mark`/`rewind` must not span heredoc-body collection —
-    /// `pending_heredocs` is intentionally not captured; that interaction is
+    /// NOTE: `mark`/`rewind` must not span heredoc-body collection — the heredoc
+    /// queue is intentionally not captured; that interaction is
     /// designed when heredocs enter the mode stack.
     pub(crate) fn mark(&self) -> Mark {
         debug_assert!(
-            self.current.is_empty() && self.parts.is_empty() && !self.has_token,
+            self.current.is_empty() && self.parts.is_empty(),
             "mark() must be taken at a pull boundary (no word mid-accumulation)"
         );
         let resume = if self.pos < self.history.len() {
@@ -1963,10 +1949,8 @@ impl<'a> Lexer<'a> {
             pos: self.pos,
             resume,
             brace_expand: self.brace_expand,
-            has_token: self.has_token,
             in_assignment_value: self.in_assignment_value,
             dbracket_depth: self.dbracket_depth,
-            expect_regex: self.expect_regex,
             opts: self.opts,
             alias_trailing_eligible: self.alias_trailing_eligible,
             modes: self.modes.clone(),
@@ -1992,7 +1976,7 @@ impl<'a> Lexer<'a> {
         // clear the word-accumulation buffers, so a mid-word rewind would leak
         // partial state into the next token. (Both points are clean today.)
         debug_assert!(
-            self.current.is_empty() && self.parts.is_empty() && !self.has_token,
+            self.current.is_empty() && self.parts.is_empty(),
             "rewind() must be called at a pull boundary (no word mid-accumulation)"
         );
         if !self.replay {
@@ -2001,10 +1985,8 @@ impl<'a> Lexer<'a> {
         }
         self.pos = m.pos;
         self.brace_expand = m.brace_expand;
-        self.has_token = m.has_token;
         self.in_assignment_value = m.in_assignment_value;
         self.dbracket_depth = m.dbracket_depth;
-        self.expect_regex = m.expect_regex;
         self.opts = m.opts;
         self.alias_trailing_eligible = m.alias_trailing_eligible;
         self.modes = m.modes.clone();
@@ -2059,13 +2041,11 @@ impl<'a> Lexer<'a> {
     /// (A nested `$((… $({compound})…))` reaches `parse_and_or_opts` — hence this
     /// call site — with the arith mark still outstanding; the depth guard is what
     /// makes that safe.) No-op for a replay lexer, and skipped while any heredoc
-    /// body is pending (`pending_heredocs` stores history `token_idx`; a
-    /// mid-collection body must not have its prefix shifted).
+    /// body is pending: a mid-collection body must not have its prefix shifted.
     pub(crate) fn maybe_prune_history(&mut self) {
         if self.replay
             || self.modes.len() > 1
             || self.pos < HISTORY_PRUNE_THRESHOLD
-            || !self.pending_heredocs.is_empty()
             || !self.atom_pending_heredocs.is_empty()
         {
             return;
@@ -5137,8 +5117,8 @@ impl<'a> Lexer<'a> {
 
     /// v247 T5: reset the word/assignment boundary flags after emitting a Blank,
     /// Newline, or operator — the next word-content atom begins a fresh word and
-    /// is no longer in assignment-value context (mirrors the oracle's whitespace
-    /// and operator arms clearing `has_token` / `in_assignment_value`).
+    /// is no longer in assignment-value context (mirrors the pre-atom scanner's
+    /// whitespace and operator arms clearing word-start / assignment-value state).
     fn boundary_reset(&mut self) {
         self.cmd_at_word_start = true;
         self.in_assignment_value = false;
@@ -5262,7 +5242,6 @@ impl<'a> Lexer<'a> {
                             delim,
                             expand,
                             strip_tabs,
-                            token_idx: 0, // token_idx unused on the atom path
                             reg_depth: self.modes.len(),
                         });
                         self.heredoc_gen += 1; // v250 T6: atom_pending_heredocs changed
@@ -6586,31 +6565,7 @@ impl<'a> Lexer<'a> {
     /// (once), then report any unterminated heredoc, else EOF. Flushing the
     /// final word returns Produced so next_token() drains it before EOF.
     fn finish(&mut self) -> Result<Step, LexError> {
-        if self.has_token {
-            flush_literal(&mut self.parts, &mut self.current, false);
-            emit_word_with_braces(
-                &mut self.history,
-                std::mem::take(&mut self.parts),
-                self.brace_expand,
-                Span::new(
-                    self.token_start,
-                    self.token_start_line,
-                    self.token_start_col,
-                ),
-            )?;
-            self.has_token = false;
-            return Ok(Step::Produced);
-        }
-        if !self.pending_heredocs.is_empty() {
-            return Err(LexError::UnterminatedHeredoc);
-        }
         Ok(Step::Eof)
-    }
-
-    /// True iff a pending heredoc still targets the token at `idx` (its body
-    /// is not yet backfilled). Such a token must not be handed out yet.
-    fn backfill_pending_at(&self, idx: usize) -> bool {
-        self.pending_heredocs.iter().any(|ph| ph.token_idx == idx)
     }
 
     /// Pull one token, scanning lazily. Hands out the next buffered token
@@ -6623,7 +6578,7 @@ impl<'a> Lexer<'a> {
     #[cfg(test)]
     fn next_token(&mut self) -> Result<Option<Token>, LexError> {
         loop {
-            if self.pos < self.history.len() && !self.backfill_pending_at(self.pos) {
+            if self.pos < self.history.len() {
                 let t = self.history[self.pos].clone();
                 self.pos += 1;
                 return Ok(Some(t));
@@ -6660,7 +6615,7 @@ impl<'a> Lexer<'a> {
             return Ok(());
         }
         loop {
-            if self.history.len() > idx && !self.backfill_pending_at(idx) {
+            if self.history.len() > idx {
                 return Ok(());
             }
             match self.scan_step_guarded()? {
@@ -7190,34 +7145,11 @@ fn split_on_sentinels(s: &str, placeholders: &[WordPart]) -> Vec<WordPart> {
     out
 }
 
-/// Emits the word for `parts` into `tokens`, expanding any unquoted braces.
-/// Every emitted Word (1 normally, or one per brace-expansion product) is built
-/// with `span` — the source span of the word's first character — so each token
-/// carries its own location. Returns the number of tokens pushed.
-fn emit_word_with_braces(
-    tokens: &mut Vec<Token>,
-    parts: Vec<WordPart>,
-    brace_expand: bool,
-    span: Span,
-) -> Result<usize, LexError> {
-    if !brace_expand {
-        tokens.push(Token::new(TokenKind::Word(Word(parts)), span));
-        return Ok(1);
-    }
-    let products = brace_expand_parts(parts)?;
-    let count = products.len();
-    for p in products {
-        // Every brace-expansion product shares the source word's start span.
-        tokens.push(Token::new(TokenKind::Word(Word(p)), span));
-    }
-    Ok(count)
-}
-
 /// Brace-expands a word's `parts` into one-or-more parts-lists. With no
 /// unquoted brace, returns the single input list unchanged. Non-literal
 /// parts (expansions, quoted runs) are sentinel-protected so only literal
-/// source braces expand. Shared by `emit_word_with_braces` (command words)
-/// and `scan_array_literal` (bare array elements).
+/// source braces expand. Used by `scan_array_literal` (bare array elements);
+/// the command-word caller went with `emit_word_with_braces` in v361.
 pub(crate) fn brace_expand_parts(parts: Vec<WordPart>) -> Result<Vec<Vec<WordPart>>, LexError> {
     if !word_contains_unquoted_brace(&parts) {
         return Ok(vec![parts]);
@@ -7298,15 +7230,6 @@ fn merge_brace_name_suffix(parts: &mut Vec<WordPart>) {
             }
             None => i += 1,
         }
-    }
-}
-
-fn flush_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: bool) {
-    if !current.is_empty() {
-        parts.push(WordPart::Literal {
-            text: std::mem::take(current),
-            quoted,
-        });
     }
 }
 
