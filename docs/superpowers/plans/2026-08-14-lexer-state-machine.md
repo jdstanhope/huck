@@ -197,7 +197,7 @@ The point of the task is that the two can no longer disagree — after this, `mo
 
 ---
 
-### Task 5: Inherited context is derived, not copied
+### Task 5: Inherited context is derived, not copied — REFUTED, see below
 
 `enclosing_dquote` is copied into four operand variants; `opts.in_dquote` is context stored as configuration, written through `set_in_dquote` and read via `in_dquote()`.
 
@@ -214,6 +214,34 @@ If it disagrees anywhere, **stop and report**: either the copy is carrying infor
 - [ ] **Step 3: All five gates. Commit**, reporting the line delta.
 
 **Note:** the M-156 gate (`set_in_dquote`) interacts with `${…}` operand parsing in ways the corpus covers closely. If Step 1's assert fires here, that is the expected place.
+
+#### Outcome: the premise was wrong, and the measurement says so
+
+`enclosing_dquote` is **not** inherited context copied into children. The parser
+chooses it per OPERAND FAMILY, and two families deliberately get `false` while
+the `${…}` is inside quotes — the code says so at the push sites ("Production:
+`modifier_with_operand(chars, false, …)` — NOT `quoted`") and bash agrees.
+Inside one `"…"`, at one stack depth:
+
+```
+x=abc; echo "${x#'a'}"       -> bc        quotes removed, pattern is `a`
+echo "${nope:?'y'}"          -> nope: y   quotes removed
+echo "${x:-'y'}"  (x unset)  -> 'y'       quotes KEPT
+```
+
+A stack walk cannot tell those apart — same depth — so it would answer `true`
+for all three and silently break the first two. Under the spec's own buckets
+this is **frame data** (rule 4), not inherited context (rule 6), and it stays.
+
+Recorded at the field's declaration in `lexer.rs` so the next reader does not
+retry it. No code change beyond that comment.
+
+`opts.in_dquote` — the other half of this task — is a different problem: it is
+mutable STATE living in an options struct. That is a bucket-5 question (options
+are not state) and moves to Task 6.
+
+Rule 6 of the spec therefore has no instance in this iteration. It is not wrong
+as a rule; it simply does not apply to the two candidates named for it.
 
 ---
 

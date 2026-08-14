@@ -1169,6 +1169,19 @@ pub(crate) enum Mode {
     // (seeded once at push time from the parser's `quoted` flag), distinct from
     // `in_dquote` which is the operand scanner's INTERNAL `'…'`/`"…"`-span state
     // that toggles as the operand text is scanned. See v264 operand-dquote fix.
+    //
+    // v361 (#641): this is FRAME DATA, not inherited context, and it is NOT
+    // derivable by walking the mode stack — an attempt to do so was measured and
+    // refuted. The parser chooses it per OPERAND FAMILY: the value family gets
+    // `quoted`, while `ErrorIfUnset` and the pattern family get `false`
+    // deliberately, mirroring bash. Inside one `"…"`, at one stack depth:
+    //
+    //     x=abc; echo "${x#'a'}"     -> bc    (quotes removed, pattern is `a`)
+    //     echo "${nope:?'y'}"        -> "nope: y"        (quotes removed)
+    //     echo "${x:-'y'}"  (x unset) -> 'y'   (quotes KEPT)
+    //
+    // A stack walk cannot tell those apart — they are the same depth — so it
+    // would return `true` for all three and silently break the first two.
     ParamWordOperand {
         in_dquote: bool,
         enclosing_dquote: bool,
