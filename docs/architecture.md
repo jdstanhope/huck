@@ -301,6 +301,45 @@ These appear in many call-site signatures; learn them once.
 
 ## Cross-cutting conventions
 
+- **The lexer's state is one automaton** (v361, #641). The lexer is a
+  pushdown automaton: `modes: Vec<ModeFrame>` with `Mode::Command` as the
+  floor, the parser pushing a mode and pulling one atom per call. It is in
+  exactly ONE state at a time; nesting — a command substitution inside a
+  double quote — is the stack, never parallel flags. Four rules decide where
+  a new piece of state belongs:
+
+  1. **Control state is the automaton.** A mode's sub-states become variants
+     or parameters of that mode, never parallel booleans on the `Lexer`. The
+     command position (`state::CommandPos`) is the worked example: word
+     position and assignment context, changed only through named transitions
+     (`boundary`, `begin_atom`, `enter_word_content`, `end_literal_run`,
+     `begin_assignment_value`, `enter_nested_command`, `resume_outer_word`),
+     so an impossible combination cannot be reached. Tilde eligibility lives
+     INSIDE `AssignCtx::Value`, which makes it unrepresentable outside an
+     assignment value rather than merely unused.
+  2. **Data may ride on a frame.** `ModeFrame` carries the mode, the byte
+     offset the construct opened at, and its `Entry` phase (`Opening` until
+     the opener is consumed, then `Body`). The rule is that the STATE is the
+     frame, not that frames are empty.
+  3. **No parallel structures.** Two vectors pushed in lockstep, two
+     counters incremented together, or a counter moved alongside a vector
+     push/pop are the same bug waiting to happen. If two values must move
+     together they are one value — `mode_open_offs` was a second vector
+     pushed with `modes` and is now a field on the frame, so they cannot
+     drift.
+  4. **Options and one-shot instructions are not state.** `LexerOptions`
+     holds toggles resolved from shell state; `retokenize_arith_as_cmdsub`
+     is an instruction consumed once; the recovery flags are parser-supplied
+     hints. Each surviving field says which it is at its declaration.
+
+  Two things that LOOK derivable are not, and both are recorded with their
+  measurements where a reader will meet them: `enclosing_dquote` is chosen
+  per operand FAMILY (the value family gets the enclosing quoting, the
+  pattern family and `${x:?…}` deliberately get `false`), and
+  `Mode::ParamExpansion`'s `start_off` is not a fixed offset from the
+  frame's `open_off` because some paths push before consuming the opener and
+  some after. Do not re-derive either from the stack.
+
 - **Builtins dispatch** — `BUILTIN_NAMES` lists all builtin names.
   `is_builtin(name)` says yes/no. `run_builtin(name, args, out,
   shell)` is the main entry point for non-declaration commands.
