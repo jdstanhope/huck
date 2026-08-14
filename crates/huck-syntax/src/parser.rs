@@ -535,7 +535,7 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
 fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
     iter.push_mode(Mode::Regex {
         paren_depth: 0,
-        body_started: false,
+        has_content: false,
     });
     // Drop any already-buffered leading Blank/Newline (the `next_is_test_binary_
     // operator_atom` peek2 buffered exactly one boundary atom after `=~`). The
@@ -841,9 +841,7 @@ fn flush_lit(acc: &mut Option<(String, bool)>, out: &mut Vec<WordPart>) {
 /// Owns the full push/pop lifecycle of its `DoubleQuote` frame; pops on ALL
 /// exit paths.
 fn parse_dquote(iter: &mut Lexer, _outer_quoted: bool) -> Result<WordPart, ParseError> {
-    iter.push_mode(Mode::DoubleQuote {
-        body_started: false,
-    });
+    iter.push_mode(Mode::DoubleQuote);
     let result = (|| -> Result<Vec<WordPart>, ParseError> {
         let mut parts: Vec<WordPart> = Vec::new();
         // Pending coalescible literal chunk (see `push_lit`/`flush_lit`); a
@@ -1670,9 +1668,7 @@ fn zero_lines_in_simple(sc: &mut SimpleCommand) {
 /// closing `)` token.
 pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
     // 1. Push the mode and pull the opening atom.
-    iter.push_mode(Mode::CommandSub {
-        body_started: false,
-    });
+    iter.push_mode(Mode::CommandSub);
     match iter.next_kind()? {
         Some(TokenKind::DeferredExpansion) => {
             // `$((` — arithmetic; defer to runtime.
@@ -1812,9 +1808,7 @@ fn unterminated_backtick(pos: usize) -> ParseError {
 /// path; the word-mode `ProcSubOpen` signal was already consumed by the caller).
 /// `dir` comes from that signal.
 pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPart, ParseError> {
-    iter.push_mode(Mode::CommandSub {
-        body_started: false,
-    });
+    iter.push_mode(Mode::CommandSub);
     match iter.next_kind()? {
         Some(TokenKind::CmdSubOpen) => {} // the real opener, scanned under CommandSub mode
         _ => {
@@ -1927,7 +1921,6 @@ fn word_has_array_literal(w: &Word) -> bool {
 
 pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseError> {
     iter.push_mode(Mode::ArrayLiteral {
-        body_started: false,
         expect_subscript_eq: false,
         at_element_start: true,
         subscript_append: false,
@@ -2142,7 +2135,7 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
 
 /// Assemble a `WordPart::Arith` for a `$(( … ))` arithmetic expansion.
 ///
-/// Pushes `Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren }`;
+/// Pushes `Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, for_header: false, delim: ArithDelim::Paren }`;
 /// the mode's first scan consumes the opening `$((` and emits `ArithOpen`.  The
 /// parser assembles the body `Word` (literal runs + embedded expansions), stops on
 /// `ArithClose`, and on `ArithBail` rewinds to the `$((` start and re-drives as a
@@ -2267,7 +2260,6 @@ pub(crate) fn parse_arith_expansion(
         in_squote: false,
         in_dquote: false,
         quote_open_off: None,
-        body_started: false,
         for_header: false,
         delim: ArithDelim::Paren,
     });
@@ -2309,7 +2301,6 @@ pub(crate) fn parse_legacy_arith_expansion(
         in_squote: false,
         in_dquote: false,
         quote_open_off: None,
-        body_started: false,
         for_header: false,
         delim: ArithDelim::Bracket,
     });
@@ -2361,12 +2352,11 @@ fn parse_arith_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     let line = iter.current_line()?; // source line of the `((` (#352)
     iter.next_kind()?; // consume first `(` (buffered Op(LParen))
     iter.next_kind()?; // consume second `(`
-    iter.push_mode(Mode::Arith {
+    iter.push_mode_in_body(Mode::Arith {
         paren_depth: 0,
         in_squote: false,
         in_dquote: false,
         quote_open_off: None,
-        body_started: true,
         for_header: false,
         delim: ArithDelim::Paren,
     });
@@ -4923,12 +4913,11 @@ fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
     // The second `(` starts one byte before the header text itself.
     let open_at = iter.peek_span()?.map(|s| s.offset + 1).unwrap_or(0);
     iter.next_kind()?; // second `(`
-    iter.push_mode(Mode::Arith {
+    iter.push_mode_in_body(Mode::Arith {
         paren_depth: 0,
         in_squote: false,
         in_dquote: false,
         quote_open_off: None,
-        body_started: true,
         for_header: true,
         delim: ArithDelim::Paren,
     });

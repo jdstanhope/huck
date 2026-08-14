@@ -1102,8 +1102,28 @@ pub(crate) enum ArithDelim {
     Bracket,
 }
 
-/// One entry on the mode stack: the mode, and the byte offset where the
-/// construct that opened it began.
+/// Whether a frame's opening delimiter has been consumed yet.
+///
+/// v361 (#641): four modes carried an identical `body_started: bool` and
+/// `BacktickRaw` — which has no fields — used a LEXER-GLOBAL
+/// `backtick_raw_started` for the same job, reset on every push so it would not
+/// leak between frames. It is one concept, it belongs to the frame, and as a
+/// frame field the leak it was guarding against cannot happen.
+///
+/// `Mode::Regex` deliberately keeps a flag of its own: despite the name it had,
+/// it tracks whether any CONTENT has been produced (the parser sets it after
+/// each pattern atom and an empty `""` leaves it false), which is a different
+/// question that can also go back to false.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Entry {
+    /// The opener has not been consumed yet; the next scan step consumes it.
+    Opening,
+    /// Inside the body.
+    Body,
+}
+
+/// One entry on the mode stack: the mode, where the construct opened, and
+/// whether its opener has been consumed.
 ///
 /// v361 (#641): these were two vectors — `modes` and `mode_open_offs` — pushed
 /// and popped in lockstep, with nothing preventing them drifting apart. Two
@@ -1114,6 +1134,9 @@ pub(crate) struct ModeFrame {
     /// Where this construct opened. An unexpected-EOF diagnostic names the line
     /// the innermost open delimiter started on (#385), and that is this offset.
     pub(crate) open_off: usize,
+    /// One-way: every frame is pushed `Opening` and enters `Body` once its
+    /// opener is consumed.
+    pub(crate) entry: Entry,
 }
 
 /// The lexing-rule context the lexer scans under. v240 implements only
@@ -1121,14 +1144,12 @@ pub(crate) struct ModeFrame {
 /// iterations and are never the active mode in production yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
-    Command, // default command-position scanner (emits atoms)
-    CommandSub {
-        body_started: bool,
-    }, // $( … ) / `…`
+    Command,    // default command-position scanner (emits atoms)
+    CommandSub, // $( … ) / `…`
     /// v274: dumb quote-blind/`$()`-blind raw-capture backtick mode (phase 1 of
     /// capture→unescape→re-parse). Streams the body verbatim as `BacktickRawText`
     /// atoms framed by `BeginBacktick`…`EndBacktick`; entry is tracked by the
-    /// lexer's `backtick_raw_started` flag (reset in `push_mode`), NOT a field.
+    /// frame's `Entry` phase, NOT a field of the mode itself.
     BacktickRaw,
     // `seen_name` — set once the NAME atom (or length/indirect prefix's name)
     // has been emitted. `indirect` — set when the `${!…}` indirect prefix was
@@ -1190,22 +1211,22 @@ pub(crate) enum Mode {
         in_squote: bool,
         in_dquote: bool,
         quote_open_off: Option<usize>,
-        body_started: bool,
         for_header: bool,
         delim: ArithDelim,
     }, // $(( … )) / (( … )) / for (( … )) / $[ … ]
-    DoubleQuote {
-        body_started: bool,
-    }, // "…" — v247 T3 (parser-driven word-level mode)
+    DoubleQuote, // "…" — v247 T3 (parser-driven word-level mode)
     ArrayLiteral {
-        body_started: bool,
         expect_subscript_eq: bool,
         at_element_start: bool,
         subscript_append: bool,
     }, // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=`/`+=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal). subscript_append: the operator the lexer just consumed for the CURRENT subscripted element was `+=` (not `=`); the parser reads it via current_mode() after scanning the value.
     Regex {
         paren_depth: u32,
-        body_started: bool,
+        /// Whether any CONTENT has been produced — the parser sets it after each
+        /// pattern atom and an empty `""` leaves it false. NOT an entry
+        /// handshake (that is the frame's `Entry`), which is why this one kept a
+        /// flag of its own when the other four lost theirs (#641).
+        has_content: bool,
     }, // v254: RHS of =~ inside [[ … ]]
     /// v264: an extglob group `<prefix>( … )` (`?(...)`/`*(...)`/`+(...)`/
     /// `@(...)`/`!(...)`, gated by `LexerOptions::extglob`). `paren_depth == 0`
@@ -1419,7 +1440,6 @@ pub struct Lexer<'a> {
     /// `Mode::BacktickRaw` frame is pushed (see `push_mode`), so sequential/re-entered
     /// backticks in one lexer each re-run the entry handshake. The raw mode never
     /// pushes a nested mode, so a single flag suffices (nesting uses a fresh Lexer).
-    backtick_raw_started: bool,
     /// v250 T6 (+ fix pass): monotonic counter bumped on EVERY mutation of
     /// `atom_pending_heredocs`/`emitting_heredoc`: the push at the atom `<<`
     /// opener site, `emitting_heredoc` set at the newline trigger, the
@@ -1492,6 +1512,7 @@ impl<'a> Lexer<'a> {
             modes: vec![ModeFrame {
                 mode: Mode::Command,
                 open_off: 0,
+                entry: Entry::Body,
             }],
             err_open_off: None,
             err_open_hint: None,
@@ -1501,7 +1522,6 @@ impl<'a> Lexer<'a> {
             force_extglob_depth: None,
             stall_steps: 0,
             heredoc_gen: 0,
-            backtick_raw_started: false,
             recover_last_depth: None,
             recovery_capture: None,
             recovery_cmd_word: true,
@@ -1519,6 +1539,19 @@ impl<'a> Lexer<'a> {
     /// way, so a scanner cannot accidentally move it.
     fn mode_last_mut(&mut self) -> Option<&mut Mode> {
         self.modes.last_mut().map(|f| &mut f.mode)
+    }
+
+    /// The innermost frame's entry phase.
+    fn mode_entry(&self) -> Entry {
+        self.modes.last().map_or(Entry::Body, |f| f.entry)
+    }
+
+    /// The innermost frame's opener has been consumed — one-way, and the only
+    /// way a frame leaves `Opening` (#641).
+    fn enter_mode_body(&mut self) {
+        if let Some(f) = self.modes.last_mut() {
+            f.entry = Entry::Body;
+        }
     }
 
     /// Stack depth including the `Command` floor.
@@ -1875,14 +1908,26 @@ impl<'a> Lexer<'a> {
     }
 
     pub(crate) fn push_mode(&mut self, m: Mode) {
-        // v274: a fresh BacktickRaw frame must re-run the entry handshake (consume
-        // the opening `` ` ``, emit BeginBacktick), so clear the started flag here.
-        if matches!(m, Mode::BacktickRaw) {
-            self.backtick_raw_started = false;
-        }
+        // Every frame is pushed `Opening`. A fresh `BacktickRaw` re-running its
+        // entry handshake used to need an explicit reset of a lexer-global flag;
+        // as frame state it cannot carry over from a previous frame at all.
         self.modes.push(ModeFrame {
             mode: m,
             open_off: self.cursor.offset(),
+            entry: Entry::Opening,
+        });
+    }
+
+    /// Push a frame whose opener the CALLER has already consumed, so it starts
+    /// in `Body` rather than `Opening`. Used where the parser recognises the
+    /// opener itself — `(( … ))` as a command, and a `for (( … ))` header, whose
+    /// two `(` the parser has already taken (#641). Every other push starts
+    /// `Opening` and the scanner consumes the opener on its first step.
+    pub(crate) fn push_mode_in_body(&mut self, m: Mode) {
+        self.modes.push(ModeFrame {
+            mode: m,
+            open_off: self.cursor.offset(),
+            entry: Entry::Body,
         });
     }
 
@@ -1910,7 +1955,7 @@ impl<'a> Lexer<'a> {
         // collected within the comsub was already removed from the queue, so this
         // only re-homes genuinely-orphaned entries. Not a forward scan: no cursor
         // movement, just a depth re-tag on the existing FIFO.
-        if matches!(popped, Mode::CommandSub { .. } | Mode::BacktickRaw) {
+        if matches!(popped, Mode::CommandSub | Mode::BacktickRaw) {
             let new_depth = self.mode_depth();
             let mut changed = false;
             for ph in self.atom_pending_heredocs.iter_mut() {
@@ -1933,8 +1978,8 @@ impl<'a> Lexer<'a> {
     /// `!(lit.is_empty() && parts.is_empty())` — an empty `""` leaves it false. A
     /// no-op if the top of the mode stack is not `Mode::Regex` (defensive).
     pub(crate) fn set_regex_body_started(&mut self, v: bool) {
-        if let Some(Mode::Regex { body_started, .. }) = self.mode_last_mut() {
-            *body_started = v;
+        if let Some(Mode::Regex { has_content, .. }) = self.mode_last_mut() {
+            *has_content = v;
         }
     }
 
@@ -2097,7 +2142,7 @@ impl<'a> Lexer<'a> {
         match mode {
             // `$( … )` / `<( … )` / `( … )` bodies are Command-mode tokens; the
             // parser closes them on `Op(RParen)` (parse_command_sub / subshell).
-            Mode::CommandSub { .. } => Some(TokenKind::Op(Operator::RParen)),
+            Mode::CommandSub => Some(TokenKind::Op(Operator::RParen)),
             Mode::BacktickRaw => Some(TokenKind::EndBacktick),
             // `${ … }` and its operand sub-modes all close on `}` → ParamClose,
             // except a subscript operand `${x[ … ]}` which closes on `]`.
@@ -2107,7 +2152,7 @@ impl<'a> Lexer<'a> {
             | Mode::ParamSubstringOffsetOperand { .. } => Some(TokenKind::ParamClose),
             Mode::ParamSubscriptOperand { .. } => Some(TokenKind::RBracket),
             Mode::Arith { .. } => Some(TokenKind::ArithClose),
-            Mode::DoubleQuote { .. } => Some(TokenKind::EndDquote),
+            Mode::DoubleQuote => Some(TokenKind::EndDquote),
             Mode::ArrayLiteral { .. } => Some(TokenKind::ArrayClose),
             Mode::Regex { .. } => Some(TokenKind::RegexEnd),
             Mode::Extglob { .. } => Some(TokenKind::ExtglobEnd),
@@ -2149,6 +2194,7 @@ impl<'a> Lexer<'a> {
                 return Ok(Step::Eof);
             }
         }
+        let entry = self.mode_entry();
         match self.current_mode() {
             Mode::Command => self.scan_step_command_atoms(),
             Mode::ParamExpansion { .. } => self.scan_step_param_head(),
@@ -2169,14 +2215,13 @@ impl<'a> Lexer<'a> {
                 in_dquote,
                 enclosing_dquote,
             } => self.scan_step_param_operand(None, ']', in_dquote, enclosing_dquote, true),
-            Mode::CommandSub { body_started } => self.scan_step_command_sub(body_started),
+            Mode::CommandSub => self.scan_step_command_sub(entry),
             Mode::BacktickRaw => self.scan_step_backtick_raw(),
             Mode::Arith {
                 paren_depth,
                 in_squote,
                 in_dquote,
                 quote_open_off,
-                body_started,
                 for_header,
                 delim,
             } => self.scan_step_arith(
@@ -2184,21 +2229,20 @@ impl<'a> Lexer<'a> {
                 in_squote,
                 in_dquote,
                 quote_open_off,
-                body_started,
+                entry,
                 for_header,
                 delim,
             ),
-            Mode::DoubleQuote { body_started } => self.scan_step_dquote(body_started),
+            Mode::DoubleQuote => self.scan_step_dquote(entry),
             Mode::ArrayLiteral {
-                body_started,
                 expect_subscript_eq,
                 at_element_start,
                 ..
-            } => self.scan_step_array_literal(body_started, expect_subscript_eq, at_element_start),
+            } => self.scan_step_array_literal(entry, expect_subscript_eq, at_element_start),
             Mode::Regex {
                 paren_depth,
-                body_started,
-            } => self.scan_step_regex(paren_depth, body_started),
+                has_content,
+            } => self.scan_step_regex(paren_depth, has_content),
             Mode::Extglob { paren_depth } => self.scan_step_extglob(paren_depth),
         }
     }
@@ -3704,8 +3748,8 @@ impl<'a> Lexer<'a> {
         self.scan_step_command_atoms_core()
     }
 
-    fn scan_step_command_sub(&mut self, body_started: bool) -> Result<Step, LexError> {
-        if !body_started {
+    fn scan_step_command_sub(&mut self, entry: Entry) -> Result<Step, LexError> {
+        if matches!(entry, Entry::Opening) {
             // Record position BEFORE consuming the opener.
             let off = self.cursor.offset();
             let l = self.cursor.line();
@@ -3754,9 +3798,7 @@ impl<'a> Lexer<'a> {
                 }
             }
             // Flip the top-of-stack frame to body_started: true.
-            if let Some(Mode::CommandSub { body_started }) = self.mode_last_mut() {
-                *body_started = true;
-            }
+            self.enter_mode_body();
             // v264: the cmdsub body begins at a FRESH command/word start — the
             // outer `cmd_at_word_start` reflects the mid-word `$(` position
             // (false), but a `#` at `$(#…` opens a comment (the oracle uses
@@ -3776,7 +3818,7 @@ impl<'a> Lexer<'a> {
     /// capture→unescape→re-parse). QUOTE-BLIND and `$()`-BLIND: `'`, `"`, `(`, `#`
     /// are ordinary body bytes. Per step:
     ///
-    /// - FIRST call (cursor parked on the opening `` ` ``, `backtick_raw_started`
+    /// - FIRST call (cursor parked on the opening `` ` ``, frame still `Opening`
     ///   still false) → consume it, emit `BeginBacktick` (the entry handshake
     ///   `parse_backtick_sub`'s opening pull expects is unchanged).
     /// - EOF before the close → `finish()` (unterminated; parser maps to an error).
@@ -3787,7 +3829,7 @@ impl<'a> Lexer<'a> {
     /// - otherwise → consume the maximal run of chars that are neither `\` nor
     ///   `` ` `` and emit it as one `BacktickRawText`.
     fn scan_step_backtick_raw(&mut self) -> Result<Step, LexError> {
-        if !self.backtick_raw_started {
+        if matches!(self.mode_entry(), Entry::Opening) {
             // ENTRY: consume the opening backtick and emit BeginBacktick.
             let off = self.cursor.offset();
             let l = self.cursor.line();
@@ -3798,7 +3840,7 @@ impl<'a> Lexer<'a> {
                 "scan_step_backtick_raw entry: expected opening `"
             );
             self.cursor.next(); // consume the opening '`'
-            self.backtick_raw_started = true;
+            self.enter_mode_body();
             self.history
                 .push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
             return Ok(Step::Produced);
@@ -3893,11 +3935,11 @@ impl<'a> Lexer<'a> {
         in_squote: bool,
         in_dquote: bool,
         quote_open_off: Option<usize>,
-        body_started: bool,
+        entry: Entry,
         for_header: bool,
         delim: ArithDelim,
     ) -> Result<Step, LexError> {
-        if !body_started {
+        if matches!(entry, Entry::Opening) {
             let off = self.cursor.offset();
             let l = self.cursor.line();
             let c = self.cursor.column();
@@ -3911,18 +3953,14 @@ impl<'a> Lexer<'a> {
                     self.cursor.next(); // `$`
                     self.cursor.next(); // `(`
                     self.cursor.next(); // `(`
-                    if let Some(Mode::Arith { body_started, .. }) = self.mode_last_mut() {
-                        *body_started = true;
-                    }
+                    self.enter_mode_body();
                     self.history
                         .push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
                 }
                 ArithDelim::Bracket => {
                     self.cursor.next(); // `$`
                     self.cursor.next(); // `[`
-                    if let Some(Mode::Arith { body_started, .. }) = self.mode_last_mut() {
-                        *body_started = true;
-                    }
+                    self.enter_mode_body();
                     self.history
                         .push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
                 }
@@ -4983,7 +5021,7 @@ impl<'a> Lexer<'a> {
             .and_then(|i| self.modes.get(i))
             .map(|f| f.mode)
         {
-            Some(Mode::CommandSub { .. }) | Some(Mode::BacktickRaw) => {}
+            Some(Mode::CommandSub) | Some(Mode::BacktickRaw) => {}
             _ => return None,
         }
         let mut probe = self.cursor.clone();
@@ -5846,8 +5884,8 @@ impl<'a> Lexer<'a> {
     /// closing `"`, emit `EndDquote` (the parser pops the mode). Mirrors
     /// `scan_step_param_operand`'s `in_dquote` branch but wires `$(`/`$((` (which
     /// the operand path still defers) since the parser owns the recursion.
-    fn scan_step_dquote(&mut self, body_started: bool) -> Result<Step, LexError> {
-        if !body_started {
+    fn scan_step_dquote(&mut self, entry: Entry) -> Result<Step, LexError> {
+        if matches!(entry, Entry::Opening) {
             // Consume the opening `"` and flip the frame to the body phase.
             debug_assert_eq!(
                 self.cursor.peek(),
@@ -5855,9 +5893,7 @@ impl<'a> Lexer<'a> {
                 "scan_step_dquote entry: expected opening \""
             );
             self.cursor.next(); // consume opening `"`
-            if let Some(Mode::DoubleQuote { body_started }) = self.mode_last_mut() {
-                *body_started = true;
-            }
+            self.enter_mode_body();
             // Fall through to scan the first inner atom.
         }
         let off = self.cursor.offset();
@@ -6047,13 +6083,13 @@ impl<'a> Lexer<'a> {
     ///    UNQUOTED — unlike the command word's `QuoteRun{Backslash}`); `\`-EOF → `\`;
     ///  - depth-0 whitespace or EOF → pop the mode + emit zero-width `RegexEnd`
     ///    (leading whitespace while `!body_started` is skipped, not a terminator).
-    fn scan_step_regex(&mut self, paren_depth: u32, body_started: bool) -> Result<Step, LexError> {
+    fn scan_step_regex(&mut self, paren_depth: u32, has_content: bool) -> Result<Step, LexError> {
         let off = self.cursor.offset();
         let l = self.cursor.line();
         let c = self.cursor.column();
 
         // Leading-whitespace / continuation skip while the operand is still empty.
-        if !body_started {
+        if !has_content {
             loop {
                 match self.cursor.peek().copied() {
                     Some(ch) if ch.is_whitespace() => {
@@ -6413,20 +6449,18 @@ impl<'a> Lexer<'a> {
     /// separator/value grammar.
     fn scan_step_array_literal(
         &mut self,
-        body_started: bool,
+        entry: Entry,
         expect_subscript_eq: bool,
         at_element_start: bool,
     ) -> Result<Step, LexError> {
-        if !body_started {
+        if matches!(entry, Entry::Opening) {
             debug_assert_eq!(
                 self.cursor.peek(),
                 Some(&'('),
                 "array-literal entry: expected '('"
             );
             self.cursor.next(); // consume opening '('
-            if let Some(Mode::ArrayLiteral { body_started, .. }) = self.mode_last_mut() {
-                *body_started = true;
-            }
+            self.enter_mode_body();
             // Each value is scanned as a FRESH word (mirrors the oracle
             // re-tokenizing the collected element text from scratch): reset the
             // word-start/assignment-value state so `try_scan_assign_prefix` and
@@ -8143,7 +8177,6 @@ mod tests {
             in_squote: false,
             in_dquote: false,
             quote_open_off: None,
-            body_started: false,
             for_header: false,
             delim: ArithDelim::Paren,
         });
@@ -8154,26 +8187,13 @@ mod tests {
                 in_squote: false,
                 in_dquote: false,
                 quote_open_off: None,
-                body_started: false,
                 for_header: false,
                 delim: ArithDelim::Paren
             }
         );
-        lx.push_mode(Mode::CommandSub {
-            body_started: false,
-        });
-        assert_eq!(
-            lx.current_mode(),
-            Mode::CommandSub {
-                body_started: false
-            }
-        );
-        assert_eq!(
-            lx.pop_mode(),
-            Mode::CommandSub {
-                body_started: false
-            }
-        );
+        lx.push_mode(Mode::CommandSub);
+        assert_eq!(lx.current_mode(), Mode::CommandSub);
+        assert_eq!(lx.pop_mode(), Mode::CommandSub);
         assert_eq!(
             lx.pop_mode(),
             Mode::Arith {
@@ -8181,7 +8201,6 @@ mod tests {
                 in_squote: false,
                 in_dquote: false,
                 quote_open_off: None,
-                body_started: false,
                 for_header: false,
                 delim: ArithDelim::Paren
             }
@@ -8199,12 +8218,11 @@ mod tests {
             &Default::default(),
             LexerOptions::default(),
         );
-        lx.push_mode(Mode::Arith {
+        lx.push_mode_in_body(Mode::Arith {
             paren_depth: 0,
             in_squote: false,
             in_dquote: false,
             quote_open_off: None,
-            body_started: true,
             for_header: true,
             delim: ArithDelim::Paren,
         });
@@ -8242,12 +8260,11 @@ mod tests {
 
         // Nested `;` (depth>0) stays literal — one Lit, no ArithSemi.
         let mut lx2 = Lexer::new("(a;b)))", &Default::default(), LexerOptions::default());
-        lx2.push_mode(Mode::Arith {
+        lx2.push_mode_in_body(Mode::Arith {
             paren_depth: 0,
             in_squote: false,
             in_dquote: false,
             quote_open_off: None,
-            body_started: true,
             for_header: true,
             delim: ArithDelim::Paren,
         });
@@ -8284,7 +8301,6 @@ mod tests {
             in_squote: false,
             in_dquote: false,
             quote_open_off: None,
-            body_started: false,
             for_header: false,
             delim: ArithDelim::Bracket,
         });
@@ -9883,20 +9899,12 @@ mod array_parse_tests {
             in_squote: false,
             in_dquote: false,
             quote_open_off: None,
-            body_started: false,
             for_header: false,
             delim: ArithDelim::Paren,
         });
         let m = lx.mark();
-        lx.push_mode(Mode::CommandSub {
-            body_started: false,
-        });
-        assert_eq!(
-            lx.current_mode(),
-            Mode::CommandSub {
-                body_started: false
-            }
-        );
+        lx.push_mode(Mode::CommandSub);
+        assert_eq!(lx.current_mode(), Mode::CommandSub);
         lx.rewind(&m);
         assert_eq!(
             lx.current_mode(),
@@ -9905,7 +9913,6 @@ mod array_parse_tests {
                 in_squote: false,
                 in_dquote: false,
                 quote_open_off: None,
-                body_started: false,
                 for_header: false,
                 delim: ArithDelim::Paren
             }
@@ -9917,7 +9924,6 @@ mod array_parse_tests {
                 in_squote: false,
                 in_dquote: false,
                 quote_open_off: None,
-                body_started: false,
                 for_header: false,
                 delim: ArithDelim::Paren
             }
