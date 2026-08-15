@@ -71,7 +71,7 @@ fn mode_to_frame(mode: &Mode) -> Option<Frame> {
         // `$( … )` / `<( … )` / `>( … )` bodies (the parser also opens this mode
         // for a bare `( … )` process-sub body); from the cursor's view all are a
         // command substitution / paren-command.
-        Mode::CommandSub { .. } => Some(Frame::CommandSub),
+        Mode::CommandSub => Some(Frame::CommandSub),
         Mode::BacktickRaw => Some(Frame::Backtick),
         Mode::ParamExpansion { .. }
         | Mode::ParamWordOperand { .. }
@@ -79,7 +79,7 @@ fn mode_to_frame(mode: &Mode) -> Option<Frame> {
         | Mode::ParamSubstringOffsetOperand { .. }
         | Mode::ParamSubscriptOperand { .. } => Some(Frame::ParamExpansion),
         Mode::Arith { .. } => Some(Frame::Arith),
-        Mode::DoubleQuote { .. } => Some(Frame::DoubleQuote),
+        Mode::DoubleQuote => Some(Frame::DoubleQuote),
         Mode::ArrayLiteral { .. } => Some(Frame::ArrayLiteral),
         // Not cursor-context frames.
         Mode::Command | Mode::Regex { .. } | Mode::Extglob { .. } => None,
