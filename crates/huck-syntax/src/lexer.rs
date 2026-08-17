@@ -1145,8 +1145,20 @@ pub(crate) struct ModeFrame {
 /// iterations and are never the active mode in production yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
-    Command,    // default command-position scanner (emits atoms)
-    CommandSub, // $( … ) / `…`
+    Command, // default command-position scanner (emits atoms)
+    /// `$( … )`.
+    ///
+    /// `from_arith_reread` marks the one frame that is a command substitution
+    /// only because huck RE-READ it as one: `$((1+2)` starts as arithmetic, the
+    /// lexer emits `ArithBail` at the depth-0 `)`, and the parser rewinds and
+    /// re-drives the same text as `$(` + a subshell `(`. bash never re-reads, so
+    /// its EOF still names the `$((` and reports the line the `$((` opened on —
+    /// where an ordinary `$(` is reported at the EOF line (#629). The offset the
+    /// frame carries is already the `$((`'s; only the line RULE differs, and the
+    /// rule is keyed on the `Delim`, so a marked frame names `DollarDParen`.
+    CommandSub {
+        from_arith_reread: bool,
+    },
     /// v274: dumb quote-blind/`$()`-blind raw-capture backtick mode (phase 1 of
     /// capture→unescape→re-parse). Streams the body verbatim as `BacktickRawText`
     /// atoms framed by `BeginBacktick`…`EndBacktick`; entry is tracked by the
@@ -1985,7 +1997,7 @@ impl<'a> Lexer<'a> {
         // collected within the comsub was already removed from the queue, so this
         // only re-homes genuinely-orphaned entries. Not a forward scan: no cursor
         // movement, just a depth re-tag on the existing FIFO.
-        if matches!(popped, Mode::CommandSub | Mode::BacktickRaw) {
+        if matches!(popped, Mode::CommandSub { .. } | Mode::BacktickRaw) {
             let new_depth = self.mode_depth();
             let mut changed = false;
             for ph in self.atom_pending_heredocs.iter_mut() {
@@ -2173,7 +2185,7 @@ impl<'a> Lexer<'a> {
         match mode {
             // `$( … )` / `<( … )` / `( … )` bodies are Command-mode tokens; the
             // parser closes them on `Op(RParen)` (parse_command_sub / subshell).
-            Mode::CommandSub => Some(TokenKind::Op(Operator::RParen)),
+            Mode::CommandSub { .. } => Some(TokenKind::Op(Operator::RParen)),
             Mode::BacktickRaw => Some(TokenKind::EndBacktick),
             // `${ … }` and its operand sub-modes all close on `}` → ParamClose,
             // except a subscript operand `${x[ … ]}` which closes on `]`.
@@ -2246,7 +2258,7 @@ impl<'a> Lexer<'a> {
                 in_dquote,
                 enclosing_dquote,
             } => self.scan_step_param_operand(None, ']', in_dquote, enclosing_dquote, true),
-            Mode::CommandSub => self.scan_step_command_sub(entry),
+            Mode::CommandSub { .. } => self.scan_step_command_sub(entry),
             Mode::BacktickRaw => self.scan_step_backtick_raw(),
             Mode::Arith {
                 paren_depth,
@@ -3193,7 +3205,7 @@ impl<'a> Lexer<'a> {
                             } else {
                                 // `$(cmd)` — emit CmdSubOpen SIGNAL without consuming `$(`.
                                 // Cursor stays at `$` so parse_command_sub (which pushes
-                                // Mode::CommandSub) can own consuming `$(` via
+                                // Mode::CommandSub { from_arith_reread: false }) can own consuming `$(` via
                                 // scan_step_command_sub(false).
                                 self.history
                                     .push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
@@ -3838,6 +3850,16 @@ impl<'a> Lexer<'a> {
                     // `$(` + a subshell `(`. Clear the one-shot flag; the second `(`
                     // stays unconsumed (cursor is on it) and lexes as the subshell
                     // opener in the body.
+                    //
+                    // #629: this is the ONLY place that knows the frame is a command
+                    // substitution by re-read rather than by spelling, so it is where
+                    // the frame gets marked. bash never re-reads, so an EOF here
+                    // still names the `$((` and its opening line.
+                    if self.retokenize_arith_as_cmdsub
+                        && let Some(Mode::CommandSub { from_arith_reread }) = self.mode_last_mut()
+                    {
+                        *from_arith_reread = true;
+                    }
                     self.retokenize_arith_as_cmdsub = false;
                 }
                 Some('(') => {
@@ -5082,7 +5104,7 @@ impl<'a> Lexer<'a> {
             .and_then(|i| self.modes.get(i))
             .map(|f| f.mode)
         {
-            Some(Mode::CommandSub) | Some(Mode::BacktickRaw) => {}
+            Some(Mode::CommandSub { .. }) | Some(Mode::BacktickRaw) => {}
             _ => return None,
         }
         let mut probe = self.cursor.clone();
@@ -8263,9 +8285,21 @@ mod tests {
                 delim: ArithDelim::Paren
             }
         );
-        lx.push_mode(Mode::CommandSub);
-        assert_eq!(lx.current_mode(), Mode::CommandSub);
-        assert_eq!(lx.pop_mode(), Mode::CommandSub);
+        lx.push_mode(Mode::CommandSub {
+            from_arith_reread: false,
+        });
+        assert_eq!(
+            lx.current_mode(),
+            Mode::CommandSub {
+                from_arith_reread: false
+            }
+        );
+        assert_eq!(
+            lx.pop_mode(),
+            Mode::CommandSub {
+                from_arith_reread: false
+            }
+        );
         assert_eq!(
             lx.pop_mode(),
             Mode::Arith {
@@ -9975,8 +10009,15 @@ mod array_parse_tests {
             delim: ArithDelim::Paren,
         });
         let m = lx.mark();
-        lx.push_mode(Mode::CommandSub);
-        assert_eq!(lx.current_mode(), Mode::CommandSub);
+        lx.push_mode(Mode::CommandSub {
+            from_arith_reread: false,
+        });
+        assert_eq!(
+            lx.current_mode(),
+            Mode::CommandSub {
+                from_arith_reread: false
+            }
+        );
         lx.rewind(&m);
         assert_eq!(
             lx.current_mode(),

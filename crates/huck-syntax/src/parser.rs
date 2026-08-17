@@ -1663,7 +1663,9 @@ fn zero_lines_in_simple(sc: &mut SimpleCommand) {
 /// closing `)` token.
 pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
     // 1. Push the mode and pull the opening atom.
-    iter.push_mode(Mode::CommandSub);
+    iter.push_mode(Mode::CommandSub {
+        from_arith_reread: false,
+    });
     match iter.next_kind()? {
         Some(TokenKind::DeferredExpansion) => {
             // `$((` — arithmetic; defer to runtime.
@@ -1694,8 +1696,13 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
     // parse_subshell's guard (~4664) so the REPL/stdin reader keeps reading.
     if iter.peek_kind()?.is_none() {
         let pos = iter.cursor_pos();
-        iter.pop_mode();
-        return Err(unterminated_cmdsub(pos));
+        let reread = matches!(
+            iter.pop_mode(),
+            Mode::CommandSub {
+                from_arith_reread: true
+            }
+        );
+        return Err(unterminated_cmdsub(pos, reread));
     }
     let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
         // Empty (or whitespace/newline-only) body `$()`/`$( )`/`$(\n)` —
@@ -1736,10 +1743,16 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
                 // verified against real bash 5.2.21. Re-map here, in the ONE
                 // caller that knows it's the `$(` context.
                 let pos = iter.cursor_pos();
-                iter.pop_mode();
+                // Read the frame AS it is popped — after this the marker is gone.
+                let reread = matches!(
+                    iter.pop_mode(),
+                    Mode::CommandSub {
+                        from_arith_reread: true
+                    }
+                );
                 let mapped = match e {
                     ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
-                    ParseError::UnterminatedSubshell => unterminated_cmdsub(pos),
+                    ParseError::UnterminatedSubshell => unterminated_cmdsub(pos, reread),
                     // #492: mark a body error so the engine can tell it from an
                     // ordinary top-level one — `bash -c` exits 127 for the
                     // first and 2 for the second. The marker is transparent to
@@ -1777,10 +1790,18 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
 /// at `parse_command_sub`'s two call sites, which both hit real EOF via the
 /// shared `parse_subshell_sequence`/whitespace-only-body checks that can't
 /// tell a `$(` apart from a bare `(`).
-fn unterminated_cmdsub(pos: usize) -> ParseError {
+/// `from_arith_reread` — the frame was a command substitution only because huck
+/// re-read a `$((` as one (#629). bash never re-reads, so its EOF still names the
+/// `$((`; naming `DollarDParen` here is what carries that, because the LINE rule
+/// is keyed on the delimiter (`$(` reports the EOF line, `$((` the opening one).
+fn unterminated_cmdsub(pos: usize, from_arith_reread: bool) -> ParseError {
     ParseError::Unexpected(ExpectFailure {
         found: Found::Eof,
-        matching: Some(Delim::DollarParen),
+        matching: Some(if from_arith_reread {
+            Delim::DollarDParen
+        } else {
+            Delim::DollarParen
+        }),
         pos,
     })
 }
@@ -1803,7 +1824,9 @@ fn unterminated_backtick(pos: usize) -> ParseError {
 /// path; the word-mode `ProcSubOpen` signal was already consumed by the caller).
 /// `dir` comes from that signal.
 pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPart, ParseError> {
-    iter.push_mode(Mode::CommandSub);
+    iter.push_mode(Mode::CommandSub {
+        from_arith_reread: false,
+    });
     match iter.next_kind()? {
         Some(TokenKind::CmdSubOpen) => {} // the real opener, scanned under CommandSub mode
         _ => {
@@ -1832,8 +1855,13 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
     // uses) rather than the raw `UnterminatedSubshell`.
     if iter.peek_kind()?.is_none() {
         let pos = iter.cursor_pos();
-        iter.pop_mode();
-        return Err(unterminated_cmdsub(pos));
+        let reread = matches!(
+            iter.pop_mode(),
+            Mode::CommandSub {
+                from_arith_reread: true
+            }
+        );
+        return Err(unterminated_cmdsub(pos, reread));
     }
     let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
         iter.next_kind()?; // consume `)`
@@ -1857,10 +1885,16 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
                 // process-sub `<( … `/`>( … ` from a real subshell `( … `, but
                 // bash reports the two differently at EOF.
                 let pos = iter.cursor_pos();
-                iter.pop_mode();
+                // Read the frame AS it is popped — after this the marker is gone.
+                let reread = matches!(
+                    iter.pop_mode(),
+                    Mode::CommandSub {
+                        from_arith_reread: true
+                    }
+                );
                 let mapped = match e {
                     ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
-                    ParseError::UnterminatedSubshell => unterminated_cmdsub(pos),
+                    ParseError::UnterminatedSubshell => unterminated_cmdsub(pos, reread),
                     // #492: mark a body error so the engine can tell it from an
                     // ordinary top-level one — `bash -c` exits 127 for the
                     // first and 2 for the second. The marker is transparent to

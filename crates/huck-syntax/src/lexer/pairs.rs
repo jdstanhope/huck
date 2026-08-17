@@ -186,7 +186,14 @@ fn pair_delim(mode: &Mode) -> Option<Delim> {
         Mode::DoubleQuote => Some(Delim::DQuote),
         Mode::BacktickRaw => Some(Delim::Backtick),
         Mode::ParamExpansion { .. } => Some(Delim::DollarBrace),
-        Mode::CommandSub => Some(Delim::DollarParen),
+        // A frame marked `from_arith_reread` names the `$((` it really came
+        // from, which is also how it inherits the opening-line rule (#629).
+        Mode::CommandSub {
+            from_arith_reread: true,
+        } => Some(Delim::DollarDParen),
+        Mode::CommandSub {
+            from_arith_reread: false,
+        } => Some(Delim::DollarParen),
         Mode::Arith { delim, .. } => Some(match delim {
             super::ArithDelim::Paren => Delim::DollarDParen,
             super::ArithDelim::Bracket => Delim::DollarBracket,
@@ -238,9 +245,35 @@ mod tests {
         let frames = [
             floor(),
             frame(Mode::DoubleQuote, 5),
-            frame(Mode::CommandSub, 9),
+            frame(
+                Mode::CommandSub {
+                    from_arith_reread: false,
+                },
+                9,
+            ),
         ];
         assert_eq!(reported_pair(&frames), Some((Delim::DollarParen, 9)));
+    }
+
+    #[test]
+    fn a_re_read_command_sub_names_the_arith_it_came_from() {
+        // #629. `DollarDParen` rather than `DollarParen` is not cosmetic — the two
+        // spell the same `)` and take DIFFERENT line rules, and this frame wants
+        // the arithmetic's (report where it opened, not where input ran out).
+        //
+        // Reached, and it was worth checking rather than assuming: arming this arm
+        // as `unreachable!()` and running the probes found `echo $((1+2) 'abc` —
+        // an atom-scanned quote inside the re-read body — hits it.
+        let frames = [
+            floor(),
+            frame(
+                Mode::CommandSub {
+                    from_arith_reread: true,
+                },
+                5,
+            ),
+        ];
+        assert_eq!(reported_pair(&frames), Some((Delim::DollarDParen, 5)));
     }
 
     #[test]
@@ -436,7 +469,12 @@ mod tests {
         let frames = [
             floor(),
             frame(arith(false, false, None), 5),
-            frame(Mode::CommandSub, 8),
+            frame(
+                Mode::CommandSub {
+                    from_arith_reread: false,
+                },
+                8,
+            ),
             param(15),
         ];
         assert_eq!(reported_pair(&frames), Some((Delim::DollarBrace, 15)));
