@@ -1,3 +1,4 @@
+pub(crate) mod pairs;
 pub(crate) mod state;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1378,13 +1379,11 @@ pub struct Lexer<'a> {
     /// Where the delimiter that was open when the last lex error was raised
     /// started — recorded at raise time, before the parser unwinds its frames.
     err_open_off: Option<usize>,
-    /// A raise site's own answer for `err_open_off`, overriding the innermost
-    /// frame's opening offset. Set immediately before returning `Err` by a
-    /// scanner that tracks an inner delimiter WITHOUT a mode frame of its own —
-    /// a quote span inside an arith body, whose opening line is the one bash
-    /// names (#621) even though the innermost frame is the `$((`. Consumed
-    /// (taken) by `scan_step_guarded` on the way out, so it never goes stale.
-    err_open_hint: Option<usize>,
+    /// The delimiter the innermost open pair would name, recorded at raise time
+    /// beside `err_open_off` (#643). `None` when no open frame is a pair — a
+    /// top-level `'…'` run is one atom with no frame, and the renderer then falls
+    /// back to the error variant.
+    err_open_delim: Option<crate::command::Delim>,
     token_start_line: u32,
     dbracket_depth: u32,
     /// v250: the atom path's heredoc queue. (It was once one of two — a legacy
@@ -1544,7 +1543,7 @@ impl<'a> Lexer<'a> {
                 entry: Entry::Body,
             }],
             err_open_off: None,
-            err_open_hint: None,
+            err_open_delim: None,
             retokenize_arith_as_cmdsub: false,
             cmd_pos: state::CommandPos::default(),
             pending_lvalue_subscript: false,
@@ -2302,15 +2301,41 @@ impl<'a> Lexer<'a> {
         let step = match self.scan_step() {
             Ok(st) => st,
             Err(e) => {
-                // A raise site that tracks a frame-less inner delimiter itself (a
-                // quote span inside an arith body, #621) leaves the offset here;
-                // take it in preference to the frame's, and only fall back to the
-                // frame when it did not.
-                self.err_open_off = self.err_open_hint.take().or(Some(if self.mode_depth() > 1 {
-                    self.modes.last().map_or(0, |f| f.open_off)
+                // v362 (#643): the frame stack decides which delimiter an EOF
+                // names and where. `err_open_hint` is gone — the arith quote span
+                // it used to ferry is read off the frame by the walk instead.
+                //
+                // When the walk finds no pair, the fallback reproduces what huck
+                // answered BEFORE rather than the more obvious "the failing atom
+                // reports itself": inside a non-pair frame (an array literal, a
+                // regex) a `'` run is still reported at the FRAME's offset. bash
+                // reports the quote's, so that is a divergence — but it belongs to
+                // #644's family (a span with nowhere to record its opener), not to
+                // this task, which must be provably inert. No matrix cell can see
+                // the difference: every cell is a single line.
+                let walked = pairs::reported_pair(&self.modes);
+                // An unterminated quote that NO frame carries is an ATOM-scanned
+                // run (`echo $('`): the quote itself is the innermost pair, and
+                // the error variant already names it. Naming the frame around it
+                // instead regresses every such cell, so leave those to the variant.
+                let atom_scanned_quote = matches!(e, LexError::UnterminatedQuote { .. })
+                    && !matches!(
+                        walked,
+                        Some((
+                            crate::command::Delim::SQuote | crate::command::Delim::DQuote,
+                            _
+                        ))
+                    );
+                self.err_open_delim = if atom_scanned_quote {
+                    None
                 } else {
-                    self.last_step_start
-                }));
+                    walked.map(|(d, _)| d)
+                };
+                self.err_open_off = Some(match walked {
+                    Some((_, off)) if !atom_scanned_quote => off,
+                    _ if self.mode_depth() > 1 => self.modes.last().map_or(0, |f| f.open_off),
+                    _ => self.last_step_start,
+                });
                 return Err(e);
             }
         };
@@ -4074,7 +4099,8 @@ impl<'a> Lexer<'a> {
                         // wins even for `echo "$(( 1+'`, whose frame starts OUTSIDE the
                         // word's own `"` (every push site seeds `in_dquote: false`) and
                         // which bash reports as `'`.
-                        self.err_open_hint = quote_off;
+                        // The frame carries `quote_open_off`, which the reported-pair
+                        // walk reads directly (#643) — no side channel needed.
                         return Err(LexError::UnterminatedQuote { double: !squote });
                     }
                     if !text.is_empty() {
@@ -6903,6 +6929,13 @@ impl<'a> Lexer<'a> {
     /// recorded at raise time rather than read from the live stack.
     pub fn error_open_start(&self) -> Option<usize> {
         self.err_open_off
+    }
+
+    /// The delimiter the innermost open pair would name for the last lex error
+    /// (#643), or `None` if no open frame was a pair. The renderer prefers this
+    /// over the error variant, which cannot tell `$((1+${x` from `echo ${x`.
+    pub fn error_delim(&self) -> Option<crate::command::Delim> {
+        self.err_open_delim
     }
 
     pub fn cursor_pos(&self) -> usize {

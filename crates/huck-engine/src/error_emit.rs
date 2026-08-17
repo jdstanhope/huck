@@ -145,7 +145,13 @@ pub(crate) fn emit_syntax_error_ex(
 /// substitution: line N:` marker. `$()` bodies parse at the top level (not
 /// through this nested-reparse path), so they keep the `-c:`/script-name
 /// prefix — matching bash.
-pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_line: u32) {
+pub fn render_syntax_diag(
+    shell: &Shell,
+    err: &ParseError,
+    source: &str,
+    token_line: u32,
+    reported: Option<Delim>,
+) {
     // `token_line` is already offset by `shell.line_base()` (v315, #209: the
     // outer line an `eval` sits on) for DISPLAY purposes, but `source` here is
     // always the LOCAL text being parsed (e.g. the eval string alone) — so
@@ -166,6 +172,7 @@ pub fn render_syntax_diag(shell: &Shell, err: &ParseError, source: &str, token_l
         token_line.saturating_sub(base),
         marker,
         line_base,
+        reported,
     );
 }
 
@@ -182,6 +189,11 @@ fn render_diag_inner(
     local_line: u32,
     marker: Marker,
     line_base: u32,
+    // v362 (#643): the delimiter the innermost open PAIR would name, from the
+    // lexer's frame stack. The error variant still decides the message SHAPE;
+    // this decides which delimiter a Shape 3 message names, because the variant
+    // cannot tell `$((1+${x` (bash: `)`) from `echo ${x` (bash: `}`).
+    reported: Option<Delim>,
 ) {
     let display_line = line_base + local_line;
     // bash's EOF line counter is "one past the last line read", regardless
@@ -251,7 +263,18 @@ fn render_diag_inner(
             );
         }
         ParseError::Lex(le) => match lex_is_shape3(le) {
-            Some(d) => emit_matching(shell, d, source, local_line, marker, line_base),
+            // The variant answers WHETHER this is an open-delimiter EOF; the
+            // reported pair answers WHICH delimiter. Falling back to the variant
+            // covers the case where no open frame was a pair — a top-level `'…'`
+            // run is one atom with no frame.
+            Some(d) => emit_matching(
+                shell,
+                reported.unwrap_or(d),
+                source,
+                local_line,
+                marker,
+                line_base,
+            ),
             None => {
                 emit_syntax_error_ex(
                     shell,
@@ -305,6 +328,9 @@ fn render_diag_inner(
                 body_local,
                 Marker::CommandSub,
                 comsub_base,
+                // The nested body was re-lexed by its own sub-lexer, so the OUTER
+                // walk's answer does not describe it; the variant answers here.
+                None,
             );
         }
         // #492: a `$( )` body error is rendered exactly as if unwrapped —
@@ -312,7 +338,9 @@ fn render_diag_inner(
         // prints. The wrapper exists only to carry the fatality (exit 127
         // under `-c`), not to change a byte of the diagnostic.
         ParseError::InDollarCommandSub(inner) => {
-            render_diag_inner(shell, inner, source, local_line, marker, line_base);
+            render_diag_inner(
+                shell, inner, source, local_line, marker, line_base, reported,
+            );
         }
         // Fallback: keep the descriptive message (unmigrated / non-top-level).
         other => {
@@ -460,7 +488,7 @@ pub fn render_incomplete_input_diag(shell: &Shell, buffer: &str) -> bool {
     // earlier commands consumed.
     let line =
         shell.line_base() + huck_syntax::lexer::line_at_offset(buffer, off.min(buffer.len()));
-    render_syntax_diag(shell, &err, buffer, line);
+    render_syntax_diag(shell, &err, buffer, line, lx.error_delim());
     true
 }
 
@@ -656,7 +684,7 @@ mod tests {
             pos: 5,
         });
         let buf = capture_err_diag(|| {
-            render_syntax_diag(&sh, &e, "echo )", 1);
+            render_syntax_diag(&sh, &e, "echo )", 1, None);
         });
         assert_eq!(
             buf,
@@ -672,7 +700,7 @@ mod tests {
 
         let sh = shape_test_shell();
         let buf = capture_err_diag(|| {
-            render_syntax_diag(&sh, &ParseError::UnterminatedIf, "if true", 1);
+            render_syntax_diag(&sh, &ParseError::UnterminatedIf, "if true", 1, None);
         });
         assert_eq!(
             buf,
@@ -688,7 +716,7 @@ mod tests {
         let sh = shape_test_shell();
         let e = ParseError::Lex(Box::new(LexError::UnterminatedQuote { double: true }));
         let buf = capture_err_diag(|| {
-            render_syntax_diag(&sh, &e, "echo \"hi", 1);
+            render_syntax_diag(&sh, &e, "echo \"hi", 1, None);
         });
         assert_eq!(
             buf,
@@ -704,7 +732,7 @@ mod tests {
         let sh = shape_test_shell();
         let e = ParseError::Lex(Box::new(LexError::UnterminatedQuote { double: false }));
         let buf = capture_err_diag(|| {
-            render_syntax_diag(&sh, &e, "echo 'hi", 1);
+            render_syntax_diag(&sh, &e, "echo 'hi", 1, None);
         });
         // Verified against real bash 5.2.21: `bash -c "echo 'hi"` →
         // `unexpected EOF while looking for matching `'''` (the SQuote
@@ -728,7 +756,7 @@ mod tests {
             pos: 9,
         });
         let buf = capture_err_diag(|| {
-            render_syntax_diag(&sh, &e, "echo `foo", 1);
+            render_syntax_diag(&sh, &e, "echo `foo", 1, None);
         });
         // Verified against real bash 5.2.21: `bash -c 'echo `foo'` →
         // `unexpected EOF while looking for matching ```'`.

@@ -552,7 +552,7 @@ fn process_line_in_sinks_ex(
                     .iter()
                     .filter(|&&b| b == b'\n')
                     .count() as u32;
-            crate::render_syntax_diag(shell, &e, line, ln);
+            crate::render_syntax_diag(shell, &e, line, ln, lx.error_delim());
             // #284: a non-interactive piped-stdin session aborts the rest of the
             // input on a syntax error, like a script file (bash). Signal the REPL
             // via the pending-fatal-status channel it already drains for fatal
