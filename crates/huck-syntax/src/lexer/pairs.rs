@@ -26,6 +26,30 @@
 use super::{Mode, ModeFrame};
 use crate::command::Delim;
 
+/// What a lex error's raise site saw on the frame stack — captured there because
+/// the parser unwinds its frames before any of it is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ErrorSite {
+    /// The byte offset to report the error at.
+    pub off: usize,
+    /// The pair to name, or `None` to let the error variant name itself.
+    pub delim: Option<Delim>,
+    /// Whether a compound assignment (`v=(`, `declare -a v=(`) was open. bash
+    /// exits **1** for any syntax error raised inside one and 2 everywhere else
+    /// (#633), so this rides along with the pair rather than being recomputed
+    /// from frames that no longer exist.
+    pub in_compound_assign: bool,
+}
+
+/// Was a compound assignment open? Not "is the innermost pair one" — bash exits
+/// 1 for `v=('abc` and `v=(${x`, where the pair NAMED is the quote or the brace,
+/// so this asks about the whole stack.
+pub(crate) fn in_compound_assign(frames: &[ModeFrame]) -> bool {
+    frames
+        .iter()
+        .any(|f| matches!(f.mode, Mode::ArrayLiteral { .. }))
+}
+
 /// The delimiter an EOF should name right now, and the byte offset to report it
 /// at. `None` means no open frame is a reportable pair, in which case the failing
 /// atom reports itself — a top-level `'…'` run is scanned as one atom with no
@@ -155,8 +179,6 @@ fn open_quote_span(frame: &ModeFrame) -> Option<(Delim, usize)> {
 ///
 ///   * the operand and subscript modes are interior to a `${…}` that is already
 ///     on the stack — bash names the `${`;
-///   * `ArrayLiteral` IS a pair in bash (`v=(` names `)`) but not yet here: it
-///     changes message shape and exit status, which is #633's own step;
 ///   * `Regex` and `Extglob` are not EOF-reportable shapes;
 ///   * `Command` is the floor.
 fn pair_delim(mode: &Mode) -> Option<Delim> {
@@ -169,12 +191,15 @@ fn pair_delim(mode: &Mode) -> Option<Delim> {
             super::ArithDelim::Paren => Delim::DollarDParen,
             super::ArithDelim::Bracket => Delim::DollarBracket,
         }),
+        // `Delim::ArrayParen`, not `Delim::Paren`: a compound assignment's `(`
+        // is reported at the line it OPENED on, where a subshell's is reported
+        // at the EOF line (#633).
+        Mode::ArrayLiteral { .. } => Some(Delim::ArrayParen),
         Mode::Command
         | Mode::ParamWordOperand { .. }
         | Mode::ParamSubstPatternOperand { .. }
         | Mode::ParamSubstringOffsetOperand { .. }
         | Mode::ParamSubscriptOperand { .. }
-        | Mode::ArrayLiteral { .. }
         | Mode::Regex { .. }
         | Mode::Extglob { .. } => None,
     }
@@ -291,9 +316,9 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_that_is_not_a_pair_is_skipped_entirely() {
-        // `v=(` is a pair in bash but not yet here (#633), and a regex is not an
-        // EOF-reportable shape at all — both fall through to the floor.
+    fn an_array_literal_names_its_own_paren() {
+        // `v=(a` — `Delim::ArrayParen`, which spells `)` like `Delim::Paren` but
+        // is Shape 3 and reports the OPENING line (#633).
         let frames = [
             floor(),
             frame(
@@ -302,11 +327,16 @@ mod tests {
                     at_element_start: true,
                     subscript_append: false,
                 },
-                3,
+                2,
             ),
         ];
-        assert_eq!(reported_pair(&frames), None);
+        assert_eq!(reported_pair(&frames), Some((Delim::ArrayParen, 2)));
+    }
 
+    #[test]
+    fn a_frame_that_is_not_a_pair_is_skipped_entirely() {
+        // A regex is not an EOF-reportable shape at all, so it falls through to
+        // the floor.
         let frames = [
             floor(),
             frame(

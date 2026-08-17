@@ -425,9 +425,14 @@ fn source_logical_line(source: &str, line: u32) -> String {
 }
 
 /// True for delimiters bash reports as `unexpected EOF while looking for
-/// matching `X'` (Shape 3: quotes, backtick, `$(`, `$((`, `${`, `[[`).
-/// False for `Paren`/`Brace` — those are keyword/subshell constructs bash
-/// reports as the generic `unexpected end of file` (Shape 2) instead.
+/// matching `X'` (Shape 3: quotes, backtick, `$(`, `$((`, `${`, `[[`, and a
+/// compound assignment's `(`). False for `Paren`/`Brace` — those are
+/// keyword/subshell constructs bash reports as the generic `unexpected end of
+/// file` (Shape 2) instead.
+///
+/// `Paren` and `ArrayParen` are the sharpest case, and the reason they are
+/// separate variants: both spell `)`, and bash puts them on OPPOSITE sides of
+/// this test. `( echo hi` is Shape 2; `v=(a` is Shape 3 (#633).
 fn is_matching_delim(d: Delim) -> bool {
     !matches!(d, Delim::Paren | Delim::Brace)
 }
@@ -450,6 +455,10 @@ fn lex_is_shape3(le: &huck_syntax::lexer::LexError) -> Option<Delim> {
         // #618: `$[ 1+` is closed by `]`, not `))`.
         LexError::UnterminatedLegacyArith => Some(Delim::DollarBracket),
         LexError::UnterminatedBrace => Some(Delim::DollarBrace),
+        // #633: a compound assignment's `(` is Shape 3, unlike the subshell `(`
+        // it shares a spelling with. The variant keeps its identity so
+        // `is_unterminated_lex` still asks the REPL for a continuation line.
+        LexError::UnterminatedArrayLiteral => Some(Delim::ArrayParen),
         _ => None,
     }
 }
@@ -468,9 +477,14 @@ fn lex_is_shape3(le: &huck_syntax::lexer::LexError) -> Option<Delim> {
 ///
 /// The quote family is reported at the line the delimiter OPENED on, which is
 /// why the line comes from the lexer's `error_open_start` rather than from the
-/// buffer's length. Returns false when the buffer parses cleanly after all (no
-/// diagnostic emitted) so the caller can fall back.
-pub fn render_incomplete_input_diag(shell: &Shell, buffer: &str) -> bool {
+/// buffer's length.
+///
+/// Returns the status to exit with, or `None` when the buffer parses cleanly
+/// after all (nothing emitted) so the caller can fall back. The status rides
+/// along with the render rather than being decided again by the caller: it is
+/// 2 for an ordinary syntax error but **1** when a compound assignment was open
+/// (#633), and only this function has the lexer that knows which.
+pub fn render_incomplete_input_diag(shell: &Shell, buffer: &str) -> Option<i32> {
     let mut lx = huck_syntax::lexer::Lexer::new(
         buffer,
         &Default::default(),
@@ -478,7 +492,7 @@ pub fn render_incomplete_input_diag(shell: &Shell, buffer: &str) -> bool {
     );
     let err = match huck_syntax::parser::parse_sequence(&mut lx) {
         Err(e) => e,
-        Ok(_) => return false,
+        Ok(_) => return None,
     };
     let off = lx
         .error_open_start()
@@ -489,7 +503,7 @@ pub fn render_incomplete_input_diag(shell: &Shell, buffer: &str) -> bool {
     let line =
         shell.line_base() + huck_syntax::lexer::line_at_offset(buffer, off.min(buffer.len()));
     render_syntax_diag(shell, &err, buffer, line, lx.error_delim());
-    true
+    Some(if lx.error_in_compound_assign() { 1 } else { 2 })
 }
 
 /// True for a lex error bash reports as `unexpected EOF while looking for

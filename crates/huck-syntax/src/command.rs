@@ -792,6 +792,14 @@ pub enum Delim {
     /// `$[` — bash's deprecated arithmetic form, closed by `]` rather than the
     /// `))` its `$((` synonym takes (#618).
     DollarBracket,
+    /// The `(` of a compound assignment — `v=(`, `v+=(`, `declare -a v=(`.
+    ///
+    /// Spelled `)` exactly like [`Delim::Paren`], and separate from it because
+    /// the two report DIFFERENTLY (#633). A subshell `( echo hi` is bash's
+    /// generic `syntax error: unexpected end of file` at the EOF line; an
+    /// unterminated array literal is `unexpected EOF while looking for matching
+    /// `)'` at the line the `(` opened on, and exits 1 rather than 2.
+    ArrayParen,
 }
 
 /// v314 (#211): captures the context of a parse expectation failure —

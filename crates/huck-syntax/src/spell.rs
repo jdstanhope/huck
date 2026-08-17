@@ -64,7 +64,7 @@ fn reserved_or_word(w: &Word) -> String {
 pub fn spell_delim(d: crate::command::Delim) -> char {
     use crate::command::Delim::*;
     match d {
-        Paren | DollarParen | DollarDParen => ')',
+        Paren | DollarParen | DollarDParen | ArrayParen => ')',
         Brace | DollarBrace => '}',
         DQuote => '"',
         SQuote => '\'',

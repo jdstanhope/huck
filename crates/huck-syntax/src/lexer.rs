@@ -1373,17 +1373,12 @@ pub struct Lexer<'a> {
     /// Byte offset the most recent scan step began at (#385) — see
     /// `last_step_start()`.
     last_step_start: usize,
-    /// Parallel to `modes`: the cursor offset each frame was pushed at, so an
-    /// EOF inside an open delimiter can name the line the delimiter OPENED on
-    /// (#385). The floor entry is 0.
-    /// Where the delimiter that was open when the last lex error was raised
-    /// started — recorded at raise time, before the parser unwinds its frames.
-    err_open_off: Option<usize>,
-    /// The delimiter the innermost open pair would name, recorded at raise time
-    /// beside `err_open_off` (#643). `None` when no open frame is a pair — a
-    /// top-level `'…'` run is one atom with no frame, and the renderer then falls
-    /// back to the error variant.
-    err_open_delim: Option<crate::command::Delim>,
+    /// Everything the last lex error's raise site observed about the open pairs,
+    /// captured before the parser unwinds its frames. ONE field rather than three
+    /// written side by side (#641 rule 3): they are read together, they are
+    /// meaningless apart, and a raise site that set two of the three would be a
+    /// silent bug.
+    err_site: Option<pairs::ErrorSite>,
     token_start_line: u32,
     dbracket_depth: u32,
     /// v250: the atom path's heredoc queue. (It was once one of two — a legacy
@@ -1542,8 +1537,7 @@ impl<'a> Lexer<'a> {
                 open_off: 0,
                 entry: Entry::Body,
             }],
-            err_open_off: None,
-            err_open_delim: None,
+            err_site: None,
             retokenize_arith_as_cmdsub: false,
             cmd_pos: state::CommandPos::default(),
             pending_lvalue_subscript: false,
@@ -2326,15 +2320,18 @@ impl<'a> Lexer<'a> {
                             _
                         ))
                     );
-                self.err_open_delim = if atom_scanned_quote {
-                    None
-                } else {
-                    walked.map(|(d, _)| d)
-                };
-                self.err_open_off = Some(match walked {
-                    Some((_, off)) if !atom_scanned_quote => off,
-                    _ if self.mode_depth() > 1 => self.modes.last().map_or(0, |f| f.open_off),
-                    _ => self.last_step_start,
+                self.err_site = Some(pairs::ErrorSite {
+                    off: match walked {
+                        Some((_, off)) if !atom_scanned_quote => off,
+                        _ if self.mode_depth() > 1 => self.modes.last().map_or(0, |f| f.open_off),
+                        _ => self.last_step_start,
+                    },
+                    delim: if atom_scanned_quote {
+                        None
+                    } else {
+                        walked.map(|(d, _)| d)
+                    },
+                    in_compound_assign: pairs::in_compound_assign(&self.modes),
                 });
                 return Err(e);
             }
@@ -6928,14 +6925,21 @@ impl<'a> Lexer<'a> {
     /// unwound its frames by the time a driver renders the error — so this is
     /// recorded at raise time rather than read from the live stack.
     pub fn error_open_start(&self) -> Option<usize> {
-        self.err_open_off
+        self.err_site.map(|s| s.off)
     }
 
     /// The delimiter the innermost open pair would name for the last lex error
     /// (#643), or `None` if no open frame was a pair. The renderer prefers this
     /// over the error variant, which cannot tell `$((1+${x` from `echo ${x`.
     pub fn error_delim(&self) -> Option<crate::command::Delim> {
-        self.err_open_delim
+        self.err_site.and_then(|s| s.delim)
+    }
+
+    /// Was a compound assignment (`v=(`) open when the last lex error was raised?
+    /// bash exits **1** for a syntax error inside one and 2 for every other
+    /// syntax error (#633), so a driver reads this to pick the status.
+    pub fn error_in_compound_assign(&self) -> bool {
+        self.err_site.is_some_and(|s| s.in_compound_assign)
     }
 
     pub fn cursor_pos(&self) -> usize {
