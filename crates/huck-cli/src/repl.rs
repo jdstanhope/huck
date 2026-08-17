@@ -368,18 +368,25 @@ pub fn run(args: &[String], version: &str) -> i32 {
                 // print its own "unexpected end of input", which bash never
                 // says. The fallback stays for a buffer that parses cleanly
                 // (the reader and the parser disagreeing about completeness).
-                if !huck_engine::render_incomplete_input_diag(&shell, &buffer) {
-                    // bash's line count for an EOF-truncated command is the line
-                    // the next (never-arriving) physical line would have been:
-                    // 1 (first line) + newlines already read + 1 (the missing one).
-                    let line = buffer.matches('\n').count() as u32 + 2;
-                    emit_syntax_error(
-                        &shell,
-                        line,
-                        format_args!("syntax error: unexpected end of input"),
-                    );
-                }
-                return shell_exit(&mut shell, 2);
+                // The status comes back with the render — 2 for an ordinary
+                // syntax error, 1 when a compound assignment was open (#633).
+                let code = match huck_engine::render_incomplete_input_diag(&shell, &buffer) {
+                    Some(status) => status,
+                    None => {
+                        // bash's line count for an EOF-truncated command is the
+                        // line the next (never-arriving) physical line would have
+                        // been: 1 (first line) + newlines already read + 1 (the
+                        // missing one).
+                        let line = buffer.matches('\n').count() as u32 + 2;
+                        emit_syntax_error(
+                            &shell,
+                            line,
+                            format_args!("syntax error: unexpected end of input"),
+                        );
+                        2
+                    }
+                };
+                return shell_exit(&mut shell, code);
             }
             ReadResult::ReadError(msg) => {
                 let mut shell = shell_cell.borrow_mut();

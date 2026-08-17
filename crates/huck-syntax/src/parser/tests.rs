@@ -4119,6 +4119,14 @@ fn prune_across_outstanding_arith_mark_does_not_corrupt() {
     // — see `cs_comment_only_body_at_eof_is_unterminated` for the bash-parity
     // rationale (an unterminated `$(` is bash's Shape 3, not Shape 2). The
     // outer construct here IS a `$(`, so the same reclassification applies.
+    //
+    // v362 (#629): and the delimiter is now `DollarDParen`, because this outer
+    // `$(` exists ONLY as huck's re-read of a `$((`. Both spell `)`; they differ
+    // in which line is reported, and bash — which never re-reads — names the
+    // `$((`'s. This assertion pinned the divergence: measured on the minimal
+    // form of this very source, `echo $(( $(echo HI) x)`, bash reports the
+    // opening line and so does huck now. What this test is really guarding is
+    // the prune-under-a-live-mark path, which is unchanged.
     let empty = std::collections::HashMap::new();
     let prefix: String = (0..2000).map(|i| format!("w{i} ")).collect();
     let inner: String = std::iter::repeat_n(":; ", HISTORY_PRUNE_THRESHOLD + 200).collect();
@@ -4130,7 +4138,7 @@ fn prune_across_outstanding_arith_mark_does_not_corrupt() {
             result,
             Err(ParseError::Unexpected(ExpectFailure {
                 found: Found::Eof,
-                matching: Some(Delim::DollarParen),
+                matching: Some(Delim::DollarDParen),
                 ..
             }))
         ),

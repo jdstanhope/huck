@@ -410,6 +410,40 @@ These appear in many call-site signatures; learn them once.
   `(error token is "tok")`), passed as the body to `sh_error!`. The
   `tests/scripts/error_message_diff_check.sh` harness (incl. a `$(err 2>&1)`
   capture matrix) is the objective guard against a mis-routed emitter site.
+- **Which delimiter an unexpected EOF names** — bash has two shapes for input
+  that ends mid-construct, and picks between them by construct:
+  - Shape 3, ``unexpected EOF while looking for matching `X'`` — a quote,
+    backtick, `$(`, `$((`, `$[`, `${`, `[[`, or a compound assignment's `(`;
+  - Shape 2, `syntax error: unexpected end of file` — `if`/`while`/`case`, a
+    `{ }` group, a function body, and a SUBSHELL `(`.
+
+  **The error VARIANT decides the shape; the FRAME STACK decides the delimiter**
+  (v362, #643). `error_emit::lex_is_shape3` answers only "is this an
+  open-delimiter EOF"; `lexer/pairs.rs::reported_pair(&[ModeFrame])` answers
+  which pair to name and at which offset, walking the frames innermost-outward.
+  It needs no storage of its own — v361 put each construct's opening offset on
+  its frame — and the raise site in `scan_step_guarded` captures its answer as a
+  `pairs::ErrorSite` (offset + delimiter + whether a compound assignment was
+  open) because the parser unwinds its frames before a driver renders anything.
+  Read it back through `Lexer::error_open_start`/`error_delim`/
+  `error_in_compound_assign`.
+
+  Three things live in `pairs.rs` that a reader will otherwise try to re-derive:
+  - the **suppression rule** — inside an arithmetic body a `${` or `$[` opens no
+    pair (a `$((` does), a `${…}` is TRANSPARENT to that question, and an OPEN
+    quote or a `$(` resets it (#627);
+  - `Delim::Paren` vs `Delim::ArrayParen` — both spell `)` and sit on OPPOSITE
+    sides of the Shape 2/3 split (#633);
+  - `Mode::CommandSub { from_arith_reread }` — a `$((` that huck re-read as `$(`
+    still names `DollarDParen`, which is how it keeps the opening-line rule,
+    since the LINE rule is keyed on the delimiter (#629).
+
+  A **parser-surfaced** EOF (a backtick, a `$(` body — the parser owns their
+  closing token) records no `ErrorSite`, so it carries neither the offset nor the
+  compound-assignment context: that is #646/#649. The gates are
+  `tests/scripts/eof_delimiter_matrix_diff_check.sh` (813 cells, driving
+  `tools/eof_matrix.sh`) and `eof_pair_lines_diff_check.sh` (which LINE each pair
+  reports, the exit statuses, and the Shape 2 controls).
 
 ### Single-threaded execution (invariant, enforced)
 

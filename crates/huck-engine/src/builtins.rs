@@ -8597,7 +8597,7 @@ fn run_sourced_contents_in_sinks_inner(
                         let line = line_of(start + tok_off) as u32;
                         let fatal = lex_error_is_fatal(&le);
                         let err = crate::command::ParseError::Lex(Box::new(le));
-                        crate::render_syntax_diag(shell, &err, contents, line);
+                        crate::render_syntax_diag(shell, &err, contents, line, iter.error_delim());
                         last_status = 2;
                         if fatal {
                             return ExecOutcome::Continue(2);
@@ -8739,7 +8739,7 @@ fn run_sourced_contents_in_sinks_inner(
                         let line = line_of(start + tok_off) as u32;
                         let fatal = lex_error_is_fatal(&le);
                         let err = crate::command::ParseError::Lex(Box::new(le));
-                        crate::render_syntax_diag(shell, &err, contents, line);
+                        crate::render_syntax_diag(shell, &err, contents, line, iter.error_delim());
                         last_status = 2;
                         if fatal {
                             return ExecOutcome::Continue(2);
@@ -8803,8 +8803,24 @@ fn run_sourced_contents_in_sinks_inner(
                         foff
                     };
                     let line = line_of(start + line_off) as u32;
-                    crate::render_syntax_diag(shell, &e, contents, line);
-                    last_status = 2;
+                    crate::render_syntax_diag(shell, &e, contents, line, iter.error_delim());
+                    // #633: a syntax error raised inside a compound assignment
+                    // (`v=(`) exits 1 where every other syntax error exits 2 —
+                    // measured on `-c`, a script file, `source` and `eval`.
+                    //
+                    // ⚠️ Status only — do NOT route this through `report_error`.
+                    // An ordinary syntax error here deliberately does not, and
+                    // for a reason: the classifier's `ExitShell` unwinds past the
+                    // CALLER, so a `source`d file would kill the whole shell
+                    // instead of ending just that file. Measured — `. ./bad.sh;
+                    // echo OUTER=$?` prints `OUTER=1` in bash, and printed
+                    // nothing at all while this called `report_error` (#340's
+                    // shape).
+                    last_status = if iter.error_in_compound_assign() {
+                        1
+                    } else {
+                        2
+                    };
                     // #492: a syntax error inside a `$( )` body is bash's one
                     // exception to "a syntax error is status 2" — it exits 127
                     // under `-c`, and it is FATAL to the whole shell even from

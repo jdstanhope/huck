@@ -1,3 +1,4 @@
+pub(crate) mod pairs;
 pub(crate) mod state;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1144,8 +1145,20 @@ pub(crate) struct ModeFrame {
 /// iterations and are never the active mode in production yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
-    Command,    // default command-position scanner (emits atoms)
-    CommandSub, // $( … ) / `…`
+    Command, // default command-position scanner (emits atoms)
+    /// `$( … )`.
+    ///
+    /// `from_arith_reread` marks the one frame that is a command substitution
+    /// only because huck RE-READ it as one: `$((1+2)` starts as arithmetic, the
+    /// lexer emits `ArithBail` at the depth-0 `)`, and the parser rewinds and
+    /// re-drives the same text as `$(` + a subshell `(`. bash never re-reads, so
+    /// its EOF still names the `$((` and reports the line the `$((` opened on —
+    /// where an ordinary `$(` is reported at the EOF line (#629). The offset the
+    /// frame carries is already the `$((`'s; only the line RULE differs, and the
+    /// rule is keyed on the `Delim`, so a marked frame names `DollarDParen`.
+    CommandSub {
+        from_arith_reread: bool,
+    },
     /// v274: dumb quote-blind/`$()`-blind raw-capture backtick mode (phase 1 of
     /// capture→unescape→re-parse). Streams the body verbatim as `BacktickRawText`
     /// atoms framed by `BeginBacktick`…`EndBacktick`; entry is tracked by the
@@ -1372,19 +1385,12 @@ pub struct Lexer<'a> {
     /// Byte offset the most recent scan step began at (#385) — see
     /// `last_step_start()`.
     last_step_start: usize,
-    /// Parallel to `modes`: the cursor offset each frame was pushed at, so an
-    /// EOF inside an open delimiter can name the line the delimiter OPENED on
-    /// (#385). The floor entry is 0.
-    /// Where the delimiter that was open when the last lex error was raised
-    /// started — recorded at raise time, before the parser unwinds its frames.
-    err_open_off: Option<usize>,
-    /// A raise site's own answer for `err_open_off`, overriding the innermost
-    /// frame's opening offset. Set immediately before returning `Err` by a
-    /// scanner that tracks an inner delimiter WITHOUT a mode frame of its own —
-    /// a quote span inside an arith body, whose opening line is the one bash
-    /// names (#621) even though the innermost frame is the `$((`. Consumed
-    /// (taken) by `scan_step_guarded` on the way out, so it never goes stale.
-    err_open_hint: Option<usize>,
+    /// Everything the last lex error's raise site observed about the open pairs,
+    /// captured before the parser unwinds its frames. ONE field rather than three
+    /// written side by side (#641 rule 3): they are read together, they are
+    /// meaningless apart, and a raise site that set two of the three would be a
+    /// silent bug.
+    err_site: Option<pairs::ErrorSite>,
     token_start_line: u32,
     dbracket_depth: u32,
     /// v250: the atom path's heredoc queue. (It was once one of two — a legacy
@@ -1543,8 +1549,7 @@ impl<'a> Lexer<'a> {
                 open_off: 0,
                 entry: Entry::Body,
             }],
-            err_open_off: None,
-            err_open_hint: None,
+            err_site: None,
             retokenize_arith_as_cmdsub: false,
             cmd_pos: state::CommandPos::default(),
             pending_lvalue_subscript: false,
@@ -1992,7 +1997,7 @@ impl<'a> Lexer<'a> {
         // collected within the comsub was already removed from the queue, so this
         // only re-homes genuinely-orphaned entries. Not a forward scan: no cursor
         // movement, just a depth re-tag on the existing FIFO.
-        if matches!(popped, Mode::CommandSub | Mode::BacktickRaw) {
+        if matches!(popped, Mode::CommandSub { .. } | Mode::BacktickRaw) {
             let new_depth = self.mode_depth();
             let mut changed = false;
             for ph in self.atom_pending_heredocs.iter_mut() {
@@ -2180,7 +2185,7 @@ impl<'a> Lexer<'a> {
         match mode {
             // `$( … )` / `<( … )` / `( … )` bodies are Command-mode tokens; the
             // parser closes them on `Op(RParen)` (parse_command_sub / subshell).
-            Mode::CommandSub => Some(TokenKind::Op(Operator::RParen)),
+            Mode::CommandSub { .. } => Some(TokenKind::Op(Operator::RParen)),
             Mode::BacktickRaw => Some(TokenKind::EndBacktick),
             // `${ … }` and its operand sub-modes all close on `}` → ParamClose,
             // except a subscript operand `${x[ … ]}` which closes on `]`.
@@ -2253,7 +2258,7 @@ impl<'a> Lexer<'a> {
                 in_dquote,
                 enclosing_dquote,
             } => self.scan_step_param_operand(None, ']', in_dquote, enclosing_dquote, true),
-            Mode::CommandSub => self.scan_step_command_sub(entry),
+            Mode::CommandSub { .. } => self.scan_step_command_sub(entry),
             Mode::BacktickRaw => self.scan_step_backtick_raw(),
             Mode::Arith {
                 paren_depth,
@@ -2302,15 +2307,44 @@ impl<'a> Lexer<'a> {
         let step = match self.scan_step() {
             Ok(st) => st,
             Err(e) => {
-                // A raise site that tracks a frame-less inner delimiter itself (a
-                // quote span inside an arith body, #621) leaves the offset here;
-                // take it in preference to the frame's, and only fall back to the
-                // frame when it did not.
-                self.err_open_off = self.err_open_hint.take().or(Some(if self.mode_depth() > 1 {
-                    self.modes.last().map_or(0, |f| f.open_off)
-                } else {
-                    self.last_step_start
-                }));
+                // v362 (#643): the frame stack decides which delimiter an EOF
+                // names and where. `err_open_hint` is gone — the arith quote span
+                // it used to ferry is read off the frame by the walk instead.
+                //
+                // When the walk finds no pair, the fallback reproduces what huck
+                // answered BEFORE rather than the more obvious "the failing atom
+                // reports itself": inside a non-pair frame (an array literal, a
+                // regex) a `'` run is still reported at the FRAME's offset. bash
+                // reports the quote's, so that is a divergence — but it belongs to
+                // #644's family (a span with nowhere to record its opener), not to
+                // this task, which must be provably inert. No matrix cell can see
+                // the difference: every cell is a single line.
+                let walked = pairs::reported_pair(&self.modes);
+                // An unterminated quote that NO frame carries is an ATOM-scanned
+                // run (`echo $('`): the quote itself is the innermost pair, and
+                // the error variant already names it. Naming the frame around it
+                // instead regresses every such cell, so leave those to the variant.
+                let atom_scanned_quote = matches!(e, LexError::UnterminatedQuote { .. })
+                    && !matches!(
+                        walked,
+                        Some((
+                            crate::command::Delim::SQuote | crate::command::Delim::DQuote,
+                            _
+                        ))
+                    );
+                self.err_site = Some(pairs::ErrorSite {
+                    off: match walked {
+                        Some((_, off)) if !atom_scanned_quote => off,
+                        _ if self.mode_depth() > 1 => self.modes.last().map_or(0, |f| f.open_off),
+                        _ => self.last_step_start,
+                    },
+                    delim: if atom_scanned_quote {
+                        None
+                    } else {
+                        walked.map(|(d, _)| d)
+                    },
+                    in_compound_assign: pairs::in_compound_assign(&self.modes),
+                });
                 return Err(e);
             }
         };
@@ -2515,6 +2549,15 @@ impl<'a> Lexer<'a> {
                         Some('\'') => emit_ext_name!(),
                         // `${$"…"}` — locale quote in name position → bad subst.
                         Some('"') => emit_bad_subst!(),
+                        // `${$(…)}` / `${$((…))}` — #634. A `$(` here is NOT the `$`
+                        // special parameter followed by a stray `(`: it OPENS A PAIR,
+                        // and that pair swallows the `}`. Bad-subst with the cursor
+                        // left ON the `$` so the parser's drive-to-`}` sees `$(` and
+                        // nests it through the operand machinery, which already gets
+                        // this right — `${e:-$(echo x}` names `)` at the EOF line and
+                        // has all along. Consuming the `$` as a name is what made the
+                        // drive start at `(echo x}` and stop at the `}`.
+                        Some('(') => emit_bad_subst!(),
                         // `${$}` / `${$:-x}` / `${$x}` — treat `$` as the name; a
                         // following non-modifier char is bad-subst'd in Phase 2.
                         _ => {
@@ -3171,7 +3214,7 @@ impl<'a> Lexer<'a> {
                             } else {
                                 // `$(cmd)` — emit CmdSubOpen SIGNAL without consuming `$(`.
                                 // Cursor stays at `$` so parse_command_sub (which pushes
-                                // Mode::CommandSub) can own consuming `$(` via
+                                // Mode::CommandSub { from_arith_reread: false }) can own consuming `$(` via
                                 // scan_step_command_sub(false).
                                 self.history
                                     .push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
@@ -3816,6 +3859,16 @@ impl<'a> Lexer<'a> {
                     // `$(` + a subshell `(`. Clear the one-shot flag; the second `(`
                     // stays unconsumed (cursor is on it) and lexes as the subshell
                     // opener in the body.
+                    //
+                    // #629: this is the ONLY place that knows the frame is a command
+                    // substitution by re-read rather than by spelling, so it is where
+                    // the frame gets marked. bash never re-reads, so an EOF here
+                    // still names the `$((` and its opening line.
+                    if self.retokenize_arith_as_cmdsub
+                        && let Some(Mode::CommandSub { from_arith_reread }) = self.mode_last_mut()
+                    {
+                        *from_arith_reread = true;
+                    }
                     self.retokenize_arith_as_cmdsub = false;
                 }
                 Some('(') => {
@@ -4074,7 +4127,8 @@ impl<'a> Lexer<'a> {
                         // wins even for `echo "$(( 1+'`, whose frame starts OUTSIDE the
                         // word's own `"` (every push site seeds `in_dquote: false`) and
                         // which bash reports as `'`.
-                        self.err_open_hint = quote_off;
+                        // The frame carries `quote_open_off`, which the reported-pair
+                        // walk reads directly (#643) — no side channel needed.
                         return Err(LexError::UnterminatedQuote { double: !squote });
                     }
                     if !text.is_empty() {
@@ -5059,7 +5113,7 @@ impl<'a> Lexer<'a> {
             .and_then(|i| self.modes.get(i))
             .map(|f| f.mode)
         {
-            Some(Mode::CommandSub) | Some(Mode::BacktickRaw) => {}
+            Some(Mode::CommandSub { .. }) | Some(Mode::BacktickRaw) => {}
             _ => return None,
         }
         let mut probe = self.cursor.clone();
@@ -6902,7 +6956,21 @@ impl<'a> Lexer<'a> {
     /// unwound its frames by the time a driver renders the error — so this is
     /// recorded at raise time rather than read from the live stack.
     pub fn error_open_start(&self) -> Option<usize> {
-        self.err_open_off
+        self.err_site.map(|s| s.off)
+    }
+
+    /// The delimiter the innermost open pair would name for the last lex error
+    /// (#643), or `None` if no open frame was a pair. The renderer prefers this
+    /// over the error variant, which cannot tell `$((1+${x` from `echo ${x`.
+    pub fn error_delim(&self) -> Option<crate::command::Delim> {
+        self.err_site.and_then(|s| s.delim)
+    }
+
+    /// Was a compound assignment (`v=(`) open when the last lex error was raised?
+    /// bash exits **1** for a syntax error inside one and 2 for every other
+    /// syntax error (#633), so a driver reads this to pick the status.
+    pub fn error_in_compound_assign(&self) -> bool {
+        self.err_site.is_some_and(|s| s.in_compound_assign)
     }
 
     pub fn cursor_pos(&self) -> usize {
@@ -8226,9 +8294,21 @@ mod tests {
                 delim: ArithDelim::Paren
             }
         );
-        lx.push_mode(Mode::CommandSub);
-        assert_eq!(lx.current_mode(), Mode::CommandSub);
-        assert_eq!(lx.pop_mode(), Mode::CommandSub);
+        lx.push_mode(Mode::CommandSub {
+            from_arith_reread: false,
+        });
+        assert_eq!(
+            lx.current_mode(),
+            Mode::CommandSub {
+                from_arith_reread: false
+            }
+        );
+        assert_eq!(
+            lx.pop_mode(),
+            Mode::CommandSub {
+                from_arith_reread: false
+            }
+        );
         assert_eq!(
             lx.pop_mode(),
             Mode::Arith {
@@ -9938,8 +10018,15 @@ mod array_parse_tests {
             delim: ArithDelim::Paren,
         });
         let m = lx.mark();
-        lx.push_mode(Mode::CommandSub);
-        assert_eq!(lx.current_mode(), Mode::CommandSub);
+        lx.push_mode(Mode::CommandSub {
+            from_arith_reread: false,
+        });
+        assert_eq!(
+            lx.current_mode(),
+            Mode::CommandSub {
+                from_arith_reread: false
+            }
+        );
         lx.rewind(&m);
         assert_eq!(
             lx.current_mode(),

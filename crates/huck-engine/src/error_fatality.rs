@@ -77,6 +77,24 @@ pub(crate) enum ErrorKind {
     ComsubSyntax { backtick: bool },
     /// A syntax error in the script itself.
     Syntax,
+    /// A syntax error raised while a COMPOUND ASSIGNMENT was open — `v=(`,
+    /// `v+=(`, `declare -a v=(`.
+    ///
+    /// The same outcome as `Syntax` with a different code, and the code is the
+    /// only thing that differs: bash exits **1** here and 2 for every other
+    /// syntax error, with no `-c` substitution. Measured on all five drivers:
+    ///
+    /// ```text
+    /// script / stdin / -c :  v=(a        -> 1        echo "a      -> 2
+    /// source              :  OUTER=1, caller survives (an ordinary syntax error gives OUTER=2)
+    /// eval                :  AFTER=1                              -> 2
+    /// ```
+    ///
+    /// Keyed on the CONTEXT, not on the error: `v=('abc` names the quote and
+    /// `v=(${x` names the brace, and both still exit 1, while the same two
+    /// errors inside a subshell `(`, a group `{` or a function body exit 2
+    /// (#633).
+    CompoundAssignmentSyntax,
     /// `set -u` on an unset variable, reported from the LENGTH form with a
     /// SUBSCRIPT — `${#nope[0]}`. The same error as `UnsetUnderNounset`
     /// except that bash's `-c` 127 substitution does NOT reach it. Measured:
@@ -241,6 +259,15 @@ pub(crate) fn fatality(kind: ErrorKind, shell: &Shell) -> Fatality {
                 Fatality::Continue
             }
         }
+        // ⚠️ NO driver substitution, and deliberately 1 rather than `Syntax`'s 2.
+        // Measured on script, stdin, `-c`, `source` and `eval` alike.
+        ErrorKind::CompoundAssignmentSyntax => {
+            if can_exit {
+                Fatality::ExitShell(1)
+            } else {
+                Fatality::Continue
+            }
+        }
         ErrorKind::BadSubstAllArgsLength => {
             if can_exit {
                 Fatality::ExitShell(driver_code(1, shell))
@@ -401,6 +428,33 @@ mod tests {
                 &shell_with(false, true)
             ),
             Fatality::ExitShell(127)
+        );
+    }
+
+    #[test]
+    fn a_compound_assignment_syntax_error_is_1_under_every_driver() {
+        // #633. Same outcome as `Syntax`, different code, and NO `-c`
+        // substitution — measured on script, stdin, `-c`, `source` and `eval`:
+        // `v=(a` is 1 where `echo "a` is 2.
+        // posix does not enter into it either, so all four combinations give 1.
+        for posix in [true, false] {
+            for dash_c in [true, false] {
+                assert_eq!(
+                    fatality(
+                        ErrorKind::CompoundAssignmentSyntax,
+                        &shell_with(posix, dash_c)
+                    ),
+                    Fatality::ExitShell(1),
+                    "posix={posix} dash_c={dash_c}"
+                );
+            }
+        }
+        // An interactive shell returns to its prompt, like every other kind.
+        let mut interactive = shell_with(false, false);
+        interactive.is_interactive = true;
+        assert_eq!(
+            fatality(ErrorKind::CompoundAssignmentSyntax, &interactive),
+            Fatality::Continue
         );
     }
 

@@ -552,7 +552,7 @@ fn process_line_in_sinks_ex(
                     .iter()
                     .filter(|&&b| b == b'\n')
                     .count() as u32;
-            crate::render_syntax_diag(shell, &e, line, ln);
+            crate::render_syntax_diag(shell, &e, line, ln, lx.error_delim());
             // #284: a non-interactive piped-stdin session aborts the rest of the
             // input on a syntax error, like a script file (bash). Signal the REPL
             // via the pending-fatal-status channel it already drains for fatal
@@ -582,6 +582,10 @@ fn process_line_in_sinks_ex(
                 shell.report_error(crate::error_fatality::ErrorKind::HeredocLimit);
                 return ExecOutcome::Continue(2);
             }
+            // #633: a syntax error raised inside a compound assignment (`v=(`) is
+            // bash's one syntax error with status 1 instead of 2 — on every
+            // driver, and whatever delimiter ended up being NAMED.
+            let in_compound_assign = lx.error_in_compound_assign();
             if top_level && !shell.is_interactive {
                 let kind = match &e {
                     crate::command::ParseError::InCommandSub { .. } => {
@@ -590,11 +594,14 @@ fn process_line_in_sinks_ex(
                     crate::command::ParseError::InDollarCommandSub(_) => {
                         crate::error_fatality::ErrorKind::ComsubSyntax { backtick: false }
                     }
+                    _ if in_compound_assign => {
+                        crate::error_fatality::ErrorKind::CompoundAssignmentSyntax
+                    }
                     _ => crate::error_fatality::ErrorKind::Syntax,
                 };
                 shell.report_error(kind);
             }
-            ExecOutcome::Continue(2)
+            ExecOutcome::Continue(if in_compound_assign { 1 } else { 2 })
         }
     }
 }

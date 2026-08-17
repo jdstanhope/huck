@@ -1,0 +1,150 @@
+---
+title: "Which bracket did you forget?"
+date: 2026-08-17
+summary: "When a script ends in the middle of something, the shell tells you which bracket it was still waiting for. huck was naming the wrong one in 78 different situations — and sometimes inventing a line number that didn't contain any bracket at all."
+tags: ["diagnostics", "parser", "bash-compat"]
+version: "v362"
+---
+
+Leave a bracket off the end of a script and the shell tells you what it was still
+waiting for:
+
+```bash
+$ cat s.sh
+echo $((1 + ${count
+
+$ bash s.sh
+s.sh: line 1: unexpected EOF while looking for matching `)'
+```
+
+bash says `)` — the arithmetic. Not `}`, even though the `${count` is the thing
+you most obviously left open. That is deliberate: inside `$(( … ))`, a `${` isn't
+treated as an opening bracket at all, so the innermost thing still waiting for a
+partner is the arithmetic's own paren.
+
+huck disagreed:
+
+```bash
+# before
+$ huck s.sh
+s.sh: line 1: unexpected EOF while looking for matching `}'
+```
+
+Which sends you hunting for a missing `}` that isn't the problem.
+
+The underlying reason is worth a sentence, because it explains the whole family
+of bugs. bash answers this question by keeping a stack of brackets it has opened
+and naming the innermost one still on it. huck answered it from whichever piece
+of the scanner happened to notice the end of input first — a different question,
+which sometimes gave the same answer and sometimes didn't. This release replaces
+that with the stack, and 60 of the 78 measured disagreements go away.
+
+## The line number could point at nothing
+
+An unterminated array assignment was worse than a wrong bracket — it reported a
+line that didn't contain any bracket at all:
+
+```bash
+$ cat s.sh
+echo start
+v=(alpha beta
+echo middle
+echo end
+```
+
+```bash
+# before
+start
+s.sh: line 5: syntax error: unterminated array literal '('
+```
+
+Line 5. The file has four lines. And the wording was huck's own invention.
+
+```bash
+# after
+start
+s.sh: line 2: unexpected EOF while looking for matching `)'
+```
+
+Line 2 — where the `(` actually is, which is what bash says.
+
+That one also had a wrong exit status, which matters if a script checks it.
+bash exits **1** for an unterminated assignment and **2** for other syntax
+errors; huck exited 2 for everything. It turns out the rule isn't about the kind
+of error at all — it's about *where* the error happened. Any syntax error inside
+`v=( … )` exits 1, even one about a quote:
+
+```bash
+$ bash -c "v=('abc"; echo "status $?"
+bash: -c: line 1: unexpected EOF while looking for matching `''
+status 1
+```
+
+The same mistake inside a subshell `( … )` exits 2. Two brackets that look
+identical, on opposite sides of the rule.
+
+## A bracket that eats the closing brace
+
+This one is easy to hit and hard to see:
+
+```bash
+$ cat s.sh
+echo ${$(date
+```
+
+```bash
+# before
+s.sh: line 1: unexpected EOF while looking for matching `}'
+# after — and bash
+s.sh: line 2: unexpected EOF while looking for matching `)'
+```
+
+The `$(` opens a command substitution, and a command substitution swallows
+everything up to its own `)` — including a `}` that looks like it should close
+the `${`. So the thing you're actually missing is `)`, on the line where input
+ran out. huck used to close the expansion at the first `}` it saw, which means
+this wasn't only a wrong message: `echo ${$(date}` was accepted where bash
+rejects it.
+
+## Sourcing a broken file no longer takes the shell with it
+
+While fixing the exit status, one draft made a sourced file's failure kill the
+whole shell:
+
+```bash
+$ cat inner.sh
+v=(a
+$ bash -c '. ./inner.sh; echo OUTER=$?'
+inner.sh: line 1: unexpected EOF while looking for matching `)'
+OUTER=1
+```
+
+bash reports the error, gives up on that file, and carries on — the caller still
+prints. huck now does the same (it printed `OUTER=2` before this release, and
+nothing at all in the middle of the work).
+
+## What's still open
+
+Eighteen of the original 78 situations remain, in three groups, and each one has
+its own issue now:
+
+- a `'` inside `${ … }` is a bracket in bash and swallows the `}`, which changes
+  what parses, not just what gets reported —
+  [#631](https://github.com/jdstanhope/huck/issues/631) and
+  [#640](https://github.com/jdstanhope/huck/issues/640);
+- `${${x}}` isn't implemented in huck at all, so there is no bracket to name yet
+  — [#650](https://github.com/jdstanhope/huck/issues/650);
+- `echo (`, `v=((` and the `[[ … ]]` comparisons use different message wording
+  entirely, and were never part of this model.
+
+Three smaller gaps turned up along the way: an unterminated `${` inside `$((`
+still consumes the arithmetic's own `))`
+([#645](https://github.com/jdstanhope/huck/issues/645)), and errors that the
+parser rather than the scanner notices — an unclosed backtick, an unclosed `$(`
+— still miss the line and the exit status
+([#646](https://github.com/jdstanhope/huck/issues/646),
+[#649](https://github.com/jdstanhope/huck/issues/649)).
+
+The whole space is now measured on every build: 813 combinations of nesting run
+through both shells, with the 18 known gaps listed by name, so the next one to
+regress is caught rather than discovered.
