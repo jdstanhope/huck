@@ -2549,6 +2549,15 @@ impl<'a> Lexer<'a> {
                         Some('\'') => emit_ext_name!(),
                         // `${$"…"}` — locale quote in name position → bad subst.
                         Some('"') => emit_bad_subst!(),
+                        // `${$(…)}` / `${$((…))}` — #634. A `$(` here is NOT the `$`
+                        // special parameter followed by a stray `(`: it OPENS A PAIR,
+                        // and that pair swallows the `}`. Bad-subst with the cursor
+                        // left ON the `$` so the parser's drive-to-`}` sees `$(` and
+                        // nests it through the operand machinery, which already gets
+                        // this right — `${e:-$(echo x}` names `)` at the EOF line and
+                        // has all along. Consuming the `$` as a name is what made the
+                        // drive start at `(echo x}` and stop at the `}`.
+                        Some('(') => emit_bad_subst!(),
                         // `${$}` / `${$:-x}` / `${$x}` — treat `$` as the name; a
                         // following non-modifier char is bad-subst'd in Phase 2.
                         _ => {

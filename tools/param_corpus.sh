@@ -136,3 +136,15 @@ emit 'echo $((1+${n}))' 'echo $[1+${n}]' 'echo $((1+${a[0]:+2}))' \
      'echo $(($(echo ${x' 'echo $(("${x' 'echo $(("a"+${x' \
      'echo $((1+`echo ${x' 'echo $((1+${x:-"abc' 'echo ${x:-$[1+${y' \
      'for ((i=0;i<${x' '((1+${x' '((1+${x))'
+
+# ---- `$(`/`$((` in NAME position (#634) ----------------------------------
+# Added in v362 Task 6. A `$(` where a name belongs opens a PAIR that swallows
+# the `}`; huck used to consume the `$` as the `$$` special-parameter name,
+# which left the drive-to-`}` starting at `(` and stopping at the first `}`.
+# The terminated rows are the controls — they must stay `bad substitution`.
+# NOTE: `${$}` expands to the PID, so it is asserted as non-empty rather than
+# printed — a row whose output changes every run would break this gate forever.
+emit 'echo ${$(echo x)}' 'echo ${$((1+1))}' 'echo ${$x}' \
+     '[ -n "${$}" ] && echo PIDSET' '[ -n "${$:-D}" ] && echo DOLLARSET' \
+     'echo ${$(' 'echo ${$((1+' 'echo ${$(echo x' 'echo ${$(echo x}' 'echo ${$((1+1)}' \
+     'echo "${$(" ' 'echo ${$(echo x)}; echo after' 'e=; echo ${e:-$(echo brace)}'
