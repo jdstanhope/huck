@@ -38,96 +38,46 @@ BASH_BIN="${BASH_BIN:-bash}"
 [ -x "$HUCK" ] || { echo "build huck first: $HUCK" >&2; exit 2; }
 
 # ── The expected DIFF set ─────────────────────────────────────────────────────
-# Every cell that diverged when this tool was written (v360 Task 2), as
-# DEPTH/CONTEXT/MIDDLE/INNER. `--check` compares a live run against it and
-# reports what LEFT (a task's fix) and what JOINED (a regression), so each task
-# in the model's rollout leaves a reviewable edit to this list rather than to a
+# The cells that still diverge, as DEPTH/CONTEXT/MIDDLE/INNER. `--check` compares
+# a live run against this and reports what LEFT (a fix) and what JOINED (a
+# regression), so a change leaves a reviewable edit here rather than to a
 # generated artifact. /tools/*.tsv is gitignored by design — the baseline lives
-# here, in the tool, where its changes are visible in review.
+# in the tool, where its changes show up in review.
 #
-# 72 of these are in v360's scope. The other 6 are out of scope by the spec and
-# stay: the four `[[ a == ` cells (conditional-expression wording), `echo (`
-# (huck reads it as a function definition) and `v=((` — none of them is a
-# matched-pair shape.
+# Rebased by v362 (#643), which took this list from 78 coordinates to 18: the
+# frame stack now decides which pair an EOF names, so #627 (30 cells), #633 (10),
+# #634's `$(` half (11) and #629 all closed, plus 9 cells that fell out with them.
+#
+# The 18 left are three families of six, each with an open issue:
+#
+#   * not matched-pair shapes at all — `echo (`, `v=((` and the four
+#     `[[ a == ` conditional-expression cells;
+#   * #631 / #640 — a `'` inside a `${…}` is a pair in bash and swallows the `}`,
+#     which changes what PARSES, not just what is reported;
+#   * #650 — a nested `${` in name position is `unsupported expansion` in huck,
+#     an unimplemented construct rather than a misreported one.
+#
+# `tests/scripts/eof_delimiter_matrix_diff_check.sh` holds the same 18 as a
+# one-directional gate (nothing NEW may diverge); keep the two in step.
 EXPECTED_DIFF=$(cat <<'COORDS'
-1/arith/-/brace
-1/arith/-/legacy
-1/arithcmd/-/brace
-1/arithcmd/-/legacy
-1/arraylit/-/escdq
-1/arraylit/-/escsq
-1/arraylit/-/none
 1/arraylit/-/paren
 1/dbracket/-/escdq
 1/dbracket/-/escsq
 1/dbracket/-/none
 1/dbracket/-/paren
-1/forhdr/-/brace
-1/forhdr/-/legacy
-1/legacy/-/brace
 1/word/-/paren
-2/arith/arith/brace
-2/arith/bracename/arith
 2/arith/bracename/brace
-2/arith/bracename/comsub
-2/arith/bracename/escdq
-2/arith/bracename/escsq
-2/arith/bracename/none
 2/arith/bracename/sq
-2/arith/legacy/brace
-2/arith/legacy/escdq
-2/arith/legacy/escsq
-2/arith/legacy/none
-2/arith/none/brace
-2/arith/operand/brace
-2/arith/operand/escdq
-2/arith/operand/escsq
-2/arith/operand/none
 2/arith/operand/sq
-2/arraylit/arith/brace
-2/arraylit/bq/bq
-2/arraylit/bracename/arith
 2/arraylit/bracename/brace
-2/arraylit/bracename/comsub
-2/arraylit/dq/dq
-2/arraylit/legacy/brace
-2/arraylit/none/escdq
-2/arraylit/none/escsq
-2/arraylit/none/none
-2/arraylit/sq/escsq
-2/arraylit/sq/sq
-2/comsub/arith/brace
-2/comsub/bracename/arith
 2/comsub/bracename/brace
-2/comsub/bracename/comsub
-2/comsub/legacy/brace
-2/dq/arith/brace
-2/dq/bracename/arith
 2/dq/bracename/brace
-2/dq/bracename/comsub
 2/dq/bracename/sq
-2/dq/legacy/brace
 2/dq/operand/sq
-2/legacy/arith/brace
-2/legacy/bracename/arith
 2/legacy/bracename/brace
-2/legacy/bracename/comsub
-2/legacy/bracename/escdq
-2/legacy/bracename/escsq
-2/legacy/bracename/none
 2/legacy/bracename/sq
-2/legacy/legacy/brace
-2/legacy/none/brace
-2/legacy/operand/brace
-2/legacy/operand/escdq
-2/legacy/operand/escsq
-2/legacy/operand/none
 2/legacy/operand/sq
-2/none/arith/brace
-2/none/bracename/arith
 2/none/bracename/brace
-2/none/bracename/comsub
-2/none/legacy/brace
 COORDS
 )
 
