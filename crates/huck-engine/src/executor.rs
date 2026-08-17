@@ -3500,7 +3500,28 @@ fn run_empty_command_tail(
             _ => None,
         })
         .collect();
-    let st = run_assignment_list(&cmd.inline_assignments, shell);
+    // #661: a command whose word list expanded to NOTHING takes the exit status
+    // of the last command substitution performed while expanding it — bash gives
+    // `` `nosuch` `` 127 and `$(exit 3)` 3, where huck gave 0. That 0 is not
+    // cosmetic: as a loop condition a false command read as TRUE, so `while
+    // `nosuch`; do :; done` never terminated.
+    //
+    // `run_assignment_list` RESETS `last_cmd_sub_status` so that only its own RHS
+    // substitutions count, which clobbers what the WORD expansion just recorded —
+    // hence the capture here, before the call. That reset is also why
+    // `x=$(exit 5) $(exit 3)` was already right (5, the assignment's own) while
+    // `x=1 $(exit 3)` was not.
+    //
+    // The fallback is keyed on `is_none()`, not on `st == 0`: an assignment whose
+    // RHS substitution genuinely returned 0 must WIN over the words' status
+    // (measured — `x=$(true) $(exit 3)` is 0, not 3), and `run_assignment_list`
+    // folds both "no substitution" and "a substitution that returned 0" into
+    // `st == 0`.
+    let word_sub_status = shell.last_cmd_sub_status();
+    let mut st = run_assignment_list(&cmd.inline_assignments, shell);
+    if st == 0 && shell.last_cmd_sub_status().is_none() {
+        st = word_sub_status.unwrap_or(0);
+    }
     let outcome = with_redirect_scope(&cmd.redirects, shell, move |_shell| {
         ExecOutcome::Continue(st)
     });
