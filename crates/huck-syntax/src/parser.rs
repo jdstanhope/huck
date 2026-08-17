@@ -3823,9 +3823,22 @@ fn parse_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
     // it. (The loop already skips blanks BETWEEN successive bangs; this covers the
     // one before the FIRST bang.) A command never begins with a meaningful Blank,
     // so this is a no-op for the paths that already arrive blank-free.
-    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
-        iter.next_kind()?;
-    }
+    //
+    // #652: NEWLINES too, not just blanks. `parse_command_impl` skips leading
+    // newlines itself, so before this the ordinary path worked while the bang
+    // loop — which runs FIRST — never saw a `!` that a newline preceded, and the
+    // `!` fell through to become the command word:
+    //
+    //     if true; then
+    //       ! false          ->  `!: command not found`, rc 127
+    //     fi
+    //
+    // Every compound body reaches the first stage through here without a leading
+    // skip (`parse_compound_section` -> `parse_and_or`), which is why `then`,
+    // `else`, `while`, `for`, `{ }`, a subshell and a function body were all
+    // affected while `&&` (whose connector loop consumes the newline first),
+    // `case` and the top level (`parse_one_unit` skips first) were not.
+    skip_newlines(iter)?;
     // Count leading `!` words (each one flips the negate flag). Under the atom
     // scanner successive bangs are separated by `Blank` atoms (`! ! a`), so skip
     // any inter-token blanks after each bang before checking for the next one.
