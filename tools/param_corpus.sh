@@ -123,3 +123,16 @@ emit 'pre1=a; pre2=b; echo ${!pre@}' 'pre1=a; pre2=b; echo ${!pre*}' 'pre1=a; ec
      'echo ${x/${x}/Y}' 'echo ${x#${x}}' 'echo "${x/b/${e:-Z}}"' \
      'echo ${e:-"$x"}' "echo \${e:-\"\$(echo s)\"}" 'echo ${e:-\}}' \
      'echo ${x:0:0}' 'echo "${x:0:0}"' 'echo ${a[@]:0:0}'
+
+# ---- `${` inside an arithmetic body (#627) -------------------------------
+# Added in v362 Task 3. The corpus had NO row where a `${` sits inside `$((`,
+# which is why it stayed byte-identical across a change that moved 39 matrix
+# cells: it was blind to the whole family, not agnostic about it. The
+# terminated rows are the controls (an arithmetic `${n}` must still evaluate);
+# the unterminated ones pin which delimiter the EOF names.
+emit 'echo $((1+${n}))' 'echo $[1+${n}]' 'echo $((1+${a[0]:+2}))' \
+     'echo $((1+${x' 'echo $[1+${x' 'echo $((1+$[2+' 'echo $[1+$((2+' \
+     'echo $((1+${x:-$[2+' 'echo $((1+${x[' 'echo $(( ${#x' \
+     'echo $(($(echo ${x' 'echo $(("${x' 'echo $(("a"+${x' \
+     'echo $((1+`echo ${x' 'echo $((1+${x:-"abc' 'echo ${x:-$[1+${y' \
+     'for ((i=0;i<${x' '((1+${x' '((1+${x))'
