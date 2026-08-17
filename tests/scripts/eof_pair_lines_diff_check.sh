@@ -34,22 +34,25 @@ script_case() { # <label> <body>
 }
 
 # ── driver: piped stdin ───────────────────────────────────────────────────────
+# ⚠️ `rc=$?` after a pipe reports the PIPE's status (sed's, always 0), so both
+# statuses are captured before normalizing. The first cut of this harness got
+# that wrong, which made these rows' rc assertions vacuous.
 stdin_case() { # <label> <body>
-    local b h
-    b=$(printf '%s\n' "$2" | (ulimit -v 500000; timeout 5 bash --norc --noprofile) 2>&1 \
-        | sed 's|^bash: ||'; echo "rc=$?")
-    h=$(printf '%s\n' "$2" | (ulimit -v 500000; timeout 5 "$HUCK_BIN") 2>&1 \
-        | sed "s|^$HUCK_BIN: ||"; echo "rc=$?")
+    local b h out rc
+    out=$(printf '%s\n' "$2" | (ulimit -v 500000; timeout 5 bash --norc --noprofile) 2>&1); rc=$?
+    b=$(printf '%s\n' "$out" | sed 's|^bash: ||'; echo "rc=$rc")
+    out=$(printf '%s\n' "$2" | (ulimit -v 500000; timeout 5 "$HUCK_BIN") 2>&1); rc=$?
+    h=$(printf '%s\n' "$out" | sed "s|^$HUCK_BIN: ||"; echo "rc=$rc")
     compare "stdin: $1" "$b" "$h"
 }
 
 # ── driver: `-c` ──────────────────────────────────────────────────────────────
 dashc_case() { # <label> <body>
-    local b h
-    b=$( (ulimit -v 500000; timeout 5 bash --norc --noprofile -c "$2") 2>&1 \
-        | sed 's|^bash: ||'; echo "rc=$?")
-    h=$( (ulimit -v 500000; timeout 5 "$HUCK_BIN" -c "$2") 2>&1 \
-        | sed "s|^$HUCK_BIN: ||"; echo "rc=$?")
+    local b h out rc
+    out=$( (ulimit -v 500000; timeout 5 bash --norc --noprofile -c "$2") 2>&1); rc=$?
+    b=$(printf '%s\n' "$out" | sed 's|^bash: ||'; echo "rc=$rc")
+    out=$( (ulimit -v 500000; timeout 5 "$HUCK_BIN" -c "$2") 2>&1); rc=$?
+    h=$(printf '%s\n' "$out" | sed "s|^$HUCK_BIN: ||"; echo "rc=$rc")
     compare "-c: $1" "$b" "$h"
 }
 
