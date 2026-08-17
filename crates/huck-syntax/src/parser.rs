@@ -990,594 +990,589 @@ pub(crate) fn parse_param_expansion(
     let m156_dq = quoted || saved_dq;
     iter.set_in_dquote(m156_dq);
 
-    // Restore-on-exit helper for the M-156 gate flag.
-    macro_rules! restore_dq {
-        () => {
-            iter.set_in_dquote(saved_dq);
-        };
-    }
-
-    match iter.next_kind()? {
-        Some(TokenKind::ParamOpen { .. }) => {
-            // Record the `${`'s `$` offset for bad-subst raw reconstruction. In
-            // production the enclosing scanner consumes `${` (2 ASCII bytes) and
-            // the cursor now sits just past it, so `$` is at `cursor - 2`.
-            iter.set_param_start_off_from_cursor();
-        }
-        _ => {
-            restore_dq!();
-            iter.pop_mode();
-            return Err(ParseError::UnsupportedExpansion);
-        }
-    }
-
-    // Byte offset of the leading `$` of this `${…}`, captured once now that the
-    // frame's `start_off` is set. A bad-substitution arm (name-position or
-    // post-name) uses it with `source_span` to assemble the verbatim `${…}` raw
-    // AFTER the parser has driven the body's tail to the matching `}`.
-    let start_off = iter.param_start_off();
-
-    // Operand macros, hoisted above the name-dispatch match so BOTH the
-    // name-position and post-name `ParamBadSubst` arms (and the operator arm)
-    // can use them.
+    // v362 (#643): the body runs in an immediately-invoked closure so this frame
+    // has ONE exit. Every `return` below leaves the CLOSURE; the `set_in_dquote`
+    // restoring the M-156 gate and the `pop_mode` dropping this frame run once,
+    // after it, on every path. Task 6's drain hooks onto that single exit.
     //
-    // Macro: push a mode, parse_word, pop mode. On error pops ParamExpansion too.
-    // NOTE: macros are scoped to this function.
-    macro_rules! word_in_mode {
-        ($mode:expr, $wquoted:expr) => {{
-            iter.push_mode($mode);
-            match parse_word(iter, $wquoted) {
-                Ok(w) => {
-                    iter.pop_mode();
-                    w
-                }
-                Err(e) => {
-                    iter.pop_mode(); // the operand mode
-                    iter.pop_mode(); // ParamExpansion
-                    return Err(e);
-                }
-            }
-        }};
-    }
-    // Macro: consume ParamClose; on failure pop ParamExpansion and return Err.
-    macro_rules! expect_close {
-        () => {
-            match iter.next_kind()? {
-                Some(TokenKind::ParamClose) => {}
-                _ => {
-                    iter.pop_mode(); // ParamExpansion
-                    return Err(ParseError::UnsupportedExpansion);
-                }
-            }
-        };
-    }
-
-    // 2. Optional length prefix (`${#name}`) or indirect prefix (`${!name}`).
-    let mut length_form = false;
-    let mut indirect = false;
-    if matches!(iter.peek_kind()?, Some(TokenKind::ParamLengthPrefix)) {
-        iter.next_kind()?;
-        length_form = true;
-    } else if matches!(iter.peek_kind()?, Some(TokenKind::ParamIndirect)) {
-        iter.next_kind()?;
-        indirect = true;
-    }
-
-    // 3. The parameter name (always present; may be "" for bad-subst). A
-    // `$'…'`-decoded name (`ParamNameDecoded`) sets `name_decoded` so the bare
-    // form is promoted to `ParamExpansion{None}` (matching the oracle's `declare
-    // -f` round-trip). A `ParamBadSubst` here is a name-position bad substitution.
-    let mut name_decoded = false;
-    let name = match iter.next_kind()? {
-        Some(TokenKind::ParamName(n)) => n,
-        Some(TokenKind::ParamNameDecoded(n)) => {
-            name_decoded = true;
-            n
-        }
-        Some(TokenKind::ParamBadSubst) => {
-            // Name-position bad substitution. The lexer emitted only a marker
-            // (cursor left on the offending char); drive the rest of the body to
-            // the matching `}` via the operand machinery (correct nesting/quote
-            // matching), discard the resulting word, then assemble the verbatim
-            // `${…}` raw from `source_span`. If the body is unterminated,
-            // `word_in_mode!` itself returns the lexer's Unterminated* error
-            // (propagates as rc=2 — the intended behavior).
-            let _ = word_in_mode!(
-                Mode::ParamWordOperand {
-                    in_dquote: false,
-                    enclosing_dquote: quoted,
-                    is_pattern: true
-                },
-                quoted
-            );
-            let close_off = iter.peek_span()?.map(|s| s.offset).unwrap_or(start_off);
-            expect_close!();
-            let raw = iter.source_span(start_off, close_off).to_string();
-            restore_dq!();
-            iter.pop_mode();
-            return Ok(WordPart::ParamExpansion {
-                name: String::new(),
-                modifier: ParamModifier::BadSubst { raw },
-                quoted,
-                subscript: None,
-                indirect: false,
-            });
-        }
-        _ => {
-            restore_dq!();
-            iter.pop_mode();
-            return Err(ParseError::UnsupportedExpansion);
-        }
-    };
-
-    // The NAME's M-156 gate has now fired. Lower the gate to the inherited value
-    // for the subscript and value/error/substring operands (the oracle scans them
-    // with `opts` unchanged); pattern-family operands re-elevate below.
-    iter.set_in_dquote(saved_dq);
-
-    // 4. Optional subscript `[…]`.
-    let mut subscript: Option<SubscriptKind> = None;
-    if matches!(iter.peek_kind()?, Some(TokenKind::LBracket)) {
-        iter.next_kind()?; // consume LBracket
-        iter.push_mode(Mode::ParamSubscriptOperand {
-            in_dquote: false,
-            enclosing_dquote: false,
-        });
-        let sub_word = match parse_word(iter, false) {
-            Ok(w) => w,
-            Err(e) => {
-                iter.pop_mode(); // ParamSubscriptOperand
-                restore_dq!();
-                iter.pop_mode(); // ParamExpansion
-                return Err(e);
-            }
-        };
+    // Before this there were eleven exits, each re-pairing those two calls by
+    // hand, and two of them popped WITHOUT restoring the gate. Mirrors
+    // `parse_arith_expansion`.
+    let result = (|| -> Result<WordPart, ParseError> {
         match iter.next_kind()? {
-            Some(TokenKind::RBracket) => {}
+            Some(TokenKind::ParamOpen { .. }) => {
+                // Record the `${`'s `$` offset for bad-subst raw reconstruction. In
+                // production the enclosing scanner consumes `${` (2 ASCII bytes) and
+                // the cursor now sits just past it, so `$` is at `cursor - 2`.
+                iter.set_param_start_off_from_cursor();
+            }
             _ => {
-                iter.pop_mode(); // ParamSubscriptOperand
-                restore_dq!();
-                iter.pop_mode(); // ParamExpansion
                 return Err(ParseError::UnsupportedExpansion);
             }
         }
-        iter.pop_mode(); // ParamSubscriptOperand
-        subscript = Some(subscript_kind_from(sub_word));
-    }
 
-    // 5. Dispatch on `ParamClose` (bare/length/indirect/subscript) or `ParamOp`.
-    let result = match iter.next_kind()? {
-        // ── Bare close: ${name}, ${#name}, ${!name}, ${name[sub]}, ${@}, ${*}, ${}
-        Some(TokenKind::ParamClose) => {
-            if indirect
-                && matches!(
-                    subscript,
-                    Some(SubscriptKind::All) | Some(SubscriptKind::Star)
-                )
-            {
-                // `${!arr[@]}` / `${!arr[*]}` — indirect array-keys form.
-                // Mirrors the production: IndirectKeys modifier, indirect:false.
-                WordPart::ParamExpansion {
-                    name,
-                    modifier: ParamModifier::IndirectKeys,
-                    quoted,
-                    subscript,
-                    indirect: false,
+        // Byte offset of the leading `$` of this `${…}`, captured once now that the
+        // frame's `start_off` is set. A bad-substitution arm (name-position or
+        // post-name) uses it with `source_span` to assemble the verbatim `${…}` raw
+        // AFTER the parser has driven the body's tail to the matching `}`.
+        let start_off = iter.param_start_off();
+
+        // Operand macros, hoisted above the name-dispatch match so BOTH the
+        // name-position and post-name `ParamBadSubst` arms (and the operator arm)
+        // can use them.
+        //
+        // Macro: push a mode, parse_word, pop mode. On error pops ParamExpansion too.
+        // NOTE: macros are scoped to this function.
+        macro_rules! word_in_mode {
+            ($mode:expr, $wquoted:expr) => {{
+                iter.push_mode($mode);
+                match parse_word(iter, $wquoted) {
+                    Ok(w) => {
+                        iter.pop_mode();
+                        w
+                    }
+                    Err(e) => {
+                        iter.pop_mode(); // the operand mode; ParamExpansion pops at the single exit
+                        return Err(e);
+                    }
                 }
-            } else if subscript.is_some() {
-                // `${a[i]}` / `${a[@]}` / `${a[*]}` — bare subscripted reference,
-                // OR `${#a[i]}` — length OF a subscripted element/array. The
-                // oracle keeps the `Length` modifier alongside the subscript
-                // (`${#a[0]}` = Length{subscript:Index(0)}); honor `length_form`
-                // here so a `#`+subscript is not dropped to `None` (v263).
-                WordPart::ParamExpansion {
-                    name,
-                    modifier: if length_form {
-                        ParamModifier::Length
-                    } else {
-                        ParamModifier::None
-                    },
-                    quoted,
-                    subscript,
-                    indirect,
+            }};
+        }
+        // Macro: consume ParamClose; on failure pop ParamExpansion and return Err.
+        macro_rules! expect_close {
+            () => {
+                match iter.next_kind()? {
+                    Some(TokenKind::ParamClose) => {}
+                    _ => {
+                        return Err(ParseError::UnsupportedExpansion);
+                    }
                 }
-            } else if indirect {
-                // `${!name}` — indirect scalar expansion with no modifier.
-                WordPart::ParamExpansion {
-                    name,
-                    modifier: ParamModifier::None,
-                    quoted,
-                    subscript: None,
-                    indirect: true,
-                }
-            } else if length_form {
-                // `${#name}` — length.
-                WordPart::ParamExpansion {
-                    name,
-                    modifier: ParamModifier::Length,
-                    quoted,
-                    subscript: None,
-                    indirect: false,
-                }
-            } else if name == "@" {
-                // `${@}` — all positional args (joined=false).
-                // Mirrors `scan_braced_param_expansion`'s `Some('@')` early-return.
-                WordPart::AllArgs {
-                    quoted,
-                    joined: false,
-                }
-            } else if name == "*" {
-                // `${*}` — all positional args (joined=true).
-                WordPart::AllArgs {
-                    quoted,
-                    joined: true,
-                }
-            } else if name_decoded {
-                // `${$'x1'}` / `${a$'b'}` — a `$'…'`-decoded name in bare form.
-                // The oracle promotes the plain `Var` to `ParamExpansion{None}`
-                // so `declare -f` reconstructs the normalised `${x1}` form.
-                WordPart::ParamExpansion {
-                    name,
-                    modifier: ParamModifier::None,
-                    quoted,
-                    subscript: None,
-                    indirect: false,
-                }
-            } else {
-                // `${name}` — plain variable reference. `braced: true` (v341,
-                // #44): this shape is a genuine `${…}` reference that was
-                // demoted from `ParamExpansion` for `declare -f` fidelity, so
-                // it must NOT absorb a following brace-suffix's name-run the
-                // way a bare `$name` does (`merge_brace_name_suffix`).
-                WordPart::Var {
-                    name,
-                    quoted,
-                    braced: true,
-                }
-            }
+            };
         }
 
-        // ── Prefix-name expansion: `${!pfx*}` / `${!pfx@}` (indirect:false).
-        Some(TokenKind::ParamPrefixClose { at }) => WordPart::ParamExpansion {
-            name,
-            modifier: ParamModifier::PrefixNames { at },
-            quoted,
-            subscript: None,
-            indirect: false,
-        },
+        // 2. Optional length prefix (`${#name}`) or indirect prefix (`${!name}`).
+        let mut length_form = false;
+        let mut indirect = false;
+        if matches!(iter.peek_kind()?, Some(TokenKind::ParamLengthPrefix)) {
+            iter.next_kind()?;
+            length_form = true;
+        } else if matches!(iter.peek_kind()?, Some(TokenKind::ParamIndirect)) {
+            iter.next_kind()?;
+            indirect = true;
+        }
 
-        // ── Post-name bad substitution (`${x!}`, `${V@}`, `${-3}`, `${x@Z}`).
-        // The lexer emitted only a marker; drive the body's tail to the matching
-        // `}` via the operand machinery, discard the word, then assemble the
-        // verbatim `${…}` raw from `source_span`. The common cleanup at the end
-        // of the function runs `restore_dq!()` + `pop_mode()`.
-        Some(TokenKind::ParamBadSubst) => {
-            let _ = word_in_mode!(
-                Mode::ParamWordOperand {
-                    in_dquote: false,
-                    enclosing_dquote: quoted,
-                    is_pattern: true
-                },
-                quoted
-            );
-            let close_off = iter.peek_span()?.map(|s| s.offset).unwrap_or(start_off);
-            expect_close!();
-            let raw = iter.source_span(start_off, close_off).to_string();
-            WordPart::ParamExpansion {
-                name: String::new(),
-                modifier: ParamModifier::BadSubst { raw },
+        // 3. The parameter name (always present; may be "" for bad-subst). A
+        // `$'…'`-decoded name (`ParamNameDecoded`) sets `name_decoded` so the bare
+        // form is promoted to `ParamExpansion{None}` (matching the oracle's `declare
+        // -f` round-trip). A `ParamBadSubst` here is a name-position bad substitution.
+        let mut name_decoded = false;
+        let name = match iter.next_kind()? {
+            Some(TokenKind::ParamName(n)) => n,
+            Some(TokenKind::ParamNameDecoded(n)) => {
+                name_decoded = true;
+                n
+            }
+            Some(TokenKind::ParamBadSubst) => {
+                // Name-position bad substitution. The lexer emitted only a marker
+                // (cursor left on the offending char); drive the rest of the body to
+                // the matching `}` via the operand machinery (correct nesting/quote
+                // matching), discard the resulting word, then assemble the verbatim
+                // `${…}` raw from `source_span`. If the body is unterminated,
+                // `word_in_mode!` itself returns the lexer's Unterminated* error
+                // (propagates as rc=2 — the intended behavior).
+                let _ = word_in_mode!(
+                    Mode::ParamWordOperand {
+                        in_dquote: false,
+                        enclosing_dquote: quoted,
+                        is_pattern: true
+                    },
+                    quoted
+                );
+                let close_off = iter.peek_span()?.map(|s| s.offset).unwrap_or(start_off);
+                expect_close!();
+                let raw = iter.source_span(start_off, close_off).to_string();
+                return Ok(WordPart::ParamExpansion {
+                    name: String::new(),
+                    modifier: ParamModifier::BadSubst { raw },
+                    quoted,
+                    subscript: None,
+                    indirect: false,
+                });
+            }
+            _ => {
+                return Err(ParseError::UnsupportedExpansion);
+            }
+        };
+
+        // The NAME's M-156 gate has now fired. Lower the gate to the inherited value
+        // for the subscript and value/error/substring operands (the oracle scans them
+        // with `opts` unchanged); pattern-family operands re-elevate below.
+        iter.set_in_dquote(saved_dq);
+
+        // 4. Optional subscript `[…]`.
+        let mut subscript: Option<SubscriptKind> = None;
+        if matches!(iter.peek_kind()?, Some(TokenKind::LBracket)) {
+            iter.next_kind()?; // consume LBracket
+            iter.push_mode(Mode::ParamSubscriptOperand {
+                in_dquote: false,
+                enclosing_dquote: false,
+            });
+            let sub_word = match parse_word(iter, false) {
+                Ok(w) => w,
+                Err(e) => {
+                    iter.pop_mode(); // ParamSubscriptOperand
+                    return Err(e);
+                }
+            };
+            match iter.next_kind()? {
+                Some(TokenKind::RBracket) => {}
+                _ => {
+                    iter.pop_mode(); // ParamSubscriptOperand
+                    return Err(ParseError::UnsupportedExpansion);
+                }
+            }
+            iter.pop_mode(); // ParamSubscriptOperand
+            subscript = Some(subscript_kind_from(sub_word));
+        }
+
+        // 5. Dispatch on `ParamClose` (bare/length/indirect/subscript) or `ParamOp`.
+        let result = match iter.next_kind()? {
+            // ── Bare close: ${name}, ${#name}, ${!name}, ${name[sub]}, ${@}, ${*}, ${}
+            Some(TokenKind::ParamClose) => {
+                if indirect
+                    && matches!(
+                        subscript,
+                        Some(SubscriptKind::All) | Some(SubscriptKind::Star)
+                    )
+                {
+                    // `${!arr[@]}` / `${!arr[*]}` — indirect array-keys form.
+                    // Mirrors the production: IndirectKeys modifier, indirect:false.
+                    WordPart::ParamExpansion {
+                        name,
+                        modifier: ParamModifier::IndirectKeys,
+                        quoted,
+                        subscript,
+                        indirect: false,
+                    }
+                } else if subscript.is_some() {
+                    // `${a[i]}` / `${a[@]}` / `${a[*]}` — bare subscripted reference,
+                    // OR `${#a[i]}` — length OF a subscripted element/array. The
+                    // oracle keeps the `Length` modifier alongside the subscript
+                    // (`${#a[0]}` = Length{subscript:Index(0)}); honor `length_form`
+                    // here so a `#`+subscript is not dropped to `None` (v263).
+                    WordPart::ParamExpansion {
+                        name,
+                        modifier: if length_form {
+                            ParamModifier::Length
+                        } else {
+                            ParamModifier::None
+                        },
+                        quoted,
+                        subscript,
+                        indirect,
+                    }
+                } else if indirect {
+                    // `${!name}` — indirect scalar expansion with no modifier.
+                    WordPart::ParamExpansion {
+                        name,
+                        modifier: ParamModifier::None,
+                        quoted,
+                        subscript: None,
+                        indirect: true,
+                    }
+                } else if length_form {
+                    // `${#name}` — length.
+                    WordPart::ParamExpansion {
+                        name,
+                        modifier: ParamModifier::Length,
+                        quoted,
+                        subscript: None,
+                        indirect: false,
+                    }
+                } else if name == "@" {
+                    // `${@}` — all positional args (joined=false).
+                    // Mirrors `scan_braced_param_expansion`'s `Some('@')` early-return.
+                    WordPart::AllArgs {
+                        quoted,
+                        joined: false,
+                    }
+                } else if name == "*" {
+                    // `${*}` — all positional args (joined=true).
+                    WordPart::AllArgs {
+                        quoted,
+                        joined: true,
+                    }
+                } else if name_decoded {
+                    // `${$'x1'}` / `${a$'b'}` — a `$'…'`-decoded name in bare form.
+                    // The oracle promotes the plain `Var` to `ParamExpansion{None}`
+                    // so `declare -f` reconstructs the normalised `${x1}` form.
+                    WordPart::ParamExpansion {
+                        name,
+                        modifier: ParamModifier::None,
+                        quoted,
+                        subscript: None,
+                        indirect: false,
+                    }
+                } else {
+                    // `${name}` — plain variable reference. `braced: true` (v341,
+                    // #44): this shape is a genuine `${…}` reference that was
+                    // demoted from `ParamExpansion` for `declare -f` fidelity, so
+                    // it must NOT absorb a following brace-suffix's name-run the
+                    // way a bare `$name` does (`merge_brace_name_suffix`).
+                    WordPart::Var {
+                        name,
+                        quoted,
+                        braced: true,
+                    }
+                }
+            }
+
+            // ── Prefix-name expansion: `${!pfx*}` / `${!pfx@}` (indirect:false).
+            Some(TokenKind::ParamPrefixClose { at }) => WordPart::ParamExpansion {
+                name,
+                modifier: ParamModifier::PrefixNames { at },
                 quoted,
                 subscript: None,
                 indirect: false,
-            }
-        }
+            },
 
-        // ── Operator: pattern removal, substitute, case, transform, substring
-        Some(TokenKind::ParamOp(op_kind)) => {
-            // Pattern-family operands (`#`/`%`/`/`/`^`/`,`) re-elevate the M-156
-            // gate so a NESTED `${…}` in the pattern sees the enclosing dquote
-            // (mirrors the oracle's `opts.with_in_dquote(quoted || opts.in_dquote)`).
-            // Value/error/substring operands keep the inherited value (`saved_dq`,
-            // already restored above).
-            if matches!(
-                op_kind,
-                ParamOpKind::RemovePrefix(_)
-                    | ParamOpKind::RemoveSuffix(_)
-                    | ParamOpKind::Substitute(_)
-                    | ParamOpKind::Case(_, _)
-            ) {
-                iter.set_in_dquote(m156_dq);
-            }
-
-            match op_kind {
-                // ── Value family: UseDefault / AssignDefault / ErrorIfUnset / UseAlternate
-                // Production: `modifier_with_operand(chars, quoted/false, ...)`.
-                // `ErrorIfUnset` uses `enclosing_dquote=false`; others use `quoted`.
-                ParamOpKind::UseDefault(colon) => {
-                    let word = word_in_mode!(
-                        Mode::ParamWordOperand {
-                            in_dquote: false,
-                            enclosing_dquote: quoted,
-                            is_pattern: false
-                        },
-                        quoted
-                    );
-                    expect_close!();
-                    WordPart::ParamExpansion {
-                        name,
-                        modifier: ParamModifier::UseDefault { word, colon },
-                        quoted,
-                        subscript,
-                        indirect,
-                    }
-                }
-                ParamOpKind::AssignDefault(colon) => {
-                    let word = word_in_mode!(
-                        Mode::ParamWordOperand {
-                            in_dquote: false,
-                            enclosing_dquote: quoted,
-                            is_pattern: false
-                        },
-                        quoted
-                    );
-                    expect_close!();
-                    WordPart::ParamExpansion {
-                        name,
-                        modifier: ParamModifier::AssignDefault { word, colon },
-                        quoted,
-                        subscript,
-                        indirect,
-                    }
-                }
-                ParamOpKind::ErrorIfUnset(colon) => {
-                    // Production: `modifier_with_operand(chars, false, ...)` — NOT `quoted`.
-                    let word = word_in_mode!(
-                        Mode::ParamWordOperand {
-                            in_dquote: false,
-                            enclosing_dquote: false,
-                            is_pattern: false
-                        },
-                        false
-                    );
-                    expect_close!();
-                    WordPart::ParamExpansion {
-                        name,
-                        modifier: ParamModifier::ErrorIfUnset { word, colon },
-                        quoted,
-                        subscript,
-                        indirect,
-                    }
-                }
-                ParamOpKind::UseAlternate(colon) => {
-                    let word = word_in_mode!(
-                        Mode::ParamWordOperand {
-                            in_dquote: false,
-                            enclosing_dquote: quoted,
-                            is_pattern: false
-                        },
-                        quoted
-                    );
-                    expect_close!();
-                    WordPart::ParamExpansion {
-                        name,
-                        modifier: ParamModifier::UseAlternate { word, colon },
-                        quoted,
-                        subscript,
-                        indirect,
-                    }
-                }
-
-                // ── Pattern removal: RemovePrefix / RemoveSuffix
-                // Production: `modifier_with_operand(chars, false, ...)` — enclosing_dquote=false.
-                ParamOpKind::RemovePrefix(longest) => {
-                    let pattern = word_in_mode!(
-                        Mode::ParamWordOperand {
-                            in_dquote: false,
-                            enclosing_dquote: false,
-                            is_pattern: true
-                        },
-                        false
-                    );
-                    expect_close!();
-                    WordPart::ParamExpansion {
-                        name,
-                        modifier: ParamModifier::RemovePrefix { pattern, longest },
-                        quoted,
-                        subscript,
-                        indirect,
-                    }
-                }
-                ParamOpKind::RemoveSuffix(longest) => {
-                    let pattern = word_in_mode!(
-                        Mode::ParamWordOperand {
-                            in_dquote: false,
-                            enclosing_dquote: false,
-                            is_pattern: true
-                        },
-                        false
-                    );
-                    expect_close!();
-                    WordPart::ParamExpansion {
-                        name,
-                        modifier: ParamModifier::RemoveSuffix { pattern, longest },
-                        quoted,
-                        subscript,
-                        indirect,
-                    }
-                }
-
-                // ── Substitute: ${var/pat/repl} / ${var//…} / ${var/#…} / ${var/%…}
-                // Pattern in ParamSubstPatternOperand (sep=/); replacement in ParamWordOperand.
-                // Both operands: enclosing_dquote=false (mirrors scan_substitution_operand).
-                // Absent replacement (no ParamSep) → empty Word, matching bash ${var/pat}.
-                ParamOpKind::Substitute(subst_kind) => {
-                    let (anchor, all) = match subst_kind {
-                        SubstKind::First => (SubstAnchor::None, false),
-                        SubstKind::All => (SubstAnchor::None, true),
-                        SubstKind::Prefix => (SubstAnchor::Prefix, false),
-                        SubstKind::Suffix => (SubstAnchor::Suffix, false),
-                    };
-
-                    // Pattern in subst-pattern mode (sep = `/`).
-                    iter.push_mode(Mode::ParamSubstPatternOperand {
+            // ── Post-name bad substitution (`${x!}`, `${V@}`, `${-3}`, `${x@Z}`).
+            // The lexer emitted only a marker; drive the body's tail to the matching
+            // `}` via the operand machinery, discard the word, then assemble the
+            // verbatim `${…}` raw from `source_span`. The common cleanup at the end
+            // closure restores the gate and pops the frame.
+            Some(TokenKind::ParamBadSubst) => {
+                let _ = word_in_mode!(
+                    Mode::ParamWordOperand {
                         in_dquote: false,
-                        enclosing_dquote: false,
-                    });
-                    let pattern = match parse_word(iter, false) {
-                        Ok(w) => {
-                            iter.pop_mode();
-                            w
-                        }
-                        Err(e) => {
-                            iter.pop_mode();
-                            iter.pop_mode();
-                            return Err(e);
-                        }
-                    };
+                        enclosing_dquote: quoted,
+                        is_pattern: true
+                    },
+                    quoted
+                );
+                let close_off = iter.peek_span()?.map(|s| s.offset).unwrap_or(start_off);
+                expect_close!();
+                let raw = iter.source_span(start_off, close_off).to_string();
+                WordPart::ParamExpansion {
+                    name: String::new(),
+                    modifier: ParamModifier::BadSubst { raw },
+                    quoted,
+                    subscript: None,
+                    indirect: false,
+                }
+            }
 
-                    // Optional `/replacement`.
-                    let replacement = if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep)) {
-                        iter.next_kind()?; // consume `/`
-                        word_in_mode!(
+            // ── Operator: pattern removal, substitute, case, transform, substring
+            Some(TokenKind::ParamOp(op_kind)) => {
+                // Pattern-family operands (`#`/`%`/`/`/`^`/`,`) re-elevate the M-156
+                // gate so a NESTED `${…}` in the pattern sees the enclosing dquote
+                // (mirrors the oracle's `opts.with_in_dquote(quoted || opts.in_dquote)`).
+                // Value/error/substring operands keep the inherited value (`saved_dq`,
+                // already restored above).
+                if matches!(
+                    op_kind,
+                    ParamOpKind::RemovePrefix(_)
+                        | ParamOpKind::RemoveSuffix(_)
+                        | ParamOpKind::Substitute(_)
+                        | ParamOpKind::Case(_, _)
+                ) {
+                    iter.set_in_dquote(m156_dq);
+                }
+
+                match op_kind {
+                    // ── Value family: UseDefault / AssignDefault / ErrorIfUnset / UseAlternate
+                    // Production: `modifier_with_operand(chars, quoted/false, ...)`.
+                    // `ErrorIfUnset` uses `enclosing_dquote=false`; others use `quoted`.
+                    ParamOpKind::UseDefault(colon) => {
+                        let word = word_in_mode!(
                             Mode::ParamWordOperand {
                                 in_dquote: false,
-                                enclosing_dquote: false,
-                                is_pattern: true
+                                enclosing_dquote: quoted,
+                                is_pattern: false
                             },
-                            false
-                        )
-                    } else {
-                        Word(vec![])
-                    };
-
-                    expect_close!();
-                    WordPart::ParamExpansion {
-                        name,
-                        modifier: ParamModifier::Substitute {
-                            pattern,
-                            replacement,
-                            anchor,
-                            all,
-                        },
-                        quoted,
-                        subscript,
-                        indirect,
-                    }
-                }
-
-                // ── Case conversion: ${var^pat} / ${var^^} / ${var,pat} / ${var,,}
-                // Production: `scan_optional_braced_operand` — empty body → None.
-                ParamOpKind::Case(direction, all) => {
-                    let word = word_in_mode!(
-                        Mode::ParamWordOperand {
-                            in_dquote: false,
-                            enclosing_dquote: false,
-                            is_pattern: true
-                        },
-                        false
-                    );
-                    expect_close!();
-                    let pattern = if word.0.is_empty() { None } else { Some(word) };
-                    WordPart::ParamExpansion {
-                        name,
-                        modifier: ParamModifier::Case {
-                            direction,
-                            all,
-                            pattern,
-                        },
-                        quoted,
-                        subscript,
-                        indirect,
-                    }
-                }
-
-                // ── Transform: ${var@Q} / ${var@U} / etc.
-                // No operand: the operator letter was already consumed by the head mode.
-                // Only a ParamClose follows.
-                ParamOpKind::Transform(op) => {
-                    expect_close!();
-                    WordPart::ParamExpansion {
-                        name,
-                        modifier: ParamModifier::Transform { op },
-                        quoted,
-                        subscript,
-                        indirect,
-                    }
-                }
-
-                // ── Substring: ${var:offset} / ${var:offset:length}
-                // Offset in ParamSubstringOffsetOperand (sep = `:`); length in ParamWordOperand.
-                // Empty offset (${var:}) → BadSubst, matching dispatch_braced_modifier's
-                // `Some(':') / Some('}') → recover_bad_subst` branch.
-                ParamOpKind::Substring => {
-                    // Offset in substring-offset mode (sep = `:`).
-                    iter.push_mode(Mode::ParamSubstringOffsetOperand {
-                        in_dquote: false,
-                        enclosing_dquote: false,
-                    });
-                    let offset = match parse_word(iter, false) {
-                        Ok(w) => {
-                            iter.pop_mode();
-                            w
-                        }
-                        Err(e) => {
-                            iter.pop_mode();
-                            iter.pop_mode();
-                            return Err(e);
-                        }
-                    };
-
-                    // Optional `:length`.
-                    let length = if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep)) {
-                        iter.next_kind()?; // consume `:`
-                        Some(word_in_mode!(
-                            Mode::ParamWordOperand {
-                                in_dquote: false,
-                                enclosing_dquote: false,
-                                is_pattern: true
-                            },
-                            false
-                        ))
-                    } else {
-                        None
-                    };
-
-                    expect_close!();
-
-                    if offset.0.is_empty() {
-                        // `${x:}` — bad substitution at runtime.  Raw reconstructed from name.
-                        let raw = format!("${{{name}:}}");
-                        WordPart::ParamExpansion {
-                            name: String::new(),
-                            modifier: ParamModifier::BadSubst { raw },
-                            quoted,
-                            subscript: None,
-                            indirect: false,
-                        }
-                    } else {
+                            quoted
+                        );
+                        expect_close!();
                         WordPart::ParamExpansion {
                             name,
-                            modifier: ParamModifier::Substring { offset, length },
+                            modifier: ParamModifier::UseDefault { word, colon },
                             quoted,
                             subscript,
                             indirect,
                         }
                     }
+                    ParamOpKind::AssignDefault(colon) => {
+                        let word = word_in_mode!(
+                            Mode::ParamWordOperand {
+                                in_dquote: false,
+                                enclosing_dquote: quoted,
+                                is_pattern: false
+                            },
+                            quoted
+                        );
+                        expect_close!();
+                        WordPart::ParamExpansion {
+                            name,
+                            modifier: ParamModifier::AssignDefault { word, colon },
+                            quoted,
+                            subscript,
+                            indirect,
+                        }
+                    }
+                    ParamOpKind::ErrorIfUnset(colon) => {
+                        // Production: `modifier_with_operand(chars, false, ...)` — NOT `quoted`.
+                        let word = word_in_mode!(
+                            Mode::ParamWordOperand {
+                                in_dquote: false,
+                                enclosing_dquote: false,
+                                is_pattern: false
+                            },
+                            false
+                        );
+                        expect_close!();
+                        WordPart::ParamExpansion {
+                            name,
+                            modifier: ParamModifier::ErrorIfUnset { word, colon },
+                            quoted,
+                            subscript,
+                            indirect,
+                        }
+                    }
+                    ParamOpKind::UseAlternate(colon) => {
+                        let word = word_in_mode!(
+                            Mode::ParamWordOperand {
+                                in_dquote: false,
+                                enclosing_dquote: quoted,
+                                is_pattern: false
+                            },
+                            quoted
+                        );
+                        expect_close!();
+                        WordPart::ParamExpansion {
+                            name,
+                            modifier: ParamModifier::UseAlternate { word, colon },
+                            quoted,
+                            subscript,
+                            indirect,
+                        }
+                    }
+
+                    // ── Pattern removal: RemovePrefix / RemoveSuffix
+                    // Production: `modifier_with_operand(chars, false, ...)` — enclosing_dquote=false.
+                    ParamOpKind::RemovePrefix(longest) => {
+                        let pattern = word_in_mode!(
+                            Mode::ParamWordOperand {
+                                in_dquote: false,
+                                enclosing_dquote: false,
+                                is_pattern: true
+                            },
+                            false
+                        );
+                        expect_close!();
+                        WordPart::ParamExpansion {
+                            name,
+                            modifier: ParamModifier::RemovePrefix { pattern, longest },
+                            quoted,
+                            subscript,
+                            indirect,
+                        }
+                    }
+                    ParamOpKind::RemoveSuffix(longest) => {
+                        let pattern = word_in_mode!(
+                            Mode::ParamWordOperand {
+                                in_dquote: false,
+                                enclosing_dquote: false,
+                                is_pattern: true
+                            },
+                            false
+                        );
+                        expect_close!();
+                        WordPart::ParamExpansion {
+                            name,
+                            modifier: ParamModifier::RemoveSuffix { pattern, longest },
+                            quoted,
+                            subscript,
+                            indirect,
+                        }
+                    }
+
+                    // ── Substitute: ${var/pat/repl} / ${var//…} / ${var/#…} / ${var/%…}
+                    // Pattern in ParamSubstPatternOperand (sep=/); replacement in ParamWordOperand.
+                    // Both operands: enclosing_dquote=false (mirrors scan_substitution_operand).
+                    // Absent replacement (no ParamSep) → empty Word, matching bash ${var/pat}.
+                    ParamOpKind::Substitute(subst_kind) => {
+                        let (anchor, all) = match subst_kind {
+                            SubstKind::First => (SubstAnchor::None, false),
+                            SubstKind::All => (SubstAnchor::None, true),
+                            SubstKind::Prefix => (SubstAnchor::Prefix, false),
+                            SubstKind::Suffix => (SubstAnchor::Suffix, false),
+                        };
+
+                        // Pattern in subst-pattern mode (sep = `/`).
+                        iter.push_mode(Mode::ParamSubstPatternOperand {
+                            in_dquote: false,
+                            enclosing_dquote: false,
+                        });
+                        let pattern = match parse_word(iter, false) {
+                            Ok(w) => {
+                                iter.pop_mode();
+                                w
+                            }
+                            Err(e) => {
+                                // Only the operand mode: `ParamExpansion` pops once
+                                // at the single exit (#643).
+                                iter.pop_mode();
+                                return Err(e);
+                            }
+                        };
+
+                        // Optional `/replacement`.
+                        let replacement = if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep))
+                        {
+                            iter.next_kind()?; // consume `/`
+                            word_in_mode!(
+                                Mode::ParamWordOperand {
+                                    in_dquote: false,
+                                    enclosing_dquote: false,
+                                    is_pattern: true
+                                },
+                                false
+                            )
+                        } else {
+                            Word(vec![])
+                        };
+
+                        expect_close!();
+                        WordPart::ParamExpansion {
+                            name,
+                            modifier: ParamModifier::Substitute {
+                                pattern,
+                                replacement,
+                                anchor,
+                                all,
+                            },
+                            quoted,
+                            subscript,
+                            indirect,
+                        }
+                    }
+
+                    // ── Case conversion: ${var^pat} / ${var^^} / ${var,pat} / ${var,,}
+                    // Production: `scan_optional_braced_operand` — empty body → None.
+                    ParamOpKind::Case(direction, all) => {
+                        let word = word_in_mode!(
+                            Mode::ParamWordOperand {
+                                in_dquote: false,
+                                enclosing_dquote: false,
+                                is_pattern: true
+                            },
+                            false
+                        );
+                        expect_close!();
+                        let pattern = if word.0.is_empty() { None } else { Some(word) };
+                        WordPart::ParamExpansion {
+                            name,
+                            modifier: ParamModifier::Case {
+                                direction,
+                                all,
+                                pattern,
+                            },
+                            quoted,
+                            subscript,
+                            indirect,
+                        }
+                    }
+
+                    // ── Transform: ${var@Q} / ${var@U} / etc.
+                    // No operand: the operator letter was already consumed by the head mode.
+                    // Only a ParamClose follows.
+                    ParamOpKind::Transform(op) => {
+                        expect_close!();
+                        WordPart::ParamExpansion {
+                            name,
+                            modifier: ParamModifier::Transform { op },
+                            quoted,
+                            subscript,
+                            indirect,
+                        }
+                    }
+
+                    // ── Substring: ${var:offset} / ${var:offset:length}
+                    // Offset in ParamSubstringOffsetOperand (sep = `:`); length in ParamWordOperand.
+                    // Empty offset (${var:}) → BadSubst, matching dispatch_braced_modifier's
+                    // `Some(':') / Some('}') → recover_bad_subst` branch.
+                    ParamOpKind::Substring => {
+                        // Offset in substring-offset mode (sep = `:`).
+                        iter.push_mode(Mode::ParamSubstringOffsetOperand {
+                            in_dquote: false,
+                            enclosing_dquote: false,
+                        });
+                        let offset = match parse_word(iter, false) {
+                            Ok(w) => {
+                                iter.pop_mode();
+                                w
+                            }
+                            Err(e) => {
+                                // Only the operand mode: `ParamExpansion` pops once
+                                // at the single exit (#643).
+                                iter.pop_mode();
+                                return Err(e);
+                            }
+                        };
+
+                        // Optional `:length`.
+                        let length = if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep)) {
+                            iter.next_kind()?; // consume `:`
+                            Some(word_in_mode!(
+                                Mode::ParamWordOperand {
+                                    in_dquote: false,
+                                    enclosing_dquote: false,
+                                    is_pattern: true
+                                },
+                                false
+                            ))
+                        } else {
+                            None
+                        };
+
+                        expect_close!();
+
+                        if offset.0.is_empty() {
+                            // `${x:}` — bad substitution at runtime.  Raw reconstructed from name.
+                            let raw = format!("${{{name}:}}");
+                            WordPart::ParamExpansion {
+                                name: String::new(),
+                                modifier: ParamModifier::BadSubst { raw },
+                                quoted,
+                                subscript: None,
+                                indirect: false,
+                            }
+                        } else {
+                            WordPart::ParamExpansion {
+                                name,
+                                modifier: ParamModifier::Substring { offset, length },
+                                quoted,
+                                subscript,
+                                indirect,
+                            }
+                        }
+                    }
                 }
             }
-        }
 
-        _ => {
-            restore_dq!();
-            iter.pop_mode(); // ParamExpansion
-            return Err(ParseError::UnsupportedExpansion);
-        }
-    };
+            _ => {
+                return Err(ParseError::UnsupportedExpansion);
+            }
+        };
 
-    // 6. Restore the M-156 gate flag and pop the ParamExpansion frame.
-    restore_dq!();
+        Ok(result)
+    })();
+
+    // 6. THE single exit: restore the M-156 gate and pop the ParamExpansion
+    // frame, on every path out of the closure above.
+    iter.set_in_dquote(saved_dq);
     iter.pop_mode();
-    Ok(result)
+    result
 }
 
 /// Recursively zero all source-line fields (`ExecCommand.line` /
