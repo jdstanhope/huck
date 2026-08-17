@@ -6473,6 +6473,45 @@ fn builtin_trap(
         return ExecOutcome::Continue(0);
     }
 
+    // #654: operands that are CONDITIONS rather than an action, i.e. a reset
+    // without the `-`. Two independent rules, both measured against bash 5.2.21
+    // rather than read off POSIX, because POSIX's wording ("if the first operand
+    // is an unsigned decimal integer") is not quite what bash implements:
+    //
+    //   trap 0            reset EXIT           a lone spec, numeric
+    //   trap INT          reset INT            a lone spec, NAME — so it is not
+    //                                          only the integer rule
+    //   trap 1 2          reset BOTH           first operand is a signal NUMBER
+    //   trap 64 2         reset both           64 is in range
+    //   trap 65 2         action `65` on INT   65 is NOT, so the integer rule
+    //   trap 999 2        action `999` on INT  does not apply and it is an action
+    //   trap EXIT INT     action `EXIT` on INT a NAME first operand is an action
+    //
+    // So the discriminator for the multi-operand form is "a valid signal NUMBER",
+    // not "an unsigned integer" and not "a valid spec". A lone operand is
+    // separate: any valid spec resets, and anything else falls through to the
+    // usage error below (`trap NOSUCHSIG` and `trap 999` are both rc 2).
+    let first_is_signal_number = rest
+        .first()
+        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+    let first_parses = rest.first().is_some_and(|s| parse_trap_signal(s).is_ok());
+    if (first_is_signal_number && first_parses) || (rest.len() == 1 && first_parses) {
+        for name in rest {
+            let sig = match parse_trap_signal(name) {
+                Ok(s) => s,
+                Err(msg) => {
+                    crate::sh_error_to!(shell, err, None, "trap: {msg}");
+                    return ExecOutcome::Continue(1);
+                }
+            };
+            if let Err(msg) = reset(shell, sig) {
+                crate::sh_error_to!(shell, err, None, "trap: {msg}");
+                return ExecOutcome::Continue(1);
+            }
+        }
+        return ExecOutcome::Continue(0);
+    }
+
     // `trap ACTION SIGNAL...`: install action for each signal.
     if rest.len() < 2 {
         // Same rc-2/posix-fatal correction as the reset-usage error above.

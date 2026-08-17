@@ -1500,6 +1500,19 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell) -> ExecOutcome {
         return ExecOutcome::Continue(1);
     }
 
+    // #656: stamp the header's line BEFORE expanding the word list. bash
+    // attributes an error raised while expanding the list — a failing command
+    // substitution, an unset variable under `set -u` — to the `for` header's own
+    // line. huck stamped only inside the per-value loop below (and, above, only
+    // for an invalid variable name), so the expansion ran with whatever
+    // `current_lineno` the PREVIOUS command happened to leave: `for p in
+    // $(nosuch)` on line 4 after a command on line 3 reported `line 3`, and the
+    // same `for` on line 1 printed NO `line N:` prefix at all, because nothing
+    // had run to leave a value behind and 0 suppresses the prefix.
+    if clause.line != 0 {
+        shell.current_lineno = shell.line_base() + clause.line;
+    }
+
     // Expand the word list once — the same path command arguments take.
     // The no-`in` form (`has_in == false`) iterates the positional
     // parameters ("$@"); an explicit empty `in` (`has_in == true`, empty
@@ -1899,6 +1912,15 @@ fn run_select(clause: &crate::command::SelectClause, shell: &mut Shell) -> ExecO
 }
 
 fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell) -> ExecOutcome {
+    // #656: stamp the header's line before expanding the list, for the same
+    // reason `run_for` does — an error raised while expanding belongs to the
+    // `select` header's line, and without this the expansion inherits whatever
+    // the previous command left in `current_lineno` (one line low in practice,
+    // and 0 — which suppresses the prefix entirely — at the top of a script).
+    if clause.line != 0 {
+        shell.current_lineno = shell.line_base() + clause.line;
+    }
+
     // 1. Build the item list: expand `in WORDS` (Some), or "$@" (None).
     let items: Vec<String> = match &clause.words {
         Some(words) => {

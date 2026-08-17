@@ -4463,7 +4463,28 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some('\\') if !squote => {
-                    if dquote {
+                    // #653: `\`+newline is a LINE CONTINUATION in every arithmetic
+                    // context — measured on `$((`, `$[`, `((`, a `for` header and
+                    // inside a double-quoted span. It precedes the escape tables
+                    // below rather than being one of their cases, because bash
+                    // removes BOTH characters before the expression text exists:
+                    // its error body for `$((1 + \<newline>@))` is exactly `1 + @`.
+                    // Retaining them made every continued expression die with
+                    // `unexpected character: '\'` and print garbage where bash
+                    // computes a value.
+                    //
+                    // The arm's own `!squote` guard is why a single-quoted span is
+                    // excluded: bash keeps that run literal and then REJECTS it (a
+                    // single-quoted operand is an arithmetic syntax error there,
+                    // where huck evaluates it — #660). If that is ever fixed, this
+                    // guard wants revisiting with it.
+                    let mut cont = self.cursor.clone();
+                    cont.next();
+                    let is_continuation = cont.peek() == Some(&'\n');
+                    if is_continuation {
+                        self.cursor.next(); // `\`
+                        self.cursor.next(); // the newline
+                    } else if dquote {
                         // Double-quote `\`-escape table (matches arith_string_to_word):
                         // `\` before `" \ $ ` `` drops the backslash and keeps the
                         // metachar; otherwise the `\` is literal and the next char is
