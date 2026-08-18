@@ -34,10 +34,15 @@ fn single_and_double_quotes_are_distinguishable() {
     //
     // The two arrive DIFFERENTLY, and the asymmetry is the lexer's: a
     // single-quoted run is ONE token carrying its style, while a double-quoted
-    // run is a FRAME (`BeginDquote` … `EndDquote`) around tokenised contents —
-    // which is what keeps expansions inside it separately visible. So single
-    // yields one mark and double yields two, and Task 6's pair records turn the
-    // latter into a single extent.
+    // run is a FRAME (`BeginDquote` … `EndDquote`) around tokenised contents,
+    // which is what keeps expansions inside it separately visible.
+    //
+    // Both still yield ONE mark, but by different routes. The frame's delimiter
+    // tokens are useless on their own — `BeginDquote` is zero-width, so its mark
+    // was `[10..10)` and `EndDquote` covered only the closing quote, which
+    // painted `"dq"` as exactly one character (John found that by using the
+    // shell). The run is therefore marked when it CLOSES, spanning the frame's
+    // `open_off`, and the delimiter tokens are skipped.
     let src = "echo 'sq' \"dq\"";
     assert_eq!(
         starts(src, Role::QuotedSingle),
@@ -46,9 +51,16 @@ fn single_and_double_quotes_are_distinguishable() {
     );
     assert_eq!(
         starts(src, Role::QuotedDouble),
-        vec![10, 13],
-        "both ends of the double-quoted run"
+        vec![10],
+        "one mark for the whole double-quoted run"
     );
+    // …and it spans the run, not just a delimiter — the actual regression.
+    let dq = record(src)
+        .marks
+        .into_iter()
+        .find(|m| m.role == Role::QuotedDouble)
+        .expect("a QuotedDouble mark");
+    assert_eq!(&src[dq.start..dq.end], "\"dq\"", "the whole run is covered");
 }
 
 #[test]

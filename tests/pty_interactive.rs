@@ -71,6 +71,13 @@ fn send(session: &mut OsSession, bytes: &str) {
 
 /// Reads the PTY stream until `needle` appears, or panics on timeout.
 /// `needle` is matched literally (not as a regex).
+///
+/// ⚠️ Choose needles that can only appear ONCE, at the point you mean. Since
+/// v363 the editor repaints prompt-and-line on every keystroke, so a prompt is
+/// emitted many times per line and `"> "` — which `"huck> "` also contains — no
+/// longer identifies a position. Prefer a marker that only the command's OUTPUT
+/// can produce, e.g. `echo TAG_$((6*7))` asserted as `TAG_42`: the typed line
+/// echoes the expression, only the output holds the value.
 fn expect(session: &mut OsSession, needle: &str) {
     session
         .expect(needle)
@@ -494,16 +501,29 @@ fn pty_ctrl_c_aborts_multiline_buffer() {
     // Start a multi-line `if`, then abort it with Ctrl-C.
     send(&mut session, "if true");
     send(&mut session, ENTER);
-    expect(&mut session, "> ");
+    // ⚠️ No `expect("> ")` here, and no `expect("huck> ")` after the abort.
+    // Both are AMBIGUOUS sync points: `"huck> "` itself contains `"> "`, and
+    // since v363 the editor repaints prompt-and-line on every keystroke, so each
+    // typed character emits another copy of the prompt. An intermediate expect
+    // then matches an arbitrary earlier repaint, the stream position drifts, and
+    // the final assertion times out looking for output that has already gone
+    // past. This test failed exactly that way in CI.
+    //
+    // The two remaining expects are unambiguous: the FIRST prompt, and a marker
+    // that can only come from the command's output. Continuation-prompt coverage
+    // is not lost — `pty_continuation_prompt_appears` asserts it directly.
     settle();
     send(&mut session, CTRL_C);
-    // After the abort the main prompt returns and the partial command
-    // is gone — a fresh `pwd` runs alone and prints the temp dir name.
-    expect(&mut session, "huck> ");
-    send(&mut session, "pwd");
-    send(&mut session, ENTER);
+    settle();
+    // After the abort the partial command is gone, so a fresh command runs alone.
+    // `pwd` proves the cwd; the arithmetic marker proves the OUTPUT was reached
+    // (it echoes as `CTRLC_$((6*7))` when typed and prints `CTRLC_42`, so a pass
+    // cannot be matching the echo of the line we just typed).
     let marker = dir.path().file_name().unwrap().to_str().unwrap();
+    send(&mut session, "pwd; echo CTRLC_$((6*7))");
+    send(&mut session, ENTER);
     expect(&mut session, marker);
+    expect(&mut session, "CTRLC_42");
     send(&mut session, "exit");
     send(&mut session, ENTER);
 }
