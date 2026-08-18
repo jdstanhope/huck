@@ -82,8 +82,14 @@ fn operators_are_marked() {
 }
 
 #[test]
-fn marks_never_overlap_and_stay_inside_the_line() {
-    // The extent invariant: every mark is non-empty, ordered, and in bounds.
+fn every_mark_is_ordered_and_inside_the_line() {
+    // The extent invariant: every mark is ordered and in bounds.
+    //
+    // NOT non-overlapping, and the old name of this test claimed otherwise.
+    // Marks nest ON PURPOSE — a `VarName` sits inside a `QuotedDouble` region, a
+    // `Glob` sits inside the word that holds it — and the painter resolves that
+    // by applying the widest first. A non-overlap assertion here would have been
+    // a false claim about the design.
     for src in [
         "echo 'sq' \"dq\" $HOME ${x:-d} $(date) | grep x",
         "for f in *.rs; do echo \"$f\"; done",
@@ -286,5 +292,82 @@ fn keywords_are_distinguished_from_command_words() {
     assert_eq!(
         roles("ls -la"),
         vec![("ls", Role::CommandWord), ("-la", Role::Word)],
+    );
+}
+
+#[test]
+fn glob_metacharacters_are_marked_but_not_the_word_around_them() {
+    // `*` is the whole signal: the reader wants to see WHICH characters will be
+    // expanded, not that the word contains one somewhere.
+    assert_eq!(
+        roles("ls *.rs")
+            .into_iter()
+            .filter(|(_, r)| *r == Role::Glob)
+            .collect::<Vec<_>>(),
+        vec![("*", Role::Glob)],
+    );
+    assert_eq!(
+        roles("ls a?c")
+            .into_iter()
+            .filter(|(_, r)| *r == Role::Glob)
+            .collect::<Vec<_>>(),
+        vec![("?", Role::Glob)],
+    );
+    // ⚠️ A bracket expression is deliberately NOT marked (#668). It is not
+    // reliably one literal run — `f[abc].rs` lexes as `f[`, `abc`, `.rs`,
+    // because the subscript scanner peels the brackets — so marking it would
+    // colour some bracket globs and silently skip others.
+    for src in ["ls f[abc].rs", "ls [ab]"] {
+        assert!(
+            !roles(src).iter().any(|(_, r)| *r == Role::Glob),
+            "{src}: bracket expressions are not marked yet"
+        );
+    }
+}
+
+#[test]
+fn a_quoted_glob_is_not_a_glob() {
+    // The distinction the colour is FOR: `'a*b'` matches a literal asterisk.
+    for src in ["ls 'a*b'", "ls \"a*b\"", "ls a\\*b"] {
+        assert!(
+            !roles(src).iter().any(|(_, r)| *r == Role::Glob),
+            "{src} must have no Glob mark: {:?}",
+            roles(src)
+        );
+    }
+    // A `*` inside a bracket expression is literal too — but see #668: brackets
+    // are not marked at all yet, so this only pins that the `*` is not claimed.
+    assert!(
+        !roles("ls 'f[a*b]'").iter().any(|(_, r)| *r == Role::Glob),
+        "a quoted bracket expression has no glob at all"
+    );
+}
+
+#[test]
+fn an_escape_is_marked_with_the_character_it_escapes() {
+    // Unquoted: `\$` is two source characters and one literal `$`.
+    assert_eq!(
+        roles("echo a\\$b")
+            .into_iter()
+            .filter(|(_, r)| *r == Role::Escape)
+            .collect::<Vec<_>>(),
+        vec![("\\$", Role::Escape)],
+    );
+    // Inside double quotes the scanner DROPS the backslash, so the token that
+    // survives says nothing about it — the mark is made where the drop happens.
+    assert_eq!(
+        roles("echo \"a\\$b\"")
+            .into_iter()
+            .filter(|(_, r)| *r == Role::Escape)
+            .collect::<Vec<_>>(),
+        vec![("\\$", Role::Escape)],
+    );
+    // A backslash inside double quotes that escapes NOTHING is not an escape:
+    // bash keeps both characters, and `\d` is literally `\d`.
+    assert!(
+        !roles("echo \"a\\db\"")
+            .iter()
+            .any(|(_, r)| *r == Role::Escape),
+        "a non-escaping backslash inside quotes is literal text"
     );
 }

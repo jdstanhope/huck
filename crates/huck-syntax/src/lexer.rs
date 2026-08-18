@@ -5995,6 +5995,27 @@ impl<'a> Lexer<'a> {
                     if boundary && ch == '~' {
                         break;
                     }
+                    // #666: mark the characters that will actually be expanded.
+                    // Recorded HERE because a literal run is coalesced into one
+                    // `Lit` — downstream there is no way to tell `*.rs` from a
+                    // file literally called that, which is exactly the
+                    // distinction the colour exists to make.
+                    //
+                    // `*` and `?` ONLY. A bracket expression is not reliably one
+                    // run: `ls f[abc].rs` lexes as `f[`, `abc`, `.rs` because the
+                    // subscript scanner peels the brackets, so marking `[…]` here
+                    // would colour `ls [ab]` and silently skip `ls f[ab].rs`.
+                    // Inconsistent colour is worse than none — filed as #668.
+                    if self.opts.record_highlight {
+                        let at = self.cursor.offset();
+                        if matches!(ch, '*' | '?') {
+                            self.hl.marks.push(crate::highlight::Mark {
+                                start: at,
+                                end: at + ch.len_utf8(),
+                                role: crate::highlight::Role::Glob,
+                            });
+                        }
+                    }
                     text.push(ch);
                     self.cursor.next();
                     // bash tilde-expands the prefix after the ASSIGNING `=` (word start, seeded by
@@ -6279,6 +6300,17 @@ impl<'a> Lexer<'a> {
                 match self.cursor.peek().copied() {
                     Some(e @ ('$' | '`' | '"' | '\\')) => {
                         self.cursor.next();
+                        // #666: the backslash is DROPPED here — the `Lit` that
+                        // survives is just `$`, and nothing downstream can tell
+                        // it from a `$` that was never escaped. So the mark is
+                        // made where the drop happens, spanning both characters.
+                        if self.opts.record_highlight {
+                            self.hl.marks.push(crate::highlight::Mark {
+                                start: off,
+                                end: self.cursor.offset(),
+                                role: crate::highlight::Role::Escape,
+                            });
+                        }
                         self.history.push(Token::new(
                             TokenKind::Lit {
                                 text: e.to_string(),
@@ -8043,6 +8075,18 @@ fn highlight_role(kind: &TokenKind) -> Option<crate::highlight::Role> {
         }
         | TokenKind::BeginDquote
         | TokenKind::EndDquote => Role::QuotedDouble,
+        // `\x` outside quotes DOES survive as a token of its own, so unlike the
+        // in-quotes case it needs no special recording — just a role.
+        TokenKind::QuoteRun {
+            style: QuoteStyle::Backslash,
+            ..
+        } => Role::Escape,
+        // `$'…'` is a quoted run that happens to interpret escapes; it reads as
+        // one piece of text, which is what `QuotedSingle` says.
+        TokenKind::QuoteRun {
+            style: QuoteStyle::AnsiC,
+            ..
+        } => Role::QuotedSingle,
         TokenKind::DollarName { .. } | TokenKind::ParamName(_) | TokenKind::ParamNameDecoded(_) => {
             Role::VarName
         }

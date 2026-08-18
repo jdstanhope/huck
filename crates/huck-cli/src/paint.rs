@@ -182,6 +182,34 @@ mod tests {
     }
 
     #[test]
+    fn a_glob_is_painted_inside_the_word_that_holds_it() {
+        // The mark is one character wide inside a four-character word, so this
+        // is also the layering test: the narrower mark must win.
+        let src = "ls *.rs";
+        let out = render(src, &rec_for(src), true);
+        assert!(out.contains("\x1b[34m*"), "the `*` itself is blue: {out:?}");
+        assert!(
+            !out.contains("\x1b[34m*.rs"),
+            "only the metacharacter is painted, not the word: {out:?}"
+        );
+        assert_eq!(strip_sgr(&out), src);
+    }
+
+    #[test]
+    fn an_escape_is_painted_over_the_quoted_region_it_sits_in() {
+        // `\$` inside `"…"` is TWO characters inside a region already painted
+        // yellow; the escape has to show through it.
+        let src = "echo \"a\\$b\"";
+        let out = render(src, &rec_for(src), true);
+        assert!(out.contains("\x1b[33m"), "the region is painted: {out:?}");
+        assert!(
+            out.contains("\x1b[96m\\$"),
+            "the escape shows through the region: {out:?}"
+        );
+        assert_eq!(strip_sgr(&out), src);
+    }
+
+    #[test]
     fn quotes_get_different_colours() {
         let src = "echo 'sq' \"dq\"";
         let out = render(src, &rec_for(src), true);
