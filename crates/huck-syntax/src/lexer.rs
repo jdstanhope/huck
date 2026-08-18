@@ -2081,11 +2081,43 @@ impl<'a> Lexer<'a> {
             return;
         }
         let step_end = self.cursor.offset();
+        // A double-quoted run is a FRAME, not a token, and that asymmetry with
+        // single quotes needs handling here or the run is all but invisible:
+        // `BeginDquote` is ZERO-WIDTH (its mark would be `[5..5)`) and
+        // `EndDquote` covers only the closing `"`, so `"dq"` painted exactly one
+        // character. Found by using the shell, not by a test.
+        //
+        // So the run is marked when it CLOSES, spanning the frame's own
+        // `open_off` — the offset v361 put on every `ModeFrame` — to the cursor.
+        // The frame is still on the stack at this point: the parser pops it after
+        // the step returns. Nothing new is tracked to make this work.
+        let dquote_run = if matches!(
+            self.history[from..].last().map(|t| &t.kind),
+            Some(TokenKind::EndDquote)
+        ) {
+            self.modes.last().and_then(|f| match f.mode {
+                Mode::DoubleQuote => Some(f.open_off),
+                _ => None,
+            })
+        } else {
+            None
+        };
         let mut pending: Vec<crate::highlight::Mark> = Vec::new();
+        if let Some(open) = dquote_run {
+            pending.push(crate::highlight::Mark {
+                start: open,
+                end: step_end,
+                role: crate::highlight::Role::QuotedDouble,
+            });
+        }
         for (i, tok) in self.history[from..].iter().enumerate() {
             let Some(role) = highlight_role(&tok.kind) else {
                 continue;
             };
+            // The frame mark above supersedes the two delimiter tokens.
+            if matches!(tok.kind, TokenKind::BeginDquote | TokenKind::EndDquote) {
+                continue;
+            }
             let next_start = self.history[from..]
                 .get(i + 1)
                 .map(|t| t.span.offset)

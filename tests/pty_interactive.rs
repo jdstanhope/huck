@@ -41,7 +41,18 @@ fn try_spawn(cwd: &Path, env: &[(&str, &str)]) -> Option<OsSession> {
     }
     match OsSession::spawn(cmd) {
         Ok(mut session) => {
-            session.set_expect_timeout(Some(Duration::from_secs(10)));
+            // 30 s, not 10. Since v363 the editor repaints the WHOLE line on
+            // every keystroke, so each session does several times the terminal
+            // I/O it used to. Individually every test here still finishes in a
+            // few seconds — `pty_multiline_if_runs` alone takes 4 s — but 26
+            // sequential pty sessions on a 1-core box pushed two or three of
+            // them past a 10 s expect, and WHICH ones moved between runs, which
+            // is the signature of contention rather than a broken expectation.
+            //
+            // Raising the ceiling rather than the sleeps on purpose: a timeout
+            // that is never reached costs nothing, while longer sleeps would slow
+            // every run whether or not the box is loaded.
+            session.set_expect_timeout(Some(Duration::from_secs(30)));
             Some(session)
         }
         Err(e) => {
@@ -442,15 +453,32 @@ fn pty_multiline_if_runs() {
     expect(&mut session, "huck> ");
     send(&mut session, "if true");
     send(&mut session, ENTER);
+    // The continuation prompt appears once here, BEFORE any body is typed, so
+    // this sync is unambiguous.
     expect(&mut session, "> ");
-    send(&mut session, "then echo MARKER42");
+    // ⚠️ The marker is written as an EXPANSION so the string that appears in the
+    // command's OUTPUT (`MARKER_42`) never appears in the ECHO of the typed line
+    // (`MARKER_$((6*7))`). Matching on the echo would pass without the `if` ever
+    // running. The repo's own `READY_$((6*7))` spawn probe uses the same trick.
+    send(&mut session, "then echo IFSYNC MARKER_$((6*7))");
     send(&mut session, ENTER);
-    expect(&mut session, "> ");
+    // ⚠️ DRAIN, not just sleep. Since v363 the editor repaints the whole line on
+    // every keystroke, so a session emits several times the bytes it used to. A
+    // test that only reads inside `expect` leaves that output in the pty buffer;
+    // once it fills, HUCK BLOCKS ON WRITE and stops consuming input, so the `if`
+    // never completes and the marker never arrives. That is what made this test
+    // fail intermittently — and which test failed moved between runs.
+    //
+    // Expecting the echo of a PLAIN word drains the buffer and syncs at once.
+    // The sync word must contain no shell metacharacters: an expansion in it
+    // would be painted, and the escape sequences interleaved into the echo would
+    // break a literal match.
+    expect(&mut session, "IFSYNC");
     send(&mut session, "fi");
     send(&mut session, ENTER);
     // The body runs only if the three lines were assembled into one
-    // complete `if` command.
-    expect(&mut session, "MARKER42");
+    // complete `if` command — and only the OUTPUT can contain this.
+    expect(&mut session, "MARKER_42");
     send(&mut session, "exit");
     send(&mut session, ENTER);
 }
@@ -513,14 +541,21 @@ fn pty_heredoc_simple() {
     expect(&mut session, "huck> ");
     send(&mut session, "cat <<EOF");
     send(&mut session, ENTER);
+    // Unambiguous: the continuation prompt is drawn once before any body typing.
     expect(&mut session, "> ");
-    send(&mut session, "PTY_HEREDOC_MARKER");
+    // ⚠️ An EXPANSION in the body, so what `cat` prints (`HEREDOC_42`) differs
+    // from the echo of the typed line (`HEREDOC_$((6*7))`). An unquoted heredoc
+    // delimiter expands the body, so this also proves the body took the
+    // expanding path rather than being copied verbatim.
+    send(&mut session, "HDSYNC HEREDOC_$((6*7))");
     send(&mut session, ENTER);
-    expect(&mut session, "> ");
+    // Drain + sync on a plain word — see `pty_multiline_if_runs` for why a sleep
+    // is not enough and why the word must have no metacharacters in it.
+    expect(&mut session, "HDSYNC");
     send(&mut session, "EOF");
     send(&mut session, ENTER);
     // `cat` echoes the body; the prompt must return afterwards.
-    expect(&mut session, "PTY_HEREDOC_MARKER");
+    expect(&mut session, "HEREDOC_42");
     expect(&mut session, "huck> ");
     send(&mut session, "exit");
     send(&mut session, ENTER);
