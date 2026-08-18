@@ -937,10 +937,15 @@ pub struct Shell {
     /// a loop and to cap the level argument to actual depth.
     pub loop_depth: u32,
 
-    /// Command-name hash table populated by the `hash` builtin.
-    /// Maps a bare name to (resolved path, hit count). Hit count
-    /// is currently always 0 — no executor integration yet (see
-    /// M-34 in docs/bash-divergences.md).
+    /// Command-name hash table. Maps a bare name to (resolved path, hit count).
+    ///
+    /// Populated both by the `hash` builtin and, since #655, by command
+    /// execution itself: a name resolved by PATH SEARCH is cached here and the
+    /// next invocation uses the cached path instead of walking PATH again,
+    /// bumping the hit count. `Shell::invalidate_command_hash_if_path` empties
+    /// it whenever PATH changes. (The stale `M-34 in docs/bash-divergences.md`
+    /// reference this comment used to carry outlived that doc entry — the
+    /// divergence moved to the issue tracker as #655 and is now closed.)
     pub command_hash: Rc<std::collections::HashMap<String, (std::path::PathBuf, u32)>>,
 
     /// Registration order of the live entries in `command_hash`, oldest
@@ -1597,6 +1602,18 @@ impl Shell {
                 self.shell_argv0 = value.to_string();
                 true
             }
+            // #655: any ASSIGNMENT to PATH invalidates the command hash table —
+            // the cached paths were resolved against the old value. bash flushes
+            // even when the value is unchanged (`PATH=$PATH`), and for every
+            // assignment form: `PATH=x`, `PATH+=:x`, `declare PATH=x`, and the
+            // command-prefix `PATH=$PATH cmd`. A bare `export PATH` assigns
+            // nothing and does NOT flush, which is why this hook (assignment)
+            // is the right place rather than the export path. Falls through to
+            // store the value, like POSIXLY_CORRECT below.
+            "PATH" => {
+                self.invalidate_command_hash_if_path(name);
+                false
+            }
             // bash re-checks POSIXLY_CORRECT on every assignment: assigning it
             // (any value) enables posix mode at runtime (v344 #327). Unlike the
             // vars above, it is a real environment variable and MUST still be
@@ -1972,6 +1989,9 @@ impl Shell {
         if name == "POSIXLY_CORRECT" {
             self.shell_options.posix = false;
         }
+        // #655: `unset PATH` invalidates the command hash table, exactly as an
+        // assignment to it does.
+        self.invalidate_command_hash_if_path(name);
         self.vars.remove(name);
     }
 
@@ -2013,6 +2033,8 @@ impl Shell {
         if name == "POSIXLY_CORRECT" {
             self.shell_options.posix = false;
         }
+        // #655: see `unset` — losing PATH invalidates every cached path.
+        self.invalidate_command_hash_if_path(name);
         // Nearest frame holding a snapshot for `name`, innermost-first
         // (the stack's top is the last element).
         let nearest = self
@@ -2069,6 +2091,21 @@ impl Shell {
         self.command_hash_created = true;
     }
 
+    /// The hashed path for `name`, if any (#655).
+    pub fn hash_lookup(&self, name: &str) -> Option<std::path::PathBuf> {
+        self.command_hash.get(name).map(|(p, _)| p.clone())
+    }
+
+    /// Count one INVOCATION of an already-hashed `name`. bash shows the hit
+    /// count in `hash`'s listing, and it counts invocations only — an entry
+    /// added by `hash NAME` or `hash -p PATH NAME` starts at 0 and reaches 1 the
+    /// first time the command actually runs.
+    pub fn hash_bump(&mut self, name: &str) {
+        if let Some((_, hits)) = Rc::make_mut(&mut self.command_hash).get_mut(name) {
+            *hits = hits.saturating_add(1);
+        }
+    }
+
     /// Remove `name` from the hash table. Returns whether it was there.
     pub fn hash_remove(&mut self, name: &str) -> bool {
         let had = Rc::make_mut(&mut self.command_hash).remove(name).is_some();
@@ -2110,7 +2147,24 @@ impl Shell {
 
     /// Restores `name` to `snapshot`: Some → reinstall; None →
     /// remove. Used by `call_function` on exit to undo `local`s.
+    /// #655: the command hash table caches paths resolved against the CURRENT
+    /// `PATH`, so anything that changes `PATH` must empty it. bash flushes on
+    /// every assignment form — `PATH=x`, `PATH+=:x`, `declare PATH=x`, the
+    /// command-prefix `PATH=$PATH cmd` and its restore afterwards, and `unset
+    /// PATH` — even when the value does not actually change. A bare `export
+    /// PATH` assigns nothing and does NOT flush.
+    ///
+    /// One helper rather than a `name == "PATH"` test at each of the four
+    /// mutation sites: the sites are easy to add to, and a new one that forgot
+    /// the rule would leave stale paths that resolve to the wrong binary.
+    fn invalidate_command_hash_if_path(&mut self, name: &str) {
+        if name == "PATH" {
+            self.hash_clear();
+        }
+    }
+
     pub fn restore_var(&mut self, name: &str, snapshot: Option<Variable>) {
+        self.invalidate_command_hash_if_path(name);
         match snapshot {
             Some(v) => {
                 self.vars.insert(name.to_string(), v);

@@ -1,6 +1,6 @@
 # huck vs bash 5.x — Intentional Divergences
 
-**Last updated:** 2026-07-25.
+**Last updated:** 2026-08-18.
 
 This document lists ONLY the divergences from bash 5.x that huck keeps **on
 purpose** — deliberate design choices we do not intend to "fix." Each one is
@@ -28,6 +28,18 @@ and merge. See `CLAUDE.md` for the full loop.
 huck behaves differently from bash here on purpose. Each links to its
 `by-design` tracking issue.
 
+
+### A stale hashed command path self-heals instead of failing
+
+[Issue #664 · by-design](https://github.com/jdstanhope/huck/issues/664)
+
+- **huck**: when the command hash table's cached path no longer exists, the entry is discarded and `PATH` is searched again — so a replacement further along `PATH` is found and run.
+- **bash**: execs the cached path regardless and reports `<cached path>: No such file or directory`, even when a good replacement is sitting in `PATH`. This is the familiar "I just installed it and the shell still can't see it — run `hash -r`" trap.
+- **Why**: it removes a well-known footgun with no scripting-visible downside, and it is the behaviour the planned fish-style command highlighting needs — a stale cache would colour a deleted command as valid. When nothing can be found the exit status still matches bash (127); only the message differs, and huck's names the command rather than a path that is gone.
+- **Cost**: one `stat` per invocation of an already-hashed command. Measured, 20 invocations of `expr`: 75 stat-family syscalls with hashing versus 341 without, so caching still wins by ~4.5x. That `stat` is the entire performance difference between the two policies.
+- **Scope**: ONLY the stale case. Population, hit counts, subshell isolation, lookup precedence, `type`/`command -V` reporting, `PATH`-assignment flushing and `set +h` all match bash exactly (#655), pinned by `tests/scripts/command_hash_lifecycle_diff_check.sh`.
+
+---
 
 ### `case` requires a separator before `esac`
 

@@ -9067,6 +9067,16 @@ enum CommandResolution {
     Builtin,
     Keyword,
     File(std::path::PathBuf),
+    /// Found in the command hash table (#655). Reported as
+    /// `NAME is hashed (/path)` and it SHADOWS the PATH match — measured:
+    /// `hash -p /bin/echo ls; type ls` says `ls is hashed (/bin/echo)`, not
+    /// `/usr/bin/ls`. `type -t` still says `file` and `-p`/`command -v` still
+    /// print the bare path, so only the long form names it.
+    ///
+    /// Deliberately NOT produced for `type -a`, which walks PATH and ignores
+    /// the table entirely — `hash -p /bin/echo zz; type -a zz` is `not found`
+    /// in bash even though plain `type zz` finds it.
+    Hashed(std::path::PathBuf),
     NotFound,
 }
 
@@ -9108,9 +9118,11 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 /// (bash reports the latter as 126 "Permission denied") from "found nothing"
 /// (127 "command not found"). `search_path_for` collapses the last two to `None`.
 pub(crate) enum PathClassify {
-    /// A PATH segment yielded an executable regular file (the resolved path is
-    /// not carried — the caller re-searches PATH via `execvp` on the bare name).
-    Executable,
+    /// A PATH segment yielded an executable regular file, and the resolved path.
+    /// It used to be dropped (the caller re-searched via `execvp` on the bare
+    /// name); the command hash table needs it, and so does exec-by-hashed-path
+    /// for a name that PATH alone cannot find — `hash -p /bin/echo zz; zz` (#655).
+    Executable(std::path::PathBuf),
     /// No executable, but at least one PATH segment yielded a non-executable
     /// regular file; carries the FIRST such resolved path (bash reports the
     /// first match in PATH order).
@@ -9136,7 +9148,7 @@ pub(crate) fn classify_path_search(name: &str, shell: &Shell) -> PathClassify {
         match std::fs::metadata(&candidate) {
             Ok(md) if md.is_file() => {
                 if md.permissions().mode() & 0o111 != 0 {
-                    return PathClassify::Executable;
+                    return PathClassify::Executable(candidate);
                 } else if first_nonexec.is_none() {
                     first_nonexec = Some(candidate);
                 }
@@ -9148,6 +9160,72 @@ pub(crate) fn classify_path_search(name: &str, shell: &Shell) -> PathClassify {
         Some(p) => PathClassify::NonExecutable(p),
         None => PathClassify::NotFound,
     }
+}
+
+/// Resolve a BARE command name for execution, consulting and maintaining the
+/// command hash table (#655). Callers handle a name containing `/` themselves —
+/// such a name is a path, and neither shell hashes it.
+///
+/// bash hashes every command it locates by PATH SEARCH, then uses the cached
+/// path next time instead of walking PATH again, bumping a hit count that
+/// `hash`'s listing shows. `set +h` (`hashall` off) disables the whole
+/// mechanism. Before this, huck's table was display-only: nothing populated it
+/// and nothing read it, so PATH was re-walked on every single invocation.
+///
+/// ⚠️ ONE DELIBERATE DIVERGENCE, kept by design (#664): when a cached path no
+/// longer exists, huck DISCARDS the entry and re-searches PATH. bash execs the
+/// stale path and fails with `No such file or directory` — the classic "I just
+/// installed it and the shell still can't find it, run `hash -r`" trap. huck
+/// self-heals instead. See docs/bash-divergences.md.
+/// Whether a resolution's hash-table WRITES should outlive it.
+///
+/// Not a policy knob — it mirrors where bash performs the search. A simple
+/// command is resolved in the current shell, so its entry and hit count stay.
+/// A pipeline stage or a background job is resolved inside the forked child, so
+/// bash's entry dies with that child and never reaches the parent's table:
+///
+///     expr 1 + 1 >/dev/null;             hash   ->   1  /usr/bin/expr
+///     expr 1 + 1 >/dev/null | cat;       hash   ->   hash table empty
+///     expr 1 + 1 >/dev/null &  wait;     hash   ->   hash table empty
+///     ( expr 1 + 1 >/dev/null );         hash   ->   hash table empty
+///     { expr 1 + 1 >/dev/null; };        hash   ->   1  /usr/bin/expr
+///
+/// Reading is always allowed — a child inherits the table, it just cannot send
+/// changes back.
+pub(crate) enum HashEffect {
+    /// Runs in THIS shell: an insert and its hit count persist.
+    Persist,
+    /// Runs in a forked child: consult the table, never write it.
+    Discard,
+}
+
+pub(crate) fn resolve_for_exec(name: &str, shell: &mut Shell, effect: HashEffect) -> PathClassify {
+    debug_assert!(
+        !name.contains('/'),
+        "resolve_for_exec is for bare names; a path is never hashed"
+    );
+    if !shell.shell_options.hashall {
+        return classify_path_search(name, shell);
+    }
+    let persist = matches!(effect, HashEffect::Persist);
+    if let Some(cached) = shell.hash_lookup(name) {
+        if is_executable_file(&cached) {
+            if persist {
+                shell.hash_bump(name);
+            }
+            return PathClassify::Executable(cached);
+        }
+        // The by-design divergence: forget the stale entry and search again.
+        if persist {
+            shell.hash_remove(name);
+        }
+    }
+    let found = classify_path_search(name, shell);
+    if persist && let PathClassify::Executable(ref path) = found {
+        shell.hash_insert(name, path.clone());
+        shell.hash_bump(name); // an insert starts at 0; this invocation makes it 1
+    }
+    found
 }
 
 pub(crate) fn search_path_for(name: &str, shell: &Shell) -> Option<std::path::PathBuf> {
@@ -9185,6 +9263,9 @@ fn resolve_command_name(name: &str, shell: &Shell) -> CommandResolution {
     }
     if is_shell_keyword(name) {
         return CommandResolution::Keyword;
+    }
+    if let Some(hashed) = shell.hash_lookup(name) {
+        return CommandResolution::Hashed(hashed);
     }
     if let Some(path) = search_path_for(name, shell) {
         return CommandResolution::File(path);
@@ -9235,6 +9316,9 @@ fn resolve_command_name_with(name: &str, shell: &Shell, skip_func: bool) -> Comm
     if is_shell_keyword(name) {
         return CommandResolution::Keyword;
     }
+    if let Some(hashed) = shell.hash_lookup(name) {
+        return CommandResolution::Hashed(hashed);
+    }
     if let Some(p) = search_path_for(name, shell) {
         return CommandResolution::File(p);
     }
@@ -9278,14 +9362,14 @@ fn emit_type_entry(
             CommandResolution::Function => "function",
             CommandResolution::Builtin => "builtin",
             CommandResolution::Keyword => "keyword",
-            CommandResolution::File(_) => "file",
+            CommandResolution::File(_) | CommandResolution::Hashed(_) => "file",
             CommandResolution::NotFound => return,
         };
         let _ = writeln!(out, "{word}");
         return;
     }
     if path_only {
-        if let CommandResolution::File(p) = res {
+        if let CommandResolution::File(p) | CommandResolution::Hashed(p) = res {
             let _ = writeln!(out, "{}", p.display());
         }
         return;
@@ -9308,6 +9392,9 @@ fn emit_type_entry(
         }
         CommandResolution::File(p) => {
             let _ = writeln!(out, "{name} is {}", p.display());
+        }
+        CommandResolution::Hashed(p) => {
+            let _ = writeln!(out, "{name} is hashed ({})", p.display());
         }
         CommandResolution::NotFound => {}
     }
@@ -9402,6 +9489,17 @@ fn builtin_hash(
     // huck used to run reset > delete > set_path > list, so `hash -dt ls`
     // deleted where bash reports, and `hash -p X -t ls` set where bash
     // reports the OLD entry.
+    // #655: `set +h` disables hashing, and then EVERY form of `hash` refuses —
+    // measured: `hash`, `hash -r`, `hash -l`, `hash -p X z`, `hash -d ls`,
+    // `hash -t ls` and `hash ls` all give this, rc 1. The check precedes option
+    // parsing, which is observable: `set +h; hash -Z` is `hashing disabled`
+    // (rc 1), NOT the `-Z: invalid option` usage error (rc 2) it gives with
+    // hashing on.
+    if !shell.shell_options.hashall {
+        crate::sh_error_to!(shell, err, None, "hash: hashing disabled");
+        return ExecOutcome::Continue(1);
+    }
+
     let mut reset = false;
     let mut delete = false;
     let mut list = false;
@@ -9630,6 +9728,15 @@ fn builtin_command(
                     let _ = writeln!(out, "{}", path.display());
                 } else {
                     let _ = writeln!(out, "{name} is {}", path.display());
+                }
+            }
+            // #655: `command -v` prints the bare path exactly as for a PATH
+            // find; only the verbose `command -V` names the table.
+            CommandResolution::Hashed(path) => {
+                if concise {
+                    let _ = writeln!(out, "{}", path.display());
+                } else {
+                    let _ = writeln!(out, "{name} is hashed ({})", path.display());
                 }
             }
             CommandResolution::NotFound => {
