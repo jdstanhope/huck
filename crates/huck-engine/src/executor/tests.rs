@@ -1853,8 +1853,12 @@ fn local_readonly_in_function_errors() {
 
 #[test]
 fn classify_runnability_bare_not_found_is_127() {
-    let shell = Shell::new();
-    match classify_command_runnability("definitely_no_such_cmd_xyz", &shell) {
+    let mut shell = Shell::new();
+    match classify_command_runnability(
+        "definitely_no_such_cmd_xyz",
+        &mut shell,
+        crate::builtins::HashEffect::Discard,
+    ) {
         StageRunnability::NotRunnable { body, code } => {
             assert_eq!(code, 127);
             assert_eq!(body, "definitely_no_such_cmd_xyz: command not found");
@@ -1865,8 +1869,12 @@ fn classify_runnability_bare_not_found_is_127() {
 
 #[test]
 fn classify_runnability_slash_not_found_is_127_no_such_file() {
-    let shell = Shell::new();
-    match classify_command_runnability("/no/such/path/xyz", &shell) {
+    let mut shell = Shell::new();
+    match classify_command_runnability(
+        "/no/such/path/xyz",
+        &mut shell,
+        crate::builtins::HashEffect::Discard,
+    ) {
         StageRunnability::NotRunnable { body, code } => {
             assert_eq!(code, 127);
             assert_eq!(body, "/no/such/path/xyz: No such file or directory");
@@ -1877,8 +1885,8 @@ fn classify_runnability_slash_not_found_is_127_no_such_file() {
 
 #[test]
 fn classify_runnability_directory_is_126_is_a_directory() {
-    let shell = Shell::new();
-    match classify_command_runnability("/etc", &shell) {
+    let mut shell = Shell::new();
+    match classify_command_runnability("/etc", &mut shell, crate::builtins::HashEffect::Discard) {
         StageRunnability::NotRunnable { body, code } => {
             assert_eq!(code, 126);
             assert_eq!(body, "/etc: Is a directory");
@@ -1898,9 +1906,9 @@ fn classify_runnability_non_executable_is_126_permission_denied() {
         writeln!(f, "#x").unwrap();
     }
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let shell = Shell::new();
+    let mut shell = Shell::new();
     let ps = p.to_str().unwrap();
-    match classify_command_runnability(ps, &shell) {
+    match classify_command_runnability(ps, &mut shell, crate::builtins::HashEffect::Discard) {
         StageRunnability::NotRunnable { body, code } => {
             assert_eq!(code, 126);
             assert_eq!(body, format!("{ps}: Permission denied"));
@@ -1912,16 +1920,16 @@ fn classify_runnability_non_executable_is_126_permission_denied() {
 
 #[test]
 fn classify_runnability_existing_binary_is_runnable() {
-    let shell = Shell::new();
+    let mut shell = Shell::new();
     // /bin/sh exists and is executable on the CI target.
     assert!(matches!(
-        classify_command_runnability("/bin/sh", &shell),
-        StageRunnability::Runnable
+        classify_command_runnability("/bin/sh", &mut shell, crate::builtins::HashEffect::Discard),
+        StageRunnability::Runnable { .. }
     ));
     // and a bare name found on PATH
     assert!(matches!(
-        classify_command_runnability("sh", &shell),
-        StageRunnability::Runnable
+        classify_command_runnability("sh", &mut shell, crate::builtins::HashEffect::Discard),
+        StageRunnability::Runnable { .. }
     ));
 }
 
@@ -1941,7 +1949,7 @@ fn classify_runnability_bare_non_executable_in_path_is_126() {
     std::fs::set_permissions(&foo, std::fs::Permissions::from_mode(0o644)).unwrap();
     let mut shell = Shell::new();
     shell.set("PATH", dir.to_str().unwrap().to_string());
-    match classify_command_runnability("foo", &shell) {
+    match classify_command_runnability("foo", &mut shell, crate::builtins::HashEffect::Discard) {
         StageRunnability::NotRunnable { body, code } => {
             assert_eq!(code, 126);
             assert_eq!(body, format!("{}: Permission denied", foo.display()));
@@ -1974,8 +1982,8 @@ fn classify_runnability_bare_executable_later_in_path_wins() {
     let mut shell = Shell::new();
     shell.set("PATH", format!("{}:{}", d1.display(), d2.display()));
     assert!(matches!(
-        classify_command_runnability("foo", &shell),
-        StageRunnability::Runnable
+        classify_command_runnability("foo", &mut shell, crate::builtins::HashEffect::Discard),
+        StageRunnability::Runnable { .. }
     ));
     let _ = std::fs::remove_dir_all(&d1);
     let _ = std::fs::remove_dir_all(&d2);
@@ -1988,7 +1996,7 @@ fn classify_runnability_bare_directory_in_path_is_not_found() {
     let _ = std::fs::create_dir_all(dir.join("foo"));
     let mut shell = Shell::new();
     shell.set("PATH", dir.to_str().unwrap().to_string());
-    match classify_command_runnability("foo", &shell) {
+    match classify_command_runnability("foo", &mut shell, crate::builtins::HashEffect::Discard) {
         StageRunnability::NotRunnable { body, code } => {
             assert_eq!(code, 127);
             assert_eq!(body, "foo: command not found");

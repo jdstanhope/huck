@@ -6170,7 +6170,37 @@ fn run_subprocess(
 ) -> ExecOutcome {
     let interactive = shell.job_control_active();
 
-    let mut process = ProcessCommand::new(&cmd.program);
+    // #655: resolve BEFORE building the command. Resolution consults/populates
+    // the command hash table and yields the path to spawn, so a bare name is
+    // exec'd by its resolved path instead of being re-searched by `execvp`, and
+    // a name only the hash table knows (`hash -p /bin/echo zz`) runs at all.
+    // The unrunnable verdict is carried to the pre_exec diagnostic below rather
+    // than being recomputed — resolution has a side effect (hashing) and must
+    // happen exactly once.
+    let runnability =
+        classify_command_runnability(&cmd.program, shell, builtins::HashEffect::Persist);
+    let exec_path = match &runnability {
+        StageRunnability::Runnable { exec_path } => exec_path.clone(),
+        StageRunnability::NotRunnable { .. } => None,
+    };
+
+    // ⚠️ argv[0] must stay the word AS WRITTEN. Spawning the resolved path makes
+    // `Command` default argv[0] to that path, and a program that prints its own
+    // argv[0] then changes its output: `cat /nonexistent` reported
+    // `/usr/bin/cat: …` instead of `cat: …`. bash execs the resolved path with
+    // argv[0] = the typed word (verified: plain `cat`, hashed `cat` and
+    // `/usr/bin/cat` give `cat:`, `cat:` and `/usr/bin/cat:` respectively), so
+    // set it explicitly whenever the spawn path differs from the word. Caught by
+    // four fd/redirect harnesses in the sweep, not by unit tests.
+    let mut process = ProcessCommand::new(
+        exec_path
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(&cmd.program)),
+    );
+    if exec_path.is_some() {
+        use std::os::unix::process::CommandExt as _;
+        process.arg0(&cmd.program);
+    }
     process.args(&cmd.args);
     process.env_clear();
     process.envs(shell.exported_env());
@@ -6241,9 +6271,7 @@ fn run_subprocess(
     // command, and the existing capture/wait/reap machinery collects the right
     // exit code. Mirrors the pipeline path's child-side emit (#78), reusing this
     // path's ProcessCommand scaffolding rather than a separate diagnostic fork.
-    if let StageRunnability::NotRunnable { body, code } =
-        classify_command_runnability(&cmd.program, shell)
-    {
+    if let StageRunnability::NotRunnable { body, code } = runnability {
         let mut diag: Vec<u8> = Vec::new();
         crate::emit_error_to(shell, &mut diag, None, format_args!("{body}"));
         unsafe {
@@ -8825,15 +8853,29 @@ fn classify_stage<'a>(cmd: &'a Command, shell: &Shell) -> StageKind<'a> {
 /// diagnostic body + exit code (127 not-found, 126 found-but-not-executable).
 #[derive(Debug)]
 enum StageRunnability {
-    Runnable,
-    NotRunnable { body: String, code: i32 },
+    /// Runnable. `exec_path` is what to actually spawn: for a BARE name the
+    /// hashed or PATH-resolved absolute path (#655), so the hash table can serve
+    /// a name `execvp` could never find (`hash -p /bin/echo zz; zz`) and PATH is
+    /// not walked a second time inside `execvp`. `None` for a name that already
+    /// contains a `/` — it is spawned exactly as written.
+    Runnable {
+        exec_path: Option<std::path::PathBuf>,
+    },
+    NotRunnable {
+        body: String,
+        code: i32,
+    },
 }
 
 /// Classify a resolved program string the way bash's command search + `execve`
 /// would, so an unrunnable command becomes a 126/127 diagnostic (the pipeline
 /// path forks a diagnostic child, #78; the single-command path emits from a
 /// `pre_exec` that `_exit`s, #172). Shared by both paths.
-fn classify_command_runnability(program: &str, shell: &Shell) -> StageRunnability {
+fn classify_command_runnability(
+    program: &str,
+    shell: &mut Shell,
+    effect: builtins::HashEffect,
+) -> StageRunnability {
     if program.contains('/') {
         match std::fs::metadata(program) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => StageRunnability::NotRunnable {
@@ -8852,7 +8894,7 @@ fn classify_command_runnability(program: &str, shell: &Shell) -> StageRunnabilit
                 // Executable bit? Use a real access(X_OK) so the errno text matches libc.
                 let c = std::ffi::CString::new(program).unwrap_or_default();
                 if unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0 {
-                    StageRunnability::Runnable
+                    StageRunnability::Runnable { exec_path: None }
                 } else {
                     let e = std::io::Error::last_os_error();
                     StageRunnability::NotRunnable {
@@ -8866,8 +8908,10 @@ fn classify_command_runnability(program: &str, shell: &Shell) -> StageRunnabilit
         // Bare name: walk PATH. A non-executable regular file found in PATH is
         // 126 "Permission denied" (reported with the resolved path, matching
         // bash's first-match-in-PATH-order); nothing found is 127 (#172).
-        match builtins::classify_path_search(program, shell) {
-            builtins::PathClassify::Executable => StageRunnability::Runnable,
+        match builtins::resolve_for_exec(program, shell, effect) {
+            builtins::PathClassify::Executable(path) => StageRunnability::Runnable {
+                exec_path: Some(path),
+            },
             builtins::PathClassify::NonExecutable(p) => StageRunnability::NotRunnable {
                 body: format!("{}: Permission denied", p.display()),
                 code: 126,
@@ -8933,21 +8977,28 @@ fn spawn_external_with_fds(
     // that prints `<name>: <reason>` to the stage's own (redirected) fd 2 and
     // exits 126/127, so the message routes correctly and PIPESTATUS is populated
     // (matching bash) instead of leaking a raw error and aborting the pipeline.
-    if let StageRunnability::NotRunnable { body, code } =
-        classify_command_runnability(&resolved.program, shell)
-    {
-        let mut diag: Vec<u8> = Vec::new();
-        crate::emit_error_to(shell, &mut diag, None, format_args!("{body}"));
-        return spawn_command_error_stage(
-            stdio,
-            pgid_target,
-            parent_fds_to_close,
-            plan.ops,
-            plan.held,
-            diag,
-            code,
-        );
-    }
+    // #655: resolution also consults/populates the command hash table, and hands
+    // back the path to spawn — so a bare name is exec'd by its resolved path
+    // rather than re-searched by `execvp`, and a name only the hash table knows
+    // (`hash -p /bin/echo zz`) runs at all.
+    let exec_path =
+        match classify_command_runnability(&resolved.program, shell, builtins::HashEffect::Discard)
+        {
+            StageRunnability::Runnable { exec_path } => exec_path,
+            StageRunnability::NotRunnable { body, code } => {
+                let mut diag: Vec<u8> = Vec::new();
+                crate::emit_error_to(shell, &mut diag, None, format_args!("{body}"));
+                return spawn_command_error_stage(
+                    stdio,
+                    pgid_target,
+                    parent_fds_to_close,
+                    plan.ops,
+                    plan.held,
+                    diag,
+                    code,
+                );
+            }
+        };
 
     if shell.shell_options.xtrace {
         let p4 = ps4(shell);
@@ -8967,7 +9018,23 @@ fn spawn_external_with_fds(
     let replay_ops: Vec<ChildRedirOp> = plan.ops;
     let held: Vec<std::os::fd::OwnedFd> = plan.held;
 
-    let mut process = ProcessCommand::new(&resolved.program);
+    // ⚠️ argv[0] must stay the word AS WRITTEN. Spawning the resolved path makes
+    // `Command` default argv[0] to that path, and a program that prints its own
+    // argv[0] then changes its output: `cat /nonexistent` reported
+    // `/usr/bin/cat: …` instead of `cat: …`. bash execs the resolved path with
+    // argv[0] = the typed word (verified: plain `cat`, hashed `cat` and
+    // `/usr/bin/cat` give `cat:`, `cat:` and `/usr/bin/cat:` respectively), so
+    // set it explicitly whenever the spawn path differs from the word. Caught by
+    // four fd/redirect harnesses in the sweep, not by unit tests.
+    let mut process = ProcessCommand::new(
+        exec_path
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(&resolved.program)),
+    );
+    if exec_path.is_some() {
+        use std::os::unix::process::CommandExt as _;
+        process.arg0(&resolved.program);
+    }
     process.args(&resolved.args);
     process.env_clear();
     process.envs(shell.exported_env());
