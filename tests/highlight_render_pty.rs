@@ -171,3 +171,24 @@ fn piped_stdin_emits_no_escapes_at_all() {
         "escape sequence leaked into piped-stdin output: {piped_text:?}"
     );
 }
+
+#[test]
+fn a_command_that_does_not_exist_is_painted_red() {
+    // The design's one loud signal, end to end (#666, Task 4).
+    //
+    // ⚠️ Only the POSITIVE half is assertable here. The stream carries every
+    // intermediate render, and while `echo` is being typed `e`, `ec` and `ech`
+    // are each genuinely not commands — so red appears on the way to a perfectly
+    // valid line. That is the intended behaviour (fish does the same), not
+    // something to assert against. "A command that resolves is left alone" is
+    // pinned on the finished line instead, in `completion_helper`'s unit tests,
+    // where the final state can actually be inspected.
+    let Some(mut session) = spawn() else { return };
+
+    typed(&mut session, "nosuchcmd_xyz");
+    let red = session.expect("\x1b[31m").is_ok();
+
+    abandon(&mut session);
+
+    assert!(red, "a command that does not resolve must be painted red");
+}

@@ -28,7 +28,9 @@ fn sgr(role: Role) -> &'static str {
         // Never reaches the map — `render` stores it as "no role" — but it is
         // spelled out so adding a role stays a compile error.
         Role::Word => "",
-        // Task 4 records this only for a command that does NOT resolve.
+        // Only a command that does NOT resolve keeps this role by the time the
+        // line is painted — `resolve_command_validity` demotes the rest to
+        // `Word`. So red on an ordinary line means "this will not run".
         Role::CommandWord => "31",  // red
         Role::Keyword => "1;34",    // bold blue
         Role::QuotedSingle => "32", // green  — inert text

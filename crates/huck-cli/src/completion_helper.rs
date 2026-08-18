@@ -27,6 +27,10 @@ pub struct HuckHelper {
     /// pipe huck, so stdout is not a terminal and nothing is painted. Task 7
     /// adds the shell option and the tests that pin all three conditions.
     colour_enabled: bool,
+    /// v363 (#666): what has already been established about the command words on
+    /// the line being typed. Cleared at every prompt (`clear_validity_cache`), so
+    /// a program installed on one line is seen on the next.
+    validity: RefCell<huck_engine::cmd_validity::ValidityCache>,
 }
 
 impl HuckHelper {
@@ -36,6 +40,68 @@ impl HuckHelper {
         Self {
             shell,
             colour_enabled,
+            validity: RefCell::new(huck_engine::cmd_validity::ValidityCache::new()),
+        }
+    }
+
+    /// Forget what was established about command names. The REPL calls this once
+    /// per prompt: it is what bounds staleness to a single line.
+    pub fn clear_validity_cache(&self) {
+        self.validity.borrow_mut().clear();
+    }
+
+    /// The roles for one line, ready to paint: parse it, then settle which
+    /// command words actually resolve.
+    ///
+    /// Separate from `highlight` so it can be tested without a terminal — the
+    /// colour gate would otherwise make every assertion vacuous.
+    ///
+    /// Parsed with NO aliases on purpose: expanding them would paint the
+    /// expansion's structure over text the user never typed.
+    fn highlight_record(&self, line: &str) -> huck_engine::highlight::HighlightRecord {
+        let no_aliases = std::collections::HashMap::new();
+        let opts = huck_engine::lexer::LexerOptions {
+            record_highlight: true,
+            ..Default::default()
+        };
+        let mut lx = huck_engine::lexer::Lexer::new(line, &no_aliases, opts);
+        let _ = huck_engine::parser::parse_sequence(&mut lx);
+        let mut rec = lx.take_highlight_record();
+        self.resolve_command_validity(line, &mut rec);
+        rec
+    }
+
+    /// v363 (#666): decide which command words are worth painting.
+    ///
+    /// The record marks command position — a fact about the grammar. Whether the
+    /// command EXISTS is a fact about this machine, and it is asked here, where
+    /// the shell is to hand. fish's restraint is the design: a command that
+    /// resolves is left alone, so the only colour on an ordinary line is the one
+    /// that means "this will not run".
+    ///
+    /// `Unknown` (the search budget was blown) is treated as valid. Painting a
+    /// name we declined to look up would be a guess shown in red.
+    fn resolve_command_validity(
+        &self,
+        line: &str,
+        rec: &mut huck_engine::highlight::HighlightRecord,
+    ) {
+        use huck_engine::cmd_validity::Validity;
+        use huck_engine::highlight::Role;
+        if !rec.marks.iter().any(|m| m.role == Role::CommandWord) {
+            return;
+        }
+        let mut shell = self.shell.borrow_mut();
+        let mut cache = self.validity.borrow_mut();
+        for m in rec.marks.iter_mut() {
+            if m.role != Role::CommandWord {
+                continue;
+            }
+            let end = m.end.min(line.len());
+            let name = line.get(m.start..end).unwrap_or("");
+            if cache.lookup(name, &mut shell) != Validity::Invalid {
+                m.role = Role::Word;
+            }
         }
     }
 }
@@ -87,14 +153,7 @@ impl Highlighter for HuckHelper {
         if !self.colour_enabled || line.is_empty() {
             return std::borrow::Cow::Borrowed(line);
         }
-        let no_aliases = std::collections::HashMap::new();
-        let opts = huck_engine::lexer::LexerOptions {
-            record_highlight: true,
-            ..Default::default()
-        };
-        let mut lx = huck_engine::lexer::Lexer::new(line, &no_aliases, opts);
-        let _ = huck_engine::parser::parse_sequence(&mut lx);
-        let rec = lx.take_highlight_record();
+        let rec = self.highlight_record(line);
         std::borrow::Cow::Owned(crate::paint::render(line, &rec, true))
     }
 
@@ -122,6 +181,68 @@ impl Helper for HuckHelper {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The roles a line ends up with, as `(text, role)` pairs.
+    fn roles(line: &str) -> Vec<(String, huck_engine::highlight::Role)> {
+        let helper = HuckHelper::new(Rc::new(RefCell::new(Shell::new())));
+        helper
+            .highlight_record(line)
+            .marks
+            .into_iter()
+            .map(|m| (line[m.start..m.end.min(line.len())].to_string(), m.role))
+            .collect()
+    }
+
+    #[test]
+    fn a_command_that_resolves_is_left_alone() {
+        use huck_engine::highlight::Role;
+        // fish's restraint: an ordinary working line carries no command colour
+        // at all, so the one command that will NOT run stands out.
+        let r = roles("echo hi");
+        assert!(
+            !r.iter().any(|(_, role)| *role == Role::CommandWord),
+            "a resolvable command must not keep the paint-me role: {r:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_that_does_not_resolve_keeps_the_role() {
+        use huck_engine::highlight::Role;
+        let r = roles("nosuchcmd_xyz hi");
+        assert!(
+            r.iter()
+                .any(|(t, role)| t == "nosuchcmd_xyz" && *role == Role::CommandWord),
+            "an unresolvable command must be marked: {r:?}"
+        );
+        // ...and the same inside a substitution, which is where it is easiest to
+        // miss a typo.
+        let r = roles("echo $(nosuchcmd_xyz)");
+        assert!(
+            r.iter()
+                .any(|(t, role)| t == "nosuchcmd_xyz" && *role == Role::CommandWord),
+            "a command inside a substitution is checked too: {r:?}"
+        );
+        assert!(
+            !r.iter()
+                .any(|(t, role)| t == "echo" && *role == Role::CommandWord),
+            "...while the outer, valid command stays plain: {r:?}"
+        );
+    }
+
+    #[test]
+    fn a_partly_typed_command_reads_as_invalid() {
+        use huck_engine::highlight::Role;
+        // Pinned deliberately, because it is what a user SEES: `ech` is not a
+        // command, so it is red until the `o` lands. fish behaves the same way,
+        // and the alternative — waiting for a word boundary — means the signal
+        // arrives after the mistake is already made.
+        let r = roles("ech");
+        assert!(
+            r.iter()
+                .any(|(t, role)| t == "ech" && *role == Role::CommandWord),
+            "{r:?}"
+        );
+    }
 
     #[test]
     fn helper_holds_rc_refcell_shell() {

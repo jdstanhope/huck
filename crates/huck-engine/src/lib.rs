@@ -18,6 +18,7 @@ pub mod builtins;
 pub(crate) mod capture_test_hook;
 pub(crate) mod child_fd;
 #[doc(hidden)]
+pub mod cmd_validity;
 pub mod completion;
 pub(crate) mod completion_builtins;
 pub(crate) mod completion_spec;
