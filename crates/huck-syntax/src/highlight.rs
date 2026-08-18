@@ -35,6 +35,16 @@
 /// context (a `Lit` is a `CommandWord`, a `Keyword`, or nothing at all).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
+    /// A bare unquoted word whose role the parser has not claimed — an
+    /// argument, a `case` pattern, a `for` variable. Painted plain.
+    ///
+    /// It is recorded anyway, and that is the point: the extent of a word is the
+    /// scanner's to know (escapes make it wider than its text), while what the
+    /// word MEANS is the parser's. The scanner lays down the extent, the parser
+    /// upgrades the role at consume time (`classify_consumed_word`). Without a
+    /// placeholder there would be nothing to upgrade, and re-deriving the extent
+    /// in a second place is how the two copies drift.
+    Word,
     /// The command word of a simple command — the thing whose existence is
     /// checked. Recorded at command position INCLUDING inside a substitution
     /// body, so the `nosuch` in `echo $(nosuch)` is marked in its own right.

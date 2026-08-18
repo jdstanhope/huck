@@ -1303,8 +1303,40 @@ pub(crate) struct Mark {
     /// checkpoint. (`recovery_capture` is instead reset to `None` in `rewind` — a
     /// rewind precedes genuine EOF, so any pending EOF snapshot is invalid.)
     recovery_frames: Vec<(usize, crate::recover::Frame)>,
-    recovery_cmd_word: bool,
+    word_context: WordContext,
     recovery_redirect_target: bool,
+}
+
+/// What the parser says the word it is about to assemble IS (v363, #666).
+///
+/// This began as `recovery_cmd_word: bool` — "would EOF recovery report Command
+/// here?" — which is a coarser question than "is this the command?". The bool
+/// answered `true` for a `for` loop's variable and a `case` subject as well as
+/// for a real command word, which is right for recovery and wrong for
+/// highlighting: it painted the `f` in `for f in *.rs` as a command, and would
+/// have painted it RED once validity checking landed.
+///
+/// Refining it rather than adding a second command-position notion is
+/// deliberate (#641): two notions drift, and the parser is the only thing that
+/// actually knows. `Subject` collapses back into `Command` for recovery, so that
+/// consumer's behaviour is unchanged by construction — see `is_cmd_word`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WordContext {
+    /// A command name, or a reserved word, is expected here.
+    Command,
+    /// A word that sits in command POSITION but names no command: a `for`/
+    /// `select` loop variable, a `case` subject or pattern.
+    Subject,
+    /// An argument, a word-list element, a redirect operand.
+    Argument,
+}
+
+impl WordContext {
+    /// What the old bool meant. `Subject` maps to `true` so EOF recovery keeps
+    /// reporting exactly what it reported before this enum existed.
+    pub(crate) fn is_cmd_word(self) -> bool {
+        matches!(self, WordContext::Command | WordContext::Subject)
+    }
 }
 
 /// Snapshot of lexer state at the FIRST real EOF reached under
@@ -1335,7 +1367,8 @@ pub(crate) struct RecoveryCapture {
     /// this — only a lone `$` at a word start. #248.
     pub(crate) trailing_lone_dollar: bool,
     /// The parser's command-vs-argument flag for the word being assembled at
-    /// EOF (`true` == command position). Set via `set_recovery_cmd_word`.
+    /// EOF (`true` == command-ish position). Derived from the parser's
+    /// `WordContext` via `is_cmd_word`, so `Subject` still reads as `true`.
     pub(crate) cmd_word: bool,
     /// The parser is assembling a bare redirect operand (`> whi`) at EOF. Set
     /// via `set_recovery_redirect_target`. Drives the LOWEST-priority
@@ -1519,7 +1552,7 @@ pub struct Lexer<'a> {
     // synthesized closer lands in the right place. They are transient and
     // invalidated by a rewind. Left as fields; converting them to arguments
     // means changing the recovery capture's signature, which is Task 7.
-    recovery_cmd_word: bool,
+    word_context: WordContext,
     /// Recovery: the parser sets this to `true` while assembling a bare redirect
     /// operand (`parse_one_redirect`'s target word) and back to `false` once the
     /// redirect is built, so the EOF capture records whether the cursor word is a
@@ -1569,7 +1602,7 @@ impl<'a> Lexer<'a> {
             heredoc_gen: 0,
             recover_last_depth: None,
             recovery_capture: None,
-            recovery_cmd_word: true,
+            word_context: WordContext::Command,
             recovery_redirect_target: false,
             recovery_frames: Vec::new(),
         }
@@ -1759,11 +1792,14 @@ impl<'a> Lexer<'a> {
         self.opts.recover_at_eof
     }
 
-    /// Recovery (Task 4): the parser declares whether the word it is about to
-    /// assemble is command-position (`true`, `consume_command_word`) or an
-    /// argument/list word (`false`). The EOF capture records the last value set.
-    pub(crate) fn set_recovery_cmd_word(&mut self, is_cmd: bool) {
-        self.recovery_cmd_word = is_cmd;
+    /// The parser declares what the word it is about to assemble IS.
+    ///
+    /// Read by two consumers with different needs: EOF recovery wants
+    /// "command-ish or not" (`WordContext::is_cmd_word`), and highlighting wants
+    /// the command word specifically (#666). One declaration, two readings —
+    /// rather than two flags that can disagree.
+    pub(crate) fn declare_word_context(&mut self, ctx: WordContext) {
+        self.word_context = ctx;
     }
 
     /// Recovery (iteration 2): the parser declares whether the word it is about
@@ -1935,7 +1971,7 @@ impl<'a> Lexer<'a> {
             word_start,
             last_is_dollar_name,
             trailing_lone_dollar,
-            cmd_word: self.recovery_cmd_word,
+            cmd_word: self.word_context.is_cmd_word(),
             redirect_target: self.recovery_redirect_target,
         }
     }
@@ -2131,6 +2167,100 @@ impl<'a> Lexer<'a> {
         self.hl.marks.append(&mut pending);
     }
 
+    /// v363 (#666): claim a consumed bare word's role for the parser.
+    ///
+    /// This is the half of highlighting that the scanner cannot answer. Command
+    /// position is a fact about what the PARSER expects, and the parser says so
+    /// (`declare_word_context`) immediately before it pulls — so the declaration
+    /// is reliable at the moment a token is handed out, and unreliable at the
+    /// moment it was scanned, because lookahead runs ahead of the declarations.
+    ///
+    /// It upgrades the `Word` placeholder the scanner already recorded rather
+    /// than pushing a mark of its own: the extent belongs to the scanner (an
+    /// escape makes a word wider than its text), the role belongs here. Rewind
+    /// re-consumes, and the last consume wins — which is the parse that stood.
+    fn classify_consumed_word(&mut self, tok: &Token) {
+        use crate::highlight::Role;
+        let TokenKind::Lit { quoted: false, .. } = &tok.kind else {
+            return;
+        };
+        if self.word_context != WordContext::Command {
+            return;
+        }
+        if let Some(m) = self
+            .hl
+            .marks
+            .iter_mut()
+            .rev()
+            .find(|m| m.start == tok.span.offset && m.role == Role::Word)
+        {
+            m.role = Role::CommandWord;
+        }
+    }
+
+    /// v363 (#666): the parser's verdict that a consumed word was a RESERVED
+    /// word, not a command.
+    ///
+    /// Split from `classify_consumed_word` deliberately. Position is the only
+    /// thing this file may judge: which words are reserved is the parser's list,
+    /// and the lexer may not reach into the parser at all — the one-way
+    /// front-end invariant, which has its own test (and which is a substring
+    /// check, so even naming the path in a comment fails it). So the lexer says
+    /// "command position" and the parser corrects the ones that are keywords.
+    pub(crate) fn claim_keyword_word(&mut self, start: usize) {
+        use crate::highlight::Role;
+        if let Some(m) = self
+            .hl
+            .marks
+            .iter_mut()
+            .rev()
+            .find(|m| m.start == start && m.role == Role::CommandWord)
+        {
+            m.role = Role::Keyword;
+        }
+    }
+
+    /// v363 (#666): is the highlight recorder on?
+    ///
+    /// Callers use it to skip work that exists only to feed the record — in
+    /// particular the extra `peek_span` a claim needs, which would otherwise
+    /// force a scan the parser had not asked for. Off, the claims cost nothing
+    /// and can change nothing.
+    pub(crate) fn recording_highlight(&self) -> bool {
+        self.opts.record_highlight
+    }
+
+    /// v363 (#666): take back the command-word role from an assignment prefix.
+    ///
+    /// `FOO=bar` is only recognisable as an assignment once the word is COMPLETE,
+    /// which is after its atoms have been consumed and classified — so this is a
+    /// correction rather than a declaration. The name becomes a variable name
+    /// (it is one), the value becomes plain text.
+    ///
+    /// It stops at the first `Expansion` mark inside the word, which is what
+    /// keeps `x=$(nosuch)` marking `nosuch` as the command it is. The known
+    /// limit: a literal AFTER an expansion in the value (`x=a$(f)b` — the `b`)
+    /// keeps a command-word role it should not have. Marking that correctly
+    /// needs the lexer'''s command-position state to be saved and restored across
+    /// expansion frames, which it is not (filed as a follow-on).
+    pub(crate) fn claim_assignment_word(&mut self, start: usize, end: usize) {
+        use crate::highlight::Role;
+        let mut named = false;
+        for m in self.hl.marks.iter_mut() {
+            if m.start < start || m.start >= end {
+                continue;
+            }
+            if m.role == Role::Expansion {
+                break;
+            }
+            if m.role != Role::CommandWord && m.role != Role::Keyword {
+                continue;
+            }
+            m.role = if named { Role::Word } else { Role::VarName };
+            named = true;
+        }
+    }
+
     /// v363 (#666): drain the marks this parse recorded.
     ///
     /// Takes rather than borrows so the caller owns the record and a second
@@ -2174,7 +2304,7 @@ impl<'a> Lexer<'a> {
             pending_lvalue_subscript: self.pending_lvalue_subscript,
             heredoc_gen: self.heredoc_gen,
             recovery_frames: self.recovery_frames.clone(),
-            recovery_cmd_word: self.recovery_cmd_word,
+            word_context: self.word_context,
             recovery_redirect_target: self.recovery_redirect_target,
         }
     }
@@ -2212,7 +2342,7 @@ impl<'a> Lexer<'a> {
         // that pushed a frame or flipped the flag inside the marked span must not
         // leave it stale after the rewind.
         self.recovery_frames = m.recovery_frames.clone();
-        self.recovery_cmd_word = m.recovery_cmd_word;
+        self.word_context = m.word_context;
         self.recovery_redirect_target = m.recovery_redirect_target;
         debug_assert_eq!(
             self.heredoc_gen, m.heredoc_gen,
@@ -2390,9 +2520,16 @@ impl<'a> Lexer<'a> {
         // reaches `history` through some `scan_step` branch — 121 push sites —
         // but they all pass through THIS wrapper, so the recorder observes the
         // tokens a step appended rather than being sprinkled across the
-        // scanners. It is also the point where `cmd_pos` still holds the
-        // position the step STARTED at, which is what makes command-word
-        // marking possible without exposing v361's state machine.
+        // scanners.
+        //
+        // Only LEXICAL roles are decided here — quotes, expansions, operators,
+        // and a plain `Word` placeholder for a bare literal. Whether that word is
+        // a command or a keyword is NOT knowable at scan time: the parser peeks
+        // ahead, so a token is often scanned one declaration too early (a
+        // `peek_kind` guard ahead of `for`'s variable scans the variable while
+        // `for` itself is still the declaration in force, which painted the `f`
+        // in `for f in *.rs` as a command). That half is settled at CONSUME time
+        // instead — see `classify_consumed_word`.
         let hl_from = if self.opts.record_highlight {
             Some(self.history.len())
         } else {
@@ -4801,6 +4938,16 @@ impl<'a> Lexer<'a> {
             // does not treat `#` as a stop char. No token is emitted.
             Some('#') if self.cmd_pos.at_word_start() => {
                 skip_line_comment(&mut self.cursor);
+                // #666: a comment emits NO token, so the highlight recorder — which
+                // reads the tokens a step produced — would never see it. Its extent
+                // is known exactly here and nowhere else, so it is recorded here.
+                if self.opts.record_highlight {
+                    self.hl.marks.push(crate::highlight::Mark {
+                        start: off,
+                        end: self.cursor.offset(),
+                        role: crate::highlight::Role::Comment,
+                    });
+                }
                 Ok(Step::Produced)
             }
 
@@ -6909,6 +7056,10 @@ impl<'a> Lexer<'a> {
         let t = self.history.get(self.pos).cloned();
         if t.is_some() {
             self.pos += 1;
+            if self.opts.record_highlight {
+                let tok = t.clone().expect("just checked");
+                self.classify_consumed_word(&tok);
+            }
         }
         Ok(t)
     }
@@ -7905,6 +8056,7 @@ fn highlight_role(kind: &TokenKind) -> Option<crate::highlight::Role> {
         | TokenKind::EndBacktick
         | TokenKind::ProcSubOpen { .. }
         | TokenKind::DollarLit { .. } => Role::Expansion,
+        TokenKind::Lit { quoted: false, .. } => Role::Word,
         TokenKind::Op(_) => Role::Operator,
         TokenKind::RedirFd(_) | TokenKind::Heredoc { .. } => Role::Redirect,
         TokenKind::Tilde { .. } => Role::Tilde,

@@ -273,9 +273,15 @@ fn up_arrow_recalls_previous() {
     expect(&mut session, "recallmarker"); // sync past the command
     expect(&mut session, "huck> "); // sync to the next prompt
     send(&mut session, UP);
-    // If up-arrow recalled the entry, the line is redrawn as the full
-    // previous command.
-    expect(&mut session, "echo recallmarker");
+    // If up-arrow recalled the entry, the line is redrawn with the previous
+    // command in it.
+    //
+    // ⚠️ The ARGUMENT is the needle, not the whole line: since #666 the command
+    // word is painted, so `echo recallmarker` is written to the terminal as
+    // `<SGR>echo<SGR> recallmarker` and no literal needle spans the two. The
+    // argument is unpainted, and this is read forward from the prompt we just
+    // synced on, so the next occurrence IS the redraw.
+    expect(&mut session, "recallmarker");
     send(&mut session, ENTER);
     expect(&mut session, "recallmarker"); // it ran again
     send(&mut session, "exit");
@@ -300,7 +306,8 @@ fn up_arrow_twice_recalls_older() {
     expect(&mut session, "huck> ");
     send(&mut session, UP);
     send(&mut session, UP);
-    expect(&mut session, "echo olderone");
+    // The unpainted ARGUMENT is the needle — see `up_arrow_recalls_previous`.
+    expect(&mut session, "olderone");
     send(&mut session, ENTER);
     expect(&mut session, "olderone");
     send(&mut session, "exit");
@@ -325,9 +332,10 @@ fn down_arrow_navigates_forward() {
     expect(&mut session, "huck> ");
     send(&mut session, UP);
     send(&mut session, UP);
-    expect(&mut session, "echo firstcmd");
+    // Unpainted ARGUMENTS are the needles — see `up_arrow_recalls_previous`.
+    expect(&mut session, "firstcmd");
     send(&mut session, DOWN);
-    expect(&mut session, "echo secondcmd");
+    expect(&mut session, "secondcmd");
     send(&mut session, ENTER);
     expect(&mut session, "secondcmd");
     send(&mut session, "exit");
@@ -366,10 +374,16 @@ fn ctrl_c_clears_partial_line() {
     // Type a partial line with NO Enter, then Ctrl-C.
     send(&mut session, "echo partialXYZ");
     send(&mut session, CTRL_C);
-    // After Ctrl-C rustyline discards the partial line and the loop
-    // redraws a fresh prompt. Sync to it before typing `pwd` so the
-    // keystrokes are not sent into the editor mid-redraw.
-    expect(&mut session, "huck> ");
+    // After Ctrl-C rustyline discards the partial line and the loop redraws a
+    // fresh prompt. Wait for the redraw before typing `pwd`, so the keystrokes
+    // are not sent into the editor mid-redraw.
+    //
+    // ⚠️ `expect("huck> ")` is NOT the way to wait for it. Every keystroke
+    // repaints prompt-and-line, so by this point the stream holds one prompt per
+    // character typed; the expect matches an EARLIER redraw, returns immediately,
+    // and the `pwd` goes out during the real redraw. `settle()` is the sync for a
+    // boundary with no unique output of its own (see its boundary #2).
+    settle();
     // Run `pwd`. If Ctrl-C cleared the partial line, `pwd` runs alone
     // and prints the cwd. If it did NOT clear, the line would be
     // `echo partialXYZpwd` and the cwd path would never be printed.

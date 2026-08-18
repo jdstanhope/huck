@@ -24,6 +24,10 @@ use huck_engine::highlight::{HighlightRecord, Role};
 /// where every word is coloured stops being readable.
 fn sgr(role: Role) -> &'static str {
     match role {
+        // A bare word the parser did not claim (an argument, a `case` pattern).
+        // Never reaches the map — `render` stores it as "no role" — but it is
+        // spelled out so adding a role stays a compile error.
+        Role::Word => "",
         // Task 4 records this only for a command that does NOT resolve.
         Role::CommandWord => "31",  // red
         Role::Keyword => "1;34",    // bold blue
@@ -69,8 +73,16 @@ pub fn render(line: &str, rec: &HighlightRecord, enabled: bool) -> String {
         // than panicking. Task 1 records zero-length marks for the zero-width
         // opener signals on purpose, so this is a normal path, not an error.
         let end = m.end.min(line.len());
+        // `Word` is the absence of a role, not a colour: it must still be
+        // APPLIED (a plain word inside a `"…"` region has to reset it) but it
+        // paints nothing.
+        let want = if m.role == Role::Word {
+            None
+        } else {
+            Some(m.role)
+        };
         for slot in role_at.iter_mut().take(end).skip(m.start) {
-            *slot = Some(m.role);
+            *slot = want;
         }
     }
 

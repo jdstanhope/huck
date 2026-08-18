@@ -138,3 +138,153 @@ fn an_unterminated_construct_records_no_mark_of_its_own() {
     );
     assert_eq!(rec.unterminated, None, "not wired until Task 6");
 }
+
+/// Every `(text, role)` pair the record holds, in source order — the shape the
+/// command-position tests below assert against.
+fn roles(src: &str) -> Vec<(&str, Role)> {
+    let mut v: Vec<_> = record(src)
+        .marks
+        .into_iter()
+        .map(|m| (&src[m.start..m.end.min(src.len())], m.role))
+        .collect();
+    v.retain(|(t, _)| !t.is_empty());
+    v
+}
+
+#[test]
+fn only_the_command_word_of_a_command_is_a_command_word() {
+    // The measurement that drove Task 3. Every row here was WRONG before it,
+    // and each is wrong in its own way:
+    //
+    //   * `for f in …` painted the loop VARIABLE as a command;
+    //   * `case … in a)` painted the PATTERN as one;
+    //   * `!` was a command rather than the reserved word it is;
+    //   * `FOO=bar cmd` painted the assignment red and missed `cmd` entirely.
+    //
+    // They share a root: command position was read when a token was SCANNED,
+    // and the parser's lookahead scans a token before it has said what it is.
+    // The role is settled at CONSUME time now, which is always after the
+    // declaration.
+    assert_eq!(
+        roles("for f in a; do echo $f; done"),
+        vec![
+            ("for", Role::Keyword),
+            ("f", Role::Word),
+            ("in", Role::Keyword),
+            ("a", Role::Word),
+            (";", Role::Operator),
+            ("do", Role::Keyword),
+            ("echo", Role::CommandWord),
+            ("$f", Role::VarName),
+            (";", Role::Operator),
+            ("done", Role::Keyword),
+        ],
+    );
+    assert_eq!(
+        roles("case $x in a) echo hi;; esac"),
+        vec![
+            ("case", Role::Keyword),
+            ("$x", Role::VarName),
+            ("in", Role::Keyword),
+            ("a", Role::Word),
+            (")", Role::Operator),
+            ("echo", Role::CommandWord),
+            ("hi", Role::Word),
+            (";;", Role::Operator),
+            ("esac", Role::Keyword),
+        ],
+    );
+    assert_eq!(
+        roles("! false"),
+        vec![("!", Role::Keyword), ("false", Role::CommandWord)],
+    );
+}
+
+#[test]
+fn an_assignment_prefix_is_a_variable_and_the_command_follows_it() {
+    // `FOO=bar cmd` — three separate claims:
+    //   the NAME is a variable name, the VALUE is plain text, and `cmd` is
+    //   still the command word even though it is the second word.
+    assert_eq!(
+        roles("FOO=bar cmd arg"),
+        vec![
+            ("FOO=", Role::VarName),
+            ("bar", Role::Word),
+            ("cmd", Role::CommandWord),
+            ("arg", Role::Word),
+        ],
+    );
+    // A bare assignment with no command at all.
+    assert_eq!(roles("FOO="), vec![("FOO=", Role::VarName)]);
+    // ⚠️ The row that keeps the claim honest: an assignment VALUE that is a
+    // command substitution still marks the command inside it. A claim that
+    // swept the whole word would paint `nosuch` as plain text.
+    assert_eq!(
+        roles("x=$(nosuch)")
+            .into_iter()
+            .filter(|(_, r)| *r != Role::Expansion)
+            .collect::<Vec<_>>(),
+        vec![
+            ("x=", Role::VarName),
+            ("nosuch", Role::CommandWord),
+            (")", Role::Operator),
+        ],
+    );
+}
+
+#[test]
+fn a_comment_is_marked_even_though_it_produces_no_token() {
+    // The recorder reads the tokens a step produced, and a comment produces
+    // none — the scanner just skips it. So the mark is made at the skip, which
+    // is the only place the comment's extent exists.
+    assert_eq!(
+        roles("echo hi # a note"),
+        vec![
+            ("echo", Role::CommandWord),
+            ("hi", Role::Word),
+            ("# a note", Role::Comment),
+        ],
+    );
+    // A `#` that does NOT begin a word is literal, not a comment.
+    assert!(
+        !roles("echo a#b").iter().any(|(_, r)| *r == Role::Comment),
+        "a mid-word `#` is not a comment"
+    );
+}
+
+#[test]
+fn a_command_inside_a_substitution_is_a_command_too() {
+    // Command position is nested, not a property of the line: the thing inside
+    // `$(…)` is checked in its own right, which is what makes an invalid command
+    // inside a substitution visible (Task 4).
+    let inner: Vec<_> = roles("echo $(nosuch)")
+        .into_iter()
+        .filter(|(_, r)| *r == Role::CommandWord)
+        .collect();
+    assert_eq!(
+        inner,
+        vec![("echo", Role::CommandWord), ("nosuch", Role::CommandWord)],
+    );
+}
+
+#[test]
+fn keywords_are_distinguished_from_command_words() {
+    assert_eq!(
+        roles("if true; then :; fi")
+            .into_iter()
+            .filter(|(_, r)| matches!(r, Role::Keyword | Role::CommandWord))
+            .collect::<Vec<_>>(),
+        vec![
+            ("if", Role::Keyword),
+            ("true", Role::CommandWord),
+            ("then", Role::Keyword),
+            (":", Role::CommandWord),
+            ("fi", Role::Keyword),
+        ],
+    );
+    // An option is an argument, not a command word — `ls -la` marks only `ls`.
+    assert_eq!(
+        roles("ls -la"),
+        vec![("ls", Role::CommandWord), ("-la", Role::Word)],
+    );
+}
