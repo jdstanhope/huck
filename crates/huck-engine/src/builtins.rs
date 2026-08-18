@@ -9184,11 +9184,13 @@ pub(crate) fn classify_path_search(name: &str, shell: &Shell) -> PathClassify {
 /// A pipeline stage or a background job is resolved inside the forked child, so
 /// bash's entry dies with that child and never reaches the parent's table:
 ///
-///     expr 1 + 1 >/dev/null;             hash   ->   1  /usr/bin/expr
-///     expr 1 + 1 >/dev/null | cat;       hash   ->   hash table empty
-///     expr 1 + 1 >/dev/null &  wait;     hash   ->   hash table empty
-///     ( expr 1 + 1 >/dev/null );         hash   ->   hash table empty
-///     { expr 1 + 1 >/dev/null; };        hash   ->   1  /usr/bin/expr
+/// ```text
+/// expr 1 + 1 >/dev/null;             hash   ->   1  /usr/bin/expr
+/// expr 1 + 1 >/dev/null | cat;       hash   ->   hash table empty
+/// expr 1 + 1 >/dev/null &  wait;     hash   ->   hash table empty
+/// ( expr 1 + 1 >/dev/null );         hash   ->   hash table empty
+/// { expr 1 + 1 >/dev/null; };        hash   ->   1  /usr/bin/expr
+/// ```
 ///
 /// Reading is always allowed — a child inherits the table, it just cannot send
 /// changes back.
