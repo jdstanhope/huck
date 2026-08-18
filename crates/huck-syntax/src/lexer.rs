@@ -1009,6 +1009,13 @@ struct PendingHeredoc {
 /// Lexer feature toggles resolved from shell state at tokenize time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LexerOptions {
+    /// v363 (#666): record `(span, role)` marks for interactive highlighting.
+    ///
+    /// OFF for every production parse. With it false the lexer must behave
+    /// bit-identically — the 3103-script parse sweep is the gate. Set only by
+    /// the line editor's highlighter, which parses a copy of the edit buffer
+    /// and throws the tree away.
+    pub record_highlight: bool,
     pub extglob: bool,
     /// True when the `${…}` currently being scanned is inside double quotes.
     /// Read ONLY by the extquote `$'…'`-name gate (M-156); it does NOT affect
@@ -1385,6 +1392,9 @@ pub struct Lexer<'a> {
     /// Byte offset the most recent scan step began at (#385) — see
     /// `last_step_start()`.
     last_step_start: usize,
+    /// v363 (#666): highlight marks recorded during THIS parse. Empty unless
+    /// `opts.record_highlight`. Drained by `take_highlight_record`.
+    hl: crate::highlight::HighlightRecord,
     /// Everything the last lex error's raise site observed about the open pairs,
     /// captured before the parser unwinds its frames. ONE field rather than three
     /// written side by side (#641 rule 3): they are read together, they are
@@ -1549,6 +1559,7 @@ impl<'a> Lexer<'a> {
                 open_off: 0,
                 entry: Entry::Body,
             }],
+            hl: crate::highlight::HighlightRecord::default(),
             err_site: None,
             retokenize_arith_as_cmdsub: false,
             cmd_pos: state::CommandPos::default(),
@@ -2052,6 +2063,50 @@ impl<'a> Lexer<'a> {
         self.retokenize_arith_as_cmdsub = true;
     }
 
+    /// v363 (#666): record marks for the tokens `scan_step` just appended.
+    ///
+    /// Extents TILE within the step: each token ends where the next one starts,
+    /// and the last ends at the cursor. That is why this runs per step rather
+    /// than once at the end — a step's tokens are contiguous, whereas deriving
+    /// extents across the whole stream would have to cope with rewinds
+    /// (`mark`/`rewind` discards history) and with lookahead pulled out of
+    /// order.
+    ///
+    /// A zero-width opener signal (`BeginDquote`, `CmdSubOpen`, `ArithOpen`)
+    /// yields a zero-length mark here on purpose: it records WHERE the
+    /// construct starts, and Task 6's pair records supply the extent. The
+    /// painter drops empty marks, so nothing is mis-rendered in the meantime.
+    fn record_highlight_marks(&mut self, from: usize) {
+        if from >= self.history.len() {
+            return;
+        }
+        let step_end = self.cursor.offset();
+        let mut pending: Vec<crate::highlight::Mark> = Vec::new();
+        for (i, tok) in self.history[from..].iter().enumerate() {
+            let Some(role) = highlight_role(&tok.kind) else {
+                continue;
+            };
+            let next_start = self.history[from..]
+                .get(i + 1)
+                .map(|t| t.span.offset)
+                .unwrap_or(step_end);
+            pending.push(crate::highlight::Mark {
+                start: tok.span.offset,
+                end: next_start.max(tok.span.offset),
+                role,
+            });
+        }
+        self.hl.marks.append(&mut pending);
+    }
+
+    /// v363 (#666): drain the marks this parse recorded.
+    ///
+    /// Takes rather than borrows so the caller owns the record and a second
+    /// call on the same lexer cannot double-count.
+    pub fn take_highlight_record(&mut self) -> crate::highlight::HighlightRecord {
+        std::mem::take(&mut self.hl)
+    }
+
     /// Checkpoint the scanning state for a later `rewind`. Must be called at a
     /// pull boundary (no partial word). The resume point is the span of the
     /// next-to-hand-out token when lookahead is buffered, else the live cursor.
@@ -2299,6 +2354,18 @@ impl<'a> Lexer<'a> {
     fn scan_step_guarded(&mut self) -> Result<Step, LexError> {
         self.last_step_start = self.cursor.offset();
         let before = self.cursor.consumed;
+        // v363 (#666): the ONE place highlight marks are recorded. Every token
+        // reaches `history` through some `scan_step` branch — 121 push sites —
+        // but they all pass through THIS wrapper, so the recorder observes the
+        // tokens a step appended rather than being sprinkled across the
+        // scanners. It is also the point where `cmd_pos` still holds the
+        // position the step STARTED at, which is what makes command-word
+        // marking possible without exposing v361's state machine.
+        let hl_from = if self.opts.record_highlight {
+            Some(self.history.len())
+        } else {
+            None
+        };
         // #385: capture where the innermost OPEN delimiter frame started while
         // it is still on the stack — the parser unwinds its frames on the way
         // out, so by the time a driver sees the error the stack is back to the
@@ -2348,6 +2415,9 @@ impl<'a> Lexer<'a> {
                 return Err(e);
             }
         };
+        if let Some(from) = hl_from {
+            self.record_highlight_marks(from);
+        }
         if matches!(step, Step::Produced) {
             if self.cursor.consumed == before {
                 self.stall_steps += 1;
@@ -7765,6 +7835,49 @@ fn skip_line_continuations(chars: &mut CharCursor<'_>) {
             return;
         }
     }
+}
+
+/// v363 (#666): which display ROLE a token kind carries, if any.
+///
+/// `None` for everything structural that the reader does not need coloured
+/// (`Blank`, `Newline`, the parser's internal signals). Context-dependent roles
+/// — a `Lit` that is a command word or a keyword — are NOT decided here; they
+/// need the command position, which Task 3 adds at the recorder.
+fn highlight_role(kind: &TokenKind) -> Option<crate::highlight::Role> {
+    use crate::highlight::Role;
+    Some(match kind {
+        // A single-quoted run arrives as ONE token carrying its style; a
+        // double-quoted run is a FRAME (BeginDquote … EndDquote) around its
+        // contents, which is what keeps expansions inside it separately
+        // visible. The asymmetry is the lexer's, and it is useful here.
+        TokenKind::QuoteRun {
+            style: QuoteStyle::Single,
+            ..
+        } => Role::QuotedSingle,
+        TokenKind::QuoteRun {
+            style: QuoteStyle::Double,
+            ..
+        }
+        | TokenKind::BeginDquote
+        | TokenKind::EndDquote => Role::QuotedDouble,
+        TokenKind::DollarName { .. } | TokenKind::ParamName(_) | TokenKind::ParamNameDecoded(_) => {
+            Role::VarName
+        }
+        TokenKind::ParamOpen { .. }
+        | TokenKind::ParamClose
+        | TokenKind::CmdSubOpen
+        | TokenKind::ArithOpen
+        | TokenKind::ArithClose
+        | TokenKind::LegacyArithOpen
+        | TokenKind::BeginBacktick
+        | TokenKind::EndBacktick
+        | TokenKind::ProcSubOpen { .. }
+        | TokenKind::DollarLit { .. } => Role::Expansion,
+        TokenKind::Op(_) => Role::Operator,
+        TokenKind::RedirFd(_) | TokenKind::Heredoc { .. } => Role::Redirect,
+        TokenKind::Tilde { .. } => Role::Tilde,
+        _ => return None,
+    })
 }
 
 /// Consumes a `#` line comment's body up to (but NOT including) the terminating

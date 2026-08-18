@@ -59,6 +59,7 @@ pub mod brace_expand;
 pub mod command;
 pub mod errors;
 pub mod generate;
+pub mod highlight;
 pub mod lexer;
 pub mod parser;
 pub mod recover;
