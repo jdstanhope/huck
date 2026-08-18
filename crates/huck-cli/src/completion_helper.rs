@@ -58,6 +58,71 @@ impl HuckHelper {
     ///
     /// Parsed with NO aliases on purpose: expanding them would paint the
     /// expansion's structure over text the user never typed.
+    /// v363 (#666): turn the pair the cursor is touching, and any dangling
+    /// opener, into marks the painter can lay down.
+    ///
+    /// Done here rather than inside `render` so the painter stays one thing:
+    /// "paint these extents". The cursor is the only input to highlighting that
+    /// is not a function of the TEXT, and keeping it out of the record means the
+    /// record is still a pure function of the line — which is what makes it
+    /// testable without a terminal.
+    ///
+    /// A pair's ends are WHOLE delimiters, not single characters: `$(` and `)`,
+    /// `${` and `}`, `$((` and `))`. Marking one character emphasised the `$` of
+    /// `$(` and left the bracket plain, which reads as off-by-one — reported from
+    /// using it.
+    ///
+    /// The delimiter's width comes from the mark the recorder already laid down
+    /// for the opener TOKEN (`$(` is one `Expansion` mark), so nothing re-derives
+    /// it from the text. A `"` has no such mark — its region mark spans the whole
+    /// string, which is not a delimiter — so it falls back to one character,
+    /// which is exactly right for a quote.
+    fn delimiter_extent(
+        rec: &huck_engine::highlight::HighlightRecord,
+        at: usize,
+    ) -> (usize, usize) {
+        use huck_engine::highlight::Role;
+        rec.marks
+            .iter()
+            .find(|m| m.start == at && m.end > m.start && m.role == Role::Expansion)
+            .map(|m| (m.start, m.end))
+            .unwrap_or((at, at + 1))
+    }
+
+    fn emphasise_pairs(rec: &mut huck_engine::highlight::HighlightRecord, cursor: usize) {
+        use huck_engine::highlight::{Mark, Role};
+        let mut pending: Vec<Mark> = Vec::new();
+        let mut add = |(start, end): (usize, usize), role: Role| {
+            pending.push(Mark { start, end, role });
+        };
+        if let Some(open) = rec.unterminated {
+            add(Self::delimiter_extent(rec, open), Role::DanglingOpener);
+        }
+        // The cursor sits BETWEEN characters, so a bracket is "under" it when the
+        // cursor is on it or just past it — which is where it lands the moment
+        // you type the thing.
+        //
+        // A degenerate record (`close <= open`) is dropped: `${x:-d}` pushes an
+        // OPERAND frame whose two ends are the same offset, and emphasising it
+        // would light up a character with no partner.
+        let touching: Vec<(usize, usize)> = rec
+            .pairs
+            .iter()
+            .filter(|p| p.close > p.open)
+            .filter(|p| {
+                let (_, open_end) = Self::delimiter_extent(rec, p.open);
+                let (_, close_end) = Self::delimiter_extent(rec, p.close);
+                (p.open..=open_end).contains(&cursor) || (p.close..=close_end).contains(&cursor)
+            })
+            .map(|p| (p.open, p.close))
+            .collect();
+        for (open, close) in touching {
+            add(Self::delimiter_extent(rec, open), Role::PairMatch);
+            add(Self::delimiter_extent(rec, close), Role::PairMatch);
+        }
+        rec.marks.append(&mut pending);
+    }
+
     fn highlight_record(&self, line: &str) -> huck_engine::highlight::HighlightRecord {
         let no_aliases = std::collections::HashMap::new();
         let opts = huck_engine::lexer::LexerOptions {
@@ -149,28 +214,44 @@ impl Highlighter for HuckHelper {
     ///
     /// The parse result is discarded; only the recorded marks are used. A parse
     /// ERROR is the normal case here, not a failure.
-    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
+    fn highlight<'l>(&self, line: &'l str, pos: usize) -> std::borrow::Cow<'l, str> {
         if !self.colour_enabled || line.is_empty() {
             return std::borrow::Cow::Borrowed(line);
         }
-        let rec = self.highlight_record(line);
+        let mut rec = self.highlight_record(line);
+        Self::emphasise_pairs(&mut rec, pos);
         std::borrow::Cow::Owned(crate::paint::render(line, &rec, true))
     }
 
     /// ⚠️ Defaults to FALSE in the trait — without this override rustyline never
     /// calls `highlight` again after the first render, so nothing updates as you
     /// type. Returning true unconditionally is what a 4-18 us parse buys.
-    fn highlight_char(&self, _line: &str, _pos: usize, kind: CmdKind) -> bool {
+    fn highlight_char(&self, line: &str, _pos: usize, kind: CmdKind) -> bool {
         // Only when the TEXT may have changed. Syntax colour is a function of
         // the line, not of where the cursor sits, so a bare cursor move needs no
         // repaint — and asking for one is not free: `true` here makes rustyline
         // do a FULL-LINE refresh, which on a 1-core box took the interactive pty
         // suite from 50 s to 92 s and timed four of its multiline rows out.
         //
-        // Task 6 (bracket matching) is the one thing that DOES depend on the
-        // cursor; it will re-enable `MoveCursor` for that case specifically
-        // rather than blanket-refreshing here.
-        self.colour_enabled && kind != CmdKind::MoveCursor
+        // Bracket matching (#666, Task 6) is the one thing that DOES depend on
+        // the cursor, so `MoveCursor` is answered by asking whether this line
+        // could possibly have a pair in it. That byte scan is a conservative
+        // SUPERSET — it says yes to `echo "hi"` and to a lone `(` alike — and it
+        // is not a second notion of what a pair is, because nothing is decided
+        // from it: a line that passes still gets the real parse, and a line that
+        // fails has no pair for the cursor to touch.
+        if !self.colour_enabled {
+            return false;
+        }
+        if kind != CmdKind::MoveCursor {
+            return true;
+        }
+        line.bytes().any(|b| {
+            matches!(
+                b,
+                b'(' | b')' | b'{' | b'}' | b'[' | b']' | b'"' | b'\'' | b'`'
+            )
+        })
     }
 }
 
@@ -241,6 +322,118 @@ mod tests {
             r.iter()
                 .any(|(t, role)| t == "ech" && *role == Role::CommandWord),
             "{r:?}"
+        );
+    }
+
+    /// The roles a line ends up with when the cursor sits at `pos`.
+    fn roles_at(line: &str, pos: usize) -> Vec<(String, huck_engine::highlight::Role)> {
+        let helper = HuckHelper::new(Rc::new(RefCell::new(Shell::new())));
+        let mut rec = helper.highlight_record(line);
+        HuckHelper::emphasise_pairs(&mut rec, pos);
+        rec.marks
+            .into_iter()
+            .map(|m| (line[m.start..m.end.min(line.len())].to_string(), m.role))
+            .collect()
+    }
+
+    #[test]
+    fn both_ends_of_the_pair_under_the_cursor_are_emphasised() {
+        // `echo $(date)` — the `$(` is at 5..7, the `)` at 11.
+        let ends = |pos: usize| matched("echo $(date)", pos);
+        // On the closer, and just past it — both ends light up either way.
+        assert_eq!(ends(11), vec!["$(".to_string(), ")".to_string()]);
+        assert_eq!(ends(12), vec!["$(".to_string(), ")".to_string()]);
+        // On the opener, and on its second character.
+        assert_eq!(ends(5), vec!["$(".to_string(), ")".to_string()]);
+        assert_eq!(ends(6), vec!["$(".to_string(), ")".to_string()]);
+        // Anywhere else, nothing — this is the half a pty test can actually see
+        // move when an arrow key is pressed.
+        assert!(
+            ends(9).is_empty(),
+            "cursor in the middle emphasises nothing"
+        );
+        assert!(ends(0).is_empty());
+    }
+
+    /// The text of every `PairMatch` mark, in record order.
+    fn matched(line: &str, pos: usize) -> Vec<String> {
+        use huck_engine::highlight::Role;
+        roles_at(line, pos)
+            .into_iter()
+            .filter(|(_, r)| *r == Role::PairMatch)
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    #[test]
+    fn a_whole_delimiter_is_emphasised_not_its_first_character() {
+        // ⚠️ Reported from USING the shell. Emphasising ONE character lit the `$`
+        // of `$(` and left the bracket plain — and `${x}` was worse, lighting the
+        // `x`, because a parameter expansion's frame is pushed AFTER its opener
+        // is consumed and so records where the BODY starts, not the construct.
+        assert_eq!(
+            matched("echo ${x}", 8),
+            vec!["${".to_string(), "}".to_string()]
+        );
+        assert_eq!(
+            matched("echo $((1+2))", 12),
+            vec!["$((".to_string(), "))".to_string()],
+            "a two-character closer is emphasised whole too"
+        );
+        assert_eq!(
+            matched("echo `date`", 10),
+            vec!["`".to_string(), "`".to_string()]
+        );
+        // A quote is one character and stays one: its region mark spans the whole
+        // string, which is not a delimiter.
+        assert_eq!(
+            matched("echo \"dq\"", 8),
+            vec!["\"".to_string(), "\"".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_pair_with_no_width_is_not_emphasised() {
+        // `${x:-d}` pushes an OPERAND frame whose two ends are the same offset;
+        // emphasising it lit a lone character with no partner.
+        for pos in 0..12 {
+            let m = matched("echo ${x:-d}", pos);
+            assert!(
+                m.is_empty() || m == vec!["${".to_string(), "}".to_string()],
+                "pos {pos} emphasised {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_inner_pair_is_the_one_that_matches() {
+        // `echo "$(date)"` — quotes at 5 and 13, `$(` at 6..8, `)` at 12. With
+        // the cursor on the inner closer only the inner pair answers, which is
+        // what makes nesting readable.
+        assert_eq!(
+            matched("echo \"$(date)\"", 12),
+            vec!["$(".to_string(), ")".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_dangling_opener_is_marked_wherever_the_cursor_is() {
+        use huck_engine::highlight::Role;
+        // Unlike the pair match this does not depend on the cursor: a construct
+        // left open is worth showing whether or not you are looking at it.
+        for pos in [0, 6, 9] {
+            let marked: Vec<String> = roles_at("echo \"abc", pos)
+                .into_iter()
+                .filter(|(_, r)| *r == Role::DanglingOpener)
+                .map(|(t, _)| t)
+                .collect();
+            assert_eq!(marked, vec!["\"".to_string()], "cursor at {pos}");
+        }
+        // A finished line has none.
+        assert!(
+            !roles_at("echo \"abc\"", 0)
+                .iter()
+                .any(|(_, r)| *r == Role::DanglingOpener)
         );
     }
 

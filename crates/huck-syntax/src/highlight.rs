@@ -67,6 +67,17 @@ pub enum Role {
     Redirect,
     /// A `#` comment, to end of line.
     Comment,
+    /// One end of the pair the cursor is touching. Both ends carry it, which is
+    /// the whole point: the eye finds the other one.
+    ///
+    /// Not a colour — the two emphasis roles are deliberately colour-FREE
+    /// (reverse video, underline), so they read on any theme and never collide
+    /// with the palette they are laid over.
+    PairMatch,
+    /// The opener of a construct that never closed — the `"` of `echo "abc`.
+    /// Answered by the same walk v362 built to decide which delimiter an EOF
+    /// names, so it is right about nesting rather than counting brackets.
+    DanglingOpener,
     /// A glob metacharacter run in an UNQUOTED literal (`*`, `?`, `[a-z]`).
     Glob,
     /// A backslash escape the scanner consumed (`\$`, `\"` inside `"…"`).

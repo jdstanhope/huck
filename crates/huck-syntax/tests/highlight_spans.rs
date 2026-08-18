@@ -132,17 +132,20 @@ fn an_unterminated_construct_records_no_mark_of_its_own() {
     //
     // A construct that never closes produces NO token — the scan fails at
     // end-of-input instead of emitting one — so there is nothing for the
-    // recorder to observe. Marking the dangling opener is `unterminated`'s job
-    // (Task 6), fed by the same walk v362 built for EOF diagnostics. Until then
-    // an unterminated quote is simply unpainted, which is honest: we do not yet
-    // claim to know where it ends.
+    // recorder to observe. The dangling opener is reported by `unterminated`
+    // instead, fed by the same walk v362 built for EOF diagnostics — a span with
+    // no end cannot be a REGION, but its start is exactly what a reader needs.
     let rec = record("echo 'unterminated");
     assert!(
         !rec.marks.iter().any(|m| m.role == Role::QuotedSingle),
-        "no QuotedSingle mark yet: {:?}",
+        "no QuotedSingle mark: {:?}",
         rec.marks
     );
-    assert_eq!(rec.unterminated, None, "not wired until Task 6");
+    assert_eq!(
+        rec.unterminated,
+        Some(5),
+        "...but the opener it is waiting on is named"
+    );
 }
 
 /// Every `(text, role)` pair the record holds, in source order — the shape the
@@ -370,4 +373,59 @@ fn an_escape_is_marked_with_the_character_it_escapes() {
             .any(|(_, r)| *r == Role::Escape),
         "a non-escaping backslash inside quotes is literal text"
     );
+}
+
+/// The `(open, close)` offsets of every pair the parse closed.
+fn pairs(src: &str) -> Vec<(usize, usize)> {
+    record(src)
+        .pairs
+        .into_iter()
+        .map(|p| (p.open, p.close))
+        .collect()
+}
+
+#[test]
+fn a_closed_construct_records_both_of_its_ends() {
+    // Both ends are known at the pop: the frame carries where it opened, and the
+    // parser is popping BECAUSE it just consumed the closer.
+    let src = "echo $(date)";
+    assert_eq!(
+        pairs(src),
+        vec![(5, 11)],
+        "the `$(` at 5 pairs with the `)` at 11"
+    );
+    let src = "echo \"dq\"";
+    assert_eq!(pairs(src), vec![(5, 8)], "the two quotes of `\"dq\"`");
+    // Nested pairs are all recorded — the inner one is what a cursor inside it
+    // needs to find.
+    let src = "echo \"$(date)\"";
+    let mut got = pairs(src);
+    got.sort();
+    assert_eq!(got, vec![(5, 13), (6, 12)]);
+}
+
+#[test]
+fn an_unterminated_construct_names_where_it_opened() {
+    // The dangling opener, from the same walk v362 built for EOF diagnostics:
+    // which pair is still open, and where did it start.
+    assert_eq!(record("echo \"abc").unterminated, Some(5));
+    assert_eq!(record("echo $(date").unterminated, Some(5));
+    assert_eq!(record("echo 'abc").unterminated, Some(5));
+    // A complete line has nothing dangling.
+    assert_eq!(record("echo \"abc\"").unterminated, None);
+    assert_eq!(record("echo hi").unterminated, None);
+}
+
+#[test]
+fn an_unterminated_construct_claims_no_pair() {
+    // ⚠️ Found by dumping a real pty stream, not by a test: the parser pops the
+    // same frames on the way OUT of a failed parse, and the "closer" is then
+    // whatever token happened to be last — so `echo $(d` claimed a pair and the
+    // editor reverse-videoed the `d`. A half-typed construct is the normal state
+    // while typing, so this was visible constantly.
+    assert_eq!(pairs("echo $(d"), Vec::new());
+    assert_eq!(pairs("echo \"abc"), Vec::new());
+    assert_eq!(pairs("echo ${x"), Vec::new());
+    // A pair that DID close before the line ran out is still recorded.
+    assert_eq!(pairs("echo $(date) \"abc"), vec![(5, 11)]);
 }

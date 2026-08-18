@@ -40,9 +40,14 @@ fn sgr(role: Role) -> &'static str {
         Role::Operator => "35",     // magenta
         Role::Redirect => "95",     // bright magenta
         Role::Comment => "90",      // grey
-        Role::Glob => "34",         // blue
-        Role::Escape => "96",       // bright cyan
-        Role::Tilde => "34",        // blue
+        // The two emphasis roles carry NO colour: they sit on top of whatever
+        // the palette already put there, and they have to read on a light theme
+        // and a dark one alike.
+        Role::PairMatch => "7",      // reverse video — the editor convention
+        Role::DanglingOpener => "4", // underline: "still open", not "wrong"
+        Role::Glob => "34",          // blue
+        Role::Escape => "96",        // bright cyan
+        Role::Tilde => "34",         // blue
     }
 }
 

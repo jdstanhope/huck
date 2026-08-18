@@ -2029,11 +2029,43 @@ impl<'a> Lexer<'a> {
             "Command is the floor and must never be popped"
         );
         let popped_depth = self.mode_depth();
-        let popped = self
-            .modes
-            .pop()
-            .expect("pop_mode on an empty mode stack")
-            .mode;
+        let frame = self.modes.pop().expect("pop_mode on an empty mode stack");
+        // #666: a pair's two ends are only ever both in hand HERE. The frame
+        // carries where it opened (v361), and the parser is popping precisely
+        // because it has just consumed the closer — so the closer is the last
+        // token handed out. Recording it anywhere else would mean deciding, per
+        // scanner, which `)` closes what, which is the parser's judgement.
+        //
+        // ⚠️ Unless it is popping because it GAVE UP. A parser unwinding out of
+        // `echo $(d` pops the same frame, and the "closer" is then whatever the
+        // last token happened to be — which made `echo $(d` claim a pair and
+        // reverse-video the `d` under the cursor. Found by dumping a real pty
+        // stream, not by a test. `unterminated` is already set by then, and it
+        // is exactly the right signal: once a construct is known to be dangling,
+        // every later pop on this line is an unwind.
+        if self.opts.record_highlight
+            && self.hl.unterminated.is_none()
+            && let Some(closer) = self.pos.checked_sub(1).and_then(|i| self.history.get(i))
+            && closer.span.offset >= frame.open_off
+        {
+            // ⚠️ `open_off` is NOT uniformly the first character of the construct,
+            // which is a real trap and was a visible bug: for `$(`, `` ` `` and
+            // `"` it is where the construct starts, but for `${` the frame is
+            // pushed AFTER the opener is consumed, so it points at the BODY —
+            // `${x}` reported the `x`. v362 got away with it because it reports
+            // LINES. v361 already recorded the answer as `ParamExpansion`'s
+            // `start_off` (the `$`), so this reads that rather than adding a
+            // second offset to the frame.
+            let open = match frame.mode {
+                Mode::ParamExpansion { start_off, .. } => start_off,
+                _ => frame.open_off,
+            };
+            self.hl.pairs.push(crate::highlight::PairSpan {
+                open,
+                close: closer.span.offset,
+            });
+        }
+        let popped = frame.mode;
         // Delayed heredoc across a comsub/backtick boundary: a `cat <<D` opened
         // INSIDE a command substitution whose `)`/`` ` `` closes before D's body
         // was collected (`echo $(cat <<D)\n…body…\nD`). bash collects such a
@@ -2568,6 +2600,12 @@ impl<'a> Lexer<'a> {
                             _
                         ))
                     );
+                // #666: the same question, for a different consumer. A line
+                // being typed is unterminated most of the time, and the opener
+                // it is waiting on is the useful thing to show. Computed from
+                // the walk below rather than repeated — `err_site.off` IS
+                // "where the innermost still-open pair started".
+                let record_dangling = self.opts.record_highlight;
                 self.err_site = Some(pairs::ErrorSite {
                     off: match walked {
                         Some((_, off)) if !atom_scanned_quote => off,
@@ -2581,11 +2619,30 @@ impl<'a> Lexer<'a> {
                     },
                     in_compound_assign: pairs::in_compound_assign(&self.modes),
                 });
+                if record_dangling && self.hl.unterminated.is_none() {
+                    self.hl.unterminated = self.err_site.as_ref().map(|site| site.off);
+                }
                 return Err(e);
             }
         };
         if let Some(from) = hl_from {
             self.record_highlight_marks(from);
+        }
+        // #666: the OTHER way a construct is left open. A quote that never closes
+        // raises a `LexError` (handled above), but a `$(` that never closes does
+        // not — the inner scanner simply reaches end of input and the PARSER
+        // reports it. Both are "a frame is still open at EOF", so both answer
+        // with the same walk. First observation wins: the stack only gets
+        // shallower as the parser unwinds.
+        if self.opts.record_highlight
+            && matches!(step, Step::Eof)
+            && self.mode_depth() > 1
+            && self.hl.unterminated.is_none()
+        {
+            self.hl.unterminated = Some(match pairs::reported_pair(&self.modes) {
+                Some((_, off)) => off,
+                None => self.modes.last().map_or(0, |f| f.open_off),
+            });
         }
         if matches!(step, Step::Produced) {
             if self.cursor.consumed == before {

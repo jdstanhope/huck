@@ -192,3 +192,65 @@ fn a_command_that_does_not_exist_is_painted_red() {
 
     assert!(red, "a command that does not resolve must be painted red");
 }
+
+#[test]
+fn moving_the_cursor_onto_a_bracket_re_renders_it_emphasised() {
+    // The one part of highlighting that is NOT a function of the text, so it is
+    // the one part a unit test cannot reach: rustyline has to ASK for a repaint
+    // when only the cursor moved (#666, Task 6).
+    //
+    // ⚠️ The obvious version of this test is not load-bearing, and a sabotage run
+    // proved it: with the `MoveCursor` repaint switched off, rustyline redraws
+    // the line from its CACHED painted string, so the emphasis computed while
+    // typing is still in the stream and any "did reverse video appear" needle
+    // matches. The needle has to be one that the cached string CANNOT contain.
+    //
+    // So the emphasis is moved to a DIFFERENT pair than the one it was last
+    // computed for, and the needle names which:
+    //
+    //   1. type `echo $(date)` — the cursor lands just past `)`, so the `$(`
+    //      pair is emphasised and `<reverse>$` appears once;
+    //   2. type ` "x"` — the cursor is now on the QUOTE pair, so every later
+    //      render emphasises `"`, never `$`;
+    //   3. Ctrl-A, then five RIGHTs, puts the cursor on the `$` at offset 5.
+    //      A stale cached render still says `"`; only a fresh parse says `$`.
+    let Some(mut session) = spawn() else { return };
+
+    typed(&mut session, "echo $(date)");
+    let while_typing = session.expect("\x1b[7m$").is_ok();
+
+    typed(&mut session, " \"x\"");
+    typed(&mut session, "\x01"); // Ctrl-A — beginning of line
+    for _ in 0..5 {
+        let _ = session.send("\x1b[C"); // RIGHT
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    let after_moving = session.expect("\x1b[7m$").is_ok();
+
+    abandon(&mut session);
+
+    assert!(while_typing, "closing the pair did not emphasise it");
+    assert!(
+        after_moving,
+        "moving the cursor onto the `$(` did not re-render its pair"
+    );
+}
+
+#[test]
+fn a_whole_delimiter_is_emphasised_end_to_end() {
+    // ⚠️ Reported from USING the shell, which is why this row exists at the pty
+    // layer too: emphasising a single character lit the `$` of `$(` and left the
+    // bracket plain, and `${x}` lit the `x`. The needle is the WHOLE opener with
+    // reverse video in front of it, so a one-character emphasis cannot match it.
+    let Some(mut session) = spawn() else { return };
+
+    typed(&mut session, "echo ${x}");
+    let braced = session.expect("\x1b[7m${").is_ok();
+
+    abandon(&mut session);
+
+    assert!(
+        braced,
+        "the brace opener was not emphasised as one delimiter"
+    );
+}
