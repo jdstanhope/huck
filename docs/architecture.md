@@ -508,15 +508,22 @@ different rates: not-a-tty and `NO_COLOR` are resolved once at construction,
 `shopt -u syntax_highlight` is read live. That option is huck's own and lives in
 `HUCK_SHOPT_TABLE`, deliberately NOT in bash's `SHOPT_TABLE` — bare `shopt`,
 `shopt -p` and `compgen -A shopt` print that table and are compared with bash
-byte for byte. Configurable COLOURS are #667; bracket globs are #668; continuation lines are
-#670. `tests/pty_interactive.rs` runs with `NO_COLOR=1` — it is a REPL-behaviour
+byte for byte. Configurable COLOURS are #667; bracket globs are #668.
+`tests/pty_interactive.rs` runs with `NO_COLOR=1` — it is a REPL-behaviour
 suite, painting multiplied its terminal traffic about fivefold, and on one core
 that starved its sessions (110 s with two failures, 33 s and green without).
 
-A **continuation line is barely painted**, and the reason is structural: it is
-parsed on its own, so `then echo hi` has no `if` in front of it, the parse fails
-at the first word, and only what was scanned before the failure can be marked.
-Highlighting the accumulated command instead of the physical line is #670.
+A **continuation line is parsed with what it continues** (#670, #673). On its
+own `then echo hi` has no `if` in front of it, so the parse fails at the first
+word and there is nothing to colour — and nothing to complete either, since
+completion is parser-driven too. The REPL publishes the accumulated buffer plus
+its joiner once per prompt (`HuckHelper::set_line_prefix`, read from the same two
+values the reader's own append uses), and the record is rebased onto the visible
+line: a REGION that starts above is clamped to column zero, a PAIR is kept only
+when both ends are visible, and a DANGLING OPENER above the line is dropped
+rather than moved. Completion resolves over the same text and shifts its start
+back; a completion that would start above the line is declined, because rustyline
+can only replace within the line it shows.
 
 Gates: `crates/huck-syntax/tests/highlight_spans.rs` (the record is a pure
 function of the text), `paint.rs`'s own tests (layering and the width contract),

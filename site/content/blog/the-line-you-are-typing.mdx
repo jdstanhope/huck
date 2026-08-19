@@ -103,12 +103,13 @@ them.
 
 ## What is still open
 
-A continuation line — the part you type after the `>` prompt of a multi-line
-`if` — is barely coloured, because it is parsed on its own and `then echo hi` is
-not a valid command by itself. Highlighting the whole accumulated command is
-[#670](https://github.com/jdstanhope/huck/issues/670). Colours are not
-configurable yet either — the palette is fixed
-([#667](https://github.com/jdstanhope/huck/issues/667)). Bracket globs like
+Colours are not configurable yet — the palette is fixed
+([#667](https://github.com/jdstanhope/huck/issues/667)).
+
+*(When this was written, a continuation line — the part you type after the `>`
+prompt — was barely coloured, because it is parsed on its own and `then echo hi`
+is not a valid command by itself. That is fixed now: see
+[The second line](/blog/the-second-line).)* Bracket globs like
 `f[abc].rs` are not marked, because they are not reliably one piece by the time
 the highlighter sees them, and colouring some but not others is worse than
 colouring none ([#668](https://github.com/jdstanhope/huck/issues/668)). And
