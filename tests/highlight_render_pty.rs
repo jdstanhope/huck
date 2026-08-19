@@ -347,3 +347,38 @@ fn shopt_u_syntax_highlight_disables_painting() {
     assert!(before, "nothing was painted even with the option ON");
     assert!(!after, "shopt -u syntax_highlight did not disable painting");
 }
+
+#[test]
+fn a_continuation_line_is_painted_like_the_command_it_continues() {
+    // #670: a continuation line used to arrive plain. It is parsed ALONE, so
+    // `then nosuchcmd_xyz` fails at its first word and nothing after it is even
+    // scanned — there was nothing to colour. The editor now parses the
+    // accumulated command and paints only the visible line of it.
+    //
+    // The needle is the KEYWORD colour: `then` is a keyword only in the company
+    // of the `if` above it, so nothing but the fix can produce it here. Bold
+    // blue never appears while typing `if true` (a bare `if` is a keyword, so
+    // the first line is drained past before this is read).
+    let Some(mut session) = spawn() else { return };
+
+    let _ = session.send("if true\r");
+    settle();
+    // Sync past the first line's own renders, so what follows can only come
+    // from the continuation line.
+    assert!(
+        session.expect("\x1b[1;34mif").is_ok(),
+        "the first line was not painted, so this proves nothing about the second"
+    );
+
+    typed(&mut session, "then nosuchcmd_xyz");
+    let keyword = session.expect("\x1b[1;34mthen").is_ok();
+    let invalid = session.expect("\x1b[31mnosuchcmd_xyz").is_ok();
+
+    abandon(&mut session);
+
+    assert!(keyword, "`then` was not painted as a keyword");
+    assert!(
+        invalid,
+        "the invalid command on the continuation line was not painted"
+    );
+}
