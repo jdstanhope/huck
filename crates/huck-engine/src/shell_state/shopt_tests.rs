@@ -592,3 +592,38 @@ fn error_prefix_syntax_no_c_segment_when_sourced_under_dash_c() {
         "badfile: -c: line 2: "
     );
 }
+
+// ── huck's own options (v363, #666) ──────────────────────────────────────────
+
+#[test]
+fn syntax_highlight_is_on_by_default_and_toggles() {
+    let mut opts = ShoptOptions::default();
+    assert_eq!(opts.get("syntax_highlight"), Some(true));
+    assert!(opts.set("syntax_highlight", false));
+    assert_eq!(opts.get("syntax_highlight"), Some(false));
+    assert!(opts.set("syntax_highlight", true));
+    assert_eq!(opts.get("syntax_highlight"), Some(true));
+}
+
+#[test]
+fn huck_options_are_invisible_to_the_bash_table() {
+    // ⚠️ The whole reason they live in a separate table. Bare `shopt`, `shopt -p`
+    // and `compgen -A shopt` all iterate `SHOPT_TABLE` and are compared with
+    // bash byte for byte by the diff harnesses — an extra row would redden all
+    // three. So the option is reachable BY NAME and absent from every listing.
+    for ext in HUCK_SHOPT_TABLE {
+        assert!(
+            !SHOPT_TABLE.iter().any(|o| o.name == ext.name),
+            "{} must not be in bash's table",
+            ext.name
+        );
+    }
+}
+
+#[test]
+fn an_unknown_name_is_still_unknown() {
+    // The extension lookup must not turn every miss into a hit.
+    let mut opts = ShoptOptions::default();
+    assert_eq!(opts.get("no_such_option_xyz"), None);
+    assert!(!opts.set("no_such_option_xyz", true));
+}

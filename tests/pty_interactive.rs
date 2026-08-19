@@ -8,24 +8,7 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::Mutex;
 use std::time::Duration;
-
-/// Held by the tests that type a LONG line into the editor.
-///
-/// Since #666 every keystroke repaints the whole line, so a thirty-character
-/// line is several kilobytes of pty traffic. `expect` is the only thing in this
-/// harness that READS, and two such tests running at once on a one-core box let
-/// the write queue fill faster than either drains it — huck then blocks on
-/// write, and the symptom is a 30-second timeout on a needle that arrives in
-/// milliseconds when the test runs alone. Measured: the suite alternated between
-/// green and one failure across consecutive 4-thread runs, and the test that
-/// failed moved.
-///
-/// Serialising these three keeps the other 23 parallel. `into_inner` on a
-/// poisoned lock deliberately: a panicking neighbour must not cascade into
-/// failures here.
-static LONG_LINE: Mutex<()> = Mutex::new(());
 
 use expectrl::session::OsSession;
 use expectrl::{Eof, Expect};
@@ -52,6 +35,20 @@ fn try_spawn(cwd: &Path, env: &[(&str, &str)]) -> Option<OsSession> {
     // precedence over --rcfile/$HUCK_RC, so a future rc-file test must spawn
     // huck directly rather than through this helper.
     cmd.arg("--norc");
+    // ⚠️ Highlighting OFF for this suite (#666). It is a REPL-BEHAVIOUR suite —
+    // history recall, Ctrl-C, multi-line assembly, heredocs — and painting the
+    // edit line multiplies its terminal traffic about fivefold, which on a
+    // one-core box starved sessions until legitimate waits exceeded half a
+    // minute. Measured: 110 s with two failures, 33 s and green without.
+    //
+    // The painted editor has its own harness, `highlight_render_pty.rs`. What
+    // that does NOT cover is a CONTINUATION line, and the reason is worth
+    // knowing: a continuation line is parsed on its own, so `then echo hi` has
+    // no `if` in front of it, the parse fails at the first word, and almost
+    // nothing gets marked. Highlighting the accumulated command rather than the
+    // physical line is #670 — so turning colour off here costs no coverage that
+    // exists today.
+    cmd.env("NO_COLOR", "1");
     cmd.current_dir(cwd);
     for (k, v) in env {
         cmd.env(k, v);
@@ -70,12 +67,10 @@ fn try_spawn(cwd: &Path, env: &[(&str, &str)]) -> Option<OsSession> {
             // that is never reached costs nothing, while longer sleeps would slow
             // every run whether or not the box is loaded.
             //
-            // 90 s now, and the extra headroom is for the FULL local test tree:
-            // this repo has 124 integration binaries, and running them all on one
-            // core starves these sessions badly enough that a legitimate wait
-            // exceeded 30 s. Measured: this suite alone takes 31 s and is green
-            // three runs in a row; inside `cargo test -p huck` it takes 51 s and
-            // one test times out. Nothing here waits 90 s when it passes.
+            // 90 s, which is headroom for a loaded box rather than for any
+            // expected wait: this repo has 124 integration binaries and one
+            // core, so a legitimate wait here has been measured past 30 s.
+            // Nothing waits 90 s when it passes.
             session.set_expect_timeout(Some(Duration::from_secs(90)));
             Some(session)
         }
@@ -490,7 +485,6 @@ fn pty_continuation_prompt_appears() {
 
 #[test]
 fn pty_multiline_if_runs() {
-    let _long_line = LONG_LINE.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let env = histfile_env(dir.path());
     let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
@@ -506,16 +500,12 @@ fn pty_multiline_if_runs() {
     // command's OUTPUT (`MARKER_42`) never appears in the ECHO of the typed line
     // (`MARKER_$((6*7))`). Matching on the echo would pass without the `if` ever
     // running. The repo's own `READY_$((6*7))` spawn probe uses the same trick.
-    // ⚠️ Typed in TWO chunks with a read between them, and that is structural,
-    // not cosmetic. Since #666 every keystroke repaints the whole line, so this
-    // 30-character line writes several kilobytes — enough to fill the pty's write
-    // queue. `expect` is the only thing that READS, so a test that types the
-    // whole line before reading once wedges huck on write, and the symptom is a
-    // 30-second timeout on a needle that would otherwise be there in
-    // milliseconds. Draining halfway keeps the queue short.
-    send(&mut session, "then echo IFSYNC");
-    expect(&mut session, "IFSYNC");
-    send(&mut session, " MARKER_$((6*7))");
+    // ⚠️ ONE send, and the sync below is the ONLY read of `IFSYNC`. Splitting
+    // this into two chunks with a read between them — which an earlier version
+    // did, to drain the pty — silently broke the test: the typed line is echoed
+    // ONCE, so the intermediate read consumed the very occurrence the sync after
+    // `ENTER` was waiting for, and that sync then waited out the full ceiling.
+    send(&mut session, "then echo IFSYNC MARKER_$((6*7))");
     send(&mut session, ENTER);
     // ⚠️ DRAIN, not just sleep. Since v363 the editor repaints the whole line on
     // every keystroke, so a session emits several times the bytes it used to. A
@@ -541,7 +531,6 @@ fn pty_multiline_if_runs() {
 
 #[test]
 fn pty_ctrl_c_aborts_multiline_buffer() {
-    let _long_line = LONG_LINE.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let env = histfile_env(dir.path());
     let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
@@ -601,7 +590,6 @@ fn pty_multi_stage_pipeline_completes_via_pgrp_wait() {
 
 #[test]
 fn pty_heredoc_simple() {
-    let _long_line = LONG_LINE.lock().unwrap_or_else(|e| e.into_inner());
     // Type a complete heredoc interactively: the body line is echoed back
     // by `cat` and the main prompt returns.
     let dir = tempfile::tempdir().unwrap();

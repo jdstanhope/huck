@@ -44,6 +44,23 @@ impl HuckHelper {
         }
     }
 
+    /// Is colour wanted right now?
+    ///
+    /// Three gates, and they are deliberately answered in different places. The
+    /// terminal and `NO_COLOR` cannot change while the shell runs, so they are
+    /// resolved once at construction. `shopt -u syntax_highlight` CAN change —
+    /// that is the point of it — so it is read live, and takes effect on the
+    /// next keystroke rather than the next session.
+    fn colour_now(&self) -> bool {
+        self.colour_enabled
+            && self
+                .shell
+                .borrow()
+                .shopt_options
+                .get("syntax_highlight")
+                .unwrap_or(true)
+    }
+
     /// Forget what was established about command names. The REPL calls this once
     /// per prompt: it is what bounds staleness to a single line.
     pub fn clear_validity_cache(&self) {
@@ -215,7 +232,7 @@ impl Highlighter for HuckHelper {
     /// The parse result is discarded; only the recorded marks are used. A parse
     /// ERROR is the normal case here, not a failure.
     fn highlight<'l>(&self, line: &'l str, pos: usize) -> std::borrow::Cow<'l, str> {
-        if !self.colour_enabled || line.is_empty() {
+        if line.is_empty() || !self.colour_now() {
             return std::borrow::Cow::Borrowed(line);
         }
         let mut rec = self.highlight_record(line);
@@ -240,7 +257,7 @@ impl Highlighter for HuckHelper {
         // is not a second notion of what a pair is, because nothing is decided
         // from it: a line that passes still gets the real parse, and a line that
         // fails has no pair for the cursor to touch.
-        if !self.colour_enabled {
+        if !self.colour_now() {
             return false;
         }
         if kind != CmdKind::MoveCursor {

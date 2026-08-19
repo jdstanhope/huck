@@ -1,0 +1,117 @@
+---
+title: "The line you are typing"
+date: 2026-08-19
+summary: "huck now colours the command line as you type it: strings, variables, globs and comments each get their own colour, brackets match under the cursor — and the only loud signal is a command that will not run."
+tags: ["interactive", "readline", "highlighting"]
+version: "v363"
+---
+
+Until now huck's prompt showed you exactly what you typed and nothing else. Type
+a command that does not exist, a quote you never closed, or a `*` you meant to
+be literal, and you found out afterwards.
+
+Here is what the terminal actually received while typing one line, before and
+after. The escape codes are shown raw — `31` is red, `33` yellow, `1;36` bold
+cyan, `34` blue:
+
+```bash
+# before
+huck> nosuchcmd "dq" $HOME *.rs
+
+# after
+huck> ^[[31mnosuchcmd^[[0m ^[[33m"dq"^[[0m ^[[1;36m$HOME^[[0m ^[[34m*^[[0m.rs
+```
+
+Four separate things, and the one that matters most is the first: `nosuchcmd`
+is red because it will not run. Everything else on the line is information —
+the string is one colour, the variable's NAME is bold so your eye finds it, and
+the `*` is coloured **on its own** so you can see which character is going to
+expand and which are just part of the filename.
+
+## The colour you do not see
+
+A working command is left alone:
+
+```bash
+huck> echo hi^[[35m;^[[0m ^[[31mnosuchcmd^[[0m hi
+```
+
+`echo` is plain. That is deliberate, and it is the whole design: if every
+command word were coloured, colour would stop meaning anything. The only word
+wearing red is the one that is about to fail. fish popularised this restraint
+and it is worth copying.
+
+The check is the shell's own resolution order — alias, function, builtin, then
+`PATH` — so a function you defined a minute ago counts, and a program you just
+installed is picked up on the next line. It never writes to the command hash
+table, so merely typing a name cannot change what `hash` prints, and it gives up
+rather than making you wait if `PATH` has something slow on it.
+
+One consequence worth knowing: while you are typing `echo`, the words `e`, `ec`
+and `ech` are genuinely not commands, so the word is red until the `o` lands.
+That is the same thing fish does. Waiting for a word boundary would mean the
+signal arrives after the mistake.
+
+## Brackets
+
+Put the cursor on a bracket and its partner lights up — whole delimiters, not
+single characters:
+
+```bash
+huck> echo ^[[7m$(^[[0mdate^[[7m)^[[0m
+```
+
+`7` is reverse video, so this reads on any colour scheme. And when a construct
+is still open, its opener is underlined so you can see what the shell is waiting
+for:
+
+```bash
+huck> echo ^[[4m$(^[[0m^[[31mdat^[[0m
+```
+
+That underline comes from the same machinery that decides which bracket an
+unexpected end-of-file names — the work described in
+[Which bracket did you forget?](/blog/which-bracket-did-you-forget). It knows
+about nesting rather than counting brackets, so it is right inside quotes,
+inside arithmetic, and inside a substitution within a string.
+
+## Structure, not guesswork
+
+The colours come from actually parsing the line, not from pattern-matching it.
+That is why `'a*b'` has no glob colour while `a*b` does, why the `nosuch` inside
+`echo $(nosuch)` is checked as a command in its own right, and why `FOO=bar cmd`
+knows that `cmd` is the command and `FOO` is a variable name.
+
+It also means the shell can colour things a regular expression would get wrong.
+`${` and `}` are one colour and the name between them is another; a comment is
+grey to end of line; an escaped `\$` inside a string is marked even though the
+backslash disappears before anything downstream could see it.
+
+## Turning it off
+
+Three ways, in the order you would reach for them:
+
+```bash
+shopt -u syntax_highlight      # this session, or put it in ~/.huckrc
+NO_COLOR=1 huck                # the cross-tool convention
+huck < script.sh               # not a terminal: nothing is ever painted
+```
+
+The last one is not a courtesy, it is a guarantee: 309 test harnesses compare
+huck's bytes with bash's, and a single stray escape would break every one of
+them.
+
+## What is still open
+
+A continuation line — the part you type after the `>` prompt of a multi-line
+`if` — is barely coloured, because it is parsed on its own and `then echo hi` is
+not a valid command by itself. Highlighting the whole accumulated command is
+[#670](https://github.com/jdstanhope/huck/issues/670). Colours are not
+configurable yet either — the palette is fixed
+([#667](https://github.com/jdstanhope/huck/issues/667)). Bracket globs like
+`f[abc].rs` are not marked, because they are not reliably one piece by the time
+the highlighter sees them, and colouring some but not others is worse than
+colouring none ([#668](https://github.com/jdstanhope/huck/issues/668)). And
+`shopt syntax_highlight` is a name bash does not have — deliberately, and
+deliberately invisible to `shopt`'s listings so that everything else still
+matches bash exactly ([#669](https://github.com/jdstanhope/huck/issues/669)).

@@ -23,6 +23,12 @@ use expectrl::Expect;
 use expectrl::session::OsSession;
 
 fn spawn() -> Option<OsSession> {
+    spawn_with(&[])
+}
+
+/// `spawn`, plus environment overrides — for the rows that prove a gate turns
+/// colour OFF, which need to change the environment huck starts in.
+fn spawn_with(env: &[(&str, &str)]) -> Option<OsSession> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_huck"));
     // Hermetic: never source the developer's ~/.huckrc (#239).
     cmd.arg("--norc");
@@ -30,6 +36,9 @@ fn spawn() -> Option<OsSession> {
     // must not leak in from the developer's environment or every row would
     // silently pass for the wrong reason.
     cmd.env_remove("NO_COLOR");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     match OsSession::spawn(cmd) {
         Ok(mut s) => {
             s.set_expect_timeout(Some(Duration::from_secs(8)));
@@ -253,4 +262,88 @@ fn a_whole_delimiter_is_emphasised_end_to_end() {
         braced,
         "the brace opener was not emphasised as one delimiter"
     );
+}
+
+/// Type a command that would be painted RED (it does not resolve), and report
+/// whether the red actually reached the terminal.
+///
+/// ⚠️ ONE needle, and a palette entry rather than a bare `\x1b[`: rustyline emits
+/// cursor-positioning escapes on every render, so a generic escape is present
+/// whether or not anything was painted — a sabotage run proved that the hard
+/// way. One needle also matters for cost: a negative answer waits out the
+/// session timeout, so a list of five needles is five timeouts.
+fn painted_red(session: &mut OsSession) -> bool {
+    typed(session, "nosuchcmd_xyz");
+    let red = session.expect("\x1b[31m").is_ok();
+    // Then RUN it. The command fails harmlessly, and its error line is a unique
+    // point to sync on — which is what a caller needs before doing anything
+    // else, since a prompt is redrawn by every keystroke and identifies nothing.
+    // Syncing on real output beats sleeping: a fixed sleep that is long enough
+    // on an idle box is not long enough on a loaded one, which is exactly how
+    // this test failed at two threads while passing at one.
+    let _ = session.send("\r");
+    assert!(
+        session.expect("nosuchcmd_xyz: command not found").is_ok(),
+        "the line never ran, so the session position is unknown from here on"
+    );
+    settle();
+    red
+}
+
+/// Pause after a submitted line, before sending the next one.
+///
+/// ⚠️ Necessary, and seeing the command's OUTPUT is NOT a substitute. When huck
+/// returns to the prompt, rustyline re-enters raw mode with `TCSAFLUSH`, which
+/// DISCARDS terminal input that arrived in the meantime — so a line sent the
+/// instant the previous command's output appears can vanish without trace.
+/// Measured while writing this file: three commands piped into a pty at once ran
+/// the FIRST and silently dropped the other two. `pty_interactive.rs` documents
+/// the same boundary.
+fn settle() {
+    std::thread::sleep(Duration::from_millis(250));
+}
+
+#[test]
+fn no_color_in_the_environment_disables_painting() {
+    // The convention every tool that colours output is expected to honour: any
+    // value at all means "do not".
+    let Some(mut session) = spawn_with(&[("NO_COLOR", "1")]) else {
+        return;
+    };
+    let painted = painted_red(&mut session);
+    abandon(&mut session);
+    assert!(!painted, "NO_COLOR did not disable painting");
+}
+
+#[test]
+fn shopt_u_syntax_highlight_disables_painting() {
+    // The control that composes with an rc file, and the one a user reaches for.
+    // Read LIVE rather than resolved at startup, so it takes effect on the very
+    // next keystroke — which is what this row proves: the option is turned off
+    // from the prompt, in the session already running.
+    let Some(mut session) = spawn() else { return };
+
+    // With it on the same fragment paints, or the assertion below would pass for
+    // the wrong reason.
+    let before = painted_red(&mut session);
+    let _ = session.send("shopt -u syntax_highlight\r");
+    // ⚠️ A settle, not a sync: `shopt -u` prints NOTHING, so there is no output
+    // to wait for — and sending the next line immediately loses it to the
+    // `TCSAFLUSH` described on `settle`.
+    settle();
+    // Prove the option actually changed in the LIVE shell before concluding
+    // anything from the absence of colour — otherwise a typo in the option name
+    // would look exactly like a working gate.
+    let _ = session.send("shopt syntax_highlight\r");
+    assert!(
+        session.expect("syntax_highlight\toff").is_ok(),
+        "the option did not turn off in the running shell"
+    );
+    settle();
+
+    let after = painted_red(&mut session);
+    abandon(&mut session);
+
+    assert!(before, "nothing was painted even with the option ON");
+    assert!(!after, "shopt -u syntax_highlight did not disable painting");
 }
