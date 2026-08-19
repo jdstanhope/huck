@@ -774,6 +774,9 @@ pub struct Shell {
     /// Names of functions marked `export -f`. Parallel to `functions` (no attribute
     /// slot). Re-defining a function keeps its export mark.
     pub exported_functions: std::collections::HashSet<String>,
+    /// Depth of "evaluate a value as an arithmetic expression" recursion
+    /// (#677). One counter for one question — see `arith_recursion_enter`.
+    pub(crate) arith_recursion_depth: u32,
     /// User-defined aliases. `name` → expansion text. Populated by
     /// the `alias` builtin; expanded at command position by the live lexer.
     pub aliases: std::collections::HashMap<String, String>,
@@ -1251,6 +1254,7 @@ impl Shell {
             getopts_optind_cache: 0,
             functions: Rc::new(HashMap::new()),
             exported_functions: std::collections::HashSet::new(),
+            arith_recursion_depth: 0,
             aliases: std::collections::HashMap::new(),
             jobs: JobTable::new(),
             sigchld_flag: Arc::new(AtomicBool::new(false)),
@@ -3543,6 +3547,23 @@ impl Shell {
     /// Enter a context that exempts failures from BOTH `set -e` and the ERR
     /// trap: an `if`/`while` condition, or a command in a non-last `&&`/`||`
     /// position. Pair with `unsuppress_both`.
+    /// Enter one level of "evaluate this value as an expression" recursion
+    /// (#677). Returns false when `limit` is already reached, in which case the
+    /// caller reports and does NOT recurse — bash prints `expression recursion
+    /// level exceeded` and stays alive, where huck used to overflow its stack
+    /// and take the whole shell down.
+    pub fn arith_recursion_enter(&mut self, limit: u32) -> bool {
+        if self.arith_recursion_depth >= limit {
+            return false;
+        }
+        self.arith_recursion_depth += 1;
+        true
+    }
+
+    pub fn arith_recursion_leave(&mut self) {
+        self.arith_recursion_depth = self.arith_recursion_depth.saturating_sub(1);
+    }
+
     pub fn suppress_both(&mut self) {
         self.suppression.errexit += 1;
         self.suppression.err_trap += 1;
