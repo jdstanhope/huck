@@ -1432,9 +1432,65 @@ fn builtin_continue_returns_loop_continue() {
     assert_eq!(outcome, ExecOutcome::LoopContinue(1));
 }
 
+/// A shell that is INSIDE a function, which is what every `return` test below
+/// implicitly assumed until #678 made the distinction real: outside a function
+/// and outside a sourced script, `return` is an error that does not unwind, so
+/// these tests were exercising a context in which their expectation is wrong.
+fn shell_in_function() -> Shell {
+    let mut shell = Shell::new();
+    shell.call_stack.push(crate::shell_state::Frame {
+        funcname: "f".to_string(),
+        source: "test".to_string(),
+        call_line: 1,
+        kind: crate::shell_state::FrameKind::Function,
+    });
+    shell
+}
+
+#[test]
+fn builtin_return_outside_a_function_does_not_unwind() {
+    // #678: bash prints a diagnostic, sets `$?` to 2, and RUNS THE NEXT
+    // COMMAND. huck returned `FunctionReturn`, which the top-level driver read
+    // as "stop" — so a stray `return` silently swallowed the rest of a script.
+    let mut shell = Shell::new();
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    assert_eq!(
+        run_builtin("return", &["5".to_string()], &mut out, &mut err, &mut shell),
+        ExecOutcome::Continue(2)
+    );
+    let msg = String::from_utf8_lossy(&err);
+    assert!(
+        msg.contains("can only `return' from a function or sourced script"),
+        "{msg:?}"
+    );
+}
+
+#[test]
+fn builtin_return_inside_a_sourced_script_is_legal() {
+    let mut shell = Shell::new();
+    shell.call_stack.push(crate::shell_state::Frame {
+        funcname: "source".to_string(),
+        source: "inner.sh".to_string(),
+        call_line: 1,
+        kind: crate::shell_state::FrameKind::Source,
+    });
+    let mut out: Vec<u8> = Vec::new();
+    assert_eq!(
+        run_builtin(
+            "return",
+            &["7".to_string()],
+            &mut out,
+            &mut std::io::stderr(),
+            &mut shell
+        ),
+        ExecOutcome::FunctionReturn(7)
+    );
+}
+
 #[test]
 fn builtin_return_with_arg_returns_function_return() {
-    let mut shell = Shell::new();
+    let mut shell = shell_in_function();
     let mut out: Vec<u8> = Vec::new();
     assert_eq!(
         run_builtin(
@@ -1450,7 +1506,7 @@ fn builtin_return_with_arg_returns_function_return() {
 
 #[test]
 fn builtin_return_no_arg_returns_last_status() {
-    let mut shell = Shell::new();
+    let mut shell = shell_in_function();
     shell.set_last_status(42);
     let mut out: Vec<u8> = Vec::new();
     assert_eq!(
@@ -1464,7 +1520,7 @@ fn builtin_return_invalid_arg_is_status_2() {
     // #520: bash's `get_exitstat` reports `return: <arg>: numeric argument
     // required` and returns with status 2 — it does NOT fall back to `$?`.
     // This test asserted the fallback, i.e. it pinned the divergence.
-    let mut shell = Shell::new();
+    let mut shell = shell_in_function();
     shell.set_last_status(13);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -1488,7 +1544,7 @@ fn builtin_return_invalid_arg_is_status_2() {
 #[test]
 fn builtin_return_masks_to_255() {
     // bash masks the status with `& 255`: `return -1` is 255, `return 300` is 44.
-    let mut shell = Shell::new();
+    let mut shell = shell_in_function();
     let mut out: Vec<u8> = Vec::new();
     for (arg, want) in [("-1", 255), ("300", 44), ("256", 0), ("-- 3", 3)] {
         let args: Vec<String> = arg.split(' ').map(str::to_string).collect();
