@@ -1564,7 +1564,13 @@ fn builtin_return_masks_to_255() {
 
 #[test]
 fn builtin_return_too_many_args_aborts() {
-    // bash: `return: too many arguments` and a hard abort at status 1.
+    // ⚠️ This asserted `Exit(1)` — "a hard abort at status 1" — which was huck's
+    // behaviour, not bash's (#683). bash ABANDONS THE COMMAND LIST here and
+    // carries on in a script file and on stdin, ending the program only under
+    // `-c`, `source` and `eval`. The builtin therefore returns `Continue(1)`
+    // and reports the kind; the classifier turns that into the right outcome
+    // per driver. `tests/scripts/return_arg_fatality_diff_check.sh` compares
+    // all five against bash.
     let mut shell = Shell::new();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -1576,7 +1582,12 @@ fn builtin_return_too_many_args_aborts() {
             &mut err,
             &mut shell
         ),
-        ExecOutcome::Exit(1)
+        ExecOutcome::Continue(1)
+    );
+    assert!(
+        shell.discard_pending(),
+        "the command list must be abandoned — that is what makes it fatal \
+         under -c/source/eval and non-fatal in a script"
     );
     assert!(
         String::from_utf8(err)

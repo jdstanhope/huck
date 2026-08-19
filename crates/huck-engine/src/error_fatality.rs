@@ -62,12 +62,30 @@ pub(crate) enum ErrorKind {
     /// tested kind to reach for.
     #[allow(dead_code)]
     BuiltinError,
-    /// `history` with too many arguments — the only builtin error in bash that
-    /// abandons the command list. It gets its own kind because a general rule
-    /// fitted to a single data point would be a fabrication: `cd -Q`,
-    /// `kill -Q`, `read -Q`, `getopts`, `umask a b`, `history -Q` and
-    /// `history a` all continue.
-    HistoryTooManyArgs,
+    /// `history` or `return` with too many arguments — the builtin errors in
+    /// bash that abandon the command list rather than continuing.
+    ///
+    /// It is a KIND rather than a general rule because a rule fitted to these
+    /// would be a fabrication: `cd -Q`, `kill -Q`, `read -Q`, `getopts`,
+    /// `umask a b`, `history -Q`, `history a`, and even the special builtins
+    /// `shift a b` and `break 1 2` all continue.
+    ///
+    /// v364 follow-on (#683) added `return`, and it is the same kind rather
+    /// than a second one because the two are byte-identical on all five
+    /// drivers — measured, not assumed:
+    ///
+    /// ```text
+    ///           return 1 2                     history 1 2
+    /// script :  message, B st=1, rc 0          message, B st=1, rc 0
+    /// stdin  :  message, B st=1, rc 0          message, B st=1, rc 0
+    /// -c     :  message, STOPS,  rc 1          message, STOPS,  rc 1
+    /// source :  message, STOPS,  rc 1          message, STOPS,  rc 1
+    /// eval   :  message, STOPS,  rc 1          message, STOPS,  rc 1
+    /// ```
+    ///
+    /// Note the name is about the SHAPE of the error, not the builtin: adding a
+    /// third member means measuring it against this table first.
+    TooManyArgsAbortsList,
     /// A syntax error inside a command substitution.
     ///
     /// `backtick` is load-bearing rather than cosmetic. A backtick body is
@@ -234,7 +252,7 @@ pub(crate) fn fatality(kind: ErrorKind, shell: &Shell) -> Fatality {
         // neighbours do NOT behave that way — an arithmetic or readonly error
         // under `-c` continues to the next line — so this cannot be folded
         // into a general rule. Measured 2026-08-06.
-        ErrorKind::HistoryTooManyArgs => {
+        ErrorKind::TooManyArgsAbortsList => {
             if shell.is_command_string && !shell.is_interactive {
                 Fatality::ExitShell(1)
             } else {
@@ -384,7 +402,7 @@ mod tests {
         // special builtins `shift a b` and `break 1 2`.
         for posix in [false, true] {
             assert_eq!(
-                fatality(ErrorKind::HistoryTooManyArgs, &shell_with(posix, false)),
+                fatality(ErrorKind::TooManyArgsAbortsList, &shell_with(posix, false)),
                 Fatality::AbortList
             );
         }
@@ -398,7 +416,7 @@ mod tests {
         // NEXT and exits 0. A test rather than a comment because it looks like
         // an inconsistency and is not.
         assert_eq!(
-            fatality(ErrorKind::HistoryTooManyArgs, &shell_with(false, true)),
+            fatality(ErrorKind::TooManyArgsAbortsList, &shell_with(false, true)),
             Fatality::ExitShell(1)
         );
         assert_eq!(
