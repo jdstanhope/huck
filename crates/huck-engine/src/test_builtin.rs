@@ -16,14 +16,27 @@ pub fn evaluate_with(args: &[String], var_is_set: &dyn Fn(&str) -> bool) -> Resu
         1 => return Ok(!args[0].is_empty()),
         _ => {}
     }
-    // For 2-4 args, try the POSIX short-form first. It handles every
-    // backward-compatible case (existing tests). On Err, fall through
-    // to the grammar parser, which handles forms the short-form
-    // rejects (e.g. `[ ( -n a ) ]`).
-    if args.len() <= 4
-        && let Ok(b) = evaluate_short_form(args, var_is_set)
-    {
-        return Ok(b);
+    // 2 and 3 args are decided ENTIRELY by the argument count, including their
+    // errors — bash's `two_arguments`/`three_arguments`. Falling through to the
+    // grammar parser on an error is what made huck name the wrong token (#679):
+    // `[ $x -eq 1 ]` with `$x` empty is `[ -eq 1 ]`, where bash says
+    // `-eq: unary operator expected` (arg 0 is not a unary operator) and huck
+    // said `1: unexpected argument`. The short form already computed bash's
+    // message; the fall-through discarded it.
+    if args.len() <= 3 {
+        return evaluate_short_form(args, var_is_set);
+    }
+    // 4 args has two special forms and then defers, exactly as bash does: a
+    // leading `!` negates the 3-arg reading, and `( X Y )` applies the 2-arg
+    // reading to the inside — which is why `[ ( a b ) ]` reports
+    // `a: unary operator expected` rather than anything about parentheses.
+    if args.len() == 4 {
+        if args[0] == "!" {
+            return negate(evaluate_with(&args[1..4], var_is_set));
+        }
+        if args[0] == "(" && args[3] == ")" {
+            return evaluate_short_form(&args[1..3], var_is_set);
+        }
     }
     let mut p = Parser {
         args,
@@ -33,7 +46,9 @@ pub fn evaluate_with(args: &[String], var_is_set: &dyn Fn(&str) -> bool) -> Resu
     };
     let result = p.parse_expr()?;
     if p.pos != args.len() {
-        return Err(format!("{}: unexpected argument", args[p.pos]));
+        // #679: bash names no argument here — it has parsed a complete
+        // expression and simply found more, which is `too many arguments`.
+        return Err("too many arguments".to_string());
     }
     Ok(result)
 }
@@ -61,6 +76,12 @@ fn evaluate_short_form(args: &[String], var_is_set: &dyn Fn(&str) -> bool) -> Re
                 apply_binary(&args[1], &args[0], &args[2])
             } else if args[0] == "!" {
                 negate(evaluate_with(&args[1..3], var_is_set))
+            } else if args[0] == "(" && args[2] == ")" {
+                // `[ ( X ) ]` is the truthiness of X. Handled HERE rather than
+                // by the grammar parser because the 3-arg reading owns its own
+                // errors now (#679) — reaching the parser at all would change
+                // the message for every OTHER 3-arg shape.
+                Ok(!args[1].is_empty())
             } else {
                 Err(format!("{}: binary operator expected", args[1]))
             }
@@ -369,12 +390,12 @@ impl<'a> Parser<'a> {
     fn parse_primary(&mut self) -> Result<bool, String> {
         // Empty input where a primary is expected.
         if self.peek().is_none() {
-            return Err("expression expected".to_string());
+            return Err("argument expected".to_string());
         }
         // Closing paren / combinator where a primary is expected.
         match self.peek() {
             Some(")") | Some("-a") | Some("-o") => {
-                return Err("expression expected".to_string());
+                return Err("argument expected".to_string());
             }
             _ => {}
         }
@@ -777,19 +798,35 @@ mod tests {
 
     #[test]
     fn empty_parens_error() {
+        // ⚠️ This asserted the word "expression", which was huck's wording and
+        // not bash's (#679). `( )` is TWO arguments, and the two-argument
+        // reading owns the message: `(` is not a unary operator, so bash says
+        // `(: unary operator expected`. Nothing about parentheses — measured.
         let r = evaluate(&args(&["(", ")"]));
-        assert!(r.is_err(), "expected error, got {r:?}");
-        assert!(
-            r.unwrap_err().contains("expression"),
-            "expected 'expression' in error"
-        );
+        assert_eq!(r.unwrap_err(), "(: unary operator expected");
     }
 
     #[test]
     fn unbalanced_open_paren_error() {
+        // ⚠️ Asserted that the message mentions `)`, which was huck's grammar
+        // parser talking. `( -n a` is THREE arguments, and the three-argument
+        // reading owns it: arg 1 (`-n`) is not a binary operator, so bash says
+        // `-n: binary operator expected` and says nothing about parentheses
+        // (#679, measured). An unclosed `(` only reaches the parser — and only
+        // then produces a `)` message — with FOUR or more arguments, which is
+        // `unbalanced_open_paren_in_long_expression` below.
         let r = evaluate(&args(&["(", "-n", "a"]));
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains(")"), "expected ')' in error");
+        assert_eq!(r.unwrap_err(), "-n: binary operator expected");
+    }
+
+    #[test]
+    fn unbalanced_open_paren_in_long_expression() {
+        // Four or more arguments DO reach the grammar parser, where an unclosed
+        // `(` is still reported as such. ⚠️ bash words this differently
+        // (`` `)' expected ``, plus a `, found X` clause under `[`) — the one
+        // `test` message that still differs, filed as #688.
+        let r = evaluate(&args(&["(", "-n", "a", "-a", "-n", "b"]));
+        assert_eq!(r.unwrap_err(), "missing ')'");
     }
 
     #[test]
@@ -802,14 +839,30 @@ mod tests {
 
     #[test]
     fn dangling_combinator_at_end_error() {
-        // [ -n a -a ] — falls through short-form (4 args, not !-prefixed),
-        // parser consumes `-n a -a`, then `parse_unary` runs out of input.
+        // ⚠️ The comment here used to say "4 args, not !-prefixed" — `-n a -a`
+        // is THREE, and the three-argument reading decides it: arg 1 (`a`) is
+        // not a binary operator, so bash says `a: binary operator expected`
+        // (#679). The old assertion wanted the word "expression", which was
+        // huck's grammar parser talking — a path this no longer reaches.
         let r = evaluate(&args(&["-n", "a", "-a"]));
-        assert!(r.is_err());
-        assert!(
-            r.unwrap_err().contains("expression"),
-            "expected 'expression' in error"
-        );
+        assert_eq!(r.unwrap_err(), "a: binary operator expected");
+    }
+
+    #[test]
+    fn four_plus_args_that_run_out_say_argument_expected() {
+        // The grammar parser IS still reached for 4+, and its wording is bash's
+        // there: `[ a = b -a ]` parses `a = b`, takes the `-a`, and finds no
+        // right-hand side.
+        let r = evaluate(&args(&["a", "=", "b", "-a"]));
+        assert_eq!(r.unwrap_err(), "argument expected");
+    }
+
+    #[test]
+    fn leftover_arguments_are_not_named() {
+        // bash names no argument once it has parsed a complete expression and
+        // simply found more.
+        let r = evaluate(&args(&["a", "b", "c", "d"]));
+        assert_eq!(r.unwrap_err(), "too many arguments");
     }
 
     #[test]
