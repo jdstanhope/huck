@@ -281,3 +281,14 @@ huck enforces `FUNCNEST` exactly like bash, but additionally clamps the effectiv
 - **Workaround**: none needed. Scripts written for bash never mention the name; `NO_COLOR` and a non-tty stdout disable highlighting without it.
 
 ---
+
+### the arithmetic value-recursion cap is 128, where bash's is 1024
+
+[Issue #681 · by-design](https://github.com/jdstanhope/huck/issues/681)
+
+- **huck**: a value evaluated as an arithmetic expression may recurse 64 deep; beyond that, `x: expression recursion level exceeded (error token is "x")` and the shell carries on.
+- **bash**: the same message at 1024 (`expr.c`'s `EXPRESSION_RECURSION_LIMIT`). A chain 65–1024 deep therefore answers under bash and errors under huck.
+- **Why intentional**: huck cannot reach 1024. Measured with a chain of `v1=v2 … vN=7`, a debug build evaluates depth 350 and overflows its stack between 350 and 400 — `thread 'main' has overflowed its stack`, which kills the whole shell where bash prints an error and continues. A 1024 cap would never be reached, so the crash would remain. Nor is the main thread the tightest constraint: a libtest thread gets 2 MiB where the main thread gets 8 MB, and 128 overflowed there while passing interactively — so the cap is 64, which holds on the smallest stack any of this code runs on. The cap ships with #677 rather than after it, because #677 gives scalars the recursion that array elements already had, and a self-referring scalar (`x=x`) is far likelier to be typed than a self-referring element. A second, smaller difference lives in the same message: for a MUTUAL chain (`x=y; y=x`) bash names the innermost variable and huck names the one the expression started from; the single-name case matches bash exactly.
+- **Workaround**: none needed — no real expression nests 64 deep, and the cases that do are the ones that used to crash.
+
+---

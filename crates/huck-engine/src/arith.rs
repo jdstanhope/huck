@@ -621,6 +621,10 @@ pub enum ArithErrorKind {
         count: i64,
     },
     ReadonlyVar(String),
+    /// A value that referred to itself, directly or through a chain (#677).
+    RecursionLimit {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -692,6 +696,7 @@ impl ArithError {
             NegativeExponent => "exponent less than 0".into(),
             ShiftCountOutOfRange { .. } => "shift count out of range".into(),
             ReadonlyVar(name) => format!("{name}: readonly variable"),
+            RecursionLimit { .. } => "expression recursion level exceeded".into(),
         }
     }
 }
@@ -705,6 +710,9 @@ impl std::fmt::Display for ArithError {
             Parse(m) => write!(f, "{m}"),
             DivisionByZero => write!(f, "division by zero"),
             ModuloByZero => write!(f, "modulo by zero"),
+            RecursionLimit { name } => {
+                write!(f, "expression recursion level exceeded for '{name}'")
+            }
             NotAnInteger { var, value } => {
                 write!(f, "variable '{var}' is not an integer: '{value}'")
             }
@@ -1040,19 +1048,79 @@ impl Parser {
 
 use crate::shell_state::Shell;
 
-/// Reads a shell variable's current i64 value. Returns 0 if unset or
-/// empty (matches existing eval Var behavior).
-fn read_var_i64(shell: &Shell, name: &str) -> Result<i64, ArithError> {
-    let raw = shell.lookup_var(name).unwrap_or_default();
-    if raw.is_empty() {
+/// How deep a value may be evaluated as an expression before huck reports
+/// instead of recursing.
+///
+/// Without a cap, `x=x; echo $((x))` recursed until the process died —
+/// measured: `thread 'main' has overflowed its stack`, which takes the whole
+/// shell down where bash prints an error and carries on. That is the bug this
+/// number exists to prevent.
+///
+/// ⚠️ bash's own cap is 1024 (`expr.c`'s `EXPRESSION_RECURSION_LIMIT`) and huck
+/// CANNOT match it. Measured with a chain of `v1=v2 … vN=7`: a debug build
+/// evaluates depth 350 on the MAIN thread and overflows between 350 and 400, so
+/// a 1024 cap would never be reached and the crash would remain.
+///
+/// ⚠️ And the main thread is not the tightest constraint — a libtest thread gets
+/// 2 MiB where the main thread gets 8 MB, and 128 overflowed THERE while passing
+/// interactively. The number has to hold on the smallest stack any of this code
+/// runs on, which is why it is 64 rather than the 128 that "worked" when tried
+/// by hand. A chain deeper than this errors where bash would answer — recorded
+/// as an intentional divergence, because the alternative is a crash.
+const RECURSION_LIMIT: u32 = 64;
+
+/// The i64 value of a NAME's raw string, evaluated the way bash does it.
+///
+/// A value referenced from arithmetic is itself an arithmetic EXPRESSION, not an
+/// integer literal: `x=010` is octal 8, `x=0x10` is 16, `x=1+1` is 2, and `x=y`
+/// resolves `y` in turn. huck parsed the string as a decimal integer, so `010`
+/// came out as **10** — silently wrong — and everything else was an error (#677).
+///
+/// One function for scalars AND array elements, which had two copies of this
+/// with different behaviour: the element copy already recursed (so `a[0]="1+1"`
+/// worked while `x="1+1"` did not) and had no depth guard.
+fn value_to_i64(shell: &mut Shell, name: &str, raw: String) -> Result<i64, ArithError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
         return Ok(0);
     }
-    raw.parse::<i64>().map_err(|_| {
+    // Fast path for the shape a loop counter has. Deliberately NOT
+    // `parse::<i64>()`: that accepts `010` and answers 10, which is the bug.
+    // A leading zero means a base prefix, so it goes through the parser.
+    let plain_decimal = trimmed == "0" || {
+        let body = trimmed.strip_prefix('-').unwrap_or(trimmed);
+        !body.starts_with('0') && body.bytes().all(|b| b.is_ascii_digit()) && !body.is_empty()
+    };
+    if plain_decimal && let Ok(n) = trimmed.parse::<i64>() {
+        return Ok(n);
+    }
+    let parsed = parse(&raw).map_err(|_| {
         ArithError::plain(ArithErrorKind::NotAnInteger {
             var: name.to_string(),
-            value: raw,
+            value: raw.clone(),
         })
-    })
+    })?;
+    if !shell.arith_recursion_enter(RECURSION_LIMIT) {
+        // `offset: Some(0)` so the renderer names the whole expression as the
+        // error token, which is what bash does when the expression IS the
+        // self-referring name (`$((x))` with `x=x` → `error token is "x"`).
+        return Err(ArithError {
+            kind: ArithErrorKind::RecursionLimit {
+                name: name.to_string(),
+            },
+            offset: Some(0),
+            token_end: None,
+        });
+    }
+    let out = eval(&parsed, shell);
+    shell.arith_recursion_leave();
+    out
+}
+
+/// Reads a shell variable's current i64 value. Returns 0 if unset or empty.
+fn read_var_i64(shell: &mut Shell, name: &str) -> Result<i64, ArithError> {
+    let raw = shell.lookup_var(name).unwrap_or_default();
+    value_to_i64(shell, name, raw)
 }
 
 /// Writes an i64 back to a shell variable as a decimal string.
@@ -1070,21 +1138,7 @@ fn element_string_to_i64(
     name: &str,
     raw: Option<String>,
 ) -> Result<i64, ArithError> {
-    let raw = raw.unwrap_or_default();
-    if raw.is_empty() {
-        return Ok(0);
-    }
-    if let Ok(n) = raw.parse::<i64>() {
-        return Ok(n);
-    }
-    // Non-numeric: arith-evaluate recursively (an element may hold "1+1").
-    let parsed = parse(&raw).map_err(|_| {
-        ArithError::plain(ArithErrorKind::NotAnInteger {
-            var: name.to_string(),
-            value: raw.clone(),
-        })
-    })?;
-    eval(&parsed, shell)
+    value_to_i64(shell, name, raw.unwrap_or_default())
 }
 
 /// Reads the current i64 value of an lvalue (scalar var or array element).
@@ -1146,19 +1200,7 @@ fn check_shift_count(count: i64) -> Result<u32, ArithError> {
 pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
     match expr {
         ArithExpr::Num(n) => Ok(*n),
-        ArithExpr::Var(name) => {
-            let raw = shell.lookup_var(name).unwrap_or_default();
-            if raw.is_empty() {
-                Ok(0)
-            } else {
-                raw.parse::<i64>().map_err(|_| {
-                    ArithError::plain(ArithErrorKind::NotAnInteger {
-                        var: name.clone(),
-                        value: raw.to_string(),
-                    })
-                })
-            }
-        }
+        ArithExpr::Var(name) => read_var_i64(shell, name),
         ArithExpr::Index {
             name,
             subscript,

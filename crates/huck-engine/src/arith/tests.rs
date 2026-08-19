@@ -786,20 +786,47 @@ fn eval_empty_var_is_zero() {
 }
 
 #[test]
-fn eval_non_integer_var_is_error() {
+fn eval_var_holding_a_name_resolves_it() {
+    // ⚠️ This test used to assert that a variable holding "abc" is an ERROR, and
+    // that was a claim about huck's behaviour rather than about the shell's.
+    // bash evaluates a value as an EXPRESSION (#677), so "abc" is a NAME, unset,
+    // worth 0 — measured: `HUCK_TEST_ARITH_BAD=abc; echo $((HUCK_TEST_ARITH_BAD
+    // + 1))` prints 1 in bash. A test pinning "what it does now" quietly becomes
+    // a defence of the bug.
     let mut s = Shell::new();
     s.export_set("HUCK_TEST_ARITH_BAD", "abc".to_string());
-    let err = eval_str("HUCK_TEST_ARITH_BAD + 1", &mut s).unwrap_err();
+    assert_eq!(eval_str("HUCK_TEST_ARITH_BAD + 1", &mut s).unwrap(), 1);
+    // ...and a name that DOES resolve resolves through.
+    s.export_set("abc", "41".to_string());
+    assert_eq!(eval_str("HUCK_TEST_ARITH_BAD + 1", &mut s).unwrap(), 42);
+}
+
+#[test]
+fn eval_var_value_is_an_expression() {
+    // The other half of #677: base prefixes and operators in a VALUE.
+    let mut s = Shell::new();
+    s.export_set("HUCK_TEST_OCT", "010".to_string());
+    s.export_set("HUCK_TEST_HEX", "0x10".to_string());
+    s.export_set("HUCK_TEST_EXPR", "1+1".to_string());
     assert_eq!(
-        err,
-        ArithError {
-            kind: ArithErrorKind::NotAnInteger {
-                var: "HUCK_TEST_ARITH_BAD".to_string(),
-                value: "abc".to_string()
-            },
-            offset: None,
-            token_end: None
-        }
+        eval_str("HUCK_TEST_OCT", &mut s).unwrap(),
+        8,
+        "010 is octal"
+    );
+    assert_eq!(eval_str("HUCK_TEST_HEX + 1", &mut s).unwrap(), 17);
+    assert_eq!(eval_str("HUCK_TEST_EXPR", &mut s).unwrap(), 2);
+}
+
+#[test]
+fn eval_self_referring_var_reports_instead_of_recursing() {
+    // Before the cap this overflowed the stack and killed the process. The
+    // assertion that matters is that it RETURNS at all.
+    let mut s = Shell::new();
+    s.export_set("HUCK_TEST_SELF", "HUCK_TEST_SELF".to_string());
+    let err = eval_str("HUCK_TEST_SELF", &mut s).unwrap_err();
+    assert!(
+        matches!(err.kind, ArithErrorKind::RecursionLimit { .. }),
+        "{err:?}"
     );
 }
 
