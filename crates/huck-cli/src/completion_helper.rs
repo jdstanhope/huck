@@ -32,10 +32,10 @@ pub struct HuckHelper {
     /// a program installed on one line is seen on the next.
     validity: RefCell<huck_engine::cmd_validity::ValidityCache>,
     /// The lines of this logical command already entered, with their joiner
-    /// (#670). Empty at a PS1 prompt; at a PS2 prompt it is what makes the line
-    /// being typed parseable at all — `then echo hi` is a syntax error on its
-    /// own, and a fragment that cannot parse is a fragment that cannot be
-    /// coloured.
+    /// (#670, #673). Empty at a PS1 prompt; at a PS2 prompt it is what makes the
+    /// line being typed parseable at all — `then echo hi` is a syntax error on
+    /// its own, and a fragment that cannot parse can be neither coloured nor
+    /// completed.
     prefix: RefCell<String>,
 }
 
@@ -51,14 +51,18 @@ impl HuckHelper {
         }
     }
 
-    /// Tell the highlighter what this line CONTINUES (#670).
+    /// Tell the helper what this line CONTINUES (#670, #673).
     ///
     /// Set once per prompt, not per keystroke: at a PS1 prompt it is empty, and
     /// at a PS2 prompt it is the accumulated buffer plus the joiner that the
     /// next line will be appended with — the same two values the reader itself
     /// uses, taken from the same place, so there is no second notion of how
     /// lines join.
-    pub fn set_highlight_prefix(&self, prefix: String) {
+    ///
+    /// BOTH consumers need it, and for the same reason: highlighting and
+    /// completion are each driven by a PARSE, and a continuation line does not
+    /// parse on its own.
+    pub fn set_line_prefix(&self, prefix: String) {
         *self.prefix.borrow_mut() = prefix;
     }
 
@@ -264,8 +268,32 @@ impl Completer for HuckHelper {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        // #673: resolve over the whole command being typed. huck's completion is
+        // parser-driven (#248), and a continuation line is a syntax error on its
+        // own — `then whil` fails at `then`, so there is no cursor context and
+        // nothing to complete. With the prefix it parses, and the offset comes
+        // back into the visible line's coordinates, which is what rustyline
+        // indexes.
+        let prefix = self.prefix.borrow().clone();
         let mut shell = self.shell.borrow_mut();
-        let (start, candidates) = completion::dispatch::resolve(line, pos, &mut shell);
+        let (start, candidates) = if prefix.is_empty() {
+            completion::dispatch::resolve(line, pos, &mut shell)
+        } else {
+            let source = format!("{prefix}{line}");
+            let (start, candidates) =
+                completion::dispatch::resolve(&source, prefix.len() + pos, &mut shell);
+            if start < prefix.len() {
+                // The word being completed STARTED on an earlier line — a
+                // backslash continuation joins with no newline, so `echo /usr/b\`
+                // then `in/l` is one word across two. rustyline can only replace
+                // within the line it is showing, so there is no honest answer
+                // here: replacing from column zero would drop the half above.
+                // Offer nothing rather than mangle the line.
+                (pos, Vec::new())
+            } else {
+                (start - prefix.len(), candidates)
+            }
+        };
         let pairs = candidates
             .into_iter()
             .map(|c: Candidate| Pair {
@@ -524,7 +552,7 @@ mod tests {
     /// Roles for `line` typed at a PS2 prompt, continuing `prefix`.
     fn roles_after(prefix: &str, line: &str) -> Vec<(String, huck_engine::highlight::Role)> {
         let helper = HuckHelper::new(Rc::new(RefCell::new(Shell::new())));
-        helper.set_highlight_prefix(prefix.to_string());
+        helper.set_line_prefix(prefix.to_string());
         helper
             .highlight_record(line)
             .marks
@@ -610,7 +638,7 @@ mod tests {
         let line = "end\" after";
         for pos in 0..line.len() {
             let helper = HuckHelper::new(Rc::new(RefCell::new(Shell::new())));
-            helper.set_highlight_prefix("echo \"start\n".to_string());
+            helper.set_line_prefix("echo \"start\n".to_string());
             let mut rec = helper.highlight_record(line);
             HuckHelper::emphasise_pairs(&mut rec, pos);
             assert!(

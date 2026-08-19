@@ -193,6 +193,35 @@ fn tab_completes_builtin() {
 }
 
 #[test]
+fn tab_completes_on_a_continuation_line() {
+    // #673: completion did NOTHING after a `>` prompt. huck's completion is
+    // parser-driven (#248), and a continuation line is a syntax error on its
+    // own — `then whil` fails at `then`, leaving no cursor context to work from.
+    //
+    // ⚠️ The needle is the COMPLETED text, which the typed keystrokes cannot
+    // produce: `whil` is sent, `while` can only come from the completion. And
+    // the first line is synced past on its own output, not on a prompt.
+    let dir = tempfile::tempdir().unwrap();
+    let env = isolated_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "if true");
+    send(&mut session, ENTER);
+    settle();
+    send(&mut session, "then whil");
+    send(&mut session, TAB);
+    expect(&mut session, "while");
+    // Finish the command so the session exits cleanly rather than sitting at a
+    // continuation prompt.
+    send(&mut session, "true; fi");
+    send(&mut session, ENTER);
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
 fn tab_double_tab_lists() {
     let dir = tempfile::tempdir().unwrap();
     let env = isolated_env(dir.path());
