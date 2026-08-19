@@ -61,14 +61,15 @@ echo "st=$?"'
 check 'bad number + context' 'echo one
 return abc
 echo "st=$?"'
-#
-# ⚠️ NOT compared: `return 1 2` (too many arguments) in a SCRIPT FILE. bash
-# continues there with `$?` = 1 and stops under `-c`; huck stops in both,
-# because that check predates v358's error-fatality classifier and hardcodes a
-# fatal outcome. Different root from this issue — the message and status are
-# already right, only the per-driver fatality is wrong — so it is #683 rather
-# than a row here. huck and bash DO agree under `-c`, which is what makes the
-# driver the whole difference.
+check 'too many arguments'   'echo one
+return 1 2
+echo "st=$?"'
+# ⚠️ That row was EXCLUDED when this harness was written: `return 1 2` was fatal
+# in every driver, because the check predated v358's error-fatality classifier
+# and hardcoded `Exit(1)`. #683 routed it through the classifier, and the row is
+# now the ordinary one — bash abandons the list here and carries on in a script
+# file, exactly as `history 1 2` does. The remaining drivers are covered by
+# `return_arg_fatality_diff_check.sh`, which compares all five.
 
 # ── controls: where `return` IS legal, nothing may change ─────────────────────
 check 'in a function'        'f() { echo in; return 5; echo NOPE; }

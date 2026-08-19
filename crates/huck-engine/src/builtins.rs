@@ -370,7 +370,7 @@ fn legal_number(s: &str) -> Option<i64> {
 ///     -1 or 300.
 ///
 /// With no argument at all the status is `$?`, unchanged.
-fn builtin_return(args: &[String], err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
+fn builtin_return(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     // `--` first: bash's `get_exitstat` skips it before counting.
     let args = match args.first() {
         Some(a) if a == "--" => &args[1..],
@@ -378,7 +378,14 @@ fn builtin_return(args: &[String], err: &mut dyn Write, shell: &Shell) -> ExecOu
     };
     if args.len() > 1 {
         crate::sh_error_to!(shell, err, None, "return: too many arguments");
-        return ExecOutcome::Exit(1);
+        // #683: this used to be a hardcoded `Exit(1)`, which made it fatal in
+        // EVERY driver. bash abandons the command list here and carries on in a
+        // script file and on stdin, and ends the program only under `-c`,
+        // `source` and `eval` — byte-identical to `history 1 2`, so it is the
+        // same kind rather than a new one. The classifier owns that split
+        // (v358): the kind picks the outcome, the driver picks the code.
+        shell.report_error(crate::error_fatality::ErrorKind::TooManyArgsAbortsList);
+        return ExecOutcome::Continue(1);
     }
     let code = match args.first() {
         Some(a) => match legal_number(a) {
@@ -6386,7 +6393,7 @@ fn builtin_history(
                 // `history -Q`, and even the special builtins `shift a b` and
                 // `break 1 2` all continue. Hence its own ErrorKind rather than
                 // a general "builtin usage" rule fitted to one data point.
-                shell.report_error(crate::error_fatality::ErrorKind::HistoryTooManyArgs);
+                shell.report_error(crate::error_fatality::ErrorKind::TooManyArgsAbortsList);
                 ExecOutcome::Continue(1)
             }
             Ok(n) => {
