@@ -410,6 +410,33 @@ fn finish_command(
     err_armed: bool,
     shell: &mut Shell,
 ) -> Option<ExecOutcome> {
+    finish_command_inner(cmd, c, err_armed, status_produced_by_body(cmd), shell)
+}
+
+/// Adjudicate a status the CALLER knows is its OWN, where the command kind
+/// alone would say otherwise (#685).
+///
+/// One caller: a redirect that failed on a compound. `Redirected` is normally
+/// pass-through — `{ false; } > /dev/null` reports the inner `false`'s status,
+/// already adjudicated inside the redirect — but when the REDIRECT is what
+/// failed the inner never ran, so nothing has adjudicated anything and this is
+/// the only site that can.
+fn finish_command_own(
+    cmd: &Command,
+    c: i32,
+    err_armed: bool,
+    shell: &mut Shell,
+) -> Option<ExecOutcome> {
+    finish_command_inner(cmd, c, err_armed, false, shell)
+}
+
+fn finish_command_inner(
+    cmd: &Command,
+    c: i32,
+    err_armed: bool,
+    inherited: bool,
+    shell: &mut Shell,
+) -> Option<ExecOutcome> {
     // B-11: propagate `$?` across sequence connectors. The top-level loop in
     // shell.rs only refreshes `shell.last_status` after `process_line` returns,
     // so without this update the second command in `false; echo $?` would see a
@@ -455,8 +482,9 @@ fn finish_command(
         // #676: BOTH consumers ask the same question — is this status this
         // command's own, or one it inherited from a body that was already
         // adjudicated? Answering it for ERR and not for errexit is what let a
-        // compound exit on an exemption it could not see.
-        let inherited = status_produced_by_body(cmd);
+        // compound exit on an exemption it could not see. `inherited` is the
+        // caller's answer: `finish_command` reads it off the command kind,
+        // `finish_command_own` knows better (#685).
         if err_armed && !inherited {
             crate::traps::fire_err_trap(shell);
             // #442: the ERR action itself ran `exit N`. Checked here, AFTER the
@@ -870,7 +898,7 @@ fn run_command(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
             run_arith(expr, *line, shell)
         }
         Command::Select(clause) => run_select(clause, shell),
-        Command::Redirected { inner, redirects } => run_redirected(inner, redirects, shell),
+        Command::Redirected { inner, redirects } => run_redirected(cmd, inner, redirects, shell),
         Command::Coproc { name, body } => run_coproc(name, body, shell),
         _ => {
             {
@@ -1379,6 +1407,7 @@ fn command_line(cmd: &Command) -> Option<u32> {
 }
 
 fn run_redirected(
+    whole: &Command,
     inner: &Command,
     redirects: &[crate::command::Redirection],
     shell: &mut Shell,
@@ -1391,7 +1420,26 @@ fn run_redirected(
     if let Some(l) = command_line(inner).filter(|&l| l != 0) {
         shell.current_lineno = shell.line_base() + l;
     }
-    with_redirect_scope(redirects, shell, |shell| run_command(inner, shell))
+    // #444: snapshot BEFORE anything runs, so a command that INSTALLS the ERR
+    // trap is not itself caught by it — the same rule `run_list_element` uses.
+    let err_armed = crate::traps::err_trap_armed(shell);
+    let inner_ran = std::cell::Cell::new(false);
+    let out = with_redirect_scope(redirects, shell, |shell| {
+        inner_ran.set(true);
+        run_command(inner, shell)
+    });
+    // #685: the inner never ran, so this status is the REDIRECT's failure and
+    // nothing has adjudicated it — `Redirected` is otherwise pass-through, on
+    // the grounds that the inner already did. This is the site that produced
+    // the failure, so it is the site that judges it.
+    if !inner_ran.get()
+        && let ExecOutcome::Continue(c) = out
+        && c != 0
+        && let Some(o) = finish_command_own(whole, c, err_armed, shell)
+    {
+        return o;
+    }
+    out
 }
 
 /// What a loop body's outcome means to the loop that ran it.
@@ -2789,6 +2837,13 @@ fn status_produced_by_body(cmd: &Command) -> bool {
             | Command::Select(_)
             | Command::If(_)
             | Command::While(_)
+            // #685: a redirected compound reports the INNER command's status
+            // whenever the inner RAN — `{ false; } > /dev/null` fired ERR twice,
+            // once inside the redirect at the `false` and once again at this
+            // wrapper after the redirect was torn down. When the REDIRECT is
+            // what failed the inner never ran, and `run_redirected` adjudicates
+            // that case itself through `finish_command_own`.
+            | Command::Redirected { .. }
     )
 }
 
