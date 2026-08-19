@@ -1,0 +1,111 @@
+---
+title: "The exit that should not have happened"
+date: 2026-08-19
+summary: "A script with `[ -f x ] && do_it` inside an if statement quietly exited early under set -e. huck was judging the same failure twice — once where it happened, and once again on the way out."
+tags: ["errexit", "traps", "bash-compat"]
+version: "v364"
+---
+
+`set -e` says: stop the script when a command fails. Except it has an
+exception, and the exception is the whole reason the option is usable —
+a command that fails on the left of `&&` is *not* a failure, it is a test:
+
+```bash
+[ -f config ] && load_config
+```
+
+That line means "load it if it's there". Failing is the normal outcome. bash
+knows not to exit; so did huck — until you put it inside an `if`, a `for`, a
+`while`, or a `{ }` group:
+
+```bash
+# before
+$ huck on_ac_power; echo "rc=$?"
+rc=1
+
+# after
+$ huck on_ac_power; echo "rc=$?"
+rc=0
+```
+
+That is `/usr/sbin/on_ac_power`, a real script on this machine, in the boot
+path. It ends with a guard of exactly that shape. Under bash it answers 0.
+Under huck it answered 1 — silently, with no message, because "exit now" is
+what `set -e` is *supposed* to do. Nothing looks wrong. The script just stops.
+
+## One failure, judged twice
+
+When a command fails inside `&&`, huck correctly noted the exemption and
+carried on. Then the enclosing `if` finished, took its body's status — the
+same failure — and judged it again. The second judge knew nothing about the
+exemption. It saw a non-zero number and exited.
+
+The fix is one sentence: **a failure is judged once, where it happened.** A
+status that a command merely inherited from its body is never re-judged.
+
+That distinction is not squeamishness about purity — it is what keeps the
+other cases right. These all still exit, and must:
+
+```bash
+set -e
+{ false; }                  # exits — through the inner false, not the group
+( false && true )           # exits — a subshell reports its own status
+f() { false && true; }; f   # exits — a function call's status is its own
+{ :; } > /nonexistent/file  # exits — the redirect is the group's own failure
+```
+
+The last one is the interesting one, and it's where the same bug had a
+second life.
+
+## The trap that fired twice
+
+huck also has an `ERR` trap — run something whenever a command fails. Same
+structure, same mistake:
+
+```bash
+# before
+$ trap 'echo ERRFIRE' ERR; { false; } > out.txt
+$ cat out.txt
+ERRFIRE
+ERRFIRE
+
+# after
+$ cat out.txt
+ERRFIRE
+```
+
+One failure, two fires. And notice *where* they are — both inside `out.txt`,
+because the redirect was still in place. That detail nearly hid the bug from
+me: when I first counted the fires I sent the trap's output to the terminal,
+and one of bash's fires had gone into the redirect instead, so my measurement
+said bash fired zero times and huck fired once. The truth was one and two.
+
+The wrinkle in fixing it: a redirected group is usually just reporting its
+inner command's status, so it should not judge anything. But if the *redirect*
+is what failed, the inner command never ran at all — nothing inside could have
+judged it, so the group must. Both of those are now decided at the point where
+the answer is actually known.
+
+## What was already right
+
+The predicate this needed already existed in huck. It listed exactly the right
+constructs, with a written explanation for every exclusion, and it had been
+used for years to stop the `ERR` trap firing twice. It just wasn't being used
+for `set -e`, because of a comment above it that said it deliberately wasn't:
+
+> `set -e; { false; }` must still exit, exactly as it does today.
+
+Which is true — but it exits through the inner `false`, not through the group.
+The conclusion was checked against the outcome instead of the mechanism, and
+the outcome was the same either way. That's a comfortable way to be wrong for
+a long time.
+
+## What is still open
+
+The sweep that found this one — running huck and bash over a couple of thousand
+real scripts from this machine and comparing what they print — also turned up
+four other divergences, two fixed since and two still open:
+[#679](https://github.com/jdstanhope/huck/issues/679) (a `[` error names the
+argument where bash names the operator) and
+[#680](https://github.com/jdstanhope/huck/issues/680) (a command inside a
+multi-line substitution reports the wrong line). Both are message-only.
