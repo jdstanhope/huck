@@ -270,3 +270,14 @@ huck enforces `FUNCNEST` exactly like bash, but additionally clamps the effectiv
 - **Workaround**: none needed — huck's behaviour is the terminating one.
 
 ---
+
+### `shopt syntax_highlight` — a huck option bash has no name for
+
+[Issue #669 · by-design](https://github.com/jdstanhope/huck/issues/669)
+
+- **huck**: `shopt syntax_highlight` reports `on`, and `shopt -u syntax_highlight` turns interactive syntax highlighting off (v363, #666). Put it in `~/.huckrc` to keep it off.
+- **bash**: `shopt: syntax_highlight: invalid shell option name`, rc 1 — it has no such option, because it has no such feature.
+- **Why intentional**: a shell extension needs a name bash does not have, and `shopt` is where shell behaviour toggles live — it is the control that composes with an rc file and the one a user already knows to reach for. The divergence is deliberately confined to that ONE name: huck's own options live in `HUCK_SHOPT_TABLE`, not in bash's `SHOPT_TABLE`, because bare `shopt`, `shopt -p` and `compgen -A shopt` all print that table and are compared with bash byte for byte. So the option is settable, queryable and printable by name, and invisible to every listing. `tests/scripts/syntax_highlight_shopt_diff_check.sh` pins the containment — including that every OTHER unknown name is still rejected exactly as bash rejects it — and it is load-bearing: moving the option into the shared table turns 8 of its 18 rows red.
+- **Workaround**: none needed. Scripts written for bash never mention the name; `NO_COLOR` and a non-tty stdout disable highlighting without it.
+
+---

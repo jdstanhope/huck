@@ -18,6 +18,7 @@ pub mod builtins;
 pub(crate) mod capture_test_hook;
 pub(crate) mod child_fd;
 #[doc(hidden)]
+pub mod cmd_validity;
 pub mod completion;
 pub(crate) mod completion_builtins;
 pub(crate) mod completion_spec;
@@ -73,4 +74,4 @@ pub use exec_builder::ExecBuilder;
 
 // Re-export the frontend so `huck_engine::lexer::`/`::command::` resolve downstream.
 pub use huck_syntax::escape_double_quote_value;
-pub use huck_syntax::{brace_expand, command, generate, lexer, parser};
+pub use huck_syntax::{brace_expand, command, generate, highlight, lexer, parser};

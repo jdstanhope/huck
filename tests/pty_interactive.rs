@@ -35,13 +35,43 @@ fn try_spawn(cwd: &Path, env: &[(&str, &str)]) -> Option<OsSession> {
     // precedence over --rcfile/$HUCK_RC, so a future rc-file test must spawn
     // huck directly rather than through this helper.
     cmd.arg("--norc");
+    // ⚠️ Highlighting OFF for this suite (#666). It is a REPL-BEHAVIOUR suite —
+    // history recall, Ctrl-C, multi-line assembly, heredocs — and painting the
+    // edit line multiplies its terminal traffic about fivefold, which on a
+    // one-core box starved sessions until legitimate waits exceeded half a
+    // minute. Measured: 110 s with two failures, 33 s and green without.
+    //
+    // The painted editor has its own harness, `highlight_render_pty.rs`. What
+    // that does NOT cover is a CONTINUATION line, and the reason is worth
+    // knowing: a continuation line is parsed on its own, so `then echo hi` has
+    // no `if` in front of it, the parse fails at the first word, and almost
+    // nothing gets marked. Highlighting the accumulated command rather than the
+    // physical line is #670 — so turning colour off here costs no coverage that
+    // exists today.
+    cmd.env("NO_COLOR", "1");
     cmd.current_dir(cwd);
     for (k, v) in env {
         cmd.env(k, v);
     }
     match OsSession::spawn(cmd) {
         Ok(mut session) => {
-            session.set_expect_timeout(Some(Duration::from_secs(10)));
+            // 30 s, not 10. Since v363 the editor repaints the WHOLE line on
+            // every keystroke, so each session does several times the terminal
+            // I/O it used to. Individually every test here still finishes in a
+            // few seconds — `pty_multiline_if_runs` alone takes 4 s — but 26
+            // sequential pty sessions on a 1-core box pushed two or three of
+            // them past a 10 s expect, and WHICH ones moved between runs, which
+            // is the signature of contention rather than a broken expectation.
+            //
+            // Raising the ceiling rather than the sleeps on purpose: a timeout
+            // that is never reached costs nothing, while longer sleeps would slow
+            // every run whether or not the box is loaded.
+            //
+            // 90 s, which is headroom for a loaded box rather than for any
+            // expected wait: this repo has 124 integration binaries and one
+            // core, so a legitimate wait here has been measured past 30 s.
+            // Nothing waits 90 s when it passes.
+            session.set_expect_timeout(Some(Duration::from_secs(90)));
             Some(session)
         }
         Err(e) => {
@@ -60,6 +90,13 @@ fn send(session: &mut OsSession, bytes: &str) {
 
 /// Reads the PTY stream until `needle` appears, or panics on timeout.
 /// `needle` is matched literally (not as a regex).
+///
+/// ⚠️ Choose needles that can only appear ONCE, at the point you mean. Since
+/// v363 the editor repaints prompt-and-line on every keystroke, so a prompt is
+/// emitted many times per line and `"> "` — which `"huck> "` also contains — no
+/// longer identifies a position. Prefer a marker that only the command's OUTPUT
+/// can produce, e.g. `echo TAG_$((6*7))` asserted as `TAG_42`: the typed line
+/// echoes the expression, only the output holds the value.
 fn expect(session: &mut OsSession, needle: &str) {
     session
         .expect(needle)
@@ -255,9 +292,15 @@ fn up_arrow_recalls_previous() {
     expect(&mut session, "recallmarker"); // sync past the command
     expect(&mut session, "huck> "); // sync to the next prompt
     send(&mut session, UP);
-    // If up-arrow recalled the entry, the line is redrawn as the full
-    // previous command.
-    expect(&mut session, "echo recallmarker");
+    // If up-arrow recalled the entry, the line is redrawn with the previous
+    // command in it.
+    //
+    // ⚠️ The ARGUMENT is the needle, not the whole line: since #666 the command
+    // word is painted, so `echo recallmarker` is written to the terminal as
+    // `<SGR>echo<SGR> recallmarker` and no literal needle spans the two. The
+    // argument is unpainted, and this is read forward from the prompt we just
+    // synced on, so the next occurrence IS the redraw.
+    expect(&mut session, "recallmarker");
     send(&mut session, ENTER);
     expect(&mut session, "recallmarker"); // it ran again
     send(&mut session, "exit");
@@ -282,7 +325,8 @@ fn up_arrow_twice_recalls_older() {
     expect(&mut session, "huck> ");
     send(&mut session, UP);
     send(&mut session, UP);
-    expect(&mut session, "echo olderone");
+    // The unpainted ARGUMENT is the needle — see `up_arrow_recalls_previous`.
+    expect(&mut session, "olderone");
     send(&mut session, ENTER);
     expect(&mut session, "olderone");
     send(&mut session, "exit");
@@ -307,9 +351,10 @@ fn down_arrow_navigates_forward() {
     expect(&mut session, "huck> ");
     send(&mut session, UP);
     send(&mut session, UP);
-    expect(&mut session, "echo firstcmd");
+    // Unpainted ARGUMENTS are the needles — see `up_arrow_recalls_previous`.
+    expect(&mut session, "firstcmd");
     send(&mut session, DOWN);
-    expect(&mut session, "echo secondcmd");
+    expect(&mut session, "secondcmd");
     send(&mut session, ENTER);
     expect(&mut session, "secondcmd");
     send(&mut session, "exit");
@@ -348,10 +393,16 @@ fn ctrl_c_clears_partial_line() {
     // Type a partial line with NO Enter, then Ctrl-C.
     send(&mut session, "echo partialXYZ");
     send(&mut session, CTRL_C);
-    // After Ctrl-C rustyline discards the partial line and the loop
-    // redraws a fresh prompt. Sync to it before typing `pwd` so the
-    // keystrokes are not sent into the editor mid-redraw.
-    expect(&mut session, "huck> ");
+    // After Ctrl-C rustyline discards the partial line and the loop redraws a
+    // fresh prompt. Wait for the redraw before typing `pwd`, so the keystrokes
+    // are not sent into the editor mid-redraw.
+    //
+    // ⚠️ `expect("huck> ")` is NOT the way to wait for it. Every keystroke
+    // repaints prompt-and-line, so by this point the stream holds one prompt per
+    // character typed; the expect matches an EARLIER redraw, returns immediately,
+    // and the `pwd` goes out during the real redraw. `settle()` is the sync for a
+    // boundary with no unique output of its own (see its boundary #2).
+    settle();
     // Run `pwd`. If Ctrl-C cleared the partial line, `pwd` runs alone
     // and prints the cwd. If it did NOT clear, the line would be
     // `echo partialXYZpwd` and the cwd path would never be printed.
@@ -442,15 +493,38 @@ fn pty_multiline_if_runs() {
     expect(&mut session, "huck> ");
     send(&mut session, "if true");
     send(&mut session, ENTER);
+    // The continuation prompt appears once here, BEFORE any body is typed, so
+    // this sync is unambiguous.
     expect(&mut session, "> ");
-    send(&mut session, "then echo MARKER42");
+    // ⚠️ The marker is written as an EXPANSION so the string that appears in the
+    // command's OUTPUT (`MARKER_42`) never appears in the ECHO of the typed line
+    // (`MARKER_$((6*7))`). Matching on the echo would pass without the `if` ever
+    // running. The repo's own `READY_$((6*7))` spawn probe uses the same trick.
+    // ⚠️ ONE send, and the sync below is the ONLY read of `IFSYNC`. Splitting
+    // this into two chunks with a read between them — which an earlier version
+    // did, to drain the pty — silently broke the test: the typed line is echoed
+    // ONCE, so the intermediate read consumed the very occurrence the sync after
+    // `ENTER` was waiting for, and that sync then waited out the full ceiling.
+    send(&mut session, "then echo IFSYNC MARKER_$((6*7))");
     send(&mut session, ENTER);
-    expect(&mut session, "> ");
+    // ⚠️ DRAIN, not just sleep. Since v363 the editor repaints the whole line on
+    // every keystroke, so a session emits several times the bytes it used to. A
+    // test that only reads inside `expect` leaves that output in the pty buffer;
+    // once it fills, HUCK BLOCKS ON WRITE and stops consuming input, so the `if`
+    // never completes and the marker never arrives. That is what made this test
+    // fail intermittently — and which test failed moved between runs.
+    //
+    // Expecting the echo of a PLAIN word drains the buffer again and syncs.
+    //
+    // The sync word must contain no shell metacharacter: an expansion in it would
+    // be painted, and the escapes interleaved into the echo would break a
+    // literal match.
+    expect(&mut session, "IFSYNC");
     send(&mut session, "fi");
     send(&mut session, ENTER);
     // The body runs only if the three lines were assembled into one
-    // complete `if` command.
-    expect(&mut session, "MARKER42");
+    // complete `if` command — and only the OUTPUT can contain this.
+    expect(&mut session, "MARKER_42");
     send(&mut session, "exit");
     send(&mut session, ENTER);
 }
@@ -466,16 +540,29 @@ fn pty_ctrl_c_aborts_multiline_buffer() {
     // Start a multi-line `if`, then abort it with Ctrl-C.
     send(&mut session, "if true");
     send(&mut session, ENTER);
-    expect(&mut session, "> ");
+    // ⚠️ No `expect("> ")` here, and no `expect("huck> ")` after the abort.
+    // Both are AMBIGUOUS sync points: `"huck> "` itself contains `"> "`, and
+    // since v363 the editor repaints prompt-and-line on every keystroke, so each
+    // typed character emits another copy of the prompt. An intermediate expect
+    // then matches an arbitrary earlier repaint, the stream position drifts, and
+    // the final assertion times out looking for output that has already gone
+    // past. This test failed exactly that way in CI.
+    //
+    // The two remaining expects are unambiguous: the FIRST prompt, and a marker
+    // that can only come from the command's output. Continuation-prompt coverage
+    // is not lost — `pty_continuation_prompt_appears` asserts it directly.
     settle();
     send(&mut session, CTRL_C);
-    // After the abort the main prompt returns and the partial command
-    // is gone — a fresh `pwd` runs alone and prints the temp dir name.
-    expect(&mut session, "huck> ");
-    send(&mut session, "pwd");
-    send(&mut session, ENTER);
+    settle();
+    // After the abort the partial command is gone, so a fresh command runs alone.
+    // `pwd` proves the cwd; the arithmetic marker proves the OUTPUT was reached
+    // (it echoes as `CTRLC_$((6*7))` when typed and prints `CTRLC_42`, so a pass
+    // cannot be matching the echo of the line we just typed).
     let marker = dir.path().file_name().unwrap().to_str().unwrap();
+    send(&mut session, "pwd; echo CTRLC_$((6*7))");
+    send(&mut session, ENTER);
     expect(&mut session, marker);
+    expect(&mut session, "CTRLC_42");
     send(&mut session, "exit");
     send(&mut session, ENTER);
 }
@@ -513,14 +600,21 @@ fn pty_heredoc_simple() {
     expect(&mut session, "huck> ");
     send(&mut session, "cat <<EOF");
     send(&mut session, ENTER);
+    // Unambiguous: the continuation prompt is drawn once before any body typing.
     expect(&mut session, "> ");
-    send(&mut session, "PTY_HEREDOC_MARKER");
+    // ⚠️ An EXPANSION in the body, so what `cat` prints (`HEREDOC_42`) differs
+    // from the echo of the typed line (`HEREDOC_$((6*7))`). An unquoted heredoc
+    // delimiter expands the body, so this also proves the body took the
+    // expanding path rather than being copied verbatim.
+    send(&mut session, "HDSYNC HEREDOC_$((6*7))");
     send(&mut session, ENTER);
-    expect(&mut session, "> ");
+    // Drain + sync on a plain word — see `pty_multiline_if_runs` for why a sleep
+    // is not enough and why the word must have no metacharacters in it.
+    expect(&mut session, "HDSYNC");
     send(&mut session, "EOF");
     send(&mut session, ENTER);
     // `cat` echoes the body; the prompt must return afterwards.
-    expect(&mut session, "PTY_HEREDOC_MARKER");
+    expect(&mut session, "HEREDOC_42");
     expect(&mut session, "huck> ");
     send(&mut session, "exit");
     send(&mut session, ENTER);

@@ -576,6 +576,12 @@ fn read_logical_command(
             // No prompt for non-tty; read one line straight from fd 0.
             read_stdin_line_raw().ok_or(ReadlineError::Eof)
         } else {
+            // v363 (#666): a fresh prompt is a fresh view of the world. Command
+            // validity established while the LAST line was typed is forgotten
+            // here, so a program installed by that line is found by this one.
+            if let Some(h) = editor.helper() {
+                h.clear_validity_cache();
+            }
             editor.readline(&(measured, expanded))
         };
         match read {

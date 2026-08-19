@@ -2680,6 +2680,34 @@ fn push_heredoc_literal_lines(parts: &mut Vec<WordPart>, text: &str, quoted: boo
     }
 }
 
+/// Consume any leading `!` words, returning how many there were (each flips the
+/// negation flag). Under the atom scanner successive bangs are separated by
+/// `Blank` atoms (`! ! a`), so inter-token blanks are skipped after each one.
+///
+/// One helper for the two pipeline entry points, so the #666 keyword claim is
+/// made once: `!` is a reserved word, but it never reaches `consume_word_in`
+/// where the rest are claimed, so it is claimed here — offset taken before the
+/// pull, role corrected after.
+fn consume_leading_bangs(iter: &mut Lexer) -> Result<usize, ParseError> {
+    let mut bangs = 0usize;
+    while iter.peek_kind()?.map(is_bang_word).unwrap_or(false) {
+        let bang_start = if iter.recording_highlight() {
+            iter.peek_span()?.map(|s| s.offset)
+        } else {
+            None
+        };
+        iter.next_kind()?; // consume `!`
+        if let Some(start) = bang_start {
+            iter.claim_keyword_word(start);
+        }
+        bangs += 1;
+        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+            iter.next_kind()?;
+        }
+    }
+    Ok(bangs)
+}
+
 /// Returns `true` if the token is a standalone `!` word (pipeline negation).
 /// Mirrors `is_bang_word` in `command.rs`.
 fn is_bang_word(tok: &TokenKind) -> bool {
@@ -2818,18 +2846,50 @@ fn peek_leading_keyword(iter: &mut Lexer) -> Result<Option<Keyword>, ParseError>
 /// whole (non-atom path).  Callers that expect a keyword here must have already
 /// verified it via `peek_leading_keyword` (which also skips leading blanks).
 fn consume_command_word(iter: &mut Lexer) -> Result<Word, ParseError> {
-    // Recovery cursor context (Task 4): a word assembled here is command-position
-    // (the leading command word, an `if`/`while` condition command, a for/case
-    // subject, or a keyword). No-op off the recovery path.
-    iter.set_recovery_cmd_word(true);
-    if matches!(iter.peek_kind()?, Some(TokenKind::Word(_))) {
+    consume_word_in(iter, crate::lexer::WordContext::Command)
+}
+
+/// Consume a word, declaring what it IS first.
+///
+/// The declaration must precede the pull: it is what the lexer reads as each
+/// token is handed out, to decide whether a bare word is a command (#666), and
+/// what EOF recovery reports if the input ends mid-word.
+///
+/// `Subject` is for a word in command POSITION that names no command — a
+/// `for`/`select` variable, a `case` subject. Recovery still treats it as
+/// command-ish (`WordContext::is_cmd_word`), so its behaviour is unchanged.
+fn consume_word_in(iter: &mut Lexer, ctx: crate::lexer::WordContext) -> Result<Word, ParseError> {
+    iter.declare_word_context(ctx);
+    // #666: where the word starts, so a reserved word can be claimed back from
+    // the command-word role below. Only when the record is being kept — off, no
+    // peek happens here at all, so this cannot perturb the scan.
+    let word_start = if iter.recording_highlight() {
+        iter.peek_span()?.map(|s| s.offset)
+    } else {
+        None
+    };
+    let w = if matches!(iter.peek_kind()?, Some(TokenKind::Word(_))) {
         match iter.next_kind()? {
             Some(TokenKind::Word(w)) => Ok(w),
             _ => unreachable!("peek confirmed Word"),
         }
     } else {
         parse_word_command(iter, false)
+    }?;
+    // #666: the lexer marked this as a command word because the parser declared
+    // command position — true, but a reserved word is not a command. Which words
+    // are reserved is THIS file's list, and the lexer may not read it (the
+    // one-way front-end invariant), so the correction is made here.
+    //
+    // (`!` is a reserved word too, but `parse_pipeline`'s bang loop consumes it
+    // and it never arrives here — it is claimed there.)
+    if let Some(start) = word_start
+        && w.as_reserved_literal()
+            .is_some_and(|t| keyword_from_str(t).is_some())
+    {
+        iter.claim_keyword_word(start);
     }
+    Ok(w)
 }
 
 /// The keyword an already-CONSUMED token represents (for error reporting in the
@@ -2933,7 +2993,7 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
             // that inner-mode position wins instead. Reset once the redirect is
             // built so a following argument word is not misread. No-op off the
             // recovery path.
-            iter.set_recovery_cmd_word(false);
+            iter.declare_word_context(crate::lexer::WordContext::Argument);
             iter.set_recovery_redirect_target(true);
             let target = match iter.peek_kind()? {
                 Some(TokenKind::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
@@ -3231,14 +3291,41 @@ fn parse_simple_with_leading_word(
             // assignment-prefix word in this command's prefix run (see the
             // flag's declaration above for the empirically-mapped rule and
             // examples).
-            if all_words.iter().all(crate::command::is_assignment_word) && !redir_after_assign {
+            //
+            // Every word so far being assignment-shaped means the command word
+            // itself is still AHEAD — `FOO=bar cmd`'s command is `cmd`. That is
+            // the same condition the alias re-drive below tests, and #666 reads
+            // it for the same reason: to know whether the word about to be
+            // assembled is the command.
+            let still_prefix = all_words.iter().all(crate::command::is_assignment_word);
+            // #666: where this word begins, for the assignment claim below. Only
+            // when the record is being kept — see `recording_highlight`.
+            let word_start = if iter.recording_highlight() {
+                iter.peek_span()?.map(|s| s.offset).unwrap_or(0)
+            } else {
+                0
+            };
+            if still_prefix && !redir_after_assign {
                 iter.expand_command_alias()?;
             }
             // v264 flip-fix (Finding 1): argument command words brace-expand
             // (1→N Words), matching the oracle's lex-time `emit_word_with_braces`.
-            // Recovery cursor context (Task 4): this is an argument-position word.
-            iter.set_recovery_cmd_word(false);
+            // Recovery cursor context (Task 4): command position while the prefix
+            // run continues, argument position once the command word is behind us.
+            iter.declare_word_context(if still_prefix {
+                crate::lexer::WordContext::Command
+            } else {
+                crate::lexer::WordContext::Argument
+            });
             let w = parse_word_command(iter, false)?;
+            // #666: an assignment prefix only reveals itself once the word is
+            // WHOLE, so its marks are claimed back here rather than declared
+            // ahead of time — the name is a variable, the value is plain text.
+            if iter.recording_highlight() && still_prefix && crate::command::is_assignment_word(&w)
+            {
+                let end = iter.peek_span()?.map(|s| s.offset).unwrap_or(usize::MAX);
+                iter.claim_assignment_word(word_start, end);
+            }
             push_command_word_brace_expanded(&mut all_words, w, iter)?;
             continue;
         }
@@ -3586,7 +3673,19 @@ fn parse_command_impl(iter: &mut Lexer, allow_empty: bool) -> Result<Command, Pa
             | Some(TokenKind::AssignPrefix { .. })
     ) {
         let line = iter.current_line()?;
+        let word_start = if iter.recording_highlight() {
+            iter.peek_span()?.map(|s| s.offset).unwrap_or(0)
+        } else {
+            0
+        };
         let name_word = consume_command_word(iter)?;
+        // #666: a LEADING assignment (`FOO=bar cmd`) is read here, by the same
+        // call that reads a command name, and only the finished word tells them
+        // apart. See `claim_assignment_word`.
+        if iter.recording_highlight() && crate::command::is_assignment_word(&name_word) {
+            let end = iter.peek_span()?.map(|s| s.offset).unwrap_or(usize::MAX);
+            iter.claim_assignment_word(word_start, end);
+        }
         // Recovery cursor context (Gap A, iteration 2): the command word is now
         // fully consumed — the parser next expects an ARGUMENT. `consume_command_word`
         // left the flag `true` (command position); flip it so an EMPTY trailing
@@ -3595,7 +3694,7 @@ fn parse_command_impl(iter: &mut Lexer, allow_empty: bool) -> Result<Command, Pa
         // the EOF capture was already taken INSIDE `consume_command_word`'s
         // terminating peek with the flag `true`, so this is moot there. No-op off
         // the recovery path.
-        iter.set_recovery_cmd_word(false);
+        iter.declare_word_context(crate::lexer::WordContext::Argument);
         while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
             iter.next_kind()?;
         }
@@ -3842,14 +3941,7 @@ fn parse_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
     // Count leading `!` words (each one flips the negate flag). Under the atom
     // scanner successive bangs are separated by `Blank` atoms (`! ! a`), so skip
     // any inter-token blanks after each bang before checking for the next one.
-    let mut bangs = 0usize;
-    while iter.peek_kind()?.map(is_bang_word).unwrap_or(false) {
-        iter.next_kind()?; // consume `!`
-        bangs += 1;
-        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
-            iter.next_kind()?;
-        }
-    }
+    let bangs = consume_leading_bangs(iter)?;
     let negate = bangs % 2 == 1;
 
     // Parse the first stage command (may be simple or compound).
@@ -3867,14 +3959,7 @@ fn parse_pipeline_allow_empty(iter: &mut Lexer) -> Result<Option<Command>, Parse
     while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
         iter.next_kind()?;
     }
-    let mut bangs = 0usize;
-    while iter.peek_kind()?.map(is_bang_word).unwrap_or(false) {
-        iter.next_kind()?;
-        bangs += 1;
-        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
-            iter.next_kind()?;
-        }
-    }
+    let bangs = consume_leading_bangs(iter)?;
     if bangs > 0 {
         let negate = bangs % 2 == 1;
         let first = parse_command(iter)?;
@@ -3944,7 +4029,7 @@ fn finish_pipeline(
     // Recovery cursor context (Gap A, iteration 2): a `|` starts a new pipeline
     // stage — a command word is expected next, so an empty trailing word (`echo hi | `)
     // reports `Command`, not the previous stage's argument position. No-op off recovery.
-    iter.set_recovery_cmd_word(true);
+    iter.declare_word_context(crate::lexer::WordContext::Command);
     skip_newlines(iter)?;
 
     loop {
@@ -3960,7 +4045,7 @@ fn finish_pipeline(
         if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Pipe))) {
             iter.next_kind()?; // consume `|`
             // Recovery (Gap A): next pipeline stage expects a command word.
-            iter.set_recovery_cmd_word(true);
+            iter.declare_word_context(crate::lexer::WordContext::Command);
             skip_newlines(iter)?;
         } else {
             break;
@@ -4085,7 +4170,7 @@ fn finish_and_or_opts(
         // word. Reset the flag (the preceding command's last argument left it
         // `false`) so an EMPTY trailing word right after the separator (`echo hi; `,
         // `echo hi && `) reports `Command`, not `Argument`. No-op off recovery.
-        iter.set_recovery_cmd_word(true);
+        iter.declare_word_context(crate::lexer::WordContext::Command);
         match token {
             // ── `&` — background / Amp separator ────────────────────────────
             TokenKind::Op(Operator::Background) => {
@@ -5056,7 +5141,9 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
     if iter.peek_kind()?.is_none() {
         return Err(ParseError::UnterminatedLoop);
     }
-    let var_word = consume_command_word(iter)?;
+    // #666: the loop VARIABLE sits in command position but names no command —
+    // marking it `Command` painted the `f` in `for f in *.rs` as a command word.
+    let var_word = consume_word_in(iter, crate::lexer::WordContext::Subject)?;
     let var = for_variable_name_word(&var_word).ok_or(ParseError::ForVariable)?;
 
     // POSIX allows a linebreak between the variable and `in`.
@@ -5070,7 +5157,7 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
         // words (argument position), not a command. `consume_command_word` left the
         // flag `true`; flip it so an empty trailing word (`for x in `) reports
         // `Argument`. No-op off recovery.
-        iter.set_recovery_cmd_word(false);
+        iter.declare_word_context(crate::lexer::WordContext::Argument);
         loop {
             while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
                 iter.next_kind()?;
@@ -5099,7 +5186,7 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
                 // (oracle: `emit_word_with_braces` is called for for/select lists).
                 // Recovery cursor context (Task 4): a for-list word is argument-position.
                 _ => {
-                    iter.set_recovery_cmd_word(false);
+                    iter.declare_word_context(crate::lexer::WordContext::Argument);
                     let w = parse_word_command(iter, false)?;
                     push_command_word_brace_expanded(&mut words, w, iter)?;
                 }
@@ -5145,7 +5232,9 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
     if iter.peek_kind()?.is_none() {
         return Err(ParseError::UnterminatedLoop);
     }
-    let var_word = consume_command_word(iter)?;
+    // #666: the loop VARIABLE sits in command position but names no command —
+    // marking it `Command` painted the `f` in `for f in *.rs` as a command word.
+    let var_word = consume_word_in(iter, crate::lexer::WordContext::Subject)?;
     let var = for_variable_name_word(&var_word).ok_or(ParseError::ForVariable)?;
 
     // POSIX allows a linebreak between the variable and `in`.
@@ -5156,7 +5245,7 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
         consume_command_word(iter)?; // consume `in`
         // Recovery (Gap A, iteration 2): after `in`, select expects word-LIST words
         // (argument position). Flip the flag so `select x in ` reports `Argument`.
-        iter.set_recovery_cmd_word(false);
+        iter.declare_word_context(crate::lexer::WordContext::Argument);
         let mut list: Vec<Word> = Vec::new();
         loop {
             while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
@@ -5185,7 +5274,7 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
                 // v264 flip-fix (Finding 1): select in-list words brace-expand too.
                 // Recovery cursor context (Task 4): a select-list word is argument-position.
                 _ => {
-                    iter.set_recovery_cmd_word(false);
+                    iter.declare_word_context(crate::lexer::WordContext::Argument);
                     let w = parse_word_command(iter, false)?;
                     push_command_word_brace_expanded(&mut list, w, iter)?;
                 }
@@ -5230,7 +5319,8 @@ fn parse_case(iter: &mut Lexer) -> Result<Command, ParseError> {
         None if recover => Word(Vec::new()),
         None => return Err(ParseError::UnterminatedCase),
         Some(TokenKind::Op(_)) => return Err(ParseError::Unexpected(iter.unexpected_here(None)?)),
-        _ => consume_command_word(iter)?,
+        // #666: the subject is command-position but names no command.
+        _ => consume_word_in(iter, crate::lexer::WordContext::Subject)?,
     };
 
     skip_newlines(iter)?;
@@ -5282,6 +5372,9 @@ fn parse_case_item(iter: &mut Lexer) -> Result<CaseItem, ParseError> {
     // Pattern list — Word (`|` Word)* `)`, non-empty.  Pattern words are
     // assembled from atoms (`a`, `*`, `$x`, …); `|`/`)`/`(` are `Op` atoms.
     let mut patterns: Vec<Word> = Vec::new();
+    // #666: patterns are not command position — the previous declaration (the
+    // subject, or a body's last command) would otherwise carry into them.
+    iter.declare_word_context(crate::lexer::WordContext::Argument);
     loop {
         skip_newlines(iter)?;
         match iter.peek_kind()? {

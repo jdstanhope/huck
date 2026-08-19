@@ -172,11 +172,14 @@ the bottom, expansion + execution above, builtins at the top.
 | `error_fatality.rs` | v358 (#198): the ONE place huck decides whether an error is fatal and with what code. `ErrorKind` -> `Fatality::{Continue, AbortList, ExitShell(n)}`, reached only through `Shell::report_error`; `raise_fatal`/`raise_discard` are `pub(crate)` so a site cannot decide for itself, and `posix_fatal` is deleted. **Two inputs, measured against bash 5.2.21 and independent:** kind + posix mode pick the outcome, and the DRIVER picks the code — `-c` (`Shell::is_command_string`) substitutes 127 for the kind's own base (1 expansion/assignment, 2 syntax). ⚠️ Three rules look like inconsistencies and are not, so each has a unit test rather than a comment: a plain top-level syntax error keeps 2 under `-c` (bash rejects it before execution begins); `SpecialBuiltinUsage` takes NO 127 substitution (`set -Q` exits 2 under every driver); and `HistoryTooManyArgs` has a driver-dependent OUTCOME — under `-c` it ends the whole program while its neighbours abandon only the list. ⚠️ It cannot help where huck rejects at PARSE time and bash defers to EXPANSION time (#493) — no fatality decision is ever reached there. Residual seal work: #494. |
 | `traps.rs` | Signal trap handling. EXIT/DEBUG/ERR/RETURN + real signals. `fire_*_trap` helpers. **The three pseudo-traps are scoped at function/source ENTRY, never at the fire site** — `take_{return,err,debug}_trap_for_call` unsets the caller's trap for the body when the matching inherit flag is off (RETURN + DEBUG ↔ functrace/`set -T`, ERR ↔ errtrace/`set -E`; `extdebug` implies all of them), and `restore_*_after_call` puts it back only if the body left that signal untrapped. So the caller's trap is invisible to `trap -p` inside the body, and a trap the body installs FOR ITSELF fires for the body's remaining commands and survives the call. A fire-site gate cannot express that second half — it cannot tell the caller's trap from the body's own (#434 RETURN, #438 ERR, #439 DEBUG). ⚠️ `source` takes the DEBUG treatment but NOT the RETURN one: bash runs an inherited RETURN trap for a sourced file with or without functrace (#440), while the caller's DEBUG does not fire for the file's commands. `clear_for_subshell` resets what a forked child cannot service — the trap table, the pending bitmask, `firing_traps`, and the parent's pending exit — and NOTHING else. Measured against bash 5.2.21: a subshell inherits the entire option set (`$-` and every `shopt` byte-identical) and inherits its caller's ignore-return, so suppression deliberately survives the fork (v356, #1). |
 | `jobs.rs` / `job_spec.rs` | Background-job tracking, `%N` / `%cmd` job specifier resolution, `jobs`/`wait`/`fg`/`bg`/`kill`/`disown`. |
+| `highlight.rs` (huck-syntax) | The side channel the front end appends roles to while parsing: `Role`, `Mark`, `PairSpan`, `HighlightRecord`. Off unless `LexerOptions::record_highlight`. |
+| `paint.rs` (huck-cli) | The one role→SGR table, and per-byte painting (widest mark first). |
 | `history.rs` | Command history + `!` expansion. `History` struct stores entries; `scan` handles `!!` / `!$` / `^a^b^`. |
 | `prompt.rs` | PS1/PS2 escape expansion (`\u` user, `\h` host, `\w` cwd, `\\$`, `\!`, etc.). |
 | `alias_expand.rs` | Alias substitution (interactive-mode only by default; `HUCK_EXPAND_ALIASES` env override). Per-input cycle protection. |
 | `brace_expand.rs` | `{a,b,c}` and `{1..N}` brace expansion (runs before word-splitting). |
 | `completion.rs` | Tab completion (commands, files, variables, arith-context). |
+| `cmd_validity.rs` | Does this name resolve? A positive AND negative cache for highlighting (#666) — the command hash table cannot serve, since it only holds names that were RUN. |
 | `continuation.rs` | Multi-line input handling (backslash-newline, unclosed quotes, partial control structures). |
 | `shell.rs` | Top-level CLI + REPL entry point. `process_line` (the canonical "execute string in current shell" path). |
 | `lib.rs` | `huck` library crate root: declares the runtime modules (`pub mod`) AND re-exports the `huck-syntax` frontend at the crate root (`pub use huck_syntax::{lexer, command, brace_expand, generate, …}`) so `crate::lexer::`/`crate::command::` paths stay valid. Also holds the `#[cfg(test)] test_support` (`CWD_LOCK`) module. |
@@ -444,6 +447,84 @@ These appear in many call-site signatures; learn them once.
   `tests/scripts/eof_delimiter_matrix_diff_check.sh` (813 cells, driving
   `tools/eof_matrix.sh`) and `eof_pair_lines_diff_check.sh` (which LINE each pair
   reports, the exit statuses, and the Shape 2 controls).
+
+### Interactive syntax highlighting (v363, #666)
+
+The line being typed is coloured by rustyline's `Highlighter`, and the roles
+come from a real **parse** — not from a second, editor-local scanner. Two
+consequences shape the whole design.
+
+**The lexer cannot be driven standalone.** Its opener signals (`$(`, `${`,
+`$((`, `"`, `` ` ``) are ZERO-WIDTH and the PARSER is what consumes them, so a
+loop pulling tokens without one re-emits `BeginDquote` forever (measured, not
+assumed). Highlighting therefore runs `parse_sequence` and reads what the parse
+recorded. A parse ERROR is the normal case while typing; everything scanned
+before it is still recorded and still painted.
+
+**Roles are produced, not derived.** `LexerOptions::record_highlight` (off by
+default) turns on a side channel — `HighlightRecord { marks, pairs,
+unterminated }` in `huck-syntax/src/highlight.rs` — that the front end appends
+to. Nothing downstream re-derives from the text what the scanner already knew:
+
+| what | recorded where | why not elsewhere |
+| --- | --- | --- |
+| quotes, expansions, operators, redirections, a bare `Word` placeholder | `scan_step_guarded`, the ONE hook (121 token push sites pass through it) | a token's extent needs consecutive token starts, which only the scanner has |
+| a glob `*` / `?` | the unquoted literal-run scanner, as it accumulates | a literal run is coalesced into ONE `Lit`: `*.rs` and a file named that are indistinguishable afterwards |
+| an escape inside `"…"` | the dquote escape arm | the backslash is DROPPED there; the surviving `Lit` is just `$` |
+| a comment | the `#` skip | a comment emits no token at all |
+| a closed pair's two ends | `pop_mode` | the frame carries `open_off`, and the parser pops BECAUSE it consumed the closer |
+| the dangling opener | the EOF/`LexError` sites | reuses v362's `pairs::reported_pair` — which pair is open, and where it started |
+| **command word vs keyword** | at CONSUME time, not scan time | see below |
+
+**Command position is settled when a token is CONSUMED.** The parser peeks
+ahead, so a token is routinely scanned one declaration too early — the
+`peek_kind` guard in front of `for`'s variable scans that variable while `for`
+is still the declaration in force. `WordContext { Command, Subject, Argument }`
+(the refinement of v329's `recovery_cmd_word` bool; EOF recovery reads it through
+`is_cmd_word`, which maps `Subject` back to `true`) is declared by the parser
+immediately before it pulls, and `classify_consumed_word` reads it as the token
+is handed out. Two corrections follow it, both from the side that owns the fact:
+the parser claims **reserved words** (the keyword list is its own, and the lexer
+may not reach into it — the one-way front-end invariant has a test), and claims
+back an **assignment prefix**, which only reveals itself once the word is whole
+(`FOO=` is a variable name, `bar` is plain text, `cmd` is still the command).
+
+**Everything the record needs is gated on `record_highlight`**, including the
+extra `peek_span` a claim wants — with highlighting off the front end takes not
+one additional step.
+
+On the CLI side (`huck-cli`): `paint.rs` holds the one role→SGR table and paints
+a per-byte role map **widest mark first**, so a narrower mark refines the region
+it sits in (a `VarName` inside a `QuotedDouble`, a `Glob` inside its word).
+`completion_helper.rs` adds the two facts that are not functions of the text —
+whether a command RESOLVES (`huck-engine/src/cmd_validity.rs`, a cache that
+remembers misses, never writes the command hash table, and gives up rather than
+blocking the editor on a slow `PATH`), and where the CURSOR is (bracket
+matching). Only a command that does NOT resolve keeps its colour: a working line
+carries no command colour at all.
+
+Three gates turn colour off, answered in different places because they change at
+different rates: not-a-tty and `NO_COLOR` are resolved once at construction,
+`shopt -u syntax_highlight` is read live. That option is huck's own and lives in
+`HUCK_SHOPT_TABLE`, deliberately NOT in bash's `SHOPT_TABLE` — bare `shopt`,
+`shopt -p` and `compgen -A shopt` print that table and are compared with bash
+byte for byte. Configurable COLOURS are #667; bracket globs are #668; continuation lines are
+#670. `tests/pty_interactive.rs` runs with `NO_COLOR=1` — it is a REPL-behaviour
+suite, painting multiplied its terminal traffic about fivefold, and on one core
+that starved its sessions (110 s with two failures, 33 s and green without).
+
+A **continuation line is barely painted**, and the reason is structural: it is
+parsed on its own, so `then echo hi` has no `if` in front of it, the parse fails
+at the first word, and only what was scanned before the failure can be marked.
+Highlighting the accumulated command instead of the physical line is #670.
+
+Gates: `crates/huck-syntax/tests/highlight_spans.rs` (the record is a pure
+function of the text), `paint.rs`'s own tests (layering and the width contract),
+`tests/highlight_render_pty.rs` (rendered escapes through a real pty — the first
+harness in the project that asserts on rendered output, since highlighting has
+no bash to compare against), and
+`tests/scripts/syntax_highlight_shopt_diff_check.sh` (the listings stay
+byte-identical with bash).
 
 ### Single-threaded execution (invariant, enforced)
 

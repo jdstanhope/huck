@@ -551,11 +551,32 @@ pub const SHOPT_TABLE: &[ShoptInfo] = &[
 /// Number of `shopt` options (length of `SHOPT_TABLE`).
 pub const SHOPT_COUNT: usize = SHOPT_TABLE.len();
 
+/// huck's OWN `shopt` options — ones bash has no name for.
+///
+/// Deliberately a separate table. `SHOPT_TABLE` is bash's, and bare `shopt`,
+/// `shopt -p` and `compgen -A shopt` print it verbatim — three outputs the
+/// diff harnesses compare with bash byte for byte. A row added there would show
+/// up in all of them and diverge. These are settable, queryable and printable
+/// BY NAME (`shopt -s syntax_highlight`, `shopt syntax_highlight`), which is
+/// what an rc file needs, and invisible to the listings, which is what
+/// compatibility needs.
+pub const HUCK_SHOPT_TABLE: &[ShoptInfo] = &[ShoptInfo {
+    // v363 (#666): syntax highlighting of the line being typed. On by default;
+    // `shopt -u syntax_highlight` in ~/.huckrc turns it off for good.
+    name: "syntax_highlight",
+    default: true,
+}];
+
+pub const HUCK_SHOPT_COUNT: usize = HUCK_SHOPT_TABLE.len();
+
 /// Persistent `shopt` option state: one bool per `SHOPT_TABLE` entry,
 /// indexed by table position. Seeded from each option's bash default.
 #[derive(Debug, Clone)]
 pub struct ShoptOptions {
     state: [bool; SHOPT_COUNT],
+    /// huck's own options — see `HUCK_SHOPT_TABLE` for why they are stored
+    /// alongside rather than in the bash table.
+    ext: [bool; HUCK_SHOPT_COUNT],
 }
 
 impl Default for ShoptOptions {
@@ -566,7 +587,13 @@ impl Default for ShoptOptions {
             state[i] = SHOPT_TABLE[i].default;
             i += 1;
         }
-        Self { state }
+        let mut ext = [false; HUCK_SHOPT_COUNT];
+        let mut j = 0;
+        while j < HUCK_SHOPT_COUNT {
+            ext[j] = HUCK_SHOPT_TABLE[j].default;
+            j += 1;
+        }
+        Self { state, ext }
     }
 }
 
@@ -575,16 +602,29 @@ impl ShoptOptions {
         SHOPT_TABLE.iter().position(|o| o.name == name)
     }
 
-    /// `Some(value)` for a known option, `None` for an unknown name.
+    fn ext_idx(name: &str) -> Option<usize> {
+        HUCK_SHOPT_TABLE.iter().position(|o| o.name == name)
+    }
+
+    /// `Some(value)` for a known option, `None` for an unknown name. Answers for
+    /// huck's own options too, so every caller reaches them without knowing
+    /// which table a name came from.
     pub fn get(&self, name: &str) -> Option<bool> {
-        Self::idx(name).map(|i| self.state[i])
+        match Self::idx(name) {
+            Some(i) => Some(self.state[i]),
+            None => Self::ext_idx(name).map(|j| self.ext[j]),
+        }
     }
 
     /// Sets a known option; returns `false` (no-op) for an unknown name.
     pub fn set(&mut self, name: &str, value: bool) -> bool {
-        match Self::idx(name) {
-            Some(i) => {
-                self.state[i] = value;
+        if let Some(i) = Self::idx(name) {
+            self.state[i] = value;
+            return true;
+        }
+        match Self::ext_idx(name) {
+            Some(j) => {
+                self.ext[j] = value;
                 true
             }
             None => false,

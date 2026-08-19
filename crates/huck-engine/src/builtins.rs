@@ -9105,7 +9105,7 @@ fn is_shell_keyword(name: &str) -> bool {
     )
 }
 
-fn is_executable_file(p: &std::path::Path) -> bool {
+pub(crate) fn is_executable_file(p: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(p) {
         Ok(md) => md.is_file() && (md.permissions().mode() & 0o111 != 0),
@@ -9117,7 +9117,7 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 /// Distinguishes "found an executable" from "found only a non-executable file"
 /// (bash reports the latter as 126 "Permission denied") from "found nothing"
 /// (127 "command not found"). `search_path_for` collapses the last two to `None`.
-pub(crate) enum PathClassify {
+pub enum PathClassify {
     /// A PATH segment yielded an executable regular file, and the resolved path.
     /// It used to be dropped (the caller re-searched via `execvp` on the bare
     /// name); the command hash table needs it, and so does exec-by-hashed-path
@@ -9194,14 +9194,14 @@ pub(crate) fn classify_path_search(name: &str, shell: &Shell) -> PathClassify {
 ///
 /// Reading is always allowed — a child inherits the table, it just cannot send
 /// changes back.
-pub(crate) enum HashEffect {
+pub enum HashEffect {
     /// Runs in THIS shell: an insert and its hit count persist.
     Persist,
     /// Runs in a forked child: consult the table, never write it.
     Discard,
 }
 
-pub(crate) fn resolve_for_exec(name: &str, shell: &mut Shell, effect: HashEffect) -> PathClassify {
+pub fn resolve_for_exec(name: &str, shell: &mut Shell, effect: HashEffect) -> PathClassify {
     debug_assert!(
         !name.contains('/'),
         "resolve_for_exec is for bare names; a path is never hashed"

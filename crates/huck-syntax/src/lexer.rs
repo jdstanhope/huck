@@ -1009,6 +1009,13 @@ struct PendingHeredoc {
 /// Lexer feature toggles resolved from shell state at tokenize time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LexerOptions {
+    /// v363 (#666): record `(span, role)` marks for interactive highlighting.
+    ///
+    /// OFF for every production parse. With it false the lexer must behave
+    /// bit-identically — the 3103-script parse sweep is the gate. Set only by
+    /// the line editor's highlighter, which parses a copy of the edit buffer
+    /// and throws the tree away.
+    pub record_highlight: bool,
     pub extglob: bool,
     /// True when the `${…}` currently being scanned is inside double quotes.
     /// Read ONLY by the extquote `$'…'`-name gate (M-156); it does NOT affect
@@ -1296,8 +1303,40 @@ pub(crate) struct Mark {
     /// checkpoint. (`recovery_capture` is instead reset to `None` in `rewind` — a
     /// rewind precedes genuine EOF, so any pending EOF snapshot is invalid.)
     recovery_frames: Vec<(usize, crate::recover::Frame)>,
-    recovery_cmd_word: bool,
+    word_context: WordContext,
     recovery_redirect_target: bool,
+}
+
+/// What the parser says the word it is about to assemble IS (v363, #666).
+///
+/// This began as `recovery_cmd_word: bool` — "would EOF recovery report Command
+/// here?" — which is a coarser question than "is this the command?". The bool
+/// answered `true` for a `for` loop's variable and a `case` subject as well as
+/// for a real command word, which is right for recovery and wrong for
+/// highlighting: it painted the `f` in `for f in *.rs` as a command, and would
+/// have painted it RED once validity checking landed.
+///
+/// Refining it rather than adding a second command-position notion is
+/// deliberate (#641): two notions drift, and the parser is the only thing that
+/// actually knows. `Subject` collapses back into `Command` for recovery, so that
+/// consumer's behaviour is unchanged by construction — see `is_cmd_word`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WordContext {
+    /// A command name, or a reserved word, is expected here.
+    Command,
+    /// A word that sits in command POSITION but names no command: a `for`/
+    /// `select` loop variable, a `case` subject or pattern.
+    Subject,
+    /// An argument, a word-list element, a redirect operand.
+    Argument,
+}
+
+impl WordContext {
+    /// What the old bool meant. `Subject` maps to `true` so EOF recovery keeps
+    /// reporting exactly what it reported before this enum existed.
+    pub(crate) fn is_cmd_word(self) -> bool {
+        matches!(self, WordContext::Command | WordContext::Subject)
+    }
 }
 
 /// Snapshot of lexer state at the FIRST real EOF reached under
@@ -1328,7 +1367,8 @@ pub(crate) struct RecoveryCapture {
     /// this — only a lone `$` at a word start. #248.
     pub(crate) trailing_lone_dollar: bool,
     /// The parser's command-vs-argument flag for the word being assembled at
-    /// EOF (`true` == command position). Set via `set_recovery_cmd_word`.
+    /// EOF (`true` == command-ish position). Derived from the parser's
+    /// `WordContext` via `is_cmd_word`, so `Subject` still reads as `true`.
     pub(crate) cmd_word: bool,
     /// The parser is assembling a bare redirect operand (`> whi`) at EOF. Set
     /// via `set_recovery_redirect_target`. Drives the LOWEST-priority
@@ -1385,6 +1425,9 @@ pub struct Lexer<'a> {
     /// Byte offset the most recent scan step began at (#385) — see
     /// `last_step_start()`.
     last_step_start: usize,
+    /// v363 (#666): highlight marks recorded during THIS parse. Empty unless
+    /// `opts.record_highlight`. Drained by `take_highlight_record`.
+    hl: crate::highlight::HighlightRecord,
     /// Everything the last lex error's raise site observed about the open pairs,
     /// captured before the parser unwinds its frames. ONE field rather than three
     /// written side by side (#641 rule 3): they are read together, they are
@@ -1509,7 +1552,7 @@ pub struct Lexer<'a> {
     // synthesized closer lands in the right place. They are transient and
     // invalidated by a rewind. Left as fields; converting them to arguments
     // means changing the recovery capture's signature, which is Task 7.
-    recovery_cmd_word: bool,
+    word_context: WordContext,
     /// Recovery: the parser sets this to `true` while assembling a bare redirect
     /// operand (`parse_one_redirect`'s target word) and back to `false` once the
     /// redirect is built, so the EOF capture records whether the cursor word is a
@@ -1549,6 +1592,7 @@ impl<'a> Lexer<'a> {
                 open_off: 0,
                 entry: Entry::Body,
             }],
+            hl: crate::highlight::HighlightRecord::default(),
             err_site: None,
             retokenize_arith_as_cmdsub: false,
             cmd_pos: state::CommandPos::default(),
@@ -1558,7 +1602,7 @@ impl<'a> Lexer<'a> {
             heredoc_gen: 0,
             recover_last_depth: None,
             recovery_capture: None,
-            recovery_cmd_word: true,
+            word_context: WordContext::Command,
             recovery_redirect_target: false,
             recovery_frames: Vec::new(),
         }
@@ -1748,11 +1792,14 @@ impl<'a> Lexer<'a> {
         self.opts.recover_at_eof
     }
 
-    /// Recovery (Task 4): the parser declares whether the word it is about to
-    /// assemble is command-position (`true`, `consume_command_word`) or an
-    /// argument/list word (`false`). The EOF capture records the last value set.
-    pub(crate) fn set_recovery_cmd_word(&mut self, is_cmd: bool) {
-        self.recovery_cmd_word = is_cmd;
+    /// The parser declares what the word it is about to assemble IS.
+    ///
+    /// Read by two consumers with different needs: EOF recovery wants
+    /// "command-ish or not" (`WordContext::is_cmd_word`), and highlighting wants
+    /// the command word specifically (#666). One declaration, two readings —
+    /// rather than two flags that can disagree.
+    pub(crate) fn declare_word_context(&mut self, ctx: WordContext) {
+        self.word_context = ctx;
     }
 
     /// Recovery (iteration 2): the parser declares whether the word it is about
@@ -1924,7 +1971,7 @@ impl<'a> Lexer<'a> {
             word_start,
             last_is_dollar_name,
             trailing_lone_dollar,
-            cmd_word: self.recovery_cmd_word,
+            cmd_word: self.word_context.is_cmd_word(),
             redirect_target: self.recovery_redirect_target,
         }
     }
@@ -1982,11 +2029,43 @@ impl<'a> Lexer<'a> {
             "Command is the floor and must never be popped"
         );
         let popped_depth = self.mode_depth();
-        let popped = self
-            .modes
-            .pop()
-            .expect("pop_mode on an empty mode stack")
-            .mode;
+        let frame = self.modes.pop().expect("pop_mode on an empty mode stack");
+        // #666: a pair's two ends are only ever both in hand HERE. The frame
+        // carries where it opened (v361), and the parser is popping precisely
+        // because it has just consumed the closer — so the closer is the last
+        // token handed out. Recording it anywhere else would mean deciding, per
+        // scanner, which `)` closes what, which is the parser's judgement.
+        //
+        // ⚠️ Unless it is popping because it GAVE UP. A parser unwinding out of
+        // `echo $(d` pops the same frame, and the "closer" is then whatever the
+        // last token happened to be — which made `echo $(d` claim a pair and
+        // reverse-video the `d` under the cursor. Found by dumping a real pty
+        // stream, not by a test. `unterminated` is already set by then, and it
+        // is exactly the right signal: once a construct is known to be dangling,
+        // every later pop on this line is an unwind.
+        if self.opts.record_highlight
+            && self.hl.unterminated.is_none()
+            && let Some(closer) = self.pos.checked_sub(1).and_then(|i| self.history.get(i))
+            && closer.span.offset >= frame.open_off
+        {
+            // ⚠️ `open_off` is NOT uniformly the first character of the construct,
+            // which is a real trap and was a visible bug: for `$(`, `` ` `` and
+            // `"` it is where the construct starts, but for `${` the frame is
+            // pushed AFTER the opener is consumed, so it points at the BODY —
+            // `${x}` reported the `x`. v362 got away with it because it reports
+            // LINES. v361 already recorded the answer as `ParamExpansion`'s
+            // `start_off` (the `$`), so this reads that rather than adding a
+            // second offset to the frame.
+            let open = match frame.mode {
+                Mode::ParamExpansion { start_off, .. } => start_off,
+                _ => frame.open_off,
+            };
+            self.hl.pairs.push(crate::highlight::PairSpan {
+                open,
+                close: closer.span.offset,
+            });
+        }
+        let popped = frame.mode;
         // Delayed heredoc across a comsub/backtick boundary: a `cat <<D` opened
         // INSIDE a command substitution whose `)`/`` ` `` closes before D's body
         // was collected (`echo $(cat <<D)\n…body…\nD`). bash collects such a
@@ -2052,6 +2131,176 @@ impl<'a> Lexer<'a> {
         self.retokenize_arith_as_cmdsub = true;
     }
 
+    /// v363 (#666): record marks for the tokens `scan_step` just appended.
+    ///
+    /// Extents TILE within the step: each token ends where the next one starts,
+    /// and the last ends at the cursor. That is why this runs per step rather
+    /// than once at the end — a step's tokens are contiguous, whereas deriving
+    /// extents across the whole stream would have to cope with rewinds
+    /// (`mark`/`rewind` discards history) and with lookahead pulled out of
+    /// order.
+    ///
+    /// A zero-width opener signal (`BeginDquote`, `CmdSubOpen`, `ArithOpen`)
+    /// yields a zero-length mark here on purpose: it records WHERE the
+    /// construct starts, and Task 6's pair records supply the extent. The
+    /// painter drops empty marks, so nothing is mis-rendered in the meantime.
+    fn record_highlight_marks(&mut self, from: usize) {
+        if from >= self.history.len() {
+            return;
+        }
+        let step_end = self.cursor.offset();
+        // A double-quoted run is a FRAME, not a token, and that asymmetry with
+        // single quotes needs handling here or the run is all but invisible:
+        // `BeginDquote` is ZERO-WIDTH (its mark would be `[5..5)`) and
+        // `EndDquote` covers only the closing `"`, so `"dq"` painted exactly one
+        // character. Found by using the shell, not by a test.
+        //
+        // So the run is marked when it CLOSES, spanning the frame's own
+        // `open_off` — the offset v361 put on every `ModeFrame` — to the cursor.
+        // The frame is still on the stack at this point: the parser pops it after
+        // the step returns. Nothing new is tracked to make this work.
+        let dquote_run = if matches!(
+            self.history[from..].last().map(|t| &t.kind),
+            Some(TokenKind::EndDquote)
+        ) {
+            self.modes.last().and_then(|f| match f.mode {
+                Mode::DoubleQuote => Some(f.open_off),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let mut pending: Vec<crate::highlight::Mark> = Vec::new();
+        if let Some(open) = dquote_run {
+            pending.push(crate::highlight::Mark {
+                start: open,
+                end: step_end,
+                role: crate::highlight::Role::QuotedDouble,
+            });
+        }
+        for (i, tok) in self.history[from..].iter().enumerate() {
+            let Some(role) = highlight_role(&tok.kind) else {
+                continue;
+            };
+            // The frame mark above supersedes the two delimiter tokens.
+            if matches!(tok.kind, TokenKind::BeginDquote | TokenKind::EndDquote) {
+                continue;
+            }
+            let next_start = self.history[from..]
+                .get(i + 1)
+                .map(|t| t.span.offset)
+                .unwrap_or(step_end);
+            pending.push(crate::highlight::Mark {
+                start: tok.span.offset,
+                end: next_start.max(tok.span.offset),
+                role,
+            });
+        }
+        self.hl.marks.append(&mut pending);
+    }
+
+    /// v363 (#666): claim a consumed bare word's role for the parser.
+    ///
+    /// This is the half of highlighting that the scanner cannot answer. Command
+    /// position is a fact about what the PARSER expects, and the parser says so
+    /// (`declare_word_context`) immediately before it pulls — so the declaration
+    /// is reliable at the moment a token is handed out, and unreliable at the
+    /// moment it was scanned, because lookahead runs ahead of the declarations.
+    ///
+    /// It upgrades the `Word` placeholder the scanner already recorded rather
+    /// than pushing a mark of its own: the extent belongs to the scanner (an
+    /// escape makes a word wider than its text), the role belongs here. Rewind
+    /// re-consumes, and the last consume wins — which is the parse that stood.
+    fn classify_consumed_word(&mut self, tok: &Token) {
+        use crate::highlight::Role;
+        let TokenKind::Lit { quoted: false, .. } = &tok.kind else {
+            return;
+        };
+        if self.word_context != WordContext::Command {
+            return;
+        }
+        if let Some(m) = self
+            .hl
+            .marks
+            .iter_mut()
+            .rev()
+            .find(|m| m.start == tok.span.offset && m.role == Role::Word)
+        {
+            m.role = Role::CommandWord;
+        }
+    }
+
+    /// v363 (#666): the parser's verdict that a consumed word was a RESERVED
+    /// word, not a command.
+    ///
+    /// Split from `classify_consumed_word` deliberately. Position is the only
+    /// thing this file may judge: which words are reserved is the parser's list,
+    /// and the lexer may not reach into the parser at all — the one-way
+    /// front-end invariant, which has its own test (and which is a substring
+    /// check, so even naming the path in a comment fails it). So the lexer says
+    /// "command position" and the parser corrects the ones that are keywords.
+    pub(crate) fn claim_keyword_word(&mut self, start: usize) {
+        use crate::highlight::Role;
+        if let Some(m) = self
+            .hl
+            .marks
+            .iter_mut()
+            .rev()
+            .find(|m| m.start == start && m.role == Role::CommandWord)
+        {
+            m.role = Role::Keyword;
+        }
+    }
+
+    /// v363 (#666): is the highlight recorder on?
+    ///
+    /// Callers use it to skip work that exists only to feed the record — in
+    /// particular the extra `peek_span` a claim needs, which would otherwise
+    /// force a scan the parser had not asked for. Off, the claims cost nothing
+    /// and can change nothing.
+    pub(crate) fn recording_highlight(&self) -> bool {
+        self.opts.record_highlight
+    }
+
+    /// v363 (#666): take back the command-word role from an assignment prefix.
+    ///
+    /// `FOO=bar` is only recognisable as an assignment once the word is COMPLETE,
+    /// which is after its atoms have been consumed and classified — so this is a
+    /// correction rather than a declaration. The name becomes a variable name
+    /// (it is one), the value becomes plain text.
+    ///
+    /// It stops at the first `Expansion` mark inside the word, which is what
+    /// keeps `x=$(nosuch)` marking `nosuch` as the command it is. The known
+    /// limit: a literal AFTER an expansion in the value (`x=a$(f)b` — the `b`)
+    /// keeps a command-word role it should not have. Marking that correctly
+    /// needs the lexer'''s command-position state to be saved and restored across
+    /// expansion frames, which it is not (filed as a follow-on).
+    pub(crate) fn claim_assignment_word(&mut self, start: usize, end: usize) {
+        use crate::highlight::Role;
+        let mut named = false;
+        for m in self.hl.marks.iter_mut() {
+            if m.start < start || m.start >= end {
+                continue;
+            }
+            if m.role == Role::Expansion {
+                break;
+            }
+            if m.role != Role::CommandWord && m.role != Role::Keyword {
+                continue;
+            }
+            m.role = if named { Role::Word } else { Role::VarName };
+            named = true;
+        }
+    }
+
+    /// v363 (#666): drain the marks this parse recorded.
+    ///
+    /// Takes rather than borrows so the caller owns the record and a second
+    /// call on the same lexer cannot double-count.
+    pub fn take_highlight_record(&mut self) -> crate::highlight::HighlightRecord {
+        std::mem::take(&mut self.hl)
+    }
+
     /// Checkpoint the scanning state for a later `rewind`. Must be called at a
     /// pull boundary (no partial word). The resume point is the span of the
     /// next-to-hand-out token when lookahead is buffered, else the live cursor.
@@ -2087,7 +2336,7 @@ impl<'a> Lexer<'a> {
             pending_lvalue_subscript: self.pending_lvalue_subscript,
             heredoc_gen: self.heredoc_gen,
             recovery_frames: self.recovery_frames.clone(),
-            recovery_cmd_word: self.recovery_cmd_word,
+            word_context: self.word_context,
             recovery_redirect_target: self.recovery_redirect_target,
         }
     }
@@ -2125,7 +2374,7 @@ impl<'a> Lexer<'a> {
         // that pushed a frame or flipped the flag inside the marked span must not
         // leave it stale after the rewind.
         self.recovery_frames = m.recovery_frames.clone();
-        self.recovery_cmd_word = m.recovery_cmd_word;
+        self.word_context = m.word_context;
         self.recovery_redirect_target = m.recovery_redirect_target;
         debug_assert_eq!(
             self.heredoc_gen, m.heredoc_gen,
@@ -2299,6 +2548,25 @@ impl<'a> Lexer<'a> {
     fn scan_step_guarded(&mut self) -> Result<Step, LexError> {
         self.last_step_start = self.cursor.offset();
         let before = self.cursor.consumed;
+        // v363 (#666): the ONE place highlight marks are recorded. Every token
+        // reaches `history` through some `scan_step` branch — 121 push sites —
+        // but they all pass through THIS wrapper, so the recorder observes the
+        // tokens a step appended rather than being sprinkled across the
+        // scanners.
+        //
+        // Only LEXICAL roles are decided here — quotes, expansions, operators,
+        // and a plain `Word` placeholder for a bare literal. Whether that word is
+        // a command or a keyword is NOT knowable at scan time: the parser peeks
+        // ahead, so a token is often scanned one declaration too early (a
+        // `peek_kind` guard ahead of `for`'s variable scans the variable while
+        // `for` itself is still the declaration in force, which painted the `f`
+        // in `for f in *.rs` as a command). That half is settled at CONSUME time
+        // instead — see `classify_consumed_word`.
+        let hl_from = if self.opts.record_highlight {
+            Some(self.history.len())
+        } else {
+            None
+        };
         // #385: capture where the innermost OPEN delimiter frame started while
         // it is still on the stack — the parser unwinds its frames on the way
         // out, so by the time a driver sees the error the stack is back to the
@@ -2332,6 +2600,12 @@ impl<'a> Lexer<'a> {
                             _
                         ))
                     );
+                // #666: the same question, for a different consumer. A line
+                // being typed is unterminated most of the time, and the opener
+                // it is waiting on is the useful thing to show. Computed from
+                // the walk below rather than repeated — `err_site.off` IS
+                // "where the innermost still-open pair started".
+                let record_dangling = self.opts.record_highlight;
                 self.err_site = Some(pairs::ErrorSite {
                     off: match walked {
                         Some((_, off)) if !atom_scanned_quote => off,
@@ -2345,9 +2619,31 @@ impl<'a> Lexer<'a> {
                     },
                     in_compound_assign: pairs::in_compound_assign(&self.modes),
                 });
+                if record_dangling && self.hl.unterminated.is_none() {
+                    self.hl.unterminated = self.err_site.as_ref().map(|site| site.off);
+                }
                 return Err(e);
             }
         };
+        if let Some(from) = hl_from {
+            self.record_highlight_marks(from);
+        }
+        // #666: the OTHER way a construct is left open. A quote that never closes
+        // raises a `LexError` (handled above), but a `$(` that never closes does
+        // not — the inner scanner simply reaches end of input and the PARSER
+        // reports it. Both are "a frame is still open at EOF", so both answer
+        // with the same walk. First observation wins: the stack only gets
+        // shallower as the parser unwinds.
+        if self.opts.record_highlight
+            && matches!(step, Step::Eof)
+            && self.mode_depth() > 1
+            && self.hl.unterminated.is_none()
+        {
+            self.hl.unterminated = Some(match pairs::reported_pair(&self.modes) {
+                Some((_, off)) => off,
+                None => self.modes.last().map_or(0, |f| f.open_off),
+            });
+        }
         if matches!(step, Step::Produced) {
             if self.cursor.consumed == before {
                 self.stall_steps += 1;
@@ -4699,6 +4995,16 @@ impl<'a> Lexer<'a> {
             // does not treat `#` as a stop char. No token is emitted.
             Some('#') if self.cmd_pos.at_word_start() => {
                 skip_line_comment(&mut self.cursor);
+                // #666: a comment emits NO token, so the highlight recorder — which
+                // reads the tokens a step produced — would never see it. Its extent
+                // is known exactly here and nowhere else, so it is recorded here.
+                if self.opts.record_highlight {
+                    self.hl.marks.push(crate::highlight::Mark {
+                        start: off,
+                        end: self.cursor.offset(),
+                        role: crate::highlight::Role::Comment,
+                    });
+                }
                 Ok(Step::Produced)
             }
 
@@ -5746,6 +6052,27 @@ impl<'a> Lexer<'a> {
                     if boundary && ch == '~' {
                         break;
                     }
+                    // #666: mark the characters that will actually be expanded.
+                    // Recorded HERE because a literal run is coalesced into one
+                    // `Lit` — downstream there is no way to tell `*.rs` from a
+                    // file literally called that, which is exactly the
+                    // distinction the colour exists to make.
+                    //
+                    // `*` and `?` ONLY. A bracket expression is not reliably one
+                    // run: `ls f[abc].rs` lexes as `f[`, `abc`, `.rs` because the
+                    // subscript scanner peels the brackets, so marking `[…]` here
+                    // would colour `ls [ab]` and silently skip `ls f[ab].rs`.
+                    // Inconsistent colour is worse than none — filed as #668.
+                    if self.opts.record_highlight {
+                        let at = self.cursor.offset();
+                        if matches!(ch, '*' | '?') {
+                            self.hl.marks.push(crate::highlight::Mark {
+                                start: at,
+                                end: at + ch.len_utf8(),
+                                role: crate::highlight::Role::Glob,
+                            });
+                        }
+                    }
                     text.push(ch);
                     self.cursor.next();
                     // bash tilde-expands the prefix after the ASSIGNING `=` (word start, seeded by
@@ -6030,6 +6357,17 @@ impl<'a> Lexer<'a> {
                 match self.cursor.peek().copied() {
                     Some(e @ ('$' | '`' | '"' | '\\')) => {
                         self.cursor.next();
+                        // #666: the backslash is DROPPED here — the `Lit` that
+                        // survives is just `$`, and nothing downstream can tell
+                        // it from a `$` that was never escaped. So the mark is
+                        // made where the drop happens, spanning both characters.
+                        if self.opts.record_highlight {
+                            self.hl.marks.push(crate::highlight::Mark {
+                                start: off,
+                                end: self.cursor.offset(),
+                                role: crate::highlight::Role::Escape,
+                            });
+                        }
                         self.history.push(Token::new(
                             TokenKind::Lit {
                                 text: e.to_string(),
@@ -6807,6 +7145,10 @@ impl<'a> Lexer<'a> {
         let t = self.history.get(self.pos).cloned();
         if t.is_some() {
             self.pos += 1;
+            if self.opts.record_highlight {
+                let tok = t.clone().expect("just checked");
+                self.classify_consumed_word(&tok);
+            }
         }
         Ok(t)
     }
@@ -7765,6 +8107,62 @@ fn skip_line_continuations(chars: &mut CharCursor<'_>) {
             return;
         }
     }
+}
+
+/// v363 (#666): which display ROLE a token kind carries, if any.
+///
+/// `None` for everything structural that the reader does not need coloured
+/// (`Blank`, `Newline`, the parser's internal signals). Context-dependent roles
+/// — a `Lit` that is a command word or a keyword — are NOT decided here; they
+/// need the command position, which Task 3 adds at the recorder.
+fn highlight_role(kind: &TokenKind) -> Option<crate::highlight::Role> {
+    use crate::highlight::Role;
+    Some(match kind {
+        // A single-quoted run arrives as ONE token carrying its style; a
+        // double-quoted run is a FRAME (BeginDquote … EndDquote) around its
+        // contents, which is what keeps expansions inside it separately
+        // visible. The asymmetry is the lexer's, and it is useful here.
+        TokenKind::QuoteRun {
+            style: QuoteStyle::Single,
+            ..
+        } => Role::QuotedSingle,
+        TokenKind::QuoteRun {
+            style: QuoteStyle::Double,
+            ..
+        }
+        | TokenKind::BeginDquote
+        | TokenKind::EndDquote => Role::QuotedDouble,
+        // `\x` outside quotes DOES survive as a token of its own, so unlike the
+        // in-quotes case it needs no special recording — just a role.
+        TokenKind::QuoteRun {
+            style: QuoteStyle::Backslash,
+            ..
+        } => Role::Escape,
+        // `$'…'` is a quoted run that happens to interpret escapes; it reads as
+        // one piece of text, which is what `QuotedSingle` says.
+        TokenKind::QuoteRun {
+            style: QuoteStyle::AnsiC,
+            ..
+        } => Role::QuotedSingle,
+        TokenKind::DollarName { .. } | TokenKind::ParamName(_) | TokenKind::ParamNameDecoded(_) => {
+            Role::VarName
+        }
+        TokenKind::ParamOpen { .. }
+        | TokenKind::ParamClose
+        | TokenKind::CmdSubOpen
+        | TokenKind::ArithOpen
+        | TokenKind::ArithClose
+        | TokenKind::LegacyArithOpen
+        | TokenKind::BeginBacktick
+        | TokenKind::EndBacktick
+        | TokenKind::ProcSubOpen { .. }
+        | TokenKind::DollarLit { .. } => Role::Expansion,
+        TokenKind::Lit { quoted: false, .. } => Role::Word,
+        TokenKind::Op(_) => Role::Operator,
+        TokenKind::RedirFd(_) | TokenKind::Heredoc { .. } => Role::Redirect,
+        TokenKind::Tilde { .. } => Role::Tilde,
+        _ => return None,
+    })
 }
 
 /// Consumes a `#` line comment's body up to (but NOT including) the terminating

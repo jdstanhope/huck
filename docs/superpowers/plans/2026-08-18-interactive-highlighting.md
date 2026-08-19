@@ -374,7 +374,12 @@ A literal run is coalesced into ONE `Lit{text}` and the dquote scanner DROPS the
 
 **Files:** `paint.rs`, `repl.rs`, `docs/architecture.md`, `site/content/blog/`
 
-- [ ] **Step 1:** `NO_COLOR` (any value disables), not-a-tty disables, and a shell option to turn it off. Tests for all three; the not-a-tty case is what keeps the 309-harness sweep green.
+- [ ] **Step 1:** `NO_COLOR` (any value disables), not-a-tty disables, and a
+  `shopt` option to turn it off — `shopt -u syntax_highlight` / `shopt -s
+  syntax_highlight`, on by default, which is the control users will reach for
+  and the one that composes with an rc file. Tests for all three; the
+  not-a-tty case is what keeps the 309-harness sweep green.
+  (Configurable COLOURS are deliberately out of scope — #667.)
 - [ ] **Step 2:** `docs/architecture.md` — a cross-cutting section: highlighting runs a parse, the lexer PRODUCES roles rather than the highlighter deriving them, and where the palette lives.
 - [ ] **Step 3:** Blog entry with real before/after (a terminal capture, since this is visual).
 - [ ] **Step 4:** Full verification from the branch point, then `gh pr create` with `Closes #666`. **Do NOT merge** — a `vNN` iteration PR is handed to the user.

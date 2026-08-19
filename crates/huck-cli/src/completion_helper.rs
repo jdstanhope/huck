@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use rustyline::completion::{Completer, Pair};
-use rustyline::highlight::Highlighter;
+use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Context, Helper};
@@ -20,11 +20,171 @@ use rustyline::{Context, Helper};
 /// `editor.readline()` so this acquisition succeeds.
 pub struct HuckHelper {
     shell: Rc<RefCell<Shell>>,
+    /// v363 (#666): whether to emit colour at all. Resolved ONCE at
+    /// construction from the terminal and `NO_COLOR`, never per keystroke.
+    ///
+    /// This gate is why the 309-harness diff sweep stays green: those harnesses
+    /// pipe huck, so stdout is not a terminal and nothing is painted. Task 7
+    /// adds the shell option and the tests that pin all three conditions.
+    colour_enabled: bool,
+    /// v363 (#666): what has already been established about the command words on
+    /// the line being typed. Cleared at every prompt (`clear_validity_cache`), so
+    /// a program installed on one line is seen on the next.
+    validity: RefCell<huck_engine::cmd_validity::ValidityCache>,
 }
 
 impl HuckHelper {
     pub fn new(shell: Rc<RefCell<Shell>>) -> Self {
-        Self { shell }
+        let colour_enabled = std::io::IsTerminal::is_terminal(&std::io::stdout())
+            && std::env::var_os("NO_COLOR").is_none();
+        Self {
+            shell,
+            colour_enabled,
+            validity: RefCell::new(huck_engine::cmd_validity::ValidityCache::new()),
+        }
+    }
+
+    /// Is colour wanted right now?
+    ///
+    /// Three gates, and they are deliberately answered in different places. The
+    /// terminal and `NO_COLOR` cannot change while the shell runs, so they are
+    /// resolved once at construction. `shopt -u syntax_highlight` CAN change —
+    /// that is the point of it — so it is read live, and takes effect on the
+    /// next keystroke rather than the next session.
+    fn colour_now(&self) -> bool {
+        self.colour_enabled
+            && self
+                .shell
+                .borrow()
+                .shopt_options
+                .get("syntax_highlight")
+                .unwrap_or(true)
+    }
+
+    /// Forget what was established about command names. The REPL calls this once
+    /// per prompt: it is what bounds staleness to a single line.
+    pub fn clear_validity_cache(&self) {
+        self.validity.borrow_mut().clear();
+    }
+
+    /// The roles for one line, ready to paint: parse it, then settle which
+    /// command words actually resolve.
+    ///
+    /// Separate from `highlight` so it can be tested without a terminal — the
+    /// colour gate would otherwise make every assertion vacuous.
+    ///
+    /// Parsed with NO aliases on purpose: expanding them would paint the
+    /// expansion's structure over text the user never typed.
+    /// v363 (#666): turn the pair the cursor is touching, and any dangling
+    /// opener, into marks the painter can lay down.
+    ///
+    /// Done here rather than inside `render` so the painter stays one thing:
+    /// "paint these extents". The cursor is the only input to highlighting that
+    /// is not a function of the TEXT, and keeping it out of the record means the
+    /// record is still a pure function of the line — which is what makes it
+    /// testable without a terminal.
+    ///
+    /// A pair's ends are WHOLE delimiters, not single characters: `$(` and `)`,
+    /// `${` and `}`, `$((` and `))`. Marking one character emphasised the `$` of
+    /// `$(` and left the bracket plain, which reads as off-by-one — reported from
+    /// using it.
+    ///
+    /// The delimiter's width comes from the mark the recorder already laid down
+    /// for the opener TOKEN (`$(` is one `Expansion` mark), so nothing re-derives
+    /// it from the text. A `"` has no such mark — its region mark spans the whole
+    /// string, which is not a delimiter — so it falls back to one character,
+    /// which is exactly right for a quote.
+    fn delimiter_extent(
+        rec: &huck_engine::highlight::HighlightRecord,
+        at: usize,
+    ) -> (usize, usize) {
+        use huck_engine::highlight::Role;
+        rec.marks
+            .iter()
+            .find(|m| m.start == at && m.end > m.start && m.role == Role::Expansion)
+            .map(|m| (m.start, m.end))
+            .unwrap_or((at, at + 1))
+    }
+
+    fn emphasise_pairs(rec: &mut huck_engine::highlight::HighlightRecord, cursor: usize) {
+        use huck_engine::highlight::{Mark, Role};
+        let mut pending: Vec<Mark> = Vec::new();
+        let mut add = |(start, end): (usize, usize), role: Role| {
+            pending.push(Mark { start, end, role });
+        };
+        if let Some(open) = rec.unterminated {
+            add(Self::delimiter_extent(rec, open), Role::DanglingOpener);
+        }
+        // The cursor sits BETWEEN characters, so a bracket is "under" it when the
+        // cursor is on it or just past it — which is where it lands the moment
+        // you type the thing.
+        //
+        // A degenerate record (`close <= open`) is dropped: `${x:-d}` pushes an
+        // OPERAND frame whose two ends are the same offset, and emphasising it
+        // would light up a character with no partner.
+        let touching: Vec<(usize, usize)> = rec
+            .pairs
+            .iter()
+            .filter(|p| p.close > p.open)
+            .filter(|p| {
+                let (_, open_end) = Self::delimiter_extent(rec, p.open);
+                let (_, close_end) = Self::delimiter_extent(rec, p.close);
+                (p.open..=open_end).contains(&cursor) || (p.close..=close_end).contains(&cursor)
+            })
+            .map(|p| (p.open, p.close))
+            .collect();
+        for (open, close) in touching {
+            add(Self::delimiter_extent(rec, open), Role::PairMatch);
+            add(Self::delimiter_extent(rec, close), Role::PairMatch);
+        }
+        rec.marks.append(&mut pending);
+    }
+
+    fn highlight_record(&self, line: &str) -> huck_engine::highlight::HighlightRecord {
+        let no_aliases = std::collections::HashMap::new();
+        let opts = huck_engine::lexer::LexerOptions {
+            record_highlight: true,
+            ..Default::default()
+        };
+        let mut lx = huck_engine::lexer::Lexer::new(line, &no_aliases, opts);
+        let _ = huck_engine::parser::parse_sequence(&mut lx);
+        let mut rec = lx.take_highlight_record();
+        self.resolve_command_validity(line, &mut rec);
+        rec
+    }
+
+    /// v363 (#666): decide which command words are worth painting.
+    ///
+    /// The record marks command position — a fact about the grammar. Whether the
+    /// command EXISTS is a fact about this machine, and it is asked here, where
+    /// the shell is to hand. fish's restraint is the design: a command that
+    /// resolves is left alone, so the only colour on an ordinary line is the one
+    /// that means "this will not run".
+    ///
+    /// `Unknown` (the search budget was blown) is treated as valid. Painting a
+    /// name we declined to look up would be a guess shown in red.
+    fn resolve_command_validity(
+        &self,
+        line: &str,
+        rec: &mut huck_engine::highlight::HighlightRecord,
+    ) {
+        use huck_engine::cmd_validity::Validity;
+        use huck_engine::highlight::Role;
+        if !rec.marks.iter().any(|m| m.role == Role::CommandWord) {
+            return;
+        }
+        let mut shell = self.shell.borrow_mut();
+        let mut cache = self.validity.borrow_mut();
+        for m in rec.marks.iter_mut() {
+            if m.role != Role::CommandWord {
+                continue;
+            }
+            let end = m.end.min(line.len());
+            let name = line.get(m.start..end).unwrap_or("");
+            if cache.lookup(name, &mut shell) != Validity::Invalid {
+                m.role = Role::Word;
+            }
+        }
     }
 }
 
@@ -55,7 +215,62 @@ impl Hinter for HuckHelper {
     type Hint = String;
 }
 
-impl Highlighter for HuckHelper {}
+impl Highlighter for HuckHelper {
+    /// v363 (#666): colour the edit buffer.
+    ///
+    /// Re-parses the line on every call. Measured at 4-18 us for a realistic
+    /// line — against a 16 ms frame, ~800x headroom — so this is synchronous
+    /// with no debounce and no incremental reparse. An INCOMPLETE line, which is
+    /// what this sees on almost every keystroke, is the cheapest case of all
+    /// (1.1-5.3 us) because parsing stops at the error.
+    ///
+    /// ⚠️ Aliases are passed EMPTY on purpose. Read-time alias expansion would
+    /// splice in tokens whose spans point into the alias BODY rather than the
+    /// typed line, so every offset after an alias would be wrong. Highlighting
+    /// shows what was typed.
+    ///
+    /// The parse result is discarded; only the recorded marks are used. A parse
+    /// ERROR is the normal case here, not a failure.
+    fn highlight<'l>(&self, line: &'l str, pos: usize) -> std::borrow::Cow<'l, str> {
+        if line.is_empty() || !self.colour_now() {
+            return std::borrow::Cow::Borrowed(line);
+        }
+        let mut rec = self.highlight_record(line);
+        Self::emphasise_pairs(&mut rec, pos);
+        std::borrow::Cow::Owned(crate::paint::render(line, &rec, true))
+    }
+
+    /// ⚠️ Defaults to FALSE in the trait — without this override rustyline never
+    /// calls `highlight` again after the first render, so nothing updates as you
+    /// type. Returning true unconditionally is what a 4-18 us parse buys.
+    fn highlight_char(&self, line: &str, _pos: usize, kind: CmdKind) -> bool {
+        // Only when the TEXT may have changed. Syntax colour is a function of
+        // the line, not of where the cursor sits, so a bare cursor move needs no
+        // repaint — and asking for one is not free: `true` here makes rustyline
+        // do a FULL-LINE refresh, which on a 1-core box took the interactive pty
+        // suite from 50 s to 92 s and timed four of its multiline rows out.
+        //
+        // Bracket matching (#666, Task 6) is the one thing that DOES depend on
+        // the cursor, so `MoveCursor` is answered by asking whether this line
+        // could possibly have a pair in it. That byte scan is a conservative
+        // SUPERSET — it says yes to `echo "hi"` and to a lone `(` alike — and it
+        // is not a second notion of what a pair is, because nothing is decided
+        // from it: a line that passes still gets the real parse, and a line that
+        // fails has no pair for the cursor to touch.
+        if !self.colour_now() {
+            return false;
+        }
+        if kind != CmdKind::MoveCursor {
+            return true;
+        }
+        line.bytes().any(|b| {
+            matches!(
+                b,
+                b'(' | b')' | b'{' | b'}' | b'[' | b']' | b'"' | b'\'' | b'`'
+            )
+        })
+    }
+}
 
 impl Validator for HuckHelper {}
 
@@ -64,6 +279,180 @@ impl Helper for HuckHelper {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The roles a line ends up with, as `(text, role)` pairs.
+    fn roles(line: &str) -> Vec<(String, huck_engine::highlight::Role)> {
+        let helper = HuckHelper::new(Rc::new(RefCell::new(Shell::new())));
+        helper
+            .highlight_record(line)
+            .marks
+            .into_iter()
+            .map(|m| (line[m.start..m.end.min(line.len())].to_string(), m.role))
+            .collect()
+    }
+
+    #[test]
+    fn a_command_that_resolves_is_left_alone() {
+        use huck_engine::highlight::Role;
+        // fish's restraint: an ordinary working line carries no command colour
+        // at all, so the one command that will NOT run stands out.
+        let r = roles("echo hi");
+        assert!(
+            !r.iter().any(|(_, role)| *role == Role::CommandWord),
+            "a resolvable command must not keep the paint-me role: {r:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_that_does_not_resolve_keeps_the_role() {
+        use huck_engine::highlight::Role;
+        let r = roles("nosuchcmd_xyz hi");
+        assert!(
+            r.iter()
+                .any(|(t, role)| t == "nosuchcmd_xyz" && *role == Role::CommandWord),
+            "an unresolvable command must be marked: {r:?}"
+        );
+        // ...and the same inside a substitution, which is where it is easiest to
+        // miss a typo.
+        let r = roles("echo $(nosuchcmd_xyz)");
+        assert!(
+            r.iter()
+                .any(|(t, role)| t == "nosuchcmd_xyz" && *role == Role::CommandWord),
+            "a command inside a substitution is checked too: {r:?}"
+        );
+        assert!(
+            !r.iter()
+                .any(|(t, role)| t == "echo" && *role == Role::CommandWord),
+            "...while the outer, valid command stays plain: {r:?}"
+        );
+    }
+
+    #[test]
+    fn a_partly_typed_command_reads_as_invalid() {
+        use huck_engine::highlight::Role;
+        // Pinned deliberately, because it is what a user SEES: `ech` is not a
+        // command, so it is red until the `o` lands. fish behaves the same way,
+        // and the alternative — waiting for a word boundary — means the signal
+        // arrives after the mistake is already made.
+        let r = roles("ech");
+        assert!(
+            r.iter()
+                .any(|(t, role)| t == "ech" && *role == Role::CommandWord),
+            "{r:?}"
+        );
+    }
+
+    /// The roles a line ends up with when the cursor sits at `pos`.
+    fn roles_at(line: &str, pos: usize) -> Vec<(String, huck_engine::highlight::Role)> {
+        let helper = HuckHelper::new(Rc::new(RefCell::new(Shell::new())));
+        let mut rec = helper.highlight_record(line);
+        HuckHelper::emphasise_pairs(&mut rec, pos);
+        rec.marks
+            .into_iter()
+            .map(|m| (line[m.start..m.end.min(line.len())].to_string(), m.role))
+            .collect()
+    }
+
+    #[test]
+    fn both_ends_of_the_pair_under_the_cursor_are_emphasised() {
+        // `echo $(date)` — the `$(` is at 5..7, the `)` at 11.
+        let ends = |pos: usize| matched("echo $(date)", pos);
+        // On the closer, and just past it — both ends light up either way.
+        assert_eq!(ends(11), vec!["$(".to_string(), ")".to_string()]);
+        assert_eq!(ends(12), vec!["$(".to_string(), ")".to_string()]);
+        // On the opener, and on its second character.
+        assert_eq!(ends(5), vec!["$(".to_string(), ")".to_string()]);
+        assert_eq!(ends(6), vec!["$(".to_string(), ")".to_string()]);
+        // Anywhere else, nothing — this is the half a pty test can actually see
+        // move when an arrow key is pressed.
+        assert!(
+            ends(9).is_empty(),
+            "cursor in the middle emphasises nothing"
+        );
+        assert!(ends(0).is_empty());
+    }
+
+    /// The text of every `PairMatch` mark, in record order.
+    fn matched(line: &str, pos: usize) -> Vec<String> {
+        use huck_engine::highlight::Role;
+        roles_at(line, pos)
+            .into_iter()
+            .filter(|(_, r)| *r == Role::PairMatch)
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    #[test]
+    fn a_whole_delimiter_is_emphasised_not_its_first_character() {
+        // ⚠️ Reported from USING the shell. Emphasising ONE character lit the `$`
+        // of `$(` and left the bracket plain — and `${x}` was worse, lighting the
+        // `x`, because a parameter expansion's frame is pushed AFTER its opener
+        // is consumed and so records where the BODY starts, not the construct.
+        assert_eq!(
+            matched("echo ${x}", 8),
+            vec!["${".to_string(), "}".to_string()]
+        );
+        assert_eq!(
+            matched("echo $((1+2))", 12),
+            vec!["$((".to_string(), "))".to_string()],
+            "a two-character closer is emphasised whole too"
+        );
+        assert_eq!(
+            matched("echo `date`", 10),
+            vec!["`".to_string(), "`".to_string()]
+        );
+        // A quote is one character and stays one: its region mark spans the whole
+        // string, which is not a delimiter.
+        assert_eq!(
+            matched("echo \"dq\"", 8),
+            vec!["\"".to_string(), "\"".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_pair_with_no_width_is_not_emphasised() {
+        // `${x:-d}` pushes an OPERAND frame whose two ends are the same offset;
+        // emphasising it lit a lone character with no partner.
+        for pos in 0..12 {
+            let m = matched("echo ${x:-d}", pos);
+            assert!(
+                m.is_empty() || m == vec!["${".to_string(), "}".to_string()],
+                "pos {pos} emphasised {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_inner_pair_is_the_one_that_matches() {
+        // `echo "$(date)"` — quotes at 5 and 13, `$(` at 6..8, `)` at 12. With
+        // the cursor on the inner closer only the inner pair answers, which is
+        // what makes nesting readable.
+        assert_eq!(
+            matched("echo \"$(date)\"", 12),
+            vec!["$(".to_string(), ")".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_dangling_opener_is_marked_wherever_the_cursor_is() {
+        use huck_engine::highlight::Role;
+        // Unlike the pair match this does not depend on the cursor: a construct
+        // left open is worth showing whether or not you are looking at it.
+        for pos in [0, 6, 9] {
+            let marked: Vec<String> = roles_at("echo \"abc", pos)
+                .into_iter()
+                .filter(|(_, r)| *r == Role::DanglingOpener)
+                .map(|(t, _)| t)
+                .collect();
+            assert_eq!(marked, vec!["\"".to_string()], "cursor at {pos}");
+        }
+        // A finished line has none.
+        assert!(
+            !roles_at("echo \"abc\"", 0)
+                .iter()
+                .any(|(_, r)| *r == Role::DanglingOpener)
+        );
+    }
 
     #[test]
     fn helper_holds_rc_refcell_shell() {
