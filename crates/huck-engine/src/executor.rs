@@ -452,7 +452,12 @@ fn finish_command(
         return Some(o);
     }
     if c != 0 && !shell.err_trap_suppressed() && !is_negated_pipeline(cmd) {
-        if err_armed && !body_already_fired_err(cmd) {
+        // #676: BOTH consumers ask the same question — is this status this
+        // command's own, or one it inherited from a body that was already
+        // adjudicated? Answering it for ERR and not for errexit is what let a
+        // compound exit on an exemption it could not see.
+        let inherited = status_produced_by_body(cmd);
+        if err_armed && !inherited {
             crate::traps::fire_err_trap(shell);
             // #442: the ERR action itself ran `exit N`. Checked here, AFTER the
             // fire and BEFORE errexit, so a trap's exit beats the errexit
@@ -461,7 +466,7 @@ fn finish_command(
                 return Some(o);
             }
         }
-        if let Some(out) = maybe_errexit(shell, c) {
+        if !inherited && let Some(out) = maybe_errexit(shell, c) {
             return Some(out);
         }
     }
@@ -2754,9 +2759,15 @@ fn is_negated_pipeline(cmd: &Command) -> bool {
 /// - `Pipeline`, `Simple`, `Arith`, `DoubleBracket` — these ARE the innermost
 ///   failing command.
 ///
-/// errexit is deliberately NOT gated on this: `set -e; { false; }` must still
-/// exit, exactly as it does today.
-fn body_already_fired_err(cmd: &Command) -> bool {
+/// ⚠️ errexit IS gated on this, and the comment that used to stand here — "errexit
+/// is deliberately NOT gated on this: `set -e; { false; }` must still exit" — was
+/// the bug (#676). It reasoned from an OUTCOME rather than a mechanism.
+/// `set -e; { false; }` does still exit, but through the inner `false`'s own
+/// adjudication, not the group's; the group's second look at the same status is
+/// what wrongly exited when the inner failure was EXEMPT, as in
+/// `{ false && true; }`. One adjudication per failure, at the site that produced
+/// it.
+fn status_produced_by_body(cmd: &Command) -> bool {
     // #481: look THROUGH a single-stage pipeline wrapper. An EVEN number of
     // `!` in front of a compound cancels to `negate: false`, which leaves the
     // compound wrapped in a `Pipeline` that `is_negated_pipeline` no longer
