@@ -79,10 +79,11 @@ check 'division by zero'     'echo $((1/0))'
 #     bash: line 2: 1 / 0: division by 0 (error token is "0")
 #     huck: line 1: 1 / 0: division by 0 (error token is "0")
 #
-# — identical but for the LINE: bash's counter advances past the newline it
-# consumed and huck's does not (#658). So such a row cannot be green until that
-# is fixed, and asserting the whole message would just pin #658's divergence
-# here. Two other arith messages diverge in WORDING for unrelated reasons
+# — identical but for the LINE: bash names the line its READER had reached, huck
+# names the line the command STARTS on. That is now a KEPT divergence (#658,
+# closed by-design with #680, recorded in docs/bash-divergences.md), so a row
+# asserting the whole message will never be green here and is not waiting on
+# anything. Two other arith messages diverge in WORDING for unrelated reasons
 # (#659), which is why `$((1 + @))` is not a control either.
 
 harness_summary
