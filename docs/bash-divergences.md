@@ -292,3 +292,24 @@ huck enforces `FUNCNEST` exactly like bash, but additionally clamps the effectiv
 - **Workaround**: none needed — no real expression nests 64 deep, and the cases that do are the ones that used to crash.
 
 ---
+
+### a diagnostic's LINE is where the command starts, not where bash's reader had reached
+
+[Issue #680 · by-design](https://github.com/jdstanhope/huck/issues/680) · [Issue #658 · by-design](https://github.com/jdstanhope/huck/issues/658)
+
+- **huck**: a runtime diagnostic names the line the failing command STARTED on. `x=$(` on line 2 with `nosuchcmd` on line 3 and `)` on line 4 reports `line 2`; `echo $((1 / \` continued onto the next line reports `line 1`.
+- **bash**: names the line its INPUT POINTER had reached, which is a different thing and not always a line the reader would pick. The same two cases report `line 4` and `line 2`. Measured across the shapes:
+
+  | script | bash | huck |
+  | --- | --- | --- |
+  | `$(` L2, command L3, `)` L4 | 4 | 2 |
+  | `$(` L4, command L5, `)` L6 | 6 | 4 |
+  | `x=$(nosuchcmd)` all on L2 | 2 | 2 |
+  | procsub `done < <(nosuchcmd)` on L5 | 5 | 5 |
+  | backtick spanning L2–L4 | **5** | 2 |
+  | `$((1 / \` L1, `0))` L2 | 2 | 1 |
+
+- **Why intentional**: bash's number is an artifact of how its reader consumes input, not a rule anyone would choose. For `$( )` it is "where the construct closed" — not where the command is, and not where the enclosing statement began. For a multi-line backtick it is the closing line **plus one**. Reproducing it would mean telling the inner command a line that exists nowhere in its own AST: a new field on the substitution word part, the front end populating it at the close, and the expander stamping it before running the body — three layers, plus a special case for the backtick's off-by-one, to make a correct message point somewhere less useful. huck's line is the one a reader would look at: where the command that failed begins. Everything else in these messages — the text, the exit status, the stream — already matches bash byte for byte, and the runtime sweep counts the affected scripts as agreeing.
+- **Workaround**: none needed. If a script parses huck's diagnostics for line numbers it will read the statement's line rather than the reader's position; no script in the 2215-script corpus does.
+
+---
