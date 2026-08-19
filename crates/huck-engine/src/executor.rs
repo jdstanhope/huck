@@ -1389,6 +1389,36 @@ fn run_redirected(
     with_redirect_scope(redirects, shell, |shell| run_command(inner, shell))
 }
 
+/// What a loop body's outcome means to the loop that ran it.
+///
+/// The four loop runners — `while`/`until`, `for`, arith-`for`, `select` — each
+/// carried an identical ~20-line match translating this. One copy means a fix
+/// lands in all four, which matters for v364: status provenance threads through
+/// exactly this path, and four copies is four places to get it wrong.
+enum LoopStep {
+    /// Keep iterating; the loop's status so far is this.
+    Next(i32),
+    /// Stop iterating; the loop's status is this (`break` at THIS level).
+    Stop(i32),
+    /// Not this loop's business — propagate unchanged. A `break`/`continue`
+    /// bound for an OUTER loop has already been decremented one level.
+    Propagate(ExecOutcome),
+}
+
+fn loop_body_step(outcome: ExecOutcome) -> LoopStep {
+    match outcome {
+        ExecOutcome::LoopBreak(1, st) => LoopStep::Stop(st),
+        ExecOutcome::LoopBreak(n, st) => LoopStep::Propagate(ExecOutcome::LoopBreak(n - 1, st)),
+        // `continue` at THIS level: the loop's status resets to 0 and the runner
+        // falls through to its own step / condition re-test, as it did before.
+        ExecOutcome::LoopContinue(1) => LoopStep::Next(0),
+        ExecOutcome::LoopContinue(n) => LoopStep::Propagate(ExecOutcome::LoopContinue(n - 1)),
+        ExecOutcome::Continue(c) => LoopStep::Next(c),
+        // Exit / FunctionReturn / Interrupted leave the loop untouched.
+        other => LoopStep::Propagate(other),
+    }
+}
+
 /// Runs a `while`/`until` loop. The body runs while the condition's
 /// exit status satisfies the loop's polarity. `break` ends the loop;
 /// `continue` jumps to the next condition test; `exit` propagates; a
@@ -1441,25 +1471,13 @@ fn run_while_inner(clause: &WhileClause, shell: &mut Shell) -> ExecOutcome {
         if !keep_going {
             break;
         }
-        match execute_sequence_body(&clause.body, shell) {
-            ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
-            ExecOutcome::LoopBreak(1, st) => {
+        match loop_body_step(execute_sequence_body(&clause.body, shell)) {
+            LoopStep::Propagate(o) => return o,
+            LoopStep::Stop(st) => {
                 last = ExecOutcome::Continue(st);
                 break;
             }
-            ExecOutcome::LoopBreak(n, st) => {
-                return ExecOutcome::LoopBreak(n - 1, st);
-            }
-            ExecOutcome::LoopContinue(1) => {
-                last = ExecOutcome::Continue(0);
-                // fall through — the loop re-tests the condition
-            }
-            ExecOutcome::LoopContinue(n) => {
-                return ExecOutcome::LoopContinue(n - 1);
-            }
-            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
-            ExecOutcome::Continue(c) => {
+            LoopStep::Next(c) => {
                 last = ExecOutcome::Continue(c);
             }
         }
@@ -1584,25 +1602,13 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell) -> ExecOutcome {
             shell.report_error(crate::error_fatality::ErrorKind::ReadonlyForVar);
             return ExecOutcome::Continue(1);
         }
-        match execute_sequence_body(&clause.body, shell) {
-            ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
-            ExecOutcome::LoopBreak(1, st) => {
+        match loop_body_step(execute_sequence_body(&clause.body, shell)) {
+            LoopStep::Propagate(o) => return o,
+            LoopStep::Stop(st) => {
                 last = ExecOutcome::Continue(st);
                 break;
             }
-            ExecOutcome::LoopBreak(n, st) => {
-                return ExecOutcome::LoopBreak(n - 1, st);
-            }
-            ExecOutcome::LoopContinue(1) => {
-                last = ExecOutcome::Continue(0);
-                // fall through — advance to the next value
-            }
-            ExecOutcome::LoopContinue(n) => {
-                return ExecOutcome::LoopContinue(n - 1);
-            }
-            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
-            ExecOutcome::Continue(c) => {
+            LoopStep::Next(c) => {
                 last = ExecOutcome::Continue(c);
             }
         }
@@ -1828,26 +1834,13 @@ fn run_arith_for_inner(clause: &crate::command::ArithForClause, shell: &mut Shel
         }
 
         // 3. Execute body.
-        match execute_sequence_body(&clause.body, shell) {
-            ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
-            ExecOutcome::LoopBreak(1, st) => {
+        match loop_body_step(execute_sequence_body(&clause.body, shell)) {
+            LoopStep::Propagate(o) => return o,
+            LoopStep::Stop(st) => {
                 last = ExecOutcome::Continue(st);
                 break;
             }
-            ExecOutcome::LoopBreak(n, st) => {
-                return ExecOutcome::LoopBreak(n - 1, st);
-            }
-            ExecOutcome::LoopContinue(1) => {
-                last = ExecOutcome::Continue(0);
-                // fall through to step (LoopContinue(1) runs this loop's step)
-            }
-            ExecOutcome::LoopContinue(n) => {
-                // Skip this loop's step — bubble to outer loop.
-                return ExecOutcome::LoopContinue(n - 1);
-            }
-            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
-            ExecOutcome::Continue(c) => {
+            LoopStep::Next(c) => {
                 last = ExecOutcome::Continue(c);
             }
         }
@@ -2045,21 +2038,15 @@ fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell) ->
         }
 
         // 3e. Run the body; bubble flow with the v79 decrement-and-bubble pattern.
-        match execute_sequence_body(&clause.body, shell) {
-            ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
-            ExecOutcome::LoopBreak(1, st) => {
+        match loop_body_step(execute_sequence_body(&clause.body, shell)) {
+            LoopStep::Propagate(o) => return o,
+            LoopStep::Stop(st) => {
                 last = ExecOutcome::Continue(st);
                 break;
             }
-            ExecOutcome::LoopBreak(n, st) => return ExecOutcome::LoopBreak(n - 1, st),
-            ExecOutcome::LoopContinue(1) => {
-                last = ExecOutcome::Continue(0);
-                // fall through — re-prompt
+            LoopStep::Next(c) => {
+                last = ExecOutcome::Continue(c);
             }
-            ExecOutcome::LoopContinue(n) => return ExecOutcome::LoopContinue(n - 1),
-            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
-            ExecOutcome::Continue(c) => last = ExecOutcome::Continue(c),
         }
 
         // 3f. Suppress the menu next iteration unless the last REPLY was empty
