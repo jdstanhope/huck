@@ -41,13 +41,9 @@ fn try_spawn(cwd: &Path, env: &[(&str, &str)]) -> Option<OsSession> {
     // one-core box starved sessions until legitimate waits exceeded half a
     // minute. Measured: 110 s with two failures, 33 s and green without.
     //
-    // The painted editor has its own harness, `highlight_render_pty.rs`. What
-    // that does NOT cover is a CONTINUATION line, and the reason is worth
-    // knowing: a continuation line is parsed on its own, so `then echo hi` has
-    // no `if` in front of it, the parse fails at the first word, and almost
-    // nothing gets marked. Highlighting the accumulated command rather than the
-    // physical line is #670 — so turning colour off here costs no coverage that
-    // exists today.
+    // The painted editor has its own harness, `highlight_render_pty.rs`,
+    // including a CONTINUATION-line row since #670. Turning colour off here
+    // costs no coverage: what this suite tests is the reader, not the paint.
     cmd.env("NO_COLOR", "1");
     cmd.current_dir(cwd);
     for (k, v) in env {

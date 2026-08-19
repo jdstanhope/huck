@@ -1,0 +1,96 @@
+---
+title: "The second line"
+date: 2026-08-19
+summary: "huck's new syntax highlighting stopped at the first line of a multi-line command — and so, it turned out, did tab completion. Both for the same reason: a continuation line does not mean anything on its own."
+tags: ["interactive", "completion", "highlighting"]
+---
+
+huck [started colouring the line you type](/blog/the-line-you-are-typing) this
+week. It stopped working the moment you pressed Enter on an unfinished command:
+
+```bash
+# before
+huck> if true
+> then nosuchcmd_xyz "dq"
+
+# after
+> ^[[1;34mthen^[[0m ^[[31mnosuchcmd_xyz^[[0m ^[[7m"^[[0m^[[33mdq^[[0m^[[7m"^[[0m
+```
+
+Everything after the `>` prompt came back plain. An `if` body, a `for` body, a
+function definition, a heredoc — all the places where a command is long enough
+to be worth checking as you write it.
+
+## Why
+
+The colours come from parsing the line, and `then nosuchcmd_xyz "dq"` is not a
+command. It is a fragment. On its own it is a syntax error — the parser stops at
+`then`, never looks at anything after it, and there is nothing to colour.
+
+The shell knows what came before, of course; it is holding the lines you have
+already entered so it can run them together. The editor just was not being told.
+Now it is, and the highlighter parses the whole command and paints only the part
+that is on screen.
+
+That last bit is fiddlier than it sounds, because the three things the parse
+records mean different things when they cross the line boundary. A **coloured
+region** that starts above is still visible from column zero — a quote opened on
+the previous line should colour this one up to where it closes. A **matched
+bracket pair** with one end above should not light up the end you can see,
+because the eye would look for a partner that is not on screen. And an
+**unclosed opener** above the line has nothing on screen to point at, so it is
+better to say nothing than to underline whatever happens to be in column zero.
+
+## The bug hiding behind it
+
+Fixing that exposed a second one, which had been invisible because the lines it
+affected were never coloured at all:
+
+```bash
+# before — `body` is red, as if it were a command that does not exist
+> ^[[31mbody^[[0m ^[[1;36m$HOME^[[0m text
+
+# after
+> body ^[[1;36m$HOME^[[0m text
+```
+
+That is a heredoc body. Its words were being treated as commands. They are text
+— the only thing in a heredoc that is a command is one you explicitly write
+inside `$( )`, and that still gets checked.
+
+## Then the same bug somewhere else
+
+While testing this I tried pressing Tab on a continuation line, and nothing
+happened:
+
+```bash
+# before
+> then whil<TAB>
+
+# after
+> ^[[1;34mthen^[[0m ^[[1;34mwhile^[[0m
+```
+
+Tab completion in huck is also driven by parsing — that is why it completes
+after `if`, inside `"$( `, and in arithmetic, where bash completes nothing. Which
+means it failed on exactly the same fragments, for exactly the same reason, and
+had been failing silently since long before any of this. Nothing tells you the
+shell could not parse what you were typing; you just get no completions and
+assume there were none.
+
+One value fixed both, and it is the same value the shell already had.
+
+## One case still answers with nothing
+
+If you split a single word across lines with a backslash:
+
+```bash
+huck> echo /usr/b\
+> in/l<TAB>
+```
+
+the completion would have to start on the line above, and the editor can only
+replace text on the line it is showing. Replacing from column zero would quietly
+drop the `/usr/b`. So huck offers nothing there rather than mangling what you
+typed — a case worth knowing about precisely because it is the one place the
+answer is deliberately empty.
