@@ -2508,6 +2508,13 @@ fn collect_heredoc_bodies_after_newline(iter: &mut Lexer) -> Result<(), ParseErr
 /// SPLITS that merged text back into the oracle's per-line
 /// (content, "\n") `Literal` pairs.
 fn parse_heredoc_body(iter: &mut Lexer) -> Result<Word, ParseError> {
+    // #670: a heredoc body is TEXT, never command position. Without this its
+    // words were classified as commands and an EXPANDING body painted red
+    // (`cat <<EOF` / `body $HOME text` — `body` and `text` both). A `$(…)` inside
+    // the body is unaffected: its own parse declares command position for the
+    // command inside it. A LITERAL body never showed the bug, since it arrives
+    // as one `Lit{quoted:true}` and only unquoted literals are classified.
+    iter.declare_word_context(crate::lexer::WordContext::Argument);
     let expand = match iter.next_kind()? {
         Some(TokenKind::HeredocBodyBegin { expand }) => expand,
         _ => unreachable!(

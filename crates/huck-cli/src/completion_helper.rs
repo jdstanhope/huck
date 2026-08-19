@@ -31,6 +31,12 @@ pub struct HuckHelper {
     /// the line being typed. Cleared at every prompt (`clear_validity_cache`), so
     /// a program installed on one line is seen on the next.
     validity: RefCell<huck_engine::cmd_validity::ValidityCache>,
+    /// The lines of this logical command already entered, with their joiner
+    /// (#670). Empty at a PS1 prompt; at a PS2 prompt it is what makes the line
+    /// being typed parseable at all — `then echo hi` is a syntax error on its
+    /// own, and a fragment that cannot parse is a fragment that cannot be
+    /// coloured.
+    prefix: RefCell<String>,
 }
 
 impl HuckHelper {
@@ -41,7 +47,19 @@ impl HuckHelper {
             shell,
             colour_enabled,
             validity: RefCell::new(huck_engine::cmd_validity::ValidityCache::new()),
+            prefix: RefCell::new(String::new()),
         }
+    }
+
+    /// Tell the highlighter what this line CONTINUES (#670).
+    ///
+    /// Set once per prompt, not per keystroke: at a PS1 prompt it is empty, and
+    /// at a PS2 prompt it is the accumulated buffer plus the joiner that the
+    /// next line will be appended with — the same two values the reader itself
+    /// uses, taken from the same place, so there is no second notion of how
+    /// lines join.
+    pub fn set_highlight_prefix(&self, prefix: String) {
+        *self.prefix.borrow_mut() = prefix;
     }
 
     /// Is colour wanted right now?
@@ -141,16 +159,65 @@ impl HuckHelper {
     }
 
     fn highlight_record(&self, line: &str) -> huck_engine::highlight::HighlightRecord {
+        let prefix = self.prefix.borrow().clone();
+        let source = if prefix.is_empty() {
+            line.to_string()
+        } else {
+            format!("{prefix}{line}")
+        };
         let no_aliases = std::collections::HashMap::new();
         let opts = huck_engine::lexer::LexerOptions {
             record_highlight: true,
             ..Default::default()
         };
-        let mut lx = huck_engine::lexer::Lexer::new(line, &no_aliases, opts);
+        let mut lx = huck_engine::lexer::Lexer::new(&source, &no_aliases, opts);
         let _ = huck_engine::parser::parse_sequence(&mut lx);
         let mut rec = lx.take_highlight_record();
+        // The record indexes what was PARSED; the painter indexes what is on
+        // screen. Those differ by exactly the prefix.
+        Self::rebase_onto_line(&mut rec, prefix.len(), line.len());
         self.resolve_command_validity(line, &mut rec);
         rec
+    }
+
+    /// Move a record recorded over `prefix + line` onto `line` alone (#670).
+    ///
+    /// Three different answers, because the three things in a record mean
+    /// different things when they straddle the boundary:
+    ///
+    /// * a MARK is a region, and a region that starts above the visible line is
+    ///   still visible from column zero — a `"…"` opened on the previous line
+    ///   colours this one to its close. So it is CLAMPED, not dropped.
+    /// * a PAIR is a relation between two points, and emphasising one end of it
+    ///   would point at a character that is not its partner. So a pair is kept
+    ///   only when BOTH ends are on this line.
+    /// * the DANGLING OPENER is a single position. If it is above the line there
+    ///   is nothing on screen to underline, so it is dropped rather than moved
+    ///   to column zero, which would accuse the wrong character.
+    fn rebase_onto_line(
+        rec: &mut huck_engine::highlight::HighlightRecord,
+        base: usize,
+        line_len: usize,
+    ) {
+        if base == 0 {
+            return;
+        }
+        let end = base + line_len;
+        rec.marks.retain(|m| m.end > base && m.start < end);
+        for m in rec.marks.iter_mut() {
+            m.start = m.start.max(base) - base;
+            m.end = m.end.min(end) - base;
+        }
+        rec.pairs
+            .retain(|p| p.open >= base && p.close >= base && p.close < end);
+        for p in rec.pairs.iter_mut() {
+            p.open -= base;
+            p.close -= base;
+        }
+        rec.unterminated = rec
+            .unterminated
+            .filter(|&off| off >= base)
+            .map(|off| off - base);
     }
 
     /// v363 (#666): decide which command words are worth painting.
@@ -452,6 +519,105 @@ mod tests {
                 .iter()
                 .any(|(_, r)| *r == Role::DanglingOpener)
         );
+    }
+
+    /// Roles for `line` typed at a PS2 prompt, continuing `prefix`.
+    fn roles_after(prefix: &str, line: &str) -> Vec<(String, huck_engine::highlight::Role)> {
+        let helper = HuckHelper::new(Rc::new(RefCell::new(Shell::new())));
+        helper.set_highlight_prefix(prefix.to_string());
+        helper
+            .highlight_record(line)
+            .marks
+            .into_iter()
+            .map(|m| (line[m.start..m.end.min(line.len())].to_string(), m.role))
+            .collect()
+    }
+
+    #[test]
+    fn a_continuation_line_is_parsed_with_what_it_continues() {
+        use huck_engine::highlight::Role;
+        // #670: `then nosuchcmd_xyz` is a syntax error ON ITS OWN — the parse
+        // fails at `then` and nothing after it is ever scanned, so the line came
+        // back almost entirely unpainted. With the prefix it parses, and every
+        // word gets the role it deserves.
+        let plain = roles("then nosuchcmd_xyz");
+        assert!(
+            !plain
+                .iter()
+                .any(|(t, r)| t == "nosuchcmd_xyz" && *r == Role::CommandWord),
+            "without the prefix the line cannot be parsed this far: {plain:?}"
+        );
+        let cont = roles_after("if true\n", "then nosuchcmd_xyz");
+        assert_eq!(
+            cont,
+            vec![
+                ("then".to_string(), Role::Keyword),
+                ("nosuchcmd_xyz".to_string(), Role::CommandWord),
+            ],
+        );
+    }
+
+    #[test]
+    fn marks_are_rebased_onto_the_visible_line_only() {
+        use huck_engine::highlight::Role;
+        // Offsets in the record index what was PARSED; the painter indexes what
+        // is on SCREEN. Every mark here must fall inside the second line.
+        let line = "then echo \"dq\" $HOME";
+        for (text, _) in roles_after("if true\n", line) {
+            assert!(
+                line.contains(&text),
+                "{text:?} is not from the visible line"
+            );
+        }
+        assert!(
+            roles_after("if true\n", line)
+                .iter()
+                .any(|(t, r)| t == "$HOME" && *r == Role::VarName),
+            "the variable on the continuation line is marked"
+        );
+    }
+
+    #[test]
+    fn a_region_opened_on_an_earlier_line_paints_from_column_zero() {
+        use huck_engine::highlight::Role;
+        // A `"` opened on the previous line is still open here, so this line is
+        // INSIDE the string up to its close. The mark straddles the boundary and
+        // must be CLAMPED, not dropped — dropping it would leave the string
+        // unpainted on exactly the line where the closing quote is.
+        let line = "end\" after";
+        let r = roles_after("echo \"start\n", line);
+        let quoted: Vec<_> = r
+            .iter()
+            .filter(|(_, role)| *role == Role::QuotedDouble)
+            .collect();
+        assert_eq!(
+            quoted.len(),
+            1,
+            "the run that closes on this line is painted: {r:?}"
+        );
+        assert_eq!(
+            quoted[0].0, "end\"",
+            "from column zero to the closing quote"
+        );
+    }
+
+    #[test]
+    fn a_pair_with_an_end_above_the_line_is_not_emphasised() {
+        use huck_engine::highlight::Role;
+        // A pair is a RELATION between two points. Emphasising the end that is
+        // on screen would point the eye at a character whose partner it cannot
+        // see, so a pair is kept only when both ends are visible.
+        let line = "end\" after";
+        for pos in 0..line.len() {
+            let helper = HuckHelper::new(Rc::new(RefCell::new(Shell::new())));
+            helper.set_highlight_prefix("echo \"start\n".to_string());
+            let mut rec = helper.highlight_record(line);
+            HuckHelper::emphasise_pairs(&mut rec, pos);
+            assert!(
+                !rec.marks.iter().any(|m| m.role == Role::PairMatch),
+                "cursor {pos} emphasised half a pair"
+            );
+        }
     }
 
     #[test]

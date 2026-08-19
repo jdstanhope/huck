@@ -581,6 +581,23 @@ fn read_logical_command(
             // here, so a program installed by that line is found by this one.
             if let Some(h) = editor.helper() {
                 h.clear_validity_cache();
+                // #670: tell the highlighter what this line CONTINUES. Empty at
+                // a PS1 prompt; at a PS2 prompt it is the buffer plus the joiner
+                // the next line will be appended with — read from the SAME two
+                // values the append below uses, so there is no second notion of
+                // how lines join. Without it a continuation line is parsed alone,
+                // `then echo hi` fails at its first word, and almost nothing on
+                // the line can be coloured.
+                h.set_highlight_prefix(match &pending {
+                    None => String::new(),
+                    Some((reason, _)) => {
+                        let mut p = buffer.clone();
+                        if *reason != huck_engine::continuation::ContinuationReason::Backslash {
+                            p.push('\n');
+                        }
+                        p
+                    }
+                });
             }
             editor.readline(&(measured, expanded))
         };

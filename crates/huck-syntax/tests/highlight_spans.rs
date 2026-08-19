@@ -429,3 +429,43 @@ fn an_unterminated_construct_claims_no_pair() {
     // A pair that DID close before the line ran out is still recorded.
     assert_eq!(pairs("echo $(date) \"abc"), vec![(5, 11)]);
 }
+
+#[test]
+fn a_heredoc_body_is_text_not_commands() {
+    // #670: an EXPANDING heredoc body's words were classified as commands, so
+    // `cat <<EOF` / `body $HOME text` painted `body` and `text` red. A body is
+    // text; the only thing in it that is a command is one inside a substitution.
+    let src = "cat <<EOF\nbody $HOME text\nEOF\n";
+    let r = roles(src);
+    assert!(
+        !r.iter()
+            .any(|(t, role)| (*t == "body " || *t == " text") && *role == Role::CommandWord),
+        "body words must not be command words: {r:?}"
+    );
+    assert!(
+        r.iter()
+            .any(|(t, role)| *t == "$HOME" && *role == Role::VarName),
+        "...but an expansion in the body is still an expansion: {r:?}"
+    );
+    // The command inside a substitution in the body IS one.
+    let src = "cat <<EOF\nx $(nosuch) y\nEOF\n";
+    assert!(
+        roles(src)
+            .iter()
+            .any(|(t, role)| *t == "nosuch" && *role == Role::CommandWord),
+        "a command inside the body's substitution is still a command"
+    );
+    // A LITERAL body never had the bug — it arrives as one `Lit{quoted:true}`,
+    // and only UNQUOTED literals are classified — but pin it anyway, since the
+    // reason is a property of the lexer that could change.
+    let src = "cat <<'EOF'\nbody text\nEOF\n";
+    let r = roles(src);
+    assert_eq!(
+        r.iter()
+            .filter(|(_, role)| *role == Role::CommandWord)
+            .map(|(t, _)| *t)
+            .collect::<Vec<_>>(),
+        vec!["cat"],
+        "only the `cat` is a command: {r:?}"
+    );
+}
