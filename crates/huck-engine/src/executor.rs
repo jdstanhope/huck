@@ -410,6 +410,33 @@ fn finish_command(
     err_armed: bool,
     shell: &mut Shell,
 ) -> Option<ExecOutcome> {
+    finish_command_inner(cmd, c, err_armed, status_produced_by_body(cmd), shell)
+}
+
+/// Adjudicate a status the CALLER knows is its OWN, where the command kind
+/// alone would say otherwise (#685).
+///
+/// One caller: a redirect that failed on a compound. `Redirected` is normally
+/// pass-through — `{ false; } > /dev/null` reports the inner `false`'s status,
+/// already adjudicated inside the redirect — but when the REDIRECT is what
+/// failed the inner never ran, so nothing has adjudicated anything and this is
+/// the only site that can.
+fn finish_command_own(
+    cmd: &Command,
+    c: i32,
+    err_armed: bool,
+    shell: &mut Shell,
+) -> Option<ExecOutcome> {
+    finish_command_inner(cmd, c, err_armed, false, shell)
+}
+
+fn finish_command_inner(
+    cmd: &Command,
+    c: i32,
+    err_armed: bool,
+    inherited: bool,
+    shell: &mut Shell,
+) -> Option<ExecOutcome> {
     // B-11: propagate `$?` across sequence connectors. The top-level loop in
     // shell.rs only refreshes `shell.last_status` after `process_line` returns,
     // so without this update the second command in `false; echo $?` would see a
@@ -452,7 +479,13 @@ fn finish_command(
         return Some(o);
     }
     if c != 0 && !shell.err_trap_suppressed() && !is_negated_pipeline(cmd) {
-        if err_armed && !body_already_fired_err(cmd) {
+        // #676: BOTH consumers ask the same question — is this status this
+        // command's own, or one it inherited from a body that was already
+        // adjudicated? Answering it for ERR and not for errexit is what let a
+        // compound exit on an exemption it could not see. `inherited` is the
+        // caller's answer: `finish_command` reads it off the command kind,
+        // `finish_command_own` knows better (#685).
+        if err_armed && !inherited {
             crate::traps::fire_err_trap(shell);
             // #442: the ERR action itself ran `exit N`. Checked here, AFTER the
             // fire and BEFORE errexit, so a trap's exit beats the errexit
@@ -461,7 +494,7 @@ fn finish_command(
                 return Some(o);
             }
         }
-        if let Some(out) = maybe_errexit(shell, c) {
+        if !inherited && let Some(out) = maybe_errexit(shell, c) {
             return Some(out);
         }
     }
@@ -865,7 +898,7 @@ fn run_command(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
             run_arith(expr, *line, shell)
         }
         Command::Select(clause) => run_select(clause, shell),
-        Command::Redirected { inner, redirects } => run_redirected(inner, redirects, shell),
+        Command::Redirected { inner, redirects } => run_redirected(cmd, inner, redirects, shell),
         Command::Coproc { name, body } => run_coproc(name, body, shell),
         _ => {
             {
@@ -1374,6 +1407,7 @@ fn command_line(cmd: &Command) -> Option<u32> {
 }
 
 fn run_redirected(
+    whole: &Command,
     inner: &Command,
     redirects: &[crate::command::Redirection],
     shell: &mut Shell,
@@ -1386,7 +1420,56 @@ fn run_redirected(
     if let Some(l) = command_line(inner).filter(|&l| l != 0) {
         shell.current_lineno = shell.line_base() + l;
     }
-    with_redirect_scope(redirects, shell, |shell| run_command(inner, shell))
+    // #444: snapshot BEFORE anything runs, so a command that INSTALLS the ERR
+    // trap is not itself caught by it — the same rule `run_list_element` uses.
+    let err_armed = crate::traps::err_trap_armed(shell);
+    let inner_ran = std::cell::Cell::new(false);
+    let out = with_redirect_scope(redirects, shell, |shell| {
+        inner_ran.set(true);
+        run_command(inner, shell)
+    });
+    // #685: the inner never ran, so this status is the REDIRECT's failure and
+    // nothing has adjudicated it — `Redirected` is otherwise pass-through, on
+    // the grounds that the inner already did. This is the site that produced
+    // the failure, so it is the site that judges it.
+    if !inner_ran.get()
+        && let ExecOutcome::Continue(c) = out
+        && c != 0
+        && let Some(o) = finish_command_own(whole, c, err_armed, shell)
+    {
+        return o;
+    }
+    out
+}
+
+/// What a loop body's outcome means to the loop that ran it.
+///
+/// The four loop runners — `while`/`until`, `for`, arith-`for`, `select` — each
+/// carried an identical ~20-line match translating this. One copy means a fix
+/// lands in all four, which matters for v364: status provenance threads through
+/// exactly this path, and four copies is four places to get it wrong.
+enum LoopStep {
+    /// Keep iterating; the loop's status so far is this.
+    Next(i32),
+    /// Stop iterating; the loop's status is this (`break` at THIS level).
+    Stop(i32),
+    /// Not this loop's business — propagate unchanged. A `break`/`continue`
+    /// bound for an OUTER loop has already been decremented one level.
+    Propagate(ExecOutcome),
+}
+
+fn loop_body_step(outcome: ExecOutcome) -> LoopStep {
+    match outcome {
+        ExecOutcome::LoopBreak(1, st) => LoopStep::Stop(st),
+        ExecOutcome::LoopBreak(n, st) => LoopStep::Propagate(ExecOutcome::LoopBreak(n - 1, st)),
+        // `continue` at THIS level: the loop's status resets to 0 and the runner
+        // falls through to its own step / condition re-test, as it did before.
+        ExecOutcome::LoopContinue(1) => LoopStep::Next(0),
+        ExecOutcome::LoopContinue(n) => LoopStep::Propagate(ExecOutcome::LoopContinue(n - 1)),
+        ExecOutcome::Continue(c) => LoopStep::Next(c),
+        // Exit / FunctionReturn / Interrupted leave the loop untouched.
+        other => LoopStep::Propagate(other),
+    }
 }
 
 /// Runs a `while`/`until` loop. The body runs while the condition's
@@ -1441,25 +1524,13 @@ fn run_while_inner(clause: &WhileClause, shell: &mut Shell) -> ExecOutcome {
         if !keep_going {
             break;
         }
-        match execute_sequence_body(&clause.body, shell) {
-            ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
-            ExecOutcome::LoopBreak(1, st) => {
+        match loop_body_step(execute_sequence_body(&clause.body, shell)) {
+            LoopStep::Propagate(o) => return o,
+            LoopStep::Stop(st) => {
                 last = ExecOutcome::Continue(st);
                 break;
             }
-            ExecOutcome::LoopBreak(n, st) => {
-                return ExecOutcome::LoopBreak(n - 1, st);
-            }
-            ExecOutcome::LoopContinue(1) => {
-                last = ExecOutcome::Continue(0);
-                // fall through — the loop re-tests the condition
-            }
-            ExecOutcome::LoopContinue(n) => {
-                return ExecOutcome::LoopContinue(n - 1);
-            }
-            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
-            ExecOutcome::Continue(c) => {
+            LoopStep::Next(c) => {
                 last = ExecOutcome::Continue(c);
             }
         }
@@ -1584,25 +1655,13 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell) -> ExecOutcome {
             shell.report_error(crate::error_fatality::ErrorKind::ReadonlyForVar);
             return ExecOutcome::Continue(1);
         }
-        match execute_sequence_body(&clause.body, shell) {
-            ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
-            ExecOutcome::LoopBreak(1, st) => {
+        match loop_body_step(execute_sequence_body(&clause.body, shell)) {
+            LoopStep::Propagate(o) => return o,
+            LoopStep::Stop(st) => {
                 last = ExecOutcome::Continue(st);
                 break;
             }
-            ExecOutcome::LoopBreak(n, st) => {
-                return ExecOutcome::LoopBreak(n - 1, st);
-            }
-            ExecOutcome::LoopContinue(1) => {
-                last = ExecOutcome::Continue(0);
-                // fall through — advance to the next value
-            }
-            ExecOutcome::LoopContinue(n) => {
-                return ExecOutcome::LoopContinue(n - 1);
-            }
-            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
-            ExecOutcome::Continue(c) => {
+            LoopStep::Next(c) => {
                 last = ExecOutcome::Continue(c);
             }
         }
@@ -1828,26 +1887,13 @@ fn run_arith_for_inner(clause: &crate::command::ArithForClause, shell: &mut Shel
         }
 
         // 3. Execute body.
-        match execute_sequence_body(&clause.body, shell) {
-            ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
-            ExecOutcome::LoopBreak(1, st) => {
+        match loop_body_step(execute_sequence_body(&clause.body, shell)) {
+            LoopStep::Propagate(o) => return o,
+            LoopStep::Stop(st) => {
                 last = ExecOutcome::Continue(st);
                 break;
             }
-            ExecOutcome::LoopBreak(n, st) => {
-                return ExecOutcome::LoopBreak(n - 1, st);
-            }
-            ExecOutcome::LoopContinue(1) => {
-                last = ExecOutcome::Continue(0);
-                // fall through to step (LoopContinue(1) runs this loop's step)
-            }
-            ExecOutcome::LoopContinue(n) => {
-                // Skip this loop's step — bubble to outer loop.
-                return ExecOutcome::LoopContinue(n - 1);
-            }
-            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
-            ExecOutcome::Continue(c) => {
+            LoopStep::Next(c) => {
                 last = ExecOutcome::Continue(c);
             }
         }
@@ -2045,21 +2091,15 @@ fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell) ->
         }
 
         // 3e. Run the body; bubble flow with the v79 decrement-and-bubble pattern.
-        match execute_sequence_body(&clause.body, shell) {
-            ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
-            ExecOutcome::LoopBreak(1, st) => {
+        match loop_body_step(execute_sequence_body(&clause.body, shell)) {
+            LoopStep::Propagate(o) => return o,
+            LoopStep::Stop(st) => {
                 last = ExecOutcome::Continue(st);
                 break;
             }
-            ExecOutcome::LoopBreak(n, st) => return ExecOutcome::LoopBreak(n - 1, st),
-            ExecOutcome::LoopContinue(1) => {
-                last = ExecOutcome::Continue(0);
-                // fall through — re-prompt
+            LoopStep::Next(c) => {
+                last = ExecOutcome::Continue(c);
             }
-            ExecOutcome::LoopContinue(n) => return ExecOutcome::LoopContinue(n - 1),
-            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
-            ExecOutcome::Continue(c) => last = ExecOutcome::Continue(c),
         }
 
         // 3f. Suppress the menu next iteration unless the last REPLY was empty
@@ -2767,9 +2807,15 @@ fn is_negated_pipeline(cmd: &Command) -> bool {
 /// - `Pipeline`, `Simple`, `Arith`, `DoubleBracket` — these ARE the innermost
 ///   failing command.
 ///
-/// errexit is deliberately NOT gated on this: `set -e; { false; }` must still
-/// exit, exactly as it does today.
-fn body_already_fired_err(cmd: &Command) -> bool {
+/// ⚠️ errexit IS gated on this, and the comment that used to stand here — "errexit
+/// is deliberately NOT gated on this: `set -e; { false; }` must still exit" — was
+/// the bug (#676). It reasoned from an OUTCOME rather than a mechanism.
+/// `set -e; { false; }` does still exit, but through the inner `false`'s own
+/// adjudication, not the group's; the group's second look at the same status is
+/// what wrongly exited when the inner failure was EXEMPT, as in
+/// `{ false && true; }`. One adjudication per failure, at the site that produced
+/// it.
+fn status_produced_by_body(cmd: &Command) -> bool {
     // #481: look THROUGH a single-stage pipeline wrapper. An EVEN number of
     // `!` in front of a compound cancels to `negate: false`, which leaves the
     // compound wrapped in a `Pipeline` that `is_negated_pipeline` no longer
@@ -2791,6 +2837,13 @@ fn body_already_fired_err(cmd: &Command) -> bool {
             | Command::Select(_)
             | Command::If(_)
             | Command::While(_)
+            // #685: a redirected compound reports the INNER command's status
+            // whenever the inner RAN — `{ false; } > /dev/null` fired ERR twice,
+            // once inside the redirect at the `false` and once again at this
+            // wrapper after the redirect was torn down. When the REDIRECT is
+            // what failed the inner never ran, and `run_redirected` adjudicates
+            // that case itself through `finish_command_own`.
+            | Command::Redirected { .. }
     )
 }
 
