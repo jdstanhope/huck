@@ -3123,6 +3123,19 @@ impl Shell {
         );
     }
 
+    /// Is `return` legal here? bash allows it only inside a function or a
+    /// sourced script (#678); at the top level of an EXECUTED script it is an
+    /// error that does not stop the script.
+    ///
+    /// Read off the unified call stack rather than a counter, because that stack
+    /// already distinguishes the two legal cases from `Main` — the question this
+    /// asks is exactly what `FrameKind` records.
+    pub fn return_is_legal_here(&self) -> bool {
+        self.call_stack
+            .iter()
+            .any(|f| matches!(f.kind, FrameKind::Function | FrameKind::Source))
+    }
+
     /// Rebuild FUNCNAME/BASH_SOURCE/BASH_LINENO from `call_stack`.
     /// `FUNCNAME[0]` is the currently-executing function, `[1]` its caller, etc.
     /// When the stack is empty (top level) all three arrays are unset, matching bash.

@@ -390,6 +390,27 @@ fn builtin_return(args: &[String], err: &mut dyn Write, shell: &Shell) -> ExecOu
         },
         None => shell.last_status(),
     };
+    // #678: `return` outside a function and outside a sourced script is an
+    // ERROR that does not unwind — bash prints this, sets `$?` to 2, and runs
+    // the next command. huck returned `FunctionReturn`, which the top-level
+    // driver took as "stop", so everything after a stray `return` silently did
+    // not happen. Found by the runtime sweep: an initramfs script has such a
+    // `return` in a guard near the top, and huck ran one line of it.
+    //
+    // ⚠️ Checked LAST, and the position is measured rather than chosen. `return
+    // 1 2` reports "too many arguments" and nothing else; `return abc` reports
+    // BOTH "numeric argument required" AND this one, in that order, in every
+    // driver. (A first reading said bash printed only this one — that was a
+    // `tail -2` cutting the first line off the measurement, not bash.)
+    if !shell.return_is_legal_here() {
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "return: can only `return' from a function or sourced script"
+        );
+        return ExecOutcome::Continue(2);
+    }
     ExecOutcome::FunctionReturn(code)
 }
 
