@@ -2669,13 +2669,46 @@ fn builtin_declare_decl(
 
         // Snapshot for local-scope unwind BEFORE mutating. With -g, write to
         // the global map and drop any outer snapshot so it survives function exit.
+        //
+        // Without -g inside a function, `declare NAME` creates a function-local
+        // binding exactly as `local NAME` does — including bash's rule that the
+        // new local is FRESH (#694, the same defect #539 fixed for `local`):
+        // it starts from nothing, not from the variable it shadows. Clearing
+        // here is what makes `declare -i N=5; f(){ declare N=abc; }` leave a
+        // plain string instead of arith-evaluating `abc` to 0, and what makes
+        // `declare -a m` inside a function an EMPTY array rather than the outer
+        // associative's first element promoted to index 0.
+        //
+        // At top level there is no shadow — `x=hello; declare -a x` promotes
+        // the existing scalar to element 0 — so the clear is gated on actually
+        // being in a function.
+        let mut inherited_export = false;
         if global {
             if let Some(frame) = shell.local_scopes.last_mut() {
                 frame.remove(name);
             }
         } else {
+            let already_local = shell
+                .local_scopes
+                .last()
+                .map(|f| f.contains_key(name))
+                .unwrap_or(false);
             snapshot_for_local_scope(shell, name);
+            // A READONLY name is never cleared: `declare`'s readonly guards
+            // live further down this loop and read `shell.is_readonly(name)`,
+            // so unsetting first would make them see a fresh, writable
+            // variable and let `f(){ declare R=2; }` overwrite a readonly R
+            // inside the function. (`local` is not exposed to this — it checks
+            // readonly BEFORE it snapshots.) bash refuses the declaration
+            // outright, which is what the untouched guards below then do.
+            if !shell.local_scopes.is_empty() && !shell.is_readonly(name) {
+                inherited_export = clear_local_shadow(shell, name, already_local);
+            }
         }
+        // Export is the one attribute a fresh local inherits. Fold it into the
+        // per-name export decision so every `continue` arm below applies it
+        // through the site it already has; `+x` still wins.
+        let want_export = want_export || (inherited_export && !want_remove_export);
 
         // Integer-attribute changes on readonly variable are rejected.
         if (want_integer || want_remove_integer) && shell.is_readonly(name) {

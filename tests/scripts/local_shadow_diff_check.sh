@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Byte-identical bash<->huck harness for what a `local` SHADOW inherits (#539).
+# Byte-identical bash<->huck harness for what a function-local SHADOW inherits
+# (#539 for `local`, #694 for `declare`/`typeset`).
 #
 # bash's `local NAME` creates a FRESH variable: it carries only the attributes
 # its own flags ask for, plus the export attribute of the variable it shadows.
 # Nothing else crosses the boundary — not the outer value, not its shape
-# (indexed/associative/nameref), not `-i`/`-l`/`-u`.
+# (indexed/associative/nameref), not `-i`/`-l`/`-u`. `declare` without `-g`
+# inside a function creates the same kind of binding and follows the same rule;
+# `declare -g` writes the global and is not a shadow at all.
 #
 # NOT byte-compared here:
 #   - bare `local V` shadowing an EXPORTED outer variable: bash keeps the
@@ -70,5 +73,42 @@ check "restore: -i scalar"       'declare -i N=5; f(){ local N=abc; }; f; declar
 check "restore: indexed array"   'declare -a A=(1 2); f(){ local A=x; }; f; declare -p A'
 check "restore: assoc array"     'declare -A M=([k]=v); f(){ local M=x; }; f; declare -p M'
 check "restore: nameref"         'declare -n P=zz; f(){ local P=2; }; f; declare -p P'
+
+# --- `declare` inside a function is the same fresh shadow (#694) ---
+check "decl: -i dropped"        'declare -i N=5; f(){ declare N=abc; declare -p N; }; f'
+check "decl: -l dropped"        'declare -l L=AB; f(){ declare L=CD; declare -p L; }; f'
+check "decl: -n dropped"        'declare -n P=zz; f(){ declare P=2; declare -p P; }; f'
+check "decl: indexed->scalar"   'declare -a A=(1 2); f(){ declare A=x; declare -p A; }; f'
+check "decl: assoc->scalar"     'declare -A M=([k]=v); f(){ declare M=x; declare -p M; }; f'
+check "decl: assoc->indexed"    'declare -A M=([k]=v); f(){ declare M=([z]=9); declare -p M; }; f'
+check "decl: bare hides value"  'N=5; f(){ declare N; echo "[${N-UNSET}]"; }; f'
+check "decl: -a starts empty"   'declare -A m=([k]=v); f(){ declare -a m; echo "n=${#m[@]}"; m+=(z); echo "${m[*]}"; }; f'
+check "decl: -x kept"           'declare -x V=1; f(){ declare V=2; declare -p V; }; f'
+check "decl: -x in child env"   'declare -x V=1; f(){ declare V=2; env | grep "^V="; }; f'
+check "decl: +x cancels -x"     'declare -x V=1; f(){ declare +x V=2; declare -p V; }; f'
+check "decl: typeset too"       'declare -i N=5; f(){ typeset N=abc; declare -p N; }; f'
+check "decl: nested fresh"      'declare -a A=(1 2); g(){ declare A=inner; declare -p A; }; f(){ declare A=mid; g; }; f'
+check "decl: repeat keeps -i"   'f(){ declare -i x=1; declare x=2+3; declare -p x; }; f'
+check "decl: after local -i"    'f(){ local -i x=1; declare x=2+3; declare -p x; }; f'
+check "decl: restore on return" 'declare -i N=5; f(){ declare N=abc; }; f; declare -p N'
+
+# --- `declare -g` is NOT a shadow: it writes the global, attributes and all ---
+check "decl -g: keeps outer -i" 'declare -i N=5; f(){ declare -g N=abc; declare -p N; }; f'
+check "decl -g: persists out"   'declare -i N=5; f(){ declare -g N=7; }; f; declare -p N'
+
+# --- a READONLY name is refused, never cleared (the clear must not disarm
+#     `declare`'s own readonly guards) ---
+#
+# stderr is dropped on these three: both shells diagnose, but the `$0` PREFIX
+# of a builtin diagnostic diverges (`main:` vs `environment:`) as it does for
+# every builtin. What is compared is the status and the surviving value —
+# which is what a bypassed guard would change.
+check "decl -r: assign refused"  'readonly R=1; f(){ declare R=2 2>/dev/null; echo "rc=$?"; declare -p R; }; f'
+check "decl -r: -i refused"      'readonly R=1; f(){ declare -i R 2>/dev/null; echo "rc=$?"; declare -p R; }; f'
+check "local -r: assign refused" 'readonly R=1; f(){ local R=2 2>/dev/null; echo "rc=$?"; declare -p R; }; f'
+
+# --- top level is not a shadow either: `declare -a` promotes the scalar ---
+check "top: -a promotes scalar" 'x=hello; declare -a x; declare -p x'
+check "top: -i then plain"      'declare -i N=5; declare N=abc; declare -p N'
 
 harness_summary
