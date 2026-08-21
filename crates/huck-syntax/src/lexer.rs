@@ -4317,6 +4317,26 @@ impl<'a> Lexer<'a> {
         c.peek() == Some(&'\n')
     }
 
+    /// Offset to record as the opener of a quote span the arith scanner is about
+    /// to enter, or `None` when this scanner does not claim the span.
+    ///
+    /// For `$((` every escape is consumed by the scanner's `\` arm (#624), so a
+    /// quote that reaches the opener arms is LIVE and sits exactly at the
+    /// cursor. The odd-backslash-run heuristic must NOT be applied there: a
+    /// trailing `\` in the scanned text is now a LITERAL backslash produced by
+    /// `\\`, and treating it as an escape made `$((1+\\"` report the arith
+    /// delimiter where bash reports the quote.
+    ///
+    /// `$[` keeps its two-pass model, which deliberately leaves `\c` in the text
+    /// for pass 2 — there a trailing odd run really does mean this quote was
+    /// escaped, so the heuristic still applies.
+    fn live_quote_opener_off(&self, text: &str, delim: ArithDelim) -> Option<usize> {
+        match delim {
+            ArithDelim::Paren => Some(self.cursor.offset()),
+            ArithDelim::Bracket => self.span_opener_off(text),
+        }
+    }
+
     /// `Mode::Arith { paren_depth, in_squote, in_dquote, quote_open_off, body_started, for_header, delim }`
     /// scanner — v246.
     /// Emits `$((` (ArithOpen) on entry, then body atoms, then `))` (ArithClose).
@@ -4473,7 +4493,7 @@ impl<'a> Lexer<'a> {
                 // the quote char — bash quote-removal). `"` toggles the double-quote
                 // span (drop the quote char). Both are DROPPED, never pushed.
                 Some('\'') => {
-                    let qoff = self.span_opener_off(&text);
+                    let qoff = self.live_quote_opener_off(&text, delim);
                     self.cursor.next();
                     text.push('\'');
                     if !dquote {
@@ -4483,7 +4503,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some('"') => {
-                    let qoff = self.span_opener_off(&text);
+                    let qoff = self.live_quote_opener_off(&text, delim);
                     self.cursor.next();
                     dquote = !dquote;
                     quote_off = if dquote { qoff } else { None };
@@ -4780,7 +4800,7 @@ impl<'a> Lexer<'a> {
                     self.cursor.next(); // drop the `\`, leave the newline to be
                     // pushed as ordinary literal text by the catch-all arm
                 }
-                Some('\\') if !squote => {
+                Some('\\') => {
                     // #653: `\`+newline is a LINE CONTINUATION in every arithmetic
                     // context — measured on `$((`, `$[`, `((`, a `for` header and
                     // inside a double-quoted span. It precedes the escape tables
@@ -4797,21 +4817,61 @@ impl<'a> Lexer<'a> {
                     // which huck now reports too). The `\`+newline inside such a
                     // span is handled by the `squote` arm above: bash strips the
                     // backslash there but does NOT join the lines.
-                    let mut cont = self.cursor.clone();
-                    cont.next();
-                    let is_continuation = cont.peek() == Some(&'\n');
+                    let is_continuation = !squote && self.peek_is_backslash_newline();
                     if is_continuation {
                         self.cursor.next(); // `\`
                         self.cursor.next(); // the newline
-                    } else if dquote {
-                        // Double-quote `\`-escape table (matches arith_string_to_word):
-                        // `\` before `" \ $ ` `` drops the backslash and keeps the
-                        // metachar; otherwise the `\` is literal and the next char is
-                        // reprocessed normally.
+                    } else if !(matches!(delim, ArithDelim::Bracket) && !dquote && !squote) {
+                        // #624/#700: ONE escape table for the whole `$((…))` body,
+                        // whatever quote span it sits in. bash expands an arith body
+                        // under DOUBLE-QUOTE rules, so `\` before `" \ $ ` `` drops the
+                        // backslash and keeps the metachar as a plain character —
+                        // measured identically bare (`$((1+\"2\"))` → `1+"2"`), inside
+                        // `"…"` and inside `'…'` (`$(( '\\2' ))` → `'\2'`).
+                        //
+                        // Two consequences that were the actual bugs:
+                        //   - the kept `"` must NOT open a span. huck pushed the `\`
+                        //     verbatim and let the quote through as a span OPENER, so
+                        //     the text differed AND a later live quote toggled that
+                        //     span closed instead of opening its own.
+                        //   - a `\` before the arith DELIMITER protects it: bash's body
+                        //     for `$(( 1+\) ))` is `1+\)`, both characters kept and the
+                        //     `)` not counted. Everything else keeps the backslash and
+                        //     lets the main loop reprocess the next character, which is
+                        //     why `\a`, `\%`, `\'` all stay verbatim.
+                        //
+                        // `$[` (Bracket) outside a quote span keeps its own two-pass
+                        // model below; inside one it joins this table.
                         self.cursor.next(); // consume `\`
                         match self.cursor.peek().copied() {
                             Some(n @ ('"' | '\\' | '$' | '`')) => {
                                 self.cursor.next();
+                                text.push(n);
+                            }
+                            // A `'` and the arith DELIMITER keep BOTH characters but
+                            // are still CONSUMED here, so neither opens a span nor
+                            // counts as a delimiter. bash's two passes are why:
+                            // the scan that finds the closing `))` honours the
+                            // backslash (`$((1+\'` runs out on `)`, not on `'`),
+                            // while the expansion that builds the text uses the
+                            // double-quote table, where `\'` is not special — so the
+                            // body of `$(( 1+\'2\' ))` is `1+\'2\'`, backslashes and
+                            // all, with no quote span ever opened.
+                            //
+                            // INSIDE a single-quoted span the backslash is not an
+                            // escape at all, so the `'` still CLOSES the span:
+                            // `$(( '1\'2' ))` runs out looking for a quote in bash,
+                            // not for `)`. Hence the `!squote` guard on that cell —
+                            // the delimiter cells need no such guard, since a
+                            // delimiter inside a span is protected either way.
+                            Some('\'') if !squote => {
+                                self.cursor.next();
+                                text.push('\\');
+                                text.push('\'');
+                            }
+                            Some(n) if n == open_char || n == close_char => {
+                                self.cursor.next();
+                                text.push('\\');
                                 text.push(n);
                             }
                             _ => {
