@@ -135,9 +135,40 @@ fn tokenize_skips_whitespace() {
 }
 
 #[test]
-fn tokenize_unknown_char_is_parse_error() {
+fn tokenize_unknown_char_is_positional_bash_error() {
+    // #659: bash has no "unexpected character" message. An unusable character
+    // is reported as the parser error for the position it fell in, offset at
+    // the character itself so the error token runs to end of source.
+    // After a complete operand, an OPERATOR was due.
     let err = tokenize("1 @ 2").unwrap_err();
-    assert!(matches!(err.kind, ArithErrorKind::Parse(_)));
+    assert!(matches!(
+        err.kind,
+        ArithErrorKind::InvalidArithmeticOperator
+    ));
+    assert_eq!(err.offset, Some(2));
+    assert_eq!(err.token_end, None);
+    // Anywhere else, an OPERAND still was.
+    let err = tokenize("1 + @").unwrap_err();
+    assert!(matches!(err.kind, ArithErrorKind::OperandExpected));
+    assert_eq!(err.offset, Some(4));
+    // `++` completes an operand only when it follows one.
+    assert!(matches!(
+        tokenize("x++ @").unwrap_err().kind,
+        ArithErrorKind::InvalidArithmeticOperator
+    ));
+    assert!(matches!(
+        tokenize("++ @").unwrap_err().kind,
+        ArithErrorKind::OperandExpected
+    ));
+    // A closing `)` does not; a closing `]` does.
+    assert!(matches!(
+        tokenize("(1) @").unwrap_err().kind,
+        ArithErrorKind::OperandExpected
+    ));
+    assert!(matches!(
+        tokenize("a[0] @").unwrap_err().kind,
+        ArithErrorKind::InvalidArithmeticOperator
+    ));
 }
 
 #[test]

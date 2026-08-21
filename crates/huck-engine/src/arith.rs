@@ -495,11 +495,48 @@ pub(crate) fn tokenize(input: &str) -> Result<(Vec<ArithToken>, Vec<usize>), Ari
                 offsets.push(start);
                 out.push(ArithToken::Tilde);
             }
-            other => {
-                return Err(ArithError::parse(format!(
-                    "unexpected character: {:?}",
-                    other as char
-                )));
+            _ => {
+                // bash has no "unexpected character" message. It fails in the
+                // PARSER on the character it could not tokenize, and the error
+                // token is the whole REMAINDER of the expression from that
+                // character — which is what `ArithError::at` produces.
+                //
+                // WHICH message depends on where the character fell. After a
+                // complete operand an operator was due (`2 @ 3` →
+                // `invalid arithmetic operator`, token `@ 3`); anywhere else an
+                // operand was still due (`1 + @` → `operand expected`, token
+                // `@`; `1 + ~@` → token `@`, because `~` is not an operand).
+                //
+                // A closing `)` is deliberately NOT an operand here: bash's
+                // reader classifies by its last token, and a parenthesised
+                // group leaves `)` there rather than a value — `$(( (1) @ 2 ))`
+                // is `operand expected` where `$(( a[0] @ 2 ))` is `invalid
+                // arithmetic operator` (bash reads a subscripted name as ONE
+                // operand token, which `]` stands in for here).
+                //
+                // `++`/`--` count only as POSTfix — an operand is complete
+                // after `x++` but not after a bare `++`, and bash reports the
+                // two differently (`$(( x++ @ ))` invalid operator, `$(( ++ @ ))`
+                // operand expected). The tokenizer emits one token for either,
+                // so the token BEFORE it decides.
+                let completes_operand = |t: Option<&ArithToken>| {
+                    matches!(
+                        t,
+                        Some(ArithToken::Number(_) | ArithToken::Ident(_) | ArithToken::RBracket)
+                    )
+                };
+                let last = out.last();
+                let done = if matches!(last, Some(ArithToken::PlusPlus | ArithToken::MinusMinus)) {
+                    completes_operand(out.get(out.len().wrapping_sub(2)))
+                } else {
+                    completes_operand(last)
+                };
+                let kind = if done {
+                    ArithErrorKind::InvalidArithmeticOperator
+                } else {
+                    ArithErrorKind::OperandExpected
+                };
+                return Err(ArithError::at(kind, i));
             }
         }
     }
@@ -603,11 +640,12 @@ pub enum ArithErrorKind {
     ExpressionExpected,      // "expression expected"
     ColonExpected,           // "`:' expected for conditional expression"
     SyntaxErrorInExpression, // "syntax error in expression"
-    // Reserved bash-compat error kind: the "bad array subscript" string is
-    // wired into the Display impl but no code path constructs this variant yet.
-    // (Surfaced once `arith` became `pub(crate)` — `pub mod` had exempted it
-    // from dead-code analysis. Kept for the pending arith-subscript work.)
-    #[allow(dead_code)]
+    /// A character the tokenizer cannot use, sitting where an OPERATOR was
+    /// expected (`2 @ 3`). In operand position the same character is
+    /// `OperandExpected` instead — see the tokenizer's catch-all arm.
+    InvalidArithmeticOperator, // "syntax error: invalid arithmetic operator"
+    /// `name[` whose subscript never closes (`$((x[))`, `$((x[1))`). bash
+    /// names the error token from the IDENTIFIER, not the bracket.
     BadArraySubscript, // "bad array subscript"
     // Eval-time:
     DivisionByZero,
@@ -690,6 +728,7 @@ impl ArithError {
             ExpressionExpected => "expression expected".into(),
             ColonExpected => "`:' expected for conditional expression".into(),
             SyntaxErrorInExpression => "syntax error in expression".into(),
+            InvalidArithmeticOperator => "syntax error: invalid arithmetic operator".into(),
             BadArraySubscript => "bad array subscript".into(),
             DivisionByZero | ModuloByZero => "division by 0".into(),
             NotAnInteger { value, .. } => format!("{value}: syntax error: operand expected"),
@@ -964,19 +1003,19 @@ impl Parser {
     /// Parses `[subscript]` given the current token is `LBracket`. Returns
     /// the parsed subscript expression (for indexed arrays) and the raw
     /// inner source text (for associative-array keys).
-    fn parse_subscript(&mut self) -> Result<(ArithExpr, String), ArithError> {
+    /// `name_off` is the offset of the IDENTIFIER the subscript belongs to:
+    /// bash's `bad array subscript` names its error token from there, not from
+    /// the bracket (`$((1 + x[))` → token `x[`, `$((x[1))` → token `x[1`).
+    fn parse_subscript(&mut self, name_off: usize) -> Result<(ArithExpr, String), ArithError> {
+        let bad = || ArithError::at(ArithErrorKind::BadArraySubscript, name_off);
         let raw = match self.bump() {
             Some(ArithToken::LBracket(raw)) => raw,
-            other => return Err(ArithError::parse(format!("expected '[', got {other:?}"))),
+            _ => return Err(bad()),
         };
-        let subscript = self.parse_comma_expr()?;
+        let subscript = self.parse_comma_expr().map_err(|_| bad())?;
         match self.bump() {
             Some(ArithToken::RBracket) => {}
-            other => {
-                return Err(ArithError::parse(format!(
-                    "expected ']' after array subscript, got {other:?}"
-                )));
-            }
+            _ => return Err(bad()),
         }
         Ok((subscript, raw))
     }
@@ -985,9 +1024,12 @@ impl Parser {
         match self.bump() {
             Some(ArithToken::Number(n)) => Ok(ArithExpr::Num(n)),
             Some(ArithToken::Ident(s)) => {
-                // `name[subscript]` → array-element reference.
+                // `name[subscript]` → array-element reference. `bump()` above
+                // left `err_off` on the identifier, which is where bash names
+                // the error token for a subscript that never closes.
+                let name_off = self.err_off;
                 if matches!(self.peek(), Some(ArithToken::LBracket(_))) {
-                    let (subscript, subscript_raw) = self.parse_subscript()?;
+                    let (subscript, subscript_raw) = self.parse_subscript(name_off)?;
                     Ok(ArithExpr::Index {
                         name: s,
                         subscript: Box::new(subscript),

@@ -7,14 +7,13 @@
 # divergence, which is what these rows pin.
 #
 # COMPARED: stdout and the exit status, with stderr dropped. Both shells
-# diagnose every row below, and the diagnostic's leading `$0` and its message
-# TAIL still diverge — the tail is #659 (`syntax error: operand expected (error
-# token is "…")` vs huck's `unexpected character`), which is a separate issue.
-# What matters here is that huck no longer produces a VALUE.
+# diagnose every row below; the diagnostic's leading `$0` diverges as it does
+# for every builtin. What matters here is that huck no longer produces a VALUE.
 #
-# The `body:` rows compare the echoed expression body, which both shells print
-# between the `line N:` prefix and the message — that part does agree, and it is
-# what the `\`+newline handling inside a single-quoted span (also #660) changes.
+# The `body:` rows compare the whole diagnostic minus that `$0`/`line N:`
+# prefix — the echoed expression body AND the message tail, which agree since
+# #659. The line NUMBER is excluded: for a body spanning lines bash names the
+# line it ENDS on and huck the line it starts on (the #649/#644 family).
 #
 # NOT compared here:
 #   - `${arr[ '1' ]}`: an array SUBSCRIPT is not lexed in arithmetic mode, so it
@@ -38,8 +37,8 @@ check() {
 # Isolates the part of the diagnostic both shells agree on.
 checkbody() {
     local label="$1" frag="$2" b h
-    b=$(printf '%s\n' "$frag" | bash --norc --noprofile 2>&1 >/dev/null | sed 's/^.*line [0-9]*: //; s/: syntax error.*$//')
-    h=$(printf '%s\n' "$frag" | "$HUCK_BIN" 2>&1 >/dev/null | sed 's/^.*line [0-9]*: //; s/: unexpected character.*$//; s/: syntax error.*$//')
+    b=$(printf '%s\n' "$frag" | bash --norc --noprofile 2>&1 >/dev/null | sed 's/^.*line [0-9]*: //')
+    h=$(printf '%s\n' "$frag" | "$HUCK_BIN" 2>&1 >/dev/null | sed 's/^.*line [0-9]*: //')
     compare "$label" "$b" "$h"
 }
 
@@ -52,10 +51,10 @@ checkbody_file() {
     local label="$1" b h tmp
     tmp=$(mktemp)
     cat > "$tmp"
-    # `sed -z` so the substitutions span the whole capture: bash's error TOKEN
-    # repeats the multi-line body, so a per-line sed cannot cut the tail off.
-    b=$(bash --norc --noprofile "$tmp" 2>&1 >/dev/null | sed -z 's/^[^ ]*: line [0-9]*: //; s/ : syntax error.*$/ /')
-    h=$("$HUCK_BIN" "$tmp" 2>&1 >/dev/null | sed -z 's/^[^ ]*: line [0-9]*: //; s/ : unexpected character.*$/ /')
+    # `sed -z` so the prefix strip sees the whole capture as one record: the
+    # body (and bash's error token, which repeats it) spans lines.
+    b=$(bash --norc --noprofile "$tmp" 2>&1 >/dev/null | sed -z 's/^[^ ]*: line [0-9]*: //')
+    h=$("$HUCK_BIN" "$tmp" 2>&1 >/dev/null | sed -z 's/^[^ ]*: line [0-9]*: //')
     rm -f "$tmp"
     compare "$label" "$b" "$h"
 }
