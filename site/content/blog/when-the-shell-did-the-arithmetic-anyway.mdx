@@ -1,0 +1,109 @@
+---
+title: "When the shell did the arithmetic anyway"
+date: 2026-08-21
+summary: "Four fixes to huck's arithmetic. Quoting a value no longer stops it being evaluated, an unusable value in an integer variable is reported instead of silently becoming zero, and failed expressions now say which part failed."
+tags: ["bug-fix", "arithmetic", "bash-compat"]
+version: null
+draft: false
+---
+
+Shell arithmetic has a quiet rule: by the time an expression is evaluated, every
+`$` in it has already been substituted. So a `$` you still see in the expression
+is one you deliberately protected — with a backslash, or with quotes — and bash
+refuses to expand it a second time.
+
+huck expanded it anyway. The worst shape was a test:
+
+```bash
+# before
+$ x=5
+$ [[ '$x' -eq 5 ]]; echo "rc=$?"
+rc=0
+```
+
+```bash
+# after
+$ x=5
+$ [[ '$x' -eq 5 ]]; echo "rc=$?"
+huck: line 1: [[: $x: syntax error: operand expected (error token is "$x")
+rc=1
+```
+
+The quotes were there to compare the literal text `$x`. huck read the variable
+instead, so the test silently passed. The same happened inside an expression:
+
+```bash
+# before
+$ x=5; echo $(( 1 + "\$x" ))
+6
+```
+
+```bash
+# after
+$ x=5; echo $(( 1 + "\$x" ))
+huck: line 1: 1 + $x : syntax error: operand expected (error token is "$x ")
+```
+
+## Integer variables that swallowed their errors
+
+An integer-flagged variable evaluates whatever you assign to it. When that
+failed, huck said nothing and stored zero:
+
+```bash
+# before
+$ declare -i total=99
+$ total=$(echo 1.5)
+$ echo "total=$total"
+total=0
+```
+
+```bash
+# after
+$ declare -i total=99
+$ total=$(echo 1.5)
+huck: line 1: 1.5: syntax error: invalid arithmetic operator (error token is ".5")
+$ echo "total=$total"
+total=99
+```
+
+A script reading a number from somewhere could not tell a real zero from a value
+it failed to parse. The `+=` form had the same hole, in a different place:
+`declare -i n=5; n+=@` quietly left `n` at 5.
+
+## Saying which part failed
+
+When arithmetic did fail inside a test or a `for` loop header, huck named the
+problem but not the expression:
+
+```bash
+# before
+$ [[ @ -eq 5 ]]; echo "rc=$?"
+huck: line 1: [[: syntax error: operand expected
+rc=2
+```
+
+```bash
+# after
+$ [[ @ -eq 5 ]]; echo "rc=$?"
+huck: line 1: [[: @: syntax error: operand expected (error token is "@")
+rc=1
+```
+
+The exit status was wrong too — bash treats a broken comparison as a
+false-with-error (1), not a usage error (2).
+
+## Still open
+
+This pass filed eight neighbouring issues. The one most worth knowing about:
+a failed operand still abandons the whole test, where bash reports it and keeps
+going, so `[[ @ -eq 5 || 1 -eq 1 ]]` is true in bash and false in huck
+([#718](https://github.com/jdstanhope/huck/issues/718)).
+
+Also open: a quoted array subscript is still evaluated
+([#699](https://github.com/jdstanhope/huck/issues/699)), an unusable regex
+prints the underlying library's error where bash is silent
+([#716](https://github.com/jdstanhope/huck/issues/716)), an unterminated
+bracket in a pattern errors where bash treats it as a literal
+([#717](https://github.com/jdstanhope/huck/issues/717)), and a number with
+trailing junk gets the wrong message
+([#720](https://github.com/jdstanhope/huck/issues/720)).
