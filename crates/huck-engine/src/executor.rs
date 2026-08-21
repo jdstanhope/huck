@@ -2316,17 +2316,10 @@ fn run_double_bracket(
     // under `set -x`) and runs on the success, false, and error paths alike
     // (bash realizes AND closes/reaps for the `[[ ]]` command).
     let procsub_base = shell.procsub_pending.len();
-    let result = match eval_test_expr(expr, shell) {
-        Ok(true) => ExecOutcome::Continue(0),
-        Ok(false) => ExecOutcome::Continue(1),
-        Err(e) => {
-            {
-                let mut err = err_writer();
-                crate::sh_error_to!(shell, &mut *err, None, "[[: {}", e.msg);
-            }
-            ExecOutcome::Continue(e.status)
-        }
-    };
+    // Every failure has already reported itself at the operand that produced it
+    // (see `eval_test_leaf`), so there is nothing to unwrap here — the composed
+    // status is the command's status.
+    let result = ExecOutcome::Continue(eval_test_expr(expr, shell));
     drain_procsubs(shell, procsub_base);
     restore_inline_assignments(snap, shell);
     result
@@ -2464,7 +2457,36 @@ fn render_test_leaf(leaf: &TestLeaf) -> String {
 }
 
 /// Evaluate an already-expanded leaf. Nothing here expands again.
-fn eval_test_leaf(leaf: &TestLeaf, shell: &mut Shell) -> Result<bool, TestError> {
+/// `[[ … ]]` statuses. bash composes a FAILED operand as an ordinary non-zero
+/// result rather than abandoning the expression (#718), so a failure is a VALUE
+/// here, not a `?`-propagated error — `[[ ! @ -eq 5 ]]` is 0 and
+/// `[[ @ -eq 5 || 1 -eq 1 ]]` is 0. 0 is true, 1 is false (and an arithmetic
+/// failure), 2 is an unusable regex or pattern.
+const TEST_TRUE: i32 = 0;
+const TEST_FALSE: i32 = 1;
+
+fn test_status(b: bool) -> i32 {
+    if b { TEST_TRUE } else { TEST_FALSE }
+}
+
+/// Evaluate one leaf to its status, REPORTING a failure here rather than
+/// propagating it. Reporting at the leaf is what lets the combinators go on
+/// composing: the diagnostic is emitted exactly once, at the operand that
+/// produced it, even when the result is later inverted or discarded.
+fn eval_test_leaf(leaf: &TestLeaf, shell: &mut Shell) -> i32 {
+    match eval_test_leaf_inner(leaf, shell) {
+        Ok(b) => test_status(b),
+        Err(e) => {
+            {
+                let mut err = err_writer();
+                crate::sh_error_to!(shell, &mut *err, None, "[[: {}", e.msg);
+            }
+            e.status
+        }
+    }
+}
+
+fn eval_test_leaf_inner(leaf: &TestLeaf, shell: &mut Shell) -> Result<bool, TestError> {
     match leaf {
         TestLeaf::Unary { op, s } => {
             if matches!(op, TestUnaryOp::VarSet) {
@@ -2511,15 +2533,11 @@ fn eval_test_leaf(leaf: &TestLeaf, shell: &mut Shell) -> Result<bool, TestError>
     }
 }
 
-fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, TestError> {
+fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> i32 {
     eval_test_expr_traced(expr, shell, false)
 }
 
-fn eval_test_expr_traced(
-    expr: &TestExpr,
-    shell: &mut Shell,
-    suppress: bool,
-) -> Result<bool, TestError> {
+fn eval_test_expr_traced(expr: &TestExpr, shell: &mut Shell, suppress: bool) -> i32 {
     // #220: expand the leaf's operands ONCE, then drive BOTH the `set -x` line
     // and the evaluation from that. Expanding separately for each ran a
     // `<(cmd)` / `$(cmd)` operand twice — under `set -x` only, so the inner
@@ -2546,20 +2564,28 @@ fn eval_test_expr_traced(
                         &format!("{p4}[[ ! {} ]]", render_test_leaf(&leaf)),
                     );
                 }
-                return eval_test_leaf(&leaf, shell).map(|b| !b);
+                // `!` inverts the STATUS, so it turns a failed operand's 1 or 2
+                // into 0 — `[[ ! a =~ [ ]]` is 0 in bash even though the regex
+                // was unusable.
+                return test_status(eval_test_leaf(&leaf, shell) != TEST_TRUE);
             }
-            eval_test_expr_traced(inner, shell, suppress).map(|b| !b)
+            test_status(eval_test_expr_traced(inner, shell, suppress) != TEST_TRUE)
         }
         TestExpr::And(a, b) => {
-            if eval_test_expr_traced(a, shell, false)? {
+            // A non-true left operand — false OR failed — short-circuits and is
+            // the result, so `[[ a =~ [ && 1 -eq 1 ]]` keeps the regex's 2.
+            let left = eval_test_expr_traced(a, shell, false);
+            if left == TEST_TRUE {
                 eval_test_expr_traced(b, shell, false)
             } else {
-                Ok(false)
+                left
             }
         }
         TestExpr::Or(a, b) => {
-            if eval_test_expr_traced(a, shell, false)? {
-                Ok(true)
+            // A failed left operand is just "not true", so the right one is
+            // still evaluated: `[[ @ -eq 5 || 1 -eq 1 ]]` is 0.
+            if eval_test_expr_traced(a, shell, false) == TEST_TRUE {
+                TEST_TRUE
             } else {
                 eval_test_expr_traced(b, shell, false)
             }

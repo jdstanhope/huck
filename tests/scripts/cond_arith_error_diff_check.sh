@@ -24,13 +24,17 @@
 #   - `[[ a == [ ]]`: bash treats an unterminated bracket as a literal that
 #     simply does not match (exit 1, no message); huck reports `bad pattern` and
 #     exits 2 (#717).
-#   - a failed operand COMPOSED with `!`/`&&`/`||`: bash reports, treats the
-#     operand as a non-zero value and carries on composing, so `[[ ! @ -eq 5 ]]`
-#     is 0 and `[[ @ -eq 5 || 1 -eq 1 ]]` is 0. huck abandons the whole
-#     evaluation at the first failure (#718). The rows below therefore keep each
-#     failing operand as the WHOLE expression.
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
+
+# Status and stdout only — for rows whose only difference is the regex MESSAGE
+# huck prints and bash does not (#716). The composed STATUS is what these pin.
+check_rc() {
+    local label="$1" frag="$2" b h
+    b=$(bash --norc --noprofile -c "$frag" sh 2>/dev/null; echo "EXIT:$?")
+    h=$("$HUCK_BIN" -c "$frag" sh 2>/dev/null; echo "EXIT:$?")
+    compare "$label" "$b" "$h"
+}
 
 check() {
     local label="$1" frag="$2" b h
@@ -52,6 +56,22 @@ check '[[: -lt operator'       '[[ @ -lt 5 ]]; echo "rc=$?"'
 check '[[: -ge operator'       '[[ @ -ge 5 ]]; echo "rc=$?"'
 check '[[: rhs of an &&'       '[[ 1 -eq 1 && @ -eq 5 ]]; echo "rc=$?"'
 check '[[: rhs of an ||'       '[[ 1 -eq 2 || @ -eq 5 ]]; echo "rc=$?"'
+
+# --- a failed operand is a VALUE, so composition carries on (#718): `!` inverts
+#     its non-zero, `||` still evaluates the right operand, `&&` short-circuits
+#     and keeps it. The diagnostic is emitted once, at the operand, even when the
+#     result is later inverted or discarded. ---
+check 'compose: ! a failure'   '[[ ! @ -eq 5 ]]; echo "rc=$?"'
+check 'compose: ! ! a failure' '[[ ! ! @ -eq 5 ]]; echo "rc=$?"'
+check_rc 'compose: ! bad regex' '[[ ! a =~ [ ]]; echo "rc=$?"'
+check 'compose: || rhs true'   '[[ @ -eq 5 || 1 -eq 1 ]]; echo "rc=$?"'
+check 'compose: || rhs false'  '[[ @ -eq 5 || 1 -eq 2 ]]; echo "rc=$?"'
+check_rc 'compose: || bad regex' '[[ a =~ [ || 1 -eq 1 ]]; echo "rc=$?"'
+check_rc 'compose: && keeps 2'   '[[ a =~ [ && 1 -eq 1 ]]; echo "rc=$?"'
+check 'compose: && lhs failed' '[[ @ -eq 5 && 1 -eq 1 ]]; echo "rc=$?"'
+check 'compose: parenthesised' '[[ ( @ -eq 5 ) || 1 -eq 1 ]]; echo "rc=$?"'
+check 'compose: not evaluated' '[[ 1 -eq 1 || a =~ [ ]]; echo "rc=$?"'
+check 'compose: reported once' '[[ ! @ -eq 5 ]] 2>&1 | wc -l'
 
 # --- a `for (( … ))` header, in each of its three sections ---
 check 'for: bad init'          'for (( i=@; i<1; i++ )); do :; done; echo "rc=$?"'
