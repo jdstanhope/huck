@@ -1,0 +1,117 @@
+---
+title: "A local that wasn't a new variable"
+date: 2026-08-21
+summary: "huck's `local` and `declare` wrote onto the variable they were supposed to shadow, so a function-local could inherit an outer variable's type and even its contents. Plus two arithmetic fixes: quoted operands no longer quietly evaluate."
+tags: ["bug-fix", "variables", "arithmetic", "bash-compat"]
+version: null
+draft: false
+---
+
+`local` is supposed to give a function its own variable. In huck it gave you the
+outer one with a fresh value written into it — and everything else about that
+variable came along.
+
+The clearest way this bit you was `declare -i`. Mark a global as an integer, then
+shadow it in a function:
+
+```bash
+# before
+$ huck -c 'declare -i count=5; tally(){ local count=abc; echo "$count"; }; tally'
+0
+```
+
+```bash
+# after
+$ huck -c 'declare -i count=5; tally(){ local count=abc; echo "$count"; }; tally'
+abc
+```
+
+The local inherited the integer attribute, so `abc` was evaluated as arithmetic
+and became `0`. Not a cosmetic difference — a wrong value, silently.
+
+Arrays were worse, because the outer contents survived too:
+
+```bash
+# before
+$ huck -c 'declare -a paths=(/usr /bin); f(){ local paths=x; echo "${paths[@]}"; }; f'
+x /bin
+```
+
+```bash
+# after
+$ huck -c 'declare -a paths=(/usr /bin); f(){ local paths=x; echo "${paths[@]}"; }; f'
+x
+```
+
+`declare` inside a function had the same root, and there it also failed to hide
+the outer value at all:
+
+```bash
+# before
+$ huck -c 'limit=10; check(){ declare limit; echo "[${limit-unset}]"; }; check'
+[10]
+```
+
+```bash
+# after
+$ huck -c 'limit=10; check(){ declare limit; echo "[${limit-unset}]"; }; check'
+[unset]
+```
+
+Only one attribute genuinely crosses into a local, and that is `export` — which
+also means `local +x` now does something, instead of being a documented no-op.
+
+## Arithmetic that answered when it should have refused
+
+Two more from the same pass. A quoted operand inside `$(( ))` is a syntax error
+in bash; huck stripped the quotes and computed a number:
+
+```bash
+# before
+$ huck -c "echo \$(( '5' + 1 ))"
+6
+```
+
+```bash
+# after
+$ huck -c "echo \$(( '5' + 1 ))"
+huck: line 1: '5' + 1 : syntax error: operand expected (error token is "'5' + 1 ")
+```
+
+`$(( 'x' ))` was the alarming case: a quoted string was silently reading the
+variable `x`.
+
+And when arithmetic did fail, huck described it in its own words with an empty
+error token. It now says what bash says, including the dedicated message for an
+unfinished subscript:
+
+```bash
+# before
+$ huck -c 'echo $((x[))'
+huck: line 1: x[: syntax error: operand expected (error token is "[")
+```
+
+```bash
+# after
+$ huck -c 'echo $((x[))'
+huck: line 1: x[: bad array subscript (error token is "x[")
+```
+
+## Still open
+
+Fixing these turned up seven neighbours, filed rather than folded in. Three are
+one coherent piece of work — the rules for converting a variable between a
+scalar, an indexed array and an associative one, which four declaration builtins
+each implement separately and get wrong in both directions
+([#347](https://github.com/jdstanhope/huck/issues/347),
+[#697](https://github.com/jdstanhope/huck/issues/697),
+[#698](https://github.com/jdstanhope/huck/issues/698)).
+
+The rest: a quoted array subscript still evaluates where bash refuses
+([#699](https://github.com/jdstanhope/huck/issues/699)), reading a script from a
+pipe joins a trailing backslash to the next line before the parser sees it, where
+running the same file does not
+([#701](https://github.com/jdstanhope/huck/issues/701)), and two small
+arithmetic-diagnostic corners
+([#703](https://github.com/jdstanhope/huck/issues/703),
+[#704](https://github.com/jdstanhope/huck/issues/704)).
