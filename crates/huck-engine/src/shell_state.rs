@@ -110,6 +110,11 @@ pub enum AssignErr {
     /// must check variants before calling and surface a user-facing
     /// diagnostic.
     TypeMismatch,
+    /// The value written to an integer-flagged variable is not valid
+    /// arithmetic (#712). `eval_integer_coerce` has ALREADY emitted the
+    /// diagnostic and raised the expansion fatality; the caller's only job is
+    /// to skip the store so the variable keeps its previous value.
+    Arith,
 }
 
 /// Where an assigned value lands. Subscripts are ALREADY resolved by the
@@ -2542,7 +2547,7 @@ impl Shell {
                 } else {
                     v
                 };
-                let stored = self.value_with_scalar_attrs(&name, v);
+                let stored = self.value_with_scalar_attrs(&name, v)?;
                 self.store_scalar(&name, stored);
                 Ok(())
             }
@@ -2567,7 +2572,7 @@ impl Shell {
                         // would otherwise be an arith parse error → 0, losing base.
                         let base = if existing.is_empty() { "0" } else { &existing };
                         let rhs = if v.is_empty() { "0" } else { &v };
-                        eval_integer_coerce(self, &format!("({base})+({rhs})"))
+                        eval_integer_coerce(self, &format!("({base})+({rhs})"))?
                     } else {
                         existing + &v
                     }
@@ -2580,7 +2585,7 @@ impl Shell {
                 // (For the integer-append branch above, `v` is already the
                 // numeric sum, so this re-coerce is a harmless no-op.)
                 let v = if self.is_integer(&n) {
-                    eval_integer_coerce(self, &v)
+                    eval_integer_coerce(self, &v)?
                 } else {
                     v
                 };
@@ -2608,7 +2613,7 @@ impl Shell {
                         // `base + 0 == base` — see the indexed arm for why.
                         let base = if existing.is_empty() { "0" } else { &existing };
                         let rhs = if v.is_empty() { "0" } else { &v };
-                        eval_integer_coerce(self, &format!("({base})+({rhs})"))
+                        eval_integer_coerce(self, &format!("({base})+({rhs})"))?
                     } else {
                         existing + &v
                     }
@@ -2617,7 +2622,7 @@ impl Shell {
                 };
                 // Integer associative arrays coerce the VALUE (never the key).
                 let v = if self.is_integer(&n) {
-                    eval_integer_coerce(self, &v)
+                    eval_integer_coerce(self, &v)?
                 } else {
                     v
                 };
@@ -2633,7 +2638,7 @@ impl Shell {
                     // eval_integer_coerce needs &mut self: build sequentially.
                     let mut out = BTreeMap::new();
                     for (k, v) in m {
-                        out.insert(k, apply_case_fold(fold, eval_integer_coerce(self, &v)));
+                        out.insert(k, apply_case_fold(fold, eval_integer_coerce(self, &v)?));
                     }
                     out
                 } else {
@@ -2653,7 +2658,7 @@ impl Shell {
                 let p: Vec<(String, String)> = if is_int {
                     let mut out = Vec::with_capacity(p.len());
                     for (k, v) in p {
-                        out.push((k, apply_case_fold(fold, eval_integer_coerce(self, &v))));
+                        out.push((k, apply_case_fold(fold, eval_integer_coerce(self, &v)?)));
                     }
                     out
                 } else {
@@ -2675,7 +2680,7 @@ impl Shell {
 
     /// Applies the SCALAR attribute chain (integer-coerce only on an existing
     /// integer-flagged Scalar, then case-fold) to a whole-variable value.
-    fn value_with_scalar_attrs(&mut self, name: &str, value: String) -> String {
+    fn value_with_scalar_attrs(&mut self, name: &str, value: String) -> Result<String, AssignErr> {
         // Coerce whenever the target is integer-flagged, regardless of its
         // current shape. For an integer SCALAR this is unchanged. For an
         // integer INDEXED array, `a=v` funnels here (Whole + Scalar arm →
@@ -2685,11 +2690,11 @@ impl Shell {
         // the value first is harmless.
         let do_integer_coerce = self.is_integer(name);
         let coerced = if do_integer_coerce {
-            eval_integer_coerce(self, &value)
+            eval_integer_coerce(self, &value)?
         } else {
             value
         };
-        apply_case_fold(self.case_fold_of(name), coerced)
+        Ok(apply_case_fold(self.case_fold_of(name), coerced))
     }
 
     /// Checked write: refuses to overwrite a readonly variable. Returns
@@ -3705,17 +3710,48 @@ impl Shell {
 }
 
 /// Evaluate `value` as a bash arithmetic expression and return the
-/// decimal-string result, or `"0"` on parse/eval failure (bash's
-/// silent-coerce-to-zero semantics for integer-flagged variable
-/// writes). Module-scope so `Shell::try_set` can call it while
-/// holding `&mut Shell` (the function takes `&mut Shell` itself).
-fn eval_integer_coerce(shell: &mut Shell, value: &str) -> String {
-    match crate::arith::parse(value) {
-        Ok(expr) => match crate::arith::eval(&expr, shell) {
-            Ok(n) => n.to_string(),
-            Err(_) => "0".to_string(),
-        },
-        Err(_) => "0".to_string(),
+/// decimal-string result.
+///
+/// A failure is NOT silently zero (#712). The doc here used to claim "bash's
+/// silent-coerce-to-zero semantics", which is not what bash does: it reports
+/// the arithmetic error, leaves the variable ALONE, and raises the ordinary
+/// arithmetic-expansion failure — so `declare -i v=5; v=@` keeps v at 5 and
+/// discards the rest of the command list, exactly like a failing `$(( ))`.
+/// Answering 0 meant `declare -i total; total=$(compute)` could not tell a
+/// genuine zero from a parse failure.
+///
+/// The diagnostic and the fatality are raised here rather than by the caller
+/// because only this function holds the expression source needed to render
+/// bash's `<expr>: <message> (error token is "…")` body. Callers turn the
+/// `Err` into a skipped store; they must NOT report again.
+///
+/// Module-scope so `Shell::try_set` can call it while holding `&mut Shell`
+/// (the function takes `&mut Shell` itself).
+fn eval_integer_coerce(shell: &mut Shell, value: &str) -> Result<String, AssignErr> {
+    // An EMPTY (or blank) value is 0, not an error: `declare -i v=5; v=` gives
+    // `v="0"` in bash, as does `v="$unset"`. That is the one case the old
+    // unconditional `unwrap_or(0)` got right, so it has to stay explicit.
+    if value.trim().is_empty() {
+        return Ok("0".to_string());
+    }
+    let res = crate::arith::parse(value).and_then(|expr| crate::arith::eval(&expr, shell));
+    match res {
+        Ok(n) => Ok(n.to_string()),
+        Err(e) => {
+            // A nested `$(( ))` inside the value already reported its own
+            // failure; saying anything more would double-report (mirrors
+            // `eval_subscript`).
+            if crate::arith::should_wrap_expansion_error(&e) {
+                crate::sh_error!(
+                    shell,
+                    None,
+                    "{}",
+                    crate::arith::render_error_body(value, &e)
+                );
+            }
+            shell.report_error(crate::error_fatality::ErrorKind::Expansion);
+            Err(AssignErr::Arith)
+        }
     }
 }
 

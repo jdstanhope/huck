@@ -2647,6 +2647,42 @@ fn eval_unary(op: TestUnaryOp, s: &str) -> bool {
 /// Arithmetic-evaluate a `[[ ]]` integer-comparison operand string. An empty
 /// operand is 0 (bash). Errors render the same as the arith evaluator does
 /// elsewhere (the caller wraps the `Err(String)` into a `[[`-prefixed message).
+/// Arith-evaluate one operand of an INTEGER `+=`, reporting bash's diagnostic
+/// and raising the ordinary arithmetic-expansion fatality when it fails (#712).
+///
+/// These sites used `arith_eval_operand(..).unwrap_or(0)`, which turned a parse
+/// failure into a silent zero: `declare -i v=5; v+=@` quietly kept 5 and
+/// carried on where bash reports `@: syntax error: operand expected` and
+/// discards the rest of the command. Emits to the writer the caller holds, not
+/// the thread-local sink, so the message still lands inside `$(… 2>&1)`.
+fn integer_append_operand(
+    s: &str,
+    shell: &mut Shell,
+    err: &mut dyn std::io::Write,
+) -> Result<i64, ()> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(0);
+    }
+    match crate::arith::parse(t).and_then(|e| crate::arith::eval(&e, shell)) {
+        Ok(n) => Ok(n),
+        Err(e) => {
+            // A nested `$(( ))` already reported its own failure.
+            if crate::arith::should_wrap_expansion_error(&e) {
+                crate::sh_error_to!(
+                    shell,
+                    err,
+                    None,
+                    "{}",
+                    crate::arith::render_error_body(t, &e)
+                );
+            }
+            shell.report_error(crate::error_fatality::ErrorKind::Expansion);
+            Err(())
+        }
+    }
+}
+
 fn arith_eval_operand(s: &str, shell: &mut Shell) -> Result<i64, String> {
     let t = s.trim();
     if t.is_empty() {
@@ -8194,8 +8230,8 @@ pub(crate) fn apply_one_assignment(
                             shell.is_integer(name)
                         };
                         if target_is_integer {
-                            let cur = arith_eval_operand(&existing, shell).unwrap_or(0);
-                            let add = arith_eval_operand(&s, shell).unwrap_or(0);
+                            let cur = integer_append_operand(&existing, shell, err)?;
+                            let add = integer_append_operand(&s, shell, err)?;
                             shell.try_set(name, (cur + add).to_string()).map_err(|_| ())
                         } else {
                             shell.try_set(name, existing + &s).map_err(|_| ())
@@ -8234,8 +8270,8 @@ pub(crate) fn apply_one_assignment(
                 // the scalar case (bash: `declare -ai a=(5); a[0]+=3` -> 8).
                 if shell.is_integer(name) {
                     let existing = shell.lookup_indexed_element(name, idx).unwrap_or_default();
-                    let cur = arith_eval_operand(&existing, shell).unwrap_or(0);
-                    let add = arith_eval_operand(&v, shell).unwrap_or(0);
+                    let cur = integer_append_operand(&existing, shell, err)?;
+                    let add = integer_append_operand(&v, shell, err)?;
                     shell
                         .set_indexed_element(name, idx, (cur + add).to_string())
                         .map_err(|_| ())
@@ -8372,8 +8408,8 @@ fn expand_array_elements(
                         })
                         .unwrap_or_default();
                     if shell.is_integer(name) {
-                        let cur = arith_eval_operand(&base, shell).unwrap_or(0);
-                        let addv = arith_eval_operand(&add, shell).unwrap_or(0);
+                        let cur = integer_append_operand(&base, shell, err)?;
+                        let addv = integer_append_operand(&add, shell, err)?;
                         (cur + addv).to_string()
                     } else {
                         base + &add
