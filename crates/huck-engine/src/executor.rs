@@ -1832,12 +1832,13 @@ fn run_arith_for_inner(clause: &crate::command::ArithForClause, shell: &mut Shel
     }
     if run_init
         && let Some(init) = &clause.init
-        && let Err(e) = crate::expand::eval_arith_word(init, shell)
+        && let (src, Err(e)) = crate::expand::eval_arith_word_src(init, shell)
     {
-        {
-            let mut err = err_writer();
-            crate::sh_error_to!(shell, &mut *err, None, "((: {e}");
-        }
+        // #711: render bash's body — the echoed SECTION plus the error token
+        // (`((: i=@: syntax error: operand expected (error token is "@")`).
+        // `eval_arith_word` discards the source, so the `{e}` Display impl used
+        // here printed the bare message with neither.
+        emit_for_header_arith_error(&src, &e, shell);
         return ExecOutcome::Continue(1);
     }
 
@@ -1871,13 +1872,10 @@ fn run_arith_for_inner(clause: &crate::command::ArithForClause, shell: &mut Shel
         // 2. Eval cond. Empty cond = always true (matches bash).
         let cond_value = match &clause.cond {
             None => 1,
-            Some(c) => match crate::expand::eval_arith_word(c, shell) {
-                Ok(v) => v,
-                Err(e) => {
-                    {
-                        let mut err = err_writer();
-                        crate::sh_error_to!(shell, &mut *err, None, "((: {e}");
-                    }
+            Some(c) => match crate::expand::eval_arith_word_src(c, shell) {
+                (_, Ok(v)) => v,
+                (src, Err(e)) => {
+                    emit_for_header_arith_error(&src, &e, shell);
                     return ExecOutcome::Continue(1);
                 }
             },
@@ -1925,12 +1923,9 @@ fn run_arith_for_inner(clause: &crate::command::ArithForClause, shell: &mut Shel
         }
         if run_step
             && let Some(step) = &clause.step
-            && let Err(e) = crate::expand::eval_arith_word(step, shell)
+            && let (src, Err(e)) = crate::expand::eval_arith_word_src(step, shell)
         {
-            {
-                let mut err = err_writer();
-                crate::sh_error_to!(shell, &mut *err, None, "((: {e}");
-            }
+            emit_for_header_arith_error(&src, &e, shell);
             return ExecOutcome::Continue(1);
         }
     }
@@ -2324,12 +2319,12 @@ fn run_double_bracket(
     let result = match eval_test_expr(expr, shell) {
         Ok(true) => ExecOutcome::Continue(0),
         Ok(false) => ExecOutcome::Continue(1),
-        Err(msg) => {
+        Err(e) => {
             {
                 let mut err = err_writer();
-                crate::sh_error_to!(shell, &mut *err, None, "[[: {msg}");
+                crate::sh_error_to!(shell, &mut *err, None, "[[: {}", e.msg);
             }
-            ExecOutcome::Continue(2)
+            ExecOutcome::Continue(e.status)
         }
     };
     drain_procsubs(shell, procsub_base);
@@ -2469,7 +2464,7 @@ fn render_test_leaf(leaf: &TestLeaf) -> String {
 }
 
 /// Evaluate an already-expanded leaf. Nothing here expands again.
-fn eval_test_leaf(leaf: &TestLeaf, shell: &mut Shell) -> Result<bool, String> {
+fn eval_test_leaf(leaf: &TestLeaf, shell: &mut Shell) -> Result<bool, TestError> {
     match leaf {
         TestLeaf::Unary { op, s } => {
             if matches!(op, TestUnaryOp::VarSet) {
@@ -2516,7 +2511,7 @@ fn eval_test_leaf(leaf: &TestLeaf, shell: &mut Shell) -> Result<bool, String> {
     }
 }
 
-fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
+fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, TestError> {
     eval_test_expr_traced(expr, shell, false)
 }
 
@@ -2524,7 +2519,7 @@ fn eval_test_expr_traced(
     expr: &TestExpr,
     shell: &mut Shell,
     suppress: bool,
-) -> Result<bool, String> {
+) -> Result<bool, TestError> {
     // #220: expand the leaf's operands ONCE, then drive BOTH the `set -x` line
     // and the evaluation from that. Expanding separately for each ran a
     // `<(cmd)` / `$(cmd)` operand twice — under `set -x` only, so the inner
@@ -2683,21 +2678,64 @@ fn integer_append_operand(
     }
 }
 
-fn arith_eval_operand(s: &str, shell: &mut Shell) -> Result<i64, String> {
+/// Emit a `for (( … ))` header's arithmetic failure the way bash does (#711):
+/// `((: <section>: <message> (error token is "…")`, where `<section>` is the
+/// init/cond/step expression that failed. A nested `$(( ))` inside the section
+/// has already reported its own failure, so it is not wrapped again.
+fn emit_for_header_arith_error(src: &str, e: &crate::arith::ArithError, shell: &mut Shell) {
+    if !crate::arith::should_wrap_expansion_error(e) {
+        return;
+    }
+    let body = crate::arith::render_error_body(src, e);
+    let mut err = err_writer();
+    crate::sh_error_to!(shell, &mut *err, None, "((: {body}");
+}
+
+/// Why a `[[ … ]]` evaluation failed, and with what status.
+///
+/// bash does not use one status for every `[[ ]]` failure (#711): an
+/// ARITHMETIC failure is a false-with-error and exits 1, while a bad regex is a
+/// usage error and exits 2. huck reported 2 for both because this channel
+/// carried only a message. `From<String>` keeps the non-arithmetic sites
+/// unchanged — they build a `String` and `?` lifts it at status 2.
+pub(crate) struct TestError {
+    msg: String,
+    status: i32,
+}
+
+impl From<String> for TestError {
+    fn from(msg: String) -> Self {
+        TestError { msg, status: 2 }
+    }
+}
+
+fn arith_eval_operand(s: &str, shell: &mut Shell) -> Result<i64, TestError> {
     let t = s.trim();
     if t.is_empty() {
         return Ok(0);
     }
     crate::arith::parse(t)
         .and_then(|e| crate::arith::eval(&e, shell))
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| TestError {
+            // bash's own rendering — `<expr>: <message> (error token is "…")` —
+            // not the legacy `Display` impl, which dropped the echoed
+            // expression and the token entirely and said "division by zero"
+            // where bash says "division by 0".
+            msg: crate::arith::render_error_body(t, &e),
+            status: 1,
+        })
 }
 
 /// `rhs` arrives ALREADY EXPANDED, in the form this operator needs
 /// (`expand_test_rhs`) — a pattern for `==`/`!=`, a plain word otherwise. It
 /// used to expand the RHS word itself, which is half of why a `$(cmd)` operand
 /// ran twice under `set -x` (#220).
-fn eval_binary(op: TestBinaryOp, lhs: &str, rhs: &str, shell: &mut Shell) -> Result<bool, String> {
+fn eval_binary(
+    op: TestBinaryOp,
+    lhs: &str,
+    rhs: &str,
+    shell: &mut Shell,
+) -> Result<bool, TestError> {
     match op {
         TestBinaryOp::StringEq | TestBinaryOp::StringNe => {
             let pattern_str = rhs.to_string();
