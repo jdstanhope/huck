@@ -123,15 +123,6 @@ pub(crate) fn eval_arith_word_src(
     (s, res)
 }
 
-/// Back-compat thin wrapper for callers that only need the value
-/// (arith-`for`, `${a[i]}` coercion, etc.).
-pub(crate) fn eval_arith_word(
-    body: &Word,
-    shell: &mut Shell,
-) -> Result<i64, crate::arith::ArithError> {
-    eval_arith_word_src(body, shell).1
-}
-
 /// Why an array subscript could not be turned into an index (#572).
 ///
 /// The two are reported differently by bash, so they cannot share a message:
