@@ -80,8 +80,19 @@ fn tokenize_identifier() {
 }
 
 #[test]
-fn tokenize_identifier_with_dollar_prefix_strips_dollar() {
-    let (toks, _) = tokenize("$foo").unwrap();
+fn tokenize_dollar_prefix_is_an_error() {
+    // #707: there is no `$` in bash's arithmetic grammar. Every caller expands
+    // `$`-forms BEFORE parsing, so a surviving `$` is one the user escaped or
+    // quoted, and reading the variable here would undo that escape.
+    let err = tokenize("$foo").unwrap_err();
+    assert!(matches!(err.kind, ArithErrorKind::OperandExpected));
+    assert_eq!(err.offset, Some(0));
+    // Mid-expression it is an operand position too, offset at the `$`.
+    let err = tokenize("1 + $foo").unwrap_err();
+    assert!(matches!(err.kind, ArithErrorKind::OperandExpected));
+    assert_eq!(err.offset, Some(4));
+    // The bare name still tokenizes as an identifier.
+    let (toks, _) = tokenize("foo").unwrap();
     assert_eq!(toks, vec![ArithToken::Ident("foo".to_string())]);
 }
 
@@ -469,8 +480,11 @@ fn parse_missing_rhs_is_error() {
 }
 
 #[test]
-fn parse_strips_dollar_on_var() {
-    assert_eq!(parse("$x + 1").unwrap(), ArithExpr::Add(v("x"), n(1)));
+fn parse_rejects_dollar_on_var() {
+    // #707: `$x` never reaches the parser in a real arithmetic context — the
+    // expander resolved it — so a `$` here is an escaped one and is refused.
+    assert!(parse("$x + 1").is_err());
+    assert_eq!(parse("x + 1").unwrap(), ArithExpr::Add(v("x"), n(1)));
 }
 
 #[test]
@@ -803,10 +817,13 @@ fn eval_set_var_lookup() {
 }
 
 #[test]
-fn eval_var_with_dollar_prefix_same_as_bare() {
+fn eval_var_with_dollar_prefix_is_refused() {
+    // #707: reading the variable here would make an ESCAPED `$` expand anyway.
+    // The bare name is the form that reaches this layer.
     let mut s = Shell::new();
     s.export_set("HUCK_TEST_ARITH_Y", "7".to_string());
-    assert_eq!(eval_str("$HUCK_TEST_ARITH_Y + 1", &mut s).unwrap(), 8);
+    assert!(parse("$HUCK_TEST_ARITH_Y + 1").is_err());
+    assert_eq!(eval_str("HUCK_TEST_ARITH_Y + 1", &mut s).unwrap(), 8);
 }
 
 #[test]

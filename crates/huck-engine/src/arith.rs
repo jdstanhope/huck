@@ -220,21 +220,14 @@ pub(crate) fn tokenize(input: &str) -> Result<(Vec<ArithToken>, Vec<usize>), Ari
                 offsets.push(num_start);
                 out.push(ArithToken::Number(n));
             }
-            // Unreachable post-v93 for the three arith *contexts* (`(( ))`,
-            // `$(( ))`, arith-`for`): those expand `$`-forms before calling
-            // `arith::parse`. Kept defensive for any other `arith::parse`
-            // caller (e.g. integer-coerce on a value still bearing a `$`).
-            b'$' => {
-                let start = i;
-                i += 1;
-                let mut s = String::new();
-                read_ident_chars(bytes, &mut i, &mut s);
-                if s.is_empty() {
-                    return Err(ArithError::parse("expected identifier after '$'"));
-                }
-                offsets.push(start);
-                out.push(ArithToken::Ident(s));
-            }
+            // NOTE: there is deliberately no `b'$'` arm. Every caller expands
+            // `$`-forms BEFORE handing the text here, so a `$` that survives is
+            // one the user escaped (`$(( 1+\$x ))`) or quoted (`declare -i v='$x'`)
+            // — and bash refuses it rather than expanding it a second time. The
+            // arm that used to read `$name` here made the escape a no-op: huck
+            // answered 6 where bash reports `$x: syntax error: operand expected`
+            // (#707). `$` now falls to the catch-all below, which reports exactly
+            // that, with the remainder as the error token.
             b if b == b'_' || (b as char).is_ascii_alphabetic() => {
                 let start = i;
                 let mut s = String::new();
