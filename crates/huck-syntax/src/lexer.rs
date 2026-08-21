@@ -4305,6 +4305,18 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// True when the cursor sits on a `\` whose very next character is a
+    /// newline. Used by the arith scanner's single-quoted-span arm, where bash
+    /// strips such a backslash but keeps the newline (#660) — distinct from the
+    /// line continuation outside a span, which drops both.
+    fn peek_is_backslash_newline(&self) -> bool {
+        let mut c = self.cursor.clone();
+        if c.next() != Some('\\') {
+            return false;
+        }
+        c.peek() == Some(&'\n')
+    }
+
     /// `Mode::Arith { paren_depth, in_squote, in_dquote, quote_open_off, body_started, for_header, delim }`
     /// scanner — v246.
     /// Emits `$((` (ArithOpen) on entry, then body atoms, then `))` (ArithClose).
@@ -4447,6 +4459,7 @@ impl<'a> Lexer<'a> {
                 // tracks quote spans). `'` closes the span; `"` is a literal.
                 Some('\'') if squote => {
                     self.cursor.next();
+                    text.push('\'');
                     squote = false;
                     quote_off = None;
                     sync_quotes!();
@@ -4462,9 +4475,8 @@ impl<'a> Lexer<'a> {
                 Some('\'') => {
                     let qoff = self.span_opener_off(&text);
                     self.cursor.next();
-                    if dquote {
-                        text.push('\'');
-                    } else {
+                    text.push('\'');
+                    if !dquote {
                         squote = true;
                         quote_off = qoff;
                         sync_quotes!();
@@ -4758,6 +4770,16 @@ impl<'a> Lexer<'a> {
                         }
                     }
                 }
+                // #660: inside a SINGLE-quoted span bash still strips the `\` of a
+                // `\`+newline but KEEPS the newline, so its error body for
+                // `$(( '1 \<newline>2' ))` is `'1 <newline>2' `. That is not the
+                // line continuation the `!squote` arm below performs (which drops
+                // both characters); the span's text is otherwise literal, which is
+                // why every other escape there stays verbatim.
+                Some('\\') if squote && self.peek_is_backslash_newline() => {
+                    self.cursor.next(); // drop the `\`, leave the newline to be
+                    // pushed as ordinary literal text by the catch-all arm
+                }
                 Some('\\') if !squote => {
                     // #653: `\`+newline is a LINE CONTINUATION in every arithmetic
                     // context — measured on `$((`, `$[`, `((`, a `for` header and
@@ -4771,9 +4793,10 @@ impl<'a> Lexer<'a> {
                     //
                     // The arm's own `!squote` guard is why a single-quoted span is
                     // excluded: bash keeps that run literal and then REJECTS it (a
-                    // single-quoted operand is an arithmetic syntax error there,
-                    // where huck evaluates it — #660). If that is ever fixed, this
-                    // guard wants revisiting with it.
+                    // single-quoted operand is an arithmetic syntax error — #660,
+                    // which huck now reports too). The `\`+newline inside such a
+                    // span is handled by the `squote` arm above: bash strips the
+                    // backslash there but does NOT join the lines.
                     let mut cont = self.cursor.clone();
                     cont.next();
                     let is_continuation = cont.peek() == Some(&'\n');
