@@ -1455,6 +1455,31 @@ fn snapshot_for_local_scope(shell: &mut Shell, name: &str) {
         .insert(name.to_string(), snap);
 }
 
+/// Clear the binding a fresh `local NAME` is about to shadow, and report
+/// whether it was exported.
+///
+/// bash's `local` creates a FRESH variable: it carries only the attributes its
+/// own flags ask for, never the shadowed outer variable's (#539). huck used to
+/// assign straight onto the outer binding after snapshotting it, so the new
+/// local inherited its value, its shape (indexed/associative/nameref) and its
+/// `-i`/`-l`/`-u` attributes — `declare -i N=5; f(){ local N=abc; }` made the
+/// local an integer, which then arith-evaluated `abc` to 0.
+///
+/// Export is the ONE attribute that crosses (`declare -ix N=5` shadowed by
+/// `local N=abc` is `declare -x N="abc"` in bash), so it is returned here for
+/// the caller to re-apply once a value exists.
+///
+/// A repeat `local NAME` in the SAME frame is not a fresh shadow — bash keeps
+/// the value and attributes there (`local -i x=1; local x` leaves x integer) —
+/// so `already_local` skips the clear.
+fn clear_local_shadow(shell: &mut Shell, name: &str, already_local: bool) -> bool {
+    let exported = shell.is_exported(name);
+    if !already_local {
+        shell.unset(name);
+    }
+    exported
+}
+
 /// Emit every variable in `shell` (sorted by name) as a
 /// `declare ATTR NAME="value"` line.
 fn declare_list_all_vars(out: &mut dyn std::io::Write, shell: &Shell, bare: bool) -> ExecOutcome {
@@ -1799,6 +1824,7 @@ fn builtin_local_decl(
     let mut saw_minus_u = false;
     let mut saw_minus_c = false;
     let mut saw_minus_n = false;
+    let mut saw_plus_x = false;
     // `local` DOES take `+`-style options — the comment here used to claim it
     // did not, and every `+anything` fell through to be reported as an invalid
     // identifier (#507). Measured on bash 5.2.21:
@@ -1808,10 +1834,12 @@ fn builtin_local_decl(
     //   local +z x=1   -> `local: +z: invalid option` + usage, rc 2
     //
     // The `-` and `+` runs interleave, so scan them alternately, as `declare`
-    // does. `+FLAG` means "do not give the new local this attribute", which is
-    // already the default: bash's `local` creates a FRESH variable carrying
-    // only the attributes its `-` flags ask for. So the accepted letters are
-    // no-ops rather than removals, and that is faithful, not a shortcut.
+    // does. `+FLAG` means "do not give the new local this attribute". bash's
+    // `local` creates a FRESH variable carrying only the attributes its `-`
+    // flags ask for, so for every letter but one there is nothing to remove and
+    // `+FLAG` is faithfully a no-op. The exception is `x`: export is the one
+    // attribute a local INHERITS from the variable it shadows (#539), so `+x`
+    // is the way to say "not exported" and has to suppress that inheritance.
     let mut idx = 0usize;
     loop {
         let pre_idx = idx;
@@ -1851,8 +1879,10 @@ fn builtin_local_decl(
         }
         for &c in &arg.as_bytes()[1..] {
             match c {
-                // Accepted, and a no-op: see the note above.
-                b'a' | b'A' | b'i' | b'r' | b'l' | b'u' | b'c' | b'n' | b'x' => {}
+                // `+x` cancels the inherited export attribute; the rest are
+                // accepted and a no-op — see the note above.
+                b'x' => saw_plus_x = true,
+                b'a' | b'A' | b'i' | b'r' | b'l' | b'u' | b'c' | b'n' => {}
                 other => {
                     crate::builtin_opts::emit_invalid_plus_option(name, other, shell, err);
                     return ExecOutcome::Continue(2);
@@ -1913,6 +1943,7 @@ fn builtin_local_decl(
                     .map(|f| f.contains_key(name))
                     .unwrap_or(false);
                 snapshot_for_local_scope(shell, name);
+                let was_exported = clear_local_shadow(shell, name, already_local);
                 if saw_minus_n {
                     // `local -n NAME` (bare, no value): declare as nameref,
                     // leave value empty (unbound nameref).
@@ -1994,6 +2025,13 @@ fn builtin_local_decl(
                 if want_readonly {
                     shell.mark_readonly(name);
                 }
+                // Re-apply the shadowed variable's export attribute (the only
+                // one bash carries into a local). Gated on the local actually
+                // having materialised: a bare `local NAME` with no flags stays
+                // unset, and `shell.export` would create an empty scalar there.
+                if was_exported && !saw_plus_x && shell.is_set(name) {
+                    shell.export(name);
+                }
             }
             DeclArg::Assign(a) => {
                 let name = a.target.name().to_string();
@@ -2012,7 +2050,13 @@ fn builtin_local_decl(
                     exit = 1;
                     continue;
                 }
+                let already_local = shell
+                    .local_scopes
+                    .last()
+                    .map(|f| f.contains_key(&name))
+                    .unwrap_or(false);
                 snapshot_for_local_scope(shell, &name);
+                let was_exported = clear_local_shadow(shell, &name, already_local);
 
                 // `local -n NAME=target`: nameref bind — validate and store raw.
                 if saw_minus_n {
@@ -2046,6 +2090,11 @@ fn builtin_local_decl(
                     // but mirror the same pattern for safety).
                     if want_readonly {
                         shell.mark_readonly(&name);
+                    }
+                    // A nameref local over an exported outer is exported too
+                    // (bash: `declare -nx`), same rule as every other shape.
+                    if was_exported && !saw_plus_x {
+                        shell.export(&name);
                     }
                     continue;
                 }
@@ -2103,6 +2152,11 @@ fn builtin_local_decl(
                 // (mirrors declare's `-r NAME=VALUE` ordering).
                 if want_readonly {
                     shell.mark_readonly(&name);
+                }
+                // Carry the shadowed variable's export attribute onto the new
+                // local (see `clear_local_shadow`), unless `+x` cancelled it.
+                if was_exported && !saw_plus_x {
+                    shell.export(&name);
                 }
             }
         }
