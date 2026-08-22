@@ -84,6 +84,13 @@ check  'unclosed, test -eq'    "test '(' 1 -eq 1"
 check 'combinator at end'  "[ '(' -n a -a ]"
 check  'combinator, test'  "test '(' -n a -a"
 
+# A `[` whose last argument is not `]` (#731). bash quotes the bracket with a
+# backtick-then-apostrophe pair, as it does for every other such diagnostic.
+check 'no closing bracket'  "[ -n a"
+check 'bracket not last'    "[ '(' -n a -a -n b ] extra"
+check 'bare word, no ]'     "[ a"
+check 'comparison, no ]'    "[ a = a"
+
 # ── controls: valid expressions must not move ────────────────────────────────
 check 'one word true'     '[ a ]; echo "st=$?"'
 check 'empty is false'    '[ ]; echo "st=$?"'
