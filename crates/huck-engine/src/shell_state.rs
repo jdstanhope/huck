@@ -755,6 +755,14 @@ pub struct Shell {
     /// statement assigned (bash `foo+=two`), not the full variable value.
     /// v339 (#310); mirrors `last_cmd_sub_status`.
     xtrace_assign_rhs: Option<String>,
+    /// The declaration builtin currently performing a SCALAR assignment, if
+    /// any. bash prefixes an integer-coercion diagnostic with the builtin's own
+    /// name (`declare: @: syntax error …`) but leaves a plain `v=@` unprefixed
+    /// (#714), and `eval_integer_coerce` is too far down the call chain to be
+    /// told by a parameter — `Shell::assign`'s signature is shared by every
+    /// writer in the shell. Scoped exactly like `xtrace_assign_rhs`: set around
+    /// the call, cleared after.
+    decl_builtin_name: Option<&'static str>,
     /// Current frame of positional parameters. Populated only by
     /// function calls (Task 5); empty at the top level.
     pub positional_args: Vec<String>,
@@ -1254,6 +1262,7 @@ impl Shell {
             last_status: 0,
             last_cmd_sub_status: None,
             xtrace_assign_rhs: None,
+            decl_builtin_name: None,
             positional_args: Vec::new(),
             getopts_sp: 0,
             getopts_optind_cache: 0,
@@ -2572,7 +2581,7 @@ impl Shell {
                         // would otherwise be an arith parse error → 0, losing base.
                         let base = if existing.is_empty() { "0" } else { &existing };
                         let rhs = if v.is_empty() { "0" } else { &v };
-                        eval_integer_coerce(self, &format!("({base})+({rhs})"))?
+                        eval_integer_coerce(self, &format!("({base})+({rhs})"), None)?
                     } else {
                         existing + &v
                     }
@@ -2585,7 +2594,7 @@ impl Shell {
                 // (For the integer-append branch above, `v` is already the
                 // numeric sum, so this re-coerce is a harmless no-op.)
                 let v = if self.is_integer(&n) {
-                    eval_integer_coerce(self, &v)?
+                    eval_integer_coerce(self, &v, None)?
                 } else {
                     v
                 };
@@ -2613,7 +2622,7 @@ impl Shell {
                         // `base + 0 == base` — see the indexed arm for why.
                         let base = if existing.is_empty() { "0" } else { &existing };
                         let rhs = if v.is_empty() { "0" } else { &v };
-                        eval_integer_coerce(self, &format!("({base})+({rhs})"))?
+                        eval_integer_coerce(self, &format!("({base})+({rhs})"), None)?
                     } else {
                         existing + &v
                     }
@@ -2622,7 +2631,7 @@ impl Shell {
                 };
                 // Integer associative arrays coerce the VALUE (never the key).
                 let v = if self.is_integer(&n) {
-                    eval_integer_coerce(self, &v)?
+                    eval_integer_coerce(self, &v, None)?
                 } else {
                     v
                 };
@@ -2638,7 +2647,10 @@ impl Shell {
                     // eval_integer_coerce needs &mut self: build sequentially.
                     let mut out = BTreeMap::new();
                     for (k, v) in m {
-                        out.insert(k, apply_case_fold(fold, eval_integer_coerce(self, &v)?));
+                        out.insert(
+                            k,
+                            apply_case_fold(fold, eval_integer_coerce(self, &v, None)?),
+                        );
                     }
                     out
                 } else {
@@ -2658,7 +2670,10 @@ impl Shell {
                 let p: Vec<(String, String)> = if is_int {
                     let mut out = Vec::with_capacity(p.len());
                     for (k, v) in p {
-                        out.push((k, apply_case_fold(fold, eval_integer_coerce(self, &v)?)));
+                        out.push((
+                            k,
+                            apply_case_fold(fold, eval_integer_coerce(self, &v, None)?),
+                        ));
                     }
                     out
                 } else {
@@ -2690,7 +2705,7 @@ impl Shell {
         // the value first is harmless.
         let do_integer_coerce = self.is_integer(name);
         let coerced = if do_integer_coerce {
-            eval_integer_coerce(self, &value)?
+            eval_integer_coerce(self, &value, self.decl_builtin_name)?
         } else {
             value
         };
@@ -3493,6 +3508,13 @@ impl Shell {
     pub(crate) fn set_xtrace_assign_rhs(&mut self, v: Option<String>) {
         self.xtrace_assign_rhs = v;
     }
+
+    /// Names the declaration builtin performing the assignment about to run, so
+    /// an integer-coercion failure can prefix its diagnostic (#714). Callers
+    /// MUST clear it afterwards — a plain `v=@` carries no prefix.
+    pub(crate) fn set_decl_builtin_name(&mut self, name: Option<&'static str>) {
+        self.decl_builtin_name = name;
+    }
     pub(crate) fn take_xtrace_assign_rhs(&mut self) -> Option<String> {
         self.xtrace_assign_rhs.take()
     }
@@ -3727,7 +3749,11 @@ impl Shell {
 ///
 /// Module-scope so `Shell::try_set` can call it while holding `&mut Shell`
 /// (the function takes `&mut Shell` itself).
-fn eval_integer_coerce(shell: &mut Shell, value: &str) -> Result<String, AssignErr> {
+fn eval_integer_coerce(
+    shell: &mut Shell,
+    value: &str,
+    cmd: Option<&'static str>,
+) -> Result<String, AssignErr> {
     // An EMPTY (or blank) value is 0, not an error: `declare -i v=5; v=` gives
     // `v="0"` in bash, as does `v="$unset"`. That is the one case the old
     // unconditional `unwrap_or(0)` got right, so it has to stay explicit.
@@ -3742,12 +3768,16 @@ fn eval_integer_coerce(shell: &mut Shell, value: &str) -> Result<String, AssignE
             // failure; saying anything more would double-report (mirrors
             // `eval_subscript`).
             if crate::arith::should_wrap_expansion_error(&e) {
-                crate::sh_error!(
-                    shell,
-                    None,
-                    "{}",
-                    crate::arith::render_error_body(value, &e)
-                );
+                let body = crate::arith::render_error_body(value, &e);
+                // Only the SCALAR path passes a name: bash prefixes with the
+                // declaration builtin that performed the assignment
+                // (`declare: @: syntax error …`), but leaves a plain `v=@` AND an
+                // array-literal element under `declare` unprefixed, so those
+                // arms pass `None` (#714).
+                match cmd {
+                    Some(cmd) => crate::sh_error!(shell, None, "{cmd}: {body}"),
+                    None => crate::sh_error!(shell, None, "{body}"),
+                }
             }
             shell.report_error(crate::error_fatality::ErrorKind::Expansion);
             Err(AssignErr::Arith)

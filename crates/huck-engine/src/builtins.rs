@@ -1783,7 +1783,12 @@ fn builtin_export_decl(
                 } else {
                     a
                 };
-                if crate::executor::apply_one_assignment(a, shell, err).is_err() {
+                // #714: name the builtin performing this SCALAR assignment, so an
+                // integer-coercion failure reports `export: @: …` as bash does.
+                shell.set_decl_builtin_name(Some("export"));
+                let assign_res = crate::executor::apply_one_assignment(a, shell, err);
+                shell.set_decl_builtin_name(None);
+                if assign_res.is_err() {
                     any_error = true;
                     continue;
                 }
@@ -2144,7 +2149,12 @@ fn builtin_local_decl(
                 } else {
                     a
                 };
-                if crate::executor::apply_one_assignment(a, shell, err).is_err() {
+                // #714: name the builtin performing this SCALAR assignment, so an
+                // integer-coercion failure reports `local: @: …` as bash does.
+                shell.set_decl_builtin_name(Some("local"));
+                let assign_res = crate::executor::apply_one_assignment(a, shell, err);
+                shell.set_decl_builtin_name(None);
+                if assign_res.is_err() {
                     exit = 1;
                     continue;
                 }
@@ -2352,7 +2362,12 @@ fn builtin_readonly_decl(
                     } else {
                         a
                     };
-                    if crate::executor::apply_one_assignment(a, shell, err).is_err() {
+                    // #714: name the builtin performing this SCALAR assignment, so an
+                    // integer-coercion failure reports `readonly: @: …` as bash does.
+                    shell.set_decl_builtin_name(Some("readonly"));
+                    let assign_res = crate::executor::apply_one_assignment(a, shell, err);
+                    shell.set_decl_builtin_name(None);
+                    if assign_res.is_err() {
                         exit = 1;
                         continue;
                     }
@@ -2404,6 +2419,15 @@ fn builtin_declare_decl(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
+    // Captured HERE because the per-name loop below shadows `name` with the
+    // VARIABLE being declared; read at the assignment site it would compare the
+    // wrong string (#714). `typeset` reaches this function too and names itself
+    // in diagnostics, exactly as bash does.
+    let decl_cmd: &'static str = if name == "typeset" {
+        "typeset"
+    } else {
+        "declare"
+    };
     let mut want_readonly = false;
     let mut want_export = false;
     let mut want_remove_export = false;
@@ -2947,7 +2971,12 @@ fn builtin_declare_decl(
             } else {
                 a
             };
-            if crate::executor::apply_one_assignment(a, shell, err).is_err() {
+            // #714: name the builtin performing this SCALAR assignment, so an
+            // integer-coercion failure reports `declare: @: …` as bash does.
+            shell.set_decl_builtin_name(Some(decl_cmd));
+            let assign_res = crate::executor::apply_one_assignment(a, shell, err);
+            shell.set_decl_builtin_name(None);
+            if assign_res.is_err() {
                 exit = 1;
                 continue;
             }
