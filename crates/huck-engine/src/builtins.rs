@@ -9901,7 +9901,12 @@ fn builtin_test(name: &str, args: &[String], err: &mut dyn Write, shell: &Shell)
         match args.last() {
             Some(last) if last == "]" => &args[..args.len() - 1],
             _ => {
-                crate::sh_error_to!(shell, err, None, "[: missing ']'");
+                // bash writes a backtick-then-apostrophe pair around the
+                // bracket, as it does for every other such diagnostic
+                // (`` `)' expected ``, ``unexpected EOF while looking for
+                // matching `)'``). This was huck's only straight-quoted one
+                // (#731); a grep of the diagnostic strings found no others.
+                crate::sh_error_to!(shell, err, None, "[: missing `]'");
                 return ExecOutcome::Continue(2);
             }
         }
