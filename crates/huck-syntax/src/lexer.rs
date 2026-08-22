@@ -4282,29 +4282,6 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Offset to record for a quote about to open a span in an arith body, or
-    /// `None` when this scanner should not claim to know where the span opened.
-    ///
-    /// A quote preceded by an ODD run of backslashes is one bash escapes: it
-    /// keeps the `"`/`'` as a literal operand char and never opens a span, so
-    /// `$(( 1+\"` runs out of input inside the ARITH, not inside a quote, and
-    /// bash names `)`. huck's arith scanner does not apply that escape — it
-    /// pushes the `\` literally and re-processes the quote as an opener, which
-    /// diverges in the expression text too (`$(( 1+\"2\" ))` errors on the `\`
-    /// where bash errors on the operand `"2"`) and is tracked as its own
-    /// divergence. Returning `None` here keeps the EOF diagnostic on the
-    /// answer that already matched bash rather than following huck's own
-    /// mis-parity: no recorded opener ⇒ the EOF arm reports the arith delimiter.
-    /// An EVEN run is an escaped BACKSLASH, leaving the quote live (`\\"`).
-    fn span_opener_off(&self, text: &str) -> Option<usize> {
-        let backslashes = text.bytes().rev().take_while(|&b| b == b'\\').count();
-        if backslashes % 2 == 1 {
-            None
-        } else {
-            Some(self.cursor.offset())
-        }
-    }
-
     /// True when the cursor sits on a `\` whose very next character is a
     /// newline. Used by the arith scanner's single-quoted-span arm, where bash
     /// strips such a backslash but keeps the newline (#660) — distinct from the
@@ -4315,26 +4292,6 @@ impl<'a> Lexer<'a> {
             return false;
         }
         c.peek() == Some(&'\n')
-    }
-
-    /// Offset to record as the opener of a quote span the arith scanner is about
-    /// to enter, or `None` when this scanner does not claim the span.
-    ///
-    /// For `$((` every escape is consumed by the scanner's `\` arm (#624), so a
-    /// quote that reaches the opener arms is LIVE and sits exactly at the
-    /// cursor. The odd-backslash-run heuristic must NOT be applied there: a
-    /// trailing `\` in the scanned text is now a LITERAL backslash produced by
-    /// `\\`, and treating it as an escape made `$((1+\\"` report the arith
-    /// delimiter where bash reports the quote.
-    ///
-    /// `$[` keeps its two-pass model, which deliberately leaves `\c` in the text
-    /// for pass 2 — there a trailing odd run really does mean this quote was
-    /// escaped, so the heuristic still applies.
-    fn live_quote_opener_off(&self, text: &str, delim: ArithDelim) -> Option<usize> {
-        match delim {
-            ArithDelim::Paren => Some(self.cursor.offset()),
-            ArithDelim::Bracket => self.span_opener_off(text),
-        }
     }
 
     /// `Mode::Arith { paren_depth, in_squote, in_dquote, quote_open_off, body_started, for_header, delim }`
@@ -4493,7 +4450,13 @@ impl<'a> Lexer<'a> {
                 // the quote char — bash quote-removal). `"` toggles the double-quote
                 // span (drop the quote char). Both are DROPPED, never pushed.
                 Some('\'') => {
-                    let qoff = self.live_quote_opener_off(&text, delim);
+                    // Every escape was consumed by the `\` arm above, in BOTH arith
+                    // forms since #709, so a quote reaching here is LIVE and its
+                    // opener is exactly the cursor. The odd-backslash-run heuristic
+                    // this used to consult became wrong once escapes were consumed
+                    // (a trailing `\` in the text is a LITERAL one from `\\`) and is
+                    // gone.
+                    let qoff = Some(self.cursor.offset());
                     self.cursor.next();
                     text.push('\'');
                     if !dquote {
@@ -4503,7 +4466,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some('"') => {
-                    let qoff = self.live_quote_opener_off(&text, delim);
+                    let qoff = Some(self.cursor.offset());
                     self.cursor.next();
                     dquote = !dquote;
                     quote_off = if dquote { qoff } else { None };
@@ -4821,7 +4784,7 @@ impl<'a> Lexer<'a> {
                     if is_continuation {
                         self.cursor.next(); // `\`
                         self.cursor.next(); // the newline
-                    } else if !(matches!(delim, ArithDelim::Bracket) && !dquote && !squote) {
+                    } else {
                         // #624/#700: ONE escape table for the whole `$((…))` body,
                         // whatever quote span it sits in. bash expands an arith body
                         // under DOUBLE-QUOTE rules, so `\` before `" \ $ ` `` drops the
@@ -4840,8 +4803,10 @@ impl<'a> Lexer<'a> {
                         //     lets the main loop reprocess the next character, which is
                         //     why `\a`, `\%`, `\'` all stay verbatim.
                         //
-                        // `$[` (Bracket) outside a quote span keeps its own two-pass
-                        // model below; inside one it joins this table.
+                        // `$[` uses the SAME table (#709): its four divergent cells
+                        // were exactly `$((`'s, and its delimiter cells (`\[`, `\]`)
+                        // are the `open_char`/`close_char` arm here, so the legacy
+                        // form needs no branch of its own.
                         self.cursor.next(); // consume `\`
                         match self.cursor.peek().copied() {
                             Some(n @ ('"' | '\\' | '$' | '`')) => {
@@ -4875,44 +4840,6 @@ impl<'a> Lexer<'a> {
                                 text.push(n);
                             }
                             _ => {
-                                text.push('\\');
-                            }
-                        }
-                    } else {
-                        match delim {
-                            // `$[`: `\` is retained VERBATIM and protects only a
-                            // `]`/`[` DELIMITER (consume+push it so it can't close the
-                            // bracket). For any OTHER next char, do NOT consume it — the
-                            // main loop re-processes it, so `$`/backtick still expand and
-                            // plain chars are pushed literally by the catch-all. This
-                            // matches the oracle two-pass model: scan_legacy_arith_body
-                            // protects only the delimiter in pass 1, then
-                            // arith_string_to_word re-expands the retained `\c` in pass 2.
-                            ArithDelim::Bracket => {
-                                self.cursor.next(); // `\`
-                                text.push('\\');
-                                // Consume+retain the next char ONLY if it is a delimiter
-                                // (`]`/`[`) or a second `\`. The oracle scan_legacy_arith_body
-                                // pairs `\` with ANY next char, but for the atom single pass
-                                // only these three matter: `]`/`[` must be protected from
-                                // closing, and a `\` must be paired-and-consumed so a
-                                // following delimiter stays LIVE (`\\]` → oracle keeps `]` a
-                                // delimiter; not consuming the 2nd `\` would re-read it as a
-                                // fresh escape and wrongly protect the `]`). `$`/`` ` ``/others
-                                // are left for the main loop to re-expand (matches pass 2);
-                                // `'`/`"` open a span (the pinned two-pass residual).
-                                match self.cursor.peek().copied() {
-                                    Some(nc @ (']' | '[' | '\\')) => {
-                                        self.cursor.next();
-                                        text.push(nc);
-                                    }
-                                    _ => { /* do NOT consume — main loop re-processes */ }
-                                }
-                            }
-                            // `$((`: `\` is a plain literal (scan_arith_body is
-                            // quote/escape-blind; arith_string_to_word keeps it).
-                            ArithDelim::Paren => {
-                                self.cursor.next();
                                 text.push('\\');
                             }
                         }
