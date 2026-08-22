@@ -2717,15 +2717,20 @@ fn builtin_declare_decl(
                 .last()
                 .map(|f| f.contains_key(name))
                 .unwrap_or(false);
+            // The one thing a readonly name forbids here is a NEW function-local
+            // SHADOW of it — that local would be a fresh variable, which is what
+            // readonly refuses (#695). It applies whatever flags were given:
+            // `declare R`, `declare -x R` and `declare R=2` are all refused
+            // inside a function, while `declare -g R` writes the global and is
+            // allowed. Refusing BEFORE the snapshot also keeps the clear below
+            // from unsetting a readonly variable.
+            if !shell.local_scopes.is_empty() && !already_local && shell.is_readonly(name) {
+                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
+                exit = 1;
+                continue;
+            }
             snapshot_for_local_scope(shell, name);
-            // A READONLY name is never cleared: `declare`'s readonly guards
-            // live further down this loop and read `shell.is_readonly(name)`,
-            // so unsetting first would make them see a fresh, writable
-            // variable and let `f(){ declare R=2; }` overwrite a readonly R
-            // inside the function. (`local` is not exposed to this — it checks
-            // readonly BEFORE it snapshots.) bash refuses the declaration
-            // outright, which is what the untouched guards below then do.
-            if !shell.local_scopes.is_empty() && !shell.is_readonly(name) {
+            if !shell.local_scopes.is_empty() {
                 inherited_export = clear_local_shadow(shell, name, already_local);
             }
         }
@@ -2734,8 +2739,18 @@ fn builtin_declare_decl(
         // through the site it already has; `+x` still wins.
         let want_export = want_export || (inherited_export && !want_remove_export);
 
-        // Integer-attribute changes on readonly variable are rejected.
-        if (want_integer || want_remove_integer) && shell.is_readonly(name) {
+        // NOTE: no readonly guard on the ATTRIBUTE flags alone. bash's readonly
+        // protects a variable's VALUE, not its attributes (#734): `readonly R=1;
+        // declare -i R` gives `declare -ir R="1"`. The guard that used to reject
+        // `-i`/`+i` unconditionally here refused what bash performs.
+        //
+        // A declaration that DOES carry a value is still refused — and refused
+        // HERE, before any attribute is applied, because bash leaves the
+        // attributes unchanged when the assignment fails: `readonly R=outer;
+        // declare -ri R=5` leaves `declare -r R="outer"`, not `-ir`. The
+        // assignment path further down has its own readonly check, but by then
+        // `mark_integer` and friends have already stamped the flags on.
+        if assign_opt.is_some() && shell.is_readonly(name) {
             crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
             exit = 1;
             continue;
