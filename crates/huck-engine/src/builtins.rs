@@ -9912,6 +9912,17 @@ fn builtin_test(name: &str, args: &[String], err: &mut dyn Write, shell: &Shell)
         Ok(true) => ExecOutcome::Continue(0),
         Ok(false) => ExecOutcome::Continue(1),
         Err(msg) => {
+            // #688: for an unclosed `(`, bash names the token its parser stopped
+            // on — `[: `)' expected, found ]` but plain `test: `)' expected`,
+            // because under `test` the arguments simply ran out. The stripped
+            // `]` is that token, and it is always the `]`: a `]` anywhere but
+            // last is rejected as `missing ']'` above, so by the time the
+            // expression parser runs there is nothing else it could be.
+            let msg = if name == "[" && msg == crate::test_builtin::CLOSE_PAREN_EXPECTED {
+                format!("{msg}, found ]")
+            } else {
+                msg
+            };
             crate::sh_error_to!(shell, err, None, "{name}: {msg}");
             ExecOutcome::Continue(2)
         }

@@ -5,6 +5,13 @@
 
 use std::os::unix::fs::MetadataExt;
 
+/// The diagnostic for a `(` whose `)` never arrives (#688). bash appends a
+/// `, found X` clause naming the token the parser stopped on — but the parser
+/// here never sees that token under `[`, because the closing `]` is stripped
+/// before evaluation. `builtin_test` owns that half and matches on THIS
+/// constant, so the two cannot drift apart.
+pub(crate) const CLOSE_PAREN_EXPECTED: &str = "`)' expected";
+
 /// Evaluates a `test` expression. `var_is_set(name)` answers `-v NAME`.
 /// `Ok(true)` / `Ok(false)` are the result; `Err(message)` is a usage error.
 pub fn evaluate_with(args: &[String], var_is_set: &dyn Fn(&str) -> bool) -> Result<bool, String> {
@@ -408,7 +415,7 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     return Ok(inner);
                 }
-                _ => return Err("missing ')'".to_string()),
+                _ => return Err(CLOSE_PAREN_EXPECTED.to_string()),
             }
         }
         // <unary> <word> — recognize a known unary op followed by a word.
@@ -826,7 +833,7 @@ mod tests {
         // (`` `)' expected ``, plus a `, found X` clause under `[`) — the one
         // `test` message that still differs, filed as #688.
         let r = evaluate(&args(&["(", "-n", "a", "-a", "-n", "b"]));
-        assert_eq!(r.unwrap_err(), "missing ')'");
+        assert_eq!(r.unwrap_err(), CLOSE_PAREN_EXPECTED);
     }
 
     #[test]

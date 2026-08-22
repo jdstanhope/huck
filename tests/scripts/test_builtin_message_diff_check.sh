@@ -69,12 +69,20 @@ check 'paren wraps unary' "[ '(' -n a ')' ]"
 check 'nested parens'     "[ '(' '(' a ')' ')' ]"
 check 'nested unclosed'   "[ '(' '(' a ')' ]"
 
-# ⚠️ NOT compared: an unclosed `(` in a 4+-argument expression —
-# `[ '(' -n a -a -n b ]`. bash says "`)' expected, found ]" and huck says
-# "missing ')'". Both exit 2. It is left out because bash's `, found X` clause
-# names the token its parser stopped on — including the `]` that huck's `[`
-# strips before evaluating — so it is a different job from naming the right
-# ARGUMENT, which is what this issue was. Filed as #688 with the measurement.
+# An unclosed `(` in a 4+-argument expression (#688). bash's `, found X` clause
+# names the token its parser stopped on, which under `[` is the closing `]` that
+# huck strips before evaluating — so `[` carries the clause and `test`, whose
+# arguments simply ran out, does not.
+check 'unclosed paren, ['  "[ '(' -n a -a -n b ]"
+check 'unclosed paren, 6'  "[ '(' -n a -a -n b -a -n c ]"
+check 'unclosed paren, eq' "[ '(' 1 -eq 1 ]"
+check 'unclosed, nested ('  "[ '(' '(' -n a -a -n b ]"
+check  'unclosed paren, test'  "test '(' -n a -a -n b"
+check  'unclosed paren, test6' "test '(' -n a -o -n b"
+check  'unclosed, test -eq'    "test '(' 1 -eq 1"
+# Neighbours that must NOT gain the clause: these end before the `)` is due.
+check 'combinator at end'  "[ '(' -n a -a ]"
+check  'combinator, test'  "test '(' -n a -a"
 
 # ── controls: valid expressions must not move ────────────────────────────────
 check 'one word true'     '[ a ]; echo "st=$?"'
