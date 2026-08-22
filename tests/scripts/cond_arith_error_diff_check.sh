@@ -19,22 +19,11 @@
 # and status.
 #
 # NOT compared here:
-#   - `[[ a =~ [ ]]`: bash exits 2 SILENTLY, huck prints a `regex error:` line
-#     naming the Rust regex crate (#716). The status agrees.
-#   - `[[ a == [ ]]`: bash treats an unterminated bracket as a literal that
-#     simply does not match (exit 1, no message); huck reports `bad pattern` and
-#     exits 2 (#717).
+#   - an unmatched `[` in a `[[ == ]]` PATTERN: bash treats it as a literal
+#     character; huck reports `bad pattern` and exits 2 — and four of huck's
+#     five pattern consumers get that rule wrong (#717).
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
-
-# Status and stdout only — for rows whose only difference is the regex MESSAGE
-# huck prints and bash does not (#716). The composed STATUS is what these pin.
-check_rc() {
-    local label="$1" frag="$2" b h
-    b=$(bash --norc --noprofile -c "$frag" sh 2>/dev/null; echo "EXIT:$?")
-    h=$("$HUCK_BIN" -c "$frag" sh 2>/dev/null; echo "EXIT:$?")
-    compare "$label" "$b" "$h"
-}
 
 check() {
     local label="$1" frag="$2" b h
@@ -63,11 +52,11 @@ check '[[: rhs of an ||'       '[[ 1 -eq 2 || @ -eq 5 ]]; echo "rc=$?"'
 #     result is later inverted or discarded. ---
 check 'compose: ! a failure'   '[[ ! @ -eq 5 ]]; echo "rc=$?"'
 check 'compose: ! ! a failure' '[[ ! ! @ -eq 5 ]]; echo "rc=$?"'
-check_rc 'compose: ! bad regex' '[[ ! a =~ [ ]]; echo "rc=$?"'
+check 'compose: ! bad regex'   '[[ ! a =~ [ ]]; echo "rc=$?"'
 check 'compose: || rhs true'   '[[ @ -eq 5 || 1 -eq 1 ]]; echo "rc=$?"'
 check 'compose: || rhs false'  '[[ @ -eq 5 || 1 -eq 2 ]]; echo "rc=$?"'
-check_rc 'compose: || bad regex' '[[ a =~ [ || 1 -eq 1 ]]; echo "rc=$?"'
-check_rc 'compose: && keeps 2'   '[[ a =~ [ && 1 -eq 1 ]]; echo "rc=$?"'
+check 'compose: || bad regex'  '[[ a =~ [ || 1 -eq 1 ]]; echo "rc=$?"'
+check 'compose: && keeps 2'    '[[ a =~ [ && 1 -eq 1 ]]; echo "rc=$?"'
 check 'compose: && lhs failed' '[[ @ -eq 5 && 1 -eq 1 ]]; echo "rc=$?"'
 check 'compose: parenthesised' '[[ ( @ -eq 5 ) || 1 -eq 1 ]]; echo "rc=$?"'
 check 'compose: not evaluated' '[[ 1 -eq 1 || a =~ [ ]]; echo "rc=$?"'
@@ -79,6 +68,11 @@ check 'for: bad cond'          'for (( i=0; @; i++ )); do :; done; echo "rc=$?"'
 check 'for: bad step'          'for (( i=0; i<1; @ )); do :; done; echo "rc=$?"'
 check 'for: division by 0'     'for (( i=1/0; i<1; i++ )); do :; done; echo "rc=$?"'
 check 'for: cond fails later'  'for (( i=0; i<3; i++ )); do echo $i; (( i==1 )) && break; done; echo "rc=$?"'
+
+# --- an ERE bash cannot compile: exit 2 and say NOTHING (#716) ---
+check 'regex: unclosed class' '[[ a =~ [ ]]; echo "rc=$?"'
+check 'regex: leading *'      '[[ a =~ *x ]]; echo "rc=$?"'
+check 'regex: unclosed brace' '[[ a =~ "a{" ]]; echo "rc=$?"'
 
 # --- the sites that already agreed must keep agreeing ---
 check 'regress: $(( ))'        'echo $(( @ )); echo "rc=$?"'
