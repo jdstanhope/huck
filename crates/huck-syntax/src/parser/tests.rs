@@ -2558,24 +2558,28 @@ fn atoms_arith_squote_blind_bail() {
 }
 
 #[test]
-fn atoms_legacy_arith_backslash_quote_carryforward() {
-    // v261 T1 NEW live-flip carry-forward: `\` before a QUOTE char in legacy
-    // `$[ … ]`. The review-B fix retains `\` verbatim and re-processes the next
-    // char (so `$`/backtick re-expand) unless it's a `]`/`[` delimiter. But a
-    // `\'`/`\"` then lets the `'`/`"` OPEN a quote-removal span that is genuinely
-    // unmatchable in the atom's ONE pass — the oracle's TWO-pass model protects
-    // the `\c` in pass 1 (scan_legacy_arith_body) then re-interprets it in pass 2
-    // (arith_string_to_word), yielding body `" \ "`. The atom instead runs off the
-    // end of the (now-quoted) body and lex-errors. Same exotic two-pass-vs-one-pass
-    // class as other source-position pins. `old_seq` panics on this (Ok w/ lex OK,
-    // but the atom errors), so assert the atom side only.
+fn atoms_legacy_arith_backslash_quote_lexes() {
+    // Used to assert `is_err()` for both of these, pinning a one-pass limitation:
+    // the `\` was retained verbatim and the following quote then OPENED a span
+    // the single pass could never close, so the body ran off the end and
+    // lex-errored.
+    //
+    // #709 gave `$[ … ]` the same escape table as `$(( … ))`, which CONSUMES the
+    // escaped quote instead of letting it open a span, so both now lex and both
+    // match bash 5.2.21 exactly:
+    //
+    //   $[ \' ]   →  \' : syntax error: operand expected (error token is "\' ")
+    //   $[ \" ]   →  "  : syntax error: operand expected (error token is "" ")
+    //
+    // (`\'` keeps both characters, `\"` drops the backslash — the table's two
+    // different cells, both exercised here.)
     assert!(
-        new_seq("echo $[ \\' ]").is_err(), // oracle: Ok body \" \\ \"
-        "atom one-pass runs off the unmatchable squote-after-backslash span"
+        new_seq("echo $[ \\' ]").is_ok(),
+        "an escaped squote no longer opens an unmatchable span"
     );
     assert!(
-        new_seq("echo $[ \\\" ]").is_err(), // oracle: Ok body \" \\ \"
-        "atom one-pass runs off the unmatchable dquote-after-backslash span"
+        new_seq("echo $[ \\\" ]").is_ok(),
+        "an escaped dquote no longer opens an unmatchable span"
     );
 }
 

@@ -29,7 +29,6 @@
 #   - `$(( '))' ))` and `$(( '1\'2' ))`: huck's scan for the closing `))` is
 #     quote-blind where bash's honours the span (#708). Pre-existing, unchanged
 #     by this work.
-#   - `$[ … ]`: the legacy form keeps its own two-pass model (#709).
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
@@ -89,6 +88,34 @@ check_eof 'eof: escaped " alone'     'echo $((1+\"'
 check_eof "eof: escaped ' alone"     "echo \$((1+\\'"
 check_eof 'eof: \\ leaves " live'    'echo $((1+\\"'
 check_eof 'eof: live " alone'        'echo $((1+"'
+
+# --- the legacy `$[ … ]` form uses the SAME table (#709); its delimiter cells
+#     are `\[` and `\]` rather than `\(` and `\)` ---
+lcheck() {
+    local label="$1" b h tmp
+    tmp=$(mktemp)
+    printf 'echo $[ %s ]\n' "$2" > "$tmp"
+    b=$( bash --norc --noprofile "$tmp" 2>&1 >/dev/null | sed -z 's/^[^ ]*: line [0-9]*: //'
+         bash --norc --noprofile "$tmp" 2>/dev/null; echo "EXIT:$?" )
+    h=$( "$HUCK_BIN" "$tmp" 2>&1 >/dev/null | sed -z 's/^[^ ]*: line [0-9]*: //'
+         "$HUCK_BIN" "$tmp" 2>/dev/null; echo "EXIT:$?" )
+    rm -f "$tmp"
+    compare "$label" "$b" "$h"
+}
+lcheck 'legacy: \" both ends' '1+\"2\"'
+lcheck 'legacy: \\ collapses'  '1+\\2'
+lcheck 'legacy: \$ kept plain' '1+\$x'
+lcheck 'legacy: \` kept plain' '1+\`'
+lcheck 'legacy: \a verbatim'   '1+\a'
+lcheck 'legacy: \% verbatim'   '1+\%'
+lcheck 'legacy: \] protected'  '1+\]'
+lcheck 'legacy: \[ protected'  '1+\['
+lcheck "legacy: \\' verbatim"  "1+\\'2\\'"
+lcheck 'legacy: escaped sq'    "\\'"
+lcheck 'legacy: escaped dq'    '\"'
+lcheck 'legacy: ok plain'      '2+3'
+lcheck 'legacy: ok dquoted'    '"2"+1'
+lcheck 'legacy: ok hex'        '0x1f'
 
 # --- valid arithmetic is unaffected ---
 check 'ok: plain'           '1+2'
