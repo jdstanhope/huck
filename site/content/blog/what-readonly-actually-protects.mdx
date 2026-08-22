@@ -1,0 +1,94 @@
+---
+title: "What readonly actually protects"
+date: 2026-08-22
+summary: "A readonly variable could be shadowed inside a function, and could not have an attribute added — huck had both halves of the rule backwards. Plus four diagnostics that now read the way bash writes them."
+tags: ["bug-fix", "variables", "diagnostics", "bash-compat"]
+version: null
+draft: false
+---
+
+`readonly` guards a variable's **value**. Not its name, not its attributes — its
+value. huck had that inverted in both directions at once.
+
+Declaring a name inside a function creates a new local variable, and creating one
+that shadows a readonly is refused. huck allowed it:
+
+```bash
+# before
+$ readonly CONFIG=/etc/app.conf
+$ setup(){ declare CONFIG; CONFIG=/tmp/evil; echo "$CONFIG"; }
+$ setup
+huck: line 1: CONFIG: readonly variable
+```
+
+```bash
+# after
+$ readonly CONFIG=/etc/app.conf
+$ setup(){ declare CONFIG; CONFIG=/tmp/evil; echo "$CONFIG"; }
+$ setup
+huck: line 1: declare: CONFIG: readonly variable
+huck: line 1: CONFIG: readonly variable
+```
+
+The value survived either way — the second message is the write being refused —
+but the declaration itself should have been rejected first, and wasn't.
+
+In the other direction, huck refused something bash allows. Marking a readonly
+variable as an integer changes an attribute, not the value, so it is permitted:
+
+```bash
+# before
+$ readonly N=5; declare -i N; declare -p N
+huck: line 1: declare: N: readonly variable
+declare -r N="5"
+```
+
+```bash
+# after
+$ readonly N=5; declare -i N; declare -p N
+declare -ir N="5"
+```
+
+Both halves are one rule, so they were fixed together. Writing a *value* to a
+readonly is still refused, including the subtle case where the attribute and the
+value arrive in the same command — `declare -ri N=5` on a readonly `N` must
+change nothing at all, not even the attribute it would have applied first.
+
+## Messages
+
+Four diagnostics now read the way bash writes them.
+
+```bash
+# before
+$ [ '(' -n a -a -n b ]
+huck: line 1: [: missing ')'
+$ [ -n a
+huck: line 1: [: missing ']'
+```
+
+```bash
+# after
+$ [ '(' -n a -a -n b ]
+huck: line 1: [: `)' expected, found ]
+$ [ -n a
+huck: line 1: [: missing `]'
+```
+
+An error from a declaration builtin now says which builtin it was, and the
+deprecated `$[ … ]` arithmetic form finally handles backslashes the way `$(( … ))`
+does — that last one deleted more code than it added, because the two forms no
+longer need separate rules.
+
+## Still open
+
+The most important thing on the list is not a fix. A multi-line command typed at
+the prompt **intermittently never completes** — roughly one run in five, on an
+idle machine, hanging rather than running slowly
+([#722](https://github.com/jdstanhope/huck/issues/722)).
+
+Also open: an unmatched `[` in a pattern should be an ordinary character, and
+four of huck's five pattern consumers get that wrong
+([#717](https://github.com/jdstanhope/huck/issues/717)); and `declare -a` on a
+readonly scalar should reshape it, which needs a decision about which operations
+may bypass the readonly check
+([#734](https://github.com/jdstanhope/huck/issues/734)).
