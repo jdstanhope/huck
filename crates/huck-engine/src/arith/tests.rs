@@ -64,12 +64,28 @@ fn tokenize_large_number() {
 }
 
 #[test]
-fn tokenize_number_overflow_is_parse_error() {
-    let err = tokenize("99999999999999999999").unwrap_err();
-    assert!(
-        matches!(err.kind, ArithErrorKind::Parse(_)),
-        "got {:?}",
-        err
+fn tokenize_number_overflow_wraps() {
+    // #725: a literal too large for 64 bits WRAPS, as C's `intmax_t` does in
+    // bash — it is not an error. `99999999999999999999 mod 2^64`, read signed.
+    let (toks, _) = tokenize("99999999999999999999").unwrap();
+    assert_eq!(toks, vec![ArithToken::Number(7766279631452241919)]);
+    // Exactly 2^64 wraps to 0, and 2^63 to i64::MIN.
+    assert_eq!(
+        tokenize("18446744073709551616").unwrap().0,
+        vec![ArithToken::Number(0)]
+    );
+    assert_eq!(
+        tokenize("9223372036854775808").unwrap().0,
+        vec![ArithToken::Number(i64::MIN)]
+    );
+    // Every base wraps the same way.
+    assert_eq!(
+        tokenize("0xFFFFFFFFFFFFFFFF").unwrap().0,
+        vec![ArithToken::Number(-1)]
+    );
+    assert_eq!(
+        tokenize("16#FFFFFFFFFFFFFFFF").unwrap().0,
+        vec![ArithToken::Number(-1)]
     );
 }
 

@@ -59,17 +59,35 @@ pub(crate) enum ArithToken {
 /// Parses hex digits 0-9, a-f, A-F after the `0x` / `0X` prefix has
 /// been consumed. Returns the i64 value. Errors on no digits, invalid
 /// digits, or out-of-range value.
-fn parse_hex_digits(bytes: &[u8], i: &mut usize) -> Result<i64, ArithError> {
-    let mut s = String::new();
+/// Folds `digits` in `base` with WRAPPING arithmetic, as C's `intmax_t` does:
+/// bash answers 7766279631452241919 for `$((99999999999999999999))` rather than
+/// refusing it (#725). `None` only when a digit is outside the base, which the
+/// caller reports as `value too great for base`.
+fn wrapping_digits(digits: &str, base: u32) -> Option<i64> {
+    let mut value: u64 = 0;
+    for c in digits.chars() {
+        let d = c.to_digit(base)?;
+        value = value.wrapping_mul(base as u64).wrapping_add(d as u64);
+    }
+    Some(value as i64)
+}
+
+/// Reads the hex digits after a consumed `0x`/`0X`. Returns `None` when there
+/// were NO digits — `$((0x))` is 0 in bash with the whole prefix consumed, so
+/// that is not an error and the caller supplies the zero.
+///
+/// Overflow WRAPS rather than erroring: `$((0xFFFFFFFFFFFFFFFF))` is -1 in bash
+/// (#725), and a longer run wraps again (`0xFFFFFFFFFFFFFFFFF` is also -1).
+fn parse_hex_digits(bytes: &[u8], i: &mut usize) -> Option<i64> {
+    let mut value: u64 = 0;
+    let mut any = false;
     while *i < bytes.len() && (bytes[*i] as char).is_ascii_hexdigit() {
-        s.push(bytes[*i] as char);
+        let d = (bytes[*i] as char).to_digit(16).expect("is_ascii_hexdigit");
+        value = value.wrapping_mul(16).wrapping_add(d as u64);
+        any = true;
         *i += 1;
     }
-    if s.is_empty() {
-        return Err(ArithError::parse("hex literal requires at least one digit"));
-    }
-    i64::from_str_radix(&s, 16)
-        .map_err(|_| ArithError::parse(format!("hex literal out of range: 0x{s}")))
+    if any { Some(value as i64) } else { None }
 }
 
 /// Parses base-N digits after the `N#` prefix has been consumed. The
@@ -85,9 +103,11 @@ fn parse_hex_digits(bytes: &[u8], i: &mut usize) -> Result<i64, ArithError> {
 /// Returns bash-mapped error kinds for positioned errors (caller adds offset):
 ///   digit >= base     → `ValueTooGreatForBase`
 ///   no digits         → `InvalidIntegerConstant`
-///   overflow          → legacy `ArithError::parse(...)` (out-of-scope)
+///   overflow          → WRAPS, like bash (#725)
 fn parse_base_n_digits(bytes: &[u8], i: &mut usize, base: u32) -> Result<i64, ArithError> {
-    let mut value: i64 = 0;
+    // Accumulate in u64 with WRAPPING arithmetic and reinterpret, which is what
+    // C's `intmax_t` does in bash: `16#FFFFFFFFFFFFFFFF` is -1 there (#725).
+    let mut value: u64 = 0;
     let mut any_digit = false;
     while *i < bytes.len() {
         let c = bytes[*i] as char;
@@ -110,17 +130,14 @@ fn parse_base_n_digits(bytes: &[u8], i: &mut usize, base: u32) -> Result<i64, Ar
         if digit >= base {
             return Err(ArithError::plain(ArithErrorKind::ValueTooGreatForBase));
         }
-        value = value
-            .checked_mul(base as i64)
-            .and_then(|v| v.checked_add(digit as i64))
-            .ok_or_else(|| ArithError::parse(format!("base-{base} literal out of range")))?;
+        value = value.wrapping_mul(base as u64).wrapping_add(digit as u64);
         any_digit = true;
         *i += 1;
     }
     if !any_digit {
         return Err(ArithError::plain(ArithErrorKind::InvalidIntegerConstant));
     }
-    Ok(value)
+    Ok(value as i64)
 }
 
 /// Returns the exclusive end of the maximal number-token run starting at
@@ -240,7 +257,7 @@ pub(crate) fn tokenize(input: &str) -> Result<(Vec<ArithToken>, Vec<usize>), Ari
                     // character alike are `value too great for base` in bash,
                     // named after the WHOLE run — not huck's own wording.
                     bad_number_run_guard(bytes, num_start, i)?;
-                    i64::from_str_radix(&digits, 8).map_err(|_| {
+                    wrapping_digits(&digits, 8).ok_or_else(|| {
                         ArithError::at_span(
                             ArithErrorKind::ValueTooGreatForBase,
                             num_start,
@@ -249,9 +266,7 @@ pub(crate) fn tokenize(input: &str) -> Result<(Vec<ArithToken>, Vec<usize>), Ari
                     })?
                 } else {
                     bad_number_run_guard(bytes, num_start, i)?;
-                    digits.parse().map_err(|_| {
-                        ArithError::parse(format!("integer literal out of range: {digits}"))
-                    })?
+                    wrapping_digits(&digits, 10).expect("decimal digits are always in base 10")
                 };
                 offsets.push(num_start);
                 out.push(ArithToken::Number(n));
