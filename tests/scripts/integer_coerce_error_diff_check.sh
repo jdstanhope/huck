@@ -19,13 +19,7 @@
 # and status. Both `-c` (where the failure discards the rest of the list) and a
 # SCRIPT FILE (where only the failing command is discarded) are driven, since
 # those differ.
-#
-# NOT compared here:
-#   - the diagnostic when the coercion happens under `declare`/`export`/
-#     `readonly`: bash prefixes it with the builtin name (`declare: @: syntax
-#     error …`), huck does not (#714). Those three rows compare status and
-#     stdout only. Every plain-assignment form — including the silent-zero one
-#     this issue is about — agrees in full.
+
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
@@ -53,21 +47,19 @@ check_file() {
     compare "file $label" "$b" "$h"
 }
 
-# Status and stdout only — for the shapes whose MESSAGE PREFIX is #714.
-check_rc() {
-    local label="$1" frag="$2" b h
-    b=$(bash --norc --noprofile -c "$frag" sh 2>/dev/null; echo "EXIT:$?")
-    h=$("$HUCK_BIN" -c "$frag" sh 2>/dev/null; echo "EXIT:$?")
-    compare "-c  $label" "$b" "$h"
-}
-
 # --- a plain assignment to an integer scalar ---
 check_c 'scalar: bad operand'   'declare -i v=5; v=@; echo "rc=$?"; declare -p v'
 check_c 'scalar: division by 0' 'declare -i v=5; v=1/0; echo "rc=$?"'
 check_c 'scalar: trailing +'    'declare -i v=5; v=1+; echo "rc=$?"'
-check_rc 'scalar: at declare'   'declare -i v=@; echo "rc=$?"'
-check_rc 'scalar: via export'   'declare -i v=5; export v=@; echo "rc=$?"'
-check_rc 'scalar: via readonly' 'declare -i v=5; readonly v=@; echo "rc=$?"'
+# The declaration builtin performing the assignment NAMES ITSELF (#714); a
+# plain assignment and an array-literal element do not.
+check_c 'scalar: at declare'    'declare -i v=@; echo "rc=$?"'
+check_c 'scalar: at typeset'    'typeset -i v=@; echo "rc=$?"'
+check_c 'scalar: via export'    'declare -i v=5; export v=@; echo "rc=$?"'
+check_c 'scalar: via readonly'  'declare -i v=5; readonly v=@; echo "rc=$?"'
+check_c 'scalar: via local'     'f(){ local -i v=@; }; f; echo "rc=$?"'
+check_c 'scalar: bare declare'  'declare -i v=5; declare v=@; echo "rc=$?"'
+check_c 'literal: NOT prefixed' 'declare -ia a; declare -ia a=(@); echo "rc=$?"'
 check_c 'scalar: fresh integer' 'declare -i v; v=@; echo "rc=$?"'
 
 # --- the integer `+=` paths, which had their own silent zero ---
