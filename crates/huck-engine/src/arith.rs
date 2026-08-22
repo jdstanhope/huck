@@ -127,6 +127,27 @@ fn parse_base_n_digits(bytes: &[u8], i: &mut usize, base: u32) -> Result<i64, Ar
 /// `start`: the run of bytes in `[A-Za-z0-9#@_]`. bash consumes the whole run
 /// before validating, so the error token covers the full run even when the
 /// fault (e.g. base > 64) is detected earlier.
+/// bash reads a numeric literal as ONE token spanning `[A-Za-z0-9#@_]*`, so a
+/// character the literal's base cannot use does not end the number — it makes
+/// the whole run invalid, reported as `value too great for base` naming the
+/// entire run (#720). huck stopped the number at the first such character and
+/// let the parser trip over the remainder separately, giving `syntax error in
+/// expression` with only the tail as the error token.
+///
+/// `consumed` is where the literal's own digits ended. Anything between there
+/// and the end of the run is what bash would still have swallowed.
+fn bad_number_run_guard(bytes: &[u8], num_start: usize, consumed: usize) -> Result<(), ArithError> {
+    let run_end = number_run_end(bytes, num_start);
+    if consumed < run_end {
+        return Err(ArithError::at_span(
+            ArithErrorKind::ValueTooGreatForBase,
+            num_start,
+            run_end,
+        ));
+    }
+    Ok(())
+}
+
 fn number_run_end(bytes: &[u8], start: usize) -> usize {
     let mut e = start;
     while e < bytes.len() {
@@ -206,13 +227,28 @@ pub(crate) fn tokenize(input: &str) -> Result<(Vec<ArithToken>, Vec<usize>), Ari
                 {
                     // Hex literal: 0x... / 0X...
                     i += 1;
-                    parse_hex_digits(bytes, &mut i)?
+                    // `0x` with NO hex digits is 0 in bash, and the whole prefix
+                    // is consumed: `$((0x))` is 0 and `$((0x + 1))` is 1 even
+                    // with `x` set. Only a NON-hex character still inside the
+                    // number run makes it a bad literal (`0x1g`).
+                    let v = parse_hex_digits(bytes, &mut i).unwrap_or(0);
+                    bad_number_run_guard(bytes, num_start, i)?;
+                    v
                 } else if digits.len() > 1 && digits.starts_with('0') {
                     // Octal literal: 010 → 8. All digits must be 0-7.
+                    // A digit outside the base (`08`) and any trailing run
+                    // character alike are `value too great for base` in bash,
+                    // named after the WHOLE run — not huck's own wording.
+                    bad_number_run_guard(bytes, num_start, i)?;
                     i64::from_str_radix(&digits, 8).map_err(|_| {
-                        ArithError::parse(format!("invalid octal literal: {digits}"))
+                        ArithError::at_span(
+                            ArithErrorKind::ValueTooGreatForBase,
+                            num_start,
+                            number_run_end(bytes, num_start),
+                        )
                     })?
                 } else {
+                    bad_number_run_guard(bytes, num_start, i)?;
                     digits.parse().map_err(|_| {
                         ArithError::parse(format!("integer literal out of range: {digits}"))
                     })?
