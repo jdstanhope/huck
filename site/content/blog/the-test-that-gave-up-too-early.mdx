@@ -1,0 +1,107 @@
+---
+title: "The test that gave up too early"
+date: 2026-08-22
+summary: "A broken operand inside [[ ]] used to abandon the whole test, so an || that should have rescued it never ran. Plus numeric literals: huck now reads them the way bash does, wrapping instead of refusing."
+tags: ["bug-fix", "conditionals", "arithmetic", "bash-compat"]
+version: null
+draft: false
+---
+
+If one operand of a `[[ ]]` test is broken, bash says so and carries on
+evaluating the rest. huck used to stop dead at the first problem, which changed
+the answer whenever something later in the expression would have rescued it:
+
+```bash
+# before
+$ x=@
+$ [[ $x -eq 5 || 1 -eq 1 ]] && echo ok
+huck: line 1: [[: @: syntax error: operand expected (error token is "@")
+```
+
+```bash
+# after
+$ x=@
+$ [[ $x -eq 5 || 1 -eq 1 ]] && echo ok
+huck: line 1: [[: @: syntax error: operand expected (error token is "@")
+ok
+```
+
+Same for `!`: a failed operand is just a non-zero result, so negating it gives
+success. Beyond the wrong answer, abandoning the expression meant the surviving
+branch was never evaluated at all — so a command substitution in it silently
+did not run.
+
+While in there, an unusable regular expression stopped announcing itself in
+somebody else's words:
+
+```bash
+# before
+$ [[ a =~ [ ]]; echo "rc=$?"
+huck: line 1: [[: regex error: regex parse error:
+    [
+    ^
+error: unclosed character class
+rc=2
+```
+
+```bash
+# after
+$ [[ a =~ [ ]]; echo "rc=$?"
+rc=2
+```
+
+bash prints nothing there. The old message was the Rust library huck is built
+on, talking directly to the user.
+
+## Numbers that were refused
+
+Shell arithmetic reads a number the way C does, which means two things huck got
+wrong. A value too big for 64 bits wraps rather than failing:
+
+```bash
+# before
+$ echo $((99999999999999999999))
+huck: line 1: 99999999999999999999: integer literal out of range: 99999999999999999999
+$ echo $((0xFFFFFFFFFFFFFFFF))
+huck: line 1: 0xFFFFFFFFFFFFFFFF: hex literal out of range: 0xFFFFFFFFFFFFFFFF
+```
+
+```bash
+# after
+$ echo $((99999999999999999999))
+7766279631452241919
+$ echo $((0xFFFFFFFFFFFFFFFF))
+-1
+```
+
+Until now `-9223372036854775808` could not be written as a literal at all.
+
+And a character the number's base cannot use belongs to the number, not to
+whatever follows it — so the complaint names the whole thing:
+
+```bash
+# before
+$ echo $((12abc))
+huck: line 1: 12abc: syntax error in expression (error token is "abc")
+```
+
+```bash
+# after
+$ echo $((12abc))
+huck: line 1: 12abc: value too great for base (error token is "12abc")
+```
+
+## Still open
+
+Two findings from this pass are worth more than the fixes. Both started as
+"flaky test" and turned out to be real.
+
+A multi-line command typed at the prompt **intermittently never completes** —
+about one run in five, on an idle machine, waiting forever rather than slowly
+([#722](https://github.com/jdstanhope/huck/issues/722)). And a coproc test fails
+two runs in eight standalone, not under load as previously recorded
+([#476](https://github.com/jdstanhope/huck/issues/476)).
+
+Also open: an unmatched `[` in a pattern should be an ordinary character, and
+four of huck's five pattern consumers get that wrong — quietly, in `case` and in
+`${var#…}` ([#717](https://github.com/jdstanhope/huck/issues/717)).
