@@ -103,14 +103,21 @@ fn declare_i_existing_var_no_reeval() {
 }
 
 #[test]
-fn declare_i_on_readonly_errors() {
+fn declare_i_on_readonly_sets_the_attribute() {
+    // Used to assert this ERRORED and left the flag unset, which PINNED a
+    // divergence (#734): bash's readonly protects a variable's VALUE, not its
+    // attributes, so `readonly R=outer; declare -i R` succeeds and gives
+    // `declare -ir R="outer"`. Only a declaration carrying a VALUE is refused —
+    // see `declare_ri_on_readonly_errors_without_corrupting_attrs` below, which
+    // is the case that must still fail.
     let mut shell = Shell::new();
     shell.set("X_INT_D4", "outer".to_string());
     shell.mark_readonly("X_INT_D4");
     let (oc, _) = run_declare(&["-i", "X_INT_D4"], &mut shell);
-    assert!(matches!(oc, ExecOutcome::Continue(1)));
-    // Integer flag NOT set on a readonly var.
-    assert!(!shell.is_integer("X_INT_D4"));
+    assert!(matches!(oc, ExecOutcome::Continue(0)));
+    assert!(shell.is_integer("X_INT_D4"));
+    // The value is untouched — that is what readonly guards.
+    assert_eq!(shell.lookup_var("X_INT_D4").as_deref(), Some("outer"));
 }
 
 #[test]
