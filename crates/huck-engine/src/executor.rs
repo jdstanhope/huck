@@ -2477,7 +2477,9 @@ fn eval_test_leaf(leaf: &TestLeaf, shell: &mut Shell) -> i32 {
     match eval_test_leaf_inner(leaf, shell) {
         Ok(b) => test_status(b),
         Err(e) => {
-            {
+            // An empty message means "fail with this status, say nothing" —
+            // bash's behaviour for an uncompilable regex (#716).
+            if !e.msg.is_empty() {
                 let mut err = err_writer();
                 crate::sh_error_to!(shell, &mut *err, None, "[[: {}", e.msg);
             }
@@ -2504,7 +2506,16 @@ fn eval_test_leaf_inner(leaf: &TestLeaf, shell: &mut Shell) -> Result<bool, Test
             } else {
                 p.clone()
             };
-            let re = regex::Regex::new(&p).map_err(|e| format!("regex error: {e}"))?;
+            // #716: bash exits 2 SILENTLY on an ERE it cannot compile — it emits
+            // nothing at all. huck printed the Rust `regex` crate's multi-line
+            // parse error, caret diagram and all, which is both noise bash never
+            // produces and an implementation detail leaking into user output.
+            // An empty message is the "no diagnostic" signal; the status still
+            // says the operand was unusable.
+            let re = regex::Regex::new(&p).map_err(|_| TestError {
+                msg: String::new(),
+                status: 2,
+            })?;
             match re.captures(l) {
                 Some(caps) => {
                     // BASH_REMATCH[0] = whole matched substring; [1..] = capture
@@ -2725,6 +2736,8 @@ fn emit_for_header_arith_error(src: &str, e: &crate::arith::ArithError, shell: &
 /// carried only a message. `From<String>` keeps the non-arithmetic sites
 /// unchanged — they build a `String` and `?` lifts it at status 2.
 pub(crate) struct TestError {
+    /// The diagnostic body, WITHOUT the `[[: ` prefix. EMPTY means bash emits
+    /// nothing for this failure (#716) — the status alone reports it.
     msg: String,
     status: i32,
 }
