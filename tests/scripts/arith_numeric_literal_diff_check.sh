@@ -19,9 +19,10 @@
 # COMPARED: the diagnostic with the `$0`/`line N:` prefix stripped, plus stdout
 # and status.
 #
-# NOT compared here:
-#   - `$((99999999999999999999))`: bash WRAPS to 7766279631452241919, huck
-#     reports `integer literal out of range` (#725). Overflow, not base.
+# A literal that IS valid for its base but too large for 64 bits WRAPS, as C's
+# `intmax_t` does — `$((99999999999999999999))` is 7766279631452241919 and
+# `$((0xFFFFFFFFFFFFFFFF))` is -1 (#725). huck used to refuse those, except for
+# the hex case, which briefly answered a silent 0.
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
@@ -65,6 +66,18 @@ check 'base: 65#1'        '65#1'
 
 # --- a SPACE ends the run, so the tail is a separate token ---
 check 'space: 12 abc'     '12 abc'
+
+# --- too large for 64 bits: WRAP, do not refuse (#725) ---
+check 'wrap: decimal'     '99999999999999999999'
+check 'wrap: exactly 2^64' '18446744073709551616'
+check 'wrap: 2^63'        '9223372036854775808'
+check 'wrap: i64 min'     '-9223372036854775808'
+check 'wrap: hex all Fs'  '0xFFFFFFFFFFFFFFFF'
+check 'wrap: hex 17 Fs'   '0xFFFFFFFFFFFFFFFFF'
+check 'wrap: base 16'     '16#FFFFFFFFFFFFFFFF'
+check 'wrap: base 2'      '2#1111111111111111111111111111111111111111111111111111111111111111'
+check 'wrap: octal'       '0777777777777777777777777'
+check 'wrap: in an expr'  '0xFFFFFFFFFFFFFFFF + 1'
 
 # --- valid literals are unaffected ---
 check 'ok: decimal'       '123'
