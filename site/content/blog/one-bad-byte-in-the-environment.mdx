@@ -1,0 +1,96 @@
+---
+title: "One bad byte and the shell wouldn't start"
+date: 2026-09-03
+summary: "A single non-UTF-8 byte anywhere in the environment — in a variable huck never even looked at — crashed the shell before it ran a line. Nothing a script could do would prevent it, because the environment arrives before the script does."
+tags: ["robustness", "startup", "bash-compat"]
+---
+
+Every program you run inherits its parent's environment. You don't choose what's
+in it. Some of it was put there by your terminal, some by your login shell, some
+by a program written in C twenty years ago that never heard of Unicode.
+
+If any one of those values contained a byte that wasn't valid UTF-8, huck died:
+
+```bash
+# before
+$ env "LEGACY=$(printf 'caf\xe9')" huck -c 'echo hello'
+thread 'main' panicked at library/std/src/env.rs:168:83:
+called `Result::unwrap()` on an `Err` value: "caf\xE9"
+rc=101
+```
+
+`caf\xe9` is `café` in Latin-1, still the default encoding for a lot of older
+software and a lot of filenames. The script never mentions `LEGACY`. It just
+prints `hello`. It never got the chance.
+
+bash, in the same situation:
+
+```bash
+$ env "LEGACY=$(printf 'caf\xe9')" bash -c 'echo hello'
+hello
+```
+
+The same thing happened through arguments:
+
+```bash
+# before
+$ huck -c 'echo hello' huck "$(printf 'caf\xe9')"
+thread 'main' panicked at library/std/src/env.rs:878:51:
+called `Result::unwrap()` on an `Err` value: "caf\xE9"
+rc=101
+```
+
+## Why it was so hard to avoid
+
+Most bugs give you an out. You can quote differently, avoid a builtin, restructure
+the script. This one had none, because the environment is read *before* your
+script is. There was no line you could add to the top of a file to protect it, and
+no way to write the file that would help. If a variable three levels up the process
+tree held a stray byte, huck was dead on arrival — and the error message pointed
+into Rust's standard library, which tells you nothing about what to fix.
+
+The cause was mundane. Rust offers two ways to read the environment: one that hands
+you text and crashes if the bytes aren't valid UTF-8, and one that hands you the raw
+bytes. huck used the first, in five places. Now it uses the second.
+
+```bash
+# after
+$ env "LEGACY=$(printf 'caf\xe9')" huck -c 'echo hello'
+hello
+
+$ huck -c 'echo hello' huck "$(printf 'caf\xe9')"
+hello
+```
+
+## What's still wrong
+
+The shell now starts, which was the whole point. But it isn't yet honest about
+those bytes if you actually go looking at them. huck stores every variable's value
+as text, so a byte it can't interpret gets replaced with `�` — the replacement
+character — rather than kept.
+
+Mostly that's invisible. The trouble is that it also happens on the way *out*, to
+programs huck launches:
+
+```bash
+# bash passes the bytes through untouched
+$ env "LEGACY=$(printf 'caf\xe9')" bash -c 'env' | grep LEGACY | LC_ALL=C od -c
+0000000   L   E   G   A   C   Y   =   c   a   f 351  \n
+
+# huck substitutes the replacement character
+$ env "LEGACY=$(printf 'caf\xe9')" huck -c 'env' | grep LEGACY | LC_ALL=C od -c
+0000000   L   E   G   A   C   Y   =   c   a   f 357 277 275  \n
+```
+
+So a variable huck never reads is still altered by passing through it. A shell in
+the middle of a pipeline is supposed to be a conduit, and on this point huck isn't
+one yet. Fixing it properly means storing values as bytes rather than text
+everywhere — through expansion, through the builtins, through the code that hands
+an environment to a child process. That's a bigger change than this one, and it's
+[issue #738](https://github.com/jdstanhope/huck/issues/738).
+
+Also filed on the way past:
+[#737](https://github.com/jdstanhope/huck/issues/737), a stopwatch in the test
+harness that held a pipe open and made every test in the suite wait for its own
+timeout on machines without GNU `timeout` — which is why this fix's first test run
+looked like it had hung.
