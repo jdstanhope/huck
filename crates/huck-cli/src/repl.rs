@@ -57,8 +57,7 @@ enum ReadResult {
 /// `argv[0]` here is the REAL process argv[0] (unlike `args`, which is
 /// `argv[1..]` — see `src/main.rs`), with a `"huck"` fallback.
 fn cli_prog_name() -> String {
-    std::env::args()
-        .next()
+    huck_engine::shell::process_argv0()
         .as_deref()
         .and_then(|a0| std::path::Path::new(a0).file_name())
         .and_then(|f| f.to_str())
@@ -106,7 +105,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
     // POSIX mode: --posix, invocation as `sh`, or POSIXLY_CORRECT. Applied before
     // any program/interactive dispatch so it governs the whole session.
     {
-        let argv0 = std::env::args().next().unwrap_or_default();
+        let argv0 = huck_engine::shell::process_argv0().unwrap_or_default();
         let posix = huck_engine::shell::startup_posix(
             opts.posix,
             &argv0,
@@ -132,7 +131,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
     //
     // Both points call the same `Shell::engage_startup_restriction`.
     let restrict_at_startup = {
-        let argv0 = std::env::args().next().unwrap_or_default();
+        let argv0 = huck_engine::shell::process_argv0().unwrap_or_default();
         huck_engine::shell::startup_restricted(opts.restricted, &argv0)
     };
     if restrict_at_startup && !matches!(opts.mode, RunMode::Interactive) {
