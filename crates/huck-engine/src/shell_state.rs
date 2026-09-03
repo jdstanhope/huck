@@ -1222,7 +1222,15 @@ impl Shell {
     pub fn new() -> Self {
         let mut vars = HashMap::new();
         let mut bash_funcs: Vec<(String, String)> = Vec::new();
-        for (key, value) in std::env::vars() {
+        // `vars_os`, not `vars`: the UTF-8 iterator unwraps internally, so one
+        // non-UTF-8 byte ANYWHERE in the inherited environment killed the
+        // shell before it started (#553) — and every invocation inherits its
+        // parent's environment, so nothing a script does could prevent it.
+        // Lossy per entry; carrying the raw bytes into a child needs a
+        // byte-string value type, which is the rest of that issue.
+        for (key, value) in std::env::vars_os() {
+            let key = key.to_string_lossy().into_owned();
+            let value = value.to_string_lossy().into_owned();
             if let Some(fname) = key
                 .strip_prefix("BASH_FUNC_")
                 .and_then(|s| s.strip_suffix("%%"))
@@ -1254,9 +1262,7 @@ impl Shell {
             );
         }
         let shell_pid = unsafe { libc::getpid() };
-        let shell_argv0 = std::env::args()
-            .next()
-            .unwrap_or_else(|| "huck".to_string());
+        let shell_argv0 = crate::shell::process_argv0().unwrap_or_else(|| "huck".to_string());
         let mut shell = Self {
             vars,
             last_status: 0,

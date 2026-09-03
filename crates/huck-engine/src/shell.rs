@@ -210,6 +210,25 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
 /// POSIX mode is enabled at startup when `--posix` was passed, the shell was
 /// invoked as `sh` (argv[0] basename), or `POSIXLY_CORRECT` is in the
 /// environment. Mirrors bash's startup posix-mode triggers.
+/// The process `argv[0]`, for the invocation-name checks below and for the
+/// shell's own `$0` default. `None` only when argv is genuinely empty; each
+/// caller keeps its own fallback, which is why this does not pick one.
+///
+/// Deliberately `args_os`, not `args`: the UTF-8 iterator UNWRAPS internally,
+/// so a single byte that is not valid UTF-8 anywhere in argv panicked the
+/// shell before it ran a line (#553). argv is not input the shell controls.
+///
+/// A non-UTF-8 argument is lossy-converted (each bad byte becomes U+FFFD).
+/// That still DIVERGES from bash, which carries the raw bytes through
+/// untouched — but a corrupted name is a divergence a script can see and work
+/// around, where a dead shell is not. Carrying the bytes needs a byte-string
+/// value type throughout `Shell`, which is the second half of #553.
+pub fn process_argv0() -> Option<String> {
+    std::env::args_os()
+        .next()
+        .map(|a| a.to_string_lossy().into_owned())
+}
+
 pub fn startup_posix(cli_posix: bool, argv0: &str, posixly_correct: bool) -> bool {
     cli_posix
         || posixly_correct
