@@ -132,6 +132,38 @@ fn settle() {
     std::thread::sleep(Duration::from_millis(600));
 }
 
+/// `settle()`, plus draining the pty while it waits. Use ONLY where the pause
+/// straddles a stretch of huck's own repainting AND nothing afterwards needs
+/// the bytes emitted during it (#743).
+///
+/// Why draining is sometimes required: a pty's buffer is finite. If nothing
+/// reads the master side while huck paints, the buffer fills and huck BLOCKS
+/// mid-repaint — it is then not at the rustyline read at all, so the keystrokes
+/// the pause exists to protect get dropped anyway, and the plain sleep defeats
+/// its own purpose. macOS has smaller pty buffers than Linux, so
+/// `pty_ctrl_c_aborts_multiline_buffer` failed there while CI stayed green; the
+/// hazard is latent on both. A single-process A/B pinned it: with the pause
+/// draining the marker matches, without it the marker never arrives.
+///
+/// ⚠️ Why this is NOT the default `settle()`. Draining DISCARDS what it reads,
+/// so any later `expect()` for output produced during the window would never
+/// match — several tests here sync on exactly such output (`pty_heredoc_simple`
+/// waits for `HEREDOC_42`). It also polls rather than sleeping once, and this
+/// suite is contention-sensitive on a 1-core runner, so the extra wakeups are
+/// not worth spending where nothing is stalling. Prefer plain `settle()`; reach
+/// for this only when a pause is demonstrably stalling the writer.
+fn settle_draining(session: &mut OsSession) {
+    let deadline = std::time::Instant::now() + Duration::from_millis(600);
+    let mut buf = [0u8; 4096];
+    while std::time::Instant::now() < deadline {
+        // `try_read` does not block, so a quiet stretch costs only the sleep.
+        match session.try_read(&mut buf) {
+            Ok(n) if n > 0 => continue,
+            _ => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+}
+
 /// Builds a `(HISTFILE=...)` env pointing into `dir`, isolating
 /// history per test.
 #[allow(dead_code)]
@@ -576,9 +608,9 @@ fn pty_ctrl_c_aborts_multiline_buffer() {
     // The two remaining expects are unambiguous: the FIRST prompt, and a marker
     // that can only come from the command's output. Continuation-prompt coverage
     // is not lost — `pty_continuation_prompt_appears` asserts it directly.
-    settle();
+    settle_draining(&mut session);
     send(&mut session, CTRL_C);
-    settle();
+    settle_draining(&mut session);
     // After the abort the partial command is gone, so a fresh command runs alone.
     // `pwd` proves the cwd; the arithmetic marker proves the OUTPUT was reached
     // (it echoes as `CTRLC_$((6*7))` when typed and prints `CTRLC_42`, so a pass
