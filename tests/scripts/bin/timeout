@@ -33,9 +33,20 @@ shift
 "$@" &
 cmd_pid=$!
 
-# Watchdog: SIGTERM the command if it outlives the deadline. Its own output is
-# silenced so a kill never adds bytes to a harness's captured stream.
-( sleep "$duration" 2>/dev/null; kill -TERM "$cmd_pid" 2>/dev/null ) &
+# Watchdog: SIGTERM the command if it outlives the deadline.
+#
+# ⚠️ stdout is redirected, not just stderr, and that is load-bearing (#737).
+# Every harness captures through `$( … )`, and a command substitution does not
+# return until the write end of its pipe is closed by EVERY process holding it
+# — not merely until the foreground child exits. A background subshell that
+# inherits this script's stdout holds that pipe for as long as it lives, so
+# with only `2>/dev/null` here the `sleep` kept the capture open for the FULL
+# duration on every single call, whether or not the command had already
+# finished. `timeout 10 /bin/echo hi` took 10 s to yield "hi".
+#
+# That silently cost ~20 s per harness row (both shells) on any box falling
+# back to this shim, which made `run_diff_checks.sh` unusable on macOS.
+( sleep "$duration" 2>/dev/null; kill -TERM "$cmd_pid" 2>/dev/null ) >/dev/null 2>&1 &
 watch_pid=$!
 
 wait "$cmd_pid" 2>/dev/null
