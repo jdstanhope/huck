@@ -258,6 +258,11 @@ mod tests {
     #[test]
     fn tmpdir_comes_from_the_shell_variable() {
         let mut shell = Shell::new();
+        // `Shell::new()` imports the process environment, and macOS ALWAYS sets
+        // `TMPDIR` (to a per-user `/var/folders/…/T/` path) where Linux normally
+        // does not. Drop it so the default below is actually reached, instead of
+        // asserting against whatever the host happens to export (#745).
+        shell.unset("TMPDIR");
         assert_eq!(procsub_tmpdir(&shell), "/tmp");
 
         // A plain (unexported) assignment counts — bash honours it too.
