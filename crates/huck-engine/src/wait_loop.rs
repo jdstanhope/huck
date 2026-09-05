@@ -151,16 +151,22 @@ mod linux {
 mod macos {
     use super::*;
 
+    // Same dead-code position as the Linux twin above: the poller is not yet
+    // wired into the capture path it was written for, so nothing outside this
+    // module constructs it and only the `#[cfg(test)]` unit tests below
+    // exercise it. Annotated on the struct and impl rather than per-field, so
+    // the two stay in step; without it `clippy -D warnings` fails on macOS
+    // while passing on CI's Linux, which hid the gap (#740).
+    #[allow(dead_code)]
     pub struct WaitLoop {
         // Owned kqueue fd: its Drop closes it exactly once (#197 Class-A).
         kq: OwnedFd,
-        #[allow(dead_code)]
         pipes: Vec<RawFd>,
-        #[allow(dead_code)]
         sigchld_registered: bool,
         saved_mask: Option<libc::sigset_t>,
     }
 
+    #[allow(dead_code)]
     impl WaitLoop {
         pub fn new() -> io::Result<Self> {
             let kq = unsafe { libc::kqueue() };
