@@ -178,3 +178,28 @@ fn trap_in_function_persists_after_return() {
     let (out, _err, _) = run(script);
     assert!(out.lines().any(|l| l == "bye"), "stdout: {out}");
 }
+
+#[test]
+fn a_forking_err_trap_action_does_not_disturb_the_surrounding_status() {
+    // The ERR action's own `$?` (7 here) must not leak into the status the
+    // script observes after the failing command — that stays 42.
+    //
+    // ⚠️ This lives here, not beside `run_trap_action`'s unit tests, because the
+    // action FORKS: `(exit 7)` is a subshell, and so is the `(exit 42)` that
+    // triggers it. huck runs subshells by forking without exec, which is only
+    // safe in a single-threaded process, so `assert_single_threaded_fork()`
+    // panics if any other thread is executing shell code. In the shared lib test
+    // binary ~2000 tests run concurrently and that guard fires (macOS loses the
+    // race every time; Linux usually wins it) — see #747. Each test here spawns
+    // its OWN huck process, which is single-threaded, so forking is safe.
+    //
+    // The unit test keeps the same two assertions with a non-forking action;
+    // this row is what preserves coverage of a SUBSHELL action end to end.
+    // Verified byte-identical against bash 5.2.21.
+    let script = "trap \"(exit 7)\" ERR\n(exit 42)\necho \"after=$?\"\n";
+    let (out, _err, _) = run(script);
+    assert!(
+        out.lines().any(|l| l == "after=42"),
+        "the trap action's status leaked into the surrounding $?; stdout: {out}"
+    );
+}
