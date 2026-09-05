@@ -784,7 +784,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set_last_status(42);
         // The action's own `$?` is 7; the surrounding `$?` must be restored to 42.
-        let r = run_trap_action(&mut shell, TrapSignal::Err, "(exit 7)");
+        let r = run_trap_action(&mut shell, TrapSignal::Err, "f() { return 7; }; f");
         assert_eq!(
             r.status, 7,
             "action status must be observable to the caller"
