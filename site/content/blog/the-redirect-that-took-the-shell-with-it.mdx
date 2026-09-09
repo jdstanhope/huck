@@ -1,0 +1,135 @@
+---
+title: "The redirect that took the whole script with it"
+date: 2026-09-09
+summary: "Under set -u, one unset variable in a redirection was enough to end a huck script on the spot — silently skipping every remaining line. bash reports the same error and keeps going, and the reason it can is that the failure happened somewhere else entirely."
+tags: ["bash-compat", "redirection", "set -u"]
+---
+
+`set -u` is the option that says *an unset variable is a mistake, tell me about
+it*. Most of the time both shells tell you the same thing. Here is a case where
+they told you the same thing and then did something completely different:
+
+```bash
+# before
+$ cat > backup.sh <<'EOF'
+set -u
+cat < $SOURCE_LIST
+echo "processing done"
+echo "cleaning up"
+EOF
+
+$ bash backup.sh
+backup.sh: line 2: SOURCE_LIST: unbound variable
+processing done
+cleaning up
+
+$ huck backup.sh
+backup.sh: line 2: SOURCE_LIST: unbound variable
+```
+
+Both shells noticed the typo. bash treated it as a failed *command* and ran the
+rest of the script; huck treated it as a failed *shell* and left. The two lines
+of stderr are byte-identical, so a log that records what went wrong — and not
+the exit status — shows nothing whatsoever about the two commands that never
+happened.
+
+That is the worst shape a divergence can have. A script that quietly loses
+everything after line 2, while reporting exactly what bash reports, is a script
+that looks fine in the log.
+
+## Why bash gets to carry on
+
+The obvious theory is that bash is more relaxed about reading than writing. It
+is not, and the pair that settles it looks almost identical:
+
+```bash
+# before
+$ bash -c 'set -u; /bin/echo hi > $nope; echo SURVIVED' bash
+bash: line 1: nope: unbound variable
+SURVIVED                            # an OUTPUT redirect, and bash carries on
+
+$ bash -c 'set -u; echo hi < $nope; echo SURVIVED' bash
+bash: line 1: nope: unbound variable
+                                    # an INPUT redirect, and bash is gone
+```
+
+The direction of the arrow has nothing to do with it. What differs is `echo`:
+the first is `/bin/echo`, a program, and the second is the shell's own builtin.
+
+bash expands a command's *arguments* itself, and then, for an external program,
+it forks a child and opens the redirections **in that child**. So an unbound
+variable in a redirect word kills the child — which is exactly what a failed
+command is — and the shell it was forked from never sees the injury. For a
+builtin there is no child; the redirect is opened in the shell itself, and the
+same error is fatal to the whole thing.
+
+Everything bash runs in a child behaves the first way: an external command, a
+`( … )` subshell, a stage of a pipeline, a background job. Everything it runs in
+the shell behaves the second: a builtin, a function, a `{ … }` group, a `while`
+loop, `exec`.
+
+huck opened every redirection in the shell process, so every one of them was
+fatal — the same pair, before the fix, ends the shell both times:
+
+```bash
+# before
+$ huck -c 'set -u; /bin/echo hi > $nope; echo SURVIVED' huck; echo "rc=$?"
+huck: line 1: nope: unbound variable
+rc=127
+
+$ huck -c 'set -u; echo hi < $nope; echo SURVIVED' huck; echo "rc=$?"
+huck: line 1: nope: unbound variable
+rc=127
+```
+
+It agreed with bash on exactly the cases where bash also had no child.
+
+## After
+
+```bash
+# after
+$ huck backup.sh
+backup.sh: line 2: SOURCE_LIST: unbound variable
+processing done
+cleaning up
+```
+
+And the same split bash has, now in huck:
+
+```bash
+# after
+$ huck -c 'set -u; /bin/echo hi > $nope; echo SURVIVED' huck
+huck: line 1: nope: unbound variable
+SURVIVED
+
+$ huck -c 'set -u; echo hi < $nope; echo SURVIVED' huck
+huck: line 1: nope: unbound variable
+```
+
+The status the failed command reports matters too, because things downstream
+read it. It is the status bash's dead child would have had, which means `&&`
+and `||` branch the same way, the `ERR` trap fires once, a loop keeps looping,
+and a pipeline records it per stage — where huck used to leak an internal
+message of its own (`resolve failed with code 127`):
+
+```bash
+# after
+$ huck -c 'set -u; cat < $nope | cat; echo "PS=${PIPESTATUS[@]}"' huck
+huck: line 1: nope: unbound variable
+PS=127 0
+```
+
+## What is still open
+
+Five neighbours turned up while measuring this one, each now its own issue:
+an external *pipeline stage* still expands its command words in the shell rather
+than the child ([#753](https://github.com/jdstanhope/huck/issues/753)); a
+redirect word whose expansion already failed is still opened, adding a second
+`: No such file or directory`
+([#754](https://github.com/jdstanhope/huck/issues/754)); a non-external
+pipeline stage reports a redirect error one line early
+([#755](https://github.com/jdstanhope/huck/issues/755)); `time` is not
+implemented as a reserved word at all — huck runs GNU `/usr/bin/time`
+([#756](https://github.com/jdstanhope/huck/issues/756)); and bash has one more
+oddity of its own here, exiting 1 under `set -e` after a failure whose `$?`
+reads 127 ([#757](https://github.com/jdstanhope/huck/issues/757)).

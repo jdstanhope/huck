@@ -1428,6 +1428,17 @@ fn run_redirected(
         inner_ran.set(true);
         run_command(inner, shell)
     });
+    // #606: a `( … )` body runs in a forked child, and bash applies the trailing
+    // redirects THERE — so a fatality expanding one of their words kills that
+    // child, not the shell. Every other inner (a brace group, a loop, a
+    // function) is applied in the shell itself and stays fatal, which is why
+    // this asks the inner what it is rather than containing unconditionally.
+    let out =
+        if !inner_ran.get() && matches!(inner, Command::Subshell { .. }) && shell.fatal_pending() {
+            ExecOutcome::Continue(contain_forked_redirect_fatal(shell, 1))
+        } else {
+            out
+        };
     // #685: the inner never ran, so this status is the REDIRECT's failure and
     // nothing has adjudicated it — `Redirected` is otherwise pass-through, on
     // the grounds that the inner already did. This is the site that produced
@@ -5229,9 +5240,15 @@ fn run_exec_single_inner(cmd: &ExecCommand, shell: &mut Shell, wrapped: bool) ->
         // in the parent here; the child replays the dup2/close ops in source
         // order. This handles fd>2,
         // `<&` dup-in, `N>&-` close, and `<>` uniformly with fds 0/1/2.
+        // #606: a FATAL raised while lowering the plan belongs to the child bash
+        // would have forked, so it becomes this command's status and the shell
+        // runs on. The `Ok` arm is checked too: an unbound here-string word
+        // still yields a (empty) body, so the plan builds and `cat <<<$nope`
+        // would otherwise RUN with empty input where bash's child never execs.
         match build_child_redir_plan(&cmd.redirects, shell) {
-            Ok(plan) => run_subprocess(&resolved, plan, shell),
-            Err(code) => {
+            Ok(plan) if !shell.fatal_pending() => run_subprocess(&resolved, plan, shell),
+            outcome => {
+                let code = contain_forked_redirect_fatal(shell, outcome.err().unwrap_or(1));
                 finalize_inline_scope(snap, persistent, shell);
                 drain_procsubs(shell, procsub_base);
                 return ExecOutcome::Continue(code);
@@ -6247,6 +6264,31 @@ fn build_child_redir_plan(
     Ok(redir_plan_to_child(lower_redirects(redirects, shell)?))
 }
 
+/// Draw the fork boundary bash draws when a redirection word's expansion is
+/// FATAL — `set -u` on an unset name is the case that reaches here (#606).
+///
+/// bash expands a simple command's WORDS in the parent, then forks and applies
+/// the redirections in the CHILD for an external command, a pipeline stage and a
+/// `( … )` subshell. So the fatality kills that child: the command's status is
+/// the code the child left with — 1 from a script or stdin, 127 under `-c`,
+/// which is exactly the nounset kind's own driver substitution, so the pending
+/// code IS the answer — and the shell runs straight on. huck opens those
+/// redirects in the parent, where the same fatality would end the shell, so the
+/// boundary has to be drawn by hand.
+///
+/// ⚠️ The discriminator is the FORK, not the direction of the redirection: the
+/// issue was filed reading `cat < $nope` (survives) against `echo hi > $nope`
+/// (exits) as an input/output split, and `/bin/echo hi > $nope` (survives)
+/// against `echo hi < $nope` (exits) is the pair that refutes it. Builtins,
+/// functions, brace groups, `while` and `exec` have no child, and huck already
+/// agrees with bash on every one of them — do not route those through here.
+///
+/// Returns the status to report for the command; `fallback` is used only when
+/// no fatal was actually pending (an ordinary redirect failure, already 1).
+fn contain_forked_redirect_fatal(shell: &mut Shell, fallback: i32) -> i32 {
+    shell.take_fatal().unwrap_or(fallback)
+}
+
 /// Translate a neutral `RedirPlan` into the child dup2/close replay plan. Owned
 /// temps move into `held` (kept alive until the fork); `{var}` high fds replay a
 /// defensive same-fd op and are held (the child inherits them non-CLOEXEC).
@@ -7118,6 +7160,11 @@ fn spawn_pipeline(
         // exit-1 child at the spawn point (spawn_failed_stage) instead of the
         // real command. Infrastructure failures (make_pipe) still bail.
         let mut redirect_failed = false;
+        // #606: the status the exit-N dummy leaves with when this stage's own
+        // setup failed. 1 for an ordinary redirect failure (#145); a contained
+        // fatality overwrites it with the code bash's child would have used, so
+        // `$PIPESTATUS` reads `1 0` from a script and `127 0` under `-c`.
+        let mut failed_stage_status = 1;
 
         // ---- Build stdin fd --------------------------------------------------
         // Priority: explicit redirect on ExecCommand > prev_pipe_read > STDIN_FILENO.
@@ -7413,6 +7460,24 @@ fn spawn_pipeline(
             None
         };
 
+        // #606: every word this stage owns — its stdin redirect above and, for an
+        // external stage, its whole plan — has now been expanded, and bash did
+        // all of it in the forked child. Contain a fatality here so it fails only
+        // this stage (the #145 dummy) instead of ending the shell.
+        //
+        // ⚠️ `runs_in_shell` is the lastpipe exemption, and it is NOT covered by
+        // the `continue` above: an unbound stdin word expands to the EMPTY field,
+        // whose open fails, so `redirect_failed` is already set and the lastpipe
+        // branch is skipped — the stage reaches here even though bash ran it in
+        // the shell. Measured: `shopt -s lastpipe; echo A | read x < $nope` ends
+        // bash, while `echo A | cat < $nope` (an external last stage, which bash
+        // still forks to exec) survives in both.
+        let runs_in_shell = is_last && lastpipe && !stage_is_external;
+        if shell.fatal_pending() && !runs_in_shell {
+            redirect_failed = true;
+            failed_stage_status = contain_forked_redirect_fatal(shell, 1);
+        }
+
         // ---- Build stdout fd -------------------------------------------------
         // Priority: explicit redirect > inter-stage pipe > Capture sink pipe > STDOUT_FILENO.
         let stdout: ChildFd = if !is_last {
@@ -7509,7 +7574,13 @@ fn spawn_pipeline(
             // 1, so downstream reads EOF, upstream (if it fed this stage) gets
             // SIGPIPE, and $PIPESTATUS records 1 — matching bash's per-stage
             // failure. child_stdio is consumed HERE (not by the real spawners).
-            match spawn_failed_stage(shell, child_stdio, pgid_target, &fds_to_close_in_child) {
+            match spawn_failed_stage(
+                shell,
+                child_stdio,
+                pgid_target,
+                &fds_to_close_in_child,
+                failed_stage_status,
+            ) {
                 Ok(pid) => pid,
                 Err(_) => {
                     // fork() failed => genuine infrastructure failure: abort.
@@ -8863,7 +8934,9 @@ pub fn fork_and_run_in_subshell(
 
 /// Fork a "failed pipeline stage": a child that inherits this stage's stdio
 /// (its inter-stage pipe ends), joins the job's process group, closes every
-/// OTHER parent-held pipe fd, and immediately `_exit(1)`. It runs no command and
+/// OTHER parent-held pipe fd, and immediately `_exit(status)` — 1 for an
+/// ordinary redirect failure, or the code a contained fatality (#606) would have
+/// left the child with. It runs no command and
 /// prints nothing — the redirect error was already reported by the parent. Its
 /// exit closes the pipe ends it holds, giving downstream EOF and upstream
 /// SIGPIPE, reproducing bash's per-stage redirect failure (#145). Unlike
@@ -8874,6 +8947,7 @@ fn spawn_failed_stage(
     stdio: ChildStdio,
     pgid_target: i32,
     parent_fds_to_close: &[RawFd],
+    status: i32,
 ) -> Result<i32, io::Error> {
     let _ = shell; // reserved for symmetry with the other spawners
     flush_stdout();
@@ -8903,7 +8977,7 @@ fn spawn_failed_stage(
                     libc::close(fd);
                 }
             }
-            libc::_exit(1);
+            libc::_exit(status);
         }
     }
     if pgid_target >= 0 {
