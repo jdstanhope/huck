@@ -7192,6 +7192,19 @@ fn spawn_pipeline(
         // `$PIPESTATUS` reads `1 0` from a script and `127 0` under `-c`.
         let mut failed_stage_status = 1;
 
+        // #69/#755: stamp the stage's own line BEFORE anything it owns is
+        // expanded, so every diagnostic from this stage carries `line N:`.
+        // It used to be stamped only in the external branch below, which sits
+        // after the stdin section — so a BUILTIN stage's stdin error was
+        // reported at whatever line was last stamped, one line early:
+        // `echo FIRST` on line 2, `echo hi < /nonexistent | cat` on line 3, and
+        // huck said line 2. An external stage (`cat < …`), a brace-group stage
+        // and a single command were all already right, which is why this is the
+        // stage loop's job rather than the stdin section's.
+        if let Some(l) = command_line(stage_cmd).filter(|&l| l != 0) {
+            shell.current_lineno = shell.line_base() + l;
+        }
+
         // ---- Build stdin fd --------------------------------------------------
         // Priority: explicit redirect on ExecCommand > prev_pipe_read > STDIN_FILENO.
         // For InProcess compound stages, there are no explicit redirects at the
@@ -7484,12 +7497,7 @@ fn spawn_pipeline(
         let mut external_resolved: Option<ResolvedCommand> = None;
         let external_plan: Option<ChildRedirPlan> = if stage_is_external && !redirect_failed {
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                // #69: stamp the stage's line so a word or redirect-open error
-                // carries `line N:` (mirrors the single-command path at
-                // executor.rs:4550).
-                if exec.line != 0 {
-                    shell.current_lineno = shell.line_base() + exec.line;
-                }
+                // (#69's stamp for this stage happened at the top of the loop.)
                 match resolve(exec, shell, &mut *err_writer()) {
                     Ok(Some(r)) => external_resolved = Some(r),
                     // #62: the program word split to ZERO fields. Keeps the

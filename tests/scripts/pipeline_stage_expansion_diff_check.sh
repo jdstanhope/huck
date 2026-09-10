@@ -23,12 +23,16 @@
 # failed stage is still visible — the PIPELINE's own status is the last stage's
 # and says nothing about the one that died.
 #
-# NOT here, each its own divergence: a non-external stage's stdin error is
-# reported one line early (#755), so the builtin-stage rows run on the `-c`
-# driver, where both shells say line 1; and a redirect word whose expansion
-# errored is still opened, adding `: No such file or directory` (#754), so the
-# arithmetic rows use a WORD rather than a redirect target. Which side of the
-# fork a REDIRECT word lands on is `redirect_word_fork_diff_check.sh` (#606).
+# The LINE a stage names is here too (#755): its own line was stamped only in
+# the external branch, which runs after the stdin section, so a BUILTIN stage's
+# stdin error was reported at whatever line was stamped last — one early. The
+# `line N` rows below put the stage on line 3 of a 3-line script, which is the
+# only way to tell a right line from a stale one.
+#
+# NOT here: a redirect word whose expansion errored is still opened, adding
+# `: No such file or directory` (#754), so the arithmetic rows use a WORD rather
+# than a redirect target. Which side of the fork a REDIRECT word lands on is
+# `redirect_word_fork_diff_check.sh` (#606).
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
@@ -59,6 +63,17 @@ check_script() {
 check() {
     check_c "$1" "$2"
     check_script "$1" "$2"
+}
+
+# DRIVER 3 — a script whose fragment sits on line 3, so the `line N:` prologue
+# of every diagnostic is compared against a line that is neither the first nor
+# the last (#755).
+check_line() {
+    local label="$1" frag="$2" b h
+    printf 'set -u\necho FIRST\n%s\necho LAST\n' "$frag" > "$TMP/l.sh"
+    b=$(cd "$TMP" && timeout 10 "$BASH_BIN" --norc --noprofile l.sh 2>&1; echo "EXIT:$?")
+    h=$(cd "$TMP" && timeout 10 "$HUCK_BIN" l.sh 2>&1; echo "EXIT:$?")
+    compare "line: $label" "$b" "$h"
 }
 
 # --- #753: an unbound name in a stage's WORDS fails only that stage ----------
@@ -101,6 +116,16 @@ check "single, once"          '/bin/echo $(echo TICK >&2)'
 
 # --- lastpipe: the last stage runs in the shell, so it is NOT contained -----
 check_c "lastpipe builtin"    'shopt -s lastpipe; echo A | read x < $nope'
+
+# --- #755: the line a stage names is its OWN --------------------------------
+check_line "builtin stage open"  'echo hi < /nonexistent-xyz | cat'
+check_line "builtin stage word"  'echo hi < $nope | cat'
+check_line "external stage open" 'cat < /nonexistent-xyz | cat'
+check_line "external stage word" 'cat $nope | cat'
+check_line "brace group stage"   '{ echo hi; } < /nonexistent-xyz | cat'
+check_line "loop stage"          'echo A | while read l; do :; done < /nonexistent-xyz'
+check_line "last stage builtin"  'echo A | read x < /nonexistent-xyz'
+check_line "single command"      'echo hi < /nonexistent-xyz'
 check "lastpipe external"     'shopt -s lastpipe; echo A | cat $nope'
 
 # --- the status consumers still see the stage's failure ---------------------

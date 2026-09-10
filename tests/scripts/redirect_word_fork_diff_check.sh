@@ -26,13 +26,11 @@
 # NOT here, each its own divergence: an external pipeline stage's command WORDS
 # (`cat $nope | cat`), which bash also expands in the child — fixed since, and
 # covered by `pipeline_stage_expansion_diff_check.sh` (#753/#760, which also
-# owns the ORDER of a stage's words against its redirections); a redirect word
-# whose expansion
+# owns the ORDER of a stage's words against its redirections, and the line a
+# stage names, #755); a redirect word whose expansion
 # errored but still yields a field (`cat < $((1/0))`), which huck goes on to
 # open, adding a second `: No such file or directory` (#754); a non-external
-# stage's stdin error, which huck reports one line early (#755), so the
-# `builtin stage` row below runs on the `-c` driver only, where both shells say
-# line 1 regardless; `time cat < $nope`, where huck runs GNU `/usr/bin/time`
+# `time cat < $nope`, where huck runs GNU `/usr/bin/time`
 # rather than the reserved word (#756); and errexit's own status under `-c`,
 # where bash leaves with 1 after a contained failure whose `$?` reads 127
 # (#757), so the `errexit` row runs on the script driver only.
@@ -88,7 +86,7 @@ check "subshell inside"      '( : < $nope )'
 check "background"           'cat < $nope & wait'
 check "pipeline stage"       'cat < $nope | cat'
 check "pipeline pipestatus"  'cat < $nope | cat; echo "PS=${PIPESTATUS[@]}"'
-check_c "builtin stage"      'echo hi < $nope | cat'
+check "builtin stage"        'echo hi < $nope | cat'
 # lastpipe moves the LAST stage into the shell itself — but only when it can run
 # there. A builtin last stage is not forked, so the fatality still ends the
 # shell; an external one is still forked to exec, so it is still contained.
