@@ -1288,10 +1288,7 @@ fn classify_stage_external_for_unknown_command() {
     // `cat` is not a builtin and not in functions → External.
     let shell = Shell::new();
     let cmd = simple_exec_cmd("cat");
-    assert!(matches!(
-        classify_stage(&cmd, &shell),
-        StageKind::External(_)
-    ));
+    assert!(matches!(classify_stage(&cmd, &shell), StageKind::External));
 }
 
 #[test]

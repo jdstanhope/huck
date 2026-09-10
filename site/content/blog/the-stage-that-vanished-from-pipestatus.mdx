@@ -1,0 +1,118 @@
+---
+title: "The stage that vanished from PIPESTATUS"
+date: 2026-09-10
+summary: "A pipeline stage that failed while being set up did not merely fail — it took the pipeline with it, leaked an internal error message, and left no trace of itself in PIPESTATUS. The cause was a question of when, not what: huck expanded a stage's words last, where bash expands them first."
+tags: ["bash-compat", "pipelines", "expansion"]
+---
+
+Last time, an unset variable in a redirection ended the whole shell, and the fix
+was to notice which side of bash's `fork` the failure happened on. Same shell,
+same option, one pipe added:
+
+```bash
+# before
+$ cat > count.sh <<'EOF'
+set -u
+grep root $PASSWD_FILE | wc -l
+echo "PS=${PIPESTATUS[@]} st=$?"
+EOF
+
+$ bash count.sh
+count.sh: line 2: PASSWD_FILE: unbound variable
+0
+PS=1 0 st=0
+
+$ huck count.sh
+count.sh: line 2: PASSWD_FILE: unbound variable
+count.sh: line 2: resolve failed with code 1
+```
+
+Three things go wrong in those two lines. The script ends where bash carries on.
+`resolve failed with code 1` is not a shell diagnostic at all — it is huck's own
+internal plumbing, printed at the user. And in the cases where the script did
+survive, the stage that failed was simply *gone*:
+
+```bash
+# before
+$ cat > subst.sh <<'EOF'
+set -u
+cat ${x!} | cat
+echo "PS=${PIPESTATUS[@]} st=$?"
+EOF
+
+$ huck subst.sh
+subst.sh: line 2: ${x!}: bad substitution
+subst.sh: line 2: resolve failed with code 1
+PS=0 st=1
+```
+
+bash reports `PS=1 0` there — first stage failed, second succeeded, pipeline
+status 0. huck reported a one-element `PIPESTATUS` describing a pipeline that
+never ran, and gave the whole thing status 1. `PIPESTATUS` is the only place a
+dead stage is still visible, since the pipeline's own status belongs to the last
+stage; losing the entry loses the failure.
+
+## When, not what
+
+bash forks every stage and does all of that stage's work in the child: expand
+the words, then open the redirections, then exec. huck expanded an external
+stage's words **last** — at the moment it spawned the process, after the
+redirections were already open. By then the failure had nowhere to go: it was
+past the point where a stage can be failed on its own, so it came back as an
+internal error and took the pipeline down.
+
+The same ordering shows up with no failure at all, if you put a side effect on
+each side of the redirect:
+
+```bash
+# before
+$ bash -c '/bin/echo $(echo WORD >&2) > /dev/null$(echo REDIR >&2) | cat'
+WORD
+REDIR
+
+$ huck -c '/bin/echo $(echo WORD >&2) > /dev/null$(echo REDIR >&2) | cat'
+REDIR
+WORD
+```
+
+Backwards — and worse than backwards when the redirection fails, because then
+huck never ran the word's substitution at all.
+
+Moving that resolution to the front of the stage's setup fixes both: the words
+now go first, like bash's, and they land inside the same fork boundary the
+redirections got last time, so a failure in them fails one stage.
+
+```bash
+# after
+$ huck count.sh
+count.sh: line 2: PASSWD_FILE: unbound variable
+0
+PS=1 0 st=0
+
+$ huck subst.sh
+subst.sh: line 2: ${x!}: bad substitution
+PS=1 0 st=0
+
+$ huck -c '/bin/echo $(echo WORD >&2) > /dev/null$(echo REDIR >&2) | cat'
+WORD
+REDIR
+```
+
+The one thing that had to stay exactly where it was: the words are resolved
+**once**. They can hold command substitutions, so resolving them a second time
+would run them a second time — and the `lastpipe` stage, which bash runs in the
+shell rather than a child, is deliberately left to be resolved by the path that
+already handles it.
+
+## What is still open
+
+From the same family: a redirect word whose expansion already failed is still
+opened, adding a stray `: No such file or directory`
+([#754](https://github.com/jdstanhope/huck/issues/754)); an in-process stage
+reports a redirect error one line early
+([#755](https://github.com/jdstanhope/huck/issues/755)); `time` is not
+implemented as a reserved word
+([#756](https://github.com/jdstanhope/huck/issues/756)); and when huck quotes a
+word back at you, a redirection inside a `$( )` goes missing —
+`$(echo X 1>&2)` prints as `$(echo X)`
+([#761](https://github.com/jdstanhope/huck/issues/761)).

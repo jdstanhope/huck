@@ -23,9 +23,11 @@
 # fragment; and the status a contained child reports is driver-dependent (1 from
 # a script, 127 under `-c`), which only the `-c` driver pins.
 #
-# NOT here, each its own divergence and none of them settled by this round: an
-# external pipeline stage's command WORDS (`cat $nope | cat`), which bash also
-# expands in the child and huck does not (#753); a redirect word whose expansion
+# NOT here, each its own divergence: an external pipeline stage's command WORDS
+# (`cat $nope | cat`), which bash also expands in the child — fixed since, and
+# covered by `pipeline_stage_expansion_diff_check.sh` (#753/#760, which also
+# owns the ORDER of a stage's words against its redirections); a redirect word
+# whose expansion
 # errored but still yields a field (`cat < $((1/0))`), which huck goes on to
 # open, adding a second `: No such file or directory` (#754); a non-external
 # stage's stdin error, which huck reports one line early (#755), so the
