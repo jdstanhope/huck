@@ -34,6 +34,13 @@
 # rather than the reserved word (#756); and errexit's own status under `-c`,
 # where bash leaves with 1 after a contained failure whose `$?` reads 127
 # (#757), so the `errexit` row runs on the script driver only.
+#
+# What a redirect word does AFTER its expansion reported is here (#754): an
+# arithmetic failure hands back the EMPTY string rather than no field at all, so
+# huck went on to open it and printed `: No such file or directory` beneath
+# bash's own message. The `ambiguous redirect` rows below are the other half of
+# that pair — a word that expands to nothing, or to several fields, still has to
+# reach that diagnostic.
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
@@ -117,5 +124,20 @@ check "comsub"               'v=$(cat < $nope); echo "v=[$v]"'
 # --- an empty expansion is still an ambiguous redirect, not this ---
 check "empty not unbound"    'e=; cat < $e'
 check "set +u"               'set +u; cat < $nope'
+
+# --- #754: a word whose expansion ERRORED is not opened afterwards ---
+check "arith in read word"   'cat < $((1/0))'
+check "arith in write word"  'echo hi > $((1/0))'
+check "arith builtin read"   'echo hi < $((1/0))'
+check "arith with 2>"        'echo hi > $((1/0)) 2>/dev/null'
+check "arith in a stage"     'cat < $((1/0)) | cat'
+check "arith last stage"     'echo A | cat < $((1/0))'
+check "arith via variable"   'v=$((1/0)); echo hi > $v'
+check "bad subst word"       'cat < ${x!}'
+
+# --- ... and the ambiguous-redirect path still fires where it should ---
+check "many fields"          'a=(1 2); echo hi > ${a[@]}'
+check "unset word"           'set +u; echo hi > $empty'
+check "unmatched glob"       'echo hi > *.no-such-glob-xyz'
 
 harness_summary
