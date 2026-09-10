@@ -3414,22 +3414,33 @@ fn expand_single(
     // We call `expand` directly and require exactly one field, preserving the
     // ambiguous-redirect contract for word-splitting that produces 0 or >1.
     let fields = expand(word, shell);
+    // #754: the expansion REPORTED an error and still handed back a field. An
+    // arithmetic failure is the shape that does it — `$((1/0))` yields the empty
+    // string — and opening that empty name added a second, invented
+    // `: No such file or directory` under bash's own message. bash abandons the
+    // redirection at the error, so there is nothing more to say here: the
+    // diagnostic is already out, and the discard/fatal already fails the command.
+    // (`set -u` and a bad substitution hand back NO field and fall to the arm
+    // below, which is why only the arithmetic shapes showed the extra line.)
+    if shell.fatal_pending() || shell.discard_pending() {
+        return Err(());
+    }
     if fields.len() == 1 {
         Ok(fields.into_iter().next().unwrap().chars)
     } else {
-        // #606: when the expansion ITSELF failed and reported — `set -u` on an
-        // unset name is the case that reaches here — bash prints that message
-        // and stops. huck used to add `$nope: ambiguous redirect` on top,
-        // naming a word that never got the chance to be ambiguous.
-        if !(shell.fatal_pending() || shell.discard_pending()) {
-            crate::sh_error_to!(
-                shell,
-                err,
-                None,
-                "{}: ambiguous redirect",
-                crate::expand::reconstruct_word_source(word)
-            );
-        }
+        // #606: an expansion that FAILED and reported (`set -u` on an unset
+        // name) hands back no field at all. bash prints that message and stops;
+        // huck used to add `$nope: ambiguous redirect` on top, naming a word
+        // that never got the chance to be ambiguous. The pending check above
+        // has already returned for that case — this arm is now reached only by
+        // a genuine 0-or-many split, which IS bash's ambiguous redirect.
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "{}: ambiguous redirect",
+            crate::expand::reconstruct_word_source(word)
+        );
         Err(())
     }
 }

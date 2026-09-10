@@ -1,0 +1,100 @@
+---
+title: "Two diagnostics that lied"
+date: 2026-09-10
+summary: "The tail of a five-round bug hunt: an error message that pointed at the wrong line of your script, and a second message that described a file you never named. Neither changed what the shell did — which is exactly why they were worth fixing."
+tags: ["bash-compat", "diagnostics", "pipelines"]
+---
+
+The last two rounds of this cascade fixed nothing about what huck *does*. Both
+were about what it *says* when something goes wrong — and a shell that reports
+the wrong thing costs you the ten minutes you spend believing it.
+
+## The line number that was off by one
+
+```bash
+# before
+$ cat > two.sh <<'EOF'
+set -u
+echo "starting"
+read line < $LIST | cat
+EOF
+
+$ bash two.sh
+starting
+two.sh: line 3: LIST: unbound variable
+
+$ huck two.sh
+starting
+two.sh: line 2: LIST: unbound variable
+```
+
+Line 2 is `echo "starting"` — a line with no variables on it at all. Follow that
+report into a long script and you are reading the wrong command, wondering how
+it could possibly be the one at fault.
+
+The stale number came from a stage of a pipeline never announcing its own line.
+huck stamps the current line when it sets up an *external* stage, but the same
+stamp never happened for a stage the shell runs itself — a builtin like `read`,
+here — so the error carried whatever line had been stamped last. Its three
+neighbours (an external stage, a `{ … }` group, a plain command with no pipe)
+were all correct already, which is what pointed at the stage loop as the place
+that owed the stamp.
+
+```bash
+# after
+$ huck two.sh
+starting
+two.sh: line 3: LIST: unbound variable
+```
+
+## The file that was never named
+
+```bash
+# before
+$ cat > div.sh <<'EOF'
+n=0
+cat < $((10/n))
+EOF
+
+$ bash div.sh
+div.sh: line 2: 10/n: division by 0 (error token is "n")
+
+$ huck div.sh
+div.sh: line 2: 10/n: division by 0 (error token is "n")
+div.sh: line 2: : No such file or directory
+```
+
+The arithmetic is wrong, both shells say so, and then huck says something else.
+There is no file in that command — the second line is the shell reporting that
+it could not open a filename that is the empty string, which is what the failed
+arithmetic left behind.
+
+That is the whole bug: an expansion that fails still has to hand *something*
+back, and for arithmetic that something is the empty string. huck took the empty
+string as a filename and tried to open it. bash abandons the redirection at the
+error and says nothing further.
+
+```bash
+# after
+$ huck div.sh
+div.sh: line 2: 10/n: division by 0 (error token is "n")
+```
+
+The fix had to keep the neighbouring case working, and it is a near-miss worth
+naming: a word that expands to *nothing* — `echo hi > $unset` — or to *several*
+fields is genuinely bash's `ambiguous redirect`, and that message still has to
+appear. The difference is whether an error was already reported. Only when
+nothing has gone wrong yet does an unusable word deserve a complaint of its own.
+
+## What this cascade fixed, end to end
+
+Five rounds from one issue: a redirection failing under `set -u` ended the whole
+shell instead of the command; a pipeline stage's words were expanded last
+instead of first, so a failure in them took the pipeline down, leaked an
+internal message and erased the stage from `PIPESTATUS`; and these two
+diagnostics. Still open from the same hunt: `time` is not implemented as a
+reserved word ([#756](https://github.com/jdstanhope/huck/issues/756)), a
+redirection inside a `$( )` goes missing when huck quotes a word back at you
+([#761](https://github.com/jdstanhope/huck/issues/761)), and bash has an
+oddity of its own where `set -e` exits 1 after a failure whose `$?` reads 127
+([#757](https://github.com/jdstanhope/huck/issues/757)).
