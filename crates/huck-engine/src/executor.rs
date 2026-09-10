@@ -6289,6 +6289,32 @@ fn contain_forked_redirect_fatal(shell: &mut Shell, fallback: i32) -> i32 {
     shell.take_fatal().unwrap_or(fallback)
 }
 
+/// The same boundary for a PIPELINE STAGE, which also swallows a pending
+/// DISCARD (#753/#760).
+///
+/// A stage is wholly bash's child — its words and its redirections alike — so
+/// nothing that happens while setting one up may unwind the parent's command
+/// list. That is the difference from `contain_forked_redirect_fatal`, which
+/// runs where the shell itself is still executing the command and leaves a
+/// discard alone (a single `cat < ${x!}` already agrees with bash).
+///
+/// Measured — `${x!}` raises a discard rather than a fatal, and the stage still
+/// only fails itself:
+///
+/// ```text
+///   cat < ${x!} | cat   ->   message, PIPESTATUS "1 0", pipeline status 0
+///   cat ${x!}   | cat   ->   message, PIPESTATUS "1 0", pipeline status 0
+/// ```
+///
+/// huck used to let both reach the spawn, where `resolve` refused, the raw
+/// `resolve failed with code 1` leaked, and the whole pipeline was abandoned —
+/// so the failed stage was missing from `$PIPESTATUS` entirely.
+fn contain_forked_stage_unwind(shell: &mut Shell, fallback: i32) -> i32 {
+    let code = shell.take_fatal().unwrap_or(fallback);
+    shell.take_discard();
+    code
+}
+
 /// Translate a neutral `RedirPlan` into the child dup2/close replay plan. Owned
 /// temps move into `held` (kept alive until the fork); `{var}` high fds replay a
 /// defensive same-fd op and are held (the child inherits them non-CLOEXEC).
@@ -7152,7 +7178,7 @@ fn spawn_pipeline(
         // Simple(Exec) stage can be EITHER kind (external program vs builtin), so we
         // must key the base on the classification, not on Simple-vs-Compound.
         let kind = classify_stage(stage_cmd, shell);
-        let stage_is_external = matches!(&kind, StageKind::External(_));
+        let stage_is_external = matches!(&kind, StageKind::External);
 
         // #145: a stage's OWN redirect setup failing must fail only this stage,
         // not the whole pipeline. On such a failure we print (already done), set
@@ -7437,20 +7463,64 @@ fn spawn_pipeline(
         // stage from ever seeing EOF. Since #169 there is no fork:
         // `heredoc_body_to_fd` delivers the body in this process and returns a
         // single read-only fd. Nothing here depends on running first.
+        //
+        // #753/#760: the stage's WORDS are resolved HERE, immediately before its
+        // redirections, for two reasons that are one root. bash expands a
+        // command's words and THEN its redirections — measured with a
+        // side-effect on each side (`/bin/echo $(echo WORD >&2) > $(echo REDIR
+        // >&2) | cat` prints WORD then REDIR) — and huck used to resolve them
+        // inside `spawn_external_with_fds`, i.e. after the plan, so a failing
+        // redirect meant the word's substitution never ran at all. Resolving
+        // here also brings the words inside the containment below, where an
+        // unbound one fails just this stage; at the spawn they were past it, and
+        // `resolve`'s refusal surfaced as the raw `resolve failed with code 1`
+        // while the whole pipeline was abandoned — dropping the failed stage
+        // from `$PIPESTATUS`.
+        //
+        // ⚠️ Resolve EXACTLY ONCE. The words may hold command substitutions, so
+        // a second resolution is a second execution (#220). The lastpipe last
+        // stage `continue`s above and is resolved by `run_command` instead,
+        // which is why this sits after that branch and not before it.
+        let mut external_resolved: Option<ResolvedCommand> = None;
         let external_plan: Option<ChildRedirPlan> = if stage_is_external && !redirect_failed {
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                // #69: stamp the stage's line so a redirect-open error carries
-                // `line N:` (mirrors the single-command path at executor.rs:4550).
+                // #69: stamp the stage's line so a word or redirect-open error
+                // carries `line N:` (mirrors the single-command path at
+                // executor.rs:4550).
                 if exec.line != 0 {
                     shell.current_lineno = shell.line_base() + exec.line;
                 }
-                match build_child_redir_plan(&exec.redirects, shell) {
-                    Ok(p) => Some(p),
-                    Err(_) => {
-                        // #145: error already reported by build_child_redir_plan;
-                        // fail ONLY this stage and fall through to the exit-1 child.
+                match resolve(exec, shell, &mut *err_writer()) {
+                    Ok(Some(r)) => external_resolved = Some(r),
+                    // #62: the program word split to ZERO fields. Keeps the
+                    // prior behavior — an empty program flows to the
+                    // NotRunnable diagnostic at the spawn.
+                    Ok(None) => {
+                        external_resolved = Some(ResolvedCommand {
+                            program: String::new(),
+                            args: Vec::new(),
+                            decl_args: None,
+                        })
+                    }
+                    Err(code) => {
+                        // The error is already reported. bash's child dies here,
+                        // before it opens a single redirection, so this stage
+                        // fails and the plan below is not built.
                         redirect_failed = true;
-                        None
+                        failed_stage_status = contain_forked_stage_unwind(shell, code);
+                    }
+                }
+                if redirect_failed {
+                    None
+                } else {
+                    match build_child_redir_plan(&exec.redirects, shell) {
+                        Ok(p) => Some(p),
+                        Err(_) => {
+                            // #145: error already reported by build_child_redir_plan;
+                            // fail ONLY this stage and fall through to the exit-1 child.
+                            redirect_failed = true;
+                            None
+                        }
                     }
                 }
             } else {
@@ -7472,10 +7542,14 @@ fn spawn_pipeline(
         // the shell. Measured: `shopt -s lastpipe; echo A | read x < $nope` ends
         // bash, while `echo A | cat < $nope` (an external last stage, which bash
         // still forks to exec) survives in both.
+        //
+        // #753: a DISCARD is contained here too, not just a fatal. `${x!}` in a
+        // redirect word raises one, and it used to survive to the spawn, where
+        // `resolve` refused it and the pipeline was abandoned wholesale.
         let runs_in_shell = is_last && lastpipe && !stage_is_external;
-        if shell.fatal_pending() && !runs_in_shell {
+        if (shell.fatal_pending() || shell.discard_pending()) && !runs_in_shell {
             redirect_failed = true;
-            failed_stage_status = contain_forked_redirect_fatal(shell, 1);
+            failed_stage_status = contain_forked_stage_unwind(shell, 1);
         }
 
         // ---- Build stdout fd -------------------------------------------------
@@ -7597,8 +7671,8 @@ fn spawn_pipeline(
             }
         } else {
             let spawn_result = match kind {
-                StageKind::External(simple) => spawn_external_with_fds(
-                    simple,
+                StageKind::External => spawn_external_with_fds(
+                    external_resolved.expect("external stage always resolved above"),
                     shell,
                     child_stdio,
                     pgid_target,
@@ -9071,20 +9145,21 @@ fn spawn_command_error_stage(
 /// assignment-only stages) → `InProcess`.
 ///
 enum StageKind<'a> {
-    /// A `SimpleCommand::Exec` that resolves to an external binary.
-    External(&'a SimpleCommand),
+    /// A `SimpleCommand::Exec` that resolves to an external binary. Carries
+    /// nothing: the stage loop resolves such a stage's words itself (#753), so
+    /// the command it named here had no reader left.
+    External,
     /// Everything else: builtins, functions, compounds, dynamic program words.
     InProcess(&'a Command),
 }
 
 fn classify_stage<'a>(cmd: &'a Command, shell: &Shell) -> StageKind<'a> {
-    if let Command::Simple(simple) = cmd
-        && let SimpleCommand::Exec(exec) = simple
+    if let Command::Simple(SimpleCommand::Exec(exec)) = cmd
         && let Some(prog) = exec.program_static_text()
         && !shell.functions.contains_key(&prog)
         && !builtins::builtin_active(&prog, shell)
     {
-        return StageKind::External(simple);
+        return StageKind::External;
     }
     StageKind::InProcess(cmd)
 }
@@ -9181,7 +9256,7 @@ fn classify_command_runnability(
 ///
 #[allow(clippy::too_many_arguments)]
 fn spawn_external_with_fds(
-    cmd: &SimpleCommand,
+    resolved: ResolvedCommand,
     shell: &mut Shell,
     stdio: ChildStdio,
     pgid_target: i32,
@@ -9193,25 +9268,10 @@ fn spawn_external_with_fds(
     flush_stdout();
     use std::os::unix::process::CommandExt;
 
-    let SimpleCommand::Exec(exec) = cmd else {
-        // Assign-only stages are classified as InProcess by classify_stage;
-        // reaching here is a caller bug.
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "spawn_external_with_fds called on Assign stage",
-        ));
-    };
-
-    // Resolve (expand) the command — same path as run_exec_single / run_multi_stage.
-    // A zero-field program in a pipeline stage (#62 `Ok(None)`) keeps the prior
-    // behavior here: an empty program flows to the NotRunnable diagnostic below.
-    let resolved = resolve(exec, shell, &mut *err_writer())
-        .map_err(|code| io::Error::other(format!("resolve failed with code {code}")))?
-        .unwrap_or(ResolvedCommand {
-            program: String::new(),
-            args: Vec::new(),
-            decl_args: None,
-        });
+    // #753/#760: the caller resolved the words — BEFORE this stage's redirections,
+    // which is bash's order, and early enough that a failure fails only the stage.
+    // Resolving here meant neither, and a refusal had nowhere to go but an
+    // `io::Error` that surfaced as `resolve failed with code N`.
 
     // #78: if the program can't be run, don't spawn — fork a diagnostic child
     // that prints `<name>: <reason>` to the stage's own (redirected) fd 2 and
