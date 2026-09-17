@@ -23,7 +23,7 @@ changes a shared subsystem's semantics and gets a spec + plan + hand-off PR.
 
 | # | Hub | Closes | Shape | Status |
 |---|-----|--------|-------|--------|
-| 1 | Job table: report-then-prune + `set -m`-aware fork dispositions | #475 #185 #476 #758 #200 #428 (+ #158 residuals) | bug-fix rounds | |
+| 1 | Job table: bash's five cleanup points + stored `+`/`-` | #475 #758 (round 1, PR #769); #185 next; #766 #478 fork dispositions | bug-fix rounds | round 1 ✅ |
 | 4 | One AST printer (retire `reconstruct_word_source`'s own renderer) | #761 #124 #589 | bug-fix rounds | |
 | 5 | One pattern-compile chokepoint | #717 #303 (#589 seam) | bug-fix round | |
 | 2A | Declared-but-unset variable state | #600 #225 #33 #691 | vNN | |
@@ -59,10 +59,21 @@ Every issue here is that one difference seen from a different angle:
 2026-09-17; only its residuals remain (`%1` as a bare command resumes the job in
 bash; `%string` / `%?substr` matching).
 
-**Why it is one hub:** `JobState` already has `Running | Stopped | Done |
-Signaled`; what is missing is a *notified* bit and the rule that pruning follows
-notification, not reaping. Once that exists #475, #185 and the three flakes are
-the same fix, and #428 is a one-condition change at the fork site.
+**Why it is one hub — corrected by round 1 (2026-09-17):** the *notified*
+bit already existed. What huck had that bash does not was a FUSED
+reap+report+prune pass between every command. bash reaps whenever `SIGCHLD`
+arrives and reports/prunes at exactly five points — the end of a foreground
+`wait_for`, `jobs`, each loop iteration (`REAP()`), `wait`, and every new
+input line the parser reads (`parse.y shell_getc`) — and what it reports
+splits on `startup_state`: a script file (or piped stdin) reports a
+background job only when a signal killed it; `-c` marks a normal exit
+reported silently. Round 1 ported that, plus bash's stored `j_current`/
+`j_previous` (a dead job keeps `+`; a stop takes it), `max+1` job numbering,
+`kill`'s re-arm/skip-dead rules, and job-control-gated `WUNTRACED`. #428's
+headline turned out already fixed; #200 is a test-hygiene item whose fix
+landed earlier. Round 2 (#185): `coproc_reap` belongs inside
+`cleanup_dead_jobs`, not the reap. Round 3 (#766 + #478): the fork-site
+signal dispositions.
 
 **Gate:** a `job_lifecycle_diff_check.sh` covering `jobs` after `wait`, after a
 signal-interrupted `wait`, a coproc exiting mid-script at several delays (#185's

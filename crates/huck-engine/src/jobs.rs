@@ -54,10 +54,26 @@ pub struct Job {
 /// far more than any realistic `wait $pid`-after-the-fact working set.
 const SAVED_STATUS_CAP: usize = 4096;
 
+/// bash's `js.c_childmax`: `sysconf(_SC_CHILD_MAX)` clamped to
+/// [`DEFAULT_CHILD_MAX`, `MAX_CHILD_MAX`] (4096..=32768). Only read by the
+/// no-force arm of `mark_dead_jobs_as_notified`.
+fn child_max() -> usize {
+    let raw = unsafe { libc::sysconf(libc::_SC_CHILD_MAX) };
+    let n = if raw < 0 { 32768 } else { raw as usize };
+    n.clamp(4096, 32768)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct JobTable {
     jobs: Vec<Job>,
     next_created_at: u64,
+    /// bash's `js.j_current` / `js.j_previous` — the `+` and `-` jobs. Stored,
+    /// not derived: a job KEEPS `+` after it dies until it is deleted, and a
+    /// stop takes `+` from a newer running job. Maintained by `set_current_job`
+    /// / `reset_current` at the same points bash calls them (a new job, a
+    /// deletion, a stop, a continue).
+    current: Option<u32>,
+    previous: Option<u32>,
     /// Terminal exit statuses of jobs that have already been pruned from
     /// `jobs`, keyed by (pid, decoded-status). bash prunes completed jobs from
     /// the visible `jobs` list but RETAINS their exit status so a later
@@ -107,8 +123,10 @@ impl JobTable {
     }
 
     /// Inserts a new Running job that owns its process group (the common case:
-    /// interactive job control). Allocates the lowest unused job id. Returns it.
+    /// interactive job control). Numbers it after the last live job (see
+    /// `next_id`), having first dropped the reported dead ones. Returns it.
     pub fn add(&mut self, pgid: i32, pids: Vec<i32>, command: String) -> u32 {
+        self.remove_notified();
         self.add_with_pgroup(pgid, pids, command, true)
     }
 
@@ -122,6 +140,7 @@ impl JobTable {
         command: String,
         own_pgroup: bool,
     ) -> u32 {
+        self.remove_notified();
         let id = self.next_id();
         let n = pids.len();
         // #183: every registered pid is a live child we own and must reap
@@ -152,6 +171,7 @@ impl JobTable {
     /// Inserts a synthetic already-Done job — used for pure-builtin
     /// pipelines that ran synchronously in the parent shell.
     pub fn add_synthetic_done(&mut self, command: String, exit: i32) -> u32 {
+        self.remove_notified();
         let id = self.next_id();
         let job = Job {
             id,
@@ -194,6 +214,9 @@ impl JobTable {
                     if !already_in_this_state {
                         job.state = JobState::Stopped(new_sig);
                         job.notified = false;
+                        let id = job.id;
+                        // bash's `waitchld`: a job that just stopped becomes current.
+                        self.set_current_job(id);
                     }
                     return;
                 }
@@ -205,6 +228,8 @@ impl JobTable {
                     if matches!(job.state, JobState::Stopped(_)) {
                         job.state = JobState::Running;
                         job.notified = false;
+                        // bash's `waitchld`: a continue re-picks the current job.
+                        self.reset_current();
                     }
                     return;
                 }
@@ -228,19 +253,69 @@ impl JobTable {
         // child or one not tracked in the job table).
     }
 
-    /// Returns all non-Running, not-yet-notified jobs (in id order),
-    /// marking them notified as a side effect.
-    pub fn drain_notifications(&mut self) -> Vec<Job> {
-        let mut out = Vec::new();
-        for job in self.jobs.iter_mut() {
-            let pending = !matches!(job.state, JobState::Running);
-            if pending && !job.notified {
-                job.notified = true;
-                out.push(job.clone());
-            }
-        }
+    /// Returns every job whose state has changed since it was last reported
+    /// (non-Running and not yet notified), in id order. Pure: which of these
+    /// get reported — and which get marked — is `notify_of_job_status`'s
+    /// decision, ported rule for rule from bash.
+    pub fn pending_notifications(&self) -> Vec<Job> {
+        let mut out: Vec<Job> = self
+            .jobs
+            .iter()
+            .filter(|j| !matches!(j.state, JobState::Running) && !j.notified)
+            .cloned()
+            .collect();
         out.sort_by_key(|j| j.id);
         out
+    }
+
+    /// Marks one job notified. No-op if the id doesn't exist.
+    pub fn mark_one_notified(&mut self, id: u32) {
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+            job.notified = true;
+        }
+    }
+
+    /// bash's `mark_dead_jobs_as_notified`. With `force`, every dead job is
+    /// marked (`wait` with no operands: POSIX lets the shell discard every
+    /// collected status) — except, in a non-interactive shell, the job that
+    /// owns `$!`, which POSIX says must stay waitable until reported.
+    /// Without `force` (a loop iteration's `REAP()`), nothing is marked unless
+    /// the dead processes exceed CHILD_MAX, and then only the oldest, down to
+    /// the cap — a bound, not a behaviour, in any real script.
+    pub fn mark_dead_jobs_as_notified(
+        &mut self,
+        force: bool,
+        interactive: bool,
+        last_async_pid: Option<i32>,
+    ) {
+        let exempt = |j: &Job| !interactive && j.pids.last().copied() == last_async_pid;
+        if force {
+            for job in self.jobs.iter_mut() {
+                if Self::terminal_code(&job.state).is_some() && !exempt(job) {
+                    job.notified = true;
+                }
+            }
+            return;
+        }
+        let mut ndeadproc: usize = self
+            .jobs
+            .iter()
+            .filter(|j| Self::terminal_code(&j.state).is_some())
+            .map(|j| j.pids.len().max(1))
+            .sum();
+        let childmax = child_max();
+        if ndeadproc <= childmax {
+            return;
+        }
+        for job in self.jobs.iter_mut() {
+            if Self::terminal_code(&job.state).is_some() && !exempt(job) {
+                ndeadproc -= job.pids.len().max(1);
+                if ndeadproc <= childmax {
+                    break;
+                }
+                job.notified = true;
+            }
+        }
     }
 
     /// Drops all jobs that are non-Running AND notified. Before dropping each
@@ -260,8 +335,9 @@ impl JobTable {
         for job in &pruned {
             self.record_pruned_job(job);
         }
-        self.jobs
-            .retain(|j| matches!(j.state, JobState::Running | JobState::Stopped(_)) || !j.notified);
+        self.delete_where(|j| {
+            !matches!(j.state, JobState::Running | JobState::Stopped(_)) && j.notified
+        });
     }
 
     /// The decoded terminal exit code for a completed job: `Done(c)` → `c`,
@@ -310,28 +386,11 @@ impl JobTable {
             .map(|(_, code)| *code)
     }
 
-    /// Removes the job with id `id`, first recording its terminal status in the
-    /// saved-status ring (so a later `wait $pid` still resolves). Used by the
-    /// `wait %n` path, which prunes the waited job immediately (matching bash).
-    pub fn remove_job_recording_status(&mut self, id: u32) {
-        if let Some(job) = self.jobs.iter().find(|j| j.id == id) {
-            let job = job.clone();
-            self.record_pruned_job(&job);
-        }
-        self.jobs.retain(|j| j.id != id);
-    }
-
-    /// Returns the most-recent and previous job ids (for `+`/`-` markers).
-    /// Unlike [`current_id`], this includes Done/Signaled jobs that are
-    /// still in the table awaiting notification, so the `+`/`-` flags on
-    /// `jobs` output match what the user just saw.
-    /// Most-recent is the highest `created_at`; previous is the next.
+    /// The `+` and `-` jobs (bash's `js.j_current` / `js.j_previous`). A dead
+    /// job keeps its marker until it is deleted, so `jobs` shows `[2]+  Done`
+    /// for the job the user just saw finish.
     pub fn current_and_previous(&self) -> (Option<u32>, Option<u32>) {
-        let mut by_age: Vec<&Job> = self.jobs.iter().collect();
-        by_age.sort_by_key(|j| std::cmp::Reverse(j.created_at));
-        let current = by_age.first().map(|j| j.id);
-        let previous = by_age.get(1).map(|j| j.id);
-        (current, previous)
+        (self.current, self.previous)
     }
 
     /// Most-recent Running or Stopped job id (the `+` job for fg/bg/jobs).
@@ -369,7 +428,14 @@ impl JobTable {
                 .find(|j| j.id == *id)
                 .map(|j| j.id)
                 .ok_or(JobSpecResolveError::NotFound),
-            JobSpec::Current => self.current_id().ok_or(JobSpecResolveError::NotFound),
+            // #758: bash's `%+` is `js.j_current`, which a job KEEPS after it dies
+            // until it is deleted at a cleanup point — so `kill -KILL %+; wait %`
+            // still finds the job and reports 137. `current_id` (Running/Stopped
+            // only) is the right question for `fg`/`bg`, not for resolving a spec.
+            JobSpec::Current => {
+                let (cur, _) = self.current_and_previous();
+                cur.ok_or(JobSpecResolveError::NotFound)
+            }
             JobSpec::Previous => {
                 let (_, prev) = self.current_and_previous();
                 prev.ok_or(JobSpecResolveError::NotFound)
@@ -381,6 +447,12 @@ impl JobTable {
 
     pub fn jobs_mut(&mut self) -> &mut Vec<Job> {
         &mut self.jobs
+    }
+
+    /// Deletes the jobs in `ids` outright (disown, a terminal job `fg`/`bg`
+    /// found), re-picking `+`/`-` if one of them held a marker.
+    pub fn remove_ids(&mut self, ids: &[u32]) {
+        self.delete_where(|j| ids.contains(&j.id));
     }
 
     /// Marks the job with id `id` as exempt from the shell's
@@ -401,14 +473,13 @@ impl JobTable {
         }
     }
 
+    /// bash's `stop_pipeline` slot rule: the slot after the LAST occupied one
+    /// (`js.j_lastj + 1`), so a freed lower number is not reused while a higher
+    /// job lives — `sleep 5 & sleep 5 & sleep 5 & kill %2; …; sleep 5 &` is
+    /// `%4`, not `%2`. Only an empty table restarts at 1. Callers run
+    /// `cleanup_dead_jobs` first, as `stop_pipeline` does.
     fn next_id(&self) -> u32 {
-        let mut id = 1u32;
-        loop {
-            if !self.jobs.iter().any(|j| j.id == id) {
-                return id;
-            }
-            id += 1;
-        }
+        self.jobs.iter().map(|j| j.id).max().map_or(1, |m| m + 1)
     }
 
     fn insert_job(&mut self, job: Job) -> u32 {
@@ -416,7 +487,96 @@ impl JobTable {
         self.next_created_at += 1;
         self.jobs.push(job);
         self.jobs.sort_by_key(|j| j.id);
+        // `stop_pipeline` ends an async job's registration with `reset_current`.
+        self.reset_current();
         id
+    }
+
+    /// The newest job numbered below `limit` that satisfies `pred` — bash's
+    /// `most_recent_job_in_state`, which walks slot indices downward.
+    fn most_recent_below<F: Fn(&Job) -> bool>(&self, limit: u32, pred: F) -> Option<u32> {
+        self.jobs
+            .iter()
+            .filter(|j| j.id < limit && pred(j))
+            .map(|j| j.id)
+            .max()
+    }
+
+    fn is_stopped(&self, id: Option<u32>) -> bool {
+        id.and_then(|id| self.jobs.iter().find(|j| j.id == id))
+            .is_some_and(|j| matches!(j.state, JobState::Stopped(_)))
+    }
+
+    fn is_running(&self, id: Option<u32>) -> bool {
+        id.and_then(|id| self.jobs.iter().find(|j| j.id == id))
+            .is_some_and(|j| matches!(j.state, JobState::Running))
+    }
+
+    /// bash's `set_current_job`: make `id` the `+` job and pick a useful `-`:
+    /// the old current if it is stopped; else the newest stopped job older than
+    /// the current (when the current is itself stopped); else the newest
+    /// running job older than the current (or the newest running job at all
+    /// when the current is not running).
+    fn set_current_job(&mut self, id: u32) {
+        if self.current != Some(id) {
+            self.previous = self.current;
+            self.current = Some(id);
+        }
+        if self.previous != self.current && self.is_stopped(self.previous) {
+            return;
+        }
+        let stopped = |j: &Job| matches!(j.state, JobState::Stopped(_));
+        let running = |j: &Job| matches!(j.state, JobState::Running);
+        if self.is_stopped(self.current)
+            && let Some(c) = self.most_recent_below(id, stopped)
+        {
+            self.previous = Some(c);
+            return;
+        }
+        let limit = if self.is_running(self.current) {
+            id
+        } else {
+            u32::MAX
+        };
+        self.previous = self.most_recent_below(limit, running);
+    }
+
+    /// bash's `reset_current`: keep a stopped current job; otherwise prefer a
+    /// stopped previous, then the newest stopped job, then the newest running
+    /// job; with none of those there is no current job at all.
+    fn reset_current(&mut self) {
+        let candidate = if self.is_stopped(self.current) {
+            self.current
+        } else {
+            let stopped = |j: &Job| matches!(j.state, JobState::Stopped(_));
+            let running = |j: &Job| matches!(j.state, JobState::Running);
+            if self.is_stopped(self.previous) {
+                self.previous
+            } else {
+                self.most_recent_below(u32::MAX, stopped)
+                    .or_else(|| self.most_recent_below(u32::MAX, running))
+            }
+        };
+        match candidate {
+            Some(id) => self.set_current_job(id),
+            None => {
+                self.current = None;
+                self.previous = None;
+            }
+        }
+    }
+
+    /// Drops the jobs `pred` selects, then re-picks `+`/`-` if either was
+    /// among them (bash's `delete_job` → `reset_current`).
+    fn delete_where<F: Fn(&Job) -> bool>(&mut self, pred: F) {
+        let lost_marker = self
+            .jobs
+            .iter()
+            .any(|j| pred(j) && (Some(j.id) == self.current || Some(j.id) == self.previous));
+        self.jobs.retain(|j| !pred(j));
+        if lost_marker {
+            self.reset_current();
+        }
     }
 
     fn resolve_by_command<F: Fn(&str) -> bool>(&self, pred: F) -> Result<u32, JobSpecResolveError> {
@@ -467,16 +627,20 @@ pub fn reap_owned_once(shell: &mut crate::shell_state::Shell) -> bool {
     targets.sort_unstable();
     targets.dedup();
 
+    // bash's `waitchld` asks for stop/continue reports only under job control
+    // (`WUNTRACED|WCONTINUED` when `job_control && subshell_environment == 0`);
+    // without it a stopped background job is still `Running` to the shell, and
+    // `jobs` says so.
+    let stop_flags = if (shell.is_interactive || shell.shell_options.monitor) && !shell.in_subshell
+    {
+        libc::WUNTRACED | libc::WCONTINUED
+    } else {
+        0
+    };
     let mut reaped_any = false;
     for pid in targets {
         let mut raw_status: libc::c_int = 0;
-        let r = unsafe {
-            libc::waitpid(
-                pid,
-                &mut raw_status,
-                libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED,
-            )
-        };
+        let r = unsafe { libc::waitpid(pid, &mut raw_status, libc::WNOHANG | stop_flags) };
         if r == 0 {
             // Still running, no state change to report.
             continue;
@@ -517,39 +681,81 @@ pub enum Notice {
     SignalLine(String),
 }
 
-/// The three shell facts the decision depends on.
+/// The shell facts `notify_of_job_status` reads.
 #[derive(Debug, Clone, Copy)]
 pub struct NoticeCtx {
     pub interactive: bool,
-    /// `is_interactive || set -m`: bash announces nothing without it.
+    /// `is_interactive || set -m` (and not inside a subshell or a completion
+    /// function): the `[N]+` job line needs it; the pid-form signal line does not.
     pub job_control: bool,
     /// Whether the signal that killed this job has a trap installed.
     pub trapped: bool,
+    /// bash's `startup_state == 0` (`Shell::reads_script_input`): a script
+    /// file or piped stdin — not `-c`, not an embedder's string, not a
+    /// terminal. Such a shell reports a background job only when
+    /// a signal killed it; a normal exit or a stop is left UNREPORTED — and so
+    /// unmarked — until `jobs` lists it or `wait` collects it.
+    pub script_mode: bool,
 }
 
-/// Decides what to announce for `job`, or `None` for silence. Pure: the whole
-/// per-signal matrix is unit-testable without a Shell or a child process.
+/// What one pending job gets: a notice (or silence) and whether that counts
+/// as having reported it. bash's `notify_of_job_status`, one job at a time.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Verdict {
+    pub notice: Option<Notice>,
+    pub mark_notified: bool,
+}
+
+/// Decides what to announce for `job`. Pure: the whole per-signal matrix is
+/// unit-testable without a Shell or a child process.
 ///
-/// bash uses the pid-prefixed form when ALL of: the shell is non-interactive,
-/// the job died from a signal, that signal is not SIGINT/SIGTERM/SIGPIPE, and
-/// the signal is untrapped. Everything else takes the `[N]+` form.
-pub fn job_notice(job: &Job, flag: char, ctx: NoticeCtx) -> Option<Notice> {
-    if !ctx.job_control {
-        return None;
+/// Ported from bash's `notify_of_job_status`:
+/// - a script-mode shell skips every job that did not die from a signal;
+/// - a dead job takes the pid form when ALL of: non-interactive, killed by a
+///   signal outside bash's quiet set (INT/TERM/PIPE), and that signal is
+///   untrapped — WITH OR WITHOUT job control (`sleep 5 & kill -KILL %1;
+///   sleep 0.3` prints `Killed` in a plain `-c` shell);
+/// - otherwise the `[N]+` line, only under job control;
+/// - a stop is only ever observed under job control (bash's `waitchld` passes
+///   `WUNTRACED` only then), so without it the stop is neither reported nor
+///   marked;
+/// - whatever was printed or deliberately kept silent is marked notified, so
+///   the next cleanup point may prune it.
+pub fn job_notice(job: &Job, flag: char, ctx: NoticeCtx) -> Verdict {
+    let silent = Verdict {
+        notice: None,
+        mark_notified: false,
+    };
+    let signaled = matches!(job.state, JobState::Signaled(_));
+    match job.state {
+        JobState::Running => return silent,
+        JobState::Stopped(_) if !ctx.job_control => return silent,
+        _ => {}
     }
-    if matches!(job.state, JobState::Running) {
-        return None;
+    if ctx.script_mode && !signaled {
+        return silent;
     }
     if let JobState::Signaled(sig) = job.state {
         let quiet_signal = sig == libc::SIGINT || sig == libc::SIGTERM || sig == libc::SIGPIPE;
         if !ctx.interactive && !quiet_signal && !ctx.trapped {
             let (state, _) = job_state_and_suffix(job);
             let pid = job.pids.first().copied().unwrap_or(job.pgid);
-            return Some(Notice::SignalLine(format!(
-                "{pid} {state:<24}{}",
-                job.command
-            )));
+            return Verdict {
+                notice: Some(Notice::SignalLine(format!(
+                    "{pid} {state:<24}{}",
+                    job.command
+                ))),
+                mark_notified: true,
+            };
         }
+    }
+    if !ctx.job_control {
+        // Dead, no job control: nothing to say, but it HAS been considered —
+        // bash marks it here so the cleanup pass can drop it.
+        return Verdict {
+            notice: None,
+            mark_notified: true,
+        };
     }
     // #418: bash precedes a STOP notice with a bare newline, and only that one.
     let lead = if matches!(job.state, JobState::Stopped(_)) {
@@ -557,49 +763,85 @@ pub fn job_notice(job: &Job, flag: char, ctx: NoticeCtx) -> Option<Notice> {
     } else {
         ""
     };
-    Some(Notice::JobLine(format!(
-        "{lead}{}",
-        notification_line(job, flag)
-    )))
+    Verdict {
+        notice: Some(Notice::JobLine(format!(
+            "{lead}{}",
+            notification_line(job, flag)
+        ))),
+        mark_notified: true,
+    }
 }
 
-/// Reaps, announces any newly-changed job, and drops the terminal ones.
-///
-/// #418/#420: the announcement is gated on JOB CONTROL, not on interactivity —
-/// bash reports a background job's state change in a non-interactive `set -m`
-/// shell too. Notices stay suppressed inside a subshell and inside completion
-/// functions, matching bash's suppression in a subshell environment.
+/// True when this shell may announce with the `[N]+` job line: job control is
+/// on (interactive, or `set -m`) and we are neither a forked subshell nor
+/// inside a completion function.
+fn job_control_for_notices(shell: &crate::shell_state::Shell) -> bool {
+    (shell.is_interactive || shell.shell_options.monitor)
+        && !shell.in_subshell
+        && !shell.in_completion
+}
+
+/// Reaps, then — at a CLEANUP POINT — announces and prunes. See
+/// [`reap_and_notify_ex`].
 pub fn reap_and_notify(shell: &mut crate::shell_state::Shell) {
     reap_and_notify_ex(shell, true)
 }
 
-/// `announce = false` reaps and prunes SILENTLY. The between-command pass
-/// passes `false` when the group that just ran never blocked on a child (#418):
-/// bash only reaps while blocked, so a run of builtins leaves a background
-/// death unnoticed — `sleep 3 & kill -TERM %1; echo A; echo B` says nothing in
-/// bash, and huck must not invent a notice there.
+/// `announce = false` only REAPS. bash reaps a child whenever SIGCHLD arrives
+/// but reports and prunes at exactly four points — the end of a foreground
+/// wait, the `jobs` builtin, each loop iteration, and `wait` — so a run of
+/// builtins leaves a background death unreported AND still in the table:
+/// `sleep 3 & kill -TERM %1; echo A; echo B` says nothing, and `trap … USR1;
+/// … & wait; jobs` (the wait interrupted by the trap) still lists the job
+/// that died meanwhile (#475). The between-command pass therefore passes
+/// `announce` = "the group just blocked on a foreground child" (#418), and
+/// with it false does nothing beyond the reap — under job control or not.
+/// Draining silently here was what emptied `jobs` in a script and swallowed
+/// the non-job-control `Killed` line.
 pub fn reap_and_notify_ex(shell: &mut crate::shell_state::Shell, announce: bool) {
     reap_completed(shell);
-    let job_control = (shell.is_interactive || shell.shell_options.monitor)
-        && !shell.in_subshell
-        && !shell.in_completion;
-    // With job control on but no blocking point since the last pass, bash has
-    // not noticed this death yet — so leave the job PENDING rather than
-    // draining it. Draining here would mark it notified and silence it
-    // forever, which is what made the notice depend on a race. Without job
-    // control there is no notice to lose, and the silent drain+prune of #175
-    // still applies.
-    if job_control && !announce {
+    if announce {
+        notify_and_cleanup(shell);
+    }
+}
+
+/// bash's `notify_and_cleanup`: report what is pending, then prune.
+pub fn notify_and_cleanup(shell: &mut crate::shell_state::Shell) {
+    notify_of_job_status(shell);
+    cleanup_dead_jobs(shell);
+}
+
+/// bash's `reap_dead_jobs`, run by every loop iteration (`REAP()`) in a
+/// non-interactive or job-control-less shell: no reporting; mark only what
+/// the CHILD_MAX bound requires, then prune what is already reported.
+pub fn reap_dead_jobs(shell: &mut crate::shell_state::Shell) {
+    if shell.is_interactive && shell.shell_options.monitor {
         return;
     }
+    reap_completed(shell);
+    shell
+        .jobs
+        .mark_dead_jobs_as_notified(false, shell.is_interactive, shell.last_bg_pid);
+    cleanup_dead_jobs(shell);
+}
+
+/// bash's `cleanup_dead_jobs`: drop every dead job that has been reported.
+pub fn cleanup_dead_jobs(shell: &mut crate::shell_state::Shell) {
+    shell.jobs.remove_notified();
+}
+
+/// bash's `notify_of_job_status`: one verdict per pending job, printed in id
+/// order; each job the verdict considered reported is marked so.
+pub fn notify_of_job_status(shell: &mut crate::shell_state::Shell) {
+    let job_control = job_control_for_notices(shell);
     let (current, previous) = shell.jobs.current_and_previous();
-    let notifs = shell.jobs.drain_notifications();
     let ctx_base = NoticeCtx {
         interactive: shell.is_interactive,
         job_control,
         trapped: false,
+        script_mode: shell.reads_script_input(),
     };
-    for job in notifs {
+    for job in shell.jobs.pending_notifications() {
         let flag = if Some(job.id) == current {
             '+'
         } else if Some(job.id) == previous {
@@ -614,22 +856,25 @@ pub fn reap_and_notify_ex(shell: &mut crate::shell_state::Shell, announce: bool)
                 .contains_key(&crate::traps::TrapSignal::Real(sig)),
             _ => false,
         };
-        match job_notice(
+        let verdict = job_notice(
             &job,
             flag,
             NoticeCtx {
                 trapped,
                 ..ctx_base
             },
-        ) {
+        );
+        match verdict.notice {
             Some(Notice::JobLine(line)) => with_err(|err| e!(err, "{line}")),
             Some(Notice::SignalLine(body)) => {
                 crate::sh_error!(shell, None, "{}", body);
             }
             None => {}
         }
+        if verdict.mark_notified {
+            shell.jobs.mark_one_notified(job.id);
+        }
     }
-    shell.jobs.remove_notified();
 }
 
 /// bash's wording for a signal, taken from the SAME source bash uses — the
@@ -750,6 +995,11 @@ mod tests {
         signum
     }
 
+    fn fake_stopped_raw(signum: i32) -> libc::c_int {
+        // POSIX: WIFSTOPPED true when low byte == 0x7f; stop signal in second byte.
+        (signum << 8) | 0x7f
+    }
+
     #[test]
     fn add_allocates_id_one_first() {
         let mut t = JobTable::new();
@@ -757,19 +1007,63 @@ mod tests {
         assert_eq!(id, 1);
     }
 
+    /// bash's `stop_pipeline` takes the slot after the LAST job: a freed lower
+    /// number is not reused while a higher job lives (`%4`, not `%2`), and only
+    /// an empty table restarts at 1.
     #[test]
-    fn add_after_remove_reuses_lowest_id() {
+    fn add_after_remove_takes_the_slot_after_the_last_job() {
         let mut t = JobTable::new();
         let _ = t.add(100, vec![100], "a".to_string()); // id 1
         let _ = t.add(101, vec![101], "b".to_string()); // id 2
         let _ = t.add(102, vec![102], "c".to_string()); // id 3
         // Reap b fully so it can be removed.
         t.reap(101, fake_done_raw(0));
-        let _ = t.drain_notifications();
+        let _ = drain_all(&mut t);
         t.remove_notified();
-        // Next add should reuse id 2.
         let new_id = t.add(200, vec![200], "d".to_string());
-        assert_eq!(new_id, 2);
+        assert_eq!(new_id, 4);
+        // Everything gone: the numbering restarts.
+        t.remove_ids(&[1, 3, 4]);
+        assert_eq!(t.add(300, vec![300], "e".to_string()), 1);
+    }
+
+    /// `add` is a cleanup point (`stop_pipeline` calls `cleanup_dead_jobs`
+    /// first): a dead, reported job is gone before the new one is numbered.
+    #[test]
+    fn add_prunes_reported_dead_jobs_first() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string()); // id 1
+        t.reap(100, fake_done_raw(0));
+        let _ = drain_all(&mut t);
+        assert_eq!(t.add(200, vec![200], "b".to_string()), 1);
+        assert_eq!(t.iter().count(), 1);
+    }
+
+    /// The `+`/`-` markers are bash's stored `j_current`/`j_previous`: a dead
+    /// job keeps `+` until it is deleted, a stop takes `+`, and a deletion
+    /// re-picks from the stopped-then-running candidates.
+    #[test]
+    fn current_and_previous_follow_bash() {
+        let mut t = JobTable::new();
+        let a = t.add(100, vec![100], "a".to_string());
+        let b = t.add(101, vec![101], "b".to_string());
+        assert_eq!(t.current_and_previous(), (Some(b), Some(a)));
+        // b dies: still `+`.
+        t.reap(101, fake_done_raw(0));
+        assert_eq!(t.current_and_previous(), (Some(b), Some(a)));
+        // a stops: it becomes `+`, b (dead) is no candidate for `-`.
+        t.reap(100, fake_stopped_raw(libc::SIGTSTP));
+        assert_eq!(t.current_and_previous(), (Some(a), None));
+        // b is deleted: a stopped current stays.
+        let _ = drain_all(&mut t);
+        t.remove_notified();
+        assert_eq!(t.current_and_previous(), (Some(a), None));
+        // A new running job: the stopped job stays current, the new one is `-`.
+        let c = t.add(102, vec![102], "c".to_string());
+        assert_eq!(t.current_and_previous(), (Some(a), Some(c)));
+        // a continues: newest running job is current again.
+        t.reap(100, fake_continued_raw());
+        assert_eq!(t.current_and_previous(), (Some(c), Some(a)));
     }
 
     #[test]
@@ -815,23 +1109,23 @@ mod tests {
     }
 
     #[test]
-    fn drain_notifications_returns_completed_unnotified() {
+    fn pending_notifications_returns_completed_unnotified() {
         let mut t = JobTable::new();
         let id = t.add(100, vec![100], "cmd".to_string());
         t.reap(100, fake_done_raw(0));
-        let notifs = t.drain_notifications();
+        let notifs = drain_all(&mut t);
         assert_eq!(notifs.len(), 1);
         assert_eq!(notifs[0].id, id);
         // Second call should be empty (notified flag set).
-        let notifs2 = t.drain_notifications();
+        let notifs2 = drain_all(&mut t);
         assert!(notifs2.is_empty());
     }
 
     #[test]
-    fn drain_notifications_skips_running() {
+    fn pending_notifications_skips_running() {
         let mut t = JobTable::new();
         let _ = t.add(100, vec![100], "running".to_string());
-        let notifs = t.drain_notifications();
+        let notifs = drain_all(&mut t);
         assert!(notifs.is_empty());
     }
 
@@ -841,7 +1135,7 @@ mod tests {
         let id_a = t.add(100, vec![100], "a".to_string()); // 1, running
         let id_b = t.add(101, vec![101], "b".to_string()); // 2, running
         t.reap(100, fake_done_raw(0));
-        let _ = t.drain_notifications(); // marks id_a notified
+        let _ = drain_all(&mut t); // marks id_a notified
         t.remove_notified();
         let remaining: Vec<u32> = t.iter().map(|j| j.id).collect();
         assert_eq!(remaining, vec![id_b]);
@@ -936,6 +1230,16 @@ mod tests {
         assert_eq!(render_state(&JobState::Stopped(libc::SIGTSTP)), "Stopped");
     }
 
+    /// Test stand-in for the old side-effecting drain: every pending job is
+    /// marked notified, as a `-c` shell without job control would.
+    fn drain_all(t: &mut JobTable) -> Vec<Job> {
+        let pending = t.pending_notifications();
+        for j in &pending {
+            t.mark_one_notified(j.id);
+        }
+        pending
+    }
+
     fn signaled_job(sig: i32) -> Job {
         let mut t = JobTable::new();
         t.add(4242, vec![4242], "sleep 5".to_string());
@@ -948,21 +1252,60 @@ mod tests {
             interactive,
             job_control,
             trapped,
+            script_mode: false,
         }
     }
 
-    /// #418/#420: nothing is announced without job control, whatever happened.
+    fn script_ctx() -> NoticeCtx {
+        NoticeCtx {
+            interactive: false,
+            job_control: false,
+            trapped: false,
+            script_mode: true,
+        }
+    }
+
+    /// Without job control the `[N]+` line is never printed, but the pid-form
+    /// signal line IS — `sleep 5 & kill -KILL %1; sleep 0.3` prints `Killed`
+    /// in a plain `-c` shell. A normal exit is silent and counts as reported.
     #[test]
-    fn job_notice_is_silent_without_job_control() {
+    fn job_notice_without_job_control() {
         let job = signaled_job(libc::SIGKILL);
-        assert_eq!(job_notice(&job, '+', ctx(false, false, false)), None);
+        let v = job_notice(&job, '+', ctx(false, false, false));
+        assert!(matches!(v.notice, Some(Notice::SignalLine(_))));
+        assert!(v.mark_notified);
         let mut t = JobTable::new();
         t.add(1, vec![1], "x".to_string());
         t.jobs_mut()[0].state = JobState::Done(0);
-        assert_eq!(
-            job_notice(&t.jobs_mut()[0], '+', ctx(true, false, false)),
-            None
-        );
+        let v = job_notice(&t.jobs_mut()[0], '+', ctx(true, false, false));
+        assert_eq!(v.notice, None);
+        assert!(v.mark_notified);
+        // A stop is only observed under job control: neither said nor marked.
+        t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTSTP);
+        let v = job_notice(&t.jobs_mut()[0], '+', ctx(false, false, false));
+        assert_eq!(v.notice, None);
+        assert!(!v.mark_notified);
+    }
+
+    /// A script-file shell reports a background job only when a signal killed
+    /// it; a normal exit stays pending — visible to `jobs` — until listed.
+    #[test]
+    fn job_notice_script_mode_skips_normal_exits() {
+        let mut t = JobTable::new();
+        t.add(1, vec![1], "x".to_string());
+        t.jobs_mut()[0].state = JobState::Done(0);
+        let v = job_notice(&t.jobs_mut()[0], '+', script_ctx());
+        assert_eq!(v.notice, None);
+        assert!(!v.mark_notified);
+        let job = signaled_job(libc::SIGKILL);
+        let v = job_notice(&job, '+', script_ctx());
+        assert!(matches!(v.notice, Some(Notice::SignalLine(_))));
+        assert!(v.mark_notified);
+        // TERM is in the quiet set: no line, but reported all the same.
+        let job = signaled_job(libc::SIGTERM);
+        let v = job_notice(&job, '+', script_ctx());
+        assert_eq!(v.notice, None);
+        assert!(v.mark_notified);
     }
 
     /// A still-running job is not news.
@@ -971,7 +1314,7 @@ mod tests {
         let mut t = JobTable::new();
         t.add(1, vec![1], "x".to_string());
         assert_eq!(
-            job_notice(&t.jobs_mut()[0], '+', ctx(false, true, false)),
+            job_notice(&t.jobs_mut()[0], '+', ctx(false, true, false)).notice,
             None
         );
     }
@@ -984,18 +1327,18 @@ mod tests {
             let job = signaled_job(sig);
             assert!(
                 matches!(
-                    job_notice(&job, '+', ctx(false, true, false)),
+                    job_notice(&job, '+', ctx(false, true, false)).notice,
                     Some(Notice::SignalLine(_))
                 ),
                 "signal {sig} non-interactive untrapped should take the pid form"
             );
             // Interactive, or trapped, flips it back to the job line.
             assert!(matches!(
-                job_notice(&job, '+', ctx(true, true, false)),
+                job_notice(&job, '+', ctx(true, true, false)).notice,
                 Some(Notice::JobLine(_))
             ));
             assert!(matches!(
-                job_notice(&job, '+', ctx(false, true, true)),
+                job_notice(&job, '+', ctx(false, true, true)).notice,
                 Some(Notice::JobLine(_))
             ));
         }
@@ -1004,7 +1347,7 @@ mod tests {
             let job = signaled_job(sig);
             assert!(
                 matches!(
-                    job_notice(&job, '+', ctx(false, true, false)),
+                    job_notice(&job, '+', ctx(false, true, false)).notice,
                     Some(Notice::JobLine(_))
                 ),
                 "signal {sig} should stay in the job-line form"
@@ -1025,7 +1368,7 @@ mod tests {
         let expected = format!("4242 {killed:<24}sleep 5");
         #[cfg(target_os = "linux")]
         assert_eq!(expected, "4242 Killed                  sleep 5");
-        match job_notice(&job, '+', ctx(false, true, false)) {
+        match job_notice(&job, '+', ctx(false, true, false)).notice {
             Some(Notice::SignalLine(body)) => {
                 assert_eq!(body, expected);
             }
@@ -1039,7 +1382,7 @@ mod tests {
         let mut t = JobTable::new();
         t.add(4242, vec![4242], "sleep 5".to_string());
         t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTSTP);
-        match job_notice(&t.jobs_mut()[0], '+', ctx(false, true, false)) {
+        match job_notice(&t.jobs_mut()[0], '+', ctx(false, true, false)).notice {
             Some(Notice::JobLine(line)) => {
                 assert_eq!(line, "\n[1]+  Stopped                 sleep 5")
             }
@@ -1047,7 +1390,7 @@ mod tests {
         }
         t.jobs_mut()[0].state = JobState::Done(0);
         t.jobs_mut()[0].notified = false;
-        match job_notice(&t.jobs_mut()[0], '+', ctx(false, true, false)) {
+        match job_notice(&t.jobs_mut()[0], '+', ctx(false, true, false)).notice {
             Some(Notice::JobLine(line)) => {
                 assert_eq!(line, "[1]+  Done                    sleep 5")
             }

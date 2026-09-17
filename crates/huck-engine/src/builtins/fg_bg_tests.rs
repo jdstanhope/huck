@@ -367,8 +367,33 @@ fn wait_with_done_spec_returns_nonzero_for_exit_n() {
 }
 
 #[test]
-fn wait_multiarg_two_done_returns_last_status() {
+fn wait_multiarg_second_dead_job_is_collected_by_the_first_wait() {
+    // #475: `wait %1` is a cleanup point. In a `-c` shell it reports job 2
+    // (dead, unreported) silently and prunes it, so `%2` is then "no such
+    // job" — bash: `sleep 0.2 & (sleep 0.1; exit 5) & wait %1 %2` → 127.
     let mut shell = Shell::new();
+    shell.jobs.add_synthetic_done("true".to_string(), 0);
+    shell.jobs.add_synthetic_done("exit 5".to_string(), 5);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let outcome = run_builtin(
+        "wait",
+        &["%1".to_string(), "%2".to_string()],
+        &mut buf,
+        &mut err,
+        &mut shell,
+    );
+    assert!(matches!(outcome, ExecOutcome::Continue(127)));
+    assert!(String::from_utf8_lossy(&err).contains("wait: %2: no such job"));
+}
+
+#[test]
+fn wait_multiarg_two_done_returns_last_status_in_a_script() {
+    // The same two operands in a script-file shell: the cleanup point leaves a
+    // normal exit unreported, so `%2` still resolves and its status is last.
+    let mut shell = Shell::new();
+    shell.is_interactive = false;
+    shell.reads_script_file = true;
     shell.jobs.add_synthetic_done("true".to_string(), 0);
     shell.jobs.add_synthetic_done("exit 5".to_string(), 5);
     let mut buf: Vec<u8> = Vec::new();
@@ -540,8 +565,10 @@ fn saved_status_ring_records_looks_up_and_evicts_oldest() {
 
 #[test]
 fn wait_for_job_removes_its_id_from_table() {
-    // #175: `wait %n` on a terminal job returns its status and removes the
-    // entry, so a following `jobs` does not show it.
+    // #175/#475: `wait %n` on a terminal job returns its status and, in a
+    // `-c` (or embedder) shell, reports it silently and prunes it at once, so
+    // a following `jobs` does not show it. (A script-file shell only MARKS it; see
+    // `wait_for_job_marks_the_job_in_a_script`.)
     let mut shell = Shell::new();
     shell.is_interactive = false;
     let id = shell.jobs.add_synthetic_done("echo hi".to_string(), 0);
@@ -558,6 +585,45 @@ fn wait_for_job_removes_its_id_from_table() {
         !shell.jobs.iter().any(|j| j.id == id),
         "wait_for_job must remove the waited job's id"
     );
+}
+
+#[test]
+fn wait_for_job_marks_the_job_in_a_script() {
+    // #475: a script-file shell never reports a normal exit at a wait, so the
+    // waited job stays in the table — marked reported ("POSIX.2: we can
+    // remove the job from the jobs table if we just waited for it") — until
+    // the next cleanup point, and `wait %n` again still resolves it.
+    let mut shell = Shell::new();
+    shell.is_interactive = false;
+    shell.reads_script_file = true;
+    let id = shell.jobs.add_synthetic_done("echo hi".to_string(), 0);
+    let mut buf: Vec<u8> = Vec::new();
+    let wait_once = |shell: &mut Shell, buf: &mut Vec<u8>| {
+        run_builtin(
+            "wait",
+            &[format!("%{id}")],
+            buf,
+            &mut std::io::stderr(),
+            shell,
+        )
+    };
+    assert!(matches!(
+        wait_once(&mut shell, &mut buf),
+        ExecOutcome::Continue(0)
+    ));
+    let job = shell
+        .jobs
+        .iter()
+        .find(|j| j.id == id)
+        .expect("still in the table");
+    assert!(job.notified);
+    // A second wait still resolves it — and, being a cleanup point itself,
+    // then drops it (bash: `sleep 0.1 & wait %1; wait %1; jobs` → rc 0, empty).
+    assert!(matches!(
+        wait_once(&mut shell, &mut buf),
+        ExecOutcome::Continue(0)
+    ));
+    assert!(!shell.jobs.iter().any(|j| j.id == id));
 }
 
 #[test]

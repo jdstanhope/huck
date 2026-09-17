@@ -24,9 +24,9 @@ use huck_engine::shell_state::Shell;
 
 #[test]
 fn reap_and_notify_prunes_done_job_non_interactively() {
-    // #175: a completed (Done) job is silently removed from the table by the
-    // between-command maintenance pass (`reap_and_notify`), matching bash's
-    // non-interactive pruning. No print because the shell is non-interactive.
+    // #175: a completed (Done) job is silently removed from the table at a
+    // cleanup point (`reap_and_notify`), matching bash's `-c` pruning. No
+    // print because the shell is non-interactive.
     let mut shell = Shell::new();
     shell.is_interactive = false;
     shell.jobs.add_synthetic_done("sleep 0".to_string(), 0);
@@ -36,6 +36,20 @@ fn reap_and_notify_prunes_done_job_non_interactively() {
         shell.jobs.iter().next().is_none(),
         "the Done job must be pruned by reap_and_notify"
     );
+}
+
+#[test]
+fn reap_and_notify_keeps_done_job_in_a_script() {
+    // #475: a script-file shell (bash's `startup_state == 0`) reports a
+    // background job only when a signal killed it, so a normal exit is left
+    // unreported — and unpruned, visible to `jobs` — by the same pass.
+    let mut shell = Shell::new();
+    shell.is_interactive = false;
+    shell.reads_script_file = true;
+    let id = shell.jobs.add_synthetic_done("sleep 0".to_string(), 0);
+    jobs::reap_and_notify(&mut shell);
+    let job = shell.jobs.iter().find(|j| j.id == id).expect("kept");
+    assert!(!job.notified, "a normal exit is not reported in a script");
 }
 
 #[test]

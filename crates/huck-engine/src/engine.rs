@@ -142,7 +142,11 @@ impl Engine {
 
     /// Run a script STRING with script semantics (a "main" frame; `$0` = `arg0`).
     pub fn run_script(&mut self, src: &str, arg0: &str) -> i32 {
-        self.cell.borrow_mut().shell_argv0 = arg0.to_string();
+        {
+            let mut sh = self.cell.borrow_mut();
+            sh.shell_argv0 = arg0.to_string();
+            sh.reads_script_file = true;
+        }
         self.run_with_label(src, arg0, true)
     }
 
