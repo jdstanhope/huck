@@ -1,7 +1,7 @@
 ---
 title: "Five places a shell looks at its jobs"
 date: 2026-09-18
-summary: "huck tidied its job table after every command. bash only looks at five specific moments — and what it says depends on whether it is running a script or a -c string. A background job that died between the two could vanish from `jobs`, lose its `Killed` notice, or turn `wait %` into 'no such job'."
+summary: "huck tidied its job table after every command. bash looks at five specific moments — and what it says depends on whether it runs a script or a -c string. A job that died between could vanish from `jobs`, lose its `Killed` notice, or make `wait %` fail. Coprocesses and QUIT followed the same thread."
 tags: ["jobs", "job-control", "wait", "bugfix"]
 version: null
 draft: false
@@ -106,12 +106,71 @@ signal beat; `kill -9` of a *stopped* child then `wait` reports the death
 about half the time. The rows now pin the death to a blocking point, a
 busy-wait, or the wait itself.
 
-Still open from this pass: an `&` child should ignore INT and QUIT when job
-control is off ([#766](https://github.com/jdstanhope/huck/issues/766)); the
-`Killed` notice is suppressed inside `( )` where bash prints it
-([#767](https://github.com/jdstanhope/huck/issues/767)); and a background job
-huck runs under a wrapper subshell reports a signal death as `Exit 143`
-([#768](https://github.com/jdstanhope/huck/issues/768)). Next in the same
-table: a coproc is still torn down the instant it is reaped, where bash
-disposes of it only at one of the five points
-([#185](https://github.com/jdstanhope/huck/issues/185)).
+## The same five places, for coprocesses
+
+A coprocess that has finished is the same story. huck closed its pipes and
+unset `NAME` and `NAME_PID` the instant the child was collected; bash only
+marks it dead then, and disposes of it at one of the five points. So a
+one-shot coproc's last line was readable in bash and gone in huck whenever
+anything at all ran in between — even a `$( )`, which is not one of the
+five:
+
+```bash
+# before
+$ huck -c 'coproc X { read l; echo "e:$l"; }; echo yo >&"${X[1]}"; x=$(sleep 0.3); read r <&"${X[0]}"; echo "[$r]"'
+huck: line 1: "${X[0]}": Bad file descriptor
+[]
+```
+
+```bash
+# after
+$ huck -c 'coproc X { read l; echo "e:$l"; }; echo yo >&"${X[1]}"; x=$(sleep 0.3); read r <&"${X[0]}"; echo "[$r]"'
+[e:yo]
+```
+
+That was the race behind a coproc test that failed only on fast machines.
+
+## And what a background job may ignore
+
+Two more rows came from reading the same file. bash ignores `SIGQUIT` in
+every shell, so a `QUIT` aimed at a script is harmless; huck took the
+default and dumped core:
+
+```bash
+# before
+$ huck -c 'kill -QUIT $$; sleep 0.2; echo alive'
+timeout: the monitored command dumped core
+```
+
+```bash
+# after
+$ huck -c 'kill -QUIT $$; sleep 0.2; echo alive'
+alive
+```
+
+And when job control is off, a command started with `&` ignores `INT` and
+`QUIT` — a stray `^C` does not take the background job with it. Only the
+command that *is* the background unit gets that; a `{ … } &` or a function
+called with `&` runs its inner commands with the defaults, exactly as bash
+does, which took a table of eighteen shapes to pin down.
+
+```bash
+# before
+$ huck -c 'sleep 2 & p=$!; sleep 0.2; kill -INT $p; wait $p; echo rc=$?'
+rc=130
+```
+
+```bash
+# after
+$ huck -c 'sleep 2 & p=$!; sleep 0.2; kill -INT $p; wait $p; echo rc=$?'
+rc=0
+```
+
+Still open from this pass: the `Killed` notice is suppressed inside `( )`
+where bash prints it ([#767](https://github.com/jdstanhope/huck/issues/767));
+a background job huck runs under a wrapper subshell reports a signal death as
+`Exit 143` ([#768](https://github.com/jdstanhope/huck/issues/768)); `jobs`
+prints `coproc X` where bash prints the body
+([#770](https://github.com/jdstanhope/huck/issues/770)); and `trap '' SIG` is
+not inherited by children for any signal
+([#772](https://github.com/jdstanhope/huck/issues/772)).

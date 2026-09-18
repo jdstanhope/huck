@@ -759,6 +759,13 @@ fn run_command(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
     if shell.shell_options.noexec && !shell.is_interactive {
         return ExecOutcome::Continue(0);
     }
+    // #766: only a simple command or a pipeline can BE the asynchronous unit
+    // whose exec keeps INT/QUIT ignored; a compound's inner commands get the
+    // defaults back (bash: `{ cmd; } &`, `( cmd ) &`, `if …; fi &` all exec
+    // `cmd` with nothing ignored). Functions clear it in `call_function`.
+    if !matches!(cmd, Command::Pipeline(_) | Command::Simple(_)) {
+        shell.async_signals_ignored = false;
+    }
     match cmd {
         Command::Pipeline(p) => run_pipeline(p, shell),
         Command::Simple(s) => run_single(s, shell),
@@ -784,6 +791,7 @@ fn run_command(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
                 &[],
                 None, // no Dup redirect at this call site
                 None,
+                /*async_child=*/ false,
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -3040,6 +3048,7 @@ fn run_background_subshell(
         /*parent_fds_to_close=*/ &[],
         None, // no Dup redirect at this call site
         None,
+        /*async_child=*/ true,
     );
     // The parent's /dev/null copy (if any) was consumed + dropped by the call.
     match fork_result {
@@ -4248,6 +4257,9 @@ pub(crate) fn call_function(
     args: Vec<String>,
     shell: &mut Shell,
 ) -> ExecOutcome {
+    // #766: a function body's commands are not the asynchronous unit — `f &`
+    // execs its inner commands with INT/QUIT at the default in bash.
+    shell.async_signals_ignored = false;
     // FUNCNEST enforcement + recursion backstop. Refuse a call that would exceed
     // the effective nesting limit BEFORE any frame/positional/local setup, so the
     // caller's statement simply sees rc 1 (matching bash). The backstop
@@ -5409,22 +5421,34 @@ fn parse_exec_flags(args: &[String]) -> Result<ExecFlags, ExecFlagErr> {
     Ok(f)
 }
 
-/// Job-control signals huck `SIG_IGN`s at the shell level (see
-/// `install_job_control_signals`). They must be reset to `SIG_DFL` for an
-/// `exec` replacement, since `SIG_IGN` is inherited across `execve`.
-const EXEC_RESET_SIGNALS: [libc::c_int; 3] = [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU];
+/// Signals huck `SIG_IGN`s at the shell level (see
+/// `install_job_control_signals`: the job-control three, and SIGQUIT per
+/// #478). They must be reset to `SIG_DFL` for an `exec` replacement, since
+/// `SIG_IGN` is inherited across `execve`. SIGINT is listed for the async
+/// child that has it ignored (#766): a compound's inner `exec` gets the
+/// default back, as in bash's `restore_original_signals`.
+const EXEC_RESET_SIGNALS: [libc::c_int; 5] = [
+    libc::SIGTSTP,
+    libc::SIGTTIN,
+    libc::SIGTTOU,
+    libc::SIGQUIT,
+    libc::SIGINT,
+];
 
 /// Set the job-control signals to `SIG_DFL` for the about-to-exec replacement,
 /// returning their prior handlers. Because `CommandExt::exec` does NOT fork,
 /// any change here persists in the shell on the (rare) exec-failure path — so
 /// the caller restores them via `restore_exec_signals` if exec returns.
-unsafe fn reset_exec_signals_saving() -> [libc::sighandler_t; 3] {
+unsafe fn reset_exec_signals_saving(keep_int_quit: bool) -> [libc::sighandler_t; 5] {
     // Default each slot to SIG_DFL so that on the (practically impossible — these
     // were SIG_IGN'd at startup) SIG_ERR return, restore becomes a no-op instead
     // of passing SIG_ERR back to signal() (POSIX-undefined). Mirrors the SIG_ERR
     // guard in install_job_control_signals.
-    let mut prev = [libc::SIG_DFL; 3];
+    let mut prev = [libc::SIG_DFL; 5];
     for (i, &sig) in EXEC_RESET_SIGNALS.iter().enumerate() {
+        if keep_int_quit && (sig == libc::SIGINT || sig == libc::SIGQUIT) {
+            continue;
+        }
         let old = unsafe { libc::signal(sig, libc::SIG_DFL) };
         if old != libc::SIG_ERR {
             prev[i] = old;
@@ -5433,7 +5457,7 @@ unsafe fn reset_exec_signals_saving() -> [libc::sighandler_t; 3] {
     prev
 }
 
-unsafe fn restore_exec_signals(prev: [libc::sighandler_t; 3]) {
+unsafe fn restore_exec_signals(prev: [libc::sighandler_t; 5]) {
     for (i, &sig) in EXEC_RESET_SIGNALS.iter().enumerate() {
         unsafe {
             libc::signal(sig, prev[i]);
@@ -5583,7 +5607,7 @@ fn run_exec_builtin(
     // Reset job-control signals to default for the replacement (huck SIG_IGNs
     // them and that is inherited across execve), saving them so a failed exec
     // restores the shell's own handlers (exec() does not fork).
-    let saved = unsafe { reset_exec_signals_saving() };
+    let saved = unsafe { reset_exec_signals_saving(shell.async_signals_ignored) };
     let err = process.exec();
     unsafe {
         restore_exec_signals(saved);
@@ -6467,10 +6491,11 @@ fn run_subprocess(
     // Reset job-control signals to SIG_DFL in every child (foreground and
     // background). The shell SIG_IGNs these, and SIG_IGN is inherited across
     // exec — without this, Ctrl-Z would never stop foreground children like
-    // vim/less, and background readers could never receive SIGTTIN.
+    // vim/less, and background readers could never receive SIGTTIN. INT/QUIT
+    // stay ignored only when this process is itself an async unit (#766).
     use std::os::unix::process::CommandExt;
     unsafe {
-        process.pre_exec(reset_job_control_signals_in_child);
+        process.pre_exec(reset_signals_in_child(shell.async_signals_ignored));
     }
 
     // Replay the ordered redirect ops in the child (AFTER the signal-reset
@@ -6814,6 +6839,7 @@ fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
         &[in_w, out_r],
         None,
         None,
+        /*async_child=*/ true,
     ) {
         Ok(pid) => pid,
         Err(e) => {
@@ -6946,6 +6972,13 @@ fn spawn_pipeline(
     let group = match mode {
         SpawnMode::Foreground => interactive,
         SpawnMode::Background => job_control,
+    };
+    // #766: each stage of `a | b &` IS the asynchronous unit — with job control
+    // off it keeps INT/QUIT ignored across exec (bash's `setup_async_signals`).
+    // A foreground pipeline inside an async child inherits that child's answer.
+    let async_unit = match mode {
+        SpawnMode::Background => !job_control,
+        SpawnMode::Foreground => shell.async_signals_ignored,
     };
     let n = commands.len();
 
@@ -7139,6 +7172,7 @@ fn spawn_pipeline(
                 &fds_to_close,
                 None,
                 None,
+                async_unit,
             ) {
                 Ok(pid) => {
                     // The pipe/capture write end was owned by the moved
@@ -7711,6 +7745,7 @@ fn spawn_pipeline(
                     pgid_target,
                     &fds_to_close_in_child,
                     external_plan.expect("external stage always has a ChildRedirPlan"),
+                    async_unit,
                 ),
                 StageKind::InProcess(cmd) => fork_and_run_in_subshell(
                     cmd,
@@ -7720,6 +7755,7 @@ fn spawn_pipeline(
                     &fds_to_close_in_child,
                     stdout_dup_target,
                     stderr_dup_target,
+                    async_unit,
                 ),
             };
             match spawn_result {
@@ -8741,17 +8777,29 @@ fn wait_with_untraced(pid: i32) -> Result<(libc::c_int, bool), ()> {
     Ok((status, libc::WIFSTOPPED(status)))
 }
 
-/// pre_exec closure that resets SIGTSTP/SIGTTIN/SIGTTOU to SIG_DFL in the
-/// child. Required because huck SIG_IGNs these at the shell level and
-/// SIG_IGN is inherited across exec — without this, Ctrl-Z would never
-/// stop a foreground job, and a background reader could never SIGTTIN.
-fn reset_job_control_signals_in_child() -> std::io::Result<()> {
-    unsafe {
-        libc::signal(libc::SIGTSTP, libc::SIG_DFL);
-        libc::signal(libc::SIGTTIN, libc::SIG_DFL);
-        libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+/// pre_exec closure that resets SIGTSTP/SIGTTIN/SIGTTOU (and SIGQUIT, #478)
+/// to SIG_DFL in the child. Required because huck SIG_IGNs these at the shell
+/// level and SIG_IGN is inherited across exec — without this, Ctrl-Z would
+/// never stop a foreground job, and a background reader could never SIGTTIN.
+///
+/// `keep_int_quit` is bash's `setup_async_signals` outcome: the command being
+/// exec'd IS an asynchronous unit started with job control off, so SIGINT and
+/// SIGQUIT stay ignored (#766). Otherwise both go to the default — the
+/// process may be an async child running a compound, whose inner commands
+/// bash hands the original dispositions.
+fn reset_signals_in_child(keep_int_quit: bool) -> impl FnMut() -> std::io::Result<()> {
+    move || {
+        unsafe {
+            libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+            libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+            libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            if !keep_int_quit {
+                libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 // ----- fork subshell helper -------------------------------------------------
@@ -8841,18 +8889,26 @@ pub fn capture_via_fork(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
         ChildFd::Inherit,     // stderr: terminal unless an inner 2>&1
     );
     // Child closes the parent's read end (else EOF never arrives).
-    let pid =
-        match fork_and_run_in_subshell(&body, shell, stdio, NO_PGROUP, &[read_raw], None, None) {
-            Ok(pid) => pid,
-            Err(e) => {
-                // `write` was owned by the moved `ChildStdio` and is already
-                // closed (RAII) by `fork_and_run_in_subshell` on its error
-                // return; the parent-kept `read` OwnedFd drops here, closing the
-                // read end — no manual close needed.
-                crate::sh_error!(shell, None, "fork: {}", crate::bash_io_error(&e));
-                return (String::new(), 1);
-            }
-        };
+    let pid = match fork_and_run_in_subshell(
+        &body,
+        shell,
+        stdio,
+        NO_PGROUP,
+        &[read_raw],
+        None,
+        None,
+        false,
+    ) {
+        Ok(pid) => pid,
+        Err(e) => {
+            // `write` was owned by the moved `ChildStdio` and is already
+            // closed (RAII) by `fork_and_run_in_subshell` on its error
+            // return; the parent-kept `read` OwnedFd drops here, closing the
+            // read end — no manual close needed.
+            crate::sh_error!(shell, None, "fork: {}", crate::bash_io_error(&e));
+            return (String::new(), 1);
+        }
+    };
     // PARENT: `write` (the pipe write end) was owned by the moved `ChildStdio`
     // and is already closed by the fork helper's RAII drop in the parent, so the
     // read end below sees EOF when the child exits.
@@ -8891,7 +8947,12 @@ pub fn fork_and_run_in_subshell(
     parent_fds_to_close: &[RawFd],
     stdout_dup_target: Option<i32>,
     stderr_dup_target: Option<i32>,
+    async_child: bool,
 ) -> Result<i32, io::Error> {
+    // Decided BEFORE the fork and before `in_subshell` is set (which turns
+    // `job_control_active` off): bash's `setup_async_signals` ignores INT and
+    // QUIT in an asynchronous child only when job control is off (#766).
+    let ignore_int_quit = async_child && !shell.job_control_active();
     // Flush buffered parent stdout BEFORE forking so the child does not inherit
     // (and then re-flush, duplicating) any pending partial line, and so pending
     // parent bytes are ordered ahead of the child's output.
@@ -8910,10 +8971,18 @@ pub fn fork_and_run_in_subshell(
         // `run_command`. Safe because the single-threaded-execution invariant
         // (enforced by `exec_guard`, checked just above the fork) holds.
         unsafe {
-            // 1. Reset job-control signals.
+            // 1. Reset job-control signals — and SIGQUIT, which the shell
+            //    ignores (#478) but a subshell gets back at the default. Then,
+            //    for an async unit with job control off, ignore INT and QUIT
+            //    (bash: `restore_original_signals` then `setup_async_signals`).
             libc::signal(libc::SIGTSTP, libc::SIG_DFL);
             libc::signal(libc::SIGTTIN, libc::SIG_DFL);
             libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            if ignore_int_quit {
+                libc::signal(libc::SIGINT, libc::SIG_IGN);
+                libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+            }
             // v137: a forked pipeline stage / subshell dies on a broken pipe
             // like bash. Redundant with the startup reset in the common case,
             // but also correct for the PIPE-trap case: bash resets a trapped
@@ -8978,6 +9047,9 @@ pub fn fork_and_run_in_subshell(
         // Mark this process as a forked subshell so its inner pipelines skip
         // interactive job-control process-grouping (deadlocks on a tty — M-104).
         shell.in_subshell = true;
+        // #766: what the exec of this unit's own command should keep. A
+        // compound body clears it again (see `run_command`).
+        shell.async_signals_ignored = ignore_int_quit;
         // 8. Run the body via the existing dispatcher.
         //    The child's stdout is now fd 1 (the dup2'd pipe end), so writes
         //    to the real fd table land at the right destination.
@@ -9295,6 +9367,7 @@ fn spawn_external_with_fds(
     pgid_target: i32,
     parent_fds_to_close: &[RawFd],
     plan: ChildRedirPlan,
+    keep_int_quit: bool,
 ) -> Result<i32, io::Error> {
     // Flush pending parent stdout before spawning an external stage so its output
     // does not race ahead of buffered parent bytes (M-118 sibling: ordering).
@@ -9373,9 +9446,10 @@ fn spawn_external_with_fds(
     process.envs(shell.exported_env());
     process.envs(shell.exported_function_env());
 
-    // Reset job-control signals to SIG_DFL before exec.
+    // Reset job-control signals (and QUIT) to SIG_DFL before exec; an async
+    // unit keeps INT/QUIT ignored (#766).
     unsafe {
-        process.pre_exec(reset_job_control_signals_in_child);
+        process.pre_exec(reset_signals_in_child(keep_int_quit));
     }
 
     // If there are Dup redirects, chain a second pre_exec to apply dup2 in the

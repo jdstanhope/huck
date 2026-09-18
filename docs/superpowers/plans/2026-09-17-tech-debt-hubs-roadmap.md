@@ -23,7 +23,7 @@ changes a shared subsystem's semantics and gets a spec + plan + hand-off PR.
 
 | # | Hub | Closes | Shape | Status |
 |---|-----|--------|-------|--------|
-| 1 | Job table: bash's five cleanup points + stored `+`/`-` | #475 #758 (round 1, PR #769); #185 (round 2, PR #771); #766 #478 fork dispositions next | bug-fix rounds | rounds 1–2 ✅ |
+| 1 | Job table: bash's five cleanup points + stored `+`/`-`; fork-site signal dispositions | #475 #758 (round 1, PR #769); #185 (round 2, PR #771); #478 #766 (round 3, PR #773) | bug-fix rounds | ✅ done (#772 filed) |
 | 4 | One AST printer (retire `reconstruct_word_source`'s own renderer) | #761 #124 #589 | bug-fix rounds | |
 | 5 | One pattern-compile chokepoint | #717 #303 (#589 seam) | bug-fix round | |
 | 2A | Declared-but-unset variable state | #600 #225 #33 #691 | vNN | |

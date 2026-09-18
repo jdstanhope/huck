@@ -86,6 +86,7 @@ fn realize_via_devfd(
         &child_close_list,
         None,
         None,
+        /*async_child=*/ false,
     )?;
     // On the error path above, `child_stdio` (owning the child's end) is dropped by
     // the callee, and `parent_owned` drops here as the `?` returns — both pipe ends
@@ -198,6 +199,7 @@ fn realize_via_fifo(
         child_close_list,
         None,
         None,
+        /*async_child=*/ false,
     )
     .inspect_err(|_| {
         let _ = std::fs::remove_file(&fifo_path);

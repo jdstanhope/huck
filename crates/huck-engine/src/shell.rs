@@ -442,19 +442,30 @@ pub fn install_sigchld_handler(flag: Arc<AtomicBool>, shell: &Shell) {
 /// emits via `emit_cli_error` (the pre-shell diagnostic path) rather than
 /// `sh_error!` — `prog` is the CLI's own invocation basename.
 pub fn install_job_control_signals(prog: &str) {
+    // Rust's runtime sets SIGPIPE to SIG_IGN at startup; restore the OS default
+    // so huck (and the stages it forks) die on a broken pipe like bash, instead
+    // of getting EPIPE back from write(2) and looping. bash runs with SIGPIPE at
+    // SIG_DFL everywhere; an interactive shell survives because its stdout is the
+    // terminal, never a pipe. (v137) Done FIRST: the runtime's ignore is not
+    // the disposition we inherited, so it must not be in the snapshot below.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    // What was ignored on ENTRY is fixed now, before we ignore anything.
+    crate::traps::snapshot_ignored_at_startup();
     for sig in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
         let prev = unsafe { libc::signal(sig, libc::SIG_IGN) };
         if prev == libc::SIG_ERR {
             crate::emit_cli_error(prog, format_args!("warning: could not ignore signal {sig}"));
         }
     }
-    // Rust's runtime sets SIGPIPE to SIG_IGN at startup; restore the OS default
-    // so huck (and the stages it forks) die on a broken pipe like bash, instead
-    // of getting EPIPE back from write(2) and looping. bash runs with SIGPIPE at
-    // SIG_DFL everywhere; an interactive shell survives because its stdout is the
-    // terminal, never a pipe. (v137)
+    // #478: bash ignores SIGQUIT in EVERY shell (`initialize_shell_signals`,
+    // unconditionally), so `kill -QUIT $$` in a script is harmless. Children
+    // get the default back before exec and in a forked subshell — except an
+    // asynchronous unit started with job control off, which keeps it ignored
+    // (`setup_async_signals`, #766).
     unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
     }
 }
 
