@@ -71,6 +71,9 @@ fn redirection_to_source(r: &crate::command::Redirection) -> String {
                 FileMode::Append => (">>", 1),
                 FileMode::Clobber => (">|", 1),
                 FileMode::ReadWrite => ("<>", 0),
+                // `&>` takes no fd prefix; bash prints `&> file` / `&>> file`.
+                FileMode::ErrAndOut => ("&>", 1),
+                FileMode::ErrAndOutAppend => ("&>>", 1),
             };
             // `<>` shows the fd unless it is exactly 1 (an absent fd is 0, shown);
             // the other File modes drop the directional default `def`.

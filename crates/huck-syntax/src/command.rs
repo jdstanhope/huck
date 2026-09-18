@@ -234,6 +234,13 @@ pub enum FileMode {
     Append,    // >>    default fd 1
     Clobber,   // >|    default fd 1
     ReadWrite, // <>    default fd 0
+    /// `&> file`: stdout AND stderr to the file (bash's `r_err_and_out`).
+    /// Kept as ONE redirection so `declare -f`, `jobs` and every diagnostic
+    /// print the operator the user wrote (#124); the executor lowers it to
+    /// the `> file 2>&1` pair it has always been.
+    ErrAndOut, // &>    default fd 1
+    /// `&>> file` (bash's `r_append_err_and_out`).
+    ErrAndOutAppend, // &>>   default fd 1
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -322,6 +329,24 @@ pub fn slots_for_simple_path(
     let (mut sin, mut sout, mut serr) = (None, None, None);
     for r in redirs {
         let Some(fd) = r.target_fd() else { continue };
+        // `&> f` / `&>> f` is one redirection that fills BOTH output slots:
+        // the file on stdout, then stderr duplicated from it (#124).
+        if let RedirOp::File {
+            mode: mode @ (FileMode::ErrAndOut | FileMode::ErrAndOutAppend),
+            target,
+        } = &r.op
+        {
+            sout = Some(if matches!(mode, FileMode::ErrAndOut) {
+                RedirectSlot::Truncate(target.clone())
+            } else {
+                RedirectSlot::Append(target.clone())
+            });
+            serr = Some(RedirectSlot::Dup {
+                fd: 2,
+                source: lit_word("1"),
+            });
+            continue;
+        }
         let legacy = match &r.op {
             RedirOp::File {
                 mode: FileMode::ReadOnly,
@@ -340,7 +365,7 @@ pub fn slots_for_simple_path(
                 target,
             } => Some(RedirectSlot::Clobber(target.clone())),
             RedirOp::File {
-                mode: FileMode::ReadWrite,
+                mode: FileMode::ReadWrite | FileMode::ErrAndOut | FileMode::ErrAndOutAppend,
                 ..
             } => None,
             RedirOp::Dup {
@@ -1118,38 +1143,23 @@ pub(crate) fn build_redirections(
             };
             vec![Redirection { fd, op }]
         }
-        Operator::AndRedirOut => vec![
-            Redirection {
-                fd: plain_fd(),
-                op: RedirOp::File {
-                    mode: FileMode::Truncate,
-                    target,
-                },
+        // #124: `&>`/`&>>` stay one redirection in the AST — the operator the
+        // user wrote is what `declare -f` and the job/diagnostic printers must
+        // show. The executor desugars it to `> f 2>&1` when it applies it.
+        Operator::AndRedirOut => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::File {
+                mode: FileMode::ErrAndOut,
+                target,
             },
-            Redirection {
-                fd: RedirFd::Number(2),
-                op: RedirOp::Dup {
-                    source: lit_word("1"),
-                    output: true,
-                },
+        }],
+        Operator::AndRedirAppend => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::File {
+                mode: FileMode::ErrAndOutAppend,
+                target,
             },
-        ],
-        Operator::AndRedirAppend => vec![
-            Redirection {
-                fd: plain_fd(),
-                op: RedirOp::File {
-                    mode: FileMode::Append,
-                    target,
-                },
-            },
-            Redirection {
-                fd: RedirFd::Number(2),
-                op: RedirOp::Dup {
-                    source: lit_word("1"),
-                    output: true,
-                },
-            },
-        ],
+        }],
         // is_redirect_op gates the callers; no other operator reaches here.
         _ => unreachable!("build_redirections called with a non-redirect operator"),
     }
