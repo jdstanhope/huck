@@ -34,7 +34,12 @@ fn check_restricted_redirect(
 ) -> Result<(), ()> {
     if !matches!(
         mode,
-        FileMode::Truncate | FileMode::Append | FileMode::Clobber | FileMode::ReadWrite
+        FileMode::Truncate
+            | FileMode::Append
+            | FileMode::Clobber
+            | FileMode::ReadWrite
+            | FileMode::ErrAndOut
+            | FileMode::ErrAndOutAppend
     ) {
         return Ok(());
     }
@@ -3959,9 +3964,11 @@ fn open_redirect_file(
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     let file: File = match mode {
         FileMode::ReadOnly => File::open(path)?,
-        FileMode::Truncate => open_writable(path, noclobber)?,
+        FileMode::Truncate | FileMode::ErrAndOut => open_writable(path, noclobber)?,
         FileMode::Clobber => open_writable(path, false)?,
-        FileMode::Append => OpenOptions::new().create(true).append(true).open(path)?,
+        FileMode::Append | FileMode::ErrAndOutAppend => {
+            OpenOptions::new().create(true).append(true).open(path)?
+        }
         FileMode::ReadWrite => OpenOptions::new()
             .read(true)
             .write(true)
@@ -5612,6 +5619,38 @@ fn lower_one_redirect(
     mut fd_state: Option<&mut std::collections::HashMap<RawFd, bool>>,
 ) -> Result<Vec<PlanOp>, i32> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // #124: `&> f` / `&>> f` is ONE redirection in the AST (so the printers
+    // show the operator as written) and exactly bash's `> f 2>&1` / `>> f 2>&1`
+    // pair when applied — lower the pair here, at the one chokepoint every
+    // apply path goes through.
+    if let RedirOp::File { mode, target } = &redir.op
+        && let Some(file_mode) = match mode {
+            FileMode::ErrAndOut => Some(FileMode::Truncate),
+            FileMode::ErrAndOutAppend => Some(FileMode::Append),
+            _ => None,
+        }
+    {
+        let file = Redirection {
+            fd: redir.fd.clone(),
+            op: RedirOp::File {
+                mode: file_mode,
+                target: target.clone(),
+            },
+        };
+        let dup = Redirection {
+            fd: RedirFd::Number(2),
+            op: RedirOp::Dup {
+                source: crate::lexer::Word(vec![crate::lexer::WordPart::Literal {
+                    text: "1".to_string(),
+                    quoted: false,
+                }]),
+                output: true,
+            },
+        };
+        let mut ops = lower_one_redirect(&file, shell, fd_state.as_deref_mut())?;
+        ops.extend(lower_one_redirect(&dup, shell, fd_state)?);
+        return Ok(ops);
+    }
     let mut ops: Vec<PlanOp> = Vec::new();
     if let RedirFd::Var(name) = &redir.fd {
         if matches!(&redir.op, RedirOp::Close) {

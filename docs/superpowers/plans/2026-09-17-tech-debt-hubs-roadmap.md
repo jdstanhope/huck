@@ -24,7 +24,7 @@ changes a shared subsystem's semantics and gets a spec + plan + hand-off PR.
 | # | Hub | Closes | Shape | Status |
 |---|-----|--------|-------|--------|
 | 1 | Job table: bash's five cleanup points + stored `+`/`-`; fork-site signal dispositions | #475 #758 (round 1, PR #769); #185 (round 2, PR #771); #478 #766 (round 3, PR #773) | bug-fix rounds | ✅ done (#772 filed) |
-| 4 | One AST printer (`generate` gains bash's outside-a-function style; diagnostics, `jobs`, `$BASH_COMMAND` use it) | #761 #770 (round 1, PR #774); #124 next; #589 moved to hub 5 (it is the matcher's escape form) | bug-fix rounds | round 1 ✅ |
+| 4 | One AST printer (`generate` gains bash's outside-a-function style; diagnostics, `jobs`, `$BASH_COMMAND` use it) | #761 #770 (round 1, PR #774); #124 (round 2, PR #775); #589 moved to hub 5 (it is the matcher's escape form) | bug-fix rounds | ✅ done |
 | 5 | One pattern-compile chokepoint | #717 #303 (#589 seam) | bug-fix round | |
 | 2A | Declared-but-unset variable state | #600 #225 #33 #691 | vNN | |
 | 2B | One declaration policy table | #347 #697 #698 #734 #65 | vNN (after 2A) | |

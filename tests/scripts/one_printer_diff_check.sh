@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Byte-identical bash<->huck harness for #761/#770 (hub 4 of #765): every
+# Byte-identical bash<->huck harness for #761/#770/#124 (hub 4 of #765): every
 # place the shell names a command back to the user renders it with ONE
 # printer, in the style bash's `print_cmd.c` uses OUTSIDE a function
 # definition — `;` joins inline, `{ }` is one line, `if`/`for`/`while` keep
@@ -52,6 +52,19 @@ check "while header two commands"  'f() { while true; false; do echo a; done; };
 check "group in header"            'f() { if { true; }; then echo a; fi; }; declare -f f'
 check "comsub in function body"    'f() { x=$(if true; then echo a; fi; echo b; { echo c; }; echo d); }; declare -f f'
 check "coproc in function body"    'f() { coproc { sleep 1; }; coproc cat; }; declare -f f'
+
+# --- &> / &>> survive as the operator the user wrote (#124) -----------------
+check "&> in declare -f"           'f() { true &>file; true &>>file; true >file 2>&1; true 2>&1 >file; }; declare -f f'
+check "&> with other redirects"    'f() { true &>"$x" 3>&1 <in; }; declare -f f'
+jobs_row "&> in jobs"              'sleep 1 &>/dev/null &'
+check "&> in a diagnostic"         'echo hi > $(echo REDIR &>/dev/null; echo x >&2)'
+check "&> in BASH_COMMAND"         'trap "echo [\$BASH_COMMAND]" DEBUG; echo hi &>/dev/null'
+# and still runs as `> f 2>&1` in every shape
+check "&> runs: group, append"     'cd "$(mktemp -d)"; { echo o; echo e >&2; } &>both; cat both; { echo o2; echo e2 >&2; } &>>both; cat both'
+check "&> runs: noclobber"         'cd "$(mktemp -d)"; set -o noclobber; echo x > f; echo y &> f; echo rc=$?; cat f'
+check "&> runs: later 2> wins"     'cd "$(mktemp -d)"; echo o &>f 2>/dev/null; cat f; ls /nope &>f; cat f'
+check "&> runs: subshell, pipe, fn" 'cd "$(mktemp -d)"; ( echo o; echo e >&2 ) &>sub; cat sub; echo a | cat &>pipe; cat pipe; f() { echo fo; echo fe >&2; }; f &>fn; cat fn'
+check "&> runs: exec"              'cd "$(mktemp -d)"; ( exec &>f; echo o; echo e >&2 ); cat f'
 
 # --- $BASH_COMMAND is the same printer --------------------------------------
 check "BASH_COMMAND"               'trap '"'"'echo "[$BASH_COMMAND]"'"'"' DEBUG; echo "a b" '"'"'c'"'"'; x=$(echo hi >&2); { echo g; }'

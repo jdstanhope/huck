@@ -1,0 +1,96 @@
+---
+title: "Three ways to say the same command"
+date: 2026-09-18
+summary: "huck had three separate pieces of code for turning a parsed command back into text — one for declare -f, one for error messages, one for jobs. Each had drifted. Now there is one, with the single switch bash's own printer has: are we inside a function body, or not?"
+tags: ["printer", "declare", "jobs", "diagnostics", "architecture", "bugfix"]
+version: null
+draft: false
+---
+
+A shell has to turn a parsed command back into text more often than you
+would think: `declare -f` prints a function body, an error message names the
+word that went wrong, `jobs` shows what each background job is, and
+`$BASH_COMMAND` hands a trap the command that fired it. huck did this in three
+unrelated places. The one behind error messages could not print a compound
+command at all, so a `$( )` containing an `if` was reported as nothing:
+
+```bash
+# before
+$ huck -c 'echo hi > $(if true; then echo a; fi; echo b   c)'
+huck: line 1: $(; echo b c): ambiguous redirect
+```
+
+```bash
+# after
+$ huck -c 'echo hi > $(if true; then echo a; fi; echo b   c)'
+huck: line 1: $(if true; then
+    echo a;
+fi; echo b c): ambiguous redirect
+```
+
+That is bash's exact text, odd line breaks and all. bash rewrites the body of
+a `$( )` from its parsed form the moment it parses it, so what the message
+shows is the printer's output, not what you typed — `>&2` becomes `1>&2`, and
+`echo b   c` loses its extra spaces.
+
+The one behind `jobs` gave up on anything that was not a simple command:
+
+```bash
+# before
+$ huck -c 'if true; then sleep 1; fi & jobs'
+[1]+  Running                 background job &
+```
+
+```bash
+# after
+$ huck -c 'if true; then sleep 1; fi & jobs'
+[1]+  Running                 if true; then
+    sleep 1;
+fi &
+```
+
+bash's printer is one function with one switch: *are we inside a function
+definition?* Inside one, every `;` ends the line and a `{ … }` group prints
+over several lines. Everywhere else — the text of a `$( )`, the `jobs`
+column — a `;` joins commands on one line and a group is `{ a; b; }`, while
+`if`, `for` and `while` keep their multi-line shape in both. huck's
+`declare -f` printer only knew the first style. It now has the switch, and the
+other two printers are gone; error messages, `jobs` and `$BASH_COMMAND` all
+ask it. Reading bash's printer also turned up two things `declare -f` had
+been getting wrong: a two-command header (`if a; b; then`) is indented to
+match its `if`, and a coprocess always prints its name, even the default one
+(`coproc COPROC cat`).
+
+The last piece was an operator that vanished at parse time. huck rewrote
+`&> file` into `> file 2>&1` before anything else saw it, so a function
+containing one came back changed:
+
+```bash
+# before
+$ huck -c 'f() { true &>log; }; declare -f f'
+f () 
+{ 
+    true > log 2>&1
+}
+```
+
+```bash
+# after
+$ huck -c 'f() { true &>log; }; declare -f f'
+f () 
+{ 
+    true &> log
+}
+```
+
+It still runs as `> log 2>&1` — that rewrite now happens at the one place
+redirections are applied, not where they are parsed — so `noclobber`, a later
+`2>/dev/null`, `exec &>f` and every other shape behave exactly as before.
+
+Still open: a `$( )` inside a malformed `${…}` is quoted verbatim in the
+bad-substitution message rather than normalised (that text is unparsed by
+design), and a literal newline between commands inside `$( )` cannot be
+preserved, because the parsed form does not record it. The `set -x` trace of a
+quoted `[[ == ]]` pattern turned out to be the pattern *matcher's* escape form
+leaking out, not the printer's, and moved to the next hub
+([#589](https://github.com/jdstanhope/huck/issues/589)).
