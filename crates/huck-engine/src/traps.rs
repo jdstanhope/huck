@@ -20,9 +20,18 @@ pub fn init_pending_bitmask(arc: Arc<AtomicU32>) {
 }
 
 /// Set of signal numbers that were ignored when huck started. Per
-/// POSIX, these cannot be trapped or reset. Populated lazily on
-/// first `install` / `reset` call.
+/// POSIX, these cannot be trapped or reset. Populated by
+/// [`snapshot_ignored_at_startup`] before the shell ignores anything itself
+/// (SIGQUIT, the job-control three — #478), or lazily on first `install` /
+/// `reset` call in an embedder that never installs the shell's signals.
 static IGNORED_AT_STARTUP: OnceLock<HashSet<i32>> = OnceLock::new();
+
+/// Record which signals the process INHERITED ignored. Must run before
+/// `install_job_control_signals` — the shell's own `SIG_IGN`s are not
+/// "ignored on entry" and stay trappable, as in bash.
+pub fn snapshot_ignored_at_startup() {
+    let _ = ignored_at_startup_set();
+}
 
 fn ignored_at_startup_set() -> &'static HashSet<i32> {
     IGNORED_AT_STARTUP.get_or_init(|| {
@@ -524,10 +533,10 @@ pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Re
 /// - SIGINT and SIGCHLD, because huck registers always-on flag handlers for
 ///   them at startup (Ctrl-C polling, child reaping) that must survive
 ///   `trap - INT` / `trap - CHLD`;
-/// - SIGQUIT until #478, because bash IGNORES it in a non-interactive shell,
-///   so the correct restore target there is IGNORE rather than default —
-///   emulating the default would turn an existing startup divergence into a
-///   new one on the reset path.
+/// - SIGQUIT, because the shell IGNORES it from startup (#478, as bash does
+///   in every shell), so `trap - QUIT` restores IGNORE — bash's
+///   `get_original_signal` records the disposition the shell itself set —
+///   and emulating the default would kill the shell on the reset path.
 fn restore_default_disposition(shell: &mut Shell, signum: i32) {
     if signum == libc::SIGINT
         || signum == libc::SIGCHLD

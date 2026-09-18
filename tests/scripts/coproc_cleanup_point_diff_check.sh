@@ -28,7 +28,10 @@ one='coproc X { read l; echo "e:$l"; }; echo yo >&"${X[1]}"; '
 # --- not cleanup points: builtins, a $( ), a new job ------------------------
 check "read straight back"     "$one"'read r <&"${X[0]}"; echo "[$r]"'
 check "builtins between"       "$one"':; :; x=1; read r <&"${X[0]}"; echo "[$r]"'
-check "comsub between"         "$one"'x=$(sleep 0.3); read r <&"${X[0]}"; echo "[$r]"'
+# (Time passes in a BUILTIN — `read -t` on a FIFO opened beforehand — so no
+# fork and no cleanup point in either shell. `x=$(sleep 0.3)` there was racy
+# in bash itself under load, ~1 run in 30.)
+check "builtin delay between"  "mkfifo $tmp/f; exec 3<>$tmp/f; $one"'read -t 0.3 d <&3; read r <&"${X[0]}"; echo "[$r]"; exec 3<&-; rm -f '"$tmp/f"
 # (Bodies that live a moment: a coproc that exits before bash has even set its
 # variables is disposed on the spot — a bash-side race, not a cleanup rule.)
 check "PID survives a comsub"  'coproc X { sleep 0.1; }; x=$(sleep 0.3); echo "[${X_PID:+set}] [${X[0]:+set}]"'

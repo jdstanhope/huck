@@ -922,6 +922,14 @@ pub struct Shell {
     /// (that deadlocks on a controlling terminal — M-104).
     pub in_subshell: bool,
 
+    /// True while this process IS an asynchronous unit started with job
+    /// control off — bash's `setup_async_signals`: SIGINT and SIGQUIT are
+    /// ignored, and stay ignored across the exec of the command that is that
+    /// unit (`cmd &`, a stage of `a | b &`). Cleared as soon as a compound or
+    /// a function runs, because their inner commands are not the async unit
+    /// and bash gives them the default dispositions again (#766).
+    pub async_signals_ignored: bool,
+
     /// Set for the dynamic extent of a completion-function invocation
     /// (`call_completion_function`). Suppresses interactive job control for the
     /// completer's subprocesses/pipelines so they don't `setpgid` / hand the
@@ -1314,6 +1322,7 @@ impl Shell {
             reads_script_file: false,
             reads_stdin: false,
             in_subshell: false,
+            async_signals_ignored: false,
             in_completion: false,
             xtrace_depth: 0,
             shell_options: ShellOptions::default(),
