@@ -1,7 +1,7 @@
 ---
 title: "Five places a shell looks at its jobs"
 date: 2026-09-18
-summary: "huck tidied its job table after every command. bash only looks at five specific moments — and what it says depends on whether it is running a script or a -c string. A background job that died between the two could vanish from `jobs`, lose its `Killed` notice, or turn `wait %` into 'no such job'. Coprocesses and a QUIT aimed at the shell followed the same thread."
+summary: "huck tidied its job table after every command. bash looks at five specific moments — and what it says depends on whether it runs a script or a -c string. A job that died between could vanish from `jobs`, lose its `Killed` notice, or make `wait %` fail. Coprocesses and QUIT followed the same thread."
 tags: ["jobs", "job-control", "wait", "bugfix"]
 version: null
 draft: false
