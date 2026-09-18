@@ -623,7 +623,7 @@ pub fn reap_owned_once(shell: &mut crate::shell_state::Shell) -> bool {
     // coproc list) as it reaps. Coproc pids are tracked on the Shell, not the job
     // table, so they are unioned in here.
     let mut targets: Vec<i32> = shell.jobs.owned_pids().to_vec();
-    targets.extend(shell.coprocs.iter().map(|c| c.pid));
+    targets.extend(shell.coprocs.iter().filter(|c| !c.dead).map(|c| c.pid));
     targets.sort_unstable();
     targets.dedup();
 
@@ -656,15 +656,15 @@ pub fn reap_owned_once(shell: &mut crate::shell_state::Shell) -> bool {
         }
         reaped_any = true;
         shell.jobs.reap(r, raw_status);
-        // If the reaped child is a live coproc that actually exited, close its
-        // fds + unset NAME/NAME_PID. A WIFSTOPPED (WUNTRACED) report means the
-        // coproc is merely stopped, and a WIFCONTINUED (WCONTINUED) report means
-        // it just resumed — in BOTH cases it is still alive, so do NOT reap it
-        // (reap_coproc tears the coproc down unconditionally by pid).
+        // If the reaped child is a live coproc that actually exited, mark it
+        // dead; its fds and variables go at the next cleanup point (#185). A
+        // WIFSTOPPED (WUNTRACED) report means the coproc is merely stopped, and
+        // a WIFCONTINUED (WCONTINUED) report means it just resumed — in BOTH
+        // cases it is still alive.
         if !libc::WIFSTOPPED(raw_status) && !libc::WIFCONTINUED(raw_status) {
             // Terminal: no longer a live child.
             shell.jobs.release_owned_pid(r);
-            shell.reap_coproc(r);
+            shell.mark_coproc_dead(r);
         }
     }
     reaped_any
@@ -825,9 +825,13 @@ pub fn reap_dead_jobs(shell: &mut crate::shell_state::Shell) {
     cleanup_dead_jobs(shell);
 }
 
-/// bash's `cleanup_dead_jobs`: drop every dead job that has been reported.
+/// bash's `cleanup_dead_jobs`: drop every dead job that has been reported,
+/// and dispose of every coproc whose child has been reaped (`coproc_reap`
+/// lives here in bash too — a dead coproc's fds and `NAME`/`NAME_PID` stay
+/// usable until one of the cleanup points, #185).
 pub fn cleanup_dead_jobs(shell: &mut crate::shell_state::Shell) {
     shell.jobs.remove_notified();
+    shell.dispose_dead_coprocs();
 }
 
 /// bash's `notify_of_job_status`: one verdict per pending job, printed in id

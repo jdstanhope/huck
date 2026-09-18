@@ -59,21 +59,23 @@ fn assert_matches_bash(script: &str) {
     );
 }
 
-// #185: both round-trip bodies use a `while read` loop so the coproc stays ALIVE
-// across the round-trip, rather than exiting after one line.
-//
-// A single-shot body (`{ read l; echo ...; }`) exits as soon as it echoes, which
-// makes the round-trip a RACE: since v306 (#175) a terminal coproc is torn down at
-// the next command boundary — `reap_coproc` closes its fds and unsets NAME — so if
-// the body wins the race to exit before the `read` below, the fd is already gone
-// and the read yields "". That is not a huck quirk: bash tears the coproc down too
-// (verified on 5.2.21 — inserting a 5ms sleep before the read makes BOTH shells
-// return empty). The old assertion just hardcoded pre-v306 huck's "never reap"
-// behavior, so it passed on a slow box and failed on a fast one.
-//
-// Keeping the coproc alive removes the race without weakening what is tested: the
-// write -> body -> read round-trip is still proven end to end. Verified
-// deterministic: 20 runs of each, under CPU load, byte-identical to bash 5.2.21.
+// #185: a coproc that has EXITED keeps its fds and NAME/NAME_PID until the
+// next cleanup point — the end of a foreground wait, `jobs`, a loop iteration,
+// `wait`, or a new input line — exactly as bash's `coproc_reap` runs inside
+// `cleanup_dead_jobs`. So a single-shot body (`{ read l; echo ...; }`) that
+// exits as soon as it echoes is still readable afterwards, as long as nothing
+// between the write and the read is a cleanup point: builtins are not, and
+// neither is a `$( )`. (Before that fix the coproc was torn down at REAP, which
+// made this a race against the between-command reaper; the `while read` bodies
+// below were the workaround and are kept as the live-coproc case.)
+
+#[test]
+fn coproc_single_shot_body_is_readable_after_it_exits() {
+    let script = r#"coproc MYP { read l; echo "echo:$l"; }; echo yo >&"${MYP[1]}"; x=$(sleep 0.2); read r <&"${MYP[0]}"; echo "$r""#;
+    let (huck_out, _) = run_c(&huck_binary(), script);
+    assert_eq!(huck_out, "echo:yo\n", "huck single-shot round-trip (#185)");
+    assert_matches_bash(script);
+}
 
 #[test]
 fn coproc_anonymous_roundtrip() {

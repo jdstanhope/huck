@@ -6898,6 +6898,7 @@ fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
         pid,
         read_fd,
         write_fd,
+        dead: false,
     });
     ExecOutcome::Continue(0)
 }
