@@ -43,6 +43,8 @@ check "wait %1 then jobs"         'sleep 0.1 & sleep 0.2 & sleep 0.4; wait %1; j
 check "wait %1 twice"             'sleep 0.1 & wait %1; wait %1; echo rc=$?'
 check "wait \$pid twice"          'sleep 0.1 & p=$!; wait $p; wait $p; echo rc=$?'
 check "wait \$pid then jobs"      'sleep 0.1 & p=$!; wait $p; jobs; echo END'
+check "wait \$pid after fg wait"  'sleep 0.1 & p=$!; sleep 0.3; wait $p; echo rc=$?'
+check "wait \$pid after loop"     'sleep 0.1 & p=$!; sleep 0.3; for i in 1; do :; done; wait $p; echo rc=$?'
 check "wait -n then jobs"         'sleep 0.1 & sleep 0.2 & wait -n; jobs | wc -l; wait'
 
 # --- #475: a trap interrupts wait; no cleanup point before the pipeline -----

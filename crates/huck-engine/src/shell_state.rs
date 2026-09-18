@@ -686,6 +686,12 @@ pub struct Coproc {
     pub pid: libc::pid_t,
     pub read_fd: std::os::unix::io::RawFd,
     pub write_fd: std::os::unix::io::RawFd,
+    /// bash's `COPROC_DEAD`: the child has been reaped, but the fds and the
+    /// `NAME`/`NAME_PID` variables live on until the next cleanup point
+    /// (`coproc_reap` runs inside `cleanup_dead_jobs`, not in the reaper) —
+    /// so `echo >&"${X[1]}"; x=$(sleep 0.3); read <&"${X[0]}"` still reads
+    /// what a coproc wrote before it exited (#185).
+    pub dead: bool,
 }
 /// Whether a failing command COUNTS — bash's ignore-return, as shell state.
 ///
@@ -1080,9 +1086,9 @@ pub struct Shell {
     /// to make the structure multi-coproc-ready.
     ///
     /// COW-clone note: a `$(...)`/subshell Shell clone copies these Coproc
-    /// records but does NOT own the fds; only the owning shell's reap path
-    /// calls `reap_coproc`, and a forked subshell exits without running it,
-    /// so there is no double-close.
+    /// records but does NOT own the fds; only the owning shell's cleanup path
+    /// calls `dispose_dead_coprocs`, and a forked subshell exits without
+    /// running it, so there is no double-close.
     #[allow(dead_code)]
     pub coprocs: Vec<Coproc>,
 
@@ -2075,22 +2081,36 @@ impl Shell {
     }
 
     /// Called from the reap path when child `pid` has exited: if it is a live
-    /// coproc, close its held fds, unset NAME + NAME_PID, and drop the record.
-    /// bash unsets the coproc variables once the coprocess is reaped.
-    pub fn reap_coproc(&mut self, pid: libc::pid_t) {
-        let Some(idx) = self.coprocs.iter().position(|c| c.pid == pid) else {
-            return;
-        };
-        let c = self.coprocs.remove(idx);
-        // #197 Class-A: owned but left raw — the parent-held coproc ends live in
-        // the `Coproc` record, which must stay `Clone` (Shell derives Clone).
-        // `OwnedFd` is not `Clone`, so these stay `RawFd` and are closed here.
-        unsafe {
-            libc::close(c.read_fd);
-            libc::close(c.write_fd);
+    /// coproc, mark it dead (bash's `coproc_pidchk`). Disposal — closing the
+    /// fds, unsetting NAME + NAME_PID — waits for [`Shell::dispose_dead_coprocs`]
+    /// at the next cleanup point, as bash's does.
+    pub fn mark_coproc_dead(&mut self, pid: libc::pid_t) {
+        if let Some(c) = self.coprocs.iter_mut().find(|c| c.pid == pid) {
+            c.dead = true;
         }
-        self.unset(&c.name); // the NAME array
-        self.unset(&format!("{}_PID", c.name)); // NAME_PID
+    }
+
+    /// bash's `coproc_reap`, run by `cleanup_dead_jobs`: every coproc whose
+    /// child has been reaped has its fds closed, NAME + NAME_PID unset, and
+    /// its record dropped.
+    pub fn dispose_dead_coprocs(&mut self) {
+        let mut idx = 0;
+        while idx < self.coprocs.len() {
+            if !self.coprocs[idx].dead {
+                idx += 1;
+                continue;
+            }
+            let c = self.coprocs.remove(idx);
+            // #197 Class-A: owned but left raw — the parent-held coproc ends live in
+            // the `Coproc` record, which must stay `Clone` (Shell derives Clone).
+            // `OwnedFd` is not `Clone`, so these stay `RawFd` and are closed here.
+            unsafe {
+                libc::close(c.read_fd);
+                libc::close(c.write_fd);
+            }
+            self.unset(&c.name); // the NAME array
+            self.unset(&format!("{}_PID", c.name)); // NAME_PID
+        }
     }
 
     /// Scope-aware variable unset for the `unset` builtin's `-v`/default path

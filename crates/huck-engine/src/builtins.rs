@@ -5188,6 +5188,15 @@ fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
 fn wait_for_pid(pid: i32, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let mut first = true;
     loop {
+        // A child the reaper already collected sits in the job table with its
+        // status until a cleanup point prunes it (a script-file shell keeps a
+        // normal exit there indefinitely, #475). Answer from the table before
+        // asking the kernel, which would say ECHILD for a reaped child.
+        if let Some((_, code)) = check_targets_terminal(&[LiveTarget::Pid(pid)], shell) {
+            let waited = job_id_for_pid(shell, pid);
+            after_wait(shell, waited);
+            return ExecOutcome::Continue(code);
+        }
         if let Some(o) = crate::executor::check_interrupt(shell) {
             return o;
         }
@@ -5204,13 +5213,13 @@ fn wait_for_pid(pid: i32, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome
         if r > 0 {
             shell.jobs.reap(r, status);
             if libc::WIFSTOPPED(status) {
-                // Still alive; keep polling. Do NOT reap_coproc (would close a
-                // live coproc's fds + unset NAME while it's merely stopped).
+                // Still alive; keep polling. Do NOT mark the coproc dead (it is
+                // merely stopped).
                 first = false;
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
-            shell.reap_coproc(r);
+            shell.mark_coproc_dead(r);
             let code = if libc::WIFEXITED(status) {
                 libc::WEXITSTATUS(status)
             } else if libc::WIFSIGNALED(status) {
@@ -5387,9 +5396,9 @@ fn wait_any_of(
     }
 
     // Probe each target once; collect any pid that was reaped inline here so
-    // we can call reap_coproc after the closure (can't hold two &mut borrows).
-    // Only record the pid for coproc reaping when it actually exited (not a
-    // mere WIFSTOPPED stop, which leaves the coproc alive).
+    // we can mark a dead coproc after the closure (can't hold two &mut
+    // borrows). Only when it actually exited (not a mere WIFSTOPPED stop,
+    // which leaves the coproc alive).
     let mut inlined_reaped_pid: Option<i32> = None;
     let any_active = targets.iter().any(|t| match t {
         LiveTarget::Job(id) => shell.jobs.iter().any(|j| j.id == *id),
@@ -5408,7 +5417,7 @@ fn wait_any_of(
         }
     });
     if let Some(r) = inlined_reaped_pid {
-        shell.reap_coproc(r);
+        shell.mark_coproc_dead(r);
     }
     if !any_active {
         if let Some(name) = &pid_var {
