@@ -24,7 +24,7 @@ changes a shared subsystem's semantics and gets a spec + plan + hand-off PR.
 | # | Hub | Closes | Shape | Status |
 |---|-----|--------|-------|--------|
 | 1 | Job table: bash's five cleanup points + stored `+`/`-`; fork-site signal dispositions | #475 #758 (round 1, PR #769); #185 (round 2, PR #771); #478 #766 (round 3, PR #773) | bug-fix rounds | ✅ done (#772 filed) |
-| 4 | One AST printer (retire `reconstruct_word_source`'s own renderer) | #761 #124 #589 | bug-fix rounds | |
+| 4 | One AST printer (`generate` gains bash's outside-a-function style; diagnostics, `jobs`, `$BASH_COMMAND` use it) | #761 #770 (round 1, PR #774); #124 next; #589 moved to hub 5 (it is the matcher's escape form) | bug-fix rounds | round 1 ✅ |
 | 5 | One pattern-compile chokepoint | #717 #303 (#589 seam) | bug-fix round | |
 | 2A | Declared-but-unset variable state | #600 #225 #33 #691 | vNN | |
 | 2B | One declaration policy table | #347 #697 #698 #734 #65 | vNN (after 2A) | |
@@ -80,7 +80,19 @@ signal-interrupted `wait`, a coproc exiting mid-script at several delays (#185's
 table), and `kill -TSTP %1` under `set -m` on and off. Run the three flaky
 tests in a loop against the frozen binary before and after.
 
-### 4. Two printers for one AST
+### 4. Three printers for one AST
+
+**Corrected by round 1 (2026-09-18):** there were three, not two — the
+`jobs` column had its own (`render_job_*`, with a `background job` fallback
+for compounds). bash's `print_cmd.c` has ONE printer with a mode,
+`inside_function_def`: in a function body `;` ends the line and `{ }` is
+multi-line; everywhere else (a `$( )` body's text at parse time, the `jobs`
+column) `;` joins inline and `{ }` is one line, while `if`/`for`/`while`
+keep their multi-line shape in both. `generate.rs` now carries that mode;
+the diagnostic printer delegates comsub/procsub bodies to it and the jobs
+column and `$BASH_COMMAND` call it directly. #589 turned out to be the
+pattern MATCHER's escape form leaking into xtrace, not the printer — it
+belongs to hub 5.
 
 `crates/huck-syntax/src/generate.rs` (used by `declare -f`, `type`, `export -f`)
 and `crate::expand::reconstruct_word_source` (45 callers — every diagnostic and

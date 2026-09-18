@@ -15,7 +15,15 @@ use crate::lexer::{
 
 /// Render a function definition for `declare -f`: `NAME ()\n<body>`.
 pub fn function_to_source(name: &str, body: &Command) -> String {
-    render_function_def(name, body, 0, false)
+    render_function_def(
+        name,
+        body,
+        Ctx {
+            indent: 0,
+            in_fn: true,
+        },
+        false,
+    )
 }
 
 /// Append every redirection in SOURCE ORDER, each prefixed with a space
@@ -114,7 +122,53 @@ fn redirection_to_source(r: &crate::command::Redirection) -> String {
 /// entry point) passes `false`. A brace-group body — bare or carrying a redirect
 /// — becomes the function's own braces, with any redirect hoisted to the close
 /// brace (`} 1>&2`). Any other body is wrapped in fresh `{ }`.
-fn render_function_def(name: &str, body: &Command, indent: usize, with_keyword: bool) -> String {
+/// Where a command is being printed — bash's `print_cmd.c` state.
+#[derive(Clone, Copy)]
+struct Ctx {
+    /// Nesting depth, 4 spaces per level (`indentation`).
+    indent: usize,
+    /// bash's `inside_function_def`. In a function body a `;` connector ends
+    /// the line and a `{ }` group prints multi-line; everywhere else — the
+    /// text of a `$( )`/`<( )` body, the `jobs` command column, a diagnostic
+    /// that names a word — a `;` joins commands inline (`a; b`) and a group is
+    /// `{ a; b; }`. `if`/`while`/`for`/`case` print multi-line in both.
+    in_fn: bool,
+}
+
+impl Ctx {
+    fn inline() -> Ctx {
+        Ctx {
+            indent: 0,
+            in_fn: false,
+        }
+    }
+    fn deeper(self) -> Ctx {
+        Ctx {
+            indent: self.indent + 1,
+            ..self
+        }
+    }
+}
+
+/// Render a sequence the way bash prints it outside a function definition:
+/// `;` joins inline and `{ }` groups are one-line. This is the form bash
+/// gives a `$( )` body's text at parse time, and the `jobs` command column.
+pub fn sequence_to_inline_source(seq: &Sequence) -> String {
+    sequence_to_source(seq, Ctx::inline())
+}
+
+/// [`sequence_to_inline_source`] for one command.
+pub fn command_to_inline_source(cmd: &Command) -> String {
+    command_to_source_ctx(cmd, Ctx::inline())
+}
+
+/// A simple command's source (`$BASH_COMMAND`, the `jobs` column): the same
+/// in either style.
+pub fn simple_command_to_source(s: &SimpleCommand) -> String {
+    simple_to_source(s)
+}
+
+fn render_function_def(name: &str, body: &Command, ctx: Ctx, with_keyword: bool) -> String {
     let kw = if with_keyword { "function " } else { "" };
     let (group_seq, hoisted): (Sequence, String) = match body {
         Command::BraceGroup(seq) => ((**seq).clone(), String::new()),
@@ -137,10 +191,16 @@ fn render_function_def(name: &str, body: &Command, indent: usize, with_keyword: 
             String::new(),
         ),
     };
+    // A function body always prints in the function-definition style, wherever
+    // the definition itself appears (bash's `inside_function_def++`).
+    let body_ctx = Ctx {
+        indent: ctx.indent + 1,
+        in_fn: true,
+    };
     format!(
         "{kw}{name} () \n{p}{{ \n{}{p}}}{hoisted}",
-        group_body(&group_seq, indent + 1),
-        p = pad(indent),
+        group_body(&group_seq, body_ctx),
+        p = pad(ctx.indent),
     )
 }
 
@@ -150,23 +210,50 @@ pub fn exported_function_value(body: &Command) -> String {
     format!("() {}", command_to_source(body, 0))
 }
 
-/// Render any command at nesting depth `indent` (4 spaces/level).
+/// Render any command at nesting depth `indent` (4 spaces/level), in the
+/// function-body style (`declare -f`, `export -f`).
 pub fn command_to_source(cmd: &Command, indent: usize) -> String {
+    command_to_source_ctx(
+        cmd,
+        Ctx {
+            indent,
+            in_fn: true,
+        },
+    )
+}
+
+fn command_to_source_ctx(cmd: &Command, ctx: Ctx) -> String {
     match cmd {
-        Command::Pipeline(p) => pipeline_to_source(p, indent),
+        Command::Pipeline(p) => pipeline_to_source(p, ctx),
         Command::Simple(s) => simple_to_source(s),
-        Command::If(c) => if_to_source(c, indent),
-        Command::While(c) => while_to_source(c, indent),
-        Command::For(c) => for_to_source(c, indent),
-        Command::ArithFor(c) => arith_for_to_source(c, indent),
-        Command::Select(c) => select_to_source(c, indent),
-        Command::Case(c) => case_to_source(c, indent),
+        Command::If(c) => if_to_source(c, ctx),
+        Command::While(c) => while_to_source(c, ctx),
+        Command::For(c) => for_to_source(c, ctx),
+        Command::ArithFor(c) => arith_for_to_source(c, ctx),
+        Command::Select(c) => select_to_source(c, ctx),
+        Command::Case(c) => case_to_source(c, ctx),
         Command::BraceGroup(seq) => {
-            format!("{{ \n{}{}}}", group_body(seq, indent + 1), pad(indent))
+            if ctx.in_fn {
+                format!(
+                    "{{ \n{}{}}}",
+                    group_body(seq, ctx.deeper()),
+                    pad(ctx.indent)
+                )
+            } else {
+                // bash's `print_group_command` outside a function definition:
+                // `{ ` body `semicolon()` ` }` on one line.
+                let inner = sequence_to_source(seq, ctx);
+                let semi = if inner.ends_with('&') || inner.ends_with('\n') {
+                    ""
+                } else {
+                    ";"
+                };
+                format!("{{ {inner}{semi} }}")
+            }
         }
         Command::Subshell { body } => {
             // bash prints subshells inline at the SAME indent: `( <body> )`.
-            format!("( {} )", sequence_to_source(body, indent))
+            format!("( {} )", sequence_to_source(body, ctx))
         }
         Command::Arith(word, _) => format!("(({}))", arith_body_to_source(word)),
         Command::DoubleBracket {
@@ -182,17 +269,15 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
             s.push_str(&format!("[[ {} ]]", testexpr_to_source(expr)));
             s
         }
-        Command::FunctionDef { name, body, .. } => render_function_def(name, body, indent, true),
+        Command::FunctionDef { name, body, .. } => render_function_def(name, body, ctx, true),
         Command::Coproc { name, body } => {
-            let body_src = command_to_source(body, indent);
-            if name == "COPROC" {
-                format!("coproc {body_src}")
-            } else {
-                format!("coproc {name} {body_src}")
-            }
+            // bash's `print_coproc_command` prints the name even when it is
+            // the default: `coproc COPROC { sleep 1; }`.
+            let body_src = command_to_source_ctx(body, ctx);
+            format!("coproc {name} {body_src}")
         }
         Command::Redirected { inner, redirects } => {
-            let mut s = command_to_source(inner, indent);
+            let mut s = command_to_source_ctx(inner, ctx);
             append_redirects(&mut s, redirects);
             s
         }
@@ -201,34 +286,35 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
 
 /// Group / function / subshell / case body: indented sequence, NO trailing
 /// `;`, terminated by a newline. (bash: these bodies never call `semicolon()`.)
-fn group_body(seq: &Sequence, indent: usize) -> String {
-    format!("{}{}\n", pad(indent), sequence_to_source(seq, indent))
+fn group_body(seq: &Sequence, ctx: Ctx) -> String {
+    format!("{}{}\n", pad(ctx.indent), sequence_to_source(seq, ctx))
 }
 
 /// if / while / until / for / arith-for / select body: indented sequence with
 /// bash's `semicolon()` terminator — a trailing `;` UNLESS the rendered body
 /// already ends in `&` (a background command) or `\n` (e.g. a heredoc).
-fn loop_body(seq: &Sequence, indent: usize) -> String {
-    let inner = sequence_to_source(seq, indent);
+fn loop_body(seq: &Sequence, ctx: Ctx) -> String {
+    let inner = sequence_to_source(seq, ctx);
     let semi = if inner.ends_with('&') || inner.ends_with('\n') {
         ""
     } else {
         ";"
     };
-    format!("{}{}{}\n", pad(indent), inner, semi)
+    format!("{}{}{}\n", pad(ctx.indent), inner, semi)
 }
 
-/// Render a condition/header sequence inline (no indentation, no trailing
-/// terminator) for use on a keyword line like `if <cond>; then`.
-fn inline_seq(seq: &Sequence) -> String {
-    sequence_to_source(seq, 0)
+/// Render a condition/header sequence for a keyword line like
+/// `if <cond>; then` — in the CURRENT context: bash prints a two-command
+/// header inside a function as `if true;` newline, indented, `true; then`.
+fn inline_seq(seq: &Sequence, ctx: Ctx) -> String {
+    sequence_to_source(seq, ctx)
 }
 
-fn if_to_source(c: &IfClause, indent: usize) -> String {
-    let mut s = format!("if {}; then\n", inline_seq(&c.condition));
-    s.push_str(&loop_body(&c.then_body, indent + 1));
-    s.push_str(&nested_elif(&c.elif_branches, &c.else_body, indent));
-    s.push_str(&pad(indent));
+fn if_to_source(c: &IfClause, ctx: Ctx) -> String {
+    let mut s = format!("if {}; then\n", inline_seq(&c.condition, ctx));
+    s.push_str(&loop_body(&c.then_body, ctx.deeper()));
+    s.push_str(&nested_elif(&c.elif_branches, &c.else_body, ctx));
+    s.push_str(&pad(ctx.indent));
     s.push_str("fi");
     s
 }
@@ -236,34 +322,37 @@ fn if_to_source(c: &IfClause, indent: usize) -> String {
 /// bash has no `elif` node — it renders `elif` as a nested `else { if … fi; }`,
 /// deepening one indent level per branch. The inner `fi` takes a `;` (the outer
 /// `semicolon()`); the outermost `fi` (emitted by `if_to_source`) does not.
-fn nested_elif(elifs: &[ElifBranch], else_body: &Option<Sequence>, indent: usize) -> String {
+fn nested_elif(elifs: &[ElifBranch], else_body: &Option<Sequence>, ctx: Ctx) -> String {
     if let Some((head, tail)) = elifs.split_first() {
-        let inner = indent + 1;
-        let mut s = format!("{}else\n", pad(indent));
-        s.push_str(&pad(inner));
-        s.push_str(&format!("if {}; then\n", inline_seq(&head.condition)));
-        s.push_str(&loop_body(&head.body, inner + 1));
+        let inner = ctx.deeper();
+        let mut s = format!("{}else\n", pad(ctx.indent));
+        s.push_str(&pad(inner.indent));
+        s.push_str(&format!(
+            "if {}; then\n",
+            inline_seq(&head.condition, inner)
+        ));
+        s.push_str(&loop_body(&head.body, inner.deeper()));
         s.push_str(&nested_elif(tail, else_body, inner));
-        s.push_str(&pad(inner));
+        s.push_str(&pad(inner.indent));
         s.push_str("fi;\n");
         s
     } else if let Some(eb) = else_body {
-        format!("{}else\n{}", pad(indent), loop_body(eb, indent + 1))
+        format!("{}else\n{}", pad(ctx.indent), loop_body(eb, ctx.deeper()))
     } else {
         String::new()
     }
 }
 
-fn while_to_source(c: &WhileClause, indent: usize) -> String {
+fn while_to_source(c: &WhileClause, ctx: Ctx) -> String {
     let kw = if c.until { "until" } else { "while" };
-    let mut s = format!("{kw} {}; do\n", inline_seq(&c.condition));
-    s.push_str(&loop_body(&c.body, indent + 1));
-    s.push_str(&pad(indent));
+    let mut s = format!("{kw} {}; do\n", inline_seq(&c.condition, ctx));
+    s.push_str(&loop_body(&c.body, ctx.deeper()));
+    s.push_str(&pad(ctx.indent));
     s.push_str("done");
     s
 }
 
-fn for_to_source(c: &ForClause, indent: usize) -> String {
+fn for_to_source(c: &ForClause, ctx: Ctx) -> String {
     let mut header = format!("for {}", c.var);
     if c.has_in {
         header.push_str(" in");
@@ -275,14 +364,14 @@ fn for_to_source(c: &ForClause, indent: usize) -> String {
         // bash desugars the no-`in` form to `in "$@"`; semantically identical.
         header.push_str(" in \"$@\"");
     }
-    let mut s = format!("{header};\n{}do\n", pad(indent));
-    s.push_str(&loop_body(&c.body, indent + 1));
-    s.push_str(&pad(indent));
+    let mut s = format!("{header};\n{}do\n", pad(ctx.indent));
+    s.push_str(&loop_body(&c.body, ctx.deeper()));
+    s.push_str(&pad(ctx.indent));
     s.push_str("done");
     s
 }
 
-fn arith_for_to_source(c: &crate::command::ArithForClause, indent: usize) -> String {
+fn arith_for_to_source(c: &crate::command::ArithForClause, ctx: Ctx) -> String {
     // bash normalises a MISSING header section to `1` when it reconstructs the
     // loop for `declare -f`/`type`, so `for ((;;))` comes back as
     // `for ((1; 1; 1))` (#64). The `1` is only in the printed form — an empty
@@ -300,15 +389,15 @@ fn arith_for_to_source(c: &crate::command::ArithForClause, indent: usize) -> Str
         sec(&c.init),
         sec(&c.cond),
         sec(&c.step),
-        pad(indent)
+        pad(ctx.indent)
     );
-    s.push_str(&loop_body(&c.body, indent + 1));
-    s.push_str(&pad(indent));
+    s.push_str(&loop_body(&c.body, ctx.deeper()));
+    s.push_str(&pad(ctx.indent));
     s.push_str("done");
     s
 }
 
-fn select_to_source(c: &SelectClause, indent: usize) -> String {
+fn select_to_source(c: &SelectClause, ctx: Ctx) -> String {
     let mut header = format!("select {}", c.var);
     if let Some(words) = &c.words {
         header.push_str(" in");
@@ -317,40 +406,40 @@ fn select_to_source(c: &SelectClause, indent: usize) -> String {
             header.push_str(&word_to_source(w));
         }
     }
-    let mut s = format!("{header};\n{}do\n", pad(indent));
-    s.push_str(&loop_body(&c.body, indent + 1));
-    s.push_str(&pad(indent));
+    let mut s = format!("{header};\n{}do\n", pad(ctx.indent));
+    s.push_str(&loop_body(&c.body, ctx.deeper()));
+    s.push_str(&pad(ctx.indent));
     s.push_str("done");
     s
 }
 
-fn case_to_source(c: &CaseClause, indent: usize) -> String {
+fn case_to_source(c: &CaseClause, ctx: Ctx) -> String {
     let mut s = format!("case {} in \n", word_to_source(&c.subject));
     for item in &c.items {
-        s.push_str(&case_item_to_source(item, indent + 1));
+        s.push_str(&case_item_to_source(item, ctx.deeper()));
     }
-    s.push_str(&pad(indent));
+    s.push_str(&pad(ctx.indent));
     s.push_str("esac");
     s
 }
 
-fn case_item_to_source(item: &CaseItem, indent: usize) -> String {
+fn case_item_to_source(item: &CaseItem, ctx: Ctx) -> String {
     let patterns = item
         .patterns
         .iter()
         .map(pattern_word_to_source)
         .collect::<Vec<_>>()
         .join(" | ");
-    let mut s = format!("{}{patterns})\n", pad(indent));
+    let mut s = format!("{}{patterns})\n", pad(ctx.indent));
     if let Some(body) = &item.body {
-        s.push_str(&group_body(body, indent + 1)); // case body: no trailing `;`
+        s.push_str(&group_body(body, ctx.deeper())); // case body: no trailing `;`
     }
     let term = match item.terminator {
         CaseTerminator::Break => ";;",
         CaseTerminator::FallThrough => ";&",
         CaseTerminator::ContinueMatch => ";;&",
     };
-    s.push_str(&pad(indent));
+    s.push_str(&pad(ctx.indent));
     s.push_str(term);
     s.push('\n');
     s
@@ -444,7 +533,7 @@ fn binary_op_token(op: TestBinaryOp) -> &'static str {
     }
 }
 
-fn pipeline_to_source(p: &Pipeline, indent: usize) -> String {
+fn pipeline_to_source(p: &Pipeline, ctx: Ctx) -> String {
     let mut s = if p.negate {
         "! ".to_string()
     } else {
@@ -453,7 +542,7 @@ fn pipeline_to_source(p: &Pipeline, indent: usize) -> String {
     let stages: Vec<String> = p
         .commands
         .iter()
-        .map(|c| command_to_source(c, indent))
+        .map(|c| command_to_source_ctx(c, ctx))
         .collect();
     s.push_str(&stages.join(" | "));
     s
@@ -471,19 +560,20 @@ fn simple_to_source(s: &SimpleCommand) -> String {
 }
 
 /// Render a command list: connectors, backgrounding, and the leading command.
-fn sequence_to_source(seq: &Sequence, indent: usize) -> String {
-    let mut out = command_to_source(&seq.first, indent);
+fn sequence_to_source(seq: &Sequence, ctx: Ctx) -> String {
+    let mut out = command_to_source_ctx(&seq.first, ctx);
     for (conn, cmd) in &seq.rest {
         match conn {
-            Connector::Semi => {
+            Connector::Semi if ctx.in_fn => {
                 out.push_str(";\n");
-                out.push_str(&pad(indent));
+                out.push_str(&pad(ctx.indent));
             }
+            Connector::Semi => out.push_str("; "),
             Connector::And => out.push_str(" && "),
             Connector::Or => out.push_str(" || "),
             Connector::Amp => out.push_str(" & "),
         }
-        out.push_str(&command_to_source(cmd, indent));
+        out.push_str(&command_to_source_ctx(cmd, ctx));
     }
     if seq.background {
         out.push_str(" &");
@@ -611,7 +701,7 @@ fn arith_body_to_source(w: &Word) -> String {
             WordPart::AllArgs { joined, .. } => out.push_str(if *joined { "$*" } else { "$@" }),
             WordPart::CommandSub { sequence, .. } => out.push_str(&format!(
                 "$({})",
-                sequence_to_source(sequence, 0).trim_end()
+                sequence_to_inline_source(sequence).trim_end()
             )),
             WordPart::Arith { body, .. } => {
                 out.push_str(&format!("$(({}))", arith_body_to_source(body)))
@@ -656,7 +746,7 @@ fn part_to_source_in_double(part: &WordPart) -> String {
         WordPart::LastStatus { .. } => "$?".to_string(),
         WordPart::AllArgs { joined, .. } => (if *joined { "$*" } else { "$@" }).to_string(),
         WordPart::CommandSub { sequence, .. } => {
-            format!("$({})", sequence_to_source(sequence, 0).trim_end())
+            format!("$({})", sequence_to_inline_source(sequence).trim_end())
         }
         WordPart::Arith { body, .. } => format!("$(({}))", arith_body_to_source(body)),
         WordPart::ParamExpansion {
@@ -708,7 +798,7 @@ fn part_to_source(part: &WordPart) -> String {
         }
         WordPart::CommandSub { sequence, quoted } => quote_if(
             *quoted,
-            format!("$({})", sequence_to_source(sequence, 0).trim_end()),
+            format!("$({})", sequence_to_inline_source(sequence).trim_end()),
         ),
         WordPart::Arith { body, quoted } => {
             quote_if(*quoted, format!("$(({}))", arith_body_to_source(body)))
@@ -740,7 +830,11 @@ fn part_to_source(part: &WordPart) -> String {
                 crate::lexer::ProcDir::In => "<(",
                 crate::lexer::ProcDir::Out => ">(",
             };
-            format!("{}{})", prefix, sequence_to_source(sequence, 0).trim_end())
+            format!(
+                "{}{})",
+                prefix,
+                sequence_to_inline_source(sequence).trim_end()
+            )
         }
         WordPart::Quoted { style, parts } => {
             use crate::lexer::QuoteStyle;
@@ -985,9 +1079,9 @@ mod tests {
     }
     fn rt(src: &str) -> (String, String) {
         let a = live_parse(src);
-        let s1 = sequence_to_source(&a, 0);
+        let s1 = sequence_to_source(&a, Ctx::inline());
         let b = live_parse(&s1);
-        let s2 = sequence_to_source(&b, 0);
+        let s2 = sequence_to_source(&b, Ctx::inline());
         (s1, s2)
     }
     #[test]
@@ -1017,14 +1111,14 @@ mod tests {
     fn assert_rt_ast_eq(src: &str) {
         assert_rt(src);
         let a = live_parse(src);
-        let s1 = sequence_to_source(&a, 0);
+        let s1 = sequence_to_source(&a, Ctx::inline());
         let b = live_parse(&s1);
         // Compare structure in canonical source form: generate->parse legitimately
         // reflows physical lines (`;`-joined commands onto separate lines), so AST
         // `line` metadata differs even when structure is identical. The source
         // fixpoint (parse(s1) regenerates to s1) is the line-agnostic check.
         assert_eq!(
-            sequence_to_source(&b, 0),
+            sequence_to_source(&b, Ctx::inline()),
             s1,
             "AST changed across round-trip for {src:?}"
         );
