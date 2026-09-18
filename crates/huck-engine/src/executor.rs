@@ -672,6 +672,17 @@ fn partition_into_groups(seq: &Sequence) -> Vec<AndOrGroup<'_>> {
     groups
 }
 
+/// One loop iteration's body, followed by bash's `REAP()`: in a shell that is
+/// non-interactive or has job control off, every iteration of `for`, `while`,
+/// `until`, `select` and `for ((…))` prunes the dead jobs already reported
+/// (and, past CHILD_MAX dead processes, reports the oldest silently). It runs
+/// after `break`/`continue` too — bash reaps before it looks at `breaking`.
+fn execute_loop_body(body: &Sequence, shell: &mut Shell) -> ExecOutcome {
+    let outcome = execute_sequence_body(body, shell);
+    crate::jobs::reap_dead_jobs(shell);
+    outcome
+}
+
 fn execute_sequence_body(seq: &Sequence, shell: &mut Shell) -> ExecOutcome {
     let groups = partition_into_groups(seq);
     // The status of the most recent FOREGROUND group; a list that ends with a
@@ -721,13 +732,15 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell) -> ExecOutcome {
                 return last_status;
             }
         }
-        // #175/#418: between-command job-table maintenance — reap, announce any
-        // state change, prune the terminal jobs. bash notices a death while
-        // running the command, so the notice lands AFTER that command's output
-        // and carries ITS line number; running the pass at the end of the group
-        // reproduces both. The interactive REPL does the same per prompt
-        // (`repl.rs`), so this is restricted to non-interactive shells to avoid
-        // a mid-line notice there.
+        // #175/#418/#475: between-command job-table maintenance — reap, and
+        // ONLY if this group blocked on a foreground child (bash's `wait_for`
+        // end, its one cleanup point inside a list) announce any state change
+        // and prune the reported jobs. bash notices a death while running the
+        // command, so the notice lands AFTER that command's output and carries
+        // ITS line number; running the pass at the end of the group reproduces
+        // both. A group of builtins reaps and nothing more. The interactive
+        // REPL does the same per prompt (`repl.rs`), so this is restricted to
+        // non-interactive shells to avoid a mid-line notice there.
         if !shell.is_interactive {
             let blocked = std::mem::take(&mut shell.blocked_on_child);
             crate::jobs::reap_and_notify_ex(shell, blocked);
@@ -1535,7 +1548,7 @@ fn run_while_inner(clause: &WhileClause, shell: &mut Shell) -> ExecOutcome {
         if !keep_going {
             break;
         }
-        match loop_body_step(execute_sequence_body(&clause.body, shell)) {
+        match loop_body_step(execute_loop_body(&clause.body, shell)) {
             LoopStep::Propagate(o) => return o,
             LoopStep::Stop(st) => {
                 last = ExecOutcome::Continue(st);
@@ -1666,7 +1679,7 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell) -> ExecOutcome {
             shell.report_error(crate::error_fatality::ErrorKind::ReadonlyForVar);
             return ExecOutcome::Continue(1);
         }
-        match loop_body_step(execute_sequence_body(&clause.body, shell)) {
+        match loop_body_step(execute_loop_body(&clause.body, shell)) {
             LoopStep::Propagate(o) => return o,
             LoopStep::Stop(st) => {
                 last = ExecOutcome::Continue(st);
@@ -1896,7 +1909,7 @@ fn run_arith_for_inner(clause: &crate::command::ArithForClause, shell: &mut Shel
         }
 
         // 3. Execute body.
-        match loop_body_step(execute_sequence_body(&clause.body, shell)) {
+        match loop_body_step(execute_loop_body(&clause.body, shell)) {
             LoopStep::Propagate(o) => return o,
             LoopStep::Stop(st) => {
                 last = ExecOutcome::Continue(st);
@@ -2097,7 +2110,7 @@ fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell) ->
         }
 
         // 3e. Run the body; bubble flow with the v79 decrement-and-bubble pattern.
-        match loop_body_step(execute_sequence_body(&clause.body, shell)) {
+        match loop_body_step(execute_loop_body(&clause.body, shell)) {
             LoopStep::Propagate(o) => return o,
             LoopStep::Stop(st) => {
                 last = ExecOutcome::Continue(st);

@@ -906,6 +906,11 @@ pub struct Shell {
     /// script file. Drives the trailing `s` letter in `$-` (#231).
     pub reads_stdin: bool,
 
+    /// True when the top-level input is a script FILE (`huck script.sh`,
+    /// `Engine::run_script`). With `reads_stdin` this is bash's
+    /// `startup_state == 0` — see [`Shell::reads_script_input`].
+    pub reads_script_file: bool,
+
     /// True when this process is a forked subshell child. A subshell must NOT
     /// perform interactive job-control process-grouping for its inner pipelines
     /// (that deadlocks on a controlling terminal — M-104).
@@ -1300,6 +1305,7 @@ impl Shell {
             builtin_usage_error: None,
             is_interactive: std::io::stdin().is_terminal(),
             is_command_string: false,
+            reads_script_file: false,
             reads_stdin: false,
             in_subshell: false,
             in_completion: false,
@@ -1460,6 +1466,15 @@ impl Shell {
     /// eval's own offset); otherwise falls back to `stdin_line_base` (the
     /// piped-stdin REPL's cumulative counter, 0 everywhere else). v315 (#209),
     /// v325 (#266).
+    /// bash's `startup_state == 0`: the shell is running a script — from a
+    /// file or from piped stdin — rather than a `-c` string, an embedder's
+    /// string, or a terminal. Such a shell reports a background job's state
+    /// change only when a signal killed it (`notify_of_job_status`); `-c` and
+    /// the embedder report a normal exit silently and prune it.
+    pub fn reads_script_input(&self) -> bool {
+        !self.is_interactive && (self.reads_script_file || self.reads_stdin)
+    }
+
     pub fn line_base(&self) -> u32 {
         self.eval_frame
             .map_or(self.stdin_line_base, |n| n.saturating_sub(1))

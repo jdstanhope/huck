@@ -1,0 +1,117 @@
+---
+title: "Five places a shell looks at its jobs"
+date: 2026-09-18
+summary: "huck tidied its job table after every command. bash only looks at five specific moments — and what it says depends on whether it is running a script or a -c string. A background job that died between the two could vanish from `jobs`, lose its `Killed` notice, or turn `wait %` into 'no such job'."
+tags: ["jobs", "job-control", "wait", "bugfix"]
+version: null
+draft: false
+---
+
+Start a job in the background, let it finish, and ask `jobs`. In a script,
+bash still lists it:
+
+```bash
+# before
+$ cat t.sh
+sleep 0.1 & sleep 0.2 &
+sleep 0.5
+jobs
+$ huck t.sh
+$
+```
+
+```bash
+# after
+$ huck t.sh
+[1]-  Done                    sleep 0.1
+[2]+  Done                    sleep 0.2
+```
+
+Nothing had gone wrong with the jobs. huck had simply forgotten them: after
+every command it reaped its children, decided whether to say anything, and
+dropped whatever had finished. bash does not work that way. It collects a dead
+child the moment the kernel says so, but it *reports and forgets* jobs at
+exactly five moments — when a foreground command it waited for finishes, when
+you run `jobs`, at the end of each loop iteration, in `wait`, and each time
+its parser reads a new line of input. Between those points a finished job is
+still there, and what bash says at each point depends on how it was started:
+a script file reports a background job only if a signal killed it; a `-c`
+string quietly marks a normal exit as reported and drops it.
+
+huck now does the same, with the same five points, and the split is what
+makes the difference above: a script leaves a normal exit alone until `jobs`
+prints it (or `wait` collects it) — even a bare `wait` keeps the job that
+owns `$!`, as POSIX asks.
+
+The forget-early habit had a louder consequence. Kill a background job in a
+plain script — no `set -m` — and bash tells you at the next thing it blocks
+on:
+
+```bash
+# before
+$ huck -c 'sleep 5 & kill -KILL %1; sleep 0.3; echo done'
+done
+```
+
+```bash
+# after
+$ huck -c 'sleep 5 & kill -KILL %1; sleep 0.3; echo done'
+huck: line 1: 1906631 Killed                  sleep 5
+done
+```
+
+huck's between-command pass had marked the death "already reported" — silently,
+because job control was off — and pruned it before the `sleep 0.3` boundary
+where the notice belonged.
+
+The third symptom was filed as a race, and was not one. `%` and `%+` name the
+*current* job, and in bash a job stays current after it dies until it is
+dropped. huck resolved `%+` only among running or stopped jobs, so a job that
+had been reaped by the time `wait %+` ran was simply gone:
+
+```bash
+# before
+$ cat t.sh
+sleep 0.1 &
+sleep 0.3
+wait %+
+echo "rc=$?"
+$ huck t.sh
+huck: line 3: wait: %+: no such job
+rc=127
+```
+
+```bash
+# after
+$ huck t.sh
+rc=0
+```
+
+Under the sweep this showed up as `wait %` returning 127 instead of 137 once
+in a few hundred runs — only when the reap happened to land first. Now the
+`+` and `-` markers are stored state, as in bash: a stop takes `+`, a death
+keeps it, and a deletion re-picks from what is stopped, then what is running.
+
+Two smaller things fell out of reading the C rather than guessing. Job
+numbers: bash gives a new job the number after the *highest* live one, so
+after `kill %2` the next job is `%4`, not `%2` (huck reused the lowest free
+number). And `kill` on a job that has already finished but is still listed
+succeeds — bash skips the dead stages rather than failing on them.
+
+The harness for this runs every fragment twice, as a `-c` string and as a
+script file, because the two drivers are supposed to differ. Several of its
+first rows failed on and off, and every one turned out to be racy in bash
+itself: a `kill` followed by builtins reports at whichever line read the
+signal beat; `kill -9` of a *stopped* child then `wait` reports the death
+about half the time. The rows now pin the death to a blocking point, a
+busy-wait, or the wait itself.
+
+Still open from this pass: an `&` child should ignore INT and QUIT when job
+control is off ([#766](https://github.com/jdstanhope/huck/issues/766)); the
+`Killed` notice is suppressed inside `( )` where bash prints it
+([#767](https://github.com/jdstanhope/huck/issues/767)); and a background job
+huck runs under a wrapper subshell reports a signal death as `Exit 143`
+([#768](https://github.com/jdstanhope/huck/issues/768)). Next in the same
+table: a coproc is still torn down the instant it is reaped, where bash
+disposes of it only at one of the five points
+([#185](https://github.com/jdstanhope/huck/issues/185)).

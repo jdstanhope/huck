@@ -4870,6 +4870,10 @@ fn builtin_jobs(
     // non-interactive `jobs` reflects Stopped/Running like the interactive REPL
     // (which reaps pre-prompt). Non-blocking + idempotent.
     crate::jobs::reap_completed(shell);
+    // bash's `list_all_jobs` runs `cleanup_dead_jobs` FIRST: a dead job that
+    // has already been reported is gone before the listing; one that has not
+    // is listed (`[1]+  Done`) and becomes reported by being printed.
+    crate::jobs::cleanup_dead_jobs(shell);
     let parsed = match parse_jobs_args(args, err, shell) {
         Ok(p) => p,
         Err(outcome) => return outcome,
@@ -4918,9 +4922,8 @@ fn builtin_jobs(
         }
         printed_ids.push(job.id);
     }
-    if parsed.only_new {
-        shell.jobs.mark_notified(&printed_ids);
-    }
+    // `pretty_print_job` marks every job it prints, whatever the format.
+    shell.jobs.mark_notified(&printed_ids);
     ExecOutcome::Continue(0)
 }
 
@@ -5042,7 +5045,7 @@ fn builtin_wait(
         return ExecOutcome::Continue(1);
     }
 
-    let outcome = match (parsed.wait_any, parsed.targets.len()) {
+    match (parsed.wait_any, parsed.targets.len()) {
         (false, 0) => wait_all(shell),
         (false, _) => wait_for_all(parsed.targets, err, shell),
         (true, 0) => wait_any_pending(parsed.pid_var, shell),
@@ -5081,9 +5084,7 @@ fn builtin_wait(
             }
             wait_any_of(live, parsed.pid_var, shell)
         }
-    };
-    mark_signaled_jobs_notified(shell);
-    outcome
+    }
 }
 
 fn wait_all(shell: &mut Shell) -> ExecOutcome {
@@ -5108,30 +5109,40 @@ fn wait_all(shell: &mut Shell) -> ExecOutcome {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
-    // Print Done lines for anything that just transitioned during the wait.
-    crate::jobs::reap_and_notify(shell);
+    // bash: every job collected here went through `wait_for`, whose end
+    // reports and prunes; then, with no operands, POSIX lets the shell discard
+    // every remaining dead status — except the job that owns `$!`, which a
+    // non-interactive shell keeps until it is reported or waited for.
+    crate::jobs::notify_and_cleanup(shell);
+    shell
+        .jobs
+        .mark_dead_jobs_as_notified(true, shell.is_interactive, shell.last_bg_pid);
+    crate::jobs::cleanup_dead_jobs(shell);
     ExecOutcome::Continue(0)
 }
 
-/// #418: a job that DIED FROM A SIGNAL and whose status `wait` collected is not
-/// announced — `wait` already reported the death through its 128+N status, and
-/// bash stays silent for it in both notice forms:
-///
-/// ```text
-/// set -m; sleep 3 & kill -TERM %1; wait      # bash: nothing
-/// set -m; sleep 3 & kill -TERM %1; sleep 0.3 # bash: [1]+  Terminated  sleep 3
-/// ```
-///
-/// A job that exited NORMALLY still gets its `[N]+ Done` line after a `wait`.
-/// Marking them here rather than in each wait path also removes a race: whether
-/// the boundary pass or `wait` reaped first used to decide whether the notice
-/// appeared at all.
-fn mark_signaled_jobs_notified(shell: &mut Shell) {
-    for job in shell.jobs.jobs_mut() {
-        if matches!(job.state, crate::jobs::JobState::Signaled(_)) {
-            job.notified = true;
-        }
+/// bash's `wait_for` epilogue for one completed `wait %job` / `wait $pid` /
+/// `wait -n`: report and prune what is pending — the just-finished job's own
+/// notice included, which is how `set -m; sleep 0.1 & wait %1` prints its
+/// `[1]+  Done` — then mark the waited job reported ("POSIX.2: if we just
+/// waited for a job, we can remove it from the jobs table"), so the next
+/// cleanup point drops it even in a script-file shell, where the report pass
+/// leaves a normal exit alone.
+fn after_wait(shell: &mut Shell, waited: Option<u32>) {
+    crate::jobs::notify_and_cleanup(shell);
+    if let Some(id) = waited {
+        shell.jobs.mark_one_notified(id);
     }
+}
+
+/// The job that owns `pid` — as a stage pid or, for a job with its own
+/// process group, as the group id `wait -n` reports.
+fn job_id_for_pid(shell: &Shell, pid: i32) -> Option<u32> {
+    shell
+        .jobs
+        .iter()
+        .find(|j| j.pids.contains(&pid) || j.pgid == pid)
+        .map(|j| j.id)
 }
 
 fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
@@ -5147,10 +5158,9 @@ fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
                 _ => None,
             });
         if let Some(code) = terminal {
-            // #175: bash removes a waited job immediately, so a following
-            // `jobs` does not show it — but it retains the terminal status so a
-            // later `wait $pid` on the same job still resolves.
-            shell.jobs.remove_job_recording_status(id);
+            // The job's terminal status is retained (saved-status ring) when the
+            // cleanup pass prunes it, so a later `wait $pid` still resolves.
+            after_wait(shell, Some(id));
             return ExecOutcome::Continue(code);
         }
         if let Some(o) = crate::executor::check_interrupt(shell) {
@@ -5213,6 +5223,8 @@ fn wait_for_pid(pid: i32, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome
             // ECHILD-ing, matching bash. Independent of whether a between-command
             // prune has recorded it yet.
             shell.jobs.record_terminal_status(r, code);
+            let waited = job_id_for_pid(shell, r);
+            after_wait(shell, waited);
             return ExecOutcome::Continue(code);
         }
         if r < 0 {
@@ -5311,15 +5323,16 @@ fn wait_any_pending(pid_var: Option<String>, shell: &mut Shell) -> ExecOutcome {
                 return None;
             }
             match j.state {
-                crate::jobs::JobState::Done(c) => Some((j.pgid, c)),
-                crate::jobs::JobState::Signaled(s) => Some((j.pgid, 128 + s)),
+                crate::jobs::JobState::Done(c) => Some((j.id, j.pgid, c)),
+                crate::jobs::JobState::Signaled(s) => Some((j.id, j.pgid, 128 + s)),
                 _ => None,
             }
         });
-        if let Some((pgid, status)) = found {
+        if let Some((id, pgid, status)) = found {
             if let Some(name) = &pid_var {
                 shell.set(name, pgid.to_string());
             }
+            after_wait(shell, Some(id));
             return ExecOutcome::Continue(status);
         }
 
@@ -5368,6 +5381,8 @@ fn wait_any_of(
         if let Some(name) = &pid_var {
             shell.set(name, pid.to_string());
         }
+        let waited = job_id_for_pid(shell, pid);
+        after_wait(shell, waited);
         return ExecOutcome::Continue(status);
     }
 
@@ -5406,6 +5421,8 @@ fn wait_any_of(
         if let Some(name) = &pid_var {
             shell.set(name, pid.to_string());
         }
+        let waited = job_id_for_pid(shell, pid);
+        after_wait(shell, waited);
         return ExecOutcome::Continue(status);
     }
 
@@ -5434,6 +5451,8 @@ fn wait_any_of(
             if let Some(name) = &pid_var {
                 shell.set(name, pid.to_string());
             }
+            let waited = job_id_for_pid(shell, pid);
+            after_wait(shell, waited);
             return ExecOutcome::Continue(st);
         }
     }
@@ -5846,14 +5865,28 @@ fn send_signal_to_targets(
                     continue;
                 }
             };
-            let (own_pgroup, pgid, pids) = match shell.jobs.iter().find(|j| j.id == id) {
-                Some(j) => (j.own_pgroup, j.pgid, j.pids.clone()),
-                None => {
-                    crate::sh_error_to!(shell, err, None, "kill: {target}: no such job");
-                    any_failed = true;
-                    continue;
-                }
-            };
+            let (own_pgroup, pgid, pids) =
+                match shell.jobs.jobs_mut().iter_mut().find(|j| j.id == id) {
+                    Some(j) => {
+                        // bash's `kill_pid`: signalling a job re-arms its report, and
+                        // a stage already reaped is skipped (`PALIVE`) rather than
+                        // failed — `kill -0 %1` on a listed-but-dead job is 0.
+                        j.notified = false;
+                        let live: Vec<i32> = j
+                            .pids
+                            .iter()
+                            .zip(j.reaped.iter())
+                            .filter(|(_, reaped)| !**reaped)
+                            .map(|(&p, _)| p)
+                            .collect();
+                        (j.own_pgroup, j.pgid, live)
+                    }
+                    None => {
+                        crate::sh_error_to!(shell, err, None, "kill: {target}: no such job");
+                        any_failed = true;
+                        continue;
+                    }
+                };
             // A job that owns its group is signalled via the group (catches
             // grandchildren); a group-less job (non-interactive background, v173)
             // is signalled per-pid, matching bash's J_JOBCONTROL-unset path.
@@ -5991,10 +6024,7 @@ fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Ex
             shell.jobs.mark_for_nohup(*id);
         }
     } else {
-        shell
-            .jobs
-            .jobs_mut()
-            .retain(|j| !target_ids.contains(&j.id));
+        shell.jobs.remove_ids(&target_ids);
     }
 
     ExecOutcome::Continue(0)
@@ -6085,7 +6115,7 @@ fn builtin_fg(
     if job_already_terminal(shell, id) {
         let spec = args.first().map(String::as_str).unwrap_or("current");
         crate::sh_error_to!(shell, err, None, "fg: {spec}: no such job");
-        shell.jobs.jobs_mut().retain(|j| j.id != id);
+        shell.jobs.remove_ids(&[id]);
         return ExecOutcome::Continue(1);
     }
     let (pgid, pids, command) = {
@@ -6169,7 +6199,7 @@ fn builtin_fg(
     // If the wait loop exited early (ECHILD race), leave the job for the
     // prompt-time reaper to handle.
     if completed == total {
-        shell.jobs.jobs_mut().retain(|j| j.id != id);
+        shell.jobs.remove_ids(&[id]);
     }
     ExecOutcome::Continue(last_status)
 }
@@ -6257,7 +6287,7 @@ fn bg_one(spec: Option<&String>, err: &mut dyn Write, shell: &mut Shell) -> Resu
     // below would misreport it as already in background.
     if job_already_terminal(shell, id) {
         crate::sh_error_to!(shell, err, None, "bg: {spec}: no such job");
-        shell.jobs.jobs_mut().retain(|j| j.id != id);
+        shell.jobs.remove_ids(&[id]);
         return Err(());
     }
     // #412: a job that is already running is not an error — bash says so and
@@ -8806,13 +8836,6 @@ fn run_sourced_contents_in_sinks_inner(
                     }
                 }
             }
-            // #175: between-command job-table maintenance. Before parsing and
-            // executing the next unit, reap completed background children and
-            // silently prune Done/Signaled entries (Running/Stopped are kept),
-            // mirroring the interactive REPL's per-prompt cadence (`repl.rs`).
-            // Printing is gated on `is_interactive`, so this prunes silently
-            // non-interactively — matching bash's non-interactive pruning.
-            crate::jobs::reap_and_notify(&mut *shell);
             // Byte offset of this unit's first token, read straight from its span.
             // peek_span cannot error here: the newline-skip above broke on an Ok
             // peek of this same token, so it is already scanned into history.
@@ -8822,6 +8845,12 @@ fn run_sourced_contents_in_sinks_inner(
                 .flatten()
                 .map(|sp| sp.offset)
                 .unwrap_or(sentinel);
+            // Between units: bash's parser runs `notify_and_cleanup` every time
+            // it reads a new input line in a non-interactive shell
+            // (`shell_getc`), stamping a notice with the line it has JUST read —
+            // the line of the unit about to run, not of the one that finished.
+            shell.current_lineno = shell.line_base() + line_of(start + unit_start_off) as u32;
+            crate::jobs::reap_and_notify(&mut *shell);
             match crate::parser::parse_one_unit(&mut iter) {
                 Ok(None) => {
                     break 'outer;
