@@ -1910,9 +1910,14 @@ fn reconstruct_part(part: &WordPart, out: &mut String) {
             out.push_str("))");
         }
         P::Tilde { spec, .. } => out.push_str(&render_tilde_literal(spec)),
+        // #761: a `$( )`/`<( )` body is named back to the user in bash's
+        // normalised form — bash rewrites the word text from the parsed
+        // command at parse time (`print_cmd`), so `$(echo X >&2)` reads
+        // `$(echo X 1>&2)` and a compound keeps its multi-line shape. One
+        // printer for that: `generate`'s, in its outside-a-function style.
         P::CommandSub { sequence, .. } => {
             out.push_str("$(");
-            out.push_str(&reconstruct_sequence_source(sequence));
+            out.push_str(crate::generate::sequence_to_inline_source(sequence).trim_end());
             out.push(')');
         }
         P::ProcessSub { sequence, dir } => {
@@ -1920,7 +1925,7 @@ fn reconstruct_part(part: &WordPart, out: &mut String) {
                 ProcDir::In => "<(",
                 ProcDir::Out => ">(",
             });
-            out.push_str(&reconstruct_sequence_source(sequence));
+            out.push_str(crate::generate::sequence_to_inline_source(sequence).trim_end());
             out.push(')');
         }
         P::ParamExpansion {
@@ -2085,39 +2090,6 @@ fn reconstruct_param_expansion(
 /// its real connectors (`a && b`, `a; b`, `a & b`). A compound command inside the
 /// list falls back to empty per `reconstruct_command_source` (documented
 /// approximation — rare in a trace header).
-fn reconstruct_sequence_source(seq: &crate::command::Sequence) -> String {
-    use crate::command::Connector;
-    let mut s = reconstruct_command_source(&seq.first);
-    for (conn, cmd) in &seq.rest {
-        s.push_str(match conn {
-            Connector::Semi => "; ",
-            Connector::And => " && ",
-            Connector::Or => " || ",
-            Connector::Amp => " & ",
-        });
-        s.push_str(&reconstruct_command_source(cmd));
-    }
-    s
-}
-
-fn reconstruct_command_source(cmd: &crate::command::Command) -> String {
-    use crate::command::{Command, SimpleCommand};
-    match cmd {
-        Command::Simple(SimpleCommand::Exec(e)) => {
-            let mut parts = vec![reconstruct_word_source(&e.program)];
-            parts.extend(e.args.iter().map(reconstruct_word_source));
-            parts.join(" ")
-        }
-        Command::Pipeline(p) => p
-            .commands
-            .iter()
-            .map(reconstruct_command_source)
-            .collect::<Vec<_>>()
-            .join(" | "),
-        _ => String::new(),
-    }
-}
-
 /// Expands a `Word` for assignment context: word-splitting is suppressed and
 /// the result is one string. Each `Var`/`LastStatus`/`CommandSub` part
 /// contributes its value verbatim regardless of the `quoted` flag — matching

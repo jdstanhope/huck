@@ -3242,171 +3242,19 @@ fn cleanup_partial_pipeline_raw(pgid: Option<i32>, pids: &[i32]) {
 }
 
 /// Render a `Command` back to a normalized bash-style source line for the
-/// `jobs`/`fg`/`bg` display: whitespace collapsed to single spaces (already done
-/// by the lexer), quotes preserved, and words shown UNEXPANDED — matching how
-/// bash re-renders a job's command from its parsed form (it does not store the
-/// literal source). This is an AST→source deparse, not source slicing. The
-/// trailing `&` is appended by the `jobs` formatter, not here.
-///
-/// Byte-identical to bash 5.2.21 for the common simple/pipeline/and-or/redirect/
-/// quoted forms. Documented best-effort residuals: exotic mixed quoting
-/// re-renders canonically with `"…"` (huck retains `quoted: bool`, not the
-/// original quote char), `&>`/`&>>` render as their desugared `> f 2>&1` form,
-/// and full compound commands (if/for/while/case/…) fall back to a label rather
-/// than bash's multi-line re-render.
+/// `jobs`/`fg`/`bg` display. bash re-renders a job's command from its parsed
+/// form with `print_cmd` outside a function definition — `;` joins inline,
+/// a `{ }` group is one line, `if`/`for`/`while` keep their multi-line shape —
+/// which is the same form it gives a `$( )` body, so this is the ONE printer
+/// (`generate`), not a second one. The trailing `&` is appended by the `jobs`
+/// formatter, not here.
 fn render_job_command(cmd: &Command) -> String {
-    match cmd {
-        Command::Simple(s) => render_job_simple(s),
-        Command::Pipeline(p) => p
-            .commands
-            .iter()
-            .map(render_job_command)
-            .collect::<Vec<_>>()
-            .join(" | "),
-        Command::Subshell { body } => format!("( {} )", render_job_sequence(body)),
-        Command::BraceGroup(body) => format!("{{ {}; }}", render_job_sequence(body)),
-        Command::Redirected { inner, redirects } => {
-            let mut out = render_job_command(inner);
-            for r in redirects {
-                out.push(' ');
-                out.push_str(&render_job_redirection(r));
-            }
-            out
-        }
-        // Full compound commands (if/for/while/case/select/[[…]]/((…))/coproc/
-        // function) are rare as direct background jobs and bash re-renders them
-        // multi-line; best-effort label rather than a byte-exact match.
-        _ => render_job_compound_fallback(cmd),
-    }
+    crate::generate::command_to_inline_source(cmd)
 }
 
-/// Render a `Sequence` (an and-or / `;`-joined list) for the job display,
-/// joining commands with their real connectors.
+/// Render a `Sequence` (an and-or / `;`-joined list) for the job display.
 fn render_job_sequence(seq: &Sequence) -> String {
-    let mut s = render_job_command(&seq.first);
-    for (conn, cmd) in &seq.rest {
-        s.push_str(match conn {
-            Connector::Semi => "; ",
-            Connector::And => " && ",
-            Connector::Or => " || ",
-            Connector::Amp => " & ",
-        });
-        s.push_str(&render_job_command(cmd));
-    }
-    s
-}
-
-fn render_job_simple(s: &SimpleCommand) -> String {
-    match s {
-        SimpleCommand::Assign(assigns, _) => assigns
-            .iter()
-            .map(render_job_assignment)
-            .collect::<Vec<_>>()
-            .join(" "),
-        SimpleCommand::Exec(e) => {
-            let mut parts: Vec<String> = Vec::new();
-            for a in &e.inline_assignments {
-                parts.push(render_job_assignment(a));
-            }
-            parts.push(crate::expand::reconstruct_word_source(&e.program));
-            for arg in &e.args {
-                parts.push(crate::expand::reconstruct_word_source(arg));
-            }
-            let mut out = parts.join(" ");
-            for r in &e.redirects {
-                out.push(' ');
-                out.push_str(&render_job_redirection(r));
-            }
-            out
-        }
-    }
-}
-
-fn render_job_assignment(a: &crate::command::Assignment) -> String {
-    use crate::command::AssignTarget;
-    let mut s = String::new();
-    match &a.target {
-        AssignTarget::Bare(n) => s.push_str(n),
-        AssignTarget::Indexed { name, subscript } => {
-            s.push_str(name);
-            s.push('[');
-            s.push_str(&crate::expand::reconstruct_word_source_inner(subscript));
-            s.push(']');
-        }
-    }
-    s.push_str(if a.append { "+=" } else { "=" });
-    s.push_str(&crate::expand::reconstruct_word_source(&a.value));
-    s
-}
-
-/// Render one redirection as bash's job display does: file redirects put a space
-/// before the target (`> /dev/null`, `2> f`, `0<> f`), dup/move/close redirects
-/// glue the source with no space (`2>&1`, `1>&2`), and bash makes the default fd
-/// explicit for `<>`/`>&`/`<&` but not for plain `<`/`>`/`>>`/`>|`.
-fn render_job_redirection(r: &Redirection) -> String {
-    let fd_prefix = |explicit_default: Option<u16>| -> String {
-        match &r.fd {
-            RedirFd::Number(n) => n.to_string(),
-            RedirFd::Var(name) => format!("{{{name}}}"),
-            RedirFd::Default => explicit_default.map(|d| d.to_string()).unwrap_or_default(),
-        }
-    };
-    let word = crate::expand::reconstruct_word_source;
-    match &r.op {
-        RedirOp::File { mode, target } => {
-            let (op, show_default) = match mode {
-                FileMode::ReadOnly => ("<", false),
-                FileMode::Truncate => (">", false),
-                FileMode::Append => (">>", false),
-                FileMode::Clobber => (">|", false),
-                FileMode::ReadWrite => ("<>", true),
-            };
-            let default = show_default.then(|| r.op.default_fd());
-            format!("{}{} {}", fd_prefix(default), op, word(target))
-        }
-        RedirOp::Dup { source, output } => {
-            let op = if *output { ">&" } else { "<&" };
-            format!(
-                "{}{}{}",
-                fd_prefix(Some(r.op.default_fd())),
-                op,
-                word(source)
-            )
-        }
-        RedirOp::Move { source, output } => {
-            let op = if *output { ">&" } else { "<&" };
-            format!(
-                "{}{}{}-",
-                fd_prefix(Some(r.op.default_fd())),
-                op,
-                word(source)
-            )
-        }
-        RedirOp::Close => {
-            // Direction (`>&-` vs `<&-`) isn't retained on `Close`; the explicit
-            // target fd survives in `r.fd`. Best-effort `<&-` (exotic as a bg job).
-            format!("{}<&-", fd_prefix(Some(r.op.default_fd())))
-        }
-        RedirOp::HereString(w) => format!("{}<<< {}", fd_prefix(None), word(w)),
-        RedirOp::Heredoc { .. } => {
-            // A heredoc on a backgrounded command is exotic; the delimiter isn't
-            // retained (only the collected body), so render a best-effort marker.
-            format!("{}<< (heredoc)", fd_prefix(None))
-        }
-    }
-}
-
-/// Best-effort `jobs`-listing label for a backgrounded compound command
-/// (if/for/while/case/…) where a byte-exact multi-line re-render is out of
-/// scope. Uses the leading command's static program name when it looks through
-/// to a plain simple command, else a generic label.
-fn render_job_compound_fallback(cmd: &Command) -> String {
-    if let Command::Simple(SimpleCommand::Exec(e)) = cmd
-        && let Some(name) = e.program_static_text()
-    {
-        return name;
-    }
-    "background job".to_string()
+    crate::generate::sequence_to_inline_source(seq)
 }
 
 // ----- resolved command (post-expansion) ------------------------------------
@@ -4182,7 +4030,7 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell) -> ExecOutcome {
     // while such an action runs. (EXIT and real-signal traps don't push
     // `firing_traps`, so their freeze is a separate follow-up.)
     if shell.firing_traps.is_empty() {
-        shell.current_command = render_job_simple(cmd);
+        shell.current_command = crate::generate::simple_command_to_source(cmd);
     }
     let outcome = match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell),
@@ -6918,7 +6766,13 @@ fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
         shell.set(pid_var.as_str(), pid.to_string());
     }
     shell.last_bg_pid = Some(pid);
-    shell.jobs.add(pid, vec![pid], format!("coproc {name}"));
+    // #770: the `jobs` column shows the coproc as bash prints it — the
+    // reserved word, the name unless it is the default, and the body.
+    let display = crate::generate::command_to_inline_source(&Command::Coproc {
+        name: name.to_string(),
+        body: Box::new(body.clone()),
+    });
+    shell.jobs.add(pid, vec![pid], display);
     shell.coprocs.push(crate::shell_state::Coproc {
         name: name.to_string(),
         pid,
