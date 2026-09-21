@@ -561,19 +561,18 @@ fn filename_matches_prefix(path: &str, prefix: &str) -> bool {
 }
 
 fn glob_match(pattern: &str, candidate: &str) -> bool {
-    // The glob crate handles neither POSIX [:name:] classes nor extended
-    // globs (`@(…)`, `!(…)`, `?(…)`, `*(…)`, `+(…)`); route both through the
-    // own-matcher (case-sensitive, matching the default glob::Pattern::matches
-    // below). Without this, a `-X` extension filter such as
-    // `_filedir_xspec`'s `!(*.@(so|…))` silently matches nothing.
-    if crate::glob_match::has_posix_class(pattern) || crate::glob_match::has_extglob(pattern) {
-        return crate::glob_match::extglob_match(pattern, candidate, false);
-    }
-    let pattern = crate::glob_match::translate_bracket_negation(pattern);
-    match glob::Pattern::new(&pattern) {
-        Ok(p) => p.matches(candidate),
-        Err(_) => false,
-    }
+    // #303: the one pattern chokepoint — it routes `[:name:]`, `[=c=]`,
+    // `[.c.]` and extended globs (`_filedir_xspec`'s `!(*.@(so|…))`) to the
+    // own matcher and everything else to the `glob` crate. `-X` filters are
+    // extended patterns in bash regardless of `shopt extglob`.
+    crate::glob_match::pattern_matches(
+        pattern,
+        candidate,
+        crate::glob_match::MatchOpts {
+            extglob: true,
+            case_insensitive: false,
+        },
+    )
 }
 
 fn complete_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> {

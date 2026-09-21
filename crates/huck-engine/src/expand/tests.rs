@@ -1638,18 +1638,15 @@ fn unq_glob_match(p: &str, subject: &str) -> bool {
     let mut shell = Shell::new();
     shell.set("HUCK_P", p.to_string());
     let pattern = expand_pattern(&var_unq("HUCK_P"), &mut shell);
-    if crate::glob_match::has_extglob(&pattern)
-        || crate::glob_match::has_posix_class(&pattern)
-        || crate::glob_match::has_collating_symbol(&pattern)
-        || crate::glob_match::has_equivalence_class(&pattern)
-    {
-        crate::glob_match::extglob_match(&pattern, subject, false)
-    } else {
-        let npat = crate::glob_match::translate_bracket_negation(&pattern);
-        glob::Pattern::new(&npat)
-            .map(|g| g.matches(subject))
-            .unwrap_or(false)
-    }
+    // Through the one chokepoint (#717): the pattern text is bash's form.
+    crate::glob_match::pattern_matches(
+        &pattern,
+        subject,
+        crate::glob_match::MatchOpts {
+            extglob: true,
+            case_insensitive: false,
+        },
+    )
 }
 
 /// Regex operand from an UNQUOTED `$p`, matched anchored like `[[ =~ ]]`
@@ -1684,10 +1681,14 @@ fn q_glob_match(p: &str, subject: &str) -> bool {
     let mut shell = Shell::new();
     shell.set("HUCK_P", p.to_string());
     let pattern = expand_pattern(&var_q("HUCK_P"), &mut shell);
-    let npat = crate::glob_match::translate_bracket_negation(&pattern);
-    glob::Pattern::new(&npat)
-        .map(|g| g.matches(subject))
-        .unwrap_or(false)
+    crate::glob_match::pattern_matches(
+        &pattern,
+        subject,
+        crate::glob_match::MatchOpts {
+            extglob: true,
+            case_insensitive: false,
+        },
+    )
 }
 
 #[test]
@@ -1716,12 +1717,29 @@ fn data_backslash_matches_literal_backslash() {
 }
 
 #[test]
-fn escape_pattern_literal_backslash_is_literal() {
-    // escape_pattern_literal on a lone backslash yields a form both the glob
-    // crate and the extglob engine treat as a literal backslash.
+fn escape_pattern_literal_is_bash_form() {
+    // #589: a quoted span is bash's `quote_string_for_globbing` output — a
+    // backslash before EVERY character — which is what `set -x` prints and
+    // what the chokepoint translates for the `glob` crate.
+    assert_eq!(escape_pattern_literal("a*"), "\\a\\*");
+    assert_eq!(escape_pattern_literal("\\"), "\\\\");
     let esc = escape_pattern_literal("\\");
-    assert!(glob::Pattern::new(&esc).map(|g| g.matches("\\")).unwrap());
+    let opts = crate::glob_match::MatchOpts {
+        extglob: true,
+        case_insensitive: false,
+    };
+    assert!(crate::glob_match::pattern_matches(&esc, "\\", opts));
     assert!(crate::glob_match::extglob_match(&esc, "\\", false));
+    assert!(crate::glob_match::pattern_matches(
+        &escape_pattern_literal("a*"),
+        "a*",
+        opts
+    ));
+    assert!(!crate::glob_match::pattern_matches(
+        &escape_pattern_literal("a*"),
+        "ab",
+        opts
+    ));
 }
 
 #[test]

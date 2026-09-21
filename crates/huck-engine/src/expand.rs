@@ -2370,19 +2370,18 @@ fn word_part_is_quoted(part: &WordPart) -> bool {
     }
 }
 
-/// Escapes a quoted span so its metacharacters match literally — both the
-/// `glob`-crate wildcards (`* ? [ ]`, via `glob::Pattern::escape`) AND the
-/// extglob structural chars `| ( )` (wrapped as single-char classes `[|]`/
-/// `[(]`/`[)]`, which are literal-equivalent in both the `glob` crate and the
-/// extglob engine). Without the extra step, a quoted `|`/`(`/`)` inside an
-/// extglob group (e.g. `@("a|b")`) would be parsed as alternation/group syntax.
+/// Escapes a quoted span so it matches literally, in bash's own form: a
+/// backslash before EVERY character, which is what `quote_string_for_globbing`
+/// makes of a quoted string and what `set -x` prints (`[[ abc == \a\* ]]`,
+/// #589). The pattern text is bash's from here on; `glob_match::normalize`
+/// translates it for the `glob` crate at the one matching chokepoint.
 fn escape_pattern_literal(text: &str) -> String {
-    // `glob::Pattern::escape` only emits `[?]`/`[*]`/`[[]`/`[]]`, so it never
-    // introduces a bare `|`/`(`/`)` — the replaces below can't double-escape.
-    glob::Pattern::escape(text)
-        .replace('|', "[|]")
-        .replace('(', "[(]")
-        .replace(')', "[)]")
+    let mut out = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        out.push('\\');
+        out.push(c);
+    }
+    out
 }
 
 /// Shared body for `expand_pattern` and `expand_regex_operand`: expands `word`
@@ -2424,24 +2423,19 @@ fn expand_word_with_quote_escape(
             // `\w`, `\s`, `\<`, `\>`, …) stay active. Do NOT collapse — push raw.
             result.push_str(&text);
         } else {
-            // Unquoted glob-pattern text: a backslash is an fnmatch escape.
-            // `\c` becomes a literal `c` — emit `escape(c)` so a `\*` matches a
-            // literal `*` (glob → `[*]`) while an unescaped metachar stays
-            // active. A trailing lone backslash is dropped (bash).
+            // Unquoted glob-pattern text: a backslash is an fnmatch escape,
+            // and the pattern text stays in bash's form, so `\c` is kept as
+            // written. A trailing lone backslash is a LITERAL backslash
+            // (`case 'ab\' in ab\) matches`), spelled `\\`.
             let mut chars = text.chars();
             while let Some(c) = chars.next() {
                 if c == '\\' {
                     match chars.next() {
-                        // `\\` → a LITERAL backslash. Emit `[\\]` (a one-char
-                        // class): both the `glob` crate and the extglob engine
-                        // (and `regex`) treat it as a literal `\`, and it can't
-                        // accidentally escape a following metachar the way a
-                        // bare `\` would in the extglob engine.
-                        Some('\\') => result.push_str(r"[\\]"),
-                        Some(next) => result.push_str(&escape(&next.to_string())),
-                        // Trailing lone backslash — bash keeps it as a LITERAL
-                        // backslash (`case 'ab\' in ab\) matches). Emit `[\\]`.
-                        None => result.push_str(r"[\\]"),
+                        Some(next) => {
+                            result.push('\\');
+                            result.push(next);
+                        }
+                        None => result.push_str("\\\\"),
                     }
                 } else {
                     result.push(c);
@@ -2861,13 +2855,10 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts, shell: &Shell
             continue;
         }
         let pattern = build_glob_pattern(&field);
-        // Route POSIX-class, collating-symbol, and equivalence-class patterns
-        // through the own-matcher too (the glob crate lacks
-        // [:name:]/[.name.]/[=name=]); unconditional on the extglob shopt.
-        let is_extglob = (opts.extglob && crate::glob_match::has_extglob(&pattern))
-            || crate::glob_match::has_posix_class(&pattern)
-            || crate::glob_match::has_collating_symbol(&pattern)
-            || crate::glob_match::has_equivalence_class(&pattern);
+        // The own matcher takes POSIX classes, collating symbols, equivalence
+        // classes and (with the shopt) extended globs — decided on the raw
+        // pattern, as bash does (#717).
+        let is_extglob = crate::glob_match::needs_own_matcher(&pattern, opts.extglob);
 
         // No globbing needed: not a wildcard field AND not an extglob field.
         if !has_unquoted_metachar(&field) && !is_extglob {
@@ -2894,11 +2885,17 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts, shell: &Shell
                 require_literal_separator: true,
                 require_literal_leading_dot: !literal_leading_dot && !opts.dotglob,
             };
-            let npat = crate::glob_match::translate_bracket_negation(&pattern);
             // `**` is recursive only with `shopt -s globstar`; otherwise it is
             // two ordinary `*` (≡ `*`). The `glob` crate always treats `**` as
             // recursive, so collapse it to `*` when globstar is off.
-            let npat = if opts.globstar {
+            // #717: bash's bracket rules (`[^…]` → `[!…]`, an unmatched `[`
+            // is a literal), so `echo [*` globs `[` followed by anything.
+            let Some(npat) = crate::glob_match::normalize(&pattern) else {
+                // A bracket expression that can never match: no file matches.
+                words.push(field.chars);
+                continue;
+            };
+            let npat: std::borrow::Cow<'_, str> = if opts.globstar {
                 npat
             } else {
                 collapse_globstar(&npat).into()
@@ -2963,15 +2960,15 @@ pub fn glob_expand_fields(fields: Vec<Field>, shell: &Shell) -> Vec<String> {
 /// (`[*]`, `[?]`, `[[]`, `[]]`), so the `glob` crate treats them as literal.
 /// Unquoted chars pass through verbatim.
 fn build_glob_pattern(field: &Field) -> String {
+    // bash's form (`quote_string_for_globbing`, QGLOB_FILENAME): a quoted
+    // globbing character is backslash-escaped; `glob_match::normalize`
+    // translates for the `glob` crate.
     let mut p = String::new();
     for (c, &q) in field.chars.chars().zip(field.quoted.iter()) {
-        if q && matches!(c, '*' | '?' | '[' | ']' | '|' | '(' | ')') {
-            p.push('[');
-            p.push(c);
-            p.push(']');
-        } else {
-            p.push(c);
+        if q && matches!(c, '*' | '?' | '[' | ']' | '|' | '(' | ')' | '\\') {
+            p.push('\\');
         }
+        p.push(c);
     }
     p
 }

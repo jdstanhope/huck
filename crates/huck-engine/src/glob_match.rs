@@ -1,8 +1,288 @@
-//! Extended-glob (`shopt extglob`) pattern matcher. Pure: no shell, no FS.
-//! Used by `[[`/`case`/`${}` only when extglob is on AND the pattern contains
-//! an extglob operator (`has_extglob`). Plain globs keep using the `glob` crate.
+//! Pattern matching, one chokepoint for every consumer (#717): `[[ == ]]`,
+//! `case`, `${…#…}`/`${…/…}`, completion's `-X` filter and pathname
+//! expansion all go through [`pattern_matches`] (or [`normalize`] + the
+//! `glob` crate's directory walk for pathnames). It picks the engine — the
+//! own matcher below for extglob, `[:class:]`, `[=c=]` and `[.c.]`, the
+//! `glob` crate otherwise — and applies bash's bracket rules first, so a
+//! pattern can no longer be "invalid": an unmatched `[` is an ordinary
+//! character (`sm_loop.c` BRACKMATCH), exactly as in bash.
 
 use std::borrow::Cow;
+
+/// How a pattern is matched.
+#[derive(Debug, Clone, Copy)]
+pub struct MatchOpts {
+    /// `shopt -s extglob`: whether `@(…)`-style groups are operators. (`[[ ]]`
+    /// passes `true` unconditionally — bash always recognises them there.)
+    pub extglob: bool,
+    pub case_insensitive: bool,
+}
+
+/// Does `text` match `pattern`, in full? The one place the engine is chosen
+/// and bash's bracket rules are applied.
+pub fn pattern_matches(pattern: &str, text: &str, opts: MatchOpts) -> bool {
+    // Engine choice is made on the RAW pattern, as bash's PATSCAN runs before
+    // any bracket handling: an unmatched `[` inside `@(…)` swallows the `)`
+    // and the group is not one. The own matcher applies the bracket rules
+    // itself; only the `glob` crate needs the pattern rewritten.
+    if needs_own_matcher(pattern, opts.extglob) {
+        return extglob_match(pattern, text, opts.case_insensitive);
+    }
+    let Some(normalized) = normalize(pattern) else {
+        return false;
+    };
+    compile_glob(&normalized).matches_with(
+        text,
+        glob::MatchOptions {
+            case_sensitive: !opts.case_insensitive,
+            require_literal_separator: false,
+            require_literal_leading_dot: false,
+        },
+    )
+}
+
+/// Whether `pattern` needs the own matcher: an extended-glob group (when
+/// `extglob` recognises them), or a `[:name:]`, `[=c=]` or `[.c.]` the
+/// `glob` crate cannot express.
+pub fn needs_own_matcher(pattern: &str, extglob: bool) -> bool {
+    (extglob && has_extglob(pattern))
+        || has_posix_class(pattern)
+        || has_collating_symbol(pattern)
+        || has_equivalence_class(pattern)
+        || has_escaped_class_member(pattern)
+}
+
+/// A closed bracket expression with a `\c` member — `[a\-z]` is the three
+/// members `a`, `-`, `z` in bash, which the `glob` crate (no escapes) would
+/// read as a range once unescaped. The own matcher takes those.
+fn has_escaped_class_member(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '[' => match bracket_close(&chars, i) {
+                BracketEnd::Closed(close) => {
+                    if chars[i..close].contains(&'\\') {
+                        return true;
+                    }
+                    i = close + 1;
+                }
+                _ => i += 1,
+            },
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// bash's bracket rules, applied to a pattern before the `glob` crate sees it:
+/// `[^…]` becomes `[!…]`, and a `[` whose bracket expression never closes is
+/// rewritten as the one-member class `[[]` so it matches itself and matching
+/// continues with the text after it — `[x` matches `[x`, `[*` matches `[`
+/// then anything, `[]` matches `[]`. Borrowed back when nothing changes.
+pub fn normalize(pattern: &str) -> Option<Cow<'_, str>> {
+    // Literalize FIRST: `[^a` with no closing `]` is the three characters
+    // `[^a`, not a negated class, so the `^` must not be rewritten.
+    let lit = literalize_unmatched_brackets(pattern)?;
+    Some(match lit {
+        Cow::Borrowed(p) => translate_bracket_negation(p),
+        Cow::Owned(p) => Cow::Owned(translate_bracket_negation(&p).into_owned()),
+    })
+}
+
+/// Compile a NORMALIZED pattern for the `glob` crate. Cannot fail in practice
+/// (normalization removed the one thing the crate rejects); should the crate
+/// still object, the pattern matches itself literally rather than nothing.
+pub(crate) fn compile_glob(normalized: &str) -> glob::Pattern {
+    glob::Pattern::new(normalized).unwrap_or_else(|_| {
+        glob::Pattern::new(&glob::Pattern::escape(normalized)).expect("an escaped pattern compiles")
+    })
+}
+
+/// How a `[` ends, per bash's `sm_loop.c` BRACKMATCH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BracketEnd {
+    /// The index of the `]` that closes the bracket expression.
+    Closed(usize),
+    /// The pattern ended first: the `[` matches itself and matching
+    /// continues with the text after it.
+    Literal,
+    /// A range whose end is missing (`[a-` at the end of the pattern, or
+    /// `[a-\`): bash returns "no match" for ANY subject, not a literal.
+    NeverMatches,
+}
+
+/// Port of the scan in bash's `sm_loop.c` BRACKMATCH from the `[` at `open`.
+/// After an optional `!`/`^`, a first `]` is a member; `[:name:]`, `[=c=]`
+/// and `[.c.]` are atomic (a `[:` with no `:]` is a plain `[` member); `\`
+/// quotes the next member; a `-` range consumes its end member.
+fn bracket_close(chars: &[char], open: usize) -> BracketEnd {
+    let n = chars.len();
+    let mut i = open + 1;
+    if i < n && (chars[i] == '!' || chars[i] == '^') {
+        i += 1;
+    }
+    let mut first = true;
+    while i < n {
+        let c = chars[i];
+        if c == ']' && !first {
+            return BracketEnd::Closed(i);
+        }
+        first = false;
+        if c == '[' && i + 1 < n && matches!(chars[i + 1], ':' | '=' | '.') {
+            let kind = chars[i + 1];
+            // Find the matching `kind]`; without one the `[` is a plain member.
+            let mut j = i + 2;
+            let mut closed = None;
+            while j + 1 < n {
+                if chars[j] == kind && chars[j + 1] == ']' {
+                    closed = Some(j + 1);
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(end) = closed {
+                i = end + 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\\' {
+            i += 2;
+            continue;
+        }
+        // A range: `x-y` consumes `y` as a member too (unless `-` is last
+        // before the `]`, when it is a literal `-`). A range with no end at
+        // all — the pattern stops after the `-` (or after `-\`) — can never
+        // match anything.
+        if i + 1 < n && chars[i + 1] == '-' {
+            if i + 2 >= n {
+                return BracketEnd::NeverMatches;
+            }
+            if chars[i + 2] != ']' {
+                i += 2;
+                if chars[i] == '\\' {
+                    if i + 1 >= n {
+                        return BracketEnd::NeverMatches;
+                    }
+                    i += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    BracketEnd::Literal
+}
+
+/// bash's `gm_loop.c` MATCHLEN: the FIXED number of characters `pattern`
+/// matches, or `None` when it can match any length (a `*`, or an extended
+/// group). `?`, a backslash-escaped character and a closed bracket expression
+/// each count one; an unterminated `[` counts one per character it swallowed
+/// (so `[*` is two). `${v/pat/rep}` uses it to bound its search — bash tries
+/// only substrings of exactly this length, which is why `${v/[*/X}` replaces
+/// exactly two characters.
+pub fn fixed_match_len(pattern: &str) -> Option<usize> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let n = chars.len();
+    let mut len = 0usize;
+    let mut i = 0;
+    while i < n {
+        match chars[i] {
+            '\\' => {
+                len += 1;
+                i += 2;
+            }
+            '*' => return None,
+            '?' | '+' | '!' | '@' if i + 1 < n && chars[i + 1] == '(' => return None,
+            '[' => match bracket_close(&chars, i) {
+                BracketEnd::Closed(close) => {
+                    len += 1;
+                    i = close + 1;
+                }
+                // bash counts every character from the `[` to the end and
+                // stops scanning there.
+                BracketEnd::Literal | BracketEnd::NeverMatches => {
+                    len += n - i;
+                    return Some(len);
+                }
+            },
+            _ => {
+                len += 1;
+                i += 1;
+            }
+        }
+    }
+    Some(len)
+}
+
+/// Rewrites bash-form pattern text for the `glob` crate, which has no
+/// escape character: outside a bracket expression `\c` becomes the one-member
+/// class `[c]` when `c` is a wildcard (`* ? [ ]`) and plain `c` otherwise; a
+/// closed bracket expression is copied with its `\c` members unescaped; an
+/// unmatched `[` becomes `[[]`. `None` when a bracket expression can never
+/// match (see `BracketEnd`).
+fn literalize_unmatched_brackets(pattern: &str) -> Option<Cow<'_, str>> {
+    if !pattern.contains('[') && !pattern.contains('\\') {
+        return Some(Cow::Borrowed(pattern));
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len() + 4);
+    let mut changed = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            changed = true;
+            match chars.get(i + 1) {
+                Some(&q) if matches!(q, '*' | '?' | '[' | ']') => {
+                    out.push('[');
+                    out.push(q);
+                    out.push(']');
+                }
+                Some(&q) => out.push(q),
+                // A trailing backslash is a literal one.
+                None => out.push('\\'),
+            }
+            i += 2;
+            continue;
+        }
+        if c == '[' {
+            match bracket_close(&chars, i) {
+                BracketEnd::Closed(close) => {
+                    // Copy the expression, unescaping `\c` members.
+                    let mut j = i;
+                    while j <= close {
+                        if chars[j] == '\\' && j < close {
+                            out.push(chars[j + 1]);
+                            changed = true;
+                            j += 2;
+                        } else {
+                            out.push(chars[j]);
+                            j += 1;
+                        }
+                    }
+                    i = close + 1;
+                }
+                BracketEnd::Literal => {
+                    out.push_str("[[]");
+                    changed = true;
+                    i += 1;
+                }
+                BracketEnd::NeverMatches => return None,
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    Some(if changed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(pattern)
+    })
+}
 
 /// Rewrite a class-leading `^` to `!` so the `glob` crate (which only honors
 /// `[!…]`) treats `[^…]` as negation, matching bash (which accepts both). Only
@@ -182,11 +462,54 @@ pub fn has_extglob(pattern: &str) -> bool {
                 i += 2;
                 continue;
             }
-            '?' | '*' | '+' | '@' | '!' if i + 1 < b.len() && b[i + 1] == '(' => return true,
+            // A bracket expression is opaque to group detection; an
+            // unmatched `[` is just a character (bash's BRACKMATCH).
+            '[' => match bracket_close(&b, i) {
+                BracketEnd::Closed(close) => i = close + 1,
+                _ => i += 1,
+            },
+            '?' | '*' | '+' | '@' | '!'
+                if i + 1 < b.len() && b[i + 1] == '(' && group_close(&b, i + 2).is_some() =>
+            {
+                return true;
+            }
             _ => i += 1,
         }
     }
     false
+}
+
+/// bash's PATSCAN: from just after a group's `(`, the index of the `)` that
+/// closes it — nested groups balance, and `(`/`)`/`|` inside a bracket
+/// expression are not special, so a `[` that never closes swallows the rest
+/// of the pattern and the group is not one (`@([x)` is five literal
+/// characters).
+pub(crate) fn group_close(chars: &[char], from: usize) -> Option<usize> {
+    let n = chars.len();
+    let mut depth = 0usize;
+    let mut i = from;
+    while i < n {
+        match chars[i] {
+            '\\' => i += 2,
+            '[' => match bracket_close(chars, i) {
+                BracketEnd::Closed(close) => i = close + 1,
+                _ => return None,
+            },
+            '(' => {
+                depth += 1;
+                i += 1;
+            }
+            ')' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// True if `pattern` contains a POSIX bracket class `[:name:]` (the
@@ -409,9 +732,29 @@ fn parse_seq(chars: &[char], pos: &mut usize, in_group: bool) -> Vec<Item> {
                 }
             }
             '[' => {
-                items.push(parse_class(chars, pos));
+                // bash's BRACKMATCH: a `[` whose bracket expression never
+                // closes matches itself, and matching continues after it.
+                match bracket_close(chars, *pos) {
+                    BracketEnd::Closed(_) => items.push(parse_class(chars, pos)),
+                    BracketEnd::Literal => {
+                        items.push(Item::Lit('['));
+                        *pos += 1;
+                    }
+                    BracketEnd::NeverMatches => {
+                        // An empty, non-negated class matches nothing, ever.
+                        items.push(Item::Class {
+                            negated: false,
+                            set: Vec::new(),
+                        });
+                        *pos = chars.len();
+                    }
+                }
             }
-            '?' | '*' | '+' | '@' | '!' if *pos + 1 < chars.len() && chars[*pos + 1] == '(' => {
+            '?' | '*' | '+' | '@' | '!'
+                if *pos + 1 < chars.len()
+                    && chars[*pos + 1] == '('
+                    && group_close(chars, *pos + 2).is_some() =>
+            {
                 let kind = match c {
                     '?' => GroupKind::ZeroOrOne,
                     '*' => GroupKind::ZeroOrMore,
@@ -539,6 +882,14 @@ fn parse_class(chars: &[char], pos: &mut usize) -> Item {
                 };
                 return (atom, RangeEp::NotEligible, close + 2);
             }
+        }
+        // `\c`: a quoted member (bash-form pattern text).
+        if chars[k] == '\\' && k + 1 < chars.len() {
+            return (
+                ClassAtom::Ch(chars[k + 1]),
+                RangeEp::Eligible(Some(chars[k + 1])),
+                k + 2,
+            );
         }
         // Plain char.
         (
@@ -789,6 +1140,87 @@ fn walk_components(
 
 #[cfg(test)]
 mod tests {
+    // ---- #717: bash's bracket rules at the chokepoint ----------------------
+
+    fn pm(pattern: &str, text: &str) -> bool {
+        pattern_matches(
+            pattern,
+            text,
+            MatchOpts {
+                extglob: true,
+                case_insensitive: false,
+            },
+        )
+    }
+
+    /// An unmatched `[` is an ordinary character (`sm_loop.c` BRACKMATCH).
+    #[test]
+    fn unmatched_bracket_is_a_literal() {
+        assert!(pm("[x", "[x"));
+        assert!(!pm("[ab", "[b"));
+        assert!(pm("[", "["));
+        assert!(pm("[]", "[]"));
+        assert!(pm("[*", "[anything"));
+        assert!(!pm("[*", "x"));
+        assert!(pm("[!a", "[!a"));
+        assert!(pm("[^a", "[^a"));
+        // After the literal `[`, `[:alpha:]` is an ORDINARY bracket
+        // expression — the set `{: a l p h}` — not a class.
+        assert!(pm("[[:alpha:]", "[a"));
+        assert!(!pm("[[:alpha:]", "[x"));
+        assert!(!pm("[[:alpha:]", "x"));
+        assert!(pm("[[:alpha:", "[[:alpha:"));
+    }
+
+    /// A range with no end can never match — not even literally.
+    #[test]
+    fn dangling_range_never_matches() {
+        assert!(!pm("[a-", "[a-"));
+        assert!(!pm("[a-", "a"));
+        assert_eq!(normalize("[a-"), None);
+        assert!(pm("[a-]", "-"));
+    }
+
+    /// Matched bracket expressions are untouched by normalization.
+    #[test]
+    fn normalize_rewrites_only_the_unmatched() {
+        assert_eq!(normalize("[x").unwrap(), "[[]x");
+        assert_eq!(normalize("[]").unwrap(), "[[]]");
+        assert_eq!(normalize("[^a").unwrap(), "[[]^a");
+        assert_eq!(normalize("[^a]").unwrap(), "[!a]");
+        assert_eq!(normalize("[]a]").unwrap(), "[]a]");
+        assert_eq!(normalize("a[[:alpha:]]b").unwrap(), "a[[:alpha:]]b");
+        assert!(matches!(normalize("plain*"), Some(Cow::Borrowed(_))));
+    }
+
+    /// PATSCAN: a `[` that never closes inside `@(…)` swallows the `)`, so
+    /// the group is not one and the whole thing is literal.
+    #[test]
+    fn group_detection_runs_before_brackets() {
+        assert!(!has_extglob("@([x)"));
+        assert!(!has_extglob("@(a|[b)"));
+        assert!(has_extglob("[@(a|b)"));
+        assert!(has_extglob("@(a)[a"));
+        assert!(pm("@([x)", "@([x)"));
+        assert!(!pm("@([x)", "[x"));
+        assert!(pm("[@(a|b)", "[a"));
+    }
+
+    /// `gm_loop.c` MATCHLEN: the fixed length `${v/…}` searches with.
+    #[test]
+    fn fixed_match_len_follows_matchlen() {
+        assert_eq!(fixed_match_len("abc"), Some(3));
+        assert_eq!(fixed_match_len("a?c"), Some(3));
+        assert_eq!(fixed_match_len("a*c"), None);
+        assert_eq!(fixed_match_len("[ab]c"), Some(2));
+        assert_eq!(fixed_match_len("[*"), Some(2));
+        assert_eq!(fixed_match_len("[*c"), Some(3));
+        assert_eq!(fixed_match_len("[b*"), Some(3));
+        assert_eq!(fixed_match_len("\\*x"), Some(2));
+        assert_eq!(fixed_match_len("@(a)"), None);
+        assert_eq!(fixed_match_len(""), Some(0));
+    }
+
     use super::*;
 
     fn m(p: &str, t: &str) -> bool {

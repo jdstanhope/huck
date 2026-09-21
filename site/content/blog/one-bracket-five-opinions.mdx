@@ -1,0 +1,84 @@
+---
+title: "One bracket, five opinions"
+date: 2026-09-21
+summary: "A lone `[` in a pattern is an ordinary character in bash. huck had five places that matched patterns, and four of them disagreed — one loudly, three by silently not matching. Now there is one, and the pattern it works on is written the way bash writes it."
+tags: ["patterns", "globbing", "case", "xtrace", "bugfix"]
+version: null
+draft: false
+---
+
+bash's rule for a `[` that never finds its `]` is one sentence: it is an
+ordinary character. huck matched patterns in five places — `[[ == ]]`,
+`case`, the `${…#…}` family, completion's `-X` filter and filename
+globbing — and only globbing had that sentence. The others had each grown
+their own way of coping with the pattern library refusing the `[`, so a
+`case` arm or a `${v/…/…}` that should have matched simply did nothing:
+
+```bash
+# before
+$ huck -c 'case "a[b" in a[b) echo matched;; *) echo no;; esac'
+no
+$ huck -c 'v="a[b"; echo "${v/[/X}"'
+a[b
+```
+
+```bash
+# after
+$ huck -c 'case "a[b" in a[b) echo matched;; *) echo no;; esac'
+matched
+$ huck -c 'v="a[b"; echo "${v/[/X}"'
+aXb
+```
+
+`[[ ]]` was the loud one, turning the library's complaint into an error and
+an exit status:
+
+```bash
+# before
+$ huck -c '[[ "[x" == [x ]] && echo yes || echo no'
+huck: line 1: [[: bad pattern: Pattern syntax error near position 0: invalid range pattern
+no
+```
+
+```bash
+# after
+$ huck -c '[[ "[x" == [x ]] && echo yes || echo no'
+yes
+```
+
+The fix is one place all five now call, which decides which engine matches
+the pattern and applies bash's bracket rules first. Reading those rules in
+bash's source turned up more than the one sentence. A range with no end,
+`[a-` at the end of a pattern, matches *nothing* — not even itself. Inside an
+extended glob like `@(…)`, the search for the closing `)` runs the bracket
+scan first, so `@([x)` is five literal characters rather than a group. And
+`${v/pat/rep}` does not look for the longest match when the pattern has no
+`*` outside a bracket: it tries substrings of exactly one length, counted
+from the pattern, and a lone `[` counts every character it swallows — which
+is why `${v/[*/X}` replaces exactly two characters in bash and now in huck.
+
+The same pass fixed what `set -x` shows for a quoted pattern. huck's internal
+spelling of "this `*` is literal" had been leaking into the trace:
+
+```bash
+# before
+$ huck -c 'set -x; [[ abc == "a*" ]]'
++ [[ abc == a[*] ]]
+```
+
+```bash
+# after
+$ huck -c 'set -x; [[ abc == "a*" ]]'
++ [[ abc == \a\* ]]
+```
+
+The pattern text huck carries around is now written the way bash writes it —
+a backslash before each quoted character — and the one matching chokepoint
+translates it for the library. That also made completion's `-X` filter honour
+`[[:alpha:]]` and friends, which it had been passing straight to a library
+that does not know them.
+
+Still open: `x[` at the very end of a word is read by the lexer as the start
+of a subscript ([#75](https://github.com/jdstanhope/huck/issues/75)), so it
+never reaches the matcher; and `[[ =~ ]]` regexes are a separate engine with
+their own open issue ([#51](https://github.com/jdstanhope/huck/issues/51)).

@@ -25,7 +25,7 @@ changes a shared subsystem's semantics and gets a spec + plan + hand-off PR.
 |---|-----|--------|-------|--------|
 | 1 | Job table: bash's five cleanup points + stored `+`/`-`; fork-site signal dispositions | #475 #758 (round 1, PR #769); #185 (round 2, PR #771); #478 #766 (round 3, PR #773) | bug-fix rounds | ✅ done (#772 filed) |
 | 4 | One AST printer (`generate` gains bash's outside-a-function style; diagnostics, `jobs`, `$BASH_COMMAND` use it) | #761 #770 (round 1, PR #774); #124 (round 2, PR #775); #589 moved to hub 5 (it is the matcher's escape form) | bug-fix rounds | ✅ done |
-| 5 | One pattern-compile chokepoint | #717 #303 (#589 seam) | bug-fix round | |
+| 5 | One pattern-matching chokepoint (`glob_match::pattern_matches`), pattern text in bash's form | #717 #303 #589 (PR #776) | bug-fix round | ✅ done |
 | 2A | Declared-but-unset variable state | #600 #225 #33 #691 | vNN | |
 | 2B | One declaration policy table | #347 #697 #698 #734 #65 | vNN (after 2A) | |
 | 3 | Piped-stdin reader feeds the lexer; parse the line before running it | #701 #81 #21 #79 #575 | vNN | |
@@ -125,10 +125,17 @@ its own arm).
   classes / POSIX classes: the same "translate before compile" seam.
 - #589 — the internal escape that leaks into xtrace is produced on this seam.
 
-**Fix shape:** one `compile_pattern` helper next to
-`glob_match::translate_bracket_negation` that escapes an unmatched `[`, then
-delete the four guards. **Gate:** the harness #717 suggests — five consumers ×
-matching/non-matching subject × (`[`, `a[b`, `[x`, `*[`).
+**Corrected by the round (2026-09-21):** the chokepoint is the MATCHER, not
+the compile — four copies of the same engine dispatch (own matcher for
+extglob/classes, `glob` crate otherwise) lived in `case`, `[[`, `${…}` and
+completion, and completion's copy skipped the class routing (#303). One
+`glob_match::pattern_matches` now; bash's bracket rules ported from
+`sm_loop.c` (an unmatched `[` is literal; a dangling range `[a-` is NO
+match; PATSCAN decides a group before brackets, so `@([x)` is literal) and
+`gm_loop.c` MATCHLEN (`${v/…}` tries only a fixed length when the pattern has
+no `*` outside a bracket). The pattern text is bash's `\c` form for quoted
+spans (#589 — `set -x` prints `\a\*`), translated for the `glob` crate at
+the chokepoint. **Gate:** `pattern_chokepoint_diff_check.sh`, 51 rows.
 
 ### 2A. A "declared but unset" variable state
 
