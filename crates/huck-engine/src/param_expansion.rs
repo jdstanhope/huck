@@ -498,39 +498,22 @@ pub(crate) fn expand_word_to_string(word: &Word, shell: &mut Shell) -> String {
     crate::expand::expand_assignment(word, shell)
 }
 
-/// Pattern match for parameter expansion: extglob engine when enabled+applicable,
-/// else the `glob` crate (preserving current behavior). `case_sensitive` mirrors
-/// the existing `MatchOptions`.
+/// Pattern match for parameter expansion (`${}` matching is case-sensitive;
+/// bash's `nocasematch` does not apply here). One chokepoint (#717).
 fn pe_pattern_matches(pattern: &str, text: &str, extglob: bool, case_sensitive: bool) -> bool {
-    if (extglob && crate::glob_match::has_extglob(pattern))
-        || crate::glob_match::has_posix_class(pattern)
-        || crate::glob_match::has_collating_symbol(pattern)
-        || crate::glob_match::has_equivalence_class(pattern)
-    {
-        crate::glob_match::extglob_match(pattern, text, !case_sensitive)
-    } else {
-        let pattern = crate::glob_match::translate_bracket_negation(pattern);
-        match glob::Pattern::new(&pattern) {
-            Ok(p) => p.matches_with(
-                text,
-                glob::MatchOptions {
-                    case_sensitive,
-                    require_literal_separator: false,
-                    require_literal_leading_dot: false,
-                },
-            ),
-            Err(_) => false,
-        }
-    }
+    crate::glob_match::pattern_matches(
+        pattern,
+        text,
+        crate::glob_match::MatchOpts {
+            extglob,
+            case_insensitive: !case_sensitive,
+        },
+    )
 }
 
 fn remove_prefix(value: &str, pattern: &str, longest: bool, extglob: bool) -> String {
     // `${}` pattern stripping is always case-sensitive (bash `nocasematch`
     // does not affect parameter expansion).
-    if glob::Pattern::new(pattern).is_err() && !(extglob && crate::glob_match::has_extglob(pattern))
-    {
-        return value.to_string();
-    }
     let mut boundaries: Vec<usize> = value.char_indices().map(|(i, _)| i).collect();
     boundaries.push(value.len());
 
@@ -551,10 +534,6 @@ fn remove_prefix(value: &str, pattern: &str, longest: bool, extglob: bool) -> St
 }
 
 fn remove_suffix(value: &str, pattern: &str, longest: bool, extglob: bool) -> String {
-    if glob::Pattern::new(pattern).is_err() && !(extglob && crate::glob_match::has_extglob(pattern))
-    {
-        return value.to_string();
-    }
     let mut boundaries: Vec<usize> = value.char_indices().map(|(i, _)| i).collect();
     boundaries.push(value.len());
 
@@ -595,17 +574,26 @@ fn substitute(
             _ => value.to_string(),
         };
     }
-    if glob::Pattern::new(pattern).is_err() && !(extglob && crate::glob_match::has_extglob(pattern))
-    {
-        return value.to_string();
-    }
     let mut boundaries: Vec<usize> = value.char_indices().map(|(i, _)| i).collect();
     boundaries.push(value.len());
+    // bash's `match_upattern`: a pattern with no `*` (outside a bracket) and
+    // no extended group has a FIXED length, and only substrings of exactly
+    // that many characters are tried (`gm_loop.c` MATCHLEN) — `${v/[*/X}`
+    // replaces exactly two characters. `None` = any length, longest wins.
+    let fixed = crate::glob_match::fixed_match_len(pattern);
+    // The boundary `fixed` characters after the one at `bi`, if any.
+    let end_at_fixed =
+        |bi: usize| -> Option<usize> { fixed.and_then(|k| boundaries.get(bi + k).copied()) };
 
     // Longest match at `start`: largest `end` (from boundaries) > start
     // such that value[start..end] matches. Returns None if no end works.
     // For empty-pattern callers this can return Some(start) (empty match).
     let longest_match_at = |start: usize| -> Option<usize> {
+        if fixed.is_some() {
+            let bi = boundaries.iter().position(|&b| b == start)?;
+            let end = end_at_fixed(bi)?;
+            return pe_pattern_matches(pattern, &value[start..end], extglob, true).then_some(end);
+        }
         // `boundaries` is ascending, so iter().rev() yields descending —
         // once we drop below `start`, every remaining entry is also below.
         for &end in boundaries.iter().rev() {
@@ -633,8 +621,14 @@ fn substitute(
         }
         SubstAnchor::Suffix => {
             // Smallest start such that value[start..] matches → longest
-            // suffix match.
-            for &start in &boundaries {
+            // suffix match. A fixed-length pattern is tried only at the one
+            // start that many characters from the end.
+            let starts: Vec<usize> = match fixed {
+                Some(k) if k < boundaries.len() => vec![boundaries[boundaries.len() - 1 - k]],
+                Some(_) => Vec::new(),
+                None => boundaries.clone(),
+            };
+            for &start in &starts {
                 if pe_pattern_matches(pattern, &value[start..], extglob, true) {
                     let mut out = String::with_capacity(start + replacement.len());
                     out.push_str(&value[..start]);
@@ -715,15 +709,6 @@ fn case_modify(
     pattern: Option<&str>,
     extglob: bool,
 ) -> String {
-    // Validate the pattern, if any. On a glob compile failure that is not a
-    // valid extglob pattern, return value unchanged (matches v32 substitute's
-    // silent-no-op convention).
-    if pattern.is_some_and(|p| {
-        glob::Pattern::new(p).is_err() && !(extglob && crate::glob_match::has_extglob(p))
-    }) {
-        return value.to_string();
-    }
-
     let should_modify = |c: char| -> bool {
         match pattern {
             None => true,
@@ -1841,11 +1826,21 @@ mod tests {
     }
 
     #[test]
-    fn case_modify_invalid_glob_returns_value_unchanged() {
-        // `[abc` (unclosed bracket) — glob::Pattern::new returns Err.
+    fn case_modify_unmatched_bracket_is_a_literal() {
+        // `[abc` (unclosed bracket) is the LITERAL four characters in bash
+        // (#717), which no single character matches — so nothing changes…
         assert_eq!(
             case_modify("hello", CaseDirection::Upper, true, Some("[abc"), false),
             "hello"
+        );
+        // …while a lone `[` does match the `[` in the value.
+        assert_eq!(
+            case_modify("[abc", CaseDirection::Upper, true, Some("["), false),
+            "[abc"
+        );
+        assert_eq!(
+            case_modify("a[b", CaseDirection::Upper, true, Some("[[]"), false),
+            "a[b"
         );
     }
 
