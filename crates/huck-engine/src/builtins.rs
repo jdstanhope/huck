@@ -1270,17 +1270,15 @@ pub(crate) fn declare_scalar_quote(v: &str) -> String {
 /// For indexed-array variables, the value is rendered as
 /// `([0]="v0" [1]="v1" ...)` over the keys in ascending order.
 pub(crate) fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String {
-    use crate::shell_state::VarValue;
-
     let mut attrs = String::new();
     // Order matches bash's `declare -p` output: n, a/A, i, r, x, l/u.
     if var.nameref {
         attrs.push('n');
     }
-    if matches!(var.value, VarValue::Indexed(_)) {
+    if matches!(var.value.shape(), crate::shell_state::Shape::Indexed) {
         attrs.push('a');
     }
-    if matches!(var.value, VarValue::Associative(_)) {
+    if matches!(var.value.shape(), crate::shell_state::Shape::Associative) {
         attrs.push('A');
     }
     if var.integer {
@@ -1306,6 +1304,10 @@ pub(crate) fn format_declare_line(name: &str, var: &crate::shell_state::Variable
         s.push_str(&attrs);
         s
     };
+    // #600: a declared-but-unset variable prints WITHOUT `=…`.
+    if var.value.is_unset() {
+        return format!("declare {flag_str} {name}");
+    }
     let value_part = render_declare_value_part(var);
     format!("declare {flag_str} {name}{value_part}")
 }

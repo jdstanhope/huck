@@ -1426,7 +1426,10 @@ impl Shell {
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.vars.get(name).map(|v| v.value.scalar_view())
+        self.vars.get(name).and_then(|v| match &v.value {
+            VarValue::Unset(_) => None,
+            other => Some(other.scalar_view()),
+        })
     }
 
     /// True when this shell should use job control (own process groups +
@@ -1666,9 +1669,11 @@ impl Shell {
                 ResolvedName::Name(_) => {} // not a nameref → fall through to normal read
             }
         }
-        self.vars
-            .get(name)
-            .map(|v| v.value.scalar_view().to_string())
+        self.vars.get(name).and_then(|v| match &v.value {
+            // #600: declared but valueless reads exactly like absent.
+            VarValue::Unset(_) => None,
+            other => Some(other.scalar_view().to_string()),
+        })
     }
 
     /// Parse $FUNCNEST. Some(n) for a positive integer limit; None (unlimited)
@@ -1878,7 +1883,9 @@ impl Shell {
                 ResolvedName::Name(_) => {}
             }
         }
-        self.vars.contains_key(name)
+        // #600: `[[ -v y ]]` is FALSE for a declared-but-unset variable; an
+        // element form (`y[k]`) is answered by the map, which is empty.
+        self.vars.get(name).is_some_and(|v| !v.value.is_unset())
     }
 
     /// `-v` target for `test`/`[[ ]]`: a bare name / positional / special
@@ -3834,7 +3841,15 @@ impl Shell {
     /// Variable names for completion / `compgen -v`: the vars table plus the known
     /// dynamic/special names not always stored. Deduped (sorted).
     pub fn completion_var_names(&self) -> Vec<String> {
-        let mut set: std::collections::BTreeSet<String> = self.vars.keys().cloned().collect();
+        let mut set: std::collections::BTreeSet<String> = self
+            .vars
+            .iter()
+            // #600: bash's `set` and `compgen -v` list only variables that HAVE a
+            // value; a declared-but-unset name appears in `declare -p` and
+            // `export -p`, but not here.
+            .filter(|(_, v)| !v.value.is_unset())
+            .map(|(name, _)| name.clone())
+            .collect();
         for &n in DYNAMIC_SPECIAL_VARS {
             set.insert(n.to_string());
         }

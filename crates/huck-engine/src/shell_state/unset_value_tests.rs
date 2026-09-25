@@ -207,3 +207,57 @@ fn attr_flags_respects_unset_shape() {
     assert!(flags.contains('a'), "should have 'a'");
     assert!(flags.contains('i'), "should have 'i'");
 }
+
+/// An unset variable reads exactly like a name that does not exist — which
+/// is what keeps all 63 `lookup_var` callers correct without edits.
+#[test]
+fn unset_reads_as_absent() {
+    let mut sh = Shell::new();
+    sh.vars
+        .insert("v".to_string(), Variable::unset(Shape::Scalar));
+    assert_eq!(sh.lookup_var("v"), None);
+    assert_eq!(sh.get("v"), None);
+    assert!(!sh.is_set("v"), "[[ -v v ]] must be false while unset");
+
+    // …and like a normal variable once it has one.
+    sh.set("v", String::new());
+    assert_eq!(sh.lookup_var("v").as_deref(), Some(""));
+    assert!(sh.is_set("v"), "an empty assignment SETS the variable");
+}
+
+/// `declare -p` prints the declaration with no `=…` while unset, and with it
+/// once set. Attributes are real either way.
+#[test]
+fn declare_p_omits_the_value_while_unset() {
+    let mut y = Variable::unset(Shape::Indexed);
+    assert_eq!(
+        crate::builtins::format_declare_line("y", &y),
+        "declare -a y"
+    );
+    y.readonly = true;
+    assert_eq!(
+        crate::builtins::format_declare_line("y", &y),
+        "declare -ar y"
+    );
+
+    let mut n = Variable::unset(Shape::Scalar);
+    n.integer = true;
+    assert_eq!(
+        crate::builtins::format_declare_line("n", &n),
+        "declare -i n"
+    );
+
+    let mut v = Variable::unset(Shape::Scalar);
+    v.exported = true;
+    assert_eq!(
+        crate::builtins::format_declare_line("v", &v),
+        "declare -x v"
+    );
+
+    // Plain, no attributes: bash prints `declare -- v`.
+    let v = Variable::unset(Shape::Scalar);
+    assert_eq!(
+        crate::builtins::format_declare_line("v", &v),
+        "declare -- v"
+    );
+}
