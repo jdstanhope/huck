@@ -1,0 +1,103 @@
+---
+title: "Declared, but not set"
+date: 2026-09-25
+summary: "In bash a variable can exist without having a value. huck had nowhere to put that, so every valueless declaration quietly invented an empty string or an empty array — which changed what `declare -p` printed, what `set -u` complained about, and what a child process inherited."
+tags: ["variables", "declare", "local", "export", "bugfix"]
+version: "v365"
+draft: false
+---
+
+`declare -a queue` does not create an empty array. It creates a variable that
+is an array *and has no value yet* — and bash keeps those two facts apart.
+huck's variable had only a value, with no way to say "none", so a declaration
+with no value on the right-hand side invented one:
+
+```bash
+# before
+$ huck -c 'declare -a y; declare -p y; [[ -v y ]] && echo set || echo unset'
+declare -a y=()
+set
+```
+
+```bash
+# after
+$ huck -c 'declare -a y; declare -p y; [[ -v y ]] && echo set || echo unset'
+declare -a y
+unset
+```
+
+That invented value leaked into everything downstream. `declare -i n` printed
+`declare -i n=""`. A bare `local v` created nothing at all, so `declare -p v`
+inside the function reported the name as not found, where bash prints
+`declare -- v`. And `set -u` — the option whose entire job is to catch you
+reading a variable you never set — said nothing:
+
+```bash
+# before
+$ huck -c 'set -u; declare -i n; echo "$n"'
+
+$ huck -c 'declare -x E; env | grep -c "^E="'
+1
+```
+
+```bash
+# after
+$ huck -c 'set -u; declare -i n; echo "$n"'
+huck: line 1: n: unbound variable
+$ huck -c 'declare -x E; env | grep -c "^E="'
+0
+```
+
+That last pair is the one with teeth: `declare -x E` marks `E` for export
+without giving it a value, and huck was putting `E=` into the environment of
+every command it ran. A child could not tell the difference between "exported
+and empty" and "not exported at all".
+
+## The part that took the measuring
+
+Exporting turned out to be two different questions, and huck was answering
+both with one lookup. `export -p` lists what you can *see*. A child process
+gets something subtly different: for each name, the innermost binding that is
+exported **and has a value**. Those come apart the moment a function shadows
+an exported variable with an unexported local:
+
+```bash
+# before
+$ huck -c 'declare -x V=1; f(){ local +x V=2; env | grep "^V="; }; f'
+
+```
+
+```bash
+# after
+$ huck -c 'declare -x V=1; f(){ local +x V=2; env | grep "^V="; }; f'
+V=1
+```
+
+bash walks past the local — it is not exported — and hands the child the
+outer `V=1`, which is still perfectly exported. huck had been building the
+environment from the one binding it could see, so the child got nothing. The
+same walk explains a case that looks unrelated: a bare `local V` over an
+exported outer inherits the export attribute but has no value, so it is
+walked past too, and the child again sees the outer value.
+
+Getting that right needed the null state to exist first, which is why it
+landed in the same change rather than after it.
+
+## What it cost
+
+`declare`, `local`, `readonly` and `export` all create the new state; every
+assignment materialises it; `unset` still removes the variable outright. Six
+unit tests had been asserting the old behaviour — each was re-run against real
+bash before being touched, on the rule that a test agreeing with bash means
+*the code* is wrong. One of those measurements produced the surprise of the
+week: `readonly -a y` with no value does not create a readonly array in bash.
+It drops the `-a` entirely and gives you `declare -r y`.
+
+A 98-row harness now runs every one of these fragments through both shells
+under two different drivers. Two smaller gaps fell out along the way and are
+fixed here too: `local -x` was rejected as an invalid option, and `export -A`
+likewise.
+
+Still open: `declare -A x; declare -a x` silently converts where bash refuses
+([#347](https://github.com/jdstanhope/huck/issues/347)) — that one predates
+this work and belongs to the array-conversion pass.
