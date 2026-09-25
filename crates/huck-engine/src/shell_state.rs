@@ -30,6 +30,17 @@ pub struct Frame {
     pub kind: FrameKind,
 }
 
+/// The kind of value a variable holds — and, when it holds none, the kind it
+/// WILL hold. bash keeps the array/assoc flag in the variable's attributes,
+/// so a valueless `declare -a y` is still an indexed array for conversion
+/// purposes (`declare -a y; declare -A y` still refuses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Scalar,
+    Indexed,
+    Associative,
+}
+
 /// Storage for a shell variable. Scalar covers ordinary strings;
 /// Indexed is a sparse map of usize subscripts to element values
 /// (sorted by key — BTreeMap so `${a[@]}` and `${!a[@]}` walk in
@@ -39,6 +50,11 @@ pub enum VarValue {
     Scalar(String),
     Indexed(BTreeMap<usize, String>),
     Associative(crate::assoc_map::AssocMap),
+    /// Declared, with NO value (bash's `SHELL_VAR.value == NULL`): created by
+    /// `declare -a/-A/-i/…`, bare `declare`/`local`, and by `readonly`/`export`
+    /// naming a variable that does not exist yet. Any assignment materialises
+    /// it; `unset` removes the entry outright. See #600.
+    Unset(Shape),
 }
 
 impl VarValue {
@@ -54,7 +70,23 @@ impl VarValue {
             VarValue::Scalar(s) => s.as_str(),
             VarValue::Indexed(m) => m.get(&0).map(String::as_str).unwrap_or(""),
             VarValue::Associative(map) => map.get("0").unwrap_or(""),
+            VarValue::Unset(_) => "",
         }
+    }
+
+    /// The shape this value has, or (when unset) will have on first write.
+    pub fn shape(&self) -> Shape {
+        match self {
+            VarValue::Scalar(_) => Shape::Scalar,
+            VarValue::Indexed(_) => Shape::Indexed,
+            VarValue::Associative(_) => Shape::Associative,
+            VarValue::Unset(s) => *s,
+        }
+    }
+
+    /// True when the variable is declared but holds no value.
+    pub fn is_unset(&self) -> bool {
+        matches!(self, VarValue::Unset(_))
     }
 }
 
@@ -84,6 +116,18 @@ impl Variable {
     pub fn scalar(value: String) -> Self {
         Variable {
             value: VarValue::Scalar(value),
+            exported: false,
+            readonly: false,
+            integer: false,
+            case_fold: None,
+            nameref: false,
+        }
+    }
+
+    /// A declared variable with no value, of the given shape.
+    pub fn unset(shape: Shape) -> Self {
+        Variable {
+            value: VarValue::Unset(shape),
             exported: false,
             readonly: false,
             integer: false,
@@ -1382,7 +1426,10 @@ impl Shell {
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.vars.get(name).map(|v| v.value.scalar_view())
+        self.vars.get(name).and_then(|v| match &v.value {
+            VarValue::Unset(_) => None,
+            other => Some(other.scalar_view()),
+        })
     }
 
     /// True when this shell should use job control (own process groups +
@@ -1622,9 +1669,11 @@ impl Shell {
                 ResolvedName::Name(_) => {} // not a nameref → fall through to normal read
             }
         }
-        self.vars
-            .get(name)
-            .map(|v| v.value.scalar_view().to_string())
+        self.vars.get(name).and_then(|v| match &v.value {
+            // #600: declared but valueless reads exactly like absent.
+            VarValue::Unset(_) => None,
+            other => Some(other.scalar_view().to_string()),
+        })
     }
 
     /// Parse $FUNCNEST. Some(n) for a positive integer limit; None (unlimited)
@@ -1834,7 +1883,18 @@ impl Shell {
                 ResolvedName::Name(_) => {}
             }
         }
-        self.vars.contains_key(name)
+        // #600: `[[ -v y ]]` is FALSE for a declared-but-unset variable.
+        // For a MATERIALISED array, bash's bare-name `-v` is NOT "does the
+        // array have any element" — it is specifically element/key "0"
+        // (measured on bash 5.2.21: `declare -a y; y[2]=x; [[ -v y ]]` is
+        // false; `y[0]=x` makes it true). Mirrors `element_or_var_is_set`'s
+        // explicit-subscript arm, just with the subscript fixed at 0/"0".
+        match self.vars.get(name).map(|v| &v.value) {
+            None | Some(VarValue::Unset(_)) => false,
+            Some(VarValue::Scalar(_)) => true,
+            Some(VarValue::Indexed(_)) => self.lookup_indexed_element(name, 0).is_some(),
+            Some(VarValue::Associative(_)) => self.lookup_associative_element(name, "0").is_some(),
+        }
     }
 
     /// `-v` target for `test`/`[[ ]]`: a bare name / positional / special
@@ -2012,19 +2072,11 @@ impl Shell {
     }
 
     /// Marks an existing variable as exported. If it doesn't exist, creates
-    /// it with an empty value, already exported.
+    /// it as a declared-but-unset scalar, already exported (#600: `export E`
+    /// / `declare -x E` with no value records the attribute without
+    /// materialising a value — `declare -p E` prints `declare -x E`).
     pub fn export(&mut self, name: &str) {
-        self.vars
-            .entry(name.to_string())
-            .and_modify(|v| v.exported = true)
-            .or_insert_with(|| Variable {
-                value: VarValue::Scalar(String::new()),
-                exported: true,
-                readonly: false,
-                integer: false,
-                case_fold: None,
-                nameref: false,
-            });
+        self.mutate_or_create(name, |v| v.exported = true);
     }
 
     /// Sets a variable's value AND marks it exported. Preserves the
@@ -2294,7 +2346,12 @@ impl Shell {
     pub fn array_var_names(&self) -> Vec<String> {
         self.vars
             .iter()
-            .filter(|(_, v)| matches!(v.value, VarValue::Indexed(_) | VarValue::Associative(_)))
+            // #600: bash's `compgen -A arrayvar` does not enumerate unset array
+            // variables (which have the shape but no value).
+            .filter(|(_, v)| {
+                matches!(v.value, VarValue::Indexed(_) | VarValue::Associative(_))
+                    && !v.value.is_unset()
+            })
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -2387,29 +2444,49 @@ impl Shell {
         value: String,
     ) -> Result<(), AssignErr> {
         match self.vars.get_mut(name) {
-            Some(v) => match &mut v.value {
-                VarValue::Indexed(m) => {
-                    m.insert(idx, value);
+            Some(v) => {
+                // #600: materialise before the shape match below sees it.
+                if matches!(v.value, VarValue::Unset(Shape::Indexed | Shape::Scalar)) {
+                    v.value = VarValue::Indexed(BTreeMap::new());
                 }
-                VarValue::Scalar(s) => {
-                    let mut m = BTreeMap::new();
-                    if idx == 0 {
-                        m.insert(0, value);
-                    } else {
-                        m.insert(0, std::mem::take(s));
+                match &mut v.value {
+                    VarValue::Indexed(m) => {
                         m.insert(idx, value);
                     }
-                    v.value = VarValue::Indexed(m);
+                    VarValue::Scalar(s) => {
+                        let mut m = BTreeMap::new();
+                        if idx == 0 {
+                            m.insert(0, value);
+                        } else {
+                            m.insert(0, std::mem::take(s));
+                            m.insert(idx, value);
+                        }
+                        v.value = VarValue::Indexed(m);
+                    }
+                    VarValue::Associative(_) => {
+                        crate::sh_error!(
+                            self,
+                            None,
+                            "{name}: set_indexed_element on associative variable"
+                        );
+                        return Err(AssignErr::TypeMismatch);
+                    }
+                    VarValue::Unset(Shape::Scalar | Shape::Indexed) => {
+                        // Should have been materialized above; if not, insert at idx.
+                        let mut m = BTreeMap::new();
+                        m.insert(idx, value);
+                        v.value = VarValue::Indexed(m);
+                    }
+                    VarValue::Unset(Shape::Associative) => {
+                        crate::sh_error!(
+                            self,
+                            None,
+                            "{name}: set_indexed_element on associative variable"
+                        );
+                        return Err(AssignErr::TypeMismatch);
+                    }
                 }
-                VarValue::Associative(_) => {
-                    crate::sh_error!(
-                        self,
-                        None,
-                        "{name}: set_indexed_element on associative variable"
-                    );
-                    return Err(AssignErr::TypeMismatch);
-                }
-            },
+            }
             None => {
                 let mut m = BTreeMap::new();
                 m.insert(idx, value);
@@ -2461,6 +2538,12 @@ impl Shell {
         name: &str,
         entries: BTreeMap<usize, String>,
     ) -> Result<(), AssignErr> {
+        // #600: materialise unset variables before the shape match.
+        if let Some(v) = self.vars.get_mut(name)
+            && matches!(v.value, VarValue::Unset(Shape::Indexed | Shape::Scalar))
+        {
+            v.value = VarValue::Indexed(BTreeMap::new());
+        }
         if matches!(
             self.vars.get(name).map(|v| &v.value),
             Some(VarValue::Scalar(_))
@@ -2510,19 +2593,26 @@ impl Shell {
         value: String,
     ) -> Result<(), AssignErr> {
         match self.vars.get_mut(name) {
-            Some(v) => match &mut v.value {
-                VarValue::Associative(map) => {
-                    map.insert(key, value);
+            Some(v) => {
+                // #600: materialise only compatible shapes (Scalar and Associative);
+                // let Unset(Indexed) fall through to the error arm like a materialised Indexed would.
+                if matches!(v.value, VarValue::Unset(Shape::Scalar | Shape::Associative)) {
+                    v.value = VarValue::Associative(crate::assoc_map::AssocMap::new());
                 }
-                _ => {
-                    crate::sh_error!(
-                        self,
-                        None,
-                        "{name}: set_associative_element on non-associative variable"
-                    );
-                    return Err(AssignErr::TypeMismatch);
+                match &mut v.value {
+                    VarValue::Associative(map) => {
+                        map.insert(key, value);
+                    }
+                    _ => {
+                        crate::sh_error!(
+                            self,
+                            None,
+                            "{name}: set_associative_element on non-associative variable"
+                        );
+                        return Err(AssignErr::TypeMismatch);
+                    }
                 }
-            },
+            }
             None => {
                 crate::sh_error!(
                     self,
@@ -2797,28 +2887,24 @@ impl Shell {
     }
 
     /// Mutates an attribute on `name` by applying `f` to its `Variable`.
-    /// If `name` is unset, creates a default empty scalar `Variable` first,
-    /// applies `f`, then inserts it — matching the bash behavior of
-    /// `readonly`/`declare -i`/etc. on unset names.
+    /// If `name` is unset, creates a declared-but-unset scalar `Variable`
+    /// first (#225/#600: the attribute exists without a value — bash stores
+    /// e.g. `readonly Q` with `value == NULL`, so `[ -v Q ]` stays false),
+    /// applies `f`, then inserts it.
     fn mutate_or_create<F: FnOnce(&mut Variable)>(&mut self, name: &str, f: F) {
         if let Some(v) = self.vars.get_mut(name) {
             f(v);
         } else {
-            let mut v = Variable::scalar(String::new());
+            let mut v = Variable::unset(Shape::Scalar);
             f(&mut v);
             self.vars.insert(name.to_string(), v);
         }
     }
 
-    /// Marks `name` readonly. If `name` is unset, creates it with an empty
-    /// value.
-    ///
-    /// This DIVERGES from bash for an unset name: bash records the attribute
-    /// without creating a value, so `readonly Q` leaves `[ -v Q ]` false while
-    /// `declare -p Q` prints `declare -r Q`. huck has no attribute-without-
-    /// value state, so `Q` becomes set-to-empty. Pre-existing; verified against
-    /// bash 5.2.21 in v319. (An earlier version of this comment claimed the
-    /// empty-value creation MATCHED bash — it does not.)
+    /// Marks `name` readonly. If `name` is unset, creates it as a declared-
+    /// but-unset scalar (#225): `readonly Q` records the attribute without a
+    /// value, so `[ -v Q ]` is false while `declare -p Q` prints `declare -r
+    /// Q`.
     pub fn mark_readonly(&mut self, name: &str) {
         self.mutate_or_create(name, |v| v.readonly = true);
     }
@@ -2852,8 +2938,8 @@ impl Shell {
         self.vars.get(name).map(|v| v.integer).unwrap_or(false)
     }
 
-    /// Marks `name` integer. If `name` is unset, creates it with an
-    /// empty value (mirrors `mark_readonly`). Used by `declare -i`.
+    /// Marks `name` integer. If `name` is unset, creates it as a declared-
+    /// but-unset scalar (mirrors `mark_readonly`). Used by `declare -i`.
     pub fn mark_integer(&mut self, name: &str) {
         self.mutate_or_create(name, |v| v.integer = true);
     }
@@ -2872,8 +2958,9 @@ impl Shell {
     }
 
     /// Sets (or clears, with `None`) the case-fold attribute on `name`.
-    /// Creates an empty scalar if the variable is unset, mirroring
-    /// `mark_integer` (so `declare -l NAME` with no value declares it).
+    /// Creates a declared-but-unset scalar if the variable is unset,
+    /// mirroring `mark_integer` (so `declare -l NAME` with no value
+    /// declares it).
     pub fn set_case_fold(&mut self, name: &str, fold: Option<CaseFold>) {
         self.mutate_or_create(name, |v| v.case_fold = fold);
     }
@@ -3127,7 +3214,7 @@ impl Shell {
         match self.vars.get(&resolved) {
             Some(v) => match &v.value {
                 VarValue::Indexed(m) => Some(m),
-                VarValue::Scalar(_) | VarValue::Associative(_) => None,
+                VarValue::Scalar(_) | VarValue::Associative(_) | VarValue::Unset(_) => None,
             },
             None => None,
         }
@@ -3143,6 +3230,7 @@ impl Shell {
                 VarValue::Scalar(s) if idx == 0 => Some(s.clone()),
                 VarValue::Scalar(_) => None,
                 VarValue::Associative(_) => None,
+                VarValue::Unset(_) => None,
             },
             None => None,
         }
@@ -3427,6 +3515,29 @@ impl Shell {
         }
     }
 
+    /// True when `name` is bound to associative-array SHAPE, whether
+    /// materialised or merely declared-but-unset (#600). Unlike
+    /// `get_associative` (which answers `None` for an unset associative,
+    /// correct for a VALUE lookup), this backs write-path dispatch that must
+    /// route an element write (`x[k]=v`) to the associative mutator even
+    /// before any element has materialised the map — `set_indexed_element`
+    /// would otherwise be tried first and refuse with a shape-mismatch
+    /// error. Resolves through namerefs like `get_associative`.
+    pub fn is_associative_shape(&self, name: &str) -> bool {
+        let resolved = if self.is_nameref(name) {
+            match self.resolve_nameref(name) {
+                ResolvedName::Name(n) => n,
+                _ => return false,
+            }
+        } else {
+            name.to_string()
+        };
+        matches!(
+            self.vars.get(&resolved).map(|v| v.value.shape()),
+            Some(Shape::Associative)
+        )
+    }
+
     /// Returns the value at string key `key` for the associative array `name`.
     /// `None` if the variable is unset, not associative, or has no such key.
     pub fn lookup_associative_element(&self, name: &str, key: &str) -> Option<String> {
@@ -3509,11 +3620,17 @@ impl Shell {
         )
     }
 
-    /// Creates an empty associative array under `name`. Enforces bash rules:
-    /// - Unset → create empty associative.
-    /// - Already associative → no-op.
-    /// - Indexed → error: `DeclareErr::IndexedExists`.
-    /// - Scalar → error: `DeclareErr::ScalarExists`.
+    /// Ensures `name` has the associative-array SHAPE. Enforces bash rules:
+    /// - Unset (no prior name) → declared-but-unset associative, no value.
+    /// - Already associative (materialised or unset) → no-op — bash does not
+    ///   materialise a value just from re-declaring the same shape (measured:
+    ///   `declare -A x; declare -A x; declare -p x` -> `declare -A x`,
+    ///   `[[ -v x ]]` false).
+    /// - Unset scalar → becomes an unset associative, still no value
+    ///   (measured: `declare v; declare -A v; declare -p v` -> `declare -A
+    ///   v`, `[[ -v v ]]` false).
+    /// - Indexed (materialised or unset) → error: `DeclareErr::IndexedExists`.
+    /// - Scalar (materialised) → error: `DeclareErr::ScalarExists`.
     ///
     /// Does NOT print any diagnostic; callers should format via
     /// [`declare_err_message`] so the correct command name (declare,
@@ -3521,23 +3638,56 @@ impl Shell {
     pub fn declare_associative(&mut self, name: &str) -> Result<(), DeclareErr> {
         match self.vars.get(name).map(|v| &v.value) {
             None => {
-                self.vars.insert(
-                    name.to_string(),
-                    Variable {
-                        value: VarValue::Associative(crate::assoc_map::AssocMap::new()),
-                        exported: false,
-                        readonly: false,
-                        integer: false,
-                        case_fold: None,
-                        nameref: false,
-                    },
-                );
+                self.vars
+                    .insert(name.to_string(), Variable::unset(Shape::Associative));
                 Ok(())
             }
             Some(VarValue::Associative(_)) => Ok(()),
             Some(VarValue::Indexed(_)) => Err(DeclareErr::IndexedExists),
             Some(VarValue::Scalar(_)) => Err(DeclareErr::ScalarExists),
+            Some(VarValue::Unset(Shape::Scalar)) => {
+                // #600: unset scalar can become associative — stays unset.
+                let var = self.vars.get_mut(name).unwrap();
+                var.value = VarValue::Unset(Shape::Associative);
+                Ok(())
+            }
+            Some(VarValue::Unset(Shape::Associative)) => Ok(()),
+            Some(VarValue::Unset(Shape::Indexed)) => {
+                // #600: unset indexed cannot become associative (same rule as materialised indexed).
+                Err(DeclareErr::IndexedExists)
+            }
         }
+    }
+
+    /// Records the indexed-array SHAPE on `name` without materialising a
+    /// value (#600): the `declare -a NAME` path when there is no existing
+    /// scalar to promote to element 0 (the caller handles that promotion
+    /// separately — a materialised scalar always has a value to carry
+    /// forward, unlike this no-value path). An absent name becomes a fresh
+    /// declared-but-unset indexed array; any other existing (necessarily
+    /// unset, since a materialised scalar is routed elsewhere and a
+    /// materialised associative/indexed value means `get_indexed`/`get`
+    /// already returned `Some`) variable just has its shape flipped to
+    /// `Indexed`, preserving its other attributes and unset-ness — mirrors
+    /// `declare_associative`'s `Unset(Scalar)` arm.
+    pub fn declare_indexed_unset(&mut self, name: &str) {
+        match self.vars.get_mut(name) {
+            Some(v) => v.value = VarValue::Unset(Shape::Indexed),
+            None => {
+                self.vars
+                    .insert(name.to_string(), Variable::unset(Shape::Indexed));
+            }
+        }
+    }
+
+    /// Declares `name` fresh as a declared-but-unset SCALAR, unconditionally
+    /// replacing any existing entry (#691: `local NAME`, bare — a fresh
+    /// local starts from nothing, not from the binding it shadows, so this
+    /// is an insert, not a mutate-in-place like `declare_indexed_unset`).
+    /// Callers apply any inherited attribute (export, per #691) afterwards.
+    pub fn declare_unset_scalar(&mut self, name: &str) {
+        self.vars
+            .insert(name.to_string(), Variable::unset(Shape::Scalar));
     }
 
     pub fn last_status(&self) -> i32 {
@@ -3709,27 +3859,90 @@ impl Shell {
         self.unwind.exit.take()
     }
 
-    /// Iterates only the exported variables, suitable for passing to a child
-    /// process's `Command::envs`.
-    pub fn exported_env(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.vars
-            .iter()
-            .filter(|(_, v)| v.exported)
-            // bash never inherits array variables into a child's environment;
-            // emit only true scalars (skip Indexed/Associative). See #28.
-            .filter_map(|(k, v)| match &v.value {
-                VarValue::Scalar(s) => Some((k.as_str(), s.as_str())),
-                VarValue::Indexed(_) | VarValue::Associative(_) => None,
-            })
-            // …plus inline-prefix scalar assignments over an array target: bash
-            // still exports the assigned scalar even though the variable is an
-            // array. Chained LAST so a same-name duplicate wins (std
-            // `Command::envs` keeps the last value). See #28.
-            .chain(
-                self.inline_scalar_export
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str())),
-            )
+    /// The environment a child process inherits. bash answers TWO different
+    /// questions about exports, and this is the second one (#692): for each
+    /// NAME, the innermost binding that is exported AND has a value. An
+    /// unexported local does not remove the enclosing binding from the export
+    /// set, so `declare -x V=1; f(){ local +x V=2; env; }` shows `V=1`; nor
+    /// does a valueless one, so a bare `local V` (which inherits export, #691)
+    /// also lets the outer value through. The FIRST question — what
+    /// `export -p` lists — is the visible binding only, and lives in the
+    /// export builtin, not here.
+    ///
+    /// `local_scopes` makes the walk cheap: each frame maps a name to the
+    /// binding it SHADOWED, innermost frame last, so iterating the frames in
+    /// reverse yields successively outer bindings.
+    // Cost note: this rebuilds the whole export table by walking `self.vars`
+    // plus every `local_scopes` frame on EVERY child spawn; fine at current
+    // shell sizes, but it is O(names × scopes) if either grows large.
+    pub fn exported_env(&self) -> Vec<(&str, &str)> {
+        /// The outcome of inspecting one binding for a NAME during the
+        /// outward walk. A binding that is unexported or valueless is
+        /// invisible to `env` — the walk keeps going outward through it. An
+        /// exported binding is where the walk must stop: a scalar
+        /// contributes its value, but an exported ARRAY contributes
+        /// nothing and still stops the walk (bash never inherits arrays,
+        /// #28, but the array is what a child *would* see, so a further-out
+        /// scalar must not leak past it — #777).
+        enum Outward<'a> {
+            Continue,
+            Stop(Option<&'a str>),
+        }
+
+        fn outward(v: &Variable) -> Outward<'_> {
+            if !v.exported {
+                return Outward::Continue;
+            }
+            match &v.value {
+                VarValue::Scalar(s) => Outward::Stop(Some(s.as_str())),
+                VarValue::Indexed(_) | VarValue::Associative(_) => Outward::Stop(None),
+                VarValue::Unset(_) => Outward::Continue,
+            }
+        }
+
+        let mut env: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+        let mut stopped: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // Innermost first: the visible bindings…
+        for (k, v) in &self.vars {
+            match outward(v) {
+                Outward::Stop(Some(s)) => {
+                    env.entry(k.as_str()).or_insert(s);
+                    stopped.insert(k.as_str());
+                }
+                Outward::Stop(None) => {
+                    stopped.insert(k.as_str());
+                }
+                Outward::Continue => {}
+            }
+        }
+        // …then outward through the shadowed snapshots. A name already
+        // STOPPED (resolved to a value, or blocked by an exported array)
+        // never looks further out; `stopped` tracks that per name across
+        // frames, since `env` alone can't distinguish "resolved" from
+        // "blocked with nothing".
+        for frame in self.local_scopes.iter().rev() {
+            for (k, snapshot) in frame {
+                if stopped.contains(k.as_str()) {
+                    continue;
+                }
+                let Some(v) = snapshot else { continue };
+                match outward(v) {
+                    Outward::Stop(Some(s)) => {
+                        env.entry(k.as_str()).or_insert(s);
+                        stopped.insert(k.as_str());
+                    }
+                    Outward::Stop(None) => {
+                        stopped.insert(k.as_str());
+                    }
+                    Outward::Continue => {}
+                }
+            }
+        }
+        // An inline prefix assignment over an array target wins outright (#28).
+        for (k, v) in &self.inline_scalar_export {
+            env.insert(k.as_str(), v.as_str());
+        }
+        env.into_iter().collect()
     }
 
     /// Iterates the names of all variables (exported or not).
@@ -3740,7 +3953,15 @@ impl Shell {
     /// Variable names for completion / `compgen -v`: the vars table plus the known
     /// dynamic/special names not always stored. Deduped (sorted).
     pub fn completion_var_names(&self) -> Vec<String> {
-        let mut set: std::collections::BTreeSet<String> = self.vars.keys().cloned().collect();
+        let mut set: std::collections::BTreeSet<String> = self
+            .vars
+            .iter()
+            // #600: bash's `set` and `compgen -v` list only variables that HAVE a
+            // value; a declared-but-unset name appears in `declare -p` and
+            // `export -p`, but not here.
+            .filter(|(_, v)| !v.value.is_unset())
+            .map(|(name, _)| name.clone())
+            .collect();
         for &n in DYNAMIC_SPECIAL_VARS {
             set.insert(n.to_string());
         }
@@ -3879,6 +4100,20 @@ fn install_scalar_value(existing: &mut Variable, value: String) -> bool {
             false
         }
         VarValue::Associative(_) => true,
+        // #600: the first write materialises the declared shape. An unset
+        // INDEXED takes the element-0 rule, exactly as a set one does; an
+        // unset ASSOCIATIVE rejects a scalar install like its set twin.
+        VarValue::Unset(Shape::Scalar) => {
+            existing.value = VarValue::Scalar(value);
+            false
+        }
+        VarValue::Unset(Shape::Indexed) => {
+            let mut m = BTreeMap::new();
+            m.insert(0, value);
+            existing.value = VarValue::Indexed(m);
+            false
+        }
+        VarValue::Unset(Shape::Associative) => true,
     }
 }
 
@@ -4070,3 +4305,6 @@ mod ifs_helper_tests;
 
 #[cfg(test)]
 mod shopt_tests;
+
+#[cfg(test)]
+mod unset_value_tests;

@@ -26,7 +26,7 @@ fn cd_sets_pwd_to_target_directory() {
     // Logical PWD (v162): `cd /tmp` stores the logical path, not the
     // symlink-resolved one (matters on macOS where /tmp -> /private/tmp).
     assert_eq!(shell.get("PWD"), Some("/tmp"));
-    assert!(shell.exported_env().any(|(k, _)| k == "PWD"));
+    assert!(shell.exported_env().iter().any(|&(k, _)| k == "PWD"));
     assert!(out.is_empty());
 }
 
@@ -46,7 +46,7 @@ fn cd_sets_oldpwd_to_previous_pwd() {
     let _ = std::env::set_current_dir(&prev);
     assert!(matches!(outcome, ExecOutcome::Continue(0)));
     assert_eq!(shell.get("OLDPWD"), Some("/var"));
-    assert!(shell.exported_env().any(|(k, _)| k == "OLDPWD"));
+    assert!(shell.exported_env().iter().any(|&(k, _)| k == "OLDPWD"));
 }
 
 #[test]

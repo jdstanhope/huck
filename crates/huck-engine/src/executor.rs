@@ -8245,7 +8245,11 @@ pub(crate) fn apply_one_assignment(
     // The minor double-warning for cyclic namerefs (get_associative resolves
     // the chain once, then the funnel resolves again) is stderr-only and benign.
     let target_name = a.target.name();
-    if shell.get_associative(target_name).is_some() {
+    // #600: an unset associative (`declare -A x` with no element written
+    // yet) must still dispatch here — `get_associative` only matches a
+    // materialised map, which would otherwise fall through to the indexed
+    // path and refuse with a shape-mismatch error on the first `x[k]=v`.
+    if shell.is_associative_shape(target_name) {
         match (&a.target, trailing_array_literal) {
             (AssignTarget::Bare(name), Some(elements)) => {
                 if a.append {
