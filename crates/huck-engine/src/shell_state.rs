@@ -30,6 +30,17 @@ pub struct Frame {
     pub kind: FrameKind,
 }
 
+/// The kind of value a variable holds — and, when it holds none, the kind it
+/// WILL hold. bash keeps the array/assoc flag in the variable's attributes,
+/// so a valueless `declare -a y` is still an indexed array for conversion
+/// purposes (`declare -a y; declare -A y` still refuses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Scalar,
+    Indexed,
+    Associative,
+}
+
 /// Storage for a shell variable. Scalar covers ordinary strings;
 /// Indexed is a sparse map of usize subscripts to element values
 /// (sorted by key — BTreeMap so `${a[@]}` and `${!a[@]}` walk in
@@ -39,6 +50,11 @@ pub enum VarValue {
     Scalar(String),
     Indexed(BTreeMap<usize, String>),
     Associative(crate::assoc_map::AssocMap),
+    /// Declared, with NO value (bash's `SHELL_VAR.value == NULL`): created by
+    /// `declare -a/-A/-i/…`, bare `declare`/`local`, and by `readonly`/`export`
+    /// naming a variable that does not exist yet. Any assignment materialises
+    /// it; `unset` removes the entry outright. See #600.
+    Unset(Shape),
 }
 
 impl VarValue {
@@ -54,7 +70,23 @@ impl VarValue {
             VarValue::Scalar(s) => s.as_str(),
             VarValue::Indexed(m) => m.get(&0).map(String::as_str).unwrap_or(""),
             VarValue::Associative(map) => map.get("0").unwrap_or(""),
+            VarValue::Unset(_) => "",
         }
+    }
+
+    /// The shape this value has, or (when unset) will have on first write.
+    pub fn shape(&self) -> Shape {
+        match self {
+            VarValue::Scalar(_) => Shape::Scalar,
+            VarValue::Indexed(_) => Shape::Indexed,
+            VarValue::Associative(_) => Shape::Associative,
+            VarValue::Unset(s) => *s,
+        }
+    }
+
+    /// True when the variable is declared but holds no value.
+    pub fn is_unset(&self) -> bool {
+        matches!(self, VarValue::Unset(_))
     }
 }
 
@@ -84,6 +116,18 @@ impl Variable {
     pub fn scalar(value: String) -> Self {
         Variable {
             value: VarValue::Scalar(value),
+            exported: false,
+            readonly: false,
+            integer: false,
+            case_fold: None,
+            nameref: false,
+        }
+    }
+
+    /// A declared variable with no value, of the given shape.
+    pub fn unset(shape: Shape) -> Self {
+        Variable {
+            value: VarValue::Unset(shape),
             exported: false,
             readonly: false,
             integer: false,
@@ -2387,29 +2431,49 @@ impl Shell {
         value: String,
     ) -> Result<(), AssignErr> {
         match self.vars.get_mut(name) {
-            Some(v) => match &mut v.value {
-                VarValue::Indexed(m) => {
-                    m.insert(idx, value);
+            Some(v) => {
+                // #600: materialise before the shape match below sees it.
+                if matches!(v.value, VarValue::Unset(Shape::Indexed | Shape::Scalar)) {
+                    v.value = VarValue::Indexed(BTreeMap::new());
                 }
-                VarValue::Scalar(s) => {
-                    let mut m = BTreeMap::new();
-                    if idx == 0 {
-                        m.insert(0, value);
-                    } else {
-                        m.insert(0, std::mem::take(s));
+                match &mut v.value {
+                    VarValue::Indexed(m) => {
                         m.insert(idx, value);
                     }
-                    v.value = VarValue::Indexed(m);
+                    VarValue::Scalar(s) => {
+                        let mut m = BTreeMap::new();
+                        if idx == 0 {
+                            m.insert(0, value);
+                        } else {
+                            m.insert(0, std::mem::take(s));
+                            m.insert(idx, value);
+                        }
+                        v.value = VarValue::Indexed(m);
+                    }
+                    VarValue::Associative(_) => {
+                        crate::sh_error!(
+                            self,
+                            None,
+                            "{name}: set_indexed_element on associative variable"
+                        );
+                        return Err(AssignErr::TypeMismatch);
+                    }
+                    VarValue::Unset(Shape::Scalar | Shape::Indexed) => {
+                        // Should have been materialized above; if not, insert at idx.
+                        let mut m = BTreeMap::new();
+                        m.insert(idx, value);
+                        v.value = VarValue::Indexed(m);
+                    }
+                    VarValue::Unset(Shape::Associative) => {
+                        crate::sh_error!(
+                            self,
+                            None,
+                            "{name}: set_indexed_element on associative variable"
+                        );
+                        return Err(AssignErr::TypeMismatch);
+                    }
                 }
-                VarValue::Associative(_) => {
-                    crate::sh_error!(
-                        self,
-                        None,
-                        "{name}: set_indexed_element on associative variable"
-                    );
-                    return Err(AssignErr::TypeMismatch);
-                }
-            },
+            }
             None => {
                 let mut m = BTreeMap::new();
                 m.insert(idx, value);
@@ -2461,6 +2525,12 @@ impl Shell {
         name: &str,
         entries: BTreeMap<usize, String>,
     ) -> Result<(), AssignErr> {
+        // #600: materialise unset variables before the shape match.
+        if let Some(v) = self.vars.get_mut(name) {
+            if matches!(v.value, VarValue::Unset(Shape::Indexed | Shape::Scalar)) {
+                v.value = VarValue::Indexed(BTreeMap::new());
+            }
+        }
         if matches!(
             self.vars.get(name).map(|v| &v.value),
             Some(VarValue::Scalar(_))
@@ -2510,19 +2580,24 @@ impl Shell {
         value: String,
     ) -> Result<(), AssignErr> {
         match self.vars.get_mut(name) {
-            Some(v) => match &mut v.value {
-                VarValue::Associative(map) => {
-                    map.insert(key, value);
+            Some(v) => {
+                if matches!(v.value, VarValue::Unset(_)) {
+                    v.value = VarValue::Associative(crate::assoc_map::AssocMap::new());
                 }
-                _ => {
-                    crate::sh_error!(
-                        self,
-                        None,
-                        "{name}: set_associative_element on non-associative variable"
-                    );
-                    return Err(AssignErr::TypeMismatch);
+                match &mut v.value {
+                    VarValue::Associative(map) => {
+                        map.insert(key, value);
+                    }
+                    _ => {
+                        crate::sh_error!(
+                            self,
+                            None,
+                            "{name}: set_associative_element on non-associative variable"
+                        );
+                        return Err(AssignErr::TypeMismatch);
+                    }
                 }
-            },
+            }
             None => {
                 crate::sh_error!(
                     self,
@@ -3127,7 +3202,7 @@ impl Shell {
         match self.vars.get(&resolved) {
             Some(v) => match &v.value {
                 VarValue::Indexed(m) => Some(m),
-                VarValue::Scalar(_) | VarValue::Associative(_) => None,
+                VarValue::Scalar(_) | VarValue::Associative(_) | VarValue::Unset(_) => None,
             },
             None => None,
         }
@@ -3143,6 +3218,7 @@ impl Shell {
                 VarValue::Scalar(s) if idx == 0 => Some(s.clone()),
                 VarValue::Scalar(_) => None,
                 VarValue::Associative(_) => None,
+                VarValue::Unset(_) => None,
             },
             None => None,
         }
@@ -3537,6 +3613,12 @@ impl Shell {
             Some(VarValue::Associative(_)) => Ok(()),
             Some(VarValue::Indexed(_)) => Err(DeclareErr::IndexedExists),
             Some(VarValue::Scalar(_)) => Err(DeclareErr::ScalarExists),
+            Some(VarValue::Unset(_)) => {
+                // #600: an unset variable is compatible with any shape. Just convert it.
+                let var = self.vars.get_mut(name).unwrap();
+                var.value = VarValue::Associative(crate::assoc_map::AssocMap::new());
+                Ok(())
+            }
         }
     }
 
@@ -3719,7 +3801,7 @@ impl Shell {
             // emit only true scalars (skip Indexed/Associative). See #28.
             .filter_map(|(k, v)| match &v.value {
                 VarValue::Scalar(s) => Some((k.as_str(), s.as_str())),
-                VarValue::Indexed(_) | VarValue::Associative(_) => None,
+                VarValue::Indexed(_) | VarValue::Associative(_) | VarValue::Unset(_) => None,
             })
             // …plus inline-prefix scalar assignments over an array target: bash
             // still exports the assigned scalar even though the variable is an
@@ -3879,6 +3961,20 @@ fn install_scalar_value(existing: &mut Variable, value: String) -> bool {
             false
         }
         VarValue::Associative(_) => true,
+        // #600: the first write materialises the declared shape. An unset
+        // INDEXED takes the element-0 rule, exactly as a set one does; an
+        // unset ASSOCIATIVE rejects a scalar install like its set twin.
+        VarValue::Unset(Shape::Scalar) => {
+            existing.value = VarValue::Scalar(value);
+            false
+        }
+        VarValue::Unset(Shape::Indexed) => {
+            let mut m = BTreeMap::new();
+            m.insert(0, value);
+            existing.value = VarValue::Indexed(m);
+            false
+        }
+        VarValue::Unset(Shape::Associative) => true,
     }
 }
 
@@ -4070,3 +4166,6 @@ mod ifs_helper_tests;
 
 #[cfg(test)]
 mod shopt_tests;
+
+#[cfg(test)]
+mod unset_value_tests;

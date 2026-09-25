@@ -1376,6 +1376,7 @@ fn render_declare_value_part(var: &crate::shell_state::Variable) -> String {
                 format!("=({} )", parts.join(" "))
             }
         }
+        VarValue::Unset(_) => String::new(),
     }
 }
 
@@ -1394,6 +1395,10 @@ fn format_declare_bare_line(name: &str, var: &crate::shell_state::Variable) -> S
             }
         }
         VarValue::Indexed(_) | VarValue::Associative(_) => {
+            format!("{name}{}", render_declare_value_part(var))
+        }
+        VarValue::Unset(_) => {
+            // Unset variable: format as just the name (empty value).
             format!("{name}{}", render_declare_value_part(var))
         }
     }

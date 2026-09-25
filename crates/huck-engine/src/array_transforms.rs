@@ -94,6 +94,11 @@ fn assign_decl_scalar_or_element(name: &str, var: &Variable, val: &str) -> Strin
                 format!("declare {attrs} {name}={}", always_quote(val))
             }
         }
+        VarValue::Unset(_) => {
+            // Unset variable: format as a declare with no value.
+            let attrs = render_attr_prefix(var, true);
+            format!("declare {attrs} {name}")
+        }
     }
 }
 
@@ -201,7 +206,7 @@ fn kv_string_whole(var: &Variable) -> String {
                 format!("{} ", parts.join(" "))
             }
         }
-        VarValue::Scalar(_) => String::new(),
+        VarValue::Scalar(_) | VarValue::Unset(_) => String::new(),
     }
 }
 
@@ -260,7 +265,7 @@ fn kv_words_whole(var: &Variable) -> Vec<String> {
             }
             out
         }
-        VarValue::Scalar(_) => Vec::new(),
+        VarValue::Scalar(_) | VarValue::Unset(_) => Vec::new(),
     }
 }
 
@@ -276,7 +281,7 @@ pub(crate) fn attr_flags(name: &str, shell: &Shell) -> String {
     match &var.value {
         VarValue::Indexed(_) => flags.push('a'),
         VarValue::Associative(_) => flags.push('A'),
-        VarValue::Scalar(_) => {}
+        VarValue::Scalar(_) | VarValue::Unset(_) => {}
     }
     if var.integer {
         flags.push('i');
