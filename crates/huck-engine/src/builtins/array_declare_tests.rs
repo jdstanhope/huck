@@ -7,10 +7,13 @@ fn run(shell: &mut Shell, line: &str) -> ExecOutcome {
 
 #[test]
 fn declare_dash_a_creates_empty_array() {
+    // bash 5.2.21: `declare -a a` records the array attribute WITHOUT
+    // materialising a value (`declare -p a` -> `declare -a a`, no `=`;
+    // `${a+set}` is empty, i.e. bash's own -v test says a is unset). #600.
     let mut s = Shell::new();
     let _ = run(&mut s, "declare -a a");
-    assert!(s.get_indexed("a").is_some());
-    assert_eq!(s.get_indexed("a").unwrap().len(), 0);
+    assert!(!s.is_set("a"));
+    assert!(s.get_indexed("a").is_none());
 }
 
 #[test]

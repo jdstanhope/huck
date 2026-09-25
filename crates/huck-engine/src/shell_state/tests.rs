@@ -473,14 +473,20 @@ fn exported_env_includes_inline_scalar_overlay() {
 
 #[test]
 fn export_creates_empty_when_missing() {
+    // bash 5.2.21: `declare -x E` (export on a fresh name) records the
+    // export attribute WITHOUT materialising a value — `${E+set}` is
+    // empty, `declare -p E` -> `declare -x E` (no `=`), and a valueless
+    // exported variable contributes NOTHING to a child's environment
+    // (`env | grep -c '^E='` -> 0). #600.
     let mut shell = Shell::new();
     shell.export("HUCK_TEST_EMPTY");
-    assert_eq!(shell.get("HUCK_TEST_EMPTY"), Some(""));
+    assert_eq!(shell.get("HUCK_TEST_EMPTY"), None);
+    assert!(!shell.is_set("HUCK_TEST_EMPTY"));
     let in_exported = shell
         .exported_env()
         .iter()
         .any(|&(k, _)| k == "HUCK_TEST_EMPTY");
-    assert!(in_exported);
+    assert!(!in_exported);
 }
 
 #[test]

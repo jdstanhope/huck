@@ -15,9 +15,14 @@ fn scalar_view_returns_empty_for_associative() {
 
 #[test]
 fn declare_associative_on_unset_creates_empty() {
+    // bash 5.2.21: `declare -A m` on a fresh name records the associative
+    // attribute WITHOUT materialising a value (`${m+set}` is empty;
+    // `declare -p m` -> `declare -A m`, no `=`). get_associative only
+    // returns a materialised map, so it is None here. #600.
     let mut shell = Shell::new();
     assert!(shell.declare_associative("m").is_ok());
-    assert_eq!(shell.get_associative("m").map(|m| m.len()), Some(0));
+    assert!(!shell.is_set("m"));
+    assert_eq!(shell.get_associative("m").map(|m| m.len()), None);
 }
 
 #[test]
