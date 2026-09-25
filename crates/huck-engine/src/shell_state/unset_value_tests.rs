@@ -96,3 +96,114 @@ fn install_scalar_value_materialises_by_shape() {
     let mut v = Variable::unset(Shape::Associative);
     assert!(install_scalar_value(&mut v, "x".to_string()));
 }
+
+/// #600 fix round 1: store_assoc_element respects shape and rejects
+/// Unset(Indexed), not materializing incompatible shapes.
+#[test]
+fn store_assoc_element_shape_crossing() {
+    // Unset(Indexed) cannot become associative.
+    let mut sh = Shell::new();
+    sh.vars
+        .insert("v".to_string(), Variable::unset(Shape::Indexed));
+    let result = sh.set_associative_element("v", "k".to_string(), "x".to_string());
+    assert!(matches!(
+        result,
+        Err(crate::shell_state::AssignErr::TypeMismatch)
+    ));
+    assert!(sh.vars["v"].value.is_unset()); // Variable unchanged
+    assert_eq!(sh.vars["v"].value.shape(), Shape::Indexed);
+
+    // Unset(Scalar) CAN become associative.
+    let mut sh = Shell::new();
+    sh.vars
+        .insert("v".to_string(), Variable::unset(Shape::Scalar));
+    let result = sh.set_associative_element("v", "k".to_string(), "x".to_string());
+    assert!(result.is_ok());
+    assert!(!sh.vars["v"].value.is_unset());
+
+    // Unset(Associative) is OK.
+    let mut sh = Shell::new();
+    sh.vars
+        .insert("v".to_string(), Variable::unset(Shape::Associative));
+    let result = sh.set_associative_element("v", "k".to_string(), "x".to_string());
+    assert!(result.is_ok());
+    assert!(!sh.vars["v"].value.is_unset());
+}
+
+/// #600 fix round 1: declare_associative respects shape. Unset(Scalar)
+/// accepts the declaration; Unset(Associative) is already correct;
+/// Unset(Indexed) refuses like a materialised indexed array.
+#[test]
+fn declare_associative_shape_crossing() {
+    use crate::shell_state::DeclareErr;
+
+    // Unset(Scalar) becomes associative.
+    let mut sh = Shell::new();
+    sh.vars
+        .insert("v".to_string(), Variable::unset(Shape::Scalar));
+    let result = sh.declare_associative("v");
+    assert!(matches!(result, Ok(())));
+    assert!(matches!(sh.vars["v"].value, VarValue::Associative(_)));
+
+    // Unset(Associative) is already associative.
+    let mut sh = Shell::new();
+    sh.vars
+        .insert("v".to_string(), Variable::unset(Shape::Associative));
+    let result = sh.declare_associative("v");
+    assert!(matches!(result, Ok(())));
+    assert!(matches!(sh.vars["v"].value, VarValue::Associative(_)));
+
+    // Unset(Indexed) cannot become associative (like a materialised indexed array).
+    let mut sh = Shell::new();
+    sh.vars
+        .insert("v".to_string(), Variable::unset(Shape::Indexed));
+    let result = sh.declare_associative("v");
+    assert!(matches!(result, Err(DeclareErr::IndexedExists)));
+}
+
+/// #600 fix round 1: attr_flags drives array markers off shape, not
+/// the materialised value. Unset(Indexed) → 'a', Unset(Associative) → 'A',
+/// Unset(Scalar) → no marker.
+#[test]
+fn attr_flags_respects_unset_shape() {
+    use crate::array_transforms::attr_flags;
+
+    // Unset(Indexed) should render the 'a' flag.
+    let mut sh = Shell::new();
+    sh.vars
+        .insert("y".to_string(), Variable::unset(Shape::Indexed));
+    let flags = attr_flags("y", &sh);
+    assert!(
+        flags.contains('a'),
+        "Unset(Indexed) should have 'a' in flags"
+    );
+
+    // Unset(Associative) should render the 'A' flag.
+    let mut sh = Shell::new();
+    sh.vars
+        .insert("x".to_string(), Variable::unset(Shape::Associative));
+    let flags = attr_flags("x", &sh);
+    assert!(
+        flags.contains('A'),
+        "Unset(Associative) should have 'A' in flags"
+    );
+
+    // Unset(Scalar) should not render an array marker.
+    let mut sh = Shell::new();
+    sh.vars
+        .insert("s".to_string(), Variable::unset(Shape::Scalar));
+    let flags = attr_flags("s", &sh);
+    assert!(
+        !flags.contains('a') && !flags.contains('A'),
+        "Unset(Scalar) should not have 'a' or 'A' in flags"
+    );
+
+    // With integer flag on an Unset(Indexed).
+    let mut sh = Shell::new();
+    let mut v = Variable::unset(Shape::Indexed);
+    v.integer = true;
+    sh.vars.insert("n".to_string(), v);
+    let flags = attr_flags("n", &sh);
+    assert!(flags.contains('a'), "should have 'a'");
+    assert!(flags.contains('i'), "should have 'i'");
+}

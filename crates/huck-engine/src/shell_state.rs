@@ -2581,7 +2581,9 @@ impl Shell {
     ) -> Result<(), AssignErr> {
         match self.vars.get_mut(name) {
             Some(v) => {
-                if matches!(v.value, VarValue::Unset(_)) {
+                // #600: materialise only compatible shapes (Scalar and Associative);
+                // let Unset(Indexed) fall through to the error arm like a materialised Indexed would.
+                if matches!(v.value, VarValue::Unset(Shape::Scalar | Shape::Associative)) {
                     v.value = VarValue::Associative(crate::assoc_map::AssocMap::new());
                 }
                 match &mut v.value {
@@ -3613,11 +3615,21 @@ impl Shell {
             Some(VarValue::Associative(_)) => Ok(()),
             Some(VarValue::Indexed(_)) => Err(DeclareErr::IndexedExists),
             Some(VarValue::Scalar(_)) => Err(DeclareErr::ScalarExists),
-            Some(VarValue::Unset(_)) => {
-                // #600: an unset variable is compatible with any shape. Just convert it.
+            Some(VarValue::Unset(Shape::Scalar)) => {
+                // #600: unset scalar can become associative.
                 let var = self.vars.get_mut(name).unwrap();
                 var.value = VarValue::Associative(crate::assoc_map::AssocMap::new());
                 Ok(())
+            }
+            Some(VarValue::Unset(Shape::Associative)) => {
+                // #600: unset associative becomes a materialised associative.
+                let var = self.vars.get_mut(name).unwrap();
+                var.value = VarValue::Associative(crate::assoc_map::AssocMap::new());
+                Ok(())
+            }
+            Some(VarValue::Unset(Shape::Indexed)) => {
+                // #600: unset indexed cannot become associative (same rule as materialised indexed).
+                Err(DeclareErr::IndexedExists)
             }
         }
     }

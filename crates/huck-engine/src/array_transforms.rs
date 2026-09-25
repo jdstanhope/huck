@@ -278,10 +278,11 @@ pub(crate) fn attr_flags(name: &str, shell: &Shell) -> String {
     if var.nameref {
         flags.push('n');
     }
-    match &var.value {
-        VarValue::Indexed(_) => flags.push('a'),
-        VarValue::Associative(_) => flags.push('A'),
-        VarValue::Scalar(_) | VarValue::Unset(_) => {}
+    // #600: drive array marker letters off shape, not the materialised value.
+    match var.value.shape() {
+        crate::shell_state::Shape::Indexed => flags.push('a'),
+        crate::shell_state::Shape::Associative => flags.push('A'),
+        crate::shell_state::Shape::Scalar => {}
     }
     if var.integer {
         flags.push('i');
