@@ -2265,48 +2265,18 @@ fn builtin_readonly_decl(
                     exit = 1;
                     continue;
                 }
-                // `readonly -A NAME` (no value): ensure name is associative
-                // before marking readonly.
-                if want_associative
-                    && shell.get_associative(name).is_none()
-                    && let Err(e) = shell.declare_associative(name)
-                {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "{}",
-                        crate::shell_state::declare_err_message("readonly", name, &e)
-                    );
-                    exit = 1;
-                    continue;
-                }
-                // `readonly -a NAME` (no value): ensure name is an indexed
-                // array before marking readonly (mirrors want_associative
-                // above; declare/local's -a bare-case pattern — promote an
-                // existing scalar to element 0, or create an empty array).
-                // Skip when NAME is already associative (e.g. `-aA` together,
-                // or a pre-existing `-A` array): `-A` wins, matching bash.
-                if want_indexed
-                    && shell.get_associative(name).is_none()
-                    && shell.get_indexed(name).is_none()
-                {
-                    match shell.get(name) {
-                        Some(scalar) => {
-                            let mut elements = std::collections::BTreeMap::new();
-                            elements.insert(0, scalar.to_string());
-                            if shell.replace_indexed(name, elements).is_err() {
-                                // assign() already emitted the readonly-variable
-                                // error (bare `{name}: readonly variable`, no prefix).
-                                exit = 1;
-                                continue;
-                            }
-                        }
-                        // #600: nothing to promote — record the shape
-                        // without materialising a value.
-                        None => shell.declare_indexed_unset(name),
-                    }
-                }
+                // `readonly -a`/`-A NAME` with NO value: bash's `-a`/`-A`
+                // here is a pure SELECTOR, never a shape mutator — it does
+                // not create an array from a brand-new name, promote an
+                // existing scalar, or convert an existing (materialised OR
+                // declared-but-unset) variable's shape. Measured on bash
+                // 5.2.21: `readonly -a brandnew` -> `declare -r brandnew`
+                // (no `-a` at all); `x=hello; readonly -a x` -> `declare -r
+                // x="hello"` (no promotion); `declare -A x; readonly -a x`
+                // -> `declare -Ar x` (shape UNCHANGED, `-a` ignored). So
+                // `want_indexed`/`want_associative` do nothing here — only
+                // `readonly NAME=value` (the `DeclArg::Assign` arm below)
+                // still creates/converts shape from a supplied value.
                 shell.mark_readonly(name);
             }
             DeclArg::Assign(a) => match &a.target {

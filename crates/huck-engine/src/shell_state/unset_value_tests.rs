@@ -131,28 +131,46 @@ fn store_assoc_element_shape_crossing() {
     assert!(!sh.vars["v"].value.is_unset());
 }
 
-/// #600 fix round 1: declare_associative respects shape. Unset(Scalar)
-/// accepts the declaration; Unset(Associative) is already correct;
-/// Unset(Indexed) refuses like a materialised indexed array.
+/// #600 fix round 1: declare_associative respects shape AND stays unset.
+/// Unset(Scalar) converts to Unset(Associative) — bash does NOT materialise
+/// a value just from the shape conversion (measured 5.2.21: `declare v;
+/// declare -A v; declare -p v` -> `declare -A v`, `[[ -v v ]]` false).
+/// Unset(Associative) re-declaring the same shape is a no-op, still unset
+/// (measured: `declare -A x; declare -A x; declare -p x` -> `declare -A x`,
+/// unset). Unset(Indexed) refuses like a materialised indexed array.
 #[test]
 fn declare_associative_shape_crossing() {
     use crate::shell_state::DeclareErr;
 
-    // Unset(Scalar) becomes associative.
+    // Unset(Scalar) becomes Unset(Associative) — shape changes, value stays
+    // NULL.
     let mut sh = Shell::new();
     sh.vars
         .insert("v".to_string(), Variable::unset(Shape::Scalar));
     let result = sh.declare_associative("v");
     assert!(matches!(result, Ok(())));
-    assert!(matches!(sh.vars["v"].value, VarValue::Associative(_)));
+    assert!(matches!(
+        sh.vars["v"].value,
+        VarValue::Unset(Shape::Associative)
+    ));
+    assert!(sh.vars["v"].value.is_unset());
+    assert_eq!(
+        crate::builtins::format_declare_line("v", &sh.vars["v"]),
+        "declare -A v"
+    );
 
-    // Unset(Associative) is already associative.
+    // Unset(Associative) re-declaring the same shape stays unset (idempotent
+    // no-op, not a materialisation).
     let mut sh = Shell::new();
     sh.vars
         .insert("v".to_string(), Variable::unset(Shape::Associative));
     let result = sh.declare_associative("v");
     assert!(matches!(result, Ok(())));
-    assert!(matches!(sh.vars["v"].value, VarValue::Associative(_)));
+    assert!(matches!(
+        sh.vars["v"].value,
+        VarValue::Unset(Shape::Associative)
+    ));
+    assert!(sh.vars["v"].value.is_unset());
 
     // Unset(Indexed) cannot become associative (like a materialised indexed array).
     let mut sh = Shell::new();

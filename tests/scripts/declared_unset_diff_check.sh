@@ -48,6 +48,17 @@ check "nameref on assign"   'declare -n r; r=x; declare -p r'
 # --- still unset ------------------------------------------------------------
 check "attribute churn"     'declare -i n; declare -p n; declare +i n; declare -p n; declare -x n; declare -p n'
 check "shape survives"      'declare -a y; declare -A y; echo rc=$?; declare -p y'
+# fix round 1 (#600 regression): on readonly/export with NO value, -a/-A is
+# a SELECTOR — it must never change the shape of an existing variable, set
+# or unset (bash: `declare -A x; readonly -a x` -> `declare -Ar x`, shape
+# unchanged). The `readonly -A` row on an existing INDEXED array is left out:
+# it hits #698 (unrelated, out of scope) on unpatched shape-conversion
+# refusal — this row happens to pass here because the SAME fix that
+# resolves the selector regression also stops readonly -a/-A from ever
+# attempting a shape conversion in the no-value path, so add it too.
+check "readonly -a selector" 'declare -A x; readonly -a x; declare -p x'
+check "readonly -A selector" 'declare -a y; readonly -A y; declare -p y; echo rc=$?'
+check "export -a selector"   'declare -A x; export -a x; declare -p x'
 check "readonly guard"      'declare -r r; r=1; echo rc=$?; declare -p r'
 check "unset removes"       'declare -a y; unset y; declare -p y; echo rc=$?'
 check "listings skip it"    'declare -a y; compgen -v y; echo ---; set | grep -c "^y="; declare -p | grep -c "^declare -a y$"'
