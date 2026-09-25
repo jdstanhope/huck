@@ -1623,13 +1623,18 @@ fn builtin_export_decl(
     let mut func = false;
     let mut saw_p = false;
     let mut saw_a = false;
+    let mut saw_capital_a = false;
     let mut g =
         crate::builtin_opts::Getopt::new(name, crate::builtin_opts::ArgView::Decl(args), "pnfaA");
     loop {
         match g.next_opt(shell, err) {
             Ok(Some(o)) => match o.ch {
                 'p' => saw_p = true,
-                'a' | 'A' => saw_a = true, // pure selector, same for both letters
+                // Same pure-selector behavior with no value (#698); split so
+                // a value-bearing `-A` can establish the associative shape
+                // rather than falling into the indexed reparse (#777).
+                'a' => saw_a = true,
+                'A' => saw_capital_a = true,
                 'n' => unexport = true,
                 'f' => func = true,
                 _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
@@ -1644,13 +1649,13 @@ fn builtin_export_decl(
         if unexport {
             return ExecOutcome::Continue(0);
         }
-        // `-f` with no operands lists exported functions. `-a` (mise
+        // `-f` with no operands lists exported functions. `-a`/`-A` (mise
         // accommodation) suppresses the var listing: rc 0, no output.
         // Otherwise list exported variables (bare `export` or `-p`).
         if func && !saw_p {
             return list_exported_functions(out, shell);
         }
-        if saw_a && !saw_p {
+        if (saw_a || saw_capital_a) && !saw_p {
             return ExecOutcome::Continue(0);
         }
         return list_exported(out, shell);
@@ -1789,8 +1794,10 @@ fn builtin_export_decl(
                 }
                 // v349 (#343, Root B): `export -a NAME='(v)'` coerces the quoted
                 // scalar `(...)` value into an array literal (matches bash).
+                // Same reparse applies under `-A` (a quoted `(...)` scalar).
                 let reparsed_owned;
-                let a = if saw_a && let Some(value) = reparse_paren_scalar_as_array(&name, &a.value)
+                let a = if (saw_a || saw_capital_a)
+                    && let Some(value) = reparse_paren_scalar_as_array(&name, &a.value)
                 {
                     reparsed_owned = crate::command::Assignment {
                         target: a.target.clone(),
@@ -1801,6 +1808,28 @@ fn builtin_export_decl(
                 } else {
                     a
                 };
+                // #777: `-A` with a VALUE must establish the associative shape
+                // before apply_one_assignment sees the compound RHS — otherwise
+                // the shared array-literal path (`is_associative_shape`) treats
+                // it as indexed and the key/value pairs collapse to a plain
+                // list, last-value-wins. Mirrors `declare -A NAME=(...)`
+                // (~builtin_declare_decl). The no-value selector path (`export
+                // -A NAME`) never reaches here — it's the Plain-arm/no-`=`
+                // case above, untouched.
+                if saw_capital_a
+                    && shell.get_associative(&name).is_none()
+                    && let Err(e) = shell.declare_associative(&name)
+                {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "{}",
+                        crate::shell_state::declare_err_message("export", &name, &e)
+                    );
+                    any_error = true;
+                    continue;
+                }
                 // #714: name the builtin performing this SCALAR assignment, so an
                 // integer-coercion failure reports `export: @: …` as bash does.
                 shell.set_decl_builtin_name(Some("export"));

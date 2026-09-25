@@ -50,7 +50,7 @@ fn readonly_dash_a_single_element_compound_value() {
 }
 
 #[test]
-fn readonly_dash_a_no_value_creates_empty_readonly_array() {
+fn readonly_dash_a_no_value_is_unset_and_not_an_array() {
     // bash 5.2.21: `-a`/`-A` with NO value is a pure shape SELECTOR, never
     // a mutator — on a brand-new name it does nothing (measured: `readonly
     // -a brandnew; declare -p brandnew` -> `declare -r brandnew`, the `-a`
@@ -139,7 +139,7 @@ fn readonly_with_value_sets_and_locks() {
 }
 
 #[test]
-fn readonly_no_value_creates_empty_and_locks() {
+fn readonly_no_value_is_unset_and_locks() {
     // bash 5.2.21: `readonly X` (no value) records the readonly attribute
     // WITHOUT materialising a value — `declare -p X` -> `declare -r X` (no
     // `=`), and `${X+set}` is empty (X reads as unset). `X=1` afterwards

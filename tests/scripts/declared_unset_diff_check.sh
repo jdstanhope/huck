@@ -93,4 +93,16 @@ check "export -A selector"     'declare -a i=(1); export -A i; echo rc=$?; decla
 check "export -a selector"     'declare -A m=([k]=v); export -a m; echo rc=$?; declare -p m'
 check "readonly -A selector"   'declare -a i=(1); readonly -A i; echo rc=$?; declare -p i'
 
+# --- #777: exported_env must STOP at an exported ARRAY, not walk past it ---
+check "exported array shadow (indexed)"     'export V=1; f(){ local -a V=(x); env | grep "^V=" || echo noenv; }; f'
+check "exported array shadow (assoc)"       'export V=1; f(){ local -A V=([k]=q); env | grep "^V=" || echo noenv; }; f'
+check "exported array shadow valueless"     'export V=1; f(){ local -a V; env | grep "^V=" || echo noenv; }; f'
+check "exported array shadow at snapshot"   'export V=1; f(){ local -a V=(x); g; }; g(){ local +x V=2; env | grep "^V=" || echo noenv; }; f'
+
+# --- #777: `export -A NAME=(...)` must build an ASSOCIATIVE array, not an
+# indexed one that silently drops every key but the last -----------------
+check "export -A with value"        'export -A x=([k]=v [j]=w); declare -p x'
+check "export -a with value"        'export -a x=(1 2); declare -p x'
+check "export -A value then key"    'export -A x=([k]=v); x[j]=w; declare -p x'
+
 harness_summary

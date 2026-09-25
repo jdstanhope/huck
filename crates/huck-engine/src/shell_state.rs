@@ -3872,31 +3872,69 @@ impl Shell {
     /// `local_scopes` makes the walk cheap: each frame maps a name to the
     /// binding it SHADOWED, innermost frame last, so iterating the frames in
     /// reverse yields successively outer bindings.
+    // Cost note: this rebuilds the whole export table by walking `self.vars`
+    // plus every `local_scopes` frame on EVERY child spawn; fine at current
+    // shell sizes, but it is O(names × scopes) if either grows large.
     pub fn exported_env(&self) -> Vec<(&str, &str)> {
-        fn exported_scalar(v: &Variable) -> Option<&str> {
-            // bash never inherits arrays into a child's environment (#28), and
-            // a valueless variable contributes nothing (#600).
-            match (&v.value, v.exported) {
-                (VarValue::Scalar(s), true) => Some(s.as_str()),
-                _ => None,
+        /// The outcome of inspecting one binding for a NAME during the
+        /// outward walk. A binding that is unexported or valueless is
+        /// invisible to `env` — the walk keeps going outward through it. An
+        /// exported binding is where the walk must stop: a scalar
+        /// contributes its value, but an exported ARRAY contributes
+        /// nothing and still stops the walk (bash never inherits arrays,
+        /// #28, but the array is what a child *would* see, so a further-out
+        /// scalar must not leak past it — #777).
+        enum Outward<'a> {
+            Continue,
+            Stop(Option<&'a str>),
+        }
+
+        fn outward(v: &Variable) -> Outward<'_> {
+            if !v.exported {
+                return Outward::Continue;
+            }
+            match &v.value {
+                VarValue::Scalar(s) => Outward::Stop(Some(s.as_str())),
+                VarValue::Indexed(_) | VarValue::Associative(_) => Outward::Stop(None),
+                VarValue::Unset(_) => Outward::Continue,
             }
         }
 
         let mut env: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+        let mut stopped: std::collections::HashSet<&str> = std::collections::HashSet::new();
         // Innermost first: the visible bindings…
         for (k, v) in &self.vars {
-            if let Some(s) = exported_scalar(v) {
-                env.entry(k.as_str()).or_insert(s);
+            match outward(v) {
+                Outward::Stop(Some(s)) => {
+                    env.entry(k.as_str()).or_insert(s);
+                    stopped.insert(k.as_str());
+                }
+                Outward::Stop(None) => {
+                    stopped.insert(k.as_str());
+                }
+                Outward::Continue => {}
             }
         }
-        // …then outward through the shadowed snapshots. `or_insert` keeps the
-        // innermost winner, so a name already resolved is never overwritten.
+        // …then outward through the shadowed snapshots. A name already
+        // STOPPED (resolved to a value, or blocked by an exported array)
+        // never looks further out; `stopped` tracks that per name across
+        // frames, since `env` alone can't distinguish "resolved" from
+        // "blocked with nothing".
         for frame in self.local_scopes.iter().rev() {
             for (k, snapshot) in frame {
-                if let Some(v) = snapshot
-                    && let Some(s) = exported_scalar(v)
-                {
-                    env.entry(k.as_str()).or_insert(s);
+                if stopped.contains(k.as_str()) {
+                    continue;
+                }
+                let Some(v) = snapshot else { continue };
+                match outward(v) {
+                    Outward::Stop(Some(s)) => {
+                        env.entry(k.as_str()).or_insert(s);
+                        stopped.insert(k.as_str());
+                    }
+                    Outward::Stop(None) => {
+                        stopped.insert(k.as_str());
+                    }
+                    Outward::Continue => {}
                 }
             }
         }

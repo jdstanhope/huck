@@ -14,7 +14,7 @@ fn scalar_view_returns_empty_for_associative() {
 }
 
 #[test]
-fn declare_associative_on_unset_creates_empty() {
+fn declare_associative_on_unset_stays_unset() {
     // bash 5.2.21: `declare -A m` on a fresh name records the associative
     // attribute WITHOUT materialising a value (`${m+set}` is empty;
     // `declare -p m` -> `declare -A m`, no `=`). get_associative only
