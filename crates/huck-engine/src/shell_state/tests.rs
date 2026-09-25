@@ -413,7 +413,7 @@ fn new_captures_inherited_env_as_exported() {
     let shell = Shell::new();
     // PATH is reliably present in test environments.
     assert!(shell.get("PATH").is_some(), "PATH should be inherited");
-    let path_exported = shell.exported_env().any(|(k, _)| k == "PATH");
+    let path_exported = shell.exported_env().iter().any(|&(k, _)| k == "PATH");
     assert!(path_exported);
 }
 
@@ -422,7 +422,10 @@ fn set_creates_unexported_var() {
     let mut shell = Shell::new();
     shell.set("HUCK_TEST_SET", "value".to_string());
     assert_eq!(shell.get("HUCK_TEST_SET"), Some("value"));
-    let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_TEST_SET");
+    let in_exported = shell
+        .exported_env()
+        .iter()
+        .any(|&(k, _)| k == "HUCK_TEST_SET");
     assert!(!in_exported);
 }
 
@@ -432,7 +435,10 @@ fn set_preserves_existing_exported_flag() {
     shell.export_set("HUCK_TEST_KEEP", "v1".to_string());
     shell.set("HUCK_TEST_KEEP", "v2".to_string());
     assert_eq!(shell.get("HUCK_TEST_KEEP"), Some("v2"));
-    let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_TEST_KEEP");
+    let in_exported = shell
+        .exported_env()
+        .iter()
+        .any(|&(k, _)| k == "HUCK_TEST_KEEP");
     assert!(in_exported);
 }
 
@@ -441,7 +447,10 @@ fn export_marks_existing_exported() {
     let mut shell = Shell::new();
     shell.set("HUCK_TEST_EX", "value".to_string());
     shell.export("HUCK_TEST_EX");
-    let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_TEST_EX");
+    let in_exported = shell
+        .exported_env()
+        .iter()
+        .any(|&(k, _)| k == "HUCK_TEST_EX");
     assert!(in_exported);
 }
 
@@ -456,7 +465,8 @@ fn exported_env_includes_inline_scalar_overlay() {
     assert!(
         shell
             .exported_env()
-            .any(|(k, val)| k == "OVL" && val == "v"),
+            .iter()
+            .any(|&(k, val)| k == "OVL" && val == "v"),
         "inline scalar overlay must appear in exported_env"
     );
 }
@@ -466,7 +476,10 @@ fn export_creates_empty_when_missing() {
     let mut shell = Shell::new();
     shell.export("HUCK_TEST_EMPTY");
     assert_eq!(shell.get("HUCK_TEST_EMPTY"), Some(""));
-    let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_TEST_EMPTY");
+    let in_exported = shell
+        .exported_env()
+        .iter()
+        .any(|&(k, _)| k == "HUCK_TEST_EMPTY");
     assert!(in_exported);
 }
 
@@ -476,7 +489,10 @@ fn unset_removes_variable() {
     shell.set("HUCK_TEST_REMOVE", "v".to_string());
     shell.unset("HUCK_TEST_REMOVE");
     assert_eq!(shell.get("HUCK_TEST_REMOVE"), None);
-    let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_TEST_REMOVE");
+    let in_exported = shell
+        .exported_env()
+        .iter()
+        .any(|&(k, _)| k == "HUCK_TEST_REMOVE");
     assert!(!in_exported);
 }
 
@@ -528,7 +544,10 @@ fn last_status_round_trip() {
 fn exported_env_excludes_unexported() {
     let mut shell = Shell::new();
     shell.set("HUCK_TEST_HIDDEN", "v".to_string());
-    let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_TEST_HIDDEN");
+    let in_exported = shell
+        .exported_env()
+        .iter()
+        .any(|&(k, _)| k == "HUCK_TEST_HIDDEN");
     assert!(!in_exported);
 }
 

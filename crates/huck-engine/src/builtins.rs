@@ -1614,20 +1614,22 @@ fn builtin_export_decl(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    // `-a` is a huck-specific no-op (mise emits `export -a chpwd_functions`);
-    // `-p` lists (only when no operands); `-n` unexports; `-f` is function
-    // export.
+    // `-a`/`-A` are a pure shape SELECTOR (never a mutator, #698): with no
+    // value they leave an existing variable's shape untouched — this also
+    // covers huck-specific no-op uses like mise's `export -a
+    // chpwd_functions`. `-p` lists (only when no operands); `-n` unexports;
+    // `-f` is function export.
     let mut unexport = false;
     let mut func = false;
     let mut saw_p = false;
     let mut saw_a = false;
     let mut g =
-        crate::builtin_opts::Getopt::new(name, crate::builtin_opts::ArgView::Decl(args), "pnfa");
+        crate::builtin_opts::Getopt::new(name, crate::builtin_opts::ArgView::Decl(args), "pnfaA");
     loop {
         match g.next_opt(shell, err) {
             Ok(Some(o)) => match o.ch {
                 'p' => saw_p = true,
-                'a' => saw_a = true, // huck-specific no-op (mise `export -a chpwd_functions`)
+                'a' | 'A' => saw_a = true, // pure selector, same for both letters
                 'n' => unexport = true,
                 'f' => func = true,
                 _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
@@ -1845,6 +1847,7 @@ fn builtin_local_decl(
     let mut saw_minus_u = false;
     let mut saw_minus_c = false;
     let mut saw_minus_n = false;
+    let mut saw_minus_x = false;
     let mut saw_plus_x = false;
     // `local` DOES take `+`-style options — the comment here used to claim it
     // did not, and every `+anything` fell through to be reported as an invalid
@@ -1867,7 +1870,7 @@ fn builtin_local_decl(
         let mut g = crate::builtin_opts::Getopt::new(
             name,
             crate::builtin_opts::ArgView::Decl(&args[idx..]),
-            "aAirlucn",
+            "aAirlucnx",
         );
         loop {
             match g.next_opt(shell, err) {
@@ -1880,6 +1883,7 @@ fn builtin_local_decl(
                     'u' => saw_minus_u = true,
                     'c' => saw_minus_c = true,
                     'n' => saw_minus_n = true,
+                    'x' => saw_minus_x = true,
                     _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
                 },
                 Ok(None) => break,
@@ -2060,7 +2064,7 @@ fn builtin_local_decl(
                 // `local NAME` that stays declared-but-unset (measured:
                 // `declare -x V=1; f(){ local V; declare -p V; }; f` ->
                 // `declare -x V`).
-                if was_exported && !saw_plus_x {
+                if (was_exported || saw_minus_x) && !saw_plus_x {
                     shell.export(name);
                 }
             }
@@ -2117,14 +2121,13 @@ fn builtin_local_decl(
                     }
                     shell.set_nameref(&name, true);
                     shell.set(&name, target);
-                    // Apply co-requested -r (local does not support -x,
-                    // but mirror the same pattern for safety).
+                    // Apply co-requested -r.
                     if want_readonly {
                         shell.mark_readonly(&name);
                     }
                     // A nameref local over an exported outer is exported too
                     // (bash: `declare -nx`), same rule as every other shape.
-                    if was_exported && !saw_plus_x {
+                    if (was_exported || saw_minus_x) && !saw_plus_x {
                         shell.export(&name);
                     }
                     continue;
@@ -2191,7 +2194,7 @@ fn builtin_local_decl(
                 }
                 // Carry the shadowed variable's export attribute onto the new
                 // local (see `clear_local_shadow`), unless `+x` cancelled it.
-                if was_exported && !saw_plus_x {
+                if (was_exported || saw_minus_x) && !saw_plus_x {
                     shell.export(&name);
                 }
             }

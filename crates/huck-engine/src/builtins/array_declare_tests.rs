@@ -83,11 +83,11 @@ fn exported_array_omitted_from_child_env_but_scalar_kept() {
     let _ = run(&mut s, "export a=(x y z)");
     let _ = run(&mut s, "export s=hi");
     assert!(
-        !s.exported_env().any(|(k, _)| k == "a"),
+        !s.exported_env().iter().any(|&(k, _)| k == "a"),
         "exported array must NOT appear in the child environment"
     );
     assert!(
-        s.exported_env().any(|(k, v)| k == "s" && v == "hi"),
+        s.exported_env().iter().any(|&(k, v)| k == "s" && v == "hi"),
         "exported scalar must still be inherited"
     );
 }

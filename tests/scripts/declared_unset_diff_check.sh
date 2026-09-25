@@ -69,4 +69,28 @@ check "local over exported" 'declare -x V=1; f(){ local V; declare -p V; V=9; de
 check "local over plain"    'V=1; f(){ local V; declare -p V; }; f'
 check "local over integer"  'declare -i N=1; f(){ local N; declare -p N; N=2+2; declare -p N; }; f'
 
+# --- #692: the export set answers TWO different questions -------------------
+# `export -p` reports the innermost VISIBLE binding if exported; a CHILD's
+# environment takes the innermost binding that is exported AND has a value,
+# walking past an unexported (or valueless) local to the outer binding.
+check "unexported local"    'declare -x V=1; f(){ local +x V=2; env | grep "^V="; echo "[$V]"; declare -p V; }; f; env | grep "^V="'
+check "export -p vs child"  'declare -x V=1; f(){ local +x V=2; export -p | grep -c "^declare -x V="; env | grep -c "^V=1$"; }; f'
+check "bare local, valueless" 'declare -x V=1; f(){ local V; env | grep "^V="; declare -p V; }; f'
+check "assign to unexported" 'declare -x V=1; f(){ local +x V=2; V=3; env | grep "^V="; declare -p V; }; f'
+check "nested local"        'declare -x V=1; f(){ local +x V=2; g(){ local V=3; env | grep "^V="; declare -p V; }; g; }; f'
+check "export inside"       'declare -x V=1; f(){ local +x V=2; export V; env | grep "^V="; }; f'
+check "unexported outer"    'V=1; f(){ local +x V=2; env | grep "^V=" || echo none; }; f'
+check "sibling unaffected"  'declare -x V=1 W=9; f(){ local +x V=2; env | grep -E "^(V|W)=" | sort; }; f'
+check "local assign exports" 'declare -x A=1; f(){ local A; A=2; env | grep "^A="; declare -p A; }; f'
+
+# --- #777: `local -x` -------------------------------------------------------
+check "local -x"            'f(){ local -x L=5; declare -p L; env | grep "^L="; }; f; env | grep -c "^L="'
+check "local -x over outer" 'declare -x V=1; f(){ local -x V=2; env | grep "^V="; declare -p V; }; f; env | grep "^V="'
+check "local -x no value"   'declare -x V=1; f(){ local -x V; env | grep "^V="; declare -p V; }; f'
+
+# --- #698 (remaining cell): export -A is a selector too, same as export -a --
+check "export -A selector"     'declare -a i=(1); export -A i; echo rc=$?; declare -p i'
+check "export -a selector"     'declare -A m=([k]=v); export -a m; echo rc=$?; declare -p m'
+check "readonly -A selector"   'declare -a i=(1); readonly -A i; echo rc=$?; declare -p i'
+
 harness_summary

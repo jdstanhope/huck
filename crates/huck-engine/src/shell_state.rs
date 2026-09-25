@@ -3859,27 +3859,52 @@ impl Shell {
         self.unwind.exit.take()
     }
 
-    /// Iterates only the exported variables, suitable for passing to a child
-    /// process's `Command::envs`.
-    pub fn exported_env(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.vars
-            .iter()
-            .filter(|(_, v)| v.exported)
-            // bash never inherits array variables into a child's environment;
-            // emit only true scalars (skip Indexed/Associative). See #28.
-            .filter_map(|(k, v)| match &v.value {
-                VarValue::Scalar(s) => Some((k.as_str(), s.as_str())),
-                VarValue::Indexed(_) | VarValue::Associative(_) | VarValue::Unset(_) => None,
-            })
-            // …plus inline-prefix scalar assignments over an array target: bash
-            // still exports the assigned scalar even though the variable is an
-            // array. Chained LAST so a same-name duplicate wins (std
-            // `Command::envs` keeps the last value). See #28.
-            .chain(
-                self.inline_scalar_export
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str())),
-            )
+    /// The environment a child process inherits. bash answers TWO different
+    /// questions about exports, and this is the second one (#692): for each
+    /// NAME, the innermost binding that is exported AND has a value. An
+    /// unexported local does not remove the enclosing binding from the export
+    /// set, so `declare -x V=1; f(){ local +x V=2; env; }` shows `V=1`; nor
+    /// does a valueless one, so a bare `local V` (which inherits export, #691)
+    /// also lets the outer value through. The FIRST question — what
+    /// `export -p` lists — is the visible binding only, and lives in the
+    /// export builtin, not here.
+    ///
+    /// `local_scopes` makes the walk cheap: each frame maps a name to the
+    /// binding it SHADOWED, innermost frame last, so iterating the frames in
+    /// reverse yields successively outer bindings.
+    pub fn exported_env(&self) -> Vec<(&str, &str)> {
+        fn exported_scalar(v: &Variable) -> Option<&str> {
+            // bash never inherits arrays into a child's environment (#28), and
+            // a valueless variable contributes nothing (#600).
+            match (&v.value, v.exported) {
+                (VarValue::Scalar(s), true) => Some(s.as_str()),
+                _ => None,
+            }
+        }
+
+        let mut env: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+        // Innermost first: the visible bindings…
+        for (k, v) in &self.vars {
+            if let Some(s) = exported_scalar(v) {
+                env.entry(k.as_str()).or_insert(s);
+            }
+        }
+        // …then outward through the shadowed snapshots. `or_insert` keeps the
+        // innermost winner, so a name already resolved is never overwritten.
+        for frame in self.local_scopes.iter().rev() {
+            for (k, snapshot) in frame {
+                if let Some(v) = snapshot
+                    && let Some(s) = exported_scalar(v)
+                {
+                    env.entry(k.as_str()).or_insert(s);
+                }
+            }
+        }
+        // An inline prefix assignment over an array target wins outright (#28).
+        for (k, v) in &self.inline_scalar_export {
+            env.insert(k.as_str(), v.as_str());
+        }
+        env.into_iter().collect()
     }
 
     /// Iterates the names of all variables (exported or not).
