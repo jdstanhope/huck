@@ -7,7 +7,8 @@ use super::*;
 fn every_mutator_materialises_an_unset_variable() {
     // (label, shape, apply) — `apply` performs one write through the public
     // mutator surface. After it, the variable must be set.
-    let cases: Vec<(&str, Shape, Box<dyn Fn(&mut Shell)>)> = vec![
+    type Case = (&'static str, Shape, Box<dyn Fn(&mut Shell)>);
+    let cases: Vec<Case> = vec![
         (
             "scalar set",
             Shape::Scalar,

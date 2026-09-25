@@ -1883,9 +1883,18 @@ impl Shell {
                 ResolvedName::Name(_) => {}
             }
         }
-        // #600: `[[ -v y ]]` is FALSE for a declared-but-unset variable; an
-        // element form (`y[k]`) is answered by the map, which is empty.
-        self.vars.get(name).is_some_and(|v| !v.value.is_unset())
+        // #600: `[[ -v y ]]` is FALSE for a declared-but-unset variable.
+        // For a MATERIALISED array, bash's bare-name `-v` is NOT "does the
+        // array have any element" — it is specifically element/key "0"
+        // (measured on bash 5.2.21: `declare -a y; y[2]=x; [[ -v y ]]` is
+        // false; `y[0]=x` makes it true). Mirrors `element_or_var_is_set`'s
+        // explicit-subscript arm, just with the subscript fixed at 0/"0".
+        match self.vars.get(name).map(|v| &v.value) {
+            None | Some(VarValue::Unset(_)) => false,
+            Some(VarValue::Scalar(_)) => true,
+            Some(VarValue::Indexed(_)) => self.lookup_indexed_element(name, 0).is_some(),
+            Some(VarValue::Associative(_)) => self.lookup_associative_element(name, "0").is_some(),
+        }
     }
 
     /// `-v` target for `test`/`[[ ]]`: a bare name / positional / special
@@ -2063,19 +2072,11 @@ impl Shell {
     }
 
     /// Marks an existing variable as exported. If it doesn't exist, creates
-    /// it with an empty value, already exported.
+    /// it as a declared-but-unset scalar, already exported (#600: `export E`
+    /// / `declare -x E` with no value records the attribute without
+    /// materialising a value — `declare -p E` prints `declare -x E`).
     pub fn export(&mut self, name: &str) {
-        self.vars
-            .entry(name.to_string())
-            .and_modify(|v| v.exported = true)
-            .or_insert_with(|| Variable {
-                value: VarValue::Scalar(String::new()),
-                exported: true,
-                readonly: false,
-                integer: false,
-                case_fold: None,
-                nameref: false,
-            });
+        self.mutate_or_create(name, |v| v.exported = true);
     }
 
     /// Sets a variable's value AND marks it exported. Preserves the
@@ -2538,10 +2539,10 @@ impl Shell {
         entries: BTreeMap<usize, String>,
     ) -> Result<(), AssignErr> {
         // #600: materialise unset variables before the shape match.
-        if let Some(v) = self.vars.get_mut(name) {
-            if matches!(v.value, VarValue::Unset(Shape::Indexed | Shape::Scalar)) {
-                v.value = VarValue::Indexed(BTreeMap::new());
-            }
+        if let Some(v) = self.vars.get_mut(name)
+            && matches!(v.value, VarValue::Unset(Shape::Indexed | Shape::Scalar))
+        {
+            v.value = VarValue::Indexed(BTreeMap::new());
         }
         if matches!(
             self.vars.get(name).map(|v| &v.value),
@@ -2886,28 +2887,24 @@ impl Shell {
     }
 
     /// Mutates an attribute on `name` by applying `f` to its `Variable`.
-    /// If `name` is unset, creates a default empty scalar `Variable` first,
-    /// applies `f`, then inserts it — matching the bash behavior of
-    /// `readonly`/`declare -i`/etc. on unset names.
+    /// If `name` is unset, creates a declared-but-unset scalar `Variable`
+    /// first (#225/#600: the attribute exists without a value — bash stores
+    /// e.g. `readonly Q` with `value == NULL`, so `[ -v Q ]` stays false),
+    /// applies `f`, then inserts it.
     fn mutate_or_create<F: FnOnce(&mut Variable)>(&mut self, name: &str, f: F) {
         if let Some(v) = self.vars.get_mut(name) {
             f(v);
         } else {
-            let mut v = Variable::scalar(String::new());
+            let mut v = Variable::unset(Shape::Scalar);
             f(&mut v);
             self.vars.insert(name.to_string(), v);
         }
     }
 
-    /// Marks `name` readonly. If `name` is unset, creates it with an empty
-    /// value.
-    ///
-    /// This DIVERGES from bash for an unset name: bash records the attribute
-    /// without creating a value, so `readonly Q` leaves `[ -v Q ]` false while
-    /// `declare -p Q` prints `declare -r Q`. huck has no attribute-without-
-    /// value state, so `Q` becomes set-to-empty. Pre-existing; verified against
-    /// bash 5.2.21 in v319. (An earlier version of this comment claimed the
-    /// empty-value creation MATCHED bash — it does not.)
+    /// Marks `name` readonly. If `name` is unset, creates it as a declared-
+    /// but-unset scalar (#225): `readonly Q` records the attribute without a
+    /// value, so `[ -v Q ]` is false while `declare -p Q` prints `declare -r
+    /// Q`.
     pub fn mark_readonly(&mut self, name: &str) {
         self.mutate_or_create(name, |v| v.readonly = true);
     }
@@ -2941,8 +2938,8 @@ impl Shell {
         self.vars.get(name).map(|v| v.integer).unwrap_or(false)
     }
 
-    /// Marks `name` integer. If `name` is unset, creates it with an
-    /// empty value (mirrors `mark_readonly`). Used by `declare -i`.
+    /// Marks `name` integer. If `name` is unset, creates it as a declared-
+    /// but-unset scalar (mirrors `mark_readonly`). Used by `declare -i`.
     pub fn mark_integer(&mut self, name: &str) {
         self.mutate_or_create(name, |v| v.integer = true);
     }
@@ -2961,8 +2958,9 @@ impl Shell {
     }
 
     /// Sets (or clears, with `None`) the case-fold attribute on `name`.
-    /// Creates an empty scalar if the variable is unset, mirroring
-    /// `mark_integer` (so `declare -l NAME` with no value declares it).
+    /// Creates a declared-but-unset scalar if the variable is unset,
+    /// mirroring `mark_integer` (so `declare -l NAME` with no value
+    /// declares it).
     pub fn set_case_fold(&mut self, name: &str, fold: Option<CaseFold>) {
         self.mutate_or_create(name, |v| v.case_fold = fold);
     }
@@ -3517,6 +3515,29 @@ impl Shell {
         }
     }
 
+    /// True when `name` is bound to associative-array SHAPE, whether
+    /// materialised or merely declared-but-unset (#600). Unlike
+    /// `get_associative` (which answers `None` for an unset associative,
+    /// correct for a VALUE lookup), this backs write-path dispatch that must
+    /// route an element write (`x[k]=v`) to the associative mutator even
+    /// before any element has materialised the map — `set_indexed_element`
+    /// would otherwise be tried first and refuse with a shape-mismatch
+    /// error. Resolves through namerefs like `get_associative`.
+    pub fn is_associative_shape(&self, name: &str) -> bool {
+        let resolved = if self.is_nameref(name) {
+            match self.resolve_nameref(name) {
+                ResolvedName::Name(n) => n,
+                _ => return false,
+            }
+        } else {
+            name.to_string()
+        };
+        matches!(
+            self.vars.get(&resolved).map(|v| v.value.shape()),
+            Some(Shape::Associative)
+        )
+    }
+
     /// Returns the value at string key `key` for the associative array `name`.
     /// `None` if the variable is unset, not associative, or has no such key.
     pub fn lookup_associative_element(&self, name: &str, key: &str) -> Option<String> {
@@ -3599,11 +3620,17 @@ impl Shell {
         )
     }
 
-    /// Creates an empty associative array under `name`. Enforces bash rules:
-    /// - Unset → create empty associative.
-    /// - Already associative → no-op.
-    /// - Indexed → error: `DeclareErr::IndexedExists`.
-    /// - Scalar → error: `DeclareErr::ScalarExists`.
+    /// Ensures `name` has the associative-array SHAPE. Enforces bash rules:
+    /// - Unset (no prior name) → declared-but-unset associative, no value.
+    /// - Already associative (materialised or unset) → no-op — bash does not
+    ///   materialise a value just from re-declaring the same shape (measured:
+    ///   `declare -A x; declare -A x; declare -p x` -> `declare -A x`,
+    ///   `[[ -v x ]]` false).
+    /// - Unset scalar → becomes an unset associative, still no value
+    ///   (measured: `declare v; declare -A v; declare -p v` -> `declare -A
+    ///   v`, `[[ -v v ]]` false).
+    /// - Indexed (materialised or unset) → error: `DeclareErr::IndexedExists`.
+    /// - Scalar (materialised) → error: `DeclareErr::ScalarExists`.
     ///
     /// Does NOT print any diagnostic; callers should format via
     /// [`declare_err_message`] so the correct command name (declare,
@@ -3611,39 +3638,56 @@ impl Shell {
     pub fn declare_associative(&mut self, name: &str) -> Result<(), DeclareErr> {
         match self.vars.get(name).map(|v| &v.value) {
             None => {
-                self.vars.insert(
-                    name.to_string(),
-                    Variable {
-                        value: VarValue::Associative(crate::assoc_map::AssocMap::new()),
-                        exported: false,
-                        readonly: false,
-                        integer: false,
-                        case_fold: None,
-                        nameref: false,
-                    },
-                );
+                self.vars
+                    .insert(name.to_string(), Variable::unset(Shape::Associative));
                 Ok(())
             }
             Some(VarValue::Associative(_)) => Ok(()),
             Some(VarValue::Indexed(_)) => Err(DeclareErr::IndexedExists),
             Some(VarValue::Scalar(_)) => Err(DeclareErr::ScalarExists),
             Some(VarValue::Unset(Shape::Scalar)) => {
-                // #600: unset scalar can become associative.
+                // #600: unset scalar can become associative — stays unset.
                 let var = self.vars.get_mut(name).unwrap();
-                var.value = VarValue::Associative(crate::assoc_map::AssocMap::new());
+                var.value = VarValue::Unset(Shape::Associative);
                 Ok(())
             }
-            Some(VarValue::Unset(Shape::Associative)) => {
-                // #600: unset associative becomes a materialised associative.
-                let var = self.vars.get_mut(name).unwrap();
-                var.value = VarValue::Associative(crate::assoc_map::AssocMap::new());
-                Ok(())
-            }
+            Some(VarValue::Unset(Shape::Associative)) => Ok(()),
             Some(VarValue::Unset(Shape::Indexed)) => {
                 // #600: unset indexed cannot become associative (same rule as materialised indexed).
                 Err(DeclareErr::IndexedExists)
             }
         }
+    }
+
+    /// Records the indexed-array SHAPE on `name` without materialising a
+    /// value (#600): the `declare -a NAME` path when there is no existing
+    /// scalar to promote to element 0 (the caller handles that promotion
+    /// separately — a materialised scalar always has a value to carry
+    /// forward, unlike this no-value path). An absent name becomes a fresh
+    /// declared-but-unset indexed array; any other existing (necessarily
+    /// unset, since a materialised scalar is routed elsewhere and a
+    /// materialised associative/indexed value means `get_indexed`/`get`
+    /// already returned `Some`) variable just has its shape flipped to
+    /// `Indexed`, preserving its other attributes and unset-ness — mirrors
+    /// `declare_associative`'s `Unset(Scalar)` arm.
+    pub fn declare_indexed_unset(&mut self, name: &str) {
+        match self.vars.get_mut(name) {
+            Some(v) => v.value = VarValue::Unset(Shape::Indexed),
+            None => {
+                self.vars
+                    .insert(name.to_string(), Variable::unset(Shape::Indexed));
+            }
+        }
+    }
+
+    /// Declares `name` fresh as a declared-but-unset SCALAR, unconditionally
+    /// replacing any existing entry (#691: `local NAME`, bare — a fresh
+    /// local starts from nothing, not from the binding it shadows, so this
+    /// is an insert, not a mutate-in-place like `declare_indexed_unset`).
+    /// Callers apply any inherited attribute (export, per #691) afterwards.
+    pub fn declare_unset_scalar(&mut self, name: &str) {
+        self.vars
+            .insert(name.to_string(), Variable::unset(Shape::Scalar));
     }
 
     pub fn last_status(&self) -> i32 {

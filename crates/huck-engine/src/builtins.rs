@@ -1970,19 +1970,24 @@ fn builtin_local_decl(
                     // leave value empty (unbound nameref).
                     shell.set_nameref(name, true);
                 } else if want_array {
-                    // Promote existing scalar to element 0 (bash semantics)
-                    // or create an empty indexed array.
+                    // Promote a materialised scalar to element 0 (bash
+                    // semantics); otherwise (unset, or genuinely absent
+                    // post-clear) just record the shape without a value
+                    // (#600) — mirrors builtin_declare_decl's array block.
                     if shell.get_indexed(name).is_none() {
-                        let mut empty = std::collections::BTreeMap::new();
-                        if let Some(scalar) = shell.get(name) {
-                            empty.insert(0, scalar.to_string());
-                        }
-                        if shell.replace_indexed(name, empty).is_err() {
-                            exit = 1;
-                            // Shape creation FAILED — skip the post-chain
-                            // mark_integer (consistent with the associative
-                            // branch / builtin_declare_decl).
-                            continue;
+                        match shell.get(name) {
+                            Some(scalar) => {
+                                let mut elements = std::collections::BTreeMap::new();
+                                elements.insert(0, scalar.to_string());
+                                if shell.replace_indexed(name, elements).is_err() {
+                                    exit = 1;
+                                    // Shape creation FAILED — skip the post-chain
+                                    // mark_integer (consistent with the associative
+                                    // branch / builtin_declare_decl).
+                                    continue;
+                                }
+                            }
+                            None => shell.declare_indexed_unset(name),
                         }
                     }
                 } else if want_associative {
@@ -2016,13 +2021,15 @@ fn builtin_local_decl(
                     shell.mark_integer(name);
                 } else if !already_local {
                     // Bare `local NAME` with no value (fresh local): declare it
-                    // function-local but UNSET (matches bash + `declare NAME`).
-                    // The snapshot above records the outer value so it is
-                    // restored on return; unsetting makes `[[ -v NAME ]]` /
-                    // `${NAME-d}` see it as unset until assigned. A bare
-                    // re-`local` of an already-local name preserves its value
-                    // (bash), so only unset when NOT already_local. (M-111)
-                    shell.unset(name);
+                    // function-local but UNSET (matches bash + `declare NAME`,
+                    // #600/#691) — a declared-but-unset scalar, not simply
+                    // absent, so `declare -p NAME` still prints `declare --
+                    // NAME` rather than "not found". The snapshot above
+                    // records the outer value so it is restored on return.
+                    // A bare re-`local` of an already-local name preserves
+                    // its value (bash), so only replace when NOT
+                    // already_local. (M-111)
+                    shell.declare_unset_scalar(name);
                 }
                 // `local -ai`/`-Ai` NAME (bare): apply the integer flag AFTER
                 // the array shape was created above (mark_integer sets the flag
@@ -2047,10 +2054,13 @@ fn builtin_local_decl(
                     shell.mark_readonly(name);
                 }
                 // Re-apply the shadowed variable's export attribute (the only
-                // one bash carries into a local). Gated on the local actually
-                // having materialised: a bare `local NAME` with no flags stays
-                // unset, and `shell.export` would create an empty scalar there.
-                if was_exported && !saw_plus_x && shell.is_set(name) {
+                // one bash carries into a local, #691). `export` is a pure
+                // attribute mutator now (#600) — it no longer needs a
+                // materialised value to apply, so this fires even for a bare
+                // `local NAME` that stays declared-but-unset (measured:
+                // `declare -x V=1; f(){ local V; declare -p V; }; f` ->
+                // `declare -x V`).
+                if was_exported && !saw_plus_x {
                     shell.export(name);
                 }
             }
@@ -2281,15 +2291,20 @@ fn builtin_readonly_decl(
                     && shell.get_associative(name).is_none()
                     && shell.get_indexed(name).is_none()
                 {
-                    let mut empty = std::collections::BTreeMap::new();
-                    if let Some(scalar) = shell.get(name) {
-                        empty.insert(0, scalar.to_string());
-                    }
-                    if shell.replace_indexed(name, empty).is_err() {
-                        // assign() already emitted the readonly-variable
-                        // error (bare `{name}: readonly variable`, no prefix).
-                        exit = 1;
-                        continue;
+                    match shell.get(name) {
+                        Some(scalar) => {
+                            let mut elements = std::collections::BTreeMap::new();
+                            elements.insert(0, scalar.to_string());
+                            if shell.replace_indexed(name, elements).is_err() {
+                                // assign() already emitted the readonly-variable
+                                // error (bare `{name}: readonly variable`, no prefix).
+                                exit = 1;
+                                continue;
+                            }
+                        }
+                        // #600: nothing to promote — record the shape
+                        // without materialising a value.
+                        None => shell.declare_indexed_unset(name),
                     }
                 }
                 shell.mark_readonly(name);
@@ -2789,19 +2804,23 @@ fn builtin_declare_decl(
             shell.unmark_integer(name);
         }
 
-        // Array-attribute handling. `-a NAME` with no value: promote
-        // scalar to element 0 (or create empty array). With a value,
-        // fall through into the assignment path below — it always
+        // Array-attribute handling. `-a NAME` with no value: promote a
+        // materialised scalar to element 0; otherwise (unset, or wholly
+        // absent) just record the shape without a value (#600). With an
+        // `=value`, fall through into the assignment path below — it always
         // routes compound RHS through apply_one_assignment.
         if want_array && assign_opt.is_none() && shell.get_indexed(name).is_none() {
-            let mut empty = std::collections::BTreeMap::new();
-            if let Some(scalar) = shell.get(name) {
-                empty.insert(0, scalar.to_string());
-            }
-            if shell.replace_indexed(name, empty).is_err() {
-                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
-                exit = 1;
-                continue;
+            match shell.get(name) {
+                Some(scalar) => {
+                    let mut elements = std::collections::BTreeMap::new();
+                    elements.insert(0, scalar.to_string());
+                    if shell.replace_indexed(name, elements).is_err() {
+                        crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
+                        exit = 1;
+                        continue;
+                    }
+                }
+                None => shell.declare_indexed_unset(name),
             }
         }
 
@@ -3036,9 +3055,15 @@ fn builtin_declare_decl(
         if want_remove_export {
             shell.unexport(name);
         }
-        // Bare `declare NAME` (no flag, no value): inside a function,
-        // the snapshot is enough. Outside, no-op. Match the legacy
-        // builtin_declare behavior.
+        // #600: bash's `declare NAME` always makes NAME a known,
+        // declared-but-unset variable — even with a no-op flag combo like
+        // `declare +i NAME` on a name that doesn't exist yet (measured:
+        // `declare +i n; declare -p n` -> `declare -- n`, rc 0). None of the
+        // attribute mutators above ran when every flag here is a no-op, so
+        // ensure the entry exists without clobbering one that already does.
+        if shell.snapshot_var(name).is_none() {
+            shell.declare_unset_scalar(name);
+        }
     }
     ExecOutcome::Continue(exit)
 }
