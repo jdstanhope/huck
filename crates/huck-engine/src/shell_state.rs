@@ -2345,7 +2345,12 @@ impl Shell {
     pub fn array_var_names(&self) -> Vec<String> {
         self.vars
             .iter()
-            .filter(|(_, v)| matches!(v.value, VarValue::Indexed(_) | VarValue::Associative(_)))
+            // #600: bash's `compgen -A arrayvar` does not enumerate unset array
+            // variables (which have the shape but no value).
+            .filter(|(_, v)| {
+                matches!(v.value, VarValue::Indexed(_) | VarValue::Associative(_))
+                    && !v.value.is_unset()
+            })
             .map(|(k, _)| k.clone())
             .collect()
     }

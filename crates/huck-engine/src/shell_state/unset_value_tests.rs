@@ -261,3 +261,136 @@ fn declare_p_omits_the_value_while_unset() {
         "declare -- v"
     );
 }
+
+/// #600 fix round 1: bare `declare` / `declare -a` / `declare -A` do not
+/// enumerate unset variables (but `declare -p` does).
+#[test]
+fn declare_bare_listing_omits_unset_variables() {
+    let mut sh = Shell::new();
+    sh.vars
+        .insert("v_unset".to_string(), Variable::unset(Shape::Scalar));
+    sh.set("v_set", "value".to_string());
+
+    // Filtering logic from declare_list_all_vars: bare listing excludes unset vars
+    let unset_count = sh.iter_vars().filter(|(_, v)| v.value.is_unset()).count();
+    let set_count = sh.iter_vars().filter(|(_, v)| !v.value.is_unset()).count();
+    let total = sh.iter_vars().count();
+
+    assert_eq!(total, unset_count + set_count);
+    assert!(unset_count >= 1, "v_unset should be in iter_vars");
+
+    // After filtering (as declare_list_all_vars does), v_unset should be excluded
+    let bare_names: Vec<&String> = sh
+        .iter_vars()
+        .filter(|(_, v)| !v.value.is_unset())
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        !bare_names.iter().any(|n| *n == "v_unset"),
+        "v_unset should not appear in bare listing"
+    );
+    assert!(
+        bare_names.iter().any(|n| *n == "v_set"),
+        "v_set should appear"
+    );
+}
+
+/// #600 fix round 1: `${!prefix*}` / `${!prefix@}` do not enumerate unset
+/// variables.
+#[test]
+fn prefix_expansion_omits_unset_variables() {
+    let mut sh = Shell::new();
+    sh.vars
+        .insert("y_unset".to_string(), Variable::unset(Shape::Scalar));
+    sh.set("y_set", "value".to_string());
+
+    // ${!y*} should only include y_set, not y_unset
+    let unset_count = sh
+        .iter_vars()
+        .filter(|(n, v)| n.starts_with("y_") && !v.value.is_unset())
+        .count();
+    assert_eq!(unset_count, 1, "only y_set should be enumerated");
+
+    // After setting y_unset
+    sh.set("y_unset", "value".to_string());
+    let set_count = sh
+        .iter_vars()
+        .filter(|(n, v)| n.starts_with("y_") && !v.value.is_unset())
+        .count();
+    assert_eq!(set_count, 2, "both y_set and y_unset should be enumerated");
+}
+
+/// #600 fix round 1: `compgen -A export` does not enumerate unset variables.
+#[test]
+fn compgen_export_omits_unset_variables() {
+    let mut sh = Shell::new();
+    let mut unset_exported = Variable::unset(Shape::Scalar);
+    unset_exported.exported = true;
+    sh.vars.insert("EE".to_string(), unset_exported);
+    sh.set("FF", "value".to_string());
+    sh.export("FF");
+
+    // compgen -A export should not list EE
+    let names: Vec<String> = sh
+        .iter_vars()
+        .filter(|(_, v)| v.exported && !v.value.is_unset())
+        .map(|(n, _)| n.clone())
+        .collect();
+    assert!(
+        !names.contains(&"EE".to_string()),
+        "unset EE should not appear"
+    );
+    assert!(names.contains(&"FF".to_string()), "set FF should appear");
+
+    // After setting EE, it should appear
+    sh.set("EE", "value".to_string());
+    let names: Vec<String> = sh
+        .iter_vars()
+        .filter(|(_, v)| v.exported && !v.value.is_unset())
+        .map(|(n, _)| n.clone())
+        .collect();
+    assert!(names.contains(&"EE".to_string()), "set EE should appear");
+}
+
+/// #600 fix round 1: `compgen -A arrayvar` does not enumerate unset array
+/// variables.
+#[test]
+fn compgen_arrayvar_omits_unset_variables() {
+    let mut sh = Shell::new();
+    sh.vars
+        .insert("yy".to_string(), Variable::unset(Shape::Indexed));
+    sh.vars
+        .insert("zz".to_string(), Variable::unset(Shape::Associative));
+    // Create materialized arrays
+    let mut aa_map = std::collections::BTreeMap::new();
+    aa_map.insert(0, "value".to_string());
+    sh.replace_indexed("aa", aa_map).unwrap();
+
+    sh.replace_associative("bb", vec![("k".to_string(), "value".to_string())])
+        .unwrap();
+
+    // array_var_names should not list yy or zz (unset arrays)
+    let names = sh.array_var_names();
+    assert!(
+        !names.contains(&"yy".to_string()),
+        "unset yy should not appear"
+    );
+    assert!(
+        !names.contains(&"zz".to_string()),
+        "unset zz should not appear"
+    );
+    assert!(names.contains(&"aa".to_string()), "set aa should appear");
+    assert!(names.contains(&"bb".to_string()), "set bb should appear");
+
+    // After setting yy and zz, they should appear
+    let mut yy_map = std::collections::BTreeMap::new();
+    yy_map.insert(0, "value".to_string());
+    sh.replace_indexed("yy", yy_map).unwrap();
+
+    sh.replace_associative("zz", vec![("k".to_string(), "value".to_string())])
+        .unwrap();
+
+    let names = sh.array_var_names();
+    assert!(names.contains(&"yy".to_string()), "set yy should appear");
+    assert!(names.contains(&"zz".to_string()), "set zz should appear");
+}

@@ -1490,7 +1490,12 @@ fn clear_local_shadow(shell: &mut Shell, name: &str, already_local: bool) -> boo
 /// Emit every variable in `shell` (sorted by name) as a
 /// `declare ATTR NAME="value"` line.
 fn declare_list_all_vars(out: &mut dyn std::io::Write, shell: &Shell, bare: bool) -> ExecOutcome {
-    let mut entries: Vec<(&String, &crate::shell_state::Variable)> = shell.iter_vars().collect();
+    let mut entries: Vec<(&String, &crate::shell_state::Variable)> = shell
+        .iter_vars()
+        // #600: bare `declare` / `typeset` omits unset variables, but `declare -p`
+        // shows them.
+        .filter(|(_, v)| !bare || !v.value.is_unset())
+        .collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (name, var) in entries {
         let line = if bare {
@@ -2634,7 +2639,9 @@ fn builtin_declare_decl(
             use crate::shell_state::VarValue;
             let mut entries: Vec<(&String, &crate::shell_state::Variable)> = shell
                 .iter_vars()
-                .filter(|(_, v)| matches!(v.value, VarValue::Indexed(_)))
+                // #600: `declare -a` lists only materialized indexed arrays, not unset
+                // ones (which match the shape but have no value).
+                .filter(|(_, v)| matches!(v.value, VarValue::Indexed(_)) && !v.value.is_unset())
                 .collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
             for (name, var) in entries {
@@ -2646,7 +2653,9 @@ fn builtin_declare_decl(
             use crate::shell_state::VarValue;
             let mut entries: Vec<(&String, &crate::shell_state::Variable)> = shell
                 .iter_vars()
-                .filter(|(_, v)| matches!(v.value, VarValue::Associative(_)))
+                // #600: `declare -A` lists only materialized associative arrays, not unset
+                // ones (which match the shape but have no value).
+                .filter(|(_, v)| matches!(v.value, VarValue::Associative(_)) && !v.value.is_unset())
                 .collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
             for (name, var) in entries {
