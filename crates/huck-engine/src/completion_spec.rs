@@ -575,7 +575,7 @@ fn glob_match(pattern: &str, candidate: &str) -> bool {
     )
 }
 
-fn complete_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> {
+pub(crate) fn complete_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> {
     let home = shell.get("HOME").unwrap_or("").to_string();
     match action {
         Action::File => list_dir_with_path_prefix(prefix, false, &home),

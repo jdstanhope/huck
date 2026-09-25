@@ -1489,7 +1489,11 @@ fn clear_local_shadow(shell: &mut Shell, name: &str, already_local: bool) -> boo
 
 /// Emit every variable in `shell` (sorted by name) as a
 /// `declare ATTR NAME="value"` line.
-fn declare_list_all_vars(out: &mut dyn std::io::Write, shell: &Shell, bare: bool) -> ExecOutcome {
+pub(crate) fn declare_list_all_vars(
+    out: &mut dyn std::io::Write,
+    shell: &Shell,
+    bare: bool,
+) -> ExecOutcome {
     let mut entries: Vec<(&String, &crate::shell_state::Variable)> = shell
         .iter_vars()
         // #600: bare `declare` / `typeset` omits unset variables, but `declare -p`

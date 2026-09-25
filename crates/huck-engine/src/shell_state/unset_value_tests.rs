@@ -271,27 +271,20 @@ fn declare_bare_listing_omits_unset_variables() {
         .insert("v_unset".to_string(), Variable::unset(Shape::Scalar));
     sh.set("v_set", "value".to_string());
 
-    // Filtering logic from declare_list_all_vars: bare listing excludes unset vars
-    let unset_count = sh.iter_vars().filter(|(_, v)| v.value.is_unset()).count();
-    let set_count = sh.iter_vars().filter(|(_, v)| !v.value.is_unset()).count();
-    let total = sh.iter_vars().count();
+    // Call the actual production function that produces bare declare listings
+    let mut output = Vec::new();
+    crate::builtins::declare_list_all_vars(&mut output, &sh, true);
+    let listing = String::from_utf8_lossy(&output);
 
-    assert_eq!(total, unset_count + set_count);
-    assert!(unset_count >= 1, "v_unset should be in iter_vars");
-
-    // After filtering (as declare_list_all_vars does), v_unset should be excluded
-    let bare_names: Vec<&String> = sh
-        .iter_vars()
-        .filter(|(_, v)| !v.value.is_unset())
-        .map(|(n, _)| n)
-        .collect();
+    // Unset variable should NOT appear in bare listing
     assert!(
-        !bare_names.iter().any(|n| *n == "v_unset"),
-        "v_unset should not appear in bare listing"
+        !listing.contains("v_unset"),
+        "unset v_unset should not appear in bare declare output"
     );
+    // Set variable should appear
     assert!(
-        bare_names.iter().any(|n| *n == "v_set"),
-        "v_set should appear"
+        listing.contains("v_set"),
+        "set v_set should appear in bare declare output"
     );
 }
 
@@ -304,20 +297,47 @@ fn prefix_expansion_omits_unset_variables() {
         .insert("y_unset".to_string(), Variable::unset(Shape::Scalar));
     sh.set("y_set", "value".to_string());
 
-    // ${!y*} should only include y_set, not y_unset
-    let unset_count = sh
-        .iter_vars()
-        .filter(|(n, v)| n.starts_with("y_") && !v.value.is_unset())
-        .count();
-    assert_eq!(unset_count, 1, "only y_set should be enumerated");
+    // Call the actual expansion for ${!y*}
+    use crate::lexer::ParamModifier;
+    let result = crate::param_expansion::expand_modifier(
+        "y",
+        &ParamModifier::PrefixNames { at: false },
+        &mut sh,
+    );
+    let names = match result {
+        crate::param_expansion::ExpansionResult::Value(v) => v,
+        _ => String::new(),
+    };
 
-    // After setting y_unset
+    // Unset variable should NOT appear in the expansion result
+    assert!(
+        !names.contains("y_unset"),
+        "unset y_unset should not appear in prefix expansion: '{}'",
+        names
+    );
+    // Set variable should appear
+    assert!(
+        names.contains("y_set"),
+        "set y_set should appear in prefix expansion: '{}'",
+        names
+    );
+
+    // After setting y_unset, it should now appear
     sh.set("y_unset", "value".to_string());
-    let set_count = sh
-        .iter_vars()
-        .filter(|(n, v)| n.starts_with("y_") && !v.value.is_unset())
-        .count();
-    assert_eq!(set_count, 2, "both y_set and y_unset should be enumerated");
+    let result = crate::param_expansion::expand_modifier(
+        "y",
+        &ParamModifier::PrefixNames { at: false },
+        &mut sh,
+    );
+    let names = match result {
+        crate::param_expansion::ExpansionResult::Value(v) => v,
+        _ => String::new(),
+    };
+    assert!(
+        names.contains("y_unset"),
+        "now-set y_unset should appear in prefix expansion: '{}'",
+        names
+    );
 }
 
 /// #600 fix round 1: `compgen -A export` does not enumerate unset variables.
@@ -330,26 +350,28 @@ fn compgen_export_omits_unset_variables() {
     sh.set("FF", "value".to_string());
     sh.export("FF");
 
-    // compgen -A export should not list EE
-    let names: Vec<String> = sh
-        .iter_vars()
-        .filter(|(_, v)| v.exported && !v.value.is_unset())
-        .map(|(n, _)| n.clone())
-        .collect();
+    // Call the actual completion action dispatcher for "export"
+    use crate::completion_spec::Action;
+    let names = crate::completion_spec::complete_action(Action::Export, "", &sh);
+
+    // Unset exported variable should NOT appear in the result
     assert!(
         !names.contains(&"EE".to_string()),
-        "unset EE should not appear"
+        "unset EE should not appear in compgen -A export"
     );
-    assert!(names.contains(&"FF".to_string()), "set FF should appear");
+    // Set exported variable should appear
+    assert!(
+        names.contains(&"FF".to_string()),
+        "set FF should appear in compgen -A export"
+    );
 
-    // After setting EE, it should appear
+    // After setting EE, it should now appear
     sh.set("EE", "value".to_string());
-    let names: Vec<String> = sh
-        .iter_vars()
-        .filter(|(_, v)| v.exported && !v.value.is_unset())
-        .map(|(n, _)| n.clone())
-        .collect();
-    assert!(names.contains(&"EE".to_string()), "set EE should appear");
+    let names = crate::completion_spec::complete_action(Action::Export, "", &sh);
+    assert!(
+        names.contains(&"EE".to_string()),
+        "now-set EE should appear in compgen -A export"
+    );
 }
 
 /// #600 fix round 1: `compgen -A arrayvar` does not enumerate unset array
