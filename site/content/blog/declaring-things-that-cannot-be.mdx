@@ -1,0 +1,152 @@
+---
+title: "Declaring things that cannot be"
+date: 2026-09-28
+summary: "Three more rounds on huck's declaration builtins: a refusal that fired when it should not have, one that never fired at all, and a builtin that kept introducing itself by the wrong name."
+tags: ["variables", "declare", "local", "typeset", "namerefs", "bugfix"]
+version: null
+draft: false
+---
+
+This follows on from [turning a variable into an array](/blog/turning-a-variable-into-an-array),
+which fixed the table bash consults when you change a variable's shape. Fixing
+one cell of that table turned up neighbours, and the neighbours turned up more.
+Three rounds landed; the fourth found something that needs a design.
+
+## A refusal that fired too eagerly
+
+`declare +a NAME` asks to take the array attribute off a variable. bash refuses
+— but only when the variable actually *is* an indexed array. huck refused
+before it had even looked at the name:
+
+```bash
+# before
+$ huck -c 'v=s; declare +a v; echo rc=$?; declare -p v'
+huck: line 1: declare: +a: array attribute cannot be removed
+rc=1
+declare -- v="s"
+```
+
+```bash
+# after
+$ huck -c 'v=s; declare +a v; echo rc=$?; declare -p v'
+rc=0
+declare -- v="s"
+```
+
+`v` is a plain string; there is no array attribute to remove, so bash shrugs.
+The same was true of a name that did not exist, and — the detail that gives the
+rule away — of an *associative* array, because `+a` and `+A` do not cross:
+`+a` objects only to an indexed array and `+A` only to an associative one.
+
+When it does fire, bash names the variable rather than the flag:
+
+```bash
+# before
+$ huck -c 'declare -a y; declare +a y'
+huck: line 1: declare: +a: array attribute cannot be removed
+```
+
+```bash
+# after
+$ huck -c 'declare -a y; declare +a y'
+huck: line 1: declare: y: cannot destroy array variables in this way
+```
+
+`local` had the opposite problem: it accepted `+a` on one of its own arrays
+silently, no message at all.
+
+## A refusal that never fired
+
+A nameref is a variable that points at another variable. An array cannot be
+one, and huck knew that — for exactly one spelling of the declaration. Give
+the nameref a target on the same line and the check was skipped, and the
+array's first element was quietly overwritten with the target's *name*:
+
+```bash
+# before
+$ huck -c 'declare -a r=(1); declare -n r=t; declare -p r'
+declare -na r=([0]="t")
+```
+
+```bash
+# after
+$ huck -c 'declare -a r=(1); declare -n r=t; declare -p r'
+huck: line 1: declare: r: reference variable cannot be an array
+declare -a r=([0]="1")
+```
+
+On an associative array the same path leaked one of huck's own internal
+messages out to the user, which is never supposed to happen:
+
+```bash
+# before
+$ huck -c 'declare -A r=([k]=v); declare -n r=t'
+huck: line 1: internal: install_scalar_value on associative array
+```
+
+```bash
+# after
+$ huck -c 'declare -A r=([k]=v); declare -n r=t'
+huck: line 1: declare: r: reference variable cannot be an array
+```
+
+Fixing it also fixed something that looked unrelated. bash checks a nameref
+declaration *before* it refuses to write a read-only variable, so
+`readonly r=1; declare -n r=r` complains about the circular reference, not
+about read-only-ness. huck had those the other way round, which hid all three
+nameref checks behind one readonly message.
+
+## The builtin with two names
+
+`typeset` is `declare` under a different name, and bash says so in its
+diagnostics — every message names the builtin you actually typed. huck had the
+word `declare` written into thirteen of them:
+
+```bash
+# before
+$ huck -c 'typeset -r y=1; typeset y=2'
+huck: line 1: declare: y: readonly variable
+```
+
+```bash
+# after
+$ huck -c 'typeset -r y=1; typeset y=2'
+huck: line 1: typeset: y: readonly variable
+```
+
+## Where it stopped
+
+The next issue on the list was the other half of the conversion table: the
+case where the declaration carries a value, as in
+`declare -A m=([k]=v); readonly -a m=([x]=y)`, which huck performed instead of
+refusing. Measuring it produced something that is not about arrays at all:
+
+```bash
+$ bash -c 'readonly m=1; declare -a m=(9)'
+bash: line 1: m: readonly variable
+
+$ bash -c 'readonly m=1; declare -a m=9'
+bash: line 1: declare: m: readonly variable
+```
+
+Same builtin, same variable, same error — but one message names `declare` and
+the other does not, and only the second lets the rest of the line run. The
+difference is the parentheses. bash performs a parenthesised assignment to a
+declaration builtin *before the builtin starts*, as part of expanding its
+arguments, so those errors come from a different place in bash with different
+manners. huck does it inside the builtin.
+
+That is a decision about where a whole class of assignment happens, not a
+missing check, so it goes back on the list with the measurements attached
+rather than into a branch.
+
+Still open from this run:
+[#347](https://github.com/jdstanhope/huck/issues/347) (that last one, with its
+two siblings [#783](https://github.com/jdstanhope/huck/issues/783) and
+[#785](https://github.com/jdstanhope/huck/issues/785)),
+[#786](https://github.com/jdstanhope/huck/issues/786) and
+[#793](https://github.com/jdstanhope/huck/issues/793) (how a nameref and an
+array shape interact), and
+[#792](https://github.com/jdstanhope/huck/issues/792) (a nameref that points at
+itself is a warning inside a function, and resolves to the global variable of
+the same name).
