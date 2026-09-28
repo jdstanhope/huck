@@ -26,7 +26,7 @@ changes a shared subsystem's semantics and gets a spec + plan + hand-off PR.
 | 1 | Job table: bash's five cleanup points + stored `+`/`-`; fork-site signal dispositions | #475 #758 (round 1, PR #769); #185 (round 2, PR #771); #478 #766 (round 3, PR #773) | bug-fix rounds | ✅ done (#772 filed) |
 | 4 | One AST printer (`generate` gains bash's outside-a-function style; diagnostics, `jobs`, `$BASH_COMMAND` use it) | #761 #770 (round 1, PR #774); #124 (round 2, PR #775); #589 moved to hub 5 (it is the matcher's escape form) | bug-fix rounds | ✅ done |
 | 5 | One pattern-matching chokepoint (`glob_match::pattern_matches`), pattern text in bash's form | #717 #303 #589 (PR #776) | bug-fix round | ✅ done |
-| 2A | Declared-but-unset variable state | #600 #225 #33 #691 | vNN | |
+| 2A | Declared-but-unset variable state (+ export set, option letters) | #600 #225 #33 #691 #692 #777 #698-half (v365, PR pending) | vNN | ✅ done |
 | 2B | One declaration policy table | #347 #697 #698 #734 #65 | vNN (after 2A) | |
 | 3 | Piped-stdin reader feeds the lexer; parse the line before running it | #701 #81 #21 #79 #575 | vNN | |
 | 6a | Brace expansion out of the lexer | #24 #44 #387 | vNN | |
@@ -154,6 +154,21 @@ an empty value.
 **Blast radius (from #600):** `scalar_view`, the `${…}` expansion arms, `-v`,
 nounset, `declare -p`/`@A` rendering, the export snapshot, `local`'s declaration
 path. This is the first of two `VarValue` passes; the second is hub 8.
+
+**What it actually took (v365, 2026-09-22/25).** Smaller than #600 feared on the
+read side, bigger on the export side. `lookup_var` already returned
+`Option<String>`, so an unset variable answers `None` like an absent one and
+all ~63 callers were untouched — the null state is invisible except where the
+distinction IS the question. The export set was the hard half: it is TWO
+questions (`export -p` lists the visible binding; a child gets the innermost
+binding that is exported AND valued), and the walk needs THREE outcomes, not
+two — continue past a valueless or unexported binding, stop with a value at an
+exported scalar, stop with NOTHING at an exported array. Getting that last case
+wrong leaked a stale outer value into children when a local array shadowed an
+exported name; it was caught only by the final whole-branch review. The plan's
+"~33 pinned assertions" was a defect: the real number was six unit tests.
+Folded in beyond the roadmap row: #692, #777 (`local -x`), `export -A`, and the
+`readonly`/`export` selector half of #698. Filed on the way: #778-#781.
 
 ### 2B. One declaration policy table
 

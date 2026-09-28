@@ -1270,17 +1270,15 @@ pub(crate) fn declare_scalar_quote(v: &str) -> String {
 /// For indexed-array variables, the value is rendered as
 /// `([0]="v0" [1]="v1" ...)` over the keys in ascending order.
 pub(crate) fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String {
-    use crate::shell_state::VarValue;
-
     let mut attrs = String::new();
     // Order matches bash's `declare -p` output: n, a/A, i, r, x, l/u.
     if var.nameref {
         attrs.push('n');
     }
-    if matches!(var.value, VarValue::Indexed(_)) {
+    if matches!(var.value.shape(), crate::shell_state::Shape::Indexed) {
         attrs.push('a');
     }
-    if matches!(var.value, VarValue::Associative(_)) {
+    if matches!(var.value.shape(), crate::shell_state::Shape::Associative) {
         attrs.push('A');
     }
     if var.integer {
@@ -1306,6 +1304,10 @@ pub(crate) fn format_declare_line(name: &str, var: &crate::shell_state::Variable
         s.push_str(&attrs);
         s
     };
+    // #600: a declared-but-unset variable prints WITHOUT `=…`.
+    if var.value.is_unset() {
+        return format!("declare {flag_str} {name}");
+    }
     let value_part = render_declare_value_part(var);
     format!("declare {flag_str} {name}{value_part}")
 }
@@ -1376,6 +1378,7 @@ fn render_declare_value_part(var: &crate::shell_state::Variable) -> String {
                 format!("=({} )", parts.join(" "))
             }
         }
+        VarValue::Unset(_) => String::new(),
     }
 }
 
@@ -1394,6 +1397,10 @@ fn format_declare_bare_line(name: &str, var: &crate::shell_state::Variable) -> S
             }
         }
         VarValue::Indexed(_) | VarValue::Associative(_) => {
+            format!("{name}{}", render_declare_value_part(var))
+        }
+        VarValue::Unset(_) => {
+            // Unset variable: format as just the name (empty value).
             format!("{name}{}", render_declare_value_part(var))
         }
     }
@@ -1482,8 +1489,17 @@ fn clear_local_shadow(shell: &mut Shell, name: &str, already_local: bool) -> boo
 
 /// Emit every variable in `shell` (sorted by name) as a
 /// `declare ATTR NAME="value"` line.
-fn declare_list_all_vars(out: &mut dyn std::io::Write, shell: &Shell, bare: bool) -> ExecOutcome {
-    let mut entries: Vec<(&String, &crate::shell_state::Variable)> = shell.iter_vars().collect();
+pub(crate) fn declare_list_all_vars(
+    out: &mut dyn std::io::Write,
+    shell: &Shell,
+    bare: bool,
+) -> ExecOutcome {
+    let mut entries: Vec<(&String, &crate::shell_state::Variable)> = shell
+        .iter_vars()
+        // #600: bare `declare` / `typeset` omits unset variables, but `declare -p`
+        // shows them.
+        .filter(|(_, v)| !bare || !v.value.is_unset())
+        .collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (name, var) in entries {
         let line = if bare {
@@ -1598,20 +1614,27 @@ fn builtin_export_decl(
     err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    // `-a` is a huck-specific no-op (mise emits `export -a chpwd_functions`);
-    // `-p` lists (only when no operands); `-n` unexports; `-f` is function
-    // export.
+    // `-a`/`-A` are a pure shape SELECTOR (never a mutator, #698): with no
+    // value they leave an existing variable's shape untouched — this also
+    // covers huck-specific no-op uses like mise's `export -a
+    // chpwd_functions`. `-p` lists (only when no operands); `-n` unexports;
+    // `-f` is function export.
     let mut unexport = false;
     let mut func = false;
     let mut saw_p = false;
     let mut saw_a = false;
+    let mut saw_capital_a = false;
     let mut g =
-        crate::builtin_opts::Getopt::new(name, crate::builtin_opts::ArgView::Decl(args), "pnfa");
+        crate::builtin_opts::Getopt::new(name, crate::builtin_opts::ArgView::Decl(args), "pnfaA");
     loop {
         match g.next_opt(shell, err) {
             Ok(Some(o)) => match o.ch {
                 'p' => saw_p = true,
-                'a' => saw_a = true, // huck-specific no-op (mise `export -a chpwd_functions`)
+                // Same pure-selector behavior with no value (#698); split so
+                // a value-bearing `-A` can establish the associative shape
+                // rather than falling into the indexed reparse (#777).
+                'a' => saw_a = true,
+                'A' => saw_capital_a = true,
                 'n' => unexport = true,
                 'f' => func = true,
                 _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
@@ -1626,13 +1649,13 @@ fn builtin_export_decl(
         if unexport {
             return ExecOutcome::Continue(0);
         }
-        // `-f` with no operands lists exported functions. `-a` (mise
+        // `-f` with no operands lists exported functions. `-a`/`-A` (mise
         // accommodation) suppresses the var listing: rc 0, no output.
         // Otherwise list exported variables (bare `export` or `-p`).
         if func && !saw_p {
             return list_exported_functions(out, shell);
         }
-        if saw_a && !saw_p {
+        if (saw_a || saw_capital_a) && !saw_p {
             return ExecOutcome::Continue(0);
         }
         return list_exported(out, shell);
@@ -1771,8 +1794,10 @@ fn builtin_export_decl(
                 }
                 // v349 (#343, Root B): `export -a NAME='(v)'` coerces the quoted
                 // scalar `(...)` value into an array literal (matches bash).
+                // Same reparse applies under `-A` (a quoted `(...)` scalar).
                 let reparsed_owned;
-                let a = if saw_a && let Some(value) = reparse_paren_scalar_as_array(&name, &a.value)
+                let a = if (saw_a || saw_capital_a)
+                    && let Some(value) = reparse_paren_scalar_as_array(&name, &a.value)
                 {
                     reparsed_owned = crate::command::Assignment {
                         target: a.target.clone(),
@@ -1783,6 +1808,28 @@ fn builtin_export_decl(
                 } else {
                     a
                 };
+                // #777: `-A` with a VALUE must establish the associative shape
+                // before apply_one_assignment sees the compound RHS — otherwise
+                // the shared array-literal path (`is_associative_shape`) treats
+                // it as indexed and the key/value pairs collapse to a plain
+                // list, last-value-wins. Mirrors `declare -A NAME=(...)`
+                // (~builtin_declare_decl). The no-value selector path (`export
+                // -A NAME`) never reaches here — it's the Plain-arm/no-`=`
+                // case above, untouched.
+                if saw_capital_a
+                    && shell.get_associative(&name).is_none()
+                    && let Err(e) = shell.declare_associative(&name)
+                {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "{}",
+                        crate::shell_state::declare_err_message("export", &name, &e)
+                    );
+                    any_error = true;
+                    continue;
+                }
                 // #714: name the builtin performing this SCALAR assignment, so an
                 // integer-coercion failure reports `export: @: …` as bash does.
                 shell.set_decl_builtin_name(Some("export"));
@@ -1829,6 +1876,7 @@ fn builtin_local_decl(
     let mut saw_minus_u = false;
     let mut saw_minus_c = false;
     let mut saw_minus_n = false;
+    let mut saw_minus_x = false;
     let mut saw_plus_x = false;
     // `local` DOES take `+`-style options — the comment here used to claim it
     // did not, and every `+anything` fell through to be reported as an invalid
@@ -1851,7 +1899,7 @@ fn builtin_local_decl(
         let mut g = crate::builtin_opts::Getopt::new(
             name,
             crate::builtin_opts::ArgView::Decl(&args[idx..]),
-            "aAirlucn",
+            "aAirlucnx",
         );
         loop {
             match g.next_opt(shell, err) {
@@ -1864,6 +1912,7 @@ fn builtin_local_decl(
                     'u' => saw_minus_u = true,
                     'c' => saw_minus_c = true,
                     'n' => saw_minus_n = true,
+                    'x' => saw_minus_x = true,
                     _ => return ExecOutcome::Continue(g.reject_unhandled(o.ch, shell, err)),
                 },
                 Ok(None) => break,
@@ -1954,19 +2003,24 @@ fn builtin_local_decl(
                     // leave value empty (unbound nameref).
                     shell.set_nameref(name, true);
                 } else if want_array {
-                    // Promote existing scalar to element 0 (bash semantics)
-                    // or create an empty indexed array.
+                    // Promote a materialised scalar to element 0 (bash
+                    // semantics); otherwise (unset, or genuinely absent
+                    // post-clear) just record the shape without a value
+                    // (#600) — mirrors builtin_declare_decl's array block.
                     if shell.get_indexed(name).is_none() {
-                        let mut empty = std::collections::BTreeMap::new();
-                        if let Some(scalar) = shell.get(name) {
-                            empty.insert(0, scalar.to_string());
-                        }
-                        if shell.replace_indexed(name, empty).is_err() {
-                            exit = 1;
-                            // Shape creation FAILED — skip the post-chain
-                            // mark_integer (consistent with the associative
-                            // branch / builtin_declare_decl).
-                            continue;
+                        match shell.get(name) {
+                            Some(scalar) => {
+                                let mut elements = std::collections::BTreeMap::new();
+                                elements.insert(0, scalar.to_string());
+                                if shell.replace_indexed(name, elements).is_err() {
+                                    exit = 1;
+                                    // Shape creation FAILED — skip the post-chain
+                                    // mark_integer (consistent with the associative
+                                    // branch / builtin_declare_decl).
+                                    continue;
+                                }
+                            }
+                            None => shell.declare_indexed_unset(name),
                         }
                     }
                 } else if want_associative {
@@ -2000,13 +2054,15 @@ fn builtin_local_decl(
                     shell.mark_integer(name);
                 } else if !already_local {
                     // Bare `local NAME` with no value (fresh local): declare it
-                    // function-local but UNSET (matches bash + `declare NAME`).
-                    // The snapshot above records the outer value so it is
-                    // restored on return; unsetting makes `[[ -v NAME ]]` /
-                    // `${NAME-d}` see it as unset until assigned. A bare
-                    // re-`local` of an already-local name preserves its value
-                    // (bash), so only unset when NOT already_local. (M-111)
-                    shell.unset(name);
+                    // function-local but UNSET (matches bash + `declare NAME`,
+                    // #600/#691) — a declared-but-unset scalar, not simply
+                    // absent, so `declare -p NAME` still prints `declare --
+                    // NAME` rather than "not found". The snapshot above
+                    // records the outer value so it is restored on return.
+                    // A bare re-`local` of an already-local name preserves
+                    // its value (bash), so only replace when NOT
+                    // already_local. (M-111)
+                    shell.declare_unset_scalar(name);
                 }
                 // `local -ai`/`-Ai` NAME (bare): apply the integer flag AFTER
                 // the array shape was created above (mark_integer sets the flag
@@ -2031,10 +2087,13 @@ fn builtin_local_decl(
                     shell.mark_readonly(name);
                 }
                 // Re-apply the shadowed variable's export attribute (the only
-                // one bash carries into a local). Gated on the local actually
-                // having materialised: a bare `local NAME` with no flags stays
-                // unset, and `shell.export` would create an empty scalar there.
-                if was_exported && !saw_plus_x && shell.is_set(name) {
+                // one bash carries into a local, #691). `export` is a pure
+                // attribute mutator now (#600) — it no longer needs a
+                // materialised value to apply, so this fires even for a bare
+                // `local NAME` that stays declared-but-unset (measured:
+                // `declare -x V=1; f(){ local V; declare -p V; }; f` ->
+                // `declare -x V`).
+                if (was_exported || saw_minus_x) && !saw_plus_x {
                     shell.export(name);
                 }
             }
@@ -2091,14 +2150,13 @@ fn builtin_local_decl(
                     }
                     shell.set_nameref(&name, true);
                     shell.set(&name, target);
-                    // Apply co-requested -r (local does not support -x,
-                    // but mirror the same pattern for safety).
+                    // Apply co-requested -r.
                     if want_readonly {
                         shell.mark_readonly(&name);
                     }
                     // A nameref local over an exported outer is exported too
                     // (bash: `declare -nx`), same rule as every other shape.
-                    if was_exported && !saw_plus_x {
+                    if (was_exported || saw_minus_x) && !saw_plus_x {
                         shell.export(&name);
                     }
                     continue;
@@ -2165,7 +2223,7 @@ fn builtin_local_decl(
                 }
                 // Carry the shadowed variable's export attribute onto the new
                 // local (see `clear_local_shadow`), unless `+x` cancelled it.
-                if was_exported && !saw_plus_x {
+                if (was_exported || saw_minus_x) && !saw_plus_x {
                     shell.export(&name);
                 }
             }
@@ -2239,43 +2297,18 @@ fn builtin_readonly_decl(
                     exit = 1;
                     continue;
                 }
-                // `readonly -A NAME` (no value): ensure name is associative
-                // before marking readonly.
-                if want_associative
-                    && shell.get_associative(name).is_none()
-                    && let Err(e) = shell.declare_associative(name)
-                {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "{}",
-                        crate::shell_state::declare_err_message("readonly", name, &e)
-                    );
-                    exit = 1;
-                    continue;
-                }
-                // `readonly -a NAME` (no value): ensure name is an indexed
-                // array before marking readonly (mirrors want_associative
-                // above; declare/local's -a bare-case pattern — promote an
-                // existing scalar to element 0, or create an empty array).
-                // Skip when NAME is already associative (e.g. `-aA` together,
-                // or a pre-existing `-A` array): `-A` wins, matching bash.
-                if want_indexed
-                    && shell.get_associative(name).is_none()
-                    && shell.get_indexed(name).is_none()
-                {
-                    let mut empty = std::collections::BTreeMap::new();
-                    if let Some(scalar) = shell.get(name) {
-                        empty.insert(0, scalar.to_string());
-                    }
-                    if shell.replace_indexed(name, empty).is_err() {
-                        // assign() already emitted the readonly-variable
-                        // error (bare `{name}: readonly variable`, no prefix).
-                        exit = 1;
-                        continue;
-                    }
-                }
+                // `readonly -a`/`-A NAME` with NO value: bash's `-a`/`-A`
+                // here is a pure SELECTOR, never a shape mutator — it does
+                // not create an array from a brand-new name, promote an
+                // existing scalar, or convert an existing (materialised OR
+                // declared-but-unset) variable's shape. Measured on bash
+                // 5.2.21: `readonly -a brandnew` -> `declare -r brandnew`
+                // (no `-a` at all); `x=hello; readonly -a x` -> `declare -r
+                // x="hello"` (no promotion); `declare -A x; readonly -a x`
+                // -> `declare -Ar x` (shape UNCHANGED, `-a` ignored). So
+                // `want_indexed`/`want_associative` do nothing here — only
+                // `readonly NAME=value` (the `DeclArg::Assign` arm below)
+                // still creates/converts shape from a supplied value.
                 shell.mark_readonly(name);
             }
             DeclArg::Assign(a) => match &a.target {
@@ -2627,7 +2660,9 @@ fn builtin_declare_decl(
             use crate::shell_state::VarValue;
             let mut entries: Vec<(&String, &crate::shell_state::Variable)> = shell
                 .iter_vars()
-                .filter(|(_, v)| matches!(v.value, VarValue::Indexed(_)))
+                // #600: `declare -a` lists only materialized indexed arrays, not unset
+                // ones (which match the shape but have no value).
+                .filter(|(_, v)| matches!(v.value, VarValue::Indexed(_)) && !v.value.is_unset())
                 .collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
             for (name, var) in entries {
@@ -2639,7 +2674,9 @@ fn builtin_declare_decl(
             use crate::shell_state::VarValue;
             let mut entries: Vec<(&String, &crate::shell_state::Variable)> = shell
                 .iter_vars()
-                .filter(|(_, v)| matches!(v.value, VarValue::Associative(_)))
+                // #600: `declare -A` lists only materialized associative arrays, not unset
+                // ones (which match the shape but have no value).
+                .filter(|(_, v)| matches!(v.value, VarValue::Associative(_)) && !v.value.is_unset())
                 .collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
             for (name, var) in entries {
@@ -2769,19 +2806,23 @@ fn builtin_declare_decl(
             shell.unmark_integer(name);
         }
 
-        // Array-attribute handling. `-a NAME` with no value: promote
-        // scalar to element 0 (or create empty array). With a value,
-        // fall through into the assignment path below — it always
+        // Array-attribute handling. `-a NAME` with no value: promote a
+        // materialised scalar to element 0; otherwise (unset, or wholly
+        // absent) just record the shape without a value (#600). With an
+        // `=value`, fall through into the assignment path below — it always
         // routes compound RHS through apply_one_assignment.
         if want_array && assign_opt.is_none() && shell.get_indexed(name).is_none() {
-            let mut empty = std::collections::BTreeMap::new();
-            if let Some(scalar) = shell.get(name) {
-                empty.insert(0, scalar.to_string());
-            }
-            if shell.replace_indexed(name, empty).is_err() {
-                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
-                exit = 1;
-                continue;
+            match shell.get(name) {
+                Some(scalar) => {
+                    let mut elements = std::collections::BTreeMap::new();
+                    elements.insert(0, scalar.to_string());
+                    if shell.replace_indexed(name, elements).is_err() {
+                        crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
+                        exit = 1;
+                        continue;
+                    }
+                }
+                None => shell.declare_indexed_unset(name),
             }
         }
 
@@ -3016,9 +3057,15 @@ fn builtin_declare_decl(
         if want_remove_export {
             shell.unexport(name);
         }
-        // Bare `declare NAME` (no flag, no value): inside a function,
-        // the snapshot is enough. Outside, no-op. Match the legacy
-        // builtin_declare behavior.
+        // #600: bash's `declare NAME` always makes NAME a known,
+        // declared-but-unset variable — even with a no-op flag combo like
+        // `declare +i NAME` on a name that doesn't exist yet (measured:
+        // `declare +i n; declare -p n` -> `declare -- n`, rc 0). None of the
+        // attribute mutators above ran when every flag here is a no-op, so
+        // ensure the entry exists without clobbering one that already does.
+        if shell.snapshot_var(name).is_none() {
+            shell.declare_unset_scalar(name);
+        }
     }
     ExecOutcome::Continue(exit)
 }

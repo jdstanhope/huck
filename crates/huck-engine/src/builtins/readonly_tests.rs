@@ -50,12 +50,17 @@ fn readonly_dash_a_single_element_compound_value() {
 }
 
 #[test]
-fn readonly_dash_a_no_value_creates_empty_readonly_array() {
+fn readonly_dash_a_no_value_is_unset_and_not_an_array() {
+    // bash 5.2.21: `-a`/`-A` with NO value is a pure shape SELECTOR, never
+    // a mutator — on a brand-new name it does nothing (measured: `readonly
+    // -a brandnew; declare -p brandnew` -> `declare -r brandnew`, the `-a`
+    // is dropped entirely, unlike `declare -a a` which DOES keep `-a`).
+    // `y` ends up a declared-but-unset SCALAR, not an array. #600.
     let mut s = Shell::new();
     let outcome = run(&mut s, "readonly -a y");
     assert!(matches!(outcome, ExecOutcome::Continue(0)));
-    let m = s.get_indexed("y").expect("y is an indexed array");
-    assert_eq!(m.len(), 0);
+    assert!(s.get_indexed("y").is_none());
+    assert!(!s.is_set("y"));
     assert!(s.is_readonly("y"));
 }
 
@@ -134,7 +139,11 @@ fn readonly_with_value_sets_and_locks() {
 }
 
 #[test]
-fn readonly_no_value_creates_empty_and_locks() {
+fn readonly_no_value_is_unset_and_locks() {
+    // bash 5.2.21: `readonly X` (no value) records the readonly attribute
+    // WITHOUT materialising a value — `declare -p X` -> `declare -r X` (no
+    // `=`), and `${X+set}` is empty (X reads as unset). `X=1` afterwards
+    // is still refused (`X: readonly variable`). #600.
     let mut shell = Shell::new();
     let mut buf: Vec<u8> = Vec::new();
     let args = vec!["X".to_string()];
@@ -146,7 +155,8 @@ fn readonly_no_value_creates_empty_and_locks() {
         &mut shell,
     );
     assert!(matches!(outcome, ExecOutcome::Continue(0)));
-    assert_eq!(shell.lookup_var("X").as_deref(), Some(""));
+    assert_eq!(shell.lookup_var("X"), None);
+    assert!(!shell.is_set("X"));
     assert!(shell.is_readonly("X"));
 }
 

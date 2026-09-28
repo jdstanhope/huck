@@ -339,9 +339,10 @@ pub fn expand_modifier_with_value(
             // dynamic params are not included (only the vars table). No match
             // yields empty, rc 0.
             let mut names: Vec<String> = shell
-                .var_names()
-                .filter(|n| n.starts_with(name))
-                .map(str::to_string)
+                .iter_vars()
+                // #600: bash does not enumerate unset variables in this expansion.
+                .filter(|(n, v)| n.starts_with(name) && !v.value.is_unset())
+                .map(|(n, _)| n.clone())
                 .collect();
             names.sort();
             if *at && quoted {

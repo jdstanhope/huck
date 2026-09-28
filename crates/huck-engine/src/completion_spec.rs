@@ -575,7 +575,7 @@ fn glob_match(pattern: &str, candidate: &str) -> bool {
     )
 }
 
-fn complete_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> {
+pub(crate) fn complete_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> {
     let home = shell.get("HOME").unwrap_or("").to_string();
     match action {
         Action::File => list_dir_with_path_prefix(prefix, false, &home),
@@ -657,9 +657,10 @@ fn complete_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> {
             .collect(),
         Action::Export => {
             let mut names: Vec<String> = shell
-                .var_names()
-                .filter(|n| shell.is_exported(n) && n.starts_with(prefix))
-                .map(|s| s.to_string())
+                .iter_vars()
+                // #600: bash does not enumerate unset variables in compgen -A export.
+                .filter(|(n, v)| v.exported && n.starts_with(prefix) && !v.value.is_unset())
+                .map(|(n, _)| n.clone())
                 .collect();
             names.sort();
             names.dedup();
