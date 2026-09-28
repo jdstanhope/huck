@@ -2683,9 +2683,17 @@ fn builtin_declare_decl(
             _ => Some(None), // 2 or 3 together cancel → clear
         };
 
-    // Reject the combinations we haven't implemented yet.
+    // Reject the combinations we haven't implemented yet. Named with
+    // `decl_cmd` like every other diagnostic here (#788), though this whole
+    // guard is a divergence: bash has no such error — it creates from `-A` and
+    // then refuses the `-a` conversion (#785).
     if want_array && want_associative {
-        crate::sh_error_to!(shell, err, None, "declare: cannot specify both -a and -A");
+        crate::sh_error_to!(
+            shell,
+            err,
+            None,
+            "{decl_cmd}: cannot specify both -a and -A"
+        );
         return ExecOutcome::Continue(1);
     }
 
@@ -2779,7 +2787,7 @@ fn builtin_declare_decl(
                 shell,
                 err,
                 None,
-                "declare: `{name}': not a valid identifier"
+                "{decl_cmd}: `{name}': not a valid identifier"
             );
             exit = 1;
             continue;
@@ -2800,7 +2808,7 @@ fn builtin_declare_decl(
                     // redirect target regardless of the ambient thread-local
                     // sink. (The prior `sh_error!` conversion broke this by
                     // going through the thread-local sink instead.)
-                    crate::sh_error_to!(shell, err, None, "declare: {name}: not found");
+                    crate::sh_error_to!(shell, err, None, "{decl_cmd}: {name}: not found");
                     exit = 1;
                 }
             }
@@ -2846,7 +2854,7 @@ fn builtin_declare_decl(
             // allowed. Refusing BEFORE the snapshot also keeps the clear below
             // from unsetting a readonly variable.
             if !shell.local_scopes.is_empty() && !already_local && shell.is_readonly(name) {
-                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
+                crate::sh_error_to!(shell, err, None, "{decl_cmd}: {name}: readonly variable");
                 exit = 1;
                 continue;
             }
@@ -2872,7 +2880,7 @@ fn builtin_declare_decl(
         // assignment path further down has its own readonly check, but by then
         // `mark_integer` and friends have already stamped the flags on.
         if assign_opt.is_some() && shell.is_readonly(name) {
-            crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
+            crate::sh_error_to!(shell, err, None, "{decl_cmd}: {name}: readonly variable");
             exit = 1;
             continue;
         }
@@ -2891,7 +2899,7 @@ fn builtin_declare_decl(
                 shell,
                 err,
                 None,
-                "declare: {name}: cannot destroy array variables in this way"
+                "{decl_cmd}: {name}: cannot destroy array variables in this way"
             );
             exit = 1;
             continue;
@@ -2935,7 +2943,7 @@ fn builtin_declare_decl(
                 err,
                 None,
                 "{}",
-                crate::shell_state::declare_err_message("declare", name, &e)
+                crate::shell_state::declare_err_message(decl_cmd, name, &e)
             );
             exit = 1;
             continue;
@@ -2958,7 +2966,7 @@ fn builtin_declare_decl(
                 err,
                 None,
                 "{}",
-                crate::shell_state::declare_err_message("declare", name, &e)
+                crate::shell_state::declare_err_message(decl_cmd, name, &e)
             );
             exit = 1;
             continue;
@@ -3001,7 +3009,7 @@ fn builtin_declare_decl(
                         shell,
                         err,
                         None,
-                        "declare: {name}: nameref variable self references not allowed"
+                        "{decl_cmd}: {name}: nameref variable self references not allowed"
                     );
                     exit = 1;
                     continue;
@@ -3014,7 +3022,7 @@ fn builtin_declare_decl(
                         shell,
                         err,
                         None,
-                        "declare: `{target}': invalid variable name for name reference"
+                        "{decl_cmd}: `{target}': invalid variable name for name reference"
                     );
                     exit = 1;
                     continue;
@@ -3042,7 +3050,7 @@ fn builtin_declare_decl(
                         shell,
                         err,
                         None,
-                        "declare: {name}: reference variable cannot be an array"
+                        "{decl_cmd}: {name}: reference variable cannot be an array"
                     );
                     exit = 1;
                     continue;
@@ -3055,7 +3063,7 @@ fn builtin_declare_decl(
                         shell,
                         err,
                         None,
-                        "declare: `{cur}': invalid variable name for name reference"
+                        "{decl_cmd}: `{cur}': invalid variable name for name reference"
                     );
                     exit = 1;
                     continue;
@@ -3080,7 +3088,7 @@ fn builtin_declare_decl(
             //   bash: declare: RO: readonly variable
             //   declare -r RO="safe"      # neither -n nor -x applied
             if shell.is_readonly(name) {
-                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
+                crate::sh_error_to!(shell, err, None, "{decl_cmd}: {name}: readonly variable");
                 exit = 1;
                 continue;
             }
@@ -3126,7 +3134,7 @@ fn builtin_declare_decl(
             // `=VALUE` must not clobber an existing readonly, with or without
             // a co-requested `-r`.
             if shell.is_readonly(name) {
-                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
+                crate::sh_error_to!(shell, err, None, "{decl_cmd}: {name}: readonly variable");
                 exit = 1;
                 continue;
             }
