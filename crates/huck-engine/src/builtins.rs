@@ -1462,6 +1462,25 @@ fn snapshot_for_local_scope(shell: &mut Shell, name: &str) {
         .insert(name.to_string(), snap);
 }
 
+/// Applies a `-a`/`-A` shape for a declaration, picking the right cell of
+/// bash's table: a name that is ALREADY a local of this frame has its value
+/// discarded on a shape change (`local v=s; local -a v` -> `declare -a v=()`),
+/// while everywhere else a scalar is promoted to element 0
+/// (`v=s; declare -a v` -> `declare -a v=([0]="s")`). Both refuse the
+/// array<->assoc directions. See `Shell::reshape_to` for the full table.
+fn reshape_for_decl(
+    shell: &mut Shell,
+    name: &str,
+    target: crate::shell_state::Shape,
+    already_local: bool,
+) -> Result<(), crate::shell_state::DeclareErr> {
+    if already_local {
+        shell.reshape_in_frame_to(name, target)
+    } else {
+        shell.reshape_to(name, target)
+    }
+}
+
 /// Clear the binding a fresh `local NAME` is about to shadow, and report
 /// whether it was exported.
 ///
@@ -2003,34 +2022,36 @@ fn builtin_local_decl(
                     // leave value empty (unbound nameref).
                     shell.set_nameref(name, true);
                 } else if want_array {
-                    // Promote a materialised scalar to element 0 (bash
-                    // semantics); otherwise (unset, or genuinely absent
-                    // post-clear) just record the shape without a value
-                    // (#600) — mirrors builtin_declare_decl's array block.
-                    if shell.get_indexed(name).is_none() {
-                        match shell.get(name) {
-                            Some(scalar) => {
-                                let mut elements = std::collections::BTreeMap::new();
-                                elements.insert(0, scalar.to_string());
-                                if shell.replace_indexed(name, elements).is_err() {
-                                    exit = 1;
-                                    // Shape creation FAILED — skip the post-chain
-                                    // mark_integer (consistent with the associative
-                                    // branch / builtin_declare_decl).
-                                    continue;
-                                }
-                            }
-                            None => shell.declare_indexed_unset(name),
-                        }
+                    // One conversion table, shared with declare (#347/#697).
+                    if let Err(e) = reshape_for_decl(
+                        shell,
+                        name,
+                        crate::shell_state::Shape::Indexed,
+                        already_local,
+                    ) {
+                        crate::sh_error_to!(
+                            shell,
+                            err,
+                            None,
+                            "{}",
+                            crate::shell_state::declare_err_message("local", name, &e)
+                        );
+                        exit = 1;
+                        // Shape creation FAILED — skip the post-chain
+                        // mark_integer (consistent with the associative branch).
+                        continue;
                     }
                 } else if want_associative {
                     // local -A NAME: ensure name is an associative array.
                     // declare_associative errors if name is already indexed
                     // or scalar; the snapshot above lets call_function
                     // restore the prior value on function exit.
-                    if shell.get_associative(name).is_none()
-                        && let Err(e) = shell.declare_associative(name)
-                    {
+                    if let Err(e) = reshape_for_decl(
+                        shell,
+                        name,
+                        crate::shell_state::Shape::Associative,
+                        already_local,
+                    ) {
                         crate::sh_error_to!(
                             shell,
                             err,
@@ -2744,16 +2765,21 @@ fn builtin_declare_decl(
         // the existing scalar to element 0 — so the clear is gated on actually
         // being in a function.
         let mut inherited_export = false;
+        // Whether this name is ALREADY local in the innermost frame. Bound
+        // before the branch because the conversion table below needs it too:
+        // bash discards the value when a shape change hits a name that is
+        // already local in this frame, and promotes it otherwise. With `-g`
+        // the write goes to the global map, so there is no in-frame binding.
+        let already_local = !global
+            && shell
+                .local_scopes
+                .last()
+                .is_some_and(|f| f.contains_key(name));
         if global {
             if let Some(frame) = shell.local_scopes.last_mut() {
                 frame.remove(name);
             }
         } else {
-            let already_local = shell
-                .local_scopes
-                .last()
-                .map(|f| f.contains_key(name))
-                .unwrap_or(false);
             // The one thing a readonly name forbids here is a NEW function-local
             // SHADOW of it — that local would be a fresh variable, which is what
             // readonly refuses (#695). It applies whatever flags were given:
@@ -2811,19 +2837,30 @@ fn builtin_declare_decl(
         // absent) just record the shape without a value (#600). With an
         // `=value`, fall through into the assignment path below — it always
         // routes compound RHS through apply_one_assignment.
-        if want_array && assign_opt.is_none() && shell.get_indexed(name).is_none() {
-            match shell.get(name) {
-                Some(scalar) => {
-                    let mut elements = std::collections::BTreeMap::new();
-                    elements.insert(0, scalar.to_string());
-                    if shell.replace_indexed(name, elements).is_err() {
-                        crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
-                        exit = 1;
-                        continue;
-                    }
-                }
-                None => shell.declare_indexed_unset(name),
-            }
+        // #347/#697/#734: ONE conversion table, in `Shell::reshape_to` — it
+        // promotes a materialised scalar to element 0, records the shape when
+        // there is no value, refuses the associative→indexed direction rather
+        // than discarding the data, and does not consult the readonly guard
+        // (a reshape is not a value change; `readonly R=1; declare -a R` is
+        // `declare -ar R=([0]="1")` in bash).
+        if want_array
+            && assign_opt.is_none()
+            && let Err(e) = reshape_for_decl(
+                shell,
+                name,
+                crate::shell_state::Shape::Indexed,
+                already_local,
+            )
+        {
+            crate::sh_error_to!(
+                shell,
+                err,
+                None,
+                "{}",
+                crate::shell_state::declare_err_message("declare", name, &e)
+            );
+            exit = 1;
+            continue;
         }
 
         // Associative-attribute handling. `declare -A NAME` ensures an
@@ -2831,8 +2868,12 @@ fn builtin_declare_decl(
         // BEFORE apply_one_assignment so the executor routes the compound
         // RHS through the associative path (not the indexed-array path).
         if want_associative
-            && shell.get_associative(name).is_none()
-            && let Err(e) = shell.declare_associative(name)
+            && let Err(e) = reshape_for_decl(
+                shell,
+                name,
+                crate::shell_state::Shape::Associative,
+                already_local,
+            )
         {
             crate::sh_error_to!(
                 shell,

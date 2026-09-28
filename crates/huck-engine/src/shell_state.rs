@@ -229,8 +229,12 @@ impl AssignDest {
 pub enum DeclareErr {
     /// `declare -A NAME` where NAME is already an indexed array.
     IndexedExists,
-    /// `declare -A NAME` where NAME is already a scalar.
+    /// `declare -A NAME` where NAME is already a scalar. Retained for the
+    /// `local`-scope cell that still refuses; the top-level scalar case
+    /// PROMOTES instead (#697).
     ScalarExists,
+    /// `declare -a NAME` where NAME is already an associative array (#347).
+    AssociativeExists,
 }
 
 /// Formats a user-facing diagnostic for a [`DeclareErr`] using the given
@@ -242,6 +246,9 @@ pub fn declare_err_message(cmd: &str, name: &str, err: &DeclareErr) -> String {
         }
         DeclareErr::ScalarExists => {
             format!("{cmd}: {name}: cannot convert scalar to associative array")
+        }
+        DeclareErr::AssociativeExists => {
+            format!("{cmd}: {name}: cannot convert associative to indexed array")
         }
     }
 }
@@ -3620,6 +3627,110 @@ impl Shell {
         )
     }
 
+    /// bash's in-frame re-declaration cell: a SHAPE CHANGE applied to a name
+    /// that is already a local of the CURRENT function frame discards the
+    /// value and materialises an EMPTY array/assoc, where the same change at
+    /// global scope promotes the scalar to element 0:
+    ///
+    /// ```text
+    /// v=s; declare -a v                      -> declare -a v=([0]="s")
+    /// f(){ local v=s; local -a v; }          -> declare -a v=()
+    /// ```
+    ///
+    /// Only a genuine shape CHANGE resets: re-declaring the same shape keeps
+    /// the value (`local -a a=(1 2); local -a a` stays `([0]="1" [1]="2")`),
+    /// and so does a bare re-`local`. Refusals still take precedence — an
+    /// indexed local re-declared `-A` errors rather than emptying.
+    pub fn reshape_in_frame_to(&mut self, name: &str, target: Shape) -> Result<(), DeclareErr> {
+        let changing = self
+            .vars
+            .get(name)
+            .is_some_and(|v| matches!(v.value, VarValue::Scalar(_)) && target != Shape::Scalar);
+        if !changing {
+            return self.reshape_to(name, target);
+        }
+        // Validate the direction first, then empty. (A scalar never refuses
+        // today, but routing through `reshape_to` keeps the table in one place
+        // if that ever changes.)
+        self.reshape_to(name, target)?;
+        if let Some(existing) = self.vars.get_mut(name) {
+            existing.value = match target {
+                Shape::Indexed => VarValue::Indexed(BTreeMap::new()),
+                Shape::Associative => VarValue::Associative(crate::assoc_map::AssocMap::new()),
+                Shape::Scalar => return Ok(()),
+            };
+        }
+        Ok(())
+    }
+
+    /// Applies a `-a`/`-A` SHAPE to `name`, carrying any existing value into
+    /// the new shape. This is bash's conversion table, in one place (#347,
+    /// #697, #734):
+    ///
+    /// | existing | to Indexed | to Associative |
+    /// | --- | --- | --- |
+    /// | absent | fresh unset | fresh unset |
+    /// | unset scalar | takes the shape | takes the shape |
+    /// | scalar `s` | promotes to `([0]="s")` | promotes to `([0]="s")` |
+    /// | indexed | ok | REFUSE `IndexedExists` |
+    /// | associative | REFUSE `AssociativeExists` | ok |
+    ///
+    /// A promotion is NOT a value change — the same data is re-filed under
+    /// element/key `0` — so this deliberately does NOT consult the readonly
+    /// guard: bash's readonly protects a variable's VALUE, not its attributes
+    /// or its shape, and permits `readonly R=1; declare -a R` →
+    /// `declare -ar R=([0]="1")` (#734). A later `R=7` is still refused,
+    /// because that goes through `assign`.
+    ///
+    /// Refusing takes precedence over readonly, matching bash: with an
+    /// associative readonly, `declare -a m` reports the CONVERSION error, not
+    /// `m: readonly variable`.
+    pub fn reshape_to(&mut self, name: &str, target: Shape) -> Result<(), DeclareErr> {
+        debug_assert!(
+            target != Shape::Scalar,
+            "reshape_to is for the -a/-A shapes; a scalar declaration has its own path"
+        );
+        let Some(existing) = self.vars.get_mut(name) else {
+            self.vars.insert(name.to_string(), Variable::unset(target));
+            return Ok(());
+        };
+        let carried: Option<String> = match (&existing.value, target) {
+            // Already the requested shape — nothing to do, value untouched.
+            (VarValue::Indexed(_), Shape::Indexed)
+            | (VarValue::Associative(_), Shape::Associative) => return Ok(()),
+            // The two refusals. bash never silently discards array data.
+            (VarValue::Indexed(_) | VarValue::Unset(Shape::Indexed), Shape::Associative) => {
+                return Err(DeclareErr::IndexedExists);
+            }
+            (VarValue::Associative(_) | VarValue::Unset(Shape::Associative), Shape::Indexed) => {
+                return Err(DeclareErr::AssociativeExists);
+            }
+            // No value to carry — the shape is simply recorded (#600).
+            (VarValue::Unset(_), _) => None,
+            // A materialised scalar is promoted to element/key `0`.
+            (VarValue::Scalar(s), _) => Some(s.clone()),
+            // `target` is never Scalar (see the debug_assert); in release this
+            // leaves the variable untouched rather than corrupting it.
+            (VarValue::Indexed(_) | VarValue::Associative(_), Shape::Scalar) => return Ok(()),
+        };
+        existing.value = match (target, carried) {
+            (Shape::Indexed, None) => VarValue::Unset(Shape::Indexed),
+            (Shape::Associative, None) => VarValue::Unset(Shape::Associative),
+            (Shape::Indexed, Some(s)) => {
+                let mut m = BTreeMap::new();
+                m.insert(0, s);
+                VarValue::Indexed(m)
+            }
+            (Shape::Associative, Some(s)) => {
+                let mut m = crate::assoc_map::AssocMap::new();
+                m.insert("0".to_string(), s);
+                VarValue::Associative(m)
+            }
+            (Shape::Scalar, _) => unreachable!("guarded by the debug_assert above"),
+        };
+        Ok(())
+    }
+
     /// Ensures `name` has the associative-array SHAPE. Enforces bash rules:
     /// - Unset (no prior name) → declared-but-unset associative, no value.
     /// - Already associative (materialised or unset) → no-op — bash does not
@@ -3659,31 +3770,10 @@ impl Shell {
         }
     }
 
-    /// Records the indexed-array SHAPE on `name` without materialising a
-    /// value (#600): the `declare -a NAME` path when there is no existing
-    /// scalar to promote to element 0 (the caller handles that promotion
-    /// separately — a materialised scalar always has a value to carry
-    /// forward, unlike this no-value path). An absent name becomes a fresh
-    /// declared-but-unset indexed array; any other existing (necessarily
-    /// unset, since a materialised scalar is routed elsewhere and a
-    /// materialised associative/indexed value means `get_indexed`/`get`
-    /// already returned `Some`) variable just has its shape flipped to
-    /// `Indexed`, preserving its other attributes and unset-ness — mirrors
-    /// `declare_associative`'s `Unset(Scalar)` arm.
-    pub fn declare_indexed_unset(&mut self, name: &str) {
-        match self.vars.get_mut(name) {
-            Some(v) => v.value = VarValue::Unset(Shape::Indexed),
-            None => {
-                self.vars
-                    .insert(name.to_string(), Variable::unset(Shape::Indexed));
-            }
-        }
-    }
-
     /// Declares `name` fresh as a declared-but-unset SCALAR, unconditionally
     /// replacing any existing entry (#691: `local NAME`, bare — a fresh
     /// local starts from nothing, not from the binding it shadows, so this
-    /// is an insert, not a mutate-in-place like `declare_indexed_unset`).
+    /// is an insert, not a mutate-in-place like `reshape_to`).
     /// Callers apply any inherited attribute (export, per #691) afterwards.
     pub fn declare_unset_scalar(&mut self, name: &str) {
         self.vars
@@ -4302,6 +4392,9 @@ mod assoc_value_tests;
 
 #[cfg(test)]
 mod ifs_helper_tests;
+
+#[cfg(test)]
+mod reshape_tests;
 
 #[cfg(test)]
 mod shopt_tests;

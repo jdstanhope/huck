@@ -79,12 +79,23 @@ fn declare_dash_cap_a_on_existing_indexed_errors() {
     assert!(s.get_associative("a").is_none());
 }
 
+/// #697: `declare -A` on an existing SCALAR does not error in bash — it
+/// promotes the scalar to key `0`, exactly as `declare -a` promotes it to
+/// element 0. This test asserted huck's refusal until the one conversion
+/// table (`Shell::reshape_to`) replaced it; re-measured against 5.2.21:
+/// `s=hello; declare -A s; declare -p s` -> `declare -A s=([0]="hello" )`.
 #[test]
-fn declare_dash_cap_a_on_existing_scalar_errors() {
+fn declare_dash_cap_a_on_existing_scalar_promotes_to_key_zero() {
     let mut s = Shell::new();
     let _ = run(&mut s, "s=hello");
     let outcome = run(&mut s, "declare -A s");
-    assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    assert_eq!(
+        s.lookup_associative_element("s", "0")
+            .map(|v| v.to_string()),
+        Some("hello".to_string())
+    );
+    assert!(s.get_indexed("s").is_none());
 }
 
 #[test]
