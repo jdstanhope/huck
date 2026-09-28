@@ -1498,6 +1498,26 @@ fn reshape_for_decl(
 /// A repeat `local NAME` in the SAME frame is not a fresh shadow — bash keeps
 /// the value and attributes there (`local -i x=1; local x` leaves x integer) —
 /// so `already_local` skips the clear.
+/// Whether a `+a` / `+A` flag is trying to take the array attribute off a
+/// variable that has it — bash's "cannot destroy array variables in this way"
+/// (#784, `builtins/declare.def:854`).
+///
+/// The two shapes do NOT cross: `+a` only objects to an indexed array and
+/// `+A` only to an associative one, so `declare +a x` on an associative (or on
+/// a scalar, or on a name that does not exist) is silently accepted.
+fn destroys_array_shape(
+    shell: &Shell,
+    name: &str,
+    want_destroy_array: bool,
+    want_destroy_assoc: bool,
+) -> bool {
+    match shell.shape_of(name) {
+        Some(crate::shell_state::Shape::Indexed) => want_destroy_array,
+        Some(crate::shell_state::Shape::Associative) => want_destroy_assoc,
+        _ => false,
+    }
+}
+
 fn clear_local_shadow(shell: &mut Shell, name: &str, already_local: bool) -> bool {
     let exported = shell.is_exported(name);
     if !already_local {
@@ -1889,6 +1909,9 @@ fn builtin_local_decl(
     }
     let mut want_array = false;
     let mut want_associative = false;
+    // `+a` / `+A` — refused per name, and only on the matching shape (#784).
+    let mut want_destroy_array = false;
+    let mut want_destroy_assoc = false;
     let mut want_integer = false;
     let mut want_readonly = false;
     let mut saw_minus_l = false;
@@ -1955,7 +1978,13 @@ fn builtin_local_decl(
                 // `+x` cancels the inherited export attribute; the rest are
                 // accepted and a no-op — see the note above.
                 b'x' => saw_plus_x = true,
-                b'a' | b'A' | b'i' | b'r' | b'l' | b'u' | b'c' | b'n' => {}
+                // #784: `+a`/`+A` is refused per NAME, on the matching shape
+                // only — `local +a v` on a scalar is fine, `local +a v` on an
+                // indexed array is `cannot destroy array variables in this
+                // way`. Deferred to the per-name loop, as in `declare`.
+                b'a' => want_destroy_array = true,
+                b'A' => want_destroy_assoc = true,
+                b'i' | b'r' | b'l' | b'u' | b'c' | b'n' => {}
                 other => {
                     crate::builtin_opts::emit_invalid_plus_option(name, other, shell, err);
                     return ExecOutcome::Continue(2);
@@ -2015,6 +2044,26 @@ fn builtin_local_decl(
                     .last()
                     .map(|f| f.contains_key(name))
                     .unwrap_or(false);
+                // #784: `+a`/`+A` cannot take the array attribute off a name
+                // that has it — but a FRESH local is a plain scalar (#539), so
+                // it has no array attribute to destroy: bash accepts
+                // `declare -a g=(1); f(){ local +a g; }` and gives a scalar
+                // local. Only a name ALREADY local in this frame can be
+                // refused, and only on the matching shape. Checked before the
+                // snapshot/clear, which would erase the shape being asked
+                // about.
+                if already_local
+                    && destroys_array_shape(shell, name, want_destroy_array, want_destroy_assoc)
+                {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "local: {name}: cannot destroy array variables in this way"
+                    );
+                    exit = 1;
+                    continue;
+                }
                 snapshot_for_local_scope(shell, name);
                 let was_exported = clear_local_shadow(shell, name, already_local);
                 if saw_minus_n {
@@ -2140,6 +2189,26 @@ fn builtin_local_decl(
                     .last()
                     .map(|f| f.contains_key(&name))
                     .unwrap_or(false);
+                // #784: `+a`/`+A` cannot take the array attribute off a name
+                // that has it — but a FRESH local is a plain scalar (#539), so
+                // it has no array attribute to destroy: bash accepts
+                // `declare -a g=(1); f(){ local +a g; }` and gives a scalar
+                // local. Only a name ALREADY local in this frame can be
+                // refused, and only on the matching shape. Checked before the
+                // snapshot/clear, which would erase the shape being asked
+                // about.
+                if already_local
+                    && destroys_array_shape(shell, &name, want_destroy_array, want_destroy_assoc)
+                {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "local: {name}: cannot destroy array variables in this way"
+                    );
+                    exit = 1;
+                    continue;
+                }
                 snapshot_for_local_scope(shell, &name);
                 let was_exported = clear_local_shadow(shell, &name, already_local);
 
@@ -2489,6 +2558,9 @@ fn builtin_declare_decl(
     let mut want_remove_integer = false;
     let mut want_array = false;
     let mut want_associative = false;
+    // `+a` / `+A` — refused per name, and only on the matching shape (#784).
+    let mut want_destroy_array = false;
+    let mut want_destroy_assoc = false;
     let mut function_mode = false;
     let mut function_names_only = false;
     let mut print_mode = false;
@@ -2570,29 +2642,15 @@ fn builtin_declare_decl(
                 b'r' => {}
                 b'x' => want_remove_export = true,
                 b'i' => want_remove_integer = true,
-                b'a' => {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "{name}: +a: array attribute cannot be removed"
-                    );
-                    return ExecOutcome::Continue(1);
-                }
-                b'A' => {
-                    // TODO: bash compat — bash silently ignores `+A` on
-                    // existing associatives (the attribute can't be
-                    // removed once set). We mirror `+a`'s conservative
-                    // rejection for now; revisit if real scripts need
-                    // silent-ignore behavior.
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "{name}: +A: associative attribute cannot be removed"
-                    );
-                    return ExecOutcome::Continue(1);
-                }
+                // #784: `+a`/`+A` is not an option error — bash decides
+                // PER NAME, and only when that name actually has the matching
+                // shape. `declare +a v` on a scalar, on an absent name, or on
+                // an ASSOCIATIVE array is silently accepted; only `+a` on an
+                // indexed array (or `+A` on an associative one) is refused,
+                // with the variable named rather than the flag. Deferred to
+                // the per-name loop below.
+                b'a' => want_destroy_array = true,
+                b'A' => want_destroy_assoc = true,
                 b'l' => saw_plus_l = true,
                 b'u' => saw_plus_u = true,
                 b'c' => saw_plus_c = true,
@@ -2815,6 +2873,26 @@ fn builtin_declare_decl(
         // `mark_integer` and friends have already stamped the flags on.
         if assign_opt.is_some() && shell.is_readonly(name) {
             crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
+            exit = 1;
+            continue;
+        }
+
+        // #784: the array attribute cannot be taken off a variable that has
+        // it. bash checks this per name, after the readonly-assignment refusal
+        // and BEFORE the conversion table (`declare.def:854`), and the shapes
+        // do not cross: `+a` on an ASSOCIATIVE array is accepted and falls
+        // through to whatever `-a`/`-A` asks for, so `declare +a -a x` on an
+        // associative reports the CONVERSION error, while `declare +A -a x`
+        // reports this one. A refused name is skipped entirely — no attribute
+        // and no assignment is applied to it — and the remaining names are
+        // still processed.
+        if destroys_array_shape(shell, name, want_destroy_array, want_destroy_assoc) {
+            crate::sh_error_to!(
+                shell,
+                err,
+                None,
+                "declare: {name}: cannot destroy array variables in this way"
+            );
             exit = 1;
             continue;
         }

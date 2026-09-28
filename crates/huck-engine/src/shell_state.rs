@@ -3545,6 +3545,14 @@ impl Shell {
         )
     }
 
+    /// The SHAPE of `name`'s binding, or `None` when no such name exists.
+    /// Reads the shape, not a materialised value, so a declared-but-unset
+    /// `declare -a y` still answers `Indexed` (#600). Does NOT resolve
+    /// namerefs — huck's declaration paths act on the name as written (#786).
+    pub fn shape_of(&self, name: &str) -> Option<Shape> {
+        self.vars.get(name).map(|v| v.value.shape())
+    }
+
     /// Returns the value at string key `key` for the associative array `name`.
     /// `None` if the variable is unset, not associative, or has no such key.
     pub fn lookup_associative_element(&self, name: &str, key: &str) -> Option<String> {
