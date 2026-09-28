@@ -27,7 +27,7 @@ changes a shared subsystem's semantics and gets a spec + plan + hand-off PR.
 | 4 | One AST printer (`generate` gains bash's outside-a-function style; diagnostics, `jobs`, `$BASH_COMMAND` use it) | #761 #770 (round 1, PR #774); #124 (round 2, PR #775); #589 moved to hub 5 (it is the matcher's escape form) | bug-fix rounds | ✅ done |
 | 5 | One pattern-matching chokepoint (`glob_match::pattern_matches`), pattern text in bash's form | #717 #303 #589 (PR #776) | bug-fix round | ✅ done |
 | 2A | Declared-but-unset variable state (+ export set, option letters) | #600 #225 #33 #691 #692 #777 #698-half (v365, PR pending) | vNN | ✅ done |
-| 2B | One declaration policy table | shape table: #697 #734 (round 1, PR pending). #698 closed in 2A. STILL OPEN: #347 (the *with-value* path — needs an always-`AbortList` `ErrorKind`), #65 (prefix over-persistence, unrelated to shape) | bug-fix rounds, not a vNN — bash answers every cell | ◐ shape table done (#783 #784 #785 #786 filed) |
+| 2B | One declaration policy table | #697 #734 (PR #787); #784 (PR #789); #788 (PR #791); #790 (PR #794). #698 closed in 2A. **HANDED BACK**: #347 + #783 + #785 (one root — bash performs a COMPOUND assignment at EXPANSION time, huck inside the builtin); #786 + #793 (nameref vs shape); #792 (circular-nameref resolution); #65 (prefix over-persistence, unrelated to shape) | 4 bug-fix rounds done; the remainder wants a spec | ◐ shape half done |
 | 3 | Piped-stdin reader feeds the lexer; parse the line before running it | #701 #81 #21 #79 #575 | vNN | |
 | 6a | Brace expansion out of the lexer | #24 #44 #387 | vNN | |
 | 6b | Tilde recognition out of the lexer | #295 #72 | vNN | |
@@ -213,6 +213,42 @@ associative array is read as key/value pairs in bash), #784 (`declare +a`
 message names the flag, not the variable), #785 (`declare -aA` is not a bad
 flag combination — bash creates from `-A` then refuses `-a`), #786 (a shape
 flag on a nameref lands on the TARGET in bash).
+
+**Rounds 2-4 (2026-09-28).** All three were filed as message-wording
+divergences and none of them was.
+
+- **#784 (PR #789)** — huck rejected `+a`/`+A` in the OPTION loop,
+  unconditionally. bash decides PER NAME on the matching shape: `+a` objects
+  only to an indexed array and `+A` only to an associative one, a scalar or an
+  absent name is accepted silently, and the refusal sits between the
+  readonly-assignment refusal and the conversion table. `local` enforces it
+  only for a name ALREADY local in the frame — a fresh local is a plain scalar
+  (#539), so it has no array attribute to destroy.
+- **#788 (PR #791)** — thirteen diagnostics in `builtin_declare_decl`
+  hardcoded `declare:`; bash names the builtin as invoked.
+- **#790 (PR #794)** — the `reference variable cannot be an array` guard
+  existed on the value-LESS form only, so `declare -n r=t` on an array
+  overwrote element 0 with the target's NAME and, on an associative array,
+  leaked `internal: install_scalar_value on associative array` to the user. The
+  same fix corrected the ORDER: bash validates a nameref (`declare.def:515`
+  and `:801`) ahead of the readonly refusal at `:845`.
+
+**The handed-back root (#347).** A COMPOUND assignment to a declaration
+builtin is performed by bash during WORD EXPANSION, before the builtin body
+runs; huck performs it inside the builtin. One probe settles it, and it is not
+even about arrays:
+
+```text
+readonly m=1; declare -a m=(9)   ->  bash: line 1: m: readonly variable            (bare, line ABANDONED)
+readonly m=1; declare -a m=9     ->  bash: line 1: declare: m: readonly variable   (prefixed, CONTINUES)
+```
+
+The parentheses pick the emitter, the prefix and the fatality. That determines
+the manners of every error those four builtins can raise — readonly,
+conversion, destroy-array and the assignment itself — on all five drivers, so
+it wants a spec. #783 and #785 are the same root (#785's `declare -aA x=(1 2)`
+leaves the value ASSIGNED behind its own error, which no in-builtin model
+produces). Full measurement is on #347.
 
 ### 3. The piped-stdin reader pre-processes text above the lexer
 
