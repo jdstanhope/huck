@@ -265,18 +265,22 @@ checkshape "capture matrix: type -Z capture is non-empty" "$h" '.'
 checkshape "capture matrix: type -Z body matches bash wording" "$h" 'invalid option'
 
 # v269 T6: shell_state.rs's `declare_err_message` error-VALUE CONSTRUCTOR
-# (spec §6) — the "callers translate" contract. bash 5.2 itself does NOT
-# error on `declare -A` over an existing nonempty scalar (a pre-existing,
-# unrelated body/behavior divergence — out of scope here, same as the
-# ambiguous-redirect and `type -Z` cases above), so this asserts ONLY huck's
-# own routing: the translating caller (`builtin_declare_decl` in
-# builtins.rs) holds a local `err` writer from `run_builtin`, so it must
-# route through `sh_error_to!` — proven by both the `2>&1`-captured AND the
-# real-fd-leaked forms carrying the identical body.
-h_cap=$("$HUCK_BIN" -c 'x=$(y=1; declare -A y 2>&1); printf "%s" "$x"')
-h_leak=$("$HUCK_BIN" -c 'y=1; declare -A y' 2>&1 >/dev/null)
-checkshape "capture matrix: declare -A on existing scalar — capture carries the body" "$h_cap" 'cannot convert scalar to associative array'
-checkshape "capture matrix: declare -A on existing scalar — leaks to real fd 2 without capture" "$h_leak" 'cannot convert scalar to associative array'
+# (spec §6) — the "callers translate" contract. The translating caller
+# (`builtin_declare_decl` in builtins.rs) holds a local `err` writer from
+# `run_builtin`, so it must route through `sh_error_to!` — proven by both the
+# `2>&1`-captured AND the real-fd-leaked forms carrying the identical body.
+#
+# The vehicle used to be `y=1; declare -A y`, a huck-ONLY error that this
+# harness noted bash does not raise. #697 fixed that (bash promotes the scalar
+# to `([0]="1")`, and so does huck now), so the routing proof moved to the
+# conversion REFUSAL, which bash does raise — letting the rows pin bash's
+# wording as well as huck's routing.
+b_cap=$("$BASH_BIN" -c 'x=$(declare -A y; declare -a y 2>&1); printf "%s" "$x"')
+h_cap=$("$HUCK_BIN" -c 'x=$(declare -A y; declare -a y 2>&1); printf "%s" "$x"')
+h_leak=$("$HUCK_BIN" -c 'declare -A y; declare -a y' 2>&1 >/dev/null)
+checkshape "capture matrix: declare -a on assoc — bash's own wording" "$b_cap" 'declare: y: cannot convert associative to indexed array'
+checkshape "capture matrix: declare -a on assoc — capture carries the body" "$h_cap" 'declare: y: cannot convert associative to indexed array'
+checkshape "capture matrix: declare -a on assoc — leaks to real fd 2 without capture" "$h_leak" 'declare: y: cannot convert associative to indexed array'
 
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

@@ -51,10 +51,16 @@ trap 'rm -rf "$TMP"' EXIT
 
 # DRIVER 1 — `-c`. Pins the message text and the status a contained child
 # reports there (127, the nounset kind's `-c` substitution).
+#
+# Runs in $TMP like DRIVER 2 does: the `unmatched glob` row redirects to a
+# pattern that matches nothing, which (nullglob off) passes through as a
+# LITERAL word and creates a file named `*.no-such-glob-xyz`. Without the cd
+# that file landed in the repo root on every sweep, where a `git add -A`
+# eventually committed it.
 check_c() {
     local label="$1" frag="$2" b h
-    b=$(timeout 10 "$BASH_BIN" --norc --noprofile -c "set -u; $frag" huck5 2>&1; echo "EXIT:$?")
-    h=$(timeout 10 "$HUCK_BIN" -c "set -u; $frag" huck5 2>&1; echo "EXIT:$?")
+    b=$(cd "$TMP" && timeout 10 "$BASH_BIN" --norc --noprofile -c "set -u; $frag" huck5 2>&1; echo "EXIT:$?")
+    h=$(cd "$TMP" && timeout 10 "$HUCK_BIN" -c "set -u; $frag" huck5 2>&1; echo "EXIT:$?")
     compare "-c: $label" "$b" "$h"
 }
 

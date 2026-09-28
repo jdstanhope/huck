@@ -27,7 +27,7 @@ changes a shared subsystem's semantics and gets a spec + plan + hand-off PR.
 | 4 | One AST printer (`generate` gains bash's outside-a-function style; diagnostics, `jobs`, `$BASH_COMMAND` use it) | #761 #770 (round 1, PR #774); #124 (round 2, PR #775); #589 moved to hub 5 (it is the matcher's escape form) | bug-fix rounds | ✅ done |
 | 5 | One pattern-matching chokepoint (`glob_match::pattern_matches`), pattern text in bash's form | #717 #303 #589 (PR #776) | bug-fix round | ✅ done |
 | 2A | Declared-but-unset variable state (+ export set, option letters) | #600 #225 #33 #691 #692 #777 #698-half (v365, PR pending) | vNN | ✅ done |
-| 2B | One declaration policy table | #347 #697 #698 #734 #65 | vNN (after 2A) | |
+| 2B | One declaration policy table | shape table: #697 #734 (round 1, PR pending). #698 closed in 2A. STILL OPEN: #347 (the *with-value* path — needs an always-`AbortList` `ErrorKind`), #65 (prefix over-persistence, unrelated to shape) | bug-fix rounds, not a vNN — bash answers every cell | ◐ shape table done (#783 #784 #785 #786 filed) |
 | 3 | Piped-stdin reader feeds the lexer; parse the line before running it | #701 #81 #21 #79 #575 | vNN | |
 | 6a | Brace expansion out of the lexer | #24 #44 #387 | vNN | |
 | 6b | Tilde recognition out of the lexer | #295 #72 | vNN | |
@@ -189,6 +189,30 @@ scattered guards, each right for some cells:
   persists only the names the builtin actually names.
 
 Depends on 2A: "a declared-but-unset name has nothing to promote" (#697).
+
+**Round 1 (2026-09-28) — the SHAPE half.** Sized as a bug-fix round rather than a
+vNN: bash answers every cell, and 2A had already unified the declaration paths, so
+there was no decision left for a spec to make. `Shell::reshape_to` is the one
+table (plus `reshape_in_frame_to` for bash's in-frame discard cell), pinned by 76
+rows in `tests/scripts/array_conversion_diff_check.sh`. Closed #697 and #734's last
+cell; #698 had already been closed inside 2A.
+
+Two things the round learned that reshape the rest of the hub:
+
+- **#347 is the WITH-VALUE path, and it is a separate round.** Its diagnostic
+  carries no builtin prefix (`m: cannot convert …`, like a readonly assignment
+  error) and it abandons the command list in posix *as well as* outside it —
+  matching no existing `ErrorKind` (`Expansion` exits in posix,
+  `AssignmentPrefix` continues outside it). So it needs an additive variant in
+  the shared `error_fatality` classifier. The full measurement is on the issue.
+- **#65 is not a shape question at all** — it is about which names a prefix
+  assignment persists. It can be taken independently of the rest of 2B.
+
+Neighbours filed while measuring: #783 (a bare word list assigned to an
+associative array is read as key/value pairs in bash), #784 (`declare +a`
+message names the flag, not the variable), #785 (`declare -aA` is not a bad
+flag combination — bash creates from `-A` then refuses `-a`), #786 (a shape
+flag on a nameref lands on the TARGET in bash).
 
 ### 3. The piped-stdin reader pre-processes text above the lexer
 

@@ -1,0 +1,112 @@
+---
+title: "Turning a variable into an array"
+date: 2026-09-28
+summary: "`declare -a` on a name that already exists asks bash to change a variable's shape, and bash has a whole table of answers — promote, refuse, or empty it out. huck had three different partial copies of that table, and one of them silently threw away an associative array."
+tags: ["variables", "declare", "arrays", "bugfix"]
+version: null
+draft: false
+---
+
+`declare -a NAME` is usually read as "make me an array". But if `NAME`
+already exists, it is really a request to change a variable's *shape*, and
+bash answers that request from a small table: sometimes it carries the old
+value over, sometimes it refuses outright, and in one case it quietly empties
+the variable. huck had three partial copies of that table — one in `declare`,
+one in `local`, one for the readonly check — and they disagreed with bash in
+different directions.
+
+The worst cell lost data:
+
+```bash
+# before
+$ huck -c 'declare -A conf=([host]=localhost); declare -a conf; echo rc=$?; declare -p conf'
+rc=0
+declare -a conf=([0]="")
+```
+
+```bash
+# after
+$ huck -c 'declare -A conf=([host]=localhost); declare -a conf; echo rc=$?; declare -p conf'
+huck: line 1: declare: conf: cannot convert associative to indexed array
+rc=1
+declare -A conf=([host]="localhost" )
+```
+
+An associative array and an indexed array are not interchangeable, so bash
+refuses to convert between them in either direction and leaves the variable
+alone. huck used to accept the `-a` and rebuild `conf` as an indexed array
+with one empty element — the keys and values simply gone, exit status 0.
+
+Going the other way, huck was too strict rather than too loose. A plain
+string *can* become an array: bash files it under index `0`.
+
+```bash
+# before
+$ huck -c 'x=hello; declare -A x; declare -p x'
+huck: line 1: declare: x: cannot convert scalar to associative array
+declare -- x="hello"
+```
+
+```bash
+# after
+$ huck -c 'x=hello; declare -A x; declare -p x'
+declare -A x=([0]="hello" )
+```
+
+## readonly is about the value
+
+`readonly` guards what a variable *is*, not what shape it is stored in.
+Re-filing `1` as element `0` is the same data under a new shape, so bash
+allows it — and huck was refusing, twice over:
+
+```bash
+# before
+$ huck -c 'readonly R=1; declare -a R; declare -p R'
+huck: line 1: R: readonly variable
+huck: line 1: declare: R: readonly variable
+declare -r R="1"
+```
+
+```bash
+# after
+$ huck -c 'readonly R=1; declare -a R; declare -p R'
+declare -ar R=([0]="1")
+```
+
+A later `R=7` is still refused. That check lives on assignment, which is
+where it belongs.
+
+## The odd cell
+
+One entry in the table looks like a bug in bash and is not. Inside a
+function, changing the shape of a name that is *already local to that same
+function* throws the value away, where the identical change at the top level
+promotes it:
+
+```bash
+# before
+$ huck -c 'f(){ local v=s; local -a v; declare -p v; }; f'
+declare -a v=([0]="s")
+```
+
+```bash
+# after
+$ huck -c 'f(){ local v=s; local -a v; declare -p v; }; f'
+declare -a v=()
+```
+
+Re-declaring the *same* shape keeps the value, so this only fires on a real
+change. It is now one function with the table written out beside it, which
+`declare`, `local`, `readonly` and `export` all call.
+
+Still open, all found by measuring the neighbouring cells: the same refusal
+is missing when the declaration carries a value
+([#347](https://github.com/jdstanhope/huck/issues/347)), a bare word list
+assigned to an associative array is rejected instead of read as key/value
+pairs ([#783](https://github.com/jdstanhope/huck/issues/783)),
+`declare +a` names the flag rather than the variable in its error
+([#784](https://github.com/jdstanhope/huck/issues/784)), `declare -aA` is
+rejected where bash applies both flags in order
+([#785](https://github.com/jdstanhope/huck/issues/785)), and a shape flag
+applied to a nameref lands on the nameref instead of its target
+([#786](https://github.com/jdstanhope/huck/issues/786)).
