@@ -2064,6 +2064,30 @@ fn builtin_local_decl(
                     exit = 1;
                     continue;
                 }
+                // #790: a name that is ALREADY local in this frame with an
+                // array shape cannot become a nameref, and bash checks it
+                // before it touches the binding. Gated on `already_local` for
+                // the same reason `+a` is (#784): a fresh local is a plain
+                // scalar, so `declare -a g=(1); f(){ local -n g=t; }` is
+                // accepted and binds a scalar nameref. Reads the SHAPE, so an
+                // unset `local -a r` is refused too.
+                if saw_minus_n
+                    && already_local
+                    && matches!(
+                        shell.shape_of(name),
+                        Some(crate::shell_state::Shape::Indexed)
+                            | Some(crate::shell_state::Shape::Associative)
+                    )
+                {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "local: {name}: reference variable cannot be an array"
+                    );
+                    exit = 1;
+                    continue;
+                }
                 snapshot_for_local_scope(shell, name);
                 let was_exported = clear_local_shadow(shell, name, already_local);
                 if saw_minus_n {
@@ -2205,6 +2229,30 @@ fn builtin_local_decl(
                         err,
                         None,
                         "local: {name}: cannot destroy array variables in this way"
+                    );
+                    exit = 1;
+                    continue;
+                }
+                // #790: a name that is ALREADY local in this frame with an
+                // array shape cannot become a nameref, and bash checks it
+                // before it touches the binding. Gated on `already_local` for
+                // the same reason `+a` is (#784): a fresh local is a plain
+                // scalar, so `declare -a g=(1); f(){ local -n g=t; }` is
+                // accepted and binds a scalar nameref. Reads the SHAPE, so an
+                // unset `local -a r` is refused too.
+                if saw_minus_n
+                    && already_local
+                    && matches!(
+                        shell.shape_of(&name),
+                        Some(crate::shell_state::Shape::Indexed)
+                            | Some(crate::shell_state::Shape::Associative)
+                    )
+                {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "local: {name}: reference variable cannot be an array"
                     );
                     exit = 1;
                     continue;
@@ -2879,6 +2927,69 @@ fn builtin_declare_decl(
         // declare -ri R=5` leaves `declare -r R="outer"`, not `-ir`. The
         // assignment path further down has its own readonly check, but by then
         // `mark_integer` and friends have already stamped the flags on.
+        // #790: bash validates a nameref declaration BEFORE it refuses a
+        // readonly assignment. Its two sites are `declare.def:515` (lexical
+        // checks on the word) and `:801` (the existing variable's shape), both
+        // ahead of the readonly refusal at `:845`, so
+        // `readonly r=1; declare -n r=r` reports the SELF-REFERENCE and
+        // `declare -a r=(1); readonly r; declare -n r=t` reports the ARRAY,
+        // where huck reported `readonly variable` for both.
+        //
+        // The target is expanded exactly ONCE here and handed to the bind
+        // below: the word can hold a command substitution, and expanding it
+        // twice would run it twice (#220).
+        let nameref_target: Option<String> = if saw_minus_n {
+            assign_opt.map(|a| crate::expand::expand_assignment(&a.value, shell))
+        } else {
+            None
+        };
+        if saw_minus_n {
+            if let Some(target) = &nameref_target {
+                // Direct self-reference is a hard error.
+                if target == name {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "{decl_cmd}: {name}: nameref variable self references not allowed"
+                    );
+                    exit = 1;
+                    continue;
+                }
+                // Target must be a valid variable name OR name[subscript].
+                let valid = is_valid_name(target)
+                    || matches!(parse_subscripted_arg(target), Ok(Some((b, _))) if is_valid_name(b));
+                if !valid {
+                    crate::sh_error_to!(
+                        shell,
+                        err,
+                        None,
+                        "{decl_cmd}: `{target}': invalid variable name for name reference"
+                    );
+                    exit = 1;
+                    continue;
+                }
+            }
+            // An existing array cannot become a nameref, whatever form the
+            // declaration takes (#227 covered only the value-LESS one). Reads
+            // the SHAPE, not a materialised value: bash's `array_p` is an
+            // ATTRIBUTE test, so a valueless `declare -a r` is refused too.
+            if matches!(
+                shell.shape_of(name),
+                Some(crate::shell_state::Shape::Indexed)
+                    | Some(crate::shell_state::Shape::Associative)
+            ) {
+                crate::sh_error_to!(
+                    shell,
+                    err,
+                    None,
+                    "{decl_cmd}: {name}: reference variable cannot be an array"
+                );
+                exit = 1;
+                continue;
+            }
+        }
+
         if assign_opt.is_some() && shell.is_readonly(name) {
             crate::sh_error_to!(shell, err, None, "{decl_cmd}: {name}: readonly variable");
             exit = 1;
@@ -3000,34 +3111,13 @@ fn builtin_declare_decl(
         // Nameref (-n / +n) handling. Must come BEFORE the compound-assignment
         // path so that the target is stored raw (not through apply_one_assignment).
         if saw_minus_n {
-            let target_opt: Option<String> =
-                assign_opt.map(|a| crate::expand::expand_assignment(&a.value, shell));
-            if let Some(ref target) = target_opt {
-                // Direct self-reference is a hard error.
-                if target == name {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "{decl_cmd}: {name}: nameref variable self references not allowed"
-                    );
-                    exit = 1;
-                    continue;
-                }
-                // Target must be a valid variable name OR name[subscript].
-                let valid = is_valid_name(target)
-                    || matches!(parse_subscripted_arg(target), Ok(Some((b, _))) if is_valid_name(b));
-                if !valid {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "{decl_cmd}: `{target}': invalid variable name for name reference"
-                    );
-                    exit = 1;
-                    continue;
-                }
-            } else if let Some(cur) = shell.get(name) {
+            // The self-reference and invalid-target checks, and the
+            // existing-array refusal, already ran above (#790) — as did the
+            // ONE expansion of the target word.
+            let target_opt: Option<String> = nameref_target;
+            if target_opt.is_none()
+                && let Some(cur) = shell.get(name)
+            {
                 // Value-less `declare -n NAME`: bash validates the variable's
                 // EXISTING value as the reference target, and this check fires
                 // BEFORE the readonly check (verified on bash 5.2.21:
@@ -3042,19 +3132,8 @@ fn builtin_declare_decl(
                 // value state, so `readonly FOO` on an unset FOO creates FOO
                 // as set-to-empty and `shell.get` returns Some(""). See #225.
                 //
-                // #227: an array-valued name cannot become a nameref — bash
-                // refuses BEFORE validating the value (`shell.get` on an array
-                // returns element 0, which would otherwise slip through).
-                if shell.get_indexed(name).is_some() || shell.get_associative(name).is_some() {
-                    crate::sh_error_to!(
-                        shell,
-                        err,
-                        None,
-                        "{decl_cmd}: {name}: reference variable cannot be an array"
-                    );
-                    exit = 1;
-                    continue;
-                }
+                // #227's array refusal now lives in the hoisted block above,
+                // where it also covers the `=target` form and unset shapes.
                 let cur = cur.to_string();
                 let valid = is_valid_name(&cur)
                     || matches!(parse_subscripted_arg(&cur), Ok(Some((b, _))) if is_valid_name(b));
